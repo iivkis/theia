@@ -28,7 +28,7 @@ theia reality identity-new --inbound ID --endpoint HOST:PORT --key PATH --confir
 theia reality descriptor-new --health PATH --key PATH --output PATH --confirm\n\
 theia reality descriptor-refresh --health PATH --key PATH --previous PATH --output PATH --sha256 HEX --confirm\n\
 theia reality invite-public --health PATH --key PATH --descriptor PATH --output PATH --confirm\n\
-theia reality invite-issued --health PATH --key PATH --descriptor PATH --server PATH --user ID --token-file PATH --output PATH --confirm\n\
+theia reality invite-issued --health PATH --key PATH --descriptor PATH --server PATH --user ID --token-file PATH --admission PATH --output PATH --confirm\n\
 theia reality preview-import --invitation PATH\n\
 theia reality import --invitation PATH --admission PATH --profile PATH --trust PATH --sha256 HEX --identity-sha256 HEX --confirm\n\
 theia reality import --invitation PATH --admission PATH --profile PATH --trust PATH --sha256 HEX --identity-sha256 HEX --token-ref REF --confirm\n\
@@ -115,6 +115,7 @@ pub enum Command {
         server: String,
         user: String,
         token: String,
+        admission: String,
         output: String,
     },
     Preview {
@@ -372,7 +373,7 @@ pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
                 output: path(o)?,
             }
         }
-        ["invite-issued", "--health", h, "--key", k, "--descriptor", d, "--server", s, "--user", u, "--token-file", t, "--output", o, "--confirm"]
+        ["invite-issued", "--health", h, "--key", k, "--descriptor", d, "--server", s, "--user", u, "--token-file", t, "--admission", a, "--output", o, "--confirm"]
             if config::valid_id(u) =>
         {
             Command::Issued {
@@ -382,6 +383,7 @@ pub(crate) fn parse(args: &[&str]) -> Result<Command, CliError> {
                 server: path(s)?,
                 user: (*u).into(),
                 token: path(t)?,
+                admission: path(a)?,
                 output: path(o)?,
             }
         }
@@ -890,6 +892,7 @@ pub fn run(command: Command) -> Result<String, Error> {
             server,
             user,
             token,
+            admission,
             output,
         } => {
             let (state, identity) = material(&health, &key)?;
@@ -905,8 +908,26 @@ pub fn run(command: Command) -> Result<String, Error> {
                 return Err(Error::Grant);
             };
             let token = bootstrap::read_credential(Path::new(&token))?;
-            let invite = Invitation::issued(&identity, &raw, &document, &user, &token, now)?;
-            publish(&output, &invite.encode()?)
+            let admission = crate::reality_admission::Secret::load(identity.scope(), Path::new(&admission))
+                .map_err(|_| Error::Credential)?;
+            let invite = Invitation::issued(&identity, &raw, &document, &user, &token, &admission, now)?;
+            // Independently supplied offline material must match the actual
+            // registered inbound, including its admission secret and signer.
+            // Otherwise a syntactically valid key may never authenticate.
+            use subtle::ConstantTimeEq;
+            let registered = reality_config::registered_invitation(
+                &document,
+                &identity.scope().inbound,
+                Some((&user, &token)),
+                now,
+            )
+            .map_err(|_| Error::Grant)?;
+            let encoded = invite.encode()?;
+            let expected = registered.encode()?;
+            if !bool::from(encoded.as_bytes().ct_eq(expected.as_bytes())) {
+                return Err(Error::Approval);
+            }
+            publish(&output, &encoded)
         }
         Command::Preview { invitation } => {
             let uri = bootstrap::read_text(Path::new(&invitation), bootstrap::MAX_URI, true)?;
@@ -1459,6 +1480,8 @@ mod tests {
             "--user",
             "device-a",
             "--token-file",
+            &d,
+            "--admission",
             &d,
             "--output",
             &p,

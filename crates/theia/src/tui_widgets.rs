@@ -39,8 +39,8 @@ pub(crate) fn section(title: &str, active: bool) -> Block<'_> {
                 .add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(SURFACE).bg(SURFACE))
-        .style(Style::default().fg(TEXT).bg(SURFACE))
+        .border_style(Style::default().fg(BG).bg(BG))
+        .style(Style::default().fg(TEXT).bg(BG))
 }
 
 /// Reports share semantic title and key styling without interpreting their
@@ -70,8 +70,8 @@ pub(crate) fn report_section(title: &str, active: bool) -> Block<'_> {
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(SURFACE).bg(SURFACE))
-        .style(Style::default().fg(TEXT).bg(SURFACE))
+        .border_style(Style::default().fg(BG).bg(BG))
+        .style(Style::default().fg(TEXT).bg(BG))
 }
 
 pub(crate) fn report_row<'a>(value: &'a str, style: Style, first: bool) -> Line<'a> {
@@ -230,7 +230,16 @@ impl Form {
             (end - start) as u16 * stride,
         );
         let help = if side {
-            Rect::new(rows.right().saturating_add(3), rows.y, 31, room.min(12))
+            let field = self.fields.iter().find(|f| f.id == self.selected);
+            let message = if self.error.is_empty() {
+                field.map_or("Выберите строку стрелками или мышью.", |f| f.hint)
+            } else { self.error.as_str() };
+            // Measure wrapped text in terminal cells; never fill unused rows
+            // with an empty side panel. A little extra room handles word wrap.
+            let mut wrapped = Vec::new();
+            append_wrapped(&mut wrapped, message, 29, Style::default());
+            let height = (wrapped.len() as u16).saturating_add(3).min(room);
+            Rect::new(rows.right().saturating_add(3), rows.y, 31, height)
         } else {
             Rect::new(inner.x, rows.bottom(), inner.width, help_h)
         };
@@ -299,7 +308,17 @@ impl Form {
                 g.stride,
             );
             let marker = if selected { "▎ " } else { "  " };
-            let label = if picker && !field.label.starts_with('[') {
+            // Explicit presentation conventions for choice rows. The owner
+            // still handles keys and mouse hit-tests never execute actions.
+            let control = !picker && (field.label.starts_with("[x] ") || field.label.starts_with("[ ] ") || field.label.starts_with("› "));
+            let control_label = if let Some(name) = field.label.strip_prefix("[x] ") {
+                format!("{marker}☑  {name}")
+            } else if let Some(name) = field.label.strip_prefix("[ ] ") {
+                format!("{marker}☐  {name}")
+            } else {
+                format!("{marker}{}", field.label)
+            };
+            let label = if control { control_label } else if picker && !field.label.starts_with('[') {
                 format!(
                     "{marker}{}  {}",
                     if selected { "●" } else { "○" },
@@ -312,7 +331,7 @@ impl Form {
                 if picker {
                     "Выбрать"
                 } else {
-                    "Введите значение"
+                    field.hint.strip_prefix("Пример: ").and_then(|hint| hint.split_once(" · ").map(|(example, _)| example)).unwrap_or("Введите значение")
                 }
             } else {
                 field.value.as_str()
@@ -321,28 +340,42 @@ impl Form {
                 .fg(if selected { ACCENT } else { TEXT })
                 .add_modifier(Modifier::BOLD);
             let value_style = Style::default()
-                .fg(if field.value.is_empty() || picker {
+                .fg(if field.value.is_empty() || picker || control {
                     MUTED
                 } else {
                     TEXT
                 })
                 .bg(if selected {
                     FOCUS
-                } else if picker {
+                } else if picker || control {
                     BG
                 } else {
                     INPUT
                 });
+            if control && g.stride >= 2 {
+                frame.render_widget(
+                    Paragraph::new(label).style(label_style.bg(if selected { FOCUS } else { BG })),
+                    Rect::new(rect.x, rect.y, rect.width, 1),
+                );
+                frame.render_widget(
+                    Paragraph::new(format!("    {}", fit_value(value, rect.width.saturating_sub(4), false)))
+                        .style(Style::default().fg(MUTED).bg(BG)),
+                    Rect::new(rect.x, rect.y + 1, rect.width, 1),
+                );
+                continue;
+            }
             if picker && g.stride >= 2 {
                 let style = label_style.bg(if selected { FOCUS } else { SURFACE });
+                let grant = matches!(field.label, "[x] Доступ выбран" | "[ ] Нет доступа");
+                let primary = if grant { format!("{marker}{} {}", if field.label.starts_with("[x]") { "[x]" } else { "[ ]" }, field.value) } else { label };
                 frame.render_widget(
-                    Paragraph::new(label).style(style),
+                    Paragraph::new(primary).style(style),
                     Rect::new(rect.x, rect.y, rect.width, 1),
                 );
                 frame.render_widget(
                     Paragraph::new(format!(
                         "  {}",
-                        fit_value(value, rect.width.saturating_sub(2), false)
+                        fit_value(if grant { if field.label.starts_with("[x]") { "Доступ выбран" } else { "Не выбран" } } else { value }, rect.width.saturating_sub(2), false)
                     ))
                     .style(value_style),
                     Rect::new(rect.x, rect.y + 1, rect.width, 1),
@@ -360,8 +393,10 @@ impl Form {
                     rect.width.saturating_sub(4),
                     1,
                 );
-                let shown = fit_value(value, input.width.saturating_sub(3), selected);
-                let content = if selected && !picker {
+                let placeholder;
+                let value = if field.value.is_empty() && field.hint.starts_with("Пример: ") { placeholder = format!("Пример: {value}"); placeholder.as_str() } else { value };
+                let shown = fit_value(value, input.width.saturating_sub(3), selected && !field.value.is_empty());
+                let content = if selected && !picker && !field.value.is_empty() {
                     format!(" {shown} ▏")
                 } else {
                     format!(" {shown}")
@@ -374,7 +409,7 @@ impl Form {
                         .split(rect);
                 frame.render_widget(Paragraph::new(label).style(label_style), columns[0]);
                 frame.render_widget(
-                    Paragraph::new(fit_value(value, columns[1].width, selected)).style(value_style),
+                    Paragraph::new(fit_value(value, columns[1].width, selected && !control)).style(value_style),
                     columns[1],
                 );
             }
@@ -399,11 +434,6 @@ impl Form {
                         Style::default()
                             .fg(if self.error.is_empty() { ACCENT } else { ERROR })
                             .add_modifier(Modifier::BOLD),
-                    ),
-                    Line::raw(""),
-                    Line::styled(
-                        field.map_or("", |f| f.label),
-                        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
                     ),
                     Line::styled(message, Style::default().fg(color)),
                 ];
@@ -441,6 +471,7 @@ pub(crate) struct ReferenceReview {
     pub rows: Vec<ReferenceRow>,
     pub details: Vec<(&'static str, String)>,
     pub note: String,
+    pub expanded: bool,
 }
 
 impl ReferenceReview {
@@ -450,72 +481,33 @@ impl ReferenceReview {
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )];
         let wide = width >= 96;
-        if wide {
-            lines.push(Line::styled(
-                format!(
-                    "{:<30} {:<25} {:<13} {}",
-                    "Референс", "Адрес", "H2 / H3", "Результат"
-                ),
-                Style::default().fg(MUTED),
-            ));
+        let eligible = self.rows.iter().filter(|row| row.h2).count();
+        let selected = self.rows.iter().filter(|row| row.selected.is_some()).count();
+        append_wrapped(&mut lines, &format!("Всего: {} · Подходит: {eligible} · Выбрано: {selected}", self.rows.len()), width, Style::default().fg(TEXT));
+        for note in self.note.lines() {
+            append_wrapped(&mut lines, note, width, Style::default().fg(if eligible == 0 || note.starts_with("Внимание") { WARNING } else { TEXT }));
         }
-        for row in &self.rows {
-            let status = match row.selected {
-                Some(0) => "Основной".into(),
-                Some(index) => format!("Резерв {index}"),
-                None => "Исключён".into(),
-            };
-            let color = if row.selected == Some(0) {
-                ACCENT
-            } else if row.selected.is_some() {
-                WARNING
-            } else {
-                ERROR
-            };
-            let transports = format!(
-                "{} H2  {} H3",
-                if row.h2 { "✓" } else { "×" },
-                if row.h3 { "✓" } else { "×" }
-            );
-            // Long names and IPv6 addresses must remain visible, not elided.
-            if wide && Span::raw(row.name.as_str()).width() <= 28 && row.address.len() <= 23 {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{:<30} {:<25} ", row.name, row.address),
-                        Style::default().fg(TEXT),
-                    ),
-                    Span::styled(format!("{transports:<13} "), Style::default().fg(MUTED)),
-                    Span::styled(
-                        format!("{status} · {}", row.score),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-            } else {
-                append_wrapped(
-                    &mut lines,
-                    &row.name,
-                    width,
-                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-                );
-                append_wrapped(
-                    &mut lines,
-                    &format!("  {}", row.address),
-                    width,
-                    Style::default().fg(MUTED),
-                );
-                append_wrapped(
-                    &mut lines,
-                    &format!("  {transports} · {status} · {}", row.score),
-                    width,
-                    Style::default().fg(color),
-                );
+        append_wrapped(&mut lines, "100: H2 и H3 подтверждены · 80: только H2 подтверждён · 0: H2 не подтверждён. ? — не подтверждено. Оценка не измеряет скорость.", width, Style::default().fg(MUTED));
+        if selected > 0 {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled("Выбранные сайты", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
+            Self::append_rows(&mut lines, width, self.rows.iter().filter(|row| row.selected.is_some()));
+        }
+        if !self.expanded {
+            for (label, value) in self.details.iter().filter(|(label, _)| matches!(*label, "Адрес сервера" | "Пользователи")) {
+                append_wrapped(&mut lines, &format!("{label}: {value}"), width, Style::default().fg(TEXT));
             }
+            lines.push(Line::raw(""));
+            append_wrapped(&mut lines, if self.details.is_empty() { "F2: Все кандидаты" } else { "F2: Все кандидаты и параметры конфигурации" }, width, Style::default().fg(ACCENT));
+            return lines;
         }
         lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            "Конфигурация к сохранению",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ));
+        if !self.details.is_empty() {
+            lines.push(Line::styled(
+                "Конфигурация к сохранению",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ));
+        }
         for (label, value) in &self.details {
             if wide && Span::raw(value.as_str()).width() + 24 <= usize::from(width) {
                 lines.push(Line::from(vec![
@@ -527,9 +519,84 @@ impl ReferenceReview {
                 append_wrapped(&mut lines, value, width, Style::default().fg(TEXT));
             }
         }
-        lines.push(Line::raw(""));
-        append_wrapped(&mut lines, &self.note, width, Style::default().fg(WARNING));
+
+        if selected < self.rows.len() {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled("Остальные проверенные сайты", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
+            Self::append_rows(&mut lines, width, self.rows.iter().filter(|row| row.selected.is_none()));
+        }
         lines
+    }
+
+    fn append_rows<'a>(lines: &mut Vec<Line<'static>>, width: u16, rows: impl Iterator<Item = &'a ReferenceRow>) {
+        let wide = width >= 96;
+        if wide {
+            lines.push(Line::styled(
+                format!(
+                    "{:<30} {:<25} {:<18} {}",
+                    "Сайт", "Адрес", "TLS / H2 / H3", "Результат"
+                ),
+                Style::default().fg(MUTED),
+            ));
+        }
+        for row in rows {
+            let status = match row.selected {
+                Some(0) => "Основной".into(),
+                Some(index) => format!("Резерв {index}"),
+                None if row.h2 => "Подходит".into(),
+                None if row.address.parse::<std::net::SocketAddr>().is_err() => "Нет адреса".into(),
+                None => "H2 не подтверждён".into(),
+            };
+            let color = if row.selected == Some(0) {
+                ACCENT
+            } else if row.selected.is_some() {
+                ACCENT
+            } else if row.h2 {
+                MUTED
+            } else {
+                ERROR
+            };
+            let transports = format!(
+                "{} TLS {} H2 {} H3",
+                if row.h2 || row.h3 { "✓" } else { "?" },
+                if row.h2 { "✓" } else { "?" },
+                if row.h3 { "✓" } else { "?" }
+            );
+            // Long names and IPv6 addresses must remain visible, not elided.
+            if wide && Span::raw(row.name.as_str()).width() <= 28 && row.address.len() <= 23 && 76 + Span::raw(format!("{status} · {}", row.score)).width() <= usize::from(width) {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:<30} {:<25} ", row.name, row.address),
+                        Style::default().fg(TEXT),
+                    ),
+                    Span::styled(format!("{transports:<18} "), Style::default().fg(MUTED)),
+                    Span::styled(
+                        format!("{status} · {}", row.score),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            } else {
+                append_wrapped(
+                    lines,
+                    &row.name,
+                    width,
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                );
+                append_wrapped(
+                    lines,
+                    &format!("  {}", row.address),
+                    width,
+                    Style::default().fg(MUTED),
+                );
+                append_wrapped(
+                    lines,
+                    &format!("  {transports} · {status} · {}", row.score),
+                    width,
+                    Style::default().fg(color),
+                );
+            }
+        }
+
     }
 }
 
@@ -613,12 +680,9 @@ impl Actions<'_> {
                 } else {
                     Style::default().fg(TEXT)
                 };
-                let shortcut = if item.key == '4' {
-                    "F4".to_owned()
-                } else {
-                    item.key.to_string()
-                };
-                let label = fit_value(item.label, area.width.saturating_sub(9), false);
+                // Named actions are primary. Shortcuts remain available in
+                // F1/F2, not repeated next to every visible action.
+                let label = fit_value(item.label, area.width.saturating_sub(5), false);
                 ListItem::new(Line::from(vec![
                     Span::raw(if active {
                         " › "
@@ -628,10 +692,6 @@ impl Actions<'_> {
                         "   "
                     }),
                     Span::raw(label),
-                    Span::styled(
-                        format!("  {shortcut}"),
-                        Style::default().fg(if active { ACCENT } else { MUTED }),
-                    ),
                 ]))
                 .style(style)
             })
@@ -639,9 +699,9 @@ impl Actions<'_> {
         frame.render_widget(
             List::new(items).block(section(
                 if focused {
-                    " Действия · ↑↓ Enter "
+                    " Действия "
                 } else {
-                    " Действия · Tab "
+                    " Действия "
                 },
                 focused,
             )),
@@ -650,28 +710,41 @@ impl Actions<'_> {
     }
 }
 
+/// Shared confirmation choices: a pointer or an arrow selects, only Enter
+/// dispatches through the owning workflow. Keep the negative choice first.
+pub(crate) fn confirmation_bar(frame: &mut Frame<'_>, area: Rect, heading: &str, error: bool,
+    confirm: &str, selected: bool) {
+    canvas(frame, area);
+    if area.height == 0 { return; }
+    let heading = fit_value(heading, area.width, false);
+    frame.render_widget(Paragraph::new(heading).style(Style::default().fg(if error { ERROR } else { MUTED })),
+        Rect::new(area.x, area.y, area.width, 1));
+    if area.height < 2 { return; }
+    let half = area.width / 2;
+    for (i, (label, x, width)) in [(if matches!(confirm, "Выпустить ключ доступа" | "Открыть пользователей") { "К обзору" } else { "Отменить" }, area.x, half), (confirm, area.x + half, area.width - half)].into_iter().enumerate() {
+        let active = (i == 1) == selected;
+        let shown = fit_value(label, width.saturating_sub(2), false);
+        frame.render_widget(Paragraph::new(format!("{} {shown}", if active { "›" } else { " " }))
+            .style(Style::default().fg(if active { ACCENT } else { TEXT })
+                .bg(if active { FOCUS } else { BG })),
+            Rect::new(x, area.bottom() - 1, width, 1));
+    }
+}
+
 pub(crate) fn action_layout(area: Rect, count: usize) -> Option<[Rect; 2]> {
-    if count == 0 || area.height < 8 {
-        return None;
-    }
-    if area.width >= 104 {
-        let parts = Layout::horizontal([
-            Constraint::Min(44),
-            Constraint::Length((area.width / 3).clamp(42, 64)),
-        ])
-        .split(area);
-        let controls = Rect::new(
-            parts[1].x,
-            parts[1].y,
-            parts[1].width,
-            parts[1].height.min((count as u16).saturating_add(2)),
-        );
-        Some([parts[0], controls])
-    } else {
-        let height = (count as u16).saturating_add(2).min(area.height / 2).max(3);
-        let parts = Layout::vertical([Constraint::Min(4), Constraint::Length(height)]).split(area);
-        Some([parts[0], parts[1]])
-    }
+    action_layout_rows(area, count, 20)
+}
+
+/// Fit actions immediately below the wrapped report, leaving room for
+/// scrolling long reports and selecting every action on compact terminals.
+pub(crate) fn action_layout_rows(area: Rect, count: usize, rows: usize) -> Option<[Rect; 2]> {
+    if count == 0 || area.height < 8 { return None; }
+    let height = (count as u16).saturating_add(2).min(area.height / 2).max(3);
+    let preferred = rows.saturating_add(2).clamp(3, 22) as u16;
+    let content_height = (area.height - height).min(preferred);
+    let report = Rect::new(area.x, area.y, area.width, content_height);
+    let controls = Rect::new(area.x, report.bottom(), area.width, height);
+    Some([report, controls])
 }
 
 pub(crate) fn action_key(
@@ -686,11 +759,11 @@ pub(crate) fn action_key(
     *focus = (*focus).min(items.len() - 1);
     match code {
         KeyCode::Up | KeyCode::BackTab => {
-            *focus = (*focus + items.len() - 1) % items.len();
+            *focus = focus.saturating_sub(1);
             None
         }
         KeyCode::Down | KeyCode::Tab => {
-            *focus = (*focus + 1) % items.len();
+            *focus = (*focus + 1).min(items.len() - 1);
             None
         }
         KeyCode::Home => {
@@ -803,7 +876,14 @@ mod tests {
             },
         ];
         let mut focus = 0;
+        assert_eq!(action_key(&items, &mut focus, KeyCode::Up), None);
+        assert_eq!(focus, 0);
         assert_eq!(action_key(&items, &mut focus, KeyCode::Down), None);
+        assert_eq!(focus, 1);
+        assert_eq!(action_key(&items, &mut focus, KeyCode::End), None);
+        assert_eq!(action_key(&items, &mut focus, KeyCode::Down), None);
+        assert_eq!(focus, 2);
+        assert_eq!(action_key(&items, &mut focus, KeyCode::Up), None);
         assert_eq!(focus, 1);
         assert_eq!(
             action_key(&items, &mut focus, KeyCode::Enter),
@@ -841,7 +921,7 @@ mod tests {
 
     #[test]
     fn reference_review_keeps_rejected_rows_and_long_values_visible() {
-        let review = ReferenceReview {
+        let mut review = ReferenceReview {
             rows: vec![
                 ReferenceRow {
                     name: "example.org".into(),
@@ -870,6 +950,7 @@ mod tests {
             ],
             details: vec![("TOML", "a".repeat(150))],
             note: "Сервер не запускается.".into(),
+            expanded: true,
         };
         for width in [32, 80, 120] {
             let lines = review.lines(width);
@@ -883,7 +964,7 @@ mod tests {
                 "example.org",
                 "Основной",
                 "Резерв 1",
-                "Исключён",
+                "H2 не подтверждён",
                 "100",
                 "80",
                 "Сервер не запускается.",
@@ -891,7 +972,13 @@ mod tests {
                 assert!(text.contains(expected), "{expected}");
             }
             assert!(text.contains(&"a".repeat(150)));
+            assert!(text.find("Сервер не запускается.").unwrap() < text.find("failed.example.org").unwrap());
+            assert!(text.find("Конфигурация к сохранению").unwrap() < text.find("failed.example.org").unwrap());
         }
+        review.expanded = false;
+        let compact = review.lines(120).iter().flat_map(|line| line.spans.iter()).map(|span| span.content.as_ref()).collect::<String>();
+        assert!(compact.contains("Основной") && compact.contains("F2:"));
+        assert!(!compact.contains("failed.example.org") && !compact.contains("Конфигурация к сохранению"));
     }
 
     #[test]
@@ -946,6 +1033,33 @@ mod tests {
             assert!(!screen.contains("┌") && !screen.contains("┐"));
             assert!(buffer.content().iter().all(|c| c.bg != Color::Cyan));
         }
+    }
+
+    #[test]
+    fn source_choice_rows_are_not_text_inputs_and_examples_are_visible() {
+        let area = Rect::new(0, 0, 108, 22);
+        let form = Form {
+            fields: vec![
+                Field { id: 8, label: "[x] Готовый каталог сайтов", value: "71 домен".into(), hint: "Пробел — выключить." },
+                Field { id: 9, label: "[ ] Добавить свои сайты", value: "Необязательно".into(), hint: "Пробел — включить." },
+                Field { id: 4, label: "Свои сайты", value: String::new(), hint: "Пример: example.org · Имена через запятую." },
+                Field { id: 5, label: "› Пользователи с доступом", value: "Никто не выбран".into(), hint: "Пробел — открыть список." },
+            ],
+            selected: 8,
+            lead: String::new(),
+            error: String::new(),
+        };
+        let geometry = form.geometry(area);
+        assert!(geometry.help.height < geometry.rows.height);
+        assert_eq!(form.hit(area, geometry.rows.x, geometry.rows.y), Some(8));
+        let mut terminal = Terminal::new(TestBackend::new(108, 22)).unwrap();
+        terminal.draw(|frame| form.render(frame, area, "")).unwrap();
+        let screen = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect::<String>();
+        assert!(screen.contains("☑"));
+        assert!(screen.contains("☐"));
+        assert!(screen.contains("example.org"));
+        assert!(screen.contains("› Пользователи с доступом"));
+        assert!(!screen.contains("▏"));
     }
 
     #[test]

@@ -147,6 +147,14 @@ impl DiscoveryPanel {
         }
     }
 
+    pub(crate) fn report_actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
+        use crate::tui_widgets::ActionItem;
+        if !self.may_review_probe() { return Vec::new(); }
+        vec![ActionItem { key: 'i', label: "Узнать внешний IP" },
+            ActionItem { key: 'r', label: "Посмотреть области поиска" },
+            ActionItem { key: 't', label: "Проверить назначенный IP" }]
+    }
+
     pub(crate) fn body(&self) -> String {
         let egress = match &self.phase {
             Phase::Complete(Ok(report)) => Some(report),
@@ -172,12 +180,12 @@ impl DiscoveryPanel {
         match &self.phase {
             Phase::Passive => {
                 body.push_str(&format!(
-                    "\nСервис по умолчанию: {DEFAULT_EGRESS_SERVICE_URL}\nЗапрос пока НЕ отправлялся.\n\ni: внешний IP ipify  r: группы/CIDR офлайн  t: один TLS/H2 IP  Esc: назад"
+                    "\nСервис по умолчанию: {DEFAULT_EGRESS_SERVICE_URL}\nЗапрос пока НЕ отправлялся."
                 ));
             }
             Phase::Confirm => {
                 body.push_str(&format!(
-                    "\nСОГЛАСИЕ НА ВНЕШНИЙ ЗАПРОС\n\nTheia обратится к {DEFAULT_EGRESS_SERVICE_URL}\nDNS и HTTPS передадут сведения о подключении стороннему сервису.\nСервис увидит ваш публичный исходящий IP.\nОдно обращение, до 5 секунд, только TLS 1.3 с проверкой сертификата.\nСканирование подсети НЕ будет запущено.\n\ny: согласиться и выполнить запрос\nn: отказаться, остаться в пассивном режиме\nEsc: закрыть панель"
+                    "\nСОГЛАСИЕ НА ВНЕШНИЙ ЗАПРОС\n\nTheia обратится к {DEFAULT_EGRESS_SERVICE_URL}\nDNS и HTTPS передадут сведения о подключении стороннему сервису.\nСервис увидит ваш публичный исходящий IP.\nОдно обращение, до 5 секунд, только TLS 1.3 с проверкой сертификата.\nСканирование подсети НЕ будет запущено."
                 ));
             }
             Phase::Running { .. } => body.push_str(
@@ -185,7 +193,7 @@ impl DiscoveryPanel {
             ),
             Phase::Complete(Ok(report)) => {
                 body.push_str(&format!(
-                    "\nВнешний IP по утверждению ipify: {}\nTLS-проверка сертификата пройдена. Время: локальное наблюдение.\nРезультат не является разрешением активного сканирования.\n\ni: повторить ipify  r: группы/CIDR офлайн  t: TLS/H2 своего IP  Esc: назад",
+                    "\nВнешний IP по утверждению ipify: {}\nTLS-проверка сертификата пройдена. Время: локальное наблюдение.\nРезультат не является разрешением активного сканирования.",
                     report.ip()
                 ));
             }
@@ -201,7 +209,7 @@ impl DiscoveryPanel {
                     EgressError::UnusableAddress => "сервис вернул непригодный IP",
                 };
                 body.push_str(&format!(
-                    "\nОпределение внешнего IP НЕ удалось: {description}.\nНет подтверждённого нового адреса.\n\ni: повторить ipify  r: группы/CIDR офлайн  t: TLS/H2 своего IP  Esc: назад"
+                    "\nОпределение внешнего IP НЕ удалось: {description}.\nНет подтверждённого нового адреса."
                 ));
             }
         }
@@ -225,7 +233,7 @@ mod tests {
         let body = p.body();
         assert!(matches!(p.phase, Phase::Passive));
         assert!(body.contains("Пассивный"));
-        assert!(body.contains("14"));
+        assert!(body.contains(&POPULAR_HTTPS_DOMAINS.len().to_string()));
         assert!(body.contains(DEFAULT_EGRESS_SERVICE_URL));
         assert!(body.contains("Запрос пока НЕ отправлялся."));
         assert!(!p.is_consent_pending());

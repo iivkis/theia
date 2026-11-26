@@ -626,7 +626,7 @@ pub fn validate_client(profile: &Profile, now: u64) -> Result<crate::descriptor:
 pub fn registered_status(path: &Path, id: &str, now: u64) -> Result<String, Error> {
     path_string(path)?;
     let document = config::read_file(path).map_err(|_| Error::Format)?;
-    status_document(&document, id, now)
+    status_document(&document, id, now).map(|(_, details)| details)
 }
 
 /// Render from the exact saved configuration bytes selected by the editor.
@@ -636,16 +636,42 @@ pub(crate) fn status_expected(
     expected: [u8; 32],
     id: &str,
     now: u64,
-) -> Result<String, Error> {
+) -> Result<(String, String), Error> {
+    let document = status_saved_document(path, expected)?;
+    status_document(&document, id, now)
+}
+
+fn status_saved_document(path: &Path, expected: [u8; 32]) -> Result<Config, Error> {
     path_string(path)?;
     let raw = config::editor_bytes(path).map_err(|_| Error::Storage)?;
     let actual: [u8; 32] = Sha256::digest(&raw).into();
     if actual != expected {
         return Err(Error::Approval);
     }
-    let document = config::parse(std::str::from_utf8(&raw).map_err(|_| Error::Format)?)
-        .map_err(|_| Error::Format)?;
-    status_document(&document, id, now)
+    config::parse(std::str::from_utf8(&raw).map_err(|_| Error::Format)?)
+        .map_err(|_| Error::Format)
+}
+
+/// Human-facing status; the diagnostic CLI report remains unchanged.
+pub(crate) fn client_status_expected(
+    path: &Path, expected: [u8; 32], id: &str, now: u64,
+) -> Result<String, Error> {
+    let Config::Client(doc) = status_saved_document(path, expected)? else {
+        return Err(Error::Format);
+    };
+    let profile = doc.client.profiles.iter().find(|p| p.id == id).ok_or(Error::Scope)?;
+    let enrollment = pinned_client(profile)?;
+    let value = enrollment.store()?.inspect(now).map_err(|_| Error::Descriptor)?;
+    let modes = value.effective_modes();
+    let yes = |v| if v { "доступен" } else { "недоступен" };
+    let valid = value.check_time(now).is_ok();
+    Ok(format!(
+        "Сервер: {}\nЗащита: REALITY\nПрофиль выбран для запуска: {}\nРежим передачи: автоматически\nОписание сервера: версия {} · {}\nПоддержка: H2 {}, H3 {}\nРежимы XHTTP: stream-one {}, stream-up {}\n{}\nСвязь с сервером пока не проверена этим экраном.",
+        profile.server, if doc.client.active_profile == id { "да" } else { "нет" },
+        value.descriptor().revision, if valid { "актуально" } else { "не действует сейчас" },
+        yes(modes.h2), yes(modes.h3), yes(modes.stream_one), yes(modes.stream_up),
+        if valid { "Можно перейти к проверке при запуске." } else { "Требуется восстановить доверие через администратора." }
+    ))
 }
 
 fn exact_client_record(path: &Path, expected: [u8; 32], id: &str) -> Result<Profile, Error> {
@@ -795,7 +821,7 @@ pub(crate) fn registered_invitation(
     let state = reference_health::Store::new(Path::new(&binding.health_store))
         .and_then(|s| s.inspect())
         .map_err(|_| Error::Health)?;
-    let (publication, _admission) = crate::reality_provision::capture_registered(
+    let (publication, admission) = crate::reality_provision::capture_registered(
         Path::new(&binding.bundle),
         binding,
         &state,
@@ -818,6 +844,7 @@ pub(crate) fn registered_invitation(
             document,
             user,
             bearer,
+            &admission,
             now,
         ),
         None => bootstrap::Invitation::public(material.identity(), material.signed(), now),
@@ -1041,7 +1068,7 @@ impl RotationReview {
     }
 }
 
-fn status_document(document: &Config, id: &str, now: u64) -> Result<String, Error> {
+fn status_document(document: &Config, id: &str, now: u64) -> Result<(String, String), Error> {
     match document {
         Config::Server(doc) => {
             let inbound = doc
@@ -1074,11 +1101,30 @@ fn status_document(document: &Config, id: &str, now: u64) -> Result<String, Erro
                 .active_status(value.descriptor(), now)
                 .map_err(|_| Error::Health)?;
             let signed = value.descriptor();
-            Ok(format!("Saved REALITY inbound; live state not inspected\ninbound={id}\nendpoint={}\nrevision={}\nidentity_sha256={}\nvalid_now={}\nactive_reference={}\nactive_status={health:?}\nreserve_candidate={}\nlast_checked_at={}\nnext_check_at={}\nh3={}\nbackend_available=true",
+            use reference_health::PrimaryStatus;
+            let health_text = match health {
+                PrimaryStatus::Healthy => "доступен по последней проверке",
+                PrimaryStatus::Suspect => "требуется повторная проверка",
+                PrimaryStatus::Degraded => "работает с ограничениями",
+                PrimaryStatus::Unavailable => "недоступен",
+                PrimaryStatus::Stale => "данные проверки устарели",
+            };
+            let valid = value.check_time(now).is_ok();
+            let checked = state.last_checked_at();
+            let next = state.next_active_check_at(signed, now).map_err(|_| Error::Health)?;
+            let brief = format!("Сервер: {}\nЗащита: REALITY\nОсновной референс: {} · {health_text}\nРезерв: {}\nОписание сервера: версия {} · {}\nПоследняя проверка: {} сек. назад · следующая {}\n{}",
+                scope.endpoint, signed.references[usize::from(signed.active_reference)].server_name,
+                if reserve.is_some() { "есть подходящий кандидат" } else { "нет подходящего кандидата" },
+                signed.revision, if valid { "актуально" } else { "не действует сейчас" },
+                now.saturating_sub(checked),
+                if next <= now { "уже требуется".to_owned() } else { format!("через {} сек.", next - now) },
+                if valid { "Состояние работающего сервера проверяется отдельно." } else { "Требуется восстановить доверие перед запуском." });
+            let details = format!("Saved REALITY inbound; live state not inspected\ninbound={id}\nendpoint={}\nrevision={}\nidentity_sha256={}\nvalid_now={}\nactive_reference={}\nactive_status={health:?}\nreserve_candidate={}\nlast_checked_at={}\nnext_check_at={}\nh3={}\nbackend_available=true",
                 scope.endpoint, signed.revision, hex(bootstrap::fingerprint(value.signer())),
                 value.check_time(now).is_ok(), signed.references[usize::from(signed.active_reference)].server_name,
                 reserve.map_or("none".into(), |i| i.to_string()), state.last_checked_at(),
-                state.next_active_check_at(signed, now).map_err(|_| Error::Health)?, signed.h3))
+                next, signed.h3);
+            Ok((brief, details))
         }
         Config::Client(doc) => {
             let profile = doc
@@ -1094,10 +1140,12 @@ fn status_document(document: &Config, id: &str, now: u64) -> Result<String, Erro
                 .map_err(|_| Error::Descriptor)?;
             let modes = value.effective_modes();
             let valid = value.check_time(now).is_ok();
-            Ok(format!("Saved REALITY profile; live state not inspected\nprofile={id}\nactive_profile={}\nrevision={}\nidentity_sha256={}\nvalid_now={valid}\nrequired_action={}\nh2={}\nh3={}\nstream_one={}\nstream_up={}\nbackend_available=true",
+            let brief = format!("Сервер: {}\nЗащита: REALITY\nОписание сервера: версия {} · {}\nСвязь с сервером не проверена.", profile.server, value.descriptor().revision, if valid { "актуально" } else { "не действует сейчас" });
+            let details = format!("Saved REALITY profile; live state not inspected\nprofile={id}\nactive_profile={}\nrevision={}\nidentity_sha256={}\nvalid_now={valid}\nrequired_action={}\nh2={}\nh3={}\nstream_one={}\nstream_up={}\nbackend_available=true",
                 doc.client.active_profile == id, value.descriptor().revision, hex(bootstrap::fingerprint(value.signer())),
                 if valid { "ready-for-startup-preflight" } else { "authenticated-offline-recovery" },
-                modes.h2, modes.h3, modes.stream_one, modes.stream_up))
+                modes.h2, modes.h3, modes.stream_one, modes.stream_up);
+            Ok((brief, details))
         }
     }
 }
@@ -1210,7 +1258,7 @@ mod tests {
         let status = registered_status(&path, "reality-edge", 1000).unwrap();
         let saved_digest: [u8; 32] = Sha256::digest(std::fs::read(&path).unwrap()).into();
         assert_eq!(
-            status_expected(&path, saved_digest, "reality-edge", 1000).unwrap(),
+            status_expected(&path, saved_digest, "reality-edge", 1000).unwrap().1,
             status
         );
         assert_eq!(
@@ -1219,6 +1267,9 @@ mod tests {
         );
         assert!(status.contains("backend_available=true"));
         assert!(status.contains("active_reference=ref.example.org"));
+        let (brief, _) = status_expected(&path, saved_digest, "reality-edge", 1000).unwrap();
+        assert!(brief.contains("Основной референс: ref.example.org"));
+        assert!(!brief.contains("identity_sha256"));
         // Compatible renewal advances publication without rewriting the
         // independently pinned initial receipt or the config record.
         let binding = inbound.reality.as_ref().unwrap();
@@ -1477,8 +1528,21 @@ mod tests {
         server.server.users[0].disabled = false;
         server.server.inbounds[0].allowed_user_ids = vec![user.clone()];
         let issued =
-            bootstrap::Invitation::issued(&identity, &signed, &server, &user, &token, 1000)
+            bootstrap::Invitation::issued(&identity, &signed, &server, &user, &token,
+                &Secret::load(&scope, &admission).unwrap(), 1000)
                 .unwrap();
+        // Credential-only refresh must not silently ignore a different
+        // admission key, even with the exact same signer, scope and bearer.
+        let different = Secret::generate().unwrap();
+        let wrong_admission = bootstrap::Invitation::issued(
+            &identity, &signed, &server, &user, &token, &different, 1000,
+        )
+        .unwrap();
+        std::fs::write(&invite_path, wrong_admission.encode().unwrap().as_bytes()).unwrap();
+        assert!(preview_credential_refresh(&client, "reality-client", &invite_path, 1000).is_err());
+        assert_eq!(std::fs::read(&client).unwrap(), before);
+        assert_eq!(std::fs::read(&enrollment).unwrap(), old_enrollment);
+        assert_eq!(std::fs::read(&trust).unwrap(), before_trust);
         std::fs::write(&invite_path, issued.encode().unwrap().as_bytes()).unwrap();
         let (approval, revision) =
             preview_credential_refresh(&client, "reality-client", &invite_path, 1000).unwrap();

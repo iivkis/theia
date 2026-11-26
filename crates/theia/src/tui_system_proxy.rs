@@ -528,6 +528,10 @@ impl Panel {
         false
     }
 
+    pub(crate) fn confirmation_choice(&self) -> Option<(char, &'static str)> {
+        (!self.unavailable && self.phase == Phase::Confirm).then_some(('y', "Подтвердить"))
+    }
+
     pub(crate) fn actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
         use crate::tui_widgets::ActionItem;
         if self.unavailable || self.phase == Phase::Busy {

@@ -200,19 +200,27 @@ impl Menu {
         let count = self.count();
         self.notice = None;
         let next = match key {
-            KeyCode::Esc | KeyCode::Left | KeyCode::Backspace | KeyCode::F(10) => {
+            KeyCode::Left => {
+                self.item = None;
+                return None;
+            }
+            KeyCode::Esc | KeyCode::Backspace | KeyCode::F(10) => {
                 if self.item.take().is_none() || key == KeyCode::F(10) {
                     return Some(Action::Close);
                 }
                 return None;
             }
-            KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => (selected + count - 1) % count,
-            KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => (selected + 1) % count,
+            KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => (selected + 1).min(count - 1),
             KeyCode::Home => 0,
             KeyCode::End => count - 1,
             KeyCode::PageUp => selected.saturating_sub(5),
             KeyCode::PageDown => (selected + 5).min(count - 1),
-            KeyCode::Enter | KeyCode::Right => {
+            KeyCode::Right => {
+                if self.item.is_none() { self.item = Some(0); }
+                return None;
+            }
+            KeyCode::Enter => {
                 if let Some(item) = self.item {
                     let e = self.groups()[self.group].entries[item];
                     if e.requires_config && !self.configured {
@@ -439,9 +447,9 @@ impl Menu {
             self.item.is_some(),
         );
         let hint = self.notice.unwrap_or(if self.item.is_none() {
-            "↑↓ раздел  ·  Enter/→ действия  ·  Esc редактор"
+            "↑ ↓ выбор · → действия · Enter открыть · Esc назад"
         } else {
-            "↑↓ действие  ·  Enter открыть  ·  ←/Esc разделы  ·  F10 редактор"
+            "↑ ↓ выбор · ← разделы · Enter открыть · Esc назад"
         });
         frame.render_widget(
             Paragraph::new(tui_widgets::key_line(hint))
@@ -708,11 +716,19 @@ impl FirstInvite {
         }
         let value = value.trim_end_matches(['\r', '\n']);
         if value.chars().any(char::is_control) {
+            if self.own.is_none() {
+                self.source = Zeroizing::new(String::new());
+            }
+            self.error = Some("Ввод содержит недопустимые символы. Вставьте значение целиком.");
             return;
         }
         if self.own.is_none() {
             if self.source.len().saturating_add(value.len()) <= crate::invite::MAX_URI {
                 self.source.push_str(value);
+                self.error = None;
+            } else {
+                self.source = Zeroizing::new(String::new());
+                self.error = Some("Ключ слишком длинный. Вставьте его целиком или запросите новый.");
             }
         } else {
             let field = if self.focus == 0 {
@@ -829,7 +845,7 @@ impl FirstInvite {
         }
         if self.review {
             if let Some(invite) = &self.own {
-                return format!("Тип: собственный TLS\nПрофиль: {}\nСервер: {}\nИмя TLS: {}\nДоверенный сертификат выбран и проверен локально.\nЛичный ключ будет сохранён защищённо; публичное приглашение использует указанную ссылку.\n\nФайл настроек: {path}\nСоздаётся первый активный профиль. Соединение и системный прокси не запускаются.", invite.id, invite.endpoint, invite.server_name);
+                return format!("Тип: собственный TLS\nПрофиль: {}\nСервер: {}\nИмя TLS: {}\nДоверенный сертификат выбран и проверен локально.\n{credential}\n\nФайл настроек: {path}\nСоздаётся первый активный профиль. Соединение и системный прокси не запускаются.", invite.id, invite.endpoint, invite.server_name, credential = if invite.has_token() { "Личный ключ будет сохранён в защищённом хранилище." } else { "Будет использована указанная ссылка на отдельный ключ." });
             }
         }
         String::new()
@@ -1082,6 +1098,22 @@ impl ConfigDialog {
             self.input.push_str(text);
         }
     }
+    pub(crate) fn confirmation_choice(&self) -> Option<(char, &'static str)> {
+        if self.loading.is_some() || self.browser.is_some() { return None; }
+        if let Some(panel) = &self.first_invite {
+            return (panel.review && panel.browser.is_none() && panel.reading.is_none()).then_some(('y', "Сохранить профиль"));
+        }
+        if let Some(panel) = &self.reality { return panel.confirmation_choice(); }
+        if let Some(panel) = &self.enrollment { return panel.confirmation_choice(); }
+        self.setup.as_ref().filter(|s| s.review.is_some()).map(|_| ('y', "Создать настройки"))
+    }
+
+    pub(crate) fn reality_success_first_user(&self) -> Option<&str> { self.reality.as_ref().and_then(|p| p.success_first_user()) }
+
+    pub(crate) fn reality_succeeded(&self) -> bool {
+        self.reality.as_ref().is_some_and(|p| p.succeeded())
+    }
+
     pub(crate) fn key(&mut self, key: KeyEvent) -> bool {
         if self.loading.is_some() {
             return false;
@@ -1128,8 +1160,10 @@ impl ConfigDialog {
             return false;
         }
         if let Some(panel) = self.reality.as_mut() {
+            let succeeded = panel.succeeded();
             if panel.key(key) {
                 self.reality = None;
+                return succeeded;
             }
             return false;
         }
@@ -2032,7 +2066,11 @@ mod tests {
     #[test]
     fn opens_existing_actions_without_requiring_shortcuts() {
         let mut m = Menu::new(Role::Server, true);
-        assert_eq!(m.key(KeyCode::Enter), None);
+        assert_eq!(m.key(KeyCode::Left), None);
+        assert!(m.item.is_none());
+        assert_eq!(m.key(KeyCode::Right), None);
+        assert_eq!(m.item, Some(0));
+        assert_eq!(m.key(KeyCode::Right), None);
         assert_eq!(m.key(KeyCode::Enter), Some(Action::ServerProcess));
         assert_eq!(m.key(KeyCode::Down), None);
         assert_eq!(m.key(KeyCode::Enter), Some(key('v')));

@@ -307,6 +307,14 @@ impl CandidateBatchPanel {
             self.cursor = id;
         }
     }
+    pub(crate) fn report_actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
+        use crate::tui_widgets::ActionItem;
+        if !matches!(self.state, BatchState::Complete(Ok(_))) { return Vec::new(); }
+        vec![ActionItem { key: 'a', label: "Подробности результата" },
+            ActionItem { key: 'k', label: "Предыдущий результат" },
+            ActionItem { key: 'j', label: "Следующий результат" }]
+    }
+
     pub(crate) fn body(&self) -> String {
         let mut out =
             String::from("F-18: выбранные вручную IP из offline-плана, H2 + H3 (без DNS)\n\n");
@@ -354,7 +362,7 @@ impl CandidateBatchPanel {
                     out.push_str(&format!("  {ip}:443  TCP/H2 + UDP/H3\n"));
                 }
                 out.push_str(&format!(
-                    "\nSNI/SAN: {}\nМаксимум 8 IP, 2 одновременно, 5с/цель и 20с/набор.\nПроверяются только TCP/TLS1.3/h2 и UDP/QUIC/TLS1.3/h3.\nПодтверждая y, оператор заявляет проверенные права на КАЖДЫЙ IP.\nСоседи, не отмеченные Space, не проверяются.\nЭто НЕ доказательство владения и НЕ REALITY-ready.\n\ny: разрешить все показанные точные проверки\nn: отказаться  Esc: вернуться к выбору",
+                    "\nSNI/SAN: {}\nМаксимум 8 IP, 2 одновременно, 5с/цель и 20с/набор.\nПроверяются только TCP/TLS1.3/h2 и UDP/QUIC/TLS1.3/h3.\nПодтверждая y, оператор заявляет проверенные права на КАЖДЫЙ IP.\nСоседи, не отмеченные Space, не проверяются.\nЭто НЕ доказательство владения и НЕ REALITY-ready.",
                     self.server_name.as_deref().unwrap_or("нет"),
                 ));
             }
@@ -432,7 +440,7 @@ impl CandidateBatchPanel {
                     }
                 }
                 out.push_str(
-                    "\nREALITY: НЕ готов. Fingerprint, HTTP/3 semantics, server identity и anti-DPI не проверены.\nScore не является вероятностью обхода DPI. Нет Apply/сохранения/автоподбора.\nj/k: выбрать результат; a: шаг 2 (просмотр). Esc: вернуться",
+                    "\nREALITY: НЕ готов. Fingerprint, HTTP/3 semantics, server identity и anti-DPI не проверены.\nScore не является вероятностью обхода DPI. Нет Apply/сохранения/автоподбора.",
                 );
             }
         }

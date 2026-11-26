@@ -26,6 +26,9 @@ use tokio_rustls::TlsConnector;
 pub const MAX_PLAN: usize = 16 * 1024;
 const MAX_STATE: usize = 64 * 1024;
 const MAX_REFERENCES: usize = 3;
+pub(crate) const MAX_SEARCH_TARGETS: usize = 112;
+const SEARCH_PARALLELISM: usize = 6;
+const SEARCH_DEADLINE: Duration = Duration::from_secs(600);
 const MAX_OWN_IPS: usize = 64;
 const MAX_DNS_ANSWERS: usize = 64;
 const ATTEMPT: Duration = Duration::from_secs(5);
@@ -98,11 +101,15 @@ impl Plan {
     }
 
     fn validate(&self) -> Result<(), Error> {
+        self.validate_scope(MAX_REFERENCES, false)
+    }
+
+    fn validate_scope(&self, limit: usize, allow_shared_pins: bool) -> Result<(), Error> {
         if self.schema_version != 1
             || !config::valid_id(&self.inbound)
             || !config::valid_remote(&self.endpoint)
             || !(1..=MAX_OWN_IPS).contains(&self.own_ips.len())
-            || !(1..=MAX_REFERENCES).contains(&self.references.len())
+            || !(1..=limit).contains(&self.references.len())
         {
             return Err(Error::Format);
         }
@@ -120,6 +127,7 @@ impl Plan {
         }
         let mut names = HashSet::new();
         let mut pins = HashSet::new();
+        let mut pairs = HashSet::new();
         for target in &self.references {
             if crate::camouflage_domain_dns::validate_manual_dns_request(
                 &target.server_name,
@@ -128,8 +136,8 @@ impl Plan {
             .is_err()
                 || target.address.port() != 443
                 || !public_address(target.address.ip())
-                || !names.insert(&target.server_name)
-                || !pins.insert(target.address)
+                || !pairs.insert((&target.server_name, target.address))
+                || (!allow_shared_pins && (!names.insert(&target.server_name) || !pins.insert(target.address)))
             {
                 return Err(Error::Format);
             }
@@ -151,6 +159,10 @@ impl Plan {
     /// Explicit preview only; public names and addresses are not credentials.
     pub fn preview(&self) -> Result<String, Error> {
         self.validate()?;
+        Ok(self.preview_targets())
+    }
+
+    fn preview_targets(&self) -> String {
         let mut out = format!(
             "Reference plan; no network, no runtime Apply\ninbound={}\nendpoint={}",
             self.inbound, self.endpoint
@@ -162,7 +174,26 @@ impl Plan {
             ));
         }
         out.push_str("\nConsent covers inbound endpoint DNS, reference DNS and two HTTPS HEAD / attempts on each exact pin, H2 and H3; no redirects, bearer or request body.");
-        Ok(out)
+        out
+    }
+}
+
+/// Ephemeral search inventory, never a persistent health State.
+pub(crate) struct SearchPlan(Plan);
+impl SearchPlan {
+    pub(crate) fn new(plan: Plan) -> Result<Self, Error> {
+        plan.validate_scope(MAX_SEARCH_TARGETS, true)?;
+        Ok(Self(plan))
+    }
+    pub(crate) fn targets(&self) -> &[Target] { &self.0.references }
+    pub(crate) fn into_targets(self) -> Vec<Target> { self.0.references }
+    pub(crate) fn digest(&self) -> Result<[u8; 32], Error> {
+        self.0.validate_scope(MAX_SEARCH_TARGETS, true)?;
+        let raw = toml::to_string(&self.0).map_err(|_| Error::Format)?;
+        let mut hash = Sha256::new();
+        hash.update(b"theia-reference-search-v1\0");
+        hash.update(raw.as_bytes());
+        Ok(hash.finalize().into())
     }
 }
 
@@ -480,6 +511,49 @@ pub async fn check(plan: &Plan, approved: [u8; 32]) -> Result<Vec<Evidence>, Err
     })
     .await
     .map_err(|_| Error::Timeout)?
+}
+
+/// Same strict health evaluator with a separately bounded search inventory.
+/// Exact pins and fresh DNS remain mandatory for every candidate.
+pub(crate) async fn check_search(
+    search: &SearchPlan,
+    approved: [u8; 32],
+    progress: &std::sync::atomic::AtomicUsize,
+) -> Result<Vec<Evidence>, Error> {
+    if search.digest()? != approved { return Err(Error::Approval); }
+    let mut roots = RootCertStore::empty();
+    roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+    if roots.is_empty() { return Err(Error::NoRoots); }
+    let roots = Arc::new(roots);
+    let own = own_addresses(&search.0)?;
+    let mut context = search.0.clone();
+    context.references.clear();
+    let own = Arc::new(extend_endpoint_addresses(&context, own).await?);
+    timeout(SEARCH_DEADLINE, async {
+        let _permit = ACTIVE.acquire().await.map_err(|_| Error::Timeout)?;
+        let mut results = vec![Evidence::default(); search.targets().len()];
+        for (batch, group) in search.targets().chunks(SEARCH_PARALLELISM).enumerate() {
+            let mut tasks = tokio::task::JoinSet::new();
+            for (offset, target) in group.iter().cloned().enumerate() {
+                let roots = Arc::clone(&roots);
+                let own = Arc::clone(&own);
+                tasks.spawn(async move {
+                    let evidence = if own.contains(&normalize(target.address.ip())) {
+                        Evidence::default()
+                    } else {
+                        check_target(&target, &roots, &own).await
+                    };
+                    (batch * SEARCH_PARALLELISM + offset, evidence)
+                });
+            }
+            while let Some(result) = tasks.join_next().await {
+                let (index, evidence) = result.map_err(|_| Error::Timeout)?;
+                results[index] = evidence;
+                progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        Ok(results)
+    }).await.map_err(|_| Error::Timeout)?
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
