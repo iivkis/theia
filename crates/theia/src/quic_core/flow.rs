@@ -80,7 +80,7 @@ impl ReceiveFlow {
     }
 
     pub(crate) fn can_open_local_bidi(&self) -> bool {
-        self.streams.keys().filter(|id| **id & 1 != self.peer_bit && !self.retired.contains(id)).count() < self.max_local_bidi as usize
+        self.streams.keys().filter(|id| **id & 1 != self.peer_bit && !self.retired.contains(*id)).count() < self.max_local_bidi as usize
     }
 
     pub fn register_local_bidi(&mut self, id: u64) -> Result<(), Error> {
@@ -211,6 +211,11 @@ impl ReceiveFlow {
         self.check_id(id)
     }
 
+    pub(crate) fn abandon(&mut self, id: u64) -> Result<(), Error> {
+        self.streams.get_mut(&id).ok_or(Error::StreamId)?.abandon();
+        Ok(())
+    }
+
     pub fn read(&mut self, id: u64, output: &mut [u8]) -> Result<usize, Error> {
         let stream = self.streams.get_mut(&id).ok_or(Error::StreamId)?;
         if let Some(code) = stream.reset_code() {
@@ -300,7 +305,11 @@ mod tests {
         assert_eq!(f.retire(6), Some((Some(3), Some(24))));
         assert_eq!(f.retire(6), None);
         assert!(f.peer_streams().is_empty());
-        f.insert(10, 0, b"x", true).unwrap();
+        f.insert(10, 0, b"x", false).unwrap();
+        f.abandon(10).unwrap();
+        assert_eq!(f.retire(10), None);
+        f.insert(10, 3, b"z", true).unwrap();
+        assert_eq!(f.retire(10), Some((Some(4), Some(28))));
     }
     #[test]
     fn reset_charges_final_size_once_and_discards_buffer() {

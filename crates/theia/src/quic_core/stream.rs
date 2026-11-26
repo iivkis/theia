@@ -20,6 +20,7 @@ pub struct ReceiveBuffer {
     highest: u64,
     final_size: Option<u64>,
     reset_code: Option<u64>,
+    abandoned: bool,
     bytes: VecDeque<Option<u8>>,
 }
 
@@ -35,6 +36,7 @@ impl ReceiveBuffer {
             highest: 0,
             final_size: None,
             reset_code: None,
+            abandoned: false,
             bytes: VecDeque::new(),
         })
     }
@@ -65,6 +67,11 @@ impl ReceiveBuffer {
             return Err(ReceiveError::FinalSize);
         }
         if self.reset_code.is_some() {
+            return Ok(());
+        }
+        if self.abandoned {
+            self.highest = self.highest.max(end);
+            if fin { self.final_size = Some(end); }
             return Ok(());
         }
         if end.saturating_sub(self.read_offset) > self.window as u64 {
@@ -122,8 +129,13 @@ impl ReceiveBuffer {
 
     /// Terminal metadata remains available to validate late duplicates, but
     /// the reassembly allocation and unread reset credit can be released.
+    pub(crate) fn abandon(&mut self) {
+        self.abandoned = true;
+        self.bytes = VecDeque::new();
+    }
+
     pub(crate) fn release_terminal(&mut self) -> Option<u64> {
-        if !self.finished() && self.reset_code.is_none() { return None; }
+        if !self.finished() && self.reset_code.is_none() && !(self.abandoned && self.final_size.is_some()) { return None; }
         let released = self.highest.saturating_sub(self.read_offset);
         self.read_offset = self.highest;
         self.bytes = VecDeque::new();

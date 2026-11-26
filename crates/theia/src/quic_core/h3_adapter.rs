@@ -110,6 +110,7 @@ struct State {
     bidi_waker: Option<Waker>,
     error: Option<CE>,
     close: Option<u64>,
+    cursor: Option<u64>,
 }
 
 fn wake(slot: &mut Option<Waker>, wakes: &mut Vec<Waker>) {
@@ -205,7 +206,14 @@ fn progress(
             }
         }
     }
-    for (&id, s) in &mut state.streams {
+    let mut ids: Vec<_> = state.streams.keys().copied().collect();
+    if let Some(cursor) = state.cursor {
+        let pivot = ids.partition_point(|id| *id <= cursor);
+        ids.rotate_left(pivot);
+    }
+    state.cursor = ids.first().copied();
+    for id in ids {
+        let s = state.streams.get_mut(&id).expect("known stream");
         if s.retired { continue; }
         if s.tx && !s.reset_sent {
             if let Some(code) = session.send_reset_code(id) {
@@ -289,6 +297,8 @@ fn progress(
             s.retired = true;
             s.outgoing = None;
             s.incoming = None;
+            s.send_waker = None;
+            s.recv_waker = None;
         }
     }
     Ok(())
@@ -418,6 +428,26 @@ pub struct Opener {
 impl Clone for Opener {
     fn clone(&self) -> Self {
         Self::new(self.shared.clone())
+    }
+}
+
+impl Drop for Opener {
+    fn drop(&mut self) {
+        // If a completed open was never polled by its caller, ownership
+        // never reached a stream handle. Cancel that stream exactly once.
+        for pending in [&mut self.uni, &mut self.bidi] {
+            if let Some(mut pending) = pending.take() {
+                pending.close();
+                if let Ok(Ok(id)) = pending.try_recv() {
+                    if let Some(s) = self.shared.lock().expect("bridge mutex").streams.get_mut(&id) {
+                        s.reset = Some(CANCEL);
+                        s.send_dropped = true;
+                        if s.rx { s.stop = Some(CANCEL); s.recv_dropped = true; }
+                    }
+                }
+            }
+        }
+        self.shared.ready.notify_one();
     }
 }
 

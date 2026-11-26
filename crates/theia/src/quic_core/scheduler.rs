@@ -126,7 +126,7 @@ impl Scheduler {
         });
         self.aliases.retain(|_, id| self.frames.contains_key(id));
         self.queue.retain(|id| self.frames.contains_key(id));
-        if self.frames.is_empty() {
+        if self.frames.is_empty() && self.ledger.bytes_in_flight() == 0 {
             self.last_eliciting = None;
         }
     }
@@ -135,7 +135,7 @@ impl Scheduler {
     /// congestion window; ordinary sends remain paced and window-limited.
     pub fn candidate(&mut self, now: Instant) -> Result<Option<(u64, Vec<u8>, bool)>, Error> {
         self.queue.retain(|id| self.frames.contains_key(id));
-        let probe_due = !self.frames.is_empty() && self.pto_deadline().is_some_and(|at| now >= at);
+        let probe_due = self.pto_deadline().is_some_and(|at| now >= at);
         if probe_due {
             if self.pto_count >= MAX_PTO {
                 return Err(Error::Timeout);
@@ -143,6 +143,9 @@ impl Scheduler {
             if self.aliases.len() >= MAX_ALIASES {
                 return Err(Error::Limit);
             }
+            // A PATH probe or canceled STREAM can leave flight bytes but
+            // no retransmittable frame. PTO still needs an eliciting probe.
+            if self.frames.is_empty() { self.enqueue(vec![1])?; }
             if let Some((&id, f)) = self.frames.first_key_value() {
                 return Ok(Some((id, f.bytes.clone(), true)));
             }
@@ -296,7 +299,7 @@ impl Scheduler {
             self.aliases.retain(|_, value| *value != id);
         }
         self.queue.retain(|id| self.frames.contains_key(id));
-        if self.frames.is_empty() {
+        if self.frames.is_empty() && self.ledger.bytes_in_flight() == 0 {
             self.last_eliciting = None;
         }
         if outcome.acknowledged.iter().any(|p| p.ack_eliciting) {
@@ -367,7 +370,7 @@ impl Scheduler {
     }
 
     fn pto_deadline(&self) -> Option<Instant> {
-        if self.frames.is_empty() {
+        if self.ledger.bytes_in_flight() == 0 {
             return None;
         }
         self.last_eliciting?
@@ -483,6 +486,21 @@ mod tests {
         s.acknowledge(&ack(0), now + Duration::from_millis(10))
             .unwrap();
         assert_eq!(s.window.in_flight(), 0);
+    }
+
+    #[test]
+    fn path_only_flight_arms_pto_and_ping_releases_lost_probe() {
+        let now = Instant::now();
+        let mut s = Scheduler::default();
+        s.record_path(0, 1200, now).unwrap();
+        let at = s.deadline().unwrap();
+        let (id, bytes, probe) = s.candidate(at).unwrap().unwrap();
+        assert_eq!(bytes, [1]);
+        assert!(probe);
+        s.record(1, 32, Some((id, probe)), at).unwrap();
+        s.acknowledge(&ack(1), at + Duration::from_millis(10)).unwrap();
+        assert_eq!(s.window.in_flight(), 0);
+        assert_eq!(s.pending(), 0);
     }
 
     #[test]

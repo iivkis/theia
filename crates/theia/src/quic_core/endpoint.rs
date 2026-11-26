@@ -362,7 +362,8 @@ impl LabSession {
                 super::wire::encode_varint(value, &mut scratch).ok_or(Error::Protocol)?,
             );
         }
-        self.scheduler.enqueue(frame).map_err(Error::Schedule)
+        self.scheduler.enqueue(frame).map_err(Error::Schedule)?;
+        self.receive.abandon(id).map_err(Error::Receive)
     }
 
     pub(crate) fn lifetime_exhausted(&self, bidi: bool) -> bool { self.send.lifetime_exhausted(bidi) }
