@@ -1,7 +1,8 @@
 //! RFC 9000 section 13.4.2 ECN counter validation, independent of socket I/O.
 //! An owner must supply actual sent IP marks and authenticated, ledger-checked
 //! ACKs. Do not enable ECN until the platform can send and receive codepoints.
-use super::wire::MAX_VARINT;
+use super::{ack::Ack, wire::MAX_VARINT};
+use std::{collections::BTreeMap, time::{Duration, Instant}};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Mark {
@@ -133,9 +134,91 @@ impl Validator {
     }
 }
 
+/// Bounded application-space ECN experiment. Marks are registered only
+/// after successful kernel send and authenticated ledger insertion. On
+/// migration or exhausted evidence, fall back to Not-ECT for this session.
+#[derive(Default)]
+pub(crate) struct PathEcn {
+    enabled: bool,
+    validator: Validator,
+    pending: BTreeMap<u64, Instant>,
+    testing_sent: u8,
+    first: Option<Instant>,
+}
+
+impl PathEcn {
+    pub(crate) fn enable(&mut self, supported: bool) { self.enabled = supported; }
+    pub(crate) fn disable(&mut self) {
+        self.enabled = false;
+        self.pending.clear();
+        self.validator.fail();
+    }
+    pub(crate) fn should_mark(&self) -> bool {
+        self.enabled && match self.validator.state() {
+            State::Testing => self.testing_sent < 10,
+            State::Capable => true,
+            State::Failed => false,
+        }
+    }
+    pub(crate) fn sent(&mut self, pn: u64, mark: Mark, now: Instant) {
+        if !self.enabled { return; }
+        if mark != Mark::Ect0 || self.pending.len() >= 8192 {
+            self.disable();
+            return;
+        }
+        self.validator.sent(mark);
+        self.pending.insert(pn, now);
+        self.first.get_or_insert(now);
+        self.testing_sent = self.testing_sent.saturating_add(1);
+    }
+    pub(crate) fn tick(&mut self, now: Instant, pto: Duration) {
+        if self.enabled && self.validator.state() == State::Testing
+            && self.first.is_some_and(|at| now.saturating_duration_since(at) >= pto.saturating_mul(3)) {
+            self.disable();
+        }
+    }
+    pub(crate) fn acknowledge(&mut self, ack: &Ack) -> Option<Instant> {
+        if !self.enabled { return None; }
+        let largest = ack.ranges.first()?.last;
+        let mut newly = 0u64;
+        let mut newest = None;
+        self.pending.retain(|pn, at| {
+            if ack.acknowledges(*pn) {
+                newly += 1;
+                newest = Some(newest.map_or(*at, |old: Instant| old.max(*at)));
+                false
+            } else { true }
+        });
+        match self.validator.acknowledge(largest, [newly, 0], ack.ecn) {
+            Feedback::Failed => { self.disable(); None },
+            Feedback::Valid { ce_increase } if ce_increase != 0 => newest,
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actual_marked_packet_history_requires_valid_feedback_and_disables_on_migration() {
+        use crate::quic_core::ack::Range;
+        let now = Instant::now();
+        let mut p = PathEcn::default();
+        p.enable(true);
+        assert!(p.should_mark());
+        p.sent(1, Mark::Ect0, now);
+        let ack = Ack { delay: 0, ranges: vec![Range { first: 1, last: 1 }], ecn: Some([0, 0, 1]) };
+        assert_eq!(p.acknowledge(&ack), Some(now));
+        assert!(p.should_mark());
+        p.disable();
+        assert!(!p.should_mark());
+        let mut p = PathEcn::default();
+        p.enable(true);
+        p.sent(2, Mark::NotEct, now);
+        assert!(!p.should_mark());
+    }
 
     #[test]
     fn validates_counter_deltas_and_ignores_reordered_ack() {

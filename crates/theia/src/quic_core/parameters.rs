@@ -216,7 +216,7 @@ impl Parameters<'_> {
                 .map(|n| n.unwrap_or(default))
                 .map_err(|_| SemanticError::Encoding)
         };
-        let max_udp_payload = get(0x03, 65527)?;
+        let max_udp_payload = get(0x03, 65527)?.min(65527);
         let max_data = get(0x04, 0)?;
         let max_streams_bidi = get(0x08, 0)?;
         let max_streams_uni = get(0x09, 0)?;

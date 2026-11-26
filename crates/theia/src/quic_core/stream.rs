@@ -1,7 +1,7 @@
 //! Bounded receive-side byte reassembly for future CRYPTO/STREAM users.
 //! This is not a connection-level flow controller or a complete stream FSM.
 use super::wire::MAX_VARINT;
-use std::collections::VecDeque;
+use std::{collections::VecDeque, time::{Duration, Instant}};
 
 pub const MAX_WINDOW: usize = 1024 * 1024;
 
@@ -22,6 +22,7 @@ pub struct ReceiveBuffer {
     reset_code: Option<u64>,
     abandoned: bool,
     bytes: VecDeque<Option<u8>>,
+    tune_epoch: Option<(Instant, u64)>,
 }
 
 impl ReceiveBuffer {
@@ -38,6 +39,7 @@ impl ReceiveBuffer {
             reset_code: None,
             abandoned: false,
             bytes: VecDeque::new(),
+            tune_epoch: None,
         })
     }
 
@@ -165,6 +167,28 @@ impl ReceiveBuffer {
         }
         self.read_offset += written as u64;
         written
+    }
+
+    /// Grow only when the application actually consumes at least half the
+    /// receive window within two measured RTTs. Never grant more memory
+    /// than the connection's fixed per-stream allocation budget.
+    pub(crate) fn tune_window(&mut self, consumed: usize, now: Instant, rtt: Duration, cap: usize) -> usize {
+        if consumed == 0 || rtt.is_zero() || self.final_size.is_some() || self.abandoned || self.window >= cap {
+            return 0;
+        }
+        let before = self.read_offset.saturating_sub(consumed as u64);
+        let (start, offset) = *self.tune_epoch.get_or_insert((now, before));
+        if now.saturating_duration_since(start) > rtt.saturating_mul(2) {
+            self.tune_epoch = Some((now, before));
+            return 0;
+        }
+        if self.read_offset.saturating_sub(offset) < (self.window / 2).max(1) as u64 {
+            return 0;
+        }
+        let old = self.window;
+        self.window = old.saturating_mul(2).min(cap).min(MAX_WINDOW);
+        self.tune_epoch = Some((now, self.read_offset));
+        self.window - old
     }
 
     pub fn finished(&self) -> bool {

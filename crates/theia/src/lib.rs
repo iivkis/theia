@@ -91,6 +91,7 @@ mod tui_staged_material;
 #[cfg(windows)]
 pub(crate) mod tui_system_proxy;
 mod tui_widgets;
+mod udp_metadata;
 mod udp_relay;
 #[cfg(target_os = "windows")]
 pub mod windows_control;

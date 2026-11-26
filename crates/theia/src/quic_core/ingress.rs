@@ -16,7 +16,7 @@ use ring::{
 use std::{
     collections::{BTreeMap, BTreeSet},
     io,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     time::Instant,
 };
 use tokio::net::UdpSocket;
@@ -41,6 +41,34 @@ pub enum Error {
     Random,
 }
 
+/// Stateless output is limited globally and per source address. Entries
+/// expire together at the next monotone second; unknown addresses cannot
+/// allocate an unbounded table. Existing CID traffic never consumes this budget.
+#[derive(Default)]
+struct ReplyBudget {
+    second: u64,
+    total: u16,
+    sources: BTreeMap<IpAddr, u16>,
+}
+
+impl ReplyBudget {
+    fn permit(&mut self, peer: IpAddr, now: u64) -> bool {
+        if now != self.second {
+            self.second = now;
+            self.total = 0;
+            self.sources.clear();
+        }
+        if self.total >= 256 || (!self.sources.contains_key(&peer) && self.sources.len() >= 256) {
+            return false;
+        }
+        let count = self.sources.entry(peer).or_default();
+        if *count >= 64 { return false; }
+        *count += 1;
+        self.total += 1;
+        true
+    }
+}
+
 pub struct Ingress {
     routes: Demux,
     owners: BTreeMap<u64, BTreeSet<Cid>>,
@@ -54,6 +82,10 @@ pub struct Ingress {
     occupied: usize,
     now: u64,
     versions: VersionPolicy,
+    accepting: bool,
+    reply_budget: ReplyBudget,
+    source_limit: Option<usize>,
+    owner_sources: BTreeMap<u64, IpAddr>,
 }
 
 impl Ingress {
@@ -93,6 +125,10 @@ impl Ingress {
             occupied: 0,
             now: 0,
             versions,
+            accepting: true,
+            reply_budget: ReplyBudget::default(),
+            source_limit: None,
+            owner_sources: BTreeMap::new(),
         })
     }
 
@@ -139,6 +175,20 @@ impl Ingress {
         Ok(cid)
     }
 
+    pub(crate) fn set_source_limit(&mut self, limit: usize) {
+        self.source_limit = Some(limit.max(1));
+    }
+
+    pub(crate) fn stop_accepting(&mut self) { self.accepting = false; }
+
+    /// Only the Retry-validated owner's initial CID can receive an authenticated
+    /// stateless-reset transport parameter. Retain its tombstone on teardown.
+    pub(crate) fn initial_reset(&mut self, owner: u64, cid: Cid) -> Result<[u8; 16], Error> {
+        if self.routes.owner(cid) != Some(owner) { return Err(Error::Owner); }
+        self.resettable.insert(cid);
+        Ok(self.reset_token(cid))
+    }
+
     pub(crate) fn reset_token(&self, cid: Cid) -> [u8; 16] {
         let tag = hmac::sign(&self.reset_key, &cid);
         let mut token = [0; 16];
@@ -183,6 +233,7 @@ impl Ingress {
         let until = now.checked_add(TOKEN_TTL).ok_or(Error::Clock)?;
         let ids = self.owners.remove(&owner).ok_or(Error::Owner)?;
         self.routes.remove_owner(owner);
+        self.owner_sources.remove(&owner);
         for cid in ids {
             self.retired.insert(cid, until);
         }
@@ -200,12 +251,13 @@ impl Ingress {
             return Ok(Action::Drop);
         }
         if let Some((version, dcid, scid)) = invariant_header(datagram) {
-            if version != 0
+            if self.accepting && version != 0
                 && Version::from_wire(version).is_none_or(|v| !self.versions.supports(v))
                 && <Cid>::try_from(dcid)
                     .ok()
                     .is_none_or(|cid| self.available(cid))
             {
+                if !self.reply_budget.permit(peer.ip(), now) { return Ok(Action::Drop); }
                 let mut reply = vec![0x80];
                 reply.extend([0; 4]);
                 reply.push(scid.len() as u8);
@@ -236,11 +288,11 @@ impl Ingress {
         }
         if head.kind == PacketKind::Application {
             return match cid {
-                Some(cid) => self.retired_reset(cid, datagram.len()),
-                None => Ok(Action::Drop),
+                Some(cid) if self.retired.contains_key(&cid) && self.reply_budget.permit(peer.ip(), now) => self.retired_reset(cid, datagram.len()),
+                _ => Ok(Action::Drop),
             };
         }
-        if head.kind != PacketKind::Initial
+        if !self.accepting || head.kind != PacketKind::Initial
             || self.occupied >= self.limit
             || self.owners.len() >= self.connection_limit
         {
@@ -256,6 +308,7 @@ impl Ingress {
             return Ok(Action::Drop);
         };
         if header.token.is_empty() {
+            if !self.reply_budget.permit(peer.ip(), now) { return Ok(Action::Drop); }
             let retry = self.fresh_cid(header.dcid)?;
             let binding = Binding {
                 version,
@@ -283,10 +336,16 @@ impl Ingress {
         if !self.available(cid) {
             return Ok(Action::Drop);
         }
+        // Only address-validated attempts may occupy this bounded table.
+        // New addresses cannot evict the quota held by an existing owner.
+        if self.source_limit.is_some_and(|limit| self.owner_sources.values().filter(|&&ip| ip == peer.ip()).count() >= limit) {
+            return Ok(Action::Drop);
+        }
         let owner = self.next_owner;
         let next = owner.checked_add(1).ok_or(Error::Limit)?;
         self.routes.register(cid, owner).map_err(|_| Error::Limit)?;
         self.owners.insert(owner, BTreeSet::from([cid]));
+        self.owner_sources.insert(owner, peer.ip());
         self.next_owner = next;
         self.occupied += 1;
         Ok(Action::Accepted { owner, binding })
@@ -450,6 +509,56 @@ mod tests {
         bytes.extend(cid);
         bytes.extend([0; 20]);
         bytes
+    }
+
+    #[test]
+    fn validated_source_quota_does_not_evict_existing_routes() {
+        let mut ingress = Ingress::for_listener(4, VersionPolicy::both()).unwrap();
+        ingress.set_source_limit(1);
+        let a = "192.0.2.1:4000".parse::<SocketAddr>().unwrap();
+        let b = "192.0.2.2:4001".parse::<SocketAddr>().unwrap();
+        let version = Version::V1;
+        let accept = |ingress: &mut Ingress, peer, seed: u8| {
+            let original = [seed; 8];
+            let client = [seed + 1; 8];
+            let Action::Reply(retry) = ingress.process(peer, &initial(version, &original, &client, &[]), 0).unwrap() else { panic!("Retry"); };
+            let (cid, token) = negotiation::retry_token(&retry, version, &client, &original, false, false).unwrap();
+            let cid: Cid = cid.try_into().unwrap();
+            (cid, ingress.process(peer, &initial(version, &cid, &client, token), 0).unwrap())
+        };
+        let (cid, Action::Accepted { owner, .. }) = accept(&mut ingress, a, 1) else { panic!("first"); };
+        assert_eq!(accept(&mut ingress, a, 3).1, Action::Drop);
+        assert!(matches!(accept(&mut ingress, b, 5).1, Action::Accepted { .. }));
+        assert_eq!(ingress.process(a, &short(cid), 0), Ok(Action::Existing(owner)));
+        ingress.close(owner, 0).unwrap();
+        assert!(matches!(accept(&mut ingress, a, 7).1, Action::Accepted { .. }));
+    }
+
+    #[test]
+    fn stateless_budget_and_drain_keep_existing_routes() {
+        let mut budget = ReplyBudget::default();
+        let a = "192.0.2.1".parse().unwrap();
+        let b = "192.0.2.2".parse().unwrap();
+        for _ in 0..64 { assert!(budget.permit(a, 0)); }
+        assert!(!budget.permit(a, 0));
+        assert!(budget.permit(b, 0));
+        assert!(budget.permit(a, 1));
+        let peer = "127.0.0.1:1000".parse().unwrap();
+        let version = Version::V1;
+        let mut ingress = Ingress::for_listener(2, VersionPolicy::both()).unwrap();
+        let packet = initial(version, &[1; 8], &[2; 8], &[]);
+        let Action::Reply(retry) = ingress.process(peer, &packet, 0).unwrap() else { panic!("Retry"); };
+        let (cid, token) = negotiation::retry_token(&retry, version, &[2; 8], &[1; 8], false, false).unwrap();
+        let cid: Cid = cid.try_into().unwrap();
+        let Action::Accepted { owner, .. } = ingress.process(peer, &initial(version, &cid, &[2; 8], token), 0).unwrap() else { panic!("accept"); };
+        assert_eq!(ingress.initial_reset(owner + 1, cid), Err(Error::Owner));
+        let reset = ingress.initial_reset(owner, cid).unwrap();
+        ingress.stop_accepting();
+        assert_eq!(ingress.process(peer, &packet, 1), Ok(Action::Drop));
+        assert_eq!(ingress.process(peer, &short(cid), 1), Ok(Action::Existing(owner)));
+        ingress.close(owner, 1).unwrap();
+        let Action::Reply(reply) = ingress.process(peer, &short(cid), 1).unwrap() else { panic!("initial CID reset"); };
+        assert_eq!(&reply[reply.len()-16..], &reset);
     }
 
     #[test]

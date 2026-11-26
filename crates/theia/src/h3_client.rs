@@ -29,6 +29,7 @@ pub struct H3Client {
     roots: RootCertStore,
     identity_quic: Option<quinn::ClientConfig>,
     native_lab: Option<crate::quic_core::wire::Version>,
+    native_pins: Option<(SocketAddr, crate::quic_core::scope::NetworkScope)>,
     identity_routes: Option<crate::split_http::IdentityRoutes>,
     padding: crate::descriptor::Padding,
     own_routes: Option<crate::split_http::IdentityRoutes>,
@@ -69,6 +70,7 @@ impl H3Client {
             roots,
             identity_quic: None,
             native_lab: None,
+            native_pins: None,
             identity_routes: None,
             padding: crate::descriptor::Padding::default(),
             own_routes: Some(crate::split_http::IdentityRoutes::new(
@@ -166,6 +168,7 @@ impl H3Client {
             roots: RootCertStore::empty(),
             identity_quic: Some(quic),
             native_lab: None,
+            native_pins: None,
             identity_routes: Some(routes),
             padding: d.padding.clone(),
             own_routes: None,
@@ -521,7 +524,22 @@ impl H3Client {
         {
             return Err(ClientError::Configuration);
         }
+        self.pool = crate::connection_pool::Pool::default();
         self.native_lab = Some(version);
+        self.native_pins = None;
+        Ok(self)
+    }
+
+    /// Explicit non-production pinned own-TLS carrier. Uses the identical
+    /// H3/XHTTP pool and request FSM, without bypassing certificate validation.
+    pub fn with_native_pinned(mut self, version: crate::quic_core::wire::Version, local: SocketAddr, scope: crate::quic_core::scope::NetworkScope) -> Result<Self, ClientError> {
+        if !scope.is_pinned() || !scope.allows_local(local.ip()) || !scope.allows_peer(self.remote.ip())
+            || local.is_ipv4() != self.remote.is_ipv4() || self.identity_quic.is_some() || self.certificate_pin.is_some() {
+            return Err(ClientError::Configuration);
+        }
+        self.pool = crate::connection_pool::Pool::default();
+        self.native_lab = Some(version);
+        self.native_pins = Some((local, scope));
         Ok(self)
     }
 
@@ -534,7 +552,7 @@ impl H3Client {
            + Send
            + '_ {
         Box::pin(async move {
-            if !self.remote.ip().is_loopback()
+            if (self.native_pins.is_none() && !self.remote.ip().is_loopback())
                 || self.identity_quic.is_some()
                 || self.certificate_pin.is_some()
             {
@@ -545,6 +563,11 @@ impl H3Client {
                 .map_err(|_| ClientError::Tls)?;
             let name =
                 ServerName::try_from(self.name.clone()).map_err(|_| ClientError::Configuration)?;
+            if let Some((local, scope)) = self.native_pins {
+                return timeout(self.connect_timeout, crate::quic_core::handshake_udp::connect_versions_scoped(
+                    local, self.remote, crate::quic_core::negotiation::VersionPolicy::exact(version), Arc::new(tls), name, scope,
+                )).await.map_err(|_| ClientError::Timeout)?.map(|(_, session)| session).map_err(|_| ClientError::Tls);
+            }
             let bind = if self.remote.is_ipv4() {
                 "127.0.0.1:0"
             } else {
@@ -602,7 +625,13 @@ impl H3Client {
     /// Dropping the endpoint closes this probe; it never opens a tunnel.
     pub(crate) async fn probe(&self) -> Result<(), ClientError> {
         if let Some(version) = self.native_lab {
-            return self.native_connection(version).await.map(|_| ());
+            return timeout(self.connect_timeout, async {
+                let mut session = self.native_connection(version).await?;
+                crate::camouflage_h3_probe::finish_native_handshake(&mut session).await.map_err(|_| ClientError::Tls)?;
+                session.close(0x100, std::time::Instant::now()).map_err(|_| ClientError::Tls)?;
+                session.flush(std::time::Instant::now()).await.map_err(|_| ClientError::Tls)?;
+                Ok(())
+            }).await.map_err(|_| ClientError::Timeout)?;
         }
         self.verified_connection().await.map(|_| ())
     }

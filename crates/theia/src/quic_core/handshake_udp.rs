@@ -54,6 +54,16 @@ pub enum Error {
     Endpoint(super::endpoint::Error),
 }
 
+/// Explicit controller selection for interoperability and benchmark trials.
+/// Existing native entry points retain their BBR default; production
+/// configuration and the accepted Quinn backend are not changed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Congestion {
+    Cubic,
+    #[default]
+    Bbr,
+}
+
 pub enum Config {
     Client {
         tls: Arc<ClientConfig>,
@@ -70,12 +80,15 @@ struct Epoch {
 }
 
 impl Epoch {
-    fn new(keys: Keys) -> Self {
+    #[cfg(test)]
+    fn new(keys: Keys) -> Self { Self::with_schedule(keys, Scheduler::default()) }
+
+    fn with_schedule(keys: Keys, schedule: Scheduler) -> Self {
         Self {
             reader: Reader::new(keys.remote),
             writer: Writer::new(keys.local),
             ack: History::default(),
-            schedule: Scheduler::default(),
+            schedule,
         }
     }
 }
@@ -87,6 +100,7 @@ fn params(
     local: &[u8; CID_LEN],
     original: &[u8],
     retry: Option<&[u8]>,
+    initial_reset: Option<[u8; 16]>,
 ) -> Result<Vec<u8>, Error> {
     let mut out = Vec::new();
     parameters::append(&mut out, 0x11, &versions.information(version, server))
@@ -94,6 +108,7 @@ fn params(
     parameters::append(&mut out, 0x0f, local).map_err(|_| Error::Protocol)?;
     if server {
         parameters::append(&mut out, 0x00, original).map_err(|_| Error::Protocol)?;
+        if let Some(token) = initial_reset { parameters::append(&mut out, 0x02, &token).map_err(|_| Error::Protocol)?; }
     }
     if server {
         if let Some(cid) = retry {
@@ -102,7 +117,7 @@ fn params(
     }
     for (id, value) in [
         (0x01, 30_000),
-        (0x03, MTU as u64),
+        (0x03, super::mtu::MAX_UDP_PAYLOAD as u64),
         (0x04, CREDIT),
         (0x05, CREDIT),
         (0x06, CREDIT),
@@ -337,6 +352,7 @@ impl HandshakeTail {
 
 struct FlightPacket {
     index: usize,
+    padded_ack: bool,
     header: Vec<u8>,
     payload: Vec<u8>,
     frame: Option<(u64, bool)>,
@@ -350,6 +366,7 @@ impl FlightPacket {
 struct Handshake {
     driver: Driver,
     epochs: [Option<Epoch>; 2],
+    application_schedule: Scheduler,
     application: Option<(Keys, Secrets)>,
     budget: PathBudget,
     server: bool,
@@ -390,7 +407,7 @@ impl Handshake {
             }
             match flight.keys {
                 Some(KeyChange::Handshake { keys }) if self.epochs[1].is_none() => {
-                    self.epochs[1] = Some(Epoch::new(keys))
+                    self.epochs[1] = Some(Epoch::with_schedule(keys, self.application_schedule.fork_space()))
                 }
                 Some(KeyChange::OneRtt { keys, next }) if self.application.is_none() => {
                     self.application = Some((keys, next))
@@ -415,6 +432,13 @@ impl Handshake {
         if total > MTU || total == 0 {
             return Err(Error::Protocol);
         }
+        let ordinary: u64 = packets.iter().filter(|p| p.padded_ack || p.frame.is_some_and(|(_, probe)| !probe)).map(|p| p.size() as u64).sum();
+        let probes: u64 = packets.iter().filter(|p| p.frame.is_some_and(|(_, probe)| probe)).map(|p| p.size() as u64).sum();
+        let stale_probe = packets.iter().any(|p| p.frame.is_some_and(|(_, probe)| probe)
+            && self.epochs[p.index].as_ref().is_none_or(|epoch| epoch.schedule.pto_deadline().is_none_or(|at| now < at)));
+        if stale_probe || packets.iter().filter(|p| p.frame.is_some_and(|(_, probe)| probe)).count() > 1 || !self.application_schedule.permits_flight(ordinary, probes, now) {
+            return Ok(false);
+        }
         if self.server && !self.budget.reserve_send(total as u64) {
             return Ok(false);
         }
@@ -426,10 +450,11 @@ impl Handshake {
                 .writer
                 .seal(&packet.header, &packet.payload)
                 .map_err(Error::Packet)?;
-            epoch
-                .schedule
-                .record(number, protected.len(), packet.frame, now)
-                .map_err(Error::Schedule)?;
+            if packet.padded_ack {
+                epoch.schedule.record_padded_ack(number, protected.len(), now).map_err(Error::Schedule)?;
+            } else {
+                epoch.schedule.record(number, protected.len(), packet.frame, now).map_err(Error::Schedule)?;
+            }
             datagram.extend_from_slice(&protected);
             if packet.frame.is_none() {
                 epoch.ack.sent();
@@ -446,7 +471,7 @@ impl Handshake {
     }
 
     fn pad_initial(&self, packet: &mut FlightPacket, minimum: usize) -> Result<(), Error> {
-        if packet.index != 0 {
+        if packet.index != 0 || (self.server && packet.frame.is_none()) {
             return Ok(());
         }
         let token = if self.server {
@@ -454,6 +479,7 @@ impl Handshake {
         } else {
             self.token.as_slice()
         };
+        let original_len = packet.payload.len();
         packet.header = header(
             self.version,
             0,
@@ -463,6 +489,7 @@ impl Handshake {
             &mut packet.payload,
             minimum,
         )?;
+        packet.padded_ack |= packet.frame.is_none() && packet.payload.len() > original_len;
         Ok(())
     }
 
@@ -499,10 +526,17 @@ impl Handshake {
             )?;
             packets.push(FlightPacket {
                 index,
+                padded_ack: false,
                 header,
                 payload,
                 frame,
             });
+        }
+        if packets.iter().filter(|p| p.frame.is_some_and(|(_, probe)| probe)).count() > 1 {
+            let first = packets.iter().filter(|p| p.frame.is_some_and(|(_, probe)| probe))
+                .min_by_key(|p| self.epochs[p.index].as_ref().and_then(|epoch| epoch.schedule.pto_deadline()))
+                .map(|p| p.index).ok_or(Error::Protocol)?;
+            packets.retain(|p| !p.frame.is_some_and(|(_, probe)| probe) || p.index == first);
         }
         if packets.len() == 2 && packets.iter().map(FlightPacket::size).sum::<usize>() <= MTU {
             let initial_size = MTU - packets[1].size();
@@ -510,7 +544,11 @@ impl Handshake {
             // Coalescing is opportunistic; if unvalidated budget is smaller
             // than a padded Initial, a standalone Handshake may still fit.
             if !self.server || self.budget.can_send(MTU as u64) {
-                return self.emit(socket, peer, packets, now).await;
+                let ordinary = packets.iter().filter(|p| p.padded_ack || p.frame.is_some_and(|(_, probe)| !probe)).map(|p| p.size() as u64).sum();
+                let probes = packets.iter().filter(|p| p.frame.is_some_and(|(_, probe)| probe)).map(|p| p.size() as u64).sum();
+                if packets.iter().filter(|p| p.frame.is_some_and(|(_, probe)| probe)).count() <= 1 && self.application_schedule.permits_flight(ordinary, probes, now) {
+                    return self.emit(socket, peer, packets, now).await;
+                }
             }
         }
         let mut sent = false;
@@ -528,7 +566,13 @@ impl Handshake {
         self.epochs
             .iter()
             .flatten()
-            .filter_map(|epoch| epoch.schedule.deadline())
+            .filter_map(|epoch| {
+                let deadline = epoch.schedule.deadline();
+                // Client Initial ACK-only packets require padding and can
+                // be deferred by the shared pacing window.
+                let ack_pace = (!self.server && epoch.ack.pending()).then(|| epoch.schedule.pacing_deadline()).flatten();
+                [deadline, ack_pace].into_iter().flatten().min()
+            })
             .filter(|at| *at > now || !self.server || self.budget.can_send(MTU as u64))
             .min()
             .map_or(DEADLINE, |at| {
@@ -565,11 +609,12 @@ impl Handshake {
         // Keep TLS and CRYPTO offsets; only Initial protection and recovery
         // are reset. The packet number MUST continue across Retry.
         let keys = initial_keys(self.version, cid, false)?;
+        let old = self.epochs[0].take().ok_or(Error::Protocol)?;
         let mut epoch = Epoch {
             reader: Reader::new(keys.remote),
             writer: Writer::with_next(keys.local, next),
             ack: History::default(),
-            schedule: Scheduler::after_retry(next),
+            schedule: old.schedule.after_retry(next, Instant::now()),
         };
         // A larger opaque Retry token consumes Initial payload space.
         // Re-fragment the original CRYPTO without changing TLS offsets.
@@ -769,6 +814,7 @@ pub async fn establish(
             remote: remote.to_vec(),
             original: original.to_vec(),
             retry: None,
+            initial_reset: None,
             token: Vec::new(),
             versions: if server {
                 VersionPolicy::both()
@@ -778,6 +824,7 @@ pub async fn establish(
             restarted: false,
         },
         config,
+        Congestion::Bbr,
     )
     .await
 }
@@ -813,10 +860,34 @@ pub async fn connect_versions(
     tls: Arc<ClientConfig>,
     name: ServerName<'static>,
 ) -> Result<(Version, LabSession), Error> {
+    connect_versions_scoped(local, peer, versions, tls, name, super::scope::NetworkScope::loopback()).await
+}
+
+/// Explicit pinned-interface client for controlled non-loopback acceptance.
+pub async fn connect_versions_scoped(
+    local: SocketAddr,
+    peer: SocketAddr,
+    versions: VersionPolicy,
+    tls: Arc<ClientConfig>,
+    name: ServerName<'static>,
+    scope: super::scope::NetworkScope,
+) -> Result<(Version, LabSession), Error> {
+    connect_versions_scoped_with_congestion(local, peer, versions, tls, name, scope, Congestion::Bbr).await
+}
+
+pub async fn connect_versions_scoped_with_congestion(
+    local: SocketAddr,
+    peer: SocketAddr,
+    versions: VersionPolicy,
+    tls: Arc<ClientConfig>,
+    name: ServerName<'static>,
+    scope: super::scope::NetworkScope,
+    congestion: Congestion,
+) -> Result<(Version, LabSession), Error> {
     let mut version = versions.preferred();
     for restarted in [false, true] {
         let socket = UdpSocket::bind(local).await.map_err(Error::Io)?;
-        if !super::loopback_pair(socket.local_addr().map_err(Error::Io)?, peer) {
+        if !scope.permits(socket.local_addr().map_err(Error::Io)?, peer) {
             return Err(Error::Scope);
         }
         let cid = super::negotiation::random_cid().map_err(|_| Error::Protocol)?;
@@ -830,18 +901,20 @@ pub async fn connect_versions(
             remote: original.to_vec(),
             original: original.to_vec(),
             retry: None,
+            initial_reset: None,
             token: Vec::new(),
             versions: versions.clone(),
             restarted,
         };
         match establish_inner(
-            socket.into(),
+            SessionIo::direct(socket, scope),
             peer,
             route,
             Config::Client {
                 tls: tls.clone(),
                 name: name.clone(),
             },
+            congestion,
         )
         .await
         {
@@ -860,7 +933,11 @@ pub async fn connect_versions(
 /// The candidate is created exclusively after the listener validates Retry.
 /// TLS and CID parameters must still authenticate before returning a session.
 pub async fn accept(candidate: Candidate, tls: Arc<ServerConfig>) -> Result<LabSession, Error> {
-    let (socket, peer, binding, token, versions) = candidate.into_parts();
+    accept_with_congestion(candidate, tls, Congestion::Bbr).await
+}
+
+pub async fn accept_with_congestion(candidate: Candidate, tls: Arc<ServerConfig>, congestion: Congestion) -> Result<LabSession, Error> {
+    let (socket, peer, binding, token, initial_reset, versions) = candidate.into_parts();
     let original = binding.original;
     let remote = binding.client;
     if !(8..=20).contains(&original.len())
@@ -881,11 +958,13 @@ pub async fn accept(candidate: Candidate, tls: Arc<ServerConfig>) -> Result<LabS
             remote,
             original,
             retry: Some(binding.retry.to_vec()),
+            initial_reset: Some(initial_reset),
             token,
             versions,
             restarted: false,
         },
         Config::Server(tls),
+        congestion,
     )
     .await
 }
@@ -912,6 +991,7 @@ struct InitialRoute {
     remote: Vec<u8>,
     original: Vec<u8>,
     retry: Option<Vec<u8>>,
+    initial_reset: Option<[u8; 16]>,
     token: Vec<u8>,
     versions: VersionPolicy,
     restarted: bool,
@@ -922,6 +1002,7 @@ async fn establish_inner(
     peer: SocketAddr,
     route: InitialRoute,
     config: Config,
+    congestion: Congestion,
 ) -> Result<LabSession, Error> {
     let InitialRoute {
         version,
@@ -929,10 +1010,12 @@ async fn establish_inner(
         remote,
         original,
         retry,
+        initial_reset,
         token,
         versions,
         restarted,
     } = route;
+    if !socket.scope().permits(socket.local_addr().map_err(Error::Io)?, peer) { return Err(Error::Scope); }
     let server = matches!(&config, Config::Server(_));
     let parameters = params(
         server,
@@ -941,6 +1024,7 @@ async fn establish_inner(
         &local,
         &original,
         retry.as_deref(),
+        initial_reset,
     )?;
     let connection = match config {
         Config::Client { tls: config, name } => tls::client(config, version, name, parameters),
@@ -954,9 +1038,12 @@ async fn establish_inner(
     .map_err(Error::Tls)?;
     let destination = retry.as_deref().unwrap_or(&original);
     let keys = initial_keys(version, destination, server)?;
+    let initial = match congestion { Congestion::Bbr => Scheduler::with_bbr(Instant::now()), Congestion::Cubic => Scheduler::default() };
+    let application_schedule = initial.fork_space();
     let mut handshake = Handshake {
         driver: Driver::new(connection),
-        epochs: [Some(Epoch::new(keys)), None],
+        epochs: [Some(Epoch::with_schedule(keys, initial)), None],
+        application_schedule,
         application: None,
         budget: PathBudget::default(),
         server,
@@ -979,7 +1066,7 @@ async fn establish_inner(
         return Err(Error::Scope);
     }
     tokio::time::timeout(DEADLINE, async {
-        let mut buffer = [0; MTU + 1];
+        let mut buffer = [0; super::mtu::MAX_UDP_PAYLOAD + 1];
         loop {
             handshake.collect()?;
             let sent = handshake.flush(&socket, peer).await?;
@@ -991,10 +1078,11 @@ async fn establish_inner(
                 tokio::task::yield_now().await;
             }
             match tokio::time::timeout(wait, socket.recv_from(&mut buffer)).await {
-                Ok(Ok((n, source))) if source == peer && n <= MTU => {
+                Ok(Ok((n, source, _mark))) if source == peer && n <= super::mtu::MAX_UDP_PAYLOAD => {
                     handshake.receive_datagram(&buffer[..n])?
                 }
                 Ok(Ok(_)) | Err(_) => {}
+                Ok(Err(e)) if super::mtu::message_too_large(&e) => {}
                 Ok(Err(e)) => return Err(Error::Io(e)),
             }
         }
@@ -1051,6 +1139,8 @@ async fn establish_inner(
                 .ok_or(Error::Protocol)?,
         })
     };
+    // Key discard releases the Initial and (server) Handshake flight.
+    handshake.epochs = [None, None];
     let (keys, secrets) = handshake.application.take().ok_or(Error::Protocol)?;
     LabSession::after_handshake(
         socket,
@@ -1065,7 +1155,9 @@ async fn establish_inner(
             binding,
             peer_limits: limits,
             peer_reset_token,
+            peer_disable_migration: peer_params.get(0x0c).is_some(),
             tail,
+            scheduler: handshake.application_schedule,
             early_application: handshake.early_application,
         },
     )

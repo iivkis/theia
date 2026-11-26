@@ -208,7 +208,9 @@ impl Receiver {
         let key = if phase == self.phase {
             &self.current
         } else if pn < self.first_current {
-            &self.previous.as_ref().ok_or(Error::TooOld)?.key
+            // No old key means the packet has not been authenticated. It
+            // remains eligible for a constant-time stateless reset check.
+            &self.previous.as_ref().ok_or(Error::Crypto)?.key
         } else if is_next && handshake_confirmed && old_key_deadline > now {
             &self.next
         } else {

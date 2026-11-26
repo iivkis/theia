@@ -20,12 +20,14 @@ pub mod key_update;
 pub mod lifecycle;
 pub mod listener;
 pub mod loss;
+pub mod mtu;
 pub mod negotiation;
 pub mod packet;
 pub mod parameters;
 pub mod path;
 pub mod recovery;
 pub mod scheduler;
+pub mod scope;
 pub mod send_flow;
 pub mod spaces;
 pub mod stream;
@@ -90,6 +92,34 @@ mod mutation_tests {
         *seed
     }
 
+    /// One external coverage-guided input, executed in an isolated test
+    /// process. The ordinary CI keeps the deterministic corpus below;
+    /// the opt-in driver uses real LLVM regions to retain interesting inputs.
+    #[test]
+    #[ignore = "external instrumented coverage-guided driver"]
+    fn coverage_guided_input() {
+        use std::io::Read;
+        let path = std::env::var_os("THEIA_QUIC_FUZZ_INPUT").expect("explicit fuzz input");
+        let file = std::fs::File::open(path).unwrap();
+        let mut bytes = Vec::new();
+        file.take(65528).read_to_end(&mut bytes).unwrap();
+        assert!(bytes.len() <= 65527);
+        let mut ingress = Ingress::new(8).unwrap();
+        exercise(&bytes, &mut ingress, 0);
+        // Additionally interpret the same bytes as a bounded sequence of
+        // length-prefixed datagrams to exercise stateful routing and Retry.
+        let mut pos = 0usize;
+        for tick in 1..=32 {
+            let Some(prefix) = bytes.get(pos..pos + 2) else { break; };
+            let size = usize::from(u16::from_be_bytes([prefix[0], prefix[1]])).min(1452);
+            pos += 2;
+            let end = pos.saturating_add(size).min(bytes.len());
+            exercise(&bytes[pos..end], &mut ingress, tick);
+            pos = end;
+            if pos == bytes.len() { break; }
+        }
+    }
+
     #[test]
     fn bounded_native_parser_corpus() {
         let mut ingress = Ingress::new(8).unwrap();
@@ -134,8 +164,8 @@ mod mutation_tests {
     }
 }
 
-/// The experimental native transport must never become an externally reachable
-/// carrier before independent admission and interoperability acceptance.
+/// Raw key fixtures retain loopback-only scope. Controlled non-loopback
+/// TLS trials require a separate explicit pinned NetworkScope.
 pub(crate) fn loopback_pair(local: std::net::SocketAddr, peer: std::net::SocketAddr) -> bool {
     local.ip().is_loopback() && peer.ip().is_loopback() && peer.port() != 0 && local != peer
 }

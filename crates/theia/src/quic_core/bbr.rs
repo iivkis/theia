@@ -1,4 +1,4 @@
-//! Experimental BBR-family controller for the native QUIC laboratory.
+//! Native QUIC BBR controller targeting draft-ietf-ccwg-bbr-07.
 //! Delivery-rate sampling, a bounded bandwidth filter, min RTT, startup,
 //! drain, bandwidth probing, RTT probing, pacing and packet conservation.
 //! This is not a claim of conformance to the evolving IETF BBR draft (v3),
@@ -15,8 +15,19 @@ const MAX_SAMPLES: usize = 4096;
 const INITIAL_RTT: Duration = Duration::from_millis(333);
 const MIN_RTT_TTL: Duration = Duration::from_secs(10);
 const PROBE_RTT_TIME: Duration = Duration::from_millis(200);
-const HIGH_GAIN: f64 = 2.885;
-const BW_GAINS: [f64; 8] = [1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+const HIGH_GAIN: f64 = 2.77;
+const DRAIN_GAIN: f64 = 0.5;
+// Four-phase bandwidth probing, following the phase structure in
+// draft-ietf-ccwg-bbr-07. The conservative bounded transitions below
+// are intentionally not a complete implementation of that draft.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbePhase { Down, Cruise, Refill, Up }
+
+impl ProbePhase {
+    fn gain(self) -> f64 {
+        match self { Self::Down => 0.90, Self::Cruise | Self::Refill => 1.0, Self::Up => 1.25 }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
@@ -40,6 +51,20 @@ struct Sample {
     first_sent_at: Instant,
     sent_at: Instant,
     app_limited: bool,
+    tx_in_flight: u64,
+    lost_at_send: u64,
+    probe_id: Option<u64>,
+}
+
+pub(crate) struct Undo {
+    mode: Mode,
+    phase: ProbePhase,
+    cwnd: u64,
+    prior_cwnd: u64,
+    bandwidth_cap: Option<u64>,
+    loss_ceiling: Option<u64>,
+    inflight_longterm: Option<u64>,
+    recovery_until: Option<u64>,
 }
 
 pub struct Bbr {
@@ -52,6 +77,7 @@ pub struct Bbr {
     last_sent: Option<u64>,
     app_limited_until: u64,
     samples: BTreeMap<u64, Sample>,
+    lost_samples: BTreeMap<u64, Sample>,
     bandwidth: VecDeque<(u64, u64)>,
     round: u64,
     next_round: u64,
@@ -60,14 +86,39 @@ pub struct Bbr {
     full_bw: u64,
     plateau: u8,
     full_pipe: bool,
-    cycle: usize,
-    cycle_at: Instant,
+    phase: ProbePhase,
+    phase_at: Instant,
+    phase_round: u64,
+    cycle: u64,
+    cycle_nonlimited: bool,
+    probe_full_bw: u64,
+    probe_plateau: u8,
+    probe_wait: Duration,
+    bandwidth_cap: Option<u64>,
+    inflight_longterm: Option<u64>,
+    bw_latest: u64,
+    inflight_latest: u64,
+    probe_up_rounds: u8,
+    probe_up_acked: u64,
+    probe_rtt_cap: Option<u64>,
+    loss_round_delivered: u64,
+    loss_events_in_round: u32,
+    total_lost: u64,
+    probe_id: u64,
+    check_probe_loss: bool,
+    prev_probe_too_high: bool,
+    stopped_risky_probe: bool,
+    initial_cwnd: u64,
+    prior_cwnd: u64,
+    ack_epoch: Instant,
+    ack_epoch_bytes: u64,
+    extra_acked: VecDeque<(u64, u64)>,
+    idle_restart: bool,
     probe_done: Option<(Instant, u64)>,
     probe_min: Option<Duration>,
     recovery_until: Option<u64>,
     loss_ceiling: Option<u64>,
-    round_acked: u64,
-    round_lost: u64,
+    last_ecn_round: Option<u64>,
 }
 
 impl Bbr {
@@ -86,6 +137,7 @@ impl Bbr {
             last_sent: None,
             app_limited_until: 0,
             samples: BTreeMap::new(),
+            lost_samples: BTreeMap::new(),
             bandwidth: VecDeque::new(),
             round: 0,
             next_round: 0,
@@ -94,20 +146,127 @@ impl Bbr {
             full_bw: 0,
             plateau: 0,
             full_pipe: false,
+            phase: ProbePhase::Down,
+            phase_at: now,
+            phase_round: 0,
             cycle: 0,
-            cycle_at: now,
+            cycle_nonlimited: false,
+            probe_full_bw: 0,
+            probe_plateau: 0,
+            probe_wait: Duration::from_secs(2),
+            bandwidth_cap: None,
+            inflight_longterm: None,
+            bw_latest: 0,
+            inflight_latest: 0,
+            probe_up_rounds: 0,
+            probe_up_acked: 0,
+            probe_rtt_cap: None,
+            loss_round_delivered: 0,
+            loss_events_in_round: 0,
+            total_lost: 0,
+            probe_id: 0,
+            check_probe_loss: false,
+            prev_probe_too_high: false,
+            stopped_risky_probe: false,
+            initial_cwnd: cwnd,
+            prior_cwnd: cwnd,
+            ack_epoch: now,
+            ack_epoch_bytes: 0,
+            extra_acked: VecDeque::new(),
+            idle_restart: false,
             probe_done: None,
             probe_min: None,
             recovery_until: None,
             loss_ceiling: None,
-            round_acked: 0,
-            round_lost: 0,
+            last_ecn_round: None,
         })
+    }
+
+    pub(crate) fn checkpoint(&self) -> Undo {
+        Undo {
+            mode: self.mode, phase: self.phase,
+            cwnd: self.cwnd, prior_cwnd: self.prior_cwnd,
+            bandwidth_cap: self.bandwidth_cap, loss_ceiling: self.loss_ceiling,
+            inflight_longterm: self.inflight_longterm, recovery_until: self.recovery_until,
+        }
+    }
+
+    pub(crate) fn undo_loss(&mut self, old: Undo, now: Instant) {
+        // Do not rewind delivery accounting or min-RTT observations.
+        // None represents an unbounded model parameter.
+        fn restore(current: Option<u64>, saved: Option<u64>) -> Option<u64> {
+            current.zip(saved).map(|(a, b)| a.max(b))
+        }
+        self.bandwidth_cap = restore(self.bandwidth_cap, old.bandwidth_cap);
+        self.loss_ceiling = restore(self.loss_ceiling, old.loss_ceiling);
+        self.inflight_longterm = restore(self.inflight_longterm, old.inflight_longterm);
+        self.recovery_until = old.recovery_until;
+        self.loss_round_delivered = self.delivered;
+        self.loss_events_in_round = 0;
+        self.prev_probe_too_high = false;
+        self.prior_cwnd = self.prior_cwnd.max(old.prior_cwnd);
+        if self.mode != Mode::ProbeRtt {
+            self.cwnd = self.cwnd.max(old.cwnd).min(MAX_CWND);
+            if old.mode == Mode::Startup && self.mode != Mode::Startup {
+                self.mode = Mode::Startup;
+                self.full_pipe = false;
+                self.full_bw = 0;
+                self.plateau = 0;
+            } else if old.mode == Mode::ProbeBw && old.phase == ProbePhase::Up
+                && !(self.mode == Mode::ProbeBw && self.phase == ProbePhase::Up) {
+                self.mode = Mode::ProbeBw;
+                self.set_phase(ProbePhase::Refill, now);
+            }
+        }
+    }
+
+    pub(crate) fn discard(&mut self, tx: u64) {
+        self.samples.remove(&tx);
+        self.lost_samples.remove(&tx);
     }
 
     pub fn mode(&self) -> Mode {
         self.mode
     }
+    pub(crate) fn set_mtu(&mut self, mtu: u64) {
+        self.mtu = mtu;
+        self.cwnd = self.cwnd.max(4 * mtu);
+        self.loss_ceiling = self.loss_ceiling.map(|limit| limit.max(4 * mtu));
+        self.inflight_longterm = self.inflight_longterm.map(|limit| limit.max(4 * mtu));
+    }
+
+    /// Conservative CE response, at most once per packet-timed round.
+    /// This does not claim BBRv3 ECN/L4S conformance.
+    pub(crate) fn persistent_congestion(&mut self, now: Instant) {
+        let floor = 4 * self.mtu;
+        self.cwnd = floor;
+        self.loss_ceiling = Some(floor);
+        self.inflight_longterm = Some(floor);
+        self.prior_cwnd = floor;
+        self.bound_bandwidth();
+        self.full_pipe = true;
+        self.recovery_until = self.last_sent;
+        self.mode = Mode::ProbeBw;
+        self.set_phase(ProbePhase::Down, now);
+    }
+
+    pub(crate) fn ecn_congestion(&mut self, now: Instant) {
+        if self.last_ecn_round == Some(self.round) { return; }
+        self.last_ecn_round = Some(self.round);
+        let bound = (self.cwnd.saturating_mul(7) / 10).max(4 * self.mtu);
+        if self.is_probing() {
+            self.inflight_longterm = Some(self.inflight_longterm.map_or(bound, |old| old.min(bound)));
+        }
+        self.loss_ceiling = Some(self.loss_ceiling.map_or(bound, |old| old.min(bound)));
+        self.cwnd = self.cwnd.min(bound);
+        self.bound_bandwidth();
+        if self.mode == Mode::ProbeBw { self.set_phase(ProbePhase::Down, now); }
+        if self.mode == Mode::Startup {
+            self.full_pipe = true;
+            self.mode = Mode::Drain;
+        }
+    }
+
     pub fn cwnd(&self) -> u64 {
         self.cwnd
     }
@@ -127,8 +286,19 @@ impl Bbr {
             .max(Duration::from_micros(1))
     }
 
-    fn bdp(&self) -> u64 {
+    fn phase_cycle(&self) -> u64 { self.cycle }
+
+    fn is_probing(&self) -> bool {
+        self.mode == Mode::Startup || (self.mode == Mode::ProbeBw && matches!(self.phase, ProbePhase::Refill | ProbePhase::Up))
+    }
+
+    fn effective_bw(&self) -> u64 {
         let bw = self.bandwidth();
+        bw.min(self.bandwidth_cap.unwrap_or(MAX_RATE))
+    }
+
+    fn bdp(&self) -> u64 {
+        let bw = self.effective_bw();
         if bw == 0 {
             return self.cwnd;
         }
@@ -138,20 +308,21 @@ impl Bbr {
     fn gain(&self) -> f64 {
         match self.mode {
             Mode::Startup => HIGH_GAIN,
-            Mode::Drain => 1.0 / HIGH_GAIN,
-            Mode::ProbeBw => BW_GAINS[self.cycle],
+            Mode::Drain => DRAIN_GAIN,
+            Mode::ProbeBw => self.phase.gain(),
             Mode::ProbeRtt => 1.0,
         }
     }
 
     pub fn pacing_rate(&self) -> u64 {
-        let bw = self.bandwidth();
+        let bw = self.effective_bw();
         let base = if bw == 0 {
             rate(self.cwnd, self.rtt())
         } else {
             bw
         };
-        ((base as f64 * self.gain()) as u64).clamp(1, MAX_RATE)
+        let gain = if self.idle_restart && self.mode == Mode::ProbeBw { 1.0 } else { self.gain() };
+        ((base as f64 * gain * 0.99) as u64).clamp(1, MAX_RATE)
     }
 
     pub fn pacing_interval(&self, bytes: u64) -> Duration {
@@ -170,7 +341,7 @@ impl Bbr {
         app_limited: bool,
     ) -> Result<(), Error> {
         if bytes == 0
-            || bytes > self.mtu
+            || bytes > self.mtu.max(super::mtu::MAX_UDP_PAYLOAD as u64)
             || self.samples.len() >= MAX_SAMPLES
             || self.last_sent.is_some_and(|last| number <= last)
         {
@@ -180,8 +351,11 @@ impl Bbr {
             return Err(Error::Clock);
         }
         if before == 0 {
+            self.idle_restart = app_limited;
             self.first_sent_at = now;
             self.delivered_at = now;
+            self.ack_epoch = now;
+            self.ack_epoch_bytes = 0;
         }
         if app_limited {
             self.app_limited_until = self
@@ -195,7 +369,10 @@ impl Bbr {
                 delivered_at: self.delivered_at,
                 first_sent_at: self.first_sent_at,
                 sent_at: now,
-                app_limited: self.delivered < self.app_limited_until,
+                app_limited: self.delivered < self.app_limited_until || self.mode == Mode::ProbeRtt,
+                tx_in_flight: before.saturating_add(bytes),
+                lost_at_send: self.total_lost,
+                probe_id: (self.mode == Mode::ProbeBw && matches!(self.phase, ProbePhase::Refill | ProbePhase::Up)).then_some(self.probe_id),
             },
         );
         self.last_sent = Some(number);
@@ -214,8 +391,10 @@ impl Bbr {
         if now < self.delivered_at {
             return Err(Error::Clock);
         }
+        if outcome.acknowledged.is_empty() && outcome.lost.is_empty() && outcome.late_acknowledged.is_empty() { return Ok(()); }
         let mut sample: Option<Sample> = None;
         let mut highest = None;
+        let mut delivered_bytes = outcome.acknowledged_bytes;
         for packet in &outcome.acknowledged {
             if !packet.in_flight {
                 continue;
@@ -234,9 +413,40 @@ impl Bbr {
             }
             highest = Some(highest.map_or(packet.number, |old: u64| old.max(packet.number)));
         }
+        // A late ACK is evidence of delivery, not a second release of
+        // flight credit or an instruction to grow the congestion window.
+        for packet in &outcome.late_acknowledged {
+            if let Some(value) = self.lost_samples.remove(&packet.number) {
+                if now < value.sent_at { return Err(Error::Clock); }
+                delivered_bytes = delivered_bytes.saturating_add(u64::from(packet.bytes));
+                if sample.is_none_or(|old| (value.delivered, value.sent_at) > (old.delivered, old.sent_at)) {
+                    sample = Some(value);
+                }
+                highest = Some(highest.map_or(packet.number, |old: u64| old.max(packet.number)));
+            }
+        }
+        let mut probe_flight = None;
+        let mut new_loss_events = 0u32;
+        let idle_restart = self.idle_restart;
         for packet in &outcome.lost {
-            if packet.in_flight && self.samples.remove(&packet.number).is_none() {
-                return Err(Error::Accounting);
+            if packet.in_flight {
+                let lost = self.samples.remove(&packet.number).ok_or(Error::Accounting)?;
+                self.lost_samples.insert(packet.number, lost);
+                if self.lost_samples.len() > MAX_SAMPLES { self.lost_samples.pop_first(); }
+                if !packet.frames.contains(&super::loss::FrameRef::MtuProbe) {
+                    self.total_lost = self.total_lost.saturating_add(u64::from(packet.bytes));
+                    new_loss_events = new_loss_events.saturating_add(1);
+                    let since_send = self.total_lost.saturating_sub(lost.lost_at_send);
+                    if self.check_probe_loss && lost.probe_id == Some(self.probe_id)
+                        && u128::from(since_send) * 50 > u128::from(lost.tx_in_flight) {
+                        self.check_probe_loss = false;
+                        self.prev_probe_too_high = true;
+                        if !lost.app_limited {
+                            let flight = inflight_at_loss(lost.tx_in_flight, since_send, u64::from(packet.bytes));
+                            probe_flight = Some(flight);
+                        }
+                    }
+                }
             }
         }
         if outcome.acknowledged_bytes != 0 && sample.is_none() {
@@ -244,75 +454,106 @@ impl Bbr {
         }
         let mut round_start = false;
         let mut nonlimited_rate = None;
+        let mut measured_rate = 0;
+        let mut delivered_sample = 0;
+        let mut sample_prior_delivered = None;
         if let Some(sample) = sample {
+            sample_prior_delivered = Some(sample.delivered);
             self.delivered = self
                 .delivered
-                .checked_add(outcome.acknowledged_bytes)
+                .checked_add(delivered_bytes)
                 .ok_or(Error::Limit)?;
             self.delivered_at = now;
+            self.idle_restart = false;
+            self.first_sent_at = self.first_sent_at.max(sample.sent_at);
             if sample.delivered >= self.next_round {
                 self.round = self.round.checked_add(1).ok_or(Error::Limit)?;
                 self.next_round = self.delivered;
                 round_start = true;
             }
-            self.bandwidth
-                .retain(|(round, _)| self.round.saturating_sub(*round) < 10);
+            // Keep the max filter bounded; cycle aging occurs at ProbeBW_DOWN.
+            self.extra_acked.retain(|(round, _)| self.round.saturating_sub(*round) < 10);
             let elapsed = now
                 .duration_since(sample.delivered_at)
                 .max(sample.sent_at.duration_since(sample.first_sent_at));
-            if !elapsed.is_zero() {
+            if !elapsed.is_zero() && self.min_rtt.is_none_or(|minimum| elapsed >= minimum) {
                 let delivered = self
                     .delivered
                     .checked_sub(sample.delivered)
                     .ok_or(Error::Accounting)?;
                 let measured = rate(delivered, elapsed);
+                measured_rate = measured;
+                delivered_sample = delivered;
                 if !sample.app_limited || measured >= self.bandwidth() {
+                    let cycle = self.phase_cycle();
                     if let Some((round, best)) = self.bandwidth.back_mut() {
-                        if *round == self.round {
+                        if *round == cycle {
                             *best = (*best).max(measured);
                         } else {
-                            self.bandwidth.push_back((self.round, measured));
+                            self.bandwidth.push_back((cycle, measured));
                         }
                     } else {
-                        self.bandwidth.push_back((self.round, measured));
+                        self.bandwidth.push_back((cycle, measured));
                     }
                 }
                 if !sample.app_limited {
+                    self.cycle_nonlimited = true;
                     nonlimited_rate = Some(measured);
                 }
             }
         }
-        // A bounded loss signal complements the delivery-rate estimate. It is
-        // deliberately conservative and does not claim the full v3 model.
-        self.round_acked = self.round_acked.saturating_add(outcome.acknowledged_bytes);
-        self.round_lost = self.round_lost.saturating_add(outcome.lost_bytes);
+        let probe_lost = outcome.lost.iter().filter(|p| p.frames.contains(&super::loss::FrameRef::MtuProbe)).map(|p| u64::from(p.bytes)).sum::<u64>();
+        let congestion_lost = outcome.lost_bytes.saturating_sub(probe_lost);
         let floor = 4 * self.mtu;
-        let observed = self.round_acked.saturating_add(self.round_lost);
-        if observed >= 4 * self.mtu && u128::from(self.round_lost) * 50 > u128::from(observed) {
-            let bound = (self.cwnd.saturating_mul(7) / 10).max(floor);
-            self.loss_ceiling = Some(self.loss_ceiling.map_or(bound, |old| old.min(bound)));
-            if self.mode == Mode::Startup {
-                self.full_pipe = true;
-                self.mode = Mode::Drain;
+        self.bw_latest = self.bw_latest.max(measured_rate);
+        self.inflight_latest = self.inflight_latest.max(delivered_sample);
+        // Packet-timed rounds used by startup and loss rounds are distinct.
+        // Start a loss round at the delivery boundary of its first loss.
+        let loss_round_start = sample_prior_delivered.is_some_and(|prior| prior >= self.loss_round_delivered);
+        if loss_round_start {
+            if self.loss_events_in_round != 0 && !self.is_probing() {
+                let old = self.loss_ceiling.unwrap_or(self.cwnd);
+                self.loss_ceiling = Some((old.saturating_mul(7) / 10).max(self.inflight_latest).clamp(floor, MAX_CWND));
+                self.bound_bandwidth();
             }
-            self.round_acked = 0;
-            self.round_lost = 0;
-        } else if round_start {
-            if self.round_lost == 0 {
-                if let Some(old) = self.loss_ceiling {
-                    self.loss_ceiling = Some(old.saturating_add(self.mtu).min(MAX_CWND));
+            self.loss_round_delivered = self.delivered;
+            self.loss_events_in_round = 0;
+            self.bw_latest = measured_rate;
+            self.inflight_latest = delivered_sample;
+        }
+        if new_loss_events != 0 {
+            if self.loss_events_in_round == 0 { self.loss_round_delivered = self.delivered; }
+            self.loss_events_in_round = self.loss_events_in_round.saturating_add(new_loss_events);
+        }
+        if let Some(flight) = probe_flight {
+            let bound = flight.max(self.bdp().saturating_mul(7) / 10).clamp(floor, MAX_CWND);
+            self.inflight_longterm = Some(bound);
+        }
+        if self.prev_probe_too_high && !self.check_probe_loss && self.mode == Mode::ProbeBw && self.phase == ProbePhase::Up {
+            self.set_phase(ProbePhase::Down, now);
+        }
+        // Startup exit requires both several loss indications and evidence
+        // that the outstanding volume is too high, not a single small loss.
+        if self.mode == Mode::Startup && self.loss_events_in_round >= 6 {
+            if let Some(sample) = sample.filter(|sample| !sample.app_limited) {
+                let lost = self.total_lost.saturating_sub(sample.lost_at_send);
+                if u128::from(lost) * 50 > u128::from(sample.tx_in_flight) {
+                    self.inflight_longterm = Some(self.bdp().max(floor));
+                    self.full_pipe = true;
+                    self.mode = Mode::Drain;
                 }
             }
-            self.round_acked = 0;
-            self.round_lost = 0;
         }
+        self.update_ack_aggregation(now, delivered_bytes);
+        // Draft -07 uses a single ten-second min-RTT filter, with the
+        // ProbeRTT window frozen from the BDP before its expiration.
         let expired = now.saturating_duration_since(self.min_stamp) >= MIN_RTT_TTL;
         if let Some(rtt) = outcome.rtt_sample.map(|r| r.max(Duration::from_micros(1))) {
-            if self.min_rtt.is_none_or(|old| rtt <= old) {
+            if self.min_rtt.is_none_or(|old| rtt <= old) || (expired && idle_restart && self.mode != Mode::ProbeRtt) {
                 self.min_rtt = Some(rtt);
                 self.min_stamp = now;
             }
-            if self.mode == Mode::ProbeRtt {
+            if self.mode == Mode::ProbeRtt && self.probe_done.is_some() {
                 self.probe_min = Some(self.probe_min.map_or(rtt, |old| old.min(rtt)));
             }
         }
@@ -332,21 +573,35 @@ impl Bbr {
         }
         if self.mode == Mode::Drain && in_flight <= self.bdp() {
             self.enter_probe_bw(now);
-        } else if self.mode == Mode::ProbeBw
-            && round_start
-            && now.saturating_duration_since(self.cycle_at) >= self.rtt()
-        {
-            self.cycle = (self.cycle + 1) % BW_GAINS.len();
-            self.cycle_at = now;
+        } else if self.mode == Mode::ProbeBw {
+            if self.phase == ProbePhase::Up {
+                if sample.is_some_and(|s| !s.app_limited && s.tx_in_flight.saturating_add(self.mtu) >= self.cwnd) {
+                    self.probe_up_acked = self.probe_up_acked.saturating_add(outcome.acknowledged_bytes);
+                }
+                if round_start {
+                    if let Some(measured) = nonlimited_rate {
+                        if self.probe_full_bw == 0 || u128::from(measured) * 4 >= u128::from(self.probe_full_bw) * 5 {
+                            self.probe_full_bw = measured;
+                            self.probe_plateau = 0;
+                        } else {
+                            self.probe_plateau = self.probe_plateau.saturating_add(1);
+                        }
+                    }
+                }
+            }
+            self.advance_probe(now, in_flight, round_start, congestion_lost != 0);
         }
-        if expired && self.min_stamp != now && sample.is_some() && self.mode != Mode::ProbeRtt {
+        if expired && self.min_stamp != now && sample.is_some() && !idle_restart && self.mode != Mode::ProbeRtt {
+            self.probe_rtt_cap = Some(self.probe_rtt_cwnd());
+            self.prior_cwnd = self.cwnd;
             self.mode = Mode::ProbeRtt;
             self.probe_done = None;
             self.probe_min = None;
         }
         let floor = 4 * self.mtu;
         if self.mode == Mode::ProbeRtt {
-            if in_flight <= floor && self.probe_done.is_none() {
+            if in_flight <= self.probe_rtt_cwnd() && self.probe_done.is_none() {
+                self.probe_min = None;
                 self.probe_done = Some((
                     now.checked_add(PROBE_RTT_TIME).ok_or(Error::Clock)?,
                     self.round,
@@ -356,6 +611,8 @@ impl Bbr {
                 if now >= end && self.round > round && self.probe_min.is_some() {
                     self.min_rtt = self.probe_min.take();
                     self.min_stamp = now;
+                    self.probe_rtt_cap = None;
+                    self.cwnd = self.cwnd.max(self.prior_cwnd);
                     self.probe_done = None;
                     if self.full_pipe {
                         self.enter_probe_bw(now);
@@ -371,46 +628,165 @@ impl Bbr {
         {
             self.recovery_until = None;
         }
-        if outcome.lost_bytes != 0 {
+        if congestion_lost != 0 {
             self.recovery_until = self.last_sent;
-            self.cwnd = self.cwnd.saturating_sub(outcome.lost_bytes).max(floor);
+            self.cwnd = self.cwnd.saturating_sub(congestion_lost).max(floor);
         }
-        let target = self
-            .bdp()
-            .saturating_mul(2)
-            .clamp(floor, MAX_CWND)
-            .min(self.loss_ceiling.unwrap_or(MAX_CWND));
+        let target = self.target_cwnd();
         self.cwnd = if self.mode == Mode::ProbeRtt {
-            floor
+            self.probe_rtt_cwnd().min(target)
         } else if self.full_pipe {
             self.cwnd
                 .saturating_add(outcome.acknowledged_bytes)
                 .min(target)
                 .max(floor)
-        } else if self.cwnd < target {
+        } else if self.cwnd < target || self.delivered < self.initial_cwnd {
             self.cwnd
                 .saturating_add(outcome.acknowledged_bytes)
                 .min(MAX_CWND)
         } else {
             self.cwnd
         };
-        if self.recovery_until.is_some() {
-            self.cwnd = self.cwnd.min(
-                in_flight
-                    .saturating_add(outcome.acknowledged_bytes)
-                    .max(floor),
-            );
+        if self.full_pipe { self.cwnd = self.cwnd.min(target); }
+        if self.recovery_until.is_some() && self.mode != Mode::ProbeRtt {
+            // Packet conservation during recovery, within the model's
+            // independently computed bounds; PTO remains a separate exception.
+            self.cwnd = self.cwnd.max(in_flight.saturating_add(outcome.acknowledged_bytes).max(floor)).min(target);
         }
         Ok(())
     }
 
+    fn probe_rtt_cwnd(&self) -> u64 { self.probe_rtt_cap.unwrap_or_else(|| self.bdp() / 2).clamp(4 * self.mtu, MAX_CWND) }
+
+    fn longterm_limit(&self) -> u64 {
+        let bound = self.inflight_longterm.unwrap_or(MAX_CWND);
+        if self.mode == Mode::ProbeRtt || (self.mode == Mode::ProbeBw && self.phase == ProbePhase::Cruise) {
+            if self.inflight_longterm.is_some() { return (bound.saturating_mul(85) / 100).max(4 * self.mtu); }
+        }
+        bound
+    }
+
+    fn target_cwnd(&self) -> u64 {
+        let bdp = self.bdp();
+        let base = if self.mode == Mode::ProbeBw && self.phase == ProbePhase::Up {
+            bdp.saturating_mul(9) / 4
+        } else if self.mode == Mode::ProbeRtt { self.probe_rtt_cwnd() } else { bdp.saturating_mul(2) };
+        let extra = if self.mode == Mode::ProbeRtt { 0 } else { self.extra_acked.iter().map(|(_, v)| *v).max().unwrap_or(0) };
+        let short = self.loss_ceiling.unwrap_or(MAX_CWND);
+        // Socket I/O currently emits individual packets rather than GSO.
+        // Two packet quantum with a three-quantum offload budget avoids
+        // starving ACK-clocked traffic on very small BDP paths.
+        let offload_budget = if self.mode == Mode::ProbeRtt { 0 } else { 6 * self.mtu };
+        base.saturating_add(extra).max(offload_budget).max(4 * self.mtu)
+            .min(self.longterm_limit()).min(short).clamp(4 * self.mtu, MAX_CWND)
+    }
+
+    fn update_ack_aggregation(&mut self, now: Instant, acked: u64) {
+        if acked == 0 || self.effective_bw() == 0 { return; }
+        let expected = (u128::from(self.effective_bw()) * now.saturating_duration_since(self.ack_epoch).as_nanos() / 1_000_000_000).min(u128::from(u64::MAX)) as u64;
+        if self.ack_epoch_bytes <= expected {
+            self.ack_epoch = now;
+            self.ack_epoch_bytes = acked;
+        } else {
+            self.ack_epoch_bytes = self.ack_epoch_bytes.saturating_add(acked);
+        }
+        let expected = if self.ack_epoch == now { 0 } else { expected };
+        let extra = self.ack_epoch_bytes.saturating_sub(expected).min(self.cwnd).min(self.bandwidth() / 10);
+        if let Some((round, value)) = self.extra_acked.back_mut() {
+            if *round == self.round { *value = (*value).max(extra); return; }
+        }
+        self.extra_acked.push_back((self.round, extra));
+    }
+
+    fn bound_bandwidth(&mut self) {
+        let bw = self.bandwidth();
+        if bw != 0 {
+            let old = self.bandwidth_cap.unwrap_or(bw);
+            self.bandwidth_cap = Some((old.saturating_mul(7) / 10).max(self.bw_latest).max(1).min(bw));
+        }
+    }
+
+    fn set_phase(&mut self, phase: ProbePhase, now: Instant) {
+        if self.phase == ProbePhase::Up && phase == ProbePhase::Down && self.cycle_nonlimited {
+            self.cycle = self.cycle.saturating_add(1);
+            let cycle = self.cycle;
+            self.bandwidth.retain(|(old, _)| cycle.saturating_sub(*old) < 2);
+            self.cycle_nonlimited = false;
+        }
+        self.phase = phase;
+        self.phase_at = now;
+        self.phase_round = self.round;
+        if phase == ProbePhase::Down {
+            // Randomize the next probe wait across flows without relying on
+            // a global clock, with a conservative bounded RNG failure value.
+            use ring::rand::{SecureRandom, SystemRandom};
+            let mut random = [0; 2];
+            let jitter = if SystemRandom::new().fill(&mut random).is_ok() {
+                u16::from_ne_bytes(random) as u64 % 1001
+            } else { 500 };
+            self.probe_wait = Duration::from_millis(2000 + jitter);
+        }
+        if phase == ProbePhase::Refill {
+            self.bandwidth_cap = None;
+            self.loss_ceiling = None;
+            self.loss_round_delivered = self.delivered;
+            self.loss_events_in_round = 0;
+            self.probe_id = self.probe_id.saturating_add(1);
+            self.check_probe_loss = true;
+            self.stopped_risky_probe = false;
+        }
+        if phase == ProbePhase::Up {
+            self.probe_up_rounds = 0;
+            self.probe_up_acked = 0;
+            self.probe_full_bw = self.bandwidth();
+            self.probe_plateau = 0;
+        }
+    }
+
+    fn advance_probe(&mut self, now: Instant, in_flight: u64, round_start: bool, lost: bool) {
+        let elapsed = now.saturating_duration_since(self.phase_at);
+        let new_round = round_start && self.round > self.phase_round;
+        if self.phase == ProbePhase::Up && !lost && !self.prev_probe_too_high {
+            if let Some(limit) = self.inflight_longterm.as_mut() {
+                let divisor = 1u64 << self.probe_up_rounds.min(16);
+                let step = (self.cwnd / divisor).max(self.mtu);
+                let count = self.probe_up_acked / step;
+                self.probe_up_acked %= step;
+                *limit = limit.saturating_add(count.saturating_mul(self.mtu)).min(MAX_CWND);
+            }
+            if new_round { self.probe_up_rounds = self.probe_up_rounds.saturating_add(1); }
+        }
+        let headroom = self.inflight_longterm.map_or(MAX_CWND, |v| (v * 85 / 100).max(4 * self.mtu));
+        match self.phase {
+            ProbePhase::Down if in_flight <= self.bdp() && in_flight <= headroom => self.set_phase(ProbePhase::Cruise, now),
+            ProbePhase::Cruise if new_round && !lost && (self.stopped_risky_probe || elapsed >= self.probe_wait || self.round.saturating_sub(self.phase_round) >= (self.bdp() / self.mtu).clamp(2, 63)) => self.set_phase(ProbePhase::Refill, now),
+            ProbePhase::Refill if lost => self.set_phase(ProbePhase::Down, now),
+            ProbePhase::Refill if new_round => self.set_phase(ProbePhase::Up, now),
+            ProbePhase::Up if self.prev_probe_too_high && self.inflight_longterm.is_some_and(|limit| in_flight >= limit) => {
+                self.stopped_risky_probe = true;
+                self.prev_probe_too_high = false;
+                self.set_phase(ProbePhase::Down, now);
+            }
+            ProbePhase::Up if (!self.check_probe_loss && lost) || self.probe_plateau >= 3 || (new_round && elapsed >= self.rtt() && in_flight >= self.bdp().saturating_mul(5) / 4) => {
+                self.set_phase(ProbePhase::Down, now);
+            }
+            _ => {}
+        }
+    }
+
     fn enter_probe_bw(&mut self, now: Instant) {
         self.mode = Mode::ProbeBw;
-        // Start in neutral cruise. A future production controller should
-        // randomize the probe epoch and implement the current v3 loss bounds.
-        self.cycle = 2;
-        self.cycle_at = now;
+        self.set_phase(ProbePhase::Down, now);
     }
+}
+
+/// Estimate the flight at which cumulative losses crossed 2%. For a
+/// single datagram this is bounded by the actual flight before/after it.
+fn inflight_at_loss(flight: u64, lost: u64, size: u64) -> u64 {
+    let before = flight.saturating_sub(size);
+    let earlier_loss = lost.saturating_sub(size);
+    let threshold = (u128::from(before).saturating_sub(u128::from(earlier_loss) * 50)).div_ceil(49);
+    before.saturating_add((threshold.min(u128::from(size))) as u64)
 }
 
 fn rate(bytes: u64, elapsed: Duration) -> u64 {
@@ -461,6 +837,128 @@ mod tests {
         assert_eq!(bbr.bandwidth(), 12_000);
         assert!(bbr.cwnd() >= 4800);
         assert!(bbr.pacing_interval(1200) > Duration::ZERO);
+    }
+
+    #[test]
+    fn four_probe_phases_and_ecn_bound_pacing_once_per_round() {
+        let now = Instant::now();
+        let mut b = Bbr::new(1200, now).unwrap();
+        b.full_pipe = true;
+        b.bandwidth.push_back((0, 120_000));
+        b.min_rtt = Some(Duration::from_millis(100));
+        b.enter_probe_bw(now);
+        assert_eq!(b.phase, ProbePhase::Down);
+        b.advance_probe(now, 0, false, false);
+        assert_eq!(b.phase, ProbePhase::Cruise);
+        let refill = now + b.probe_wait;
+        b.round += 1;
+        b.advance_probe(refill, 0, true, false);
+        assert_eq!(b.phase, ProbePhase::Refill);
+        b.round += 1;
+        b.advance_probe(refill + Duration::from_millis(100), 0, true, false);
+        assert_eq!(b.phase, ProbePhase::Up);
+        let rate = b.pacing_rate();
+        b.ecn_congestion(refill + Duration::from_millis(200));
+        assert_eq!(b.phase, ProbePhase::Down);
+        assert!(b.pacing_rate() < rate);
+        let cwnd = b.cwnd();
+        b.ecn_congestion(refill + Duration::from_millis(201));
+        assert_eq!(b.cwnd(), cwnd);
+        b.persistent_congestion(refill + Duration::from_secs(1));
+        assert_eq!(b.cwnd(), 4800);
+        assert_eq!(b.loss_ceiling, Some(4800));
+    }
+
+    #[test]
+    fn loss_threshold_uses_send_time_flight_and_bounds_packet_prefix() {
+        assert_eq!(inflight_at_loss(50_000, 1200, 1200), 49_796);
+        assert_eq!(inflight_at_loss(50_000, 2400, 1200), 48_800);
+        assert_eq!(inflight_at_loss(1200, 1200, 1200), 0);
+        let now = Instant::now();
+        let mut b = Bbr::new(1200, now).unwrap();
+        b.min_rtt = Some(Duration::from_millis(100));
+        b.bandwidth.push_back((0, 1_000_000));
+        b.mode = Mode::ProbeBw;
+        b.set_phase(ProbePhase::Refill, now);
+        b.set_phase(ProbePhase::Up, now);
+        b.sent(0, 1200, now, 48_000, false).unwrap();
+        b.feedback(&Outcome { lost: vec![packet(0, now)], lost_bytes: 1200, ..Outcome::default() }, now + Duration::from_millis(100), 0).unwrap();
+        assert_eq!(b.inflight_longterm, Some(70_000));
+        assert!(!b.check_probe_loss);
+    }
+
+    #[test]
+    fn probe_rtt_uses_pre_expiry_bdp_and_ten_second_filter() {
+        let now = Instant::now();
+        let mut b = Bbr::new(1200, now).unwrap();
+        b.min_rtt = Some(Duration::from_millis(100));
+        b.bandwidth.push_back((0, 1_000_000));
+        ack(&mut b, 0, now + Duration::from_secs(6), Duration::from_millis(150), false);
+        assert_ne!(b.mode(), Mode::ProbeRtt);
+        ack(&mut b, 1, now + Duration::from_secs(11), Duration::from_millis(200), false);
+        assert_eq!(b.mode(), Mode::ProbeRtt);
+        assert_eq!(b.probe_rtt_cwnd(), 50_000);
+        b.bandwidth.push_back((1, 2_000_000));
+        assert_eq!(b.probe_rtt_cwnd(), 50_000);
+    }
+
+    #[test]
+    fn application_limited_probe_does_not_age_out_bandwidth() {
+        let now = Instant::now();
+        let mut b = Bbr::new(1200, now).unwrap();
+        b.bandwidth.push_back((0, 100_000));
+        b.mode = Mode::ProbeBw;
+        for _ in 0..4 {
+            b.set_phase(ProbePhase::Up, now);
+            b.set_phase(ProbePhase::Down, now);
+        }
+        assert_eq!(b.bandwidth(), 100_000);
+        assert_eq!(b.cycle, 0);
+        b.set_phase(ProbePhase::Up, now);
+        b.cycle_nonlimited = true;
+        b.probe_plateau = 3;
+        b.advance_probe(now, 0, false, false);
+        assert_eq!(b.phase, ProbePhase::Down);
+        assert_eq!(b.cycle, 1);
+    }
+
+    #[test]
+    fn late_ack_counts_delivery_once_without_resurrecting_flight() {
+        let now = Instant::now();
+        let mut b = Bbr::new(1200, now).unwrap();
+        let rtt = Duration::from_millis(100);
+        b.sent(0, 1200, now, 0, false).unwrap();
+        b.feedback(&Outcome { lost: vec![packet(0, now)], lost_bytes: 1200, ..Outcome::default() }, now + rtt, 0).unwrap();
+        assert_eq!(b.delivered, 0);
+        let late = Outcome { late_acknowledged: vec![packet(0, now)], ..Outcome::default() };
+        b.feedback(&late, now + rtt * 2, 0).unwrap();
+        assert_eq!(b.delivered, 1200);
+        assert!(b.lost_samples.is_empty());
+        b.feedback(&late, now + rtt * 3, 0).unwrap();
+        assert_eq!(b.delivered, 1200);
+    }
+
+    #[test]
+    fn short_term_bounds_reset_on_refill_but_long_term_and_headroom_remain() {
+        let now = Instant::now();
+        let mut b = Bbr::new(1200, now).unwrap();
+        b.full_pipe = true;
+        b.bandwidth.push_back((0, 1_200_000));
+        b.min_rtt = Some(Duration::from_millis(100));
+        b.mode = Mode::ProbeBw;
+        b.phase = ProbePhase::Cruise;
+        b.bandwidth_cap = Some(600_000);
+        b.loss_ceiling = Some(40_000);
+        b.inflight_longterm = Some(80_000);
+        assert_eq!(b.effective_bw(), 600_000);
+        assert_eq!(b.target_cwnd(), 40_000);
+        b.set_phase(ProbePhase::Refill, now);
+        assert_eq!(b.effective_bw(), 1_200_000);
+        assert_eq!(b.loss_ceiling, None);
+        assert_eq!(b.target_cwnd(), 80_000);
+        b.set_phase(ProbePhase::Cruise, now);
+        assert_eq!(b.target_cwnd(), 68_000);
+        assert_eq!(b.probe_rtt_cwnd(), 60_000);
     }
 
     #[test]
