@@ -214,4 +214,43 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn actual_udp_handshake_and_stream_v1_v2() {
+        use crate::quic_core::handshake_udp::{establish, Config};
+        use std::time::{Duration, Instant};
+        use tokio::net::UdpSocket;
+
+        for version in [Version::V1, Version::V2] {
+            let (cc, mut sc) = configs();
+            sc.send_tls13_tickets = 0;
+            let ca = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let sa = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let caddr = ca.local_addr().unwrap();
+            let saddr = sa.local_addr().unwrap();
+            let (c, s) = tokio::join!(
+                establish(ca, saddr, version, [1; 8], [2; 8], Config::Client {
+                    tls: Arc::new(cc), name: ServerName::try_from("localhost").unwrap(),
+                }),
+                establish(sa, caddr, version, [2; 8], [1; 8], Config::Server(Arc::new(sc))),
+            );
+            let mut c = c.unwrap();
+            let mut s = s.unwrap();
+            let stream = c.open_uni().unwrap();
+            c.queue(stream, b"udp handshake", true).unwrap();
+            assert!(c.flush(Instant::now()).await.unwrap());
+            // A final handshake ACK may remain in the connected socket.
+            for _ in 0..8 {
+                s.recv(Duration::from_millis(100)).await.unwrap();
+                if s.finished(stream) { break; }
+                let mut out = [0; 13];
+                if s.read(stream, &mut out).ok() == Some(13) {
+                    assert_eq!(&out, b"udp handshake");
+                    assert!(s.finished(stream));
+                    break;
+                }
+            }
+            assert!(s.finished(stream));
+        }
+    }
+
 }
