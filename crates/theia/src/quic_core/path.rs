@@ -2,13 +2,13 @@
 //! routing is performed here. Only authenticated packets may call the
 //! receive/challenge methods; Initial AEAD alone is not authentication.
 use super::recovery::PathBudget;
-use subtle::ConstantTimeEq;
 use ring::rand::{SecureRandom, SystemRandom};
 use std::{
     collections::BTreeMap,
     net::SocketAddr,
     time::{Duration, Instant},
 };
+use subtle::ConstantTimeEq;
 
 const MAX_CIDS: usize = 8;
 const CHALLENGE_TTL: Duration = Duration::from_secs(3);
@@ -56,16 +56,29 @@ impl PeerIds {
 
     /// Seed sequence zero from the authenticated handshake. An absent
     /// reset token is not replaced with a guessed or synthetic token.
-    pub(crate) fn with_initial(cid: &[u8], token: Option<[u8; 16]>, limit: usize) -> Result<Self, Error> {
-        if cid.is_empty() || cid.len() > 20 { return Err(Error::Invalid); }
+    pub(crate) fn with_initial(
+        cid: &[u8],
+        token: Option<[u8; 16]>,
+        limit: usize,
+    ) -> Result<Self, Error> {
+        if cid.is_empty() || cid.len() > 20 {
+            return Err(Error::Invalid);
+        }
         let mut ids = Self::new(limit)?;
-        ids.initial = Some(InitialId { cid: cid.to_vec(), reset_token: token });
+        ids.initial = Some(InitialId {
+            cid: cid.to_vec(),
+            reset_token: token,
+        });
         Ok(ids)
     }
 
     pub(crate) fn current(&self) -> Option<&[u8]> {
-        if let Some(initial) = &self.initial { return Some(&initial.cid); }
-        self.entries.first_key_value().map(|(_, id)| id.cid.as_slice())
+        if let Some(initial) = &self.initial {
+            return Some(&initial.cid);
+        }
+        self.entries
+            .first_key_value()
+            .map(|(_, id)| id.cid.as_slice())
     }
 
     pub(crate) fn has_spare(&self) -> bool {
@@ -76,8 +89,12 @@ impl PeerIds {
     /// monotone floor prevents a retransmitted NEW_CONNECTION_ID from
     /// resurrecting a CID already used on a different physical path.
     pub(crate) fn rotate(&mut self) -> Option<u64> {
-        if !self.has_spare() { return None; }
-        let retired = if self.initial.take().is_some() { 0 } else {
+        if !self.has_spare() {
+            return None;
+        }
+        let retired = if self.initial.take().is_some() {
+            0
+        } else {
             self.entries.pop_first()?.0
         };
         self.floor = *self.entries.first_key_value()?.0;
@@ -87,11 +104,17 @@ impl PeerIds {
     /// Constant-time comparison of the trailing token against live peer
     /// CIDs. Caller must first rule out successful packet protection.
     pub(crate) fn matches_reset(&self, packet: &[u8]) -> bool {
-        if packet.len() < 21 || packet[0] & 0x80 != 0 { return false; }
-        let tail = &packet[packet.len()-16..];
+        if packet.len() < 21 || packet[0] & 0x80 != 0 {
+            return false;
+        }
+        let tail = &packet[packet.len() - 16..];
         // Do not match tokens belonging to spare, never-used or retired CIDs.
-        let token = if let Some(initial) = &self.initial { initial.reset_token.as_ref() } else {
-            self.entries.first_key_value().map(|(_, id)| &id.reset_token)
+        let token = if let Some(initial) = &self.initial {
+            initial.reset_token.as_ref()
+        } else {
+            self.entries
+                .first_key_value()
+                .map(|(_, id)| &id.reset_token)
         };
         token.is_some_and(|token| bool::from(token.as_slice().ct_eq(tail)))
     }
@@ -109,14 +132,20 @@ impl PeerIds {
         }
         if let Some(initial) = &mut self.initial {
             if id.sequence == 0 {
-                if initial.cid != id.cid || initial.reset_token.is_some_and(|old| old != id.reset_token)
-                    || self.entries.values().any(|old| old.reset_token == id.reset_token) {
+                if initial.cid != id.cid
+                    || initial.reset_token.is_some_and(|old| old != id.reset_token)
+                    || self
+                        .entries
+                        .values()
+                        .any(|old| old.reset_token == id.reset_token)
+                {
                     return Err(Error::Conflict);
                 }
                 initial.reset_token = Some(id.reset_token);
                 return Ok(Vec::new());
             }
-            if initial.cid == id.cid || initial.reset_token.is_some_and(|old| old == id.reset_token) {
+            if initial.cid == id.cid || initial.reset_token.is_some_and(|old| old == id.reset_token)
+            {
                 return Err(Error::Conflict);
             }
         }
@@ -146,7 +175,9 @@ impl PeerIds {
             .copied()
             .filter(|n| *n < floor)
             .collect();
-        if floor > 0 && self.initial.take().is_some() { retired.insert(0, 0); }
+        if floor > 0 && self.initial.take().is_some() {
+            retired.insert(0, 0);
+        }
         self.entries.retain(|n, _| *n >= floor);
         self.floor = floor;
         self.entries.insert(id.sequence, id);

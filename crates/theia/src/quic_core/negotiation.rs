@@ -40,17 +40,30 @@ pub struct VersionPolicy(Vec<Version>);
 
 impl VersionPolicy {
     pub fn new(versions: &[Version]) -> Result<Self, Error> {
-        if versions.is_empty() || versions.len() > 2 || (versions.len() == 2 && versions[0] == versions[1]) {
+        if versions.is_empty()
+            || versions.len() > 2
+            || (versions.len() == 2 && versions[0] == versions[1])
+        {
             return Err(Error::Context);
         }
         Ok(Self(versions.to_vec()))
     }
 
-    pub fn both() -> Self { Self(vec![Version::V1, Version::V2]) }
-    pub fn exact(version: Version) -> Self { Self(vec![version]) }
-    pub fn preferred(&self) -> Version { self.0[0] }
-    pub fn supports(&self, version: Version) -> bool { self.0.contains(&version) }
-    pub fn versions(&self) -> &[Version] { &self.0 }
+    pub fn both() -> Self {
+        Self(vec![Version::V1, Version::V2])
+    }
+    pub fn exact(version: Version) -> Self {
+        Self(vec![version])
+    }
+    pub fn preferred(&self) -> Version {
+        self.0[0]
+    }
+    pub fn supports(&self, version: Version) -> bool {
+        self.0.contains(&version)
+    }
+    pub fn versions(&self) -> &[Version] {
+        &self.0
+    }
     pub fn choose(&self, offered: &[Version]) -> Option<Version> {
         self.0.iter().copied().find(|v| offered.contains(v))
     }
@@ -59,29 +72,57 @@ impl VersionPolicy {
     /// compatible in-place negotiation; server lists fully deployed versions.
     pub(crate) fn information(&self, chosen: Version, server: bool) -> Vec<u8> {
         let mut out = chosen.wire().to_be_bytes().to_vec();
-        let available = if server { self.versions() } else { std::slice::from_ref(&chosen) };
-        for version in available { out.extend_from_slice(&version.wire().to_be_bytes()); }
+        let available = if server {
+            self.versions()
+        } else {
+            std::slice::from_ref(&chosen)
+        };
+        for version in available {
+            out.extend_from_slice(&version.wire().to_be_bytes());
+        }
         out
     }
 
     /// Validate the authenticated version_information TP, not just public
     /// VN bytes. A missing TP is never accepted after a native VN restart.
-    pub(crate) fn validate_information(&self, bytes: Option<&[u8]>, chosen: Version,
-        peer_server: bool, restarted: bool) -> Result<(), Error> {
-        let Some(bytes) = bytes else { return if restarted { Err(Error::Context) } else { Ok(()) }; };
+    pub(crate) fn validate_information(
+        &self,
+        bytes: Option<&[u8]>,
+        chosen: Version,
+        peer_server: bool,
+        restarted: bool,
+    ) -> Result<(), Error> {
+        let Some(bytes) = bytes else {
+            return if restarted {
+                Err(Error::Context)
+            } else {
+                Ok(())
+            };
+        };
         let (words, tail) = bytes.as_chunks::<4>();
-        if words.is_empty() || !tail.is_empty() || words.len() > 65 { return Err(Error::Invalid); }
+        if words.is_empty() || !tail.is_empty() || words.len() > 65 {
+            return Err(Error::Invalid);
+        }
         let mut numbers = words.iter().map(|word| u32::from_be_bytes(*word));
-        if numbers.next() != Some(chosen.wire()) { return Err(Error::Context); }
+        if numbers.next() != Some(chosen.wire()) {
+            return Err(Error::Context);
+        }
         let available: Vec<_> = numbers.collect();
         if available.contains(&0) || (!peer_server && !available.contains(&chosen.wire())) {
             return Err(Error::Invalid);
         }
         if peer_server && restarted {
-            if available.is_empty() { return Err(Error::Context); }
-            let mut candidates: Vec<_> = available.into_iter().filter_map(Version::from_wire).collect();
+            if available.is_empty() {
+                return Err(Error::Context);
+            }
+            let mut candidates: Vec<_> = available
+                .into_iter()
+                .filter_map(Version::from_wire)
+                .collect();
             candidates.push(chosen);
-            if self.choose(&candidates) != Some(chosen) { return Err(Error::Context); }
+            if self.choose(&candidates) != Some(chosen) {
+                return Err(Error::Context);
+            }
         }
         Ok(())
     }
@@ -394,10 +435,31 @@ mod version_policy_tests {
         let preferred = VersionPolicy::new(&[Version::V2, Version::V1]).unwrap();
         let v1 = VersionPolicy::exact(Version::V1);
         assert_eq!(preferred.choose(&[Version::V1]), Some(Version::V1));
-        assert_eq!(preferred.validate_information(Some(&v1.information(Version::V1, true)), Version::V1, true, true), Ok(()));
-        assert_eq!(preferred.validate_information(Some(&preferred.information(Version::V1, true)), Version::V1, true, true), Err(Error::Context));
-        assert_eq!(preferred.validate_information(None, Version::V1, true, true), Err(Error::Context));
-        assert!(preferred.validate_information(Some(&[0; 8]), Version::V1, false, false).is_err());
+        assert_eq!(
+            preferred.validate_information(
+                Some(&v1.information(Version::V1, true)),
+                Version::V1,
+                true,
+                true
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            preferred.validate_information(
+                Some(&preferred.information(Version::V1, true)),
+                Version::V1,
+                true,
+                true
+            ),
+            Err(Error::Context)
+        );
+        assert_eq!(
+            preferred.validate_information(None, Version::V1, true, true),
+            Err(Error::Context)
+        );
+        assert!(preferred
+            .validate_information(Some(&[0; 8]), Version::V1, false, false)
+            .is_err());
         assert!(VersionPolicy::new(&[Version::V1, Version::V1]).is_err());
     }
 }

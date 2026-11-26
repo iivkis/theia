@@ -58,7 +58,9 @@ pub struct Validator {
 }
 
 impl Validator {
-    pub fn state(&self) -> State { self.state }
+    pub fn state(&self) -> State {
+        self.state
+    }
 
     /// Count only packets actually transmitted with the indicated codepoint.
     pub fn sent(&mut self, mark: Mark) {
@@ -76,9 +78,18 @@ impl Validator {
 
     /// newly_marked counts distinct ECT(0), ECT(1) packets newly ACKed by
     /// the authenticated sent ledger. ACK reordering cannot disable ECN.
-    pub fn acknowledge(&mut self, largest: u64, newly_marked: [u64; 2], counts: Option<[u64; 3]>) -> Feedback {
-        if self.state == State::Failed { return Feedback::Failed; }
-        if self.largest.is_some_and(|old| largest <= old) { return Feedback::Ignored; }
+    pub fn acknowledge(
+        &mut self,
+        largest: u64,
+        newly_marked: [u64; 2],
+        counts: Option<[u64; 3]>,
+    ) -> Feedback {
+        if self.state == State::Failed {
+            return Feedback::Failed;
+        }
+        if self.largest.is_some_and(|old| largest <= old) {
+            return Feedback::Ignored;
+        }
         self.largest = Some(largest);
         let Some(counts) = counts else {
             if newly_marked != [0; 2] {
@@ -87,22 +98,38 @@ impl Validator {
             }
             return Feedback::Ignored;
         };
-        let invalid = counts.iter().zip(self.reported).any(|(&n, old)| n < old || n > MAX_VARINT)
-            || counts[0] > self.sent[0] || counts[1] > self.sent[1]
-            || counts.iter().map(|&n| u128::from(n)).sum::<u128>() > self.sent.iter().map(|&n| u128::from(n)).sum::<u128>();
+        let invalid = counts
+            .iter()
+            .zip(self.reported)
+            .any(|(&n, old)| n < old || n > MAX_VARINT)
+            || counts[0] > self.sent[0]
+            || counts[1] > self.sent[1]
+            || counts.iter().map(|&n| u128::from(n)).sum::<u128>()
+                > self.sent.iter().map(|&n| u128::from(n)).sum::<u128>();
         if invalid {
             self.fail();
             return Feedback::Failed;
         }
-        let delta = [counts[0]-self.reported[0], counts[1]-self.reported[1], counts[2]-self.reported[2]];
-        if delta[0]+delta[2] < newly_marked[0] || delta[1]+delta[2] < newly_marked[1]
-            || delta.iter().map(|&n| u128::from(n)).sum::<u128>() < newly_marked.iter().map(|&n| u128::from(n)).sum::<u128>() {
+        let delta = [
+            counts[0] - self.reported[0],
+            counts[1] - self.reported[1],
+            counts[2] - self.reported[2],
+        ];
+        if delta[0] + delta[2] < newly_marked[0]
+            || delta[1] + delta[2] < newly_marked[1]
+            || delta.iter().map(|&n| u128::from(n)).sum::<u128>()
+                < newly_marked.iter().map(|&n| u128::from(n)).sum::<u128>()
+        {
             self.fail();
             return Feedback::Failed;
         }
         self.reported = counts;
-        if newly_marked != [0; 2] { self.state = State::Capable; }
-        Feedback::Valid { ce_increase: delta[2] }
+        if newly_marked != [0; 2] {
+            self.state = State::Capable;
+        }
+        Feedback::Valid {
+            ce_increase: delta[2],
+        }
     }
 }
 
@@ -113,14 +140,25 @@ mod tests {
     #[test]
     fn validates_counter_deltas_and_ignores_reordered_ack() {
         let mut v = Validator::default();
-        for mark in [Mark::Ect0, Mark::Ect0, Mark::Ect1] { v.sent(mark); }
+        for mark in [Mark::Ect0, Mark::Ect0, Mark::Ect1] {
+            v.sent(mark);
+        }
         assert_eq!(v.acknowledge(0, [0, 0], None), Feedback::Ignored);
         assert_eq!(v.state(), State::Testing);
-        assert_eq!(v.acknowledge(1, [1, 0], Some([1, 0, 0])), Feedback::Valid { ce_increase: 0 });
+        assert_eq!(
+            v.acknowledge(1, [1, 0], Some([1, 0, 0])),
+            Feedback::Valid { ce_increase: 0 }
+        );
         assert_eq!(v.state(), State::Capable);
-        assert_eq!(v.acknowledge(3, [1, 1], Some([1, 1, 1])), Feedback::Valid { ce_increase: 1 });
+        assert_eq!(
+            v.acknowledge(3, [1, 1], Some([1, 1, 1])),
+            Feedback::Valid { ce_increase: 1 }
+        );
         assert_eq!(v.acknowledge(2, [1, 0], None), Feedback::Ignored);
-        assert_eq!(v.acknowledge(4, [0, 0], Some([1, 1, 1])), Feedback::Valid { ce_increase: 0 });
+        assert_eq!(
+            v.acknowledge(4, [0, 0], Some([1, 1, 1])),
+            Feedback::Valid { ce_increase: 0 }
+        );
         assert_eq!(v.acknowledge(5, [0, 0], Some([0, 1, 1])), Feedback::Failed);
         assert_eq!(v.state(), State::Failed);
         assert_eq!(v.acknowledge(6, [0, 0], Some([1, 1, 1])), Feedback::Failed);
@@ -129,7 +167,10 @@ mod tests {
     #[test]
     fn detects_missing_bleached_and_fabricated_marks() {
         let mut extreme = Validator::default();
-        assert_eq!(extreme.acknowledge(1, [u64::MAX; 2], Some([0; 3])), Feedback::Failed);
+        assert_eq!(
+            extreme.acknowledge(1, [u64::MAX; 2], Some([0; 3])),
+            Feedback::Failed
+        );
         for counters in [None, Some([0, 0, 0]), Some([0, 1, 0]), Some([2, 0, 0])] {
             let mut v = Validator::default();
             v.sent(Mark::Ect0);

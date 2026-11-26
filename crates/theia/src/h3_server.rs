@@ -22,7 +22,10 @@ type Stream<S> = RequestStream<S, Bytes>;
 // Both carriers must enter the very same request handlers; the native lab
 // does not get its own less restrictive authorization path.
 trait CarrierStream: quic::BidiStream<Bytes> + quic::RecvStream<Buf = Bytes> + Send + 'static {}
-impl<S: quic::BidiStream<Bytes> + quic::RecvStream<Buf = Bytes> + Send + 'static> CarrierStream for S {}
+impl<S: quic::BidiStream<Bytes> + quic::RecvStream<Buf = Bytes> + Send + 'static> CarrierStream
+    for S
+{
+}
 
 struct ConnectionGuard(quinn::Connection);
 
@@ -147,39 +150,60 @@ pub(crate) async fn run_connection(
         None
     };
     let transport = h3_quinn::Connection::new(guard.0.clone());
-    run_h3(transport, context, phase, peer, binding, async { let _ = guard.0.closed().await; }).await;
+    run_h3(transport, context, phase, peer, binding, async {
+        let _ = guard.0.closed().await;
+    })
+    .await;
 }
 
 /// Experimental loopback entry point; no external listener or configuration
 /// switch. Requires TLS exporter material even for own-TLS; raw fixed-key
 /// sessions cannot enter the shared admission/relay handlers.
-pub async fn run_native_lab(session: crate::quic_core::endpoint::LabSession, context: Arc<ServerContext>) -> Result<(), ServerError> {
+pub async fn run_native_lab(
+    session: crate::quic_core::endpoint::LabSession,
+    context: Arc<ServerContext>,
+) -> Result<(), ServerError> {
     let peer = session.peer_addr().ip();
     // REALITY dispatch and pinned-identity admission are not yet integrated.
-    if !peer.is_loopback() || !context.allows_native_lab() { return Err(ServerError::Io); }
+    if !peer.is_loopback() || !context.allows_native_lab() {
+        return Err(ServerError::Io);
+    }
     let _slot = context.connection_slot().ok_or(ServerError::Io)?;
-    let (transport, _key) = crate::quic_core::h3_adapter::NativeConnection::start(session).map_err(|_| ServerError::Io)?;
+    let (transport, _key) = crate::quic_core::h3_adapter::NativeConnection::start(session)
+        .map_err(|_| ServerError::Io)?;
     let binding = None;
     let (_owner, phase) = watch::channel(GenerationPhase::Active);
-    run_h3(transport, context, phase, peer, binding, std::future::pending::<()>()).await;
+    run_h3(
+        transport,
+        context,
+        phase,
+        peer,
+        binding,
+        std::future::pending::<()>(),
+    )
+    .await;
     Ok(())
 }
 
-async fn run_h3<C, F>(transport: C, context: Arc<ServerContext>, mut phase: watch::Receiver<GenerationPhase>, peer: IpAddr,
-    binding: Option<Arc<crate::channel_binding::Admission>>, closed: F)
-where C: quic::Connection<Bytes>, C::BidiStream: CarrierStream,
+async fn run_h3<C, F>(
+    transport: C,
+    context: Arc<ServerContext>,
+    mut phase: watch::Receiver<GenerationPhase>,
+    peer: IpAddr,
+    binding: Option<Arc<crate::channel_binding::Admission>>,
+    closed: F,
+) where
+    C: quic::Connection<Bytes>,
+    C::BidiStream: CarrierStream,
     <C::BidiStream as quic::BidiStream<Bytes>>::SendStream: Send + 'static,
-    <C::BidiStream as quic::BidiStream<Bytes>>::RecvStream: quic::RecvStream<Buf = Bytes> + Send + 'static,
+    <C::BidiStream as quic::BidiStream<Bytes>>::RecvStream:
+        quic::RecvStream<Buf = Bytes> + Send + 'static,
     F: std::future::Future<Output = ()>,
 {
     tokio::pin!(closed);
     let mut builder = h3::server::builder();
     builder.max_field_section_size(u64::from(crate::transport_policy::MAX_HEADER_LIST_BYTES));
-    let Ok(Ok(mut h3)) = timeout(
-        HANDSHAKE_TIMEOUT,
-        builder.build::<_, Bytes>(transport),
-    )
-    .await
+    let Ok(Ok(mut h3)) = timeout(HANDSHAKE_TIMEOUT, builder.build::<_, Bytes>(transport)).await
     else {
         crate::diag!(Warn, "server.h3", "h3_handshake_failed_or_timeout");
         return;
@@ -543,7 +567,10 @@ async fn relay_request<T: quic::SendStream<Bytes>, R: quic::RecvStream>(
     }
 }
 
-async fn respond_admitted<S: CarrierStream>(stream: &mut Stream<S>, context: &ServerContext) -> Result<(), ServerError> {
+async fn respond_admitted<S: CarrierStream>(
+    stream: &mut Stream<S>,
+    context: &ServerContext,
+) -> Result<(), ServerError> {
     let response = Response::builder()
         .status(StatusCode::OK)
         .body(())
@@ -554,7 +581,10 @@ async fn respond_admitted<S: CarrierStream>(stream: &mut Stream<S>, context: &Se
         .map_err(|_| ServerError::Io)
 }
 
-async fn respond<S: CarrierStream>(stream: &mut Stream<S>, status: StatusCode) -> Result<(), ServerError> {
+async fn respond<S: CarrierStream>(
+    stream: &mut Stream<S>,
+    status: StatusCode,
+) -> Result<(), ServerError> {
     let response = Response::builder()
         .status(status)
         .body(())

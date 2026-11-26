@@ -56,10 +56,14 @@ struct Bridge {
 }
 impl std::ops::Deref for Bridge {
     type Target = Mutex<State>;
-    fn deref(&self) -> &Self::Target { &self.state }
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
 }
 impl Drop for Bridge {
-    fn drop(&mut self) { self.ready.notify_one(); }
+    fn drop(&mut self) {
+        self.ready.notify_one();
+    }
 }
 type Shared = Arc<Bridge>;
 type OpenResult = Result<u64, CE>;
@@ -174,7 +178,9 @@ fn progress(
     state.discover(session, wakes);
     // Visit each queued open once: a blocked bidi must not starve uni.
     for _ in 0..state.open.len() {
-        let Some(request) = state.open.pop_front() else { break; };
+        let Some(request) = state.open.pop_front() else {
+            break;
+        };
         if request.result.is_closed() {
             continue;
         }
@@ -195,7 +201,9 @@ fn progress(
                 }
                 state.streams.insert(id, stream);
             }
-            Err(NativeError::Send(send_flow::Error::Limit)) if !session.lifetime_exhausted(request.bidi) => {
+            Err(NativeError::Send(send_flow::Error::Limit))
+                if !session.lifetime_exhausted(request.bidi) =>
+            {
                 state.open.push_back(request);
             }
             Err(_) => {
@@ -234,17 +242,18 @@ fn progress(
                 }
             } else if let Some(data) = s.outgoing.as_mut() {
                 let n = data.len().min(session.send_capacity(id));
-                if n != 0 { match session.queue(id, &data[..n], false) {
-                    Ok(()) => {
-                        data.advance(n);
-                        if data.is_empty() {
-                            s.outgoing = None;
-                            wake(&mut s.send_waker, wakes);
+                if n != 0 {
+                    match session.queue(id, &data[..n], false) {
+                        Ok(()) => {
+                            data.advance(n);
+                            if data.is_empty() {
+                                s.outgoing = None;
+                                wake(&mut s.send_waker, wakes);
+                            }
                         }
+                        Err(e) if blocked(&e) => {}
+                        Err(e) => return Err(e),
                     }
-                    Err(e) if blocked(&e) => {}
-                    Err(e) => return Err(e),
-                }
                 }
             } else if s.finish && !s.fin_queued {
                 match session.queue(id, &[], true) {
@@ -293,7 +302,10 @@ fn progress(
                 }
             }
         }
-        if (!s.tx || s.send_dropped) && (!s.rx || s.recv_dropped) && session.retire_stream(id, s.tx, s.rx)? {
+        if (!s.tx || s.send_dropped)
+            && (!s.rx || s.recv_dropped)
+            && session.retire_stream(id, s.tx, s.rx)?
+        {
             state.streams.remove(&id);
             ready.notify_one();
         }
@@ -361,9 +373,17 @@ async fn drive(mut session: LabSession, weak: Weak<Bridge>, ready: Arc<Notify>) 
             return;
         }
         // Bound immediate sends so a full socket cannot starve ingress or other connections.
-        if sent && burst < MAX_BURST { burst += 1; continue; }
-        let wait = if sent { tokio::task::yield_now().await; Duration::ZERO } else {
-            session.deadline().map_or(IDLE_WAIT, |at| at.saturating_duration_since(Instant::now()).min(IDLE_WAIT))
+        if sent && burst < MAX_BURST {
+            burst += 1;
+            continue;
+        }
+        let wait = if sent {
+            tokio::task::yield_now().await;
+            Duration::ZERO
+        } else {
+            session.deadline().map_or(IDLE_WAIT, |at| {
+                at.saturating_duration_since(Instant::now()).min(IDLE_WAIT)
+            })
         };
         burst = 0;
         if session.recv_with_wake(wait, Some(&ready)).await.is_err() {
@@ -385,7 +405,10 @@ impl NativeConnection {
         let key = session.take_channel_binding().ok_or_else(internal)?;
         session.enable_auto_cids();
         let ready = Arc::new(Notify::new());
-        let shared = Arc::new(Bridge { state: Mutex::new(State::default()), ready: ready.clone() });
+        let shared = Arc::new(Bridge {
+            state: Mutex::new(State::default()),
+            ready: ready.clone(),
+        });
         tokio::spawn(drive(session, Arc::downgrade(&shared), ready));
         Ok((
             Self {
@@ -437,10 +460,19 @@ impl Drop for Opener {
             if let Some(mut pending) = pending.take() {
                 pending.close();
                 if let Ok(Ok(id)) = pending.try_recv() {
-                    if let Some(s) = self.shared.lock().expect("bridge mutex").streams.get_mut(&id) {
+                    if let Some(s) = self
+                        .shared
+                        .lock()
+                        .expect("bridge mutex")
+                        .streams
+                        .get_mut(&id)
+                    {
                         s.reset = Some(CANCEL);
                         s.send_dropped = true;
-                        if s.rx { s.stop = Some(CANCEL); s.recv_dropped = true; }
+                        if s.rx {
+                            s.stop = Some(CANCEL);
+                            s.recv_dropped = true;
+                        }
                     }
                 }
             }
@@ -589,7 +621,15 @@ impl SendSide {
 impl Drop for SendSide {
     fn drop(&mut self) {
         self.cancel(CANCEL);
-        if let Some(s) = self.shared.lock().expect("bridge mutex").streams.get_mut(&self.id) { s.send_dropped = true; }
+        if let Some(s) = self
+            .shared
+            .lock()
+            .expect("bridge mutex")
+            .streams
+            .get_mut(&self.id)
+        {
+            s.send_dropped = true;
+        }
         self.shared.ready.notify_one();
     }
 }
@@ -691,7 +731,15 @@ impl RecvSide {
 impl Drop for RecvSide {
     fn drop(&mut self) {
         self.stop(CANCEL);
-        if let Some(s) = self.shared.lock().expect("bridge mutex").streams.get_mut(&self.id) { s.recv_dropped = true; }
+        if let Some(s) = self
+            .shared
+            .lock()
+            .expect("bridge mutex")
+            .streams
+            .get_mut(&self.id)
+        {
+            s.recv_dropped = true;
+        }
         self.shared.ready.notify_one();
     }
 }

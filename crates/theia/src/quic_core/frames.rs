@@ -36,8 +36,14 @@ pub enum Frame<'a> {
     },
     NewToken(&'a [u8]),
     DataBlocked(u64),
-    StreamDataBlocked { id: u64, limit: u64 },
-    StreamsBlocked { bidi: bool, limit: u64 },
+    StreamDataBlocked {
+        id: u64,
+        limit: u64,
+    },
+    StreamsBlocked {
+        bidi: bool,
+        limit: u64,
+    },
     MaxData(u64),
     MaxStreamData {
         id: u64,
@@ -146,7 +152,9 @@ pub fn decode(bytes: &[u8], space: Space) -> Result<Vec<Frame<'_>>, Error> {
             }
             7 => {
                 let len = number(bytes, &mut at)?;
-                if len == 0 { return Err(Error::Invalid); }
+                if len == 0 {
+                    return Err(Error::Invalid);
+                }
                 Frame::NewToken(take(bytes, &mut at, len)?)
             }
             8..=15 => {
@@ -184,11 +192,19 @@ pub fn decode(bytes: &[u8], space: Space) -> Result<Vec<Frame<'_>>, Error> {
                 }
             }
             0x14 => Frame::DataBlocked(number(bytes, &mut at)?),
-            0x15 => Frame::StreamDataBlocked { id: number(bytes, &mut at)?, limit: number(bytes, &mut at)? },
+            0x15 => Frame::StreamDataBlocked {
+                id: number(bytes, &mut at)?,
+                limit: number(bytes, &mut at)?,
+            },
             0x16 | 0x17 => {
                 let limit = number(bytes, &mut at)?;
-                if limit > 1 << 60 { return Err(Error::Limit); }
-                Frame::StreamsBlocked { bidi: ty == 0x16, limit }
+                if limit > 1 << 60 {
+                    return Err(Error::Limit);
+                }
+                Frame::StreamsBlocked {
+                    bidi: ty == 0x16,
+                    limit,
+                }
             }
             0x18 => {
                 let sequence = number(bytes, &mut at)?;
@@ -315,16 +331,35 @@ mod tests {
     #[test]
     fn token_and_blocked_hints_are_bounded_and_application_only() {
         let wire = [7, 2, 9, 8, 0x14, 3, 0x15, 4, 5, 0x16, 6, 0x17, 7];
-        assert_eq!(decode(&wire, Space::Application).unwrap(), [
-            Frame::NewToken(&[9, 8]), Frame::DataBlocked(3),
-            Frame::StreamDataBlocked { id: 4, limit: 5 },
-            Frame::StreamsBlocked { bidi: true, limit: 6 },
-            Frame::StreamsBlocked { bidi: false, limit: 7 },
-        ]);
+        assert_eq!(
+            decode(&wire, Space::Application).unwrap(),
+            [
+                Frame::NewToken(&[9, 8]),
+                Frame::DataBlocked(3),
+                Frame::StreamDataBlocked { id: 4, limit: 5 },
+                Frame::StreamsBlocked {
+                    bidi: true,
+                    limit: 6
+                },
+                Frame::StreamsBlocked {
+                    bidi: false,
+                    limit: 7
+                },
+            ]
+        );
         assert_eq!(decode(&[7, 0], Space::Application), Err(Error::Invalid));
-        assert_eq!(decode(&[7, 2, 1], Space::Application), Err(Error::Truncated));
+        assert_eq!(
+            decode(&[7, 2, 1], Space::Application),
+            Err(Error::Truncated)
+        );
         assert_eq!(decode(&[0x14, 0], Space::Handshake), Err(Error::WrongSpace));
-        assert_eq!(decode(&[0x16, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], Space::Application), Err(Error::Limit));
+        assert_eq!(
+            decode(
+                &[0x16, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+                Space::Application
+            ),
+            Err(Error::Limit)
+        );
     }
 
     #[test]

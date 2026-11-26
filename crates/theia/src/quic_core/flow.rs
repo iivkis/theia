@@ -86,7 +86,11 @@ impl ReceiveFlow {
     }
 
     pub(crate) fn can_open_local_bidi(&self) -> bool {
-        self.streams.keys().filter(|id| **id & 1 != self.peer_bit).count() < self.max_local_bidi as usize
+        self.streams
+            .keys()
+            .filter(|id| **id & 1 != self.peer_bit)
+            .count()
+            < self.max_local_bidi as usize
     }
 
     pub fn register_local_bidi(&mut self, id: u64) -> Result<(), Error> {
@@ -98,7 +102,9 @@ impl ReceiveFlow {
             return Err(Error::StreamId);
         }
         if !self.streams.contains_key(&id) {
-            if !self.can_open_local_bidi() { return Err(Error::Limit); }
+            if !self.can_open_local_bidi() {
+                return Err(Error::Limit);
+            }
             let buffer =
                 ReceiveBuffer::new(self.window, self.stream_limit).map_err(Error::Receive)?;
             self.streams.insert(id, buffer);
@@ -108,7 +114,11 @@ impl ReceiveFlow {
     }
 
     fn check_id(&self, id: u64) -> Result<(), Error> {
-        if id <= MAX_VARINT && id & 1 != self.peer_bit && id & 2 == 0 && id / 4 < self.opened[(id & 3) as usize] {
+        if id <= MAX_VARINT
+            && id & 1 != self.peer_bit
+            && id & 2 == 0
+            && id / 4 < self.opened[(id & 3) as usize]
+        {
             return Ok(());
         }
         let limit = if id & 2 == 0 {
@@ -157,7 +167,9 @@ impl ReceiveFlow {
         for n in self.opened[kind]..end {
             let prior = n * 4 + kind as u64;
             if let std::collections::btree_map::Entry::Vacant(slot) = self.streams.entry(prior) {
-                slot.insert(ReceiveBuffer::new(self.window, self.stream_limit).map_err(Error::Receive)?);
+                slot.insert(
+                    ReceiveBuffer::new(self.window, self.stream_limit).map_err(Error::Receive)?,
+                );
             }
         }
         self.opened[kind] = self.opened[kind].max(end);
@@ -165,7 +177,9 @@ impl ReceiveFlow {
     }
 
     pub(crate) fn is_closed(&self, id: u64) -> bool {
-        id <= MAX_VARINT && id / 4 < self.opened[(id & 3) as usize] && !self.streams.contains_key(&id)
+        id <= MAX_VARINT
+            && id / 4 < self.opened[(id & 3) as usize]
+            && !self.streams.contains_key(&id)
     }
 
     /// Charge the increase in highest offset, including gaps, once only.
@@ -279,12 +293,25 @@ impl ReceiveFlow {
         let released = self.streams.get_mut(&id)?.release_terminal()?;
         let terminal = self.streams.remove(&id)?;
         self.recent_closed.insert(id, terminal);
-        if self.recent_closed.len() > RECENT_CLOSED { self.recent_closed.pop_first(); }
+        if self.recent_closed.len() > RECENT_CLOSED {
+            self.recent_closed.pop_first();
+        }
         self.max_data = self.max_data.saturating_add(released).min(MAX_VARINT);
         let grant = if id & 1 == self.peer_bit {
-            let limit = if id & 2 == 0 { &mut self.max_bidi } else { &mut self.max_uni };
-            if *limit < MAX_STREAM_COUNT { *limit += 1; Some(*limit) } else { None }
-        } else { None };
+            let limit = if id & 2 == 0 {
+                &mut self.max_bidi
+            } else {
+                &mut self.max_uni
+            };
+            if *limit < MAX_STREAM_COUNT {
+                *limit += 1;
+                Some(*limit)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         Some((grant, (released != 0).then_some(self.max_data)))
     }
 

@@ -66,8 +66,17 @@ impl SendFlow {
 
     /// Authenticated peer limits apply before the first stream is opened.
     /// A peer-local bidi stream is remote-initiated from our perspective.
-    pub(crate) fn from_peer(server: bool, limits: super::parameters::Limits, peer_bidi: u64) -> Result<Self, Error> {
-        let mut flow = Self::new(server, limits.max_streams_uni, limits.initial_uni, limits.max_data)?;
+    pub(crate) fn from_peer(
+        server: bool,
+        limits: super::parameters::Limits,
+        peer_bidi: u64,
+    ) -> Result<Self, Error> {
+        let mut flow = Self::new(
+            server,
+            limits.max_streams_uni,
+            limits.initial_uni,
+            limits.max_data,
+        )?;
         flow.enable_bidi(limits.max_streams_bidi, peer_bidi)?;
         flow.local_bidi_limit = limits.initial_bidi_remote;
         flow.peer_bidi_limit = limits.initial_bidi_local;
@@ -112,7 +121,9 @@ impl SendFlow {
     }
 
     pub fn open_bidi(&mut self) -> Result<u64, Error> {
-        if self.next_bidi >= self.max_bidi || self.active_type(self.local_bit) >= MAX_ACTIVE_PER_TYPE {
+        if self.next_bidi >= self.max_bidi
+            || self.active_type(self.local_bit) >= MAX_ACTIVE_PER_TYPE
+        {
             return Err(Error::Limit);
         }
         let id = self.next_bidi * 4 + self.local_bit;
@@ -134,8 +145,13 @@ impl SendFlow {
         if id > MAX_VARINT || id & 2 != 0 || id & 1 == self.local_bit || id / 4 >= self.peer_bidi {
             return Err(Error::Stream);
         }
-        if id / 4 < self.peer_opened { return Ok(()); }
-        if id / 4 != self.peer_opened || self.active_type(1 - self.local_bit) >= MAX_ACTIVE_PER_TYPE { return Err(Error::Limit); }
+        if id / 4 < self.peer_opened {
+            return Ok(());
+        }
+        if id / 4 != self.peer_opened || self.active_type(1 - self.local_bit) >= MAX_ACTIVE_PER_TYPE
+        {
+            return Err(Error::Limit);
+        }
         self.peer_opened += 1;
         self.streams.entry(id).or_insert(Stream {
             offset: 0,
@@ -163,7 +179,9 @@ impl SendFlow {
     }
 
     pub(crate) fn is_closed(&self, id: u64) -> bool {
-        if id > MAX_VARINT || self.streams.contains_key(&id) { return false; }
+        if id > MAX_VARINT || self.streams.contains_key(&id) {
+            return false;
+        }
         let next = match (id & 1 == self.local_bit, id & 2 == 0) {
             (true, true) => self.next_bidi,
             (true, false) => self.next_uni,
@@ -183,7 +201,10 @@ impl SendFlow {
 
     pub(crate) fn available(&self, id: u64) -> usize {
         self.streams.get(&id).filter(|s| !s.fin).map_or(0, |s| {
-            s.limit.saturating_sub(s.offset).min(self.max_data.saturating_sub(self.used)).min(MAX_CHUNK as u64) as usize
+            s.limit
+                .saturating_sub(s.offset)
+                .min(self.max_data.saturating_sub(self.used))
+                .min(MAX_CHUNK as u64) as usize
         })
     }
 
@@ -207,7 +228,9 @@ impl SendFlow {
         if value > MAX_VARINT {
             return Err(Error::Limit);
         }
-        if self.is_closed(id) { return Ok(()); }
+        if self.is_closed(id) {
+            return Ok(());
+        }
         let stream = self.streams.get_mut(&id).ok_or(Error::Stream)?;
         stream.limit = stream.limit.max(value);
         Ok(())
@@ -221,7 +244,9 @@ impl SendFlow {
     }
 
     pub fn reset(&mut self, id: u64, code: u64) -> Result<Option<Vec<u8>>, Error> {
-        if self.is_closed(id) { return Ok(None); }
+        if self.is_closed(id) {
+            return Ok(None);
+        }
         let stream = self.streams.get_mut(&id).ok_or(Error::Stream)?;
         if code > MAX_VARINT {
             return Err(Error::Limit);
@@ -278,12 +303,26 @@ mod tests {
 
     #[test]
     fn authenticated_asymmetric_credit_uses_peer_direction() {
-        let limits = super::super::parameters::Limits { max_udp_payload: 1400, max_data: 30, initial_bidi_local: 3, initial_bidi_remote: 5, initial_uni: 7, max_streams_bidi: 1, max_streams_uni: 1, ack_delay_exponent: 3, max_ack_delay_ms: 25, active_cid_limit: 2 };
+        let limits = super::super::parameters::Limits {
+            max_udp_payload: 1400,
+            max_data: 30,
+            initial_bidi_local: 3,
+            initial_bidi_remote: 5,
+            initial_uni: 7,
+            max_streams_bidi: 1,
+            max_streams_uni: 1,
+            ack_delay_exponent: 3,
+            max_ack_delay_ms: 25,
+            active_cid_limit: 2,
+        };
         let mut flow = SendFlow::from_peer(false, limits, 8).unwrap();
         let uni = flow.open().unwrap();
         let bidi = flow.open_bidi().unwrap();
         flow.register_peer_bidi(1).unwrap();
-        assert_eq!((flow.available(uni), flow.available(bidi), flow.available(1)), (7,5,3));
+        assert_eq!(
+            (flow.available(uni), flow.available(bidi), flow.available(1)),
+            (7, 5, 3)
+        );
         assert_eq!(flow.open_bidi(), Err(Error::Limit));
     }
 

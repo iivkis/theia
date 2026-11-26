@@ -165,7 +165,10 @@ impl Window {
             return Ok(());
         }
         let current = self.cwnd as f64 / self.mtu as f64;
-        if self.epoch.is_none() { self.epoch = Some((now, current)); self.friendly = current; }
+        if self.epoch.is_none() {
+            self.epoch = Some((now, current));
+            self.friendly = current;
+        }
         let (start, initial) = self.epoch.ok_or(Error::Accounting)?;
         let elapsed = now.checked_duration_since(start).ok_or(Error::Accounting)?;
         let rtt = rtt.max(Duration::from_micros(1));
@@ -176,7 +179,11 @@ impl Window {
         // merely wall time (an ACK after an idle period must not grant a burst).
         // RFC 9438 section 4.3: use the Reno increment after W_est reaches
         // the pre-congestion window. The denominator is the current cwnd.
-        let alpha = if self.friendly >= self.prior_cwnd { 1.0 } else { 3.0 * (1.0 - BETA) / (1.0 + BETA) };
+        let alpha = if self.friendly >= self.prior_cwnd {
+            1.0
+        } else {
+            3.0 * (1.0 - BETA) / (1.0 + BETA)
+        };
         self.friendly += alpha * (bytes as f64 / self.mtu as f64) / current.max(1.0);
         let cubic_now = cubic_target(w_max, initial, elapsed).ok_or(Error::Accounting)?;
         // Reno-friendly growth updates the estimate directly rather than
@@ -246,7 +253,8 @@ mod tests {
         assert!(w.cwnd() > initial);
         let after = w.cwnd();
         w.application_limited();
-        w.on_ack(sent, sent + Duration::from_secs(60), 1200, rtt, true).unwrap();
+        w.on_ack(sent, sent + Duration::from_secs(60), 1200, rtt, true)
+            .unwrap();
         assert!(w.cwnd() <= after + 1200);
     }
 

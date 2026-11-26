@@ -6,6 +6,7 @@ use super::{
     ingress::{Action, Ingress},
     negotiation::{Binding, VersionPolicy},
 };
+use ring::rand::{SecureRandom, SystemRandom};
 use std::{
     collections::BTreeMap,
     io,
@@ -13,14 +14,24 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{net::UdpSocket, sync::{mpsc, oneshot}, task::JoinHandle};
-use ring::rand::{SecureRandom, SystemRandom};
+use tokio::{
+    net::UdpSocket,
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
 
 type Cid = [u8; 8];
 type IssuedCid = (Cid, [u8; 16]);
 pub(crate) enum RouteCommand {
-    Issue { owner: u64, reply: oneshot::Sender<io::Result<IssuedCid>> },
-    Retire { owner: u64, cid: Cid, reply: oneshot::Sender<io::Result<()>> },
+    Issue {
+        owner: u64,
+        reply: oneshot::Sender<io::Result<IssuedCid>>,
+    },
+    Retire {
+        owner: u64,
+        cid: Cid,
+        reply: oneshot::Sender<io::Result<()>>,
+    },
 }
 
 const MTU: usize = 1200;
@@ -64,12 +75,22 @@ impl SessionIo {
             Self::Direct(_) => {
                 let cid = super::negotiation::random_cid().map_err(|_| io::ErrorKind::Other)?;
                 let mut token = [0; 16];
-                SystemRandom::new().fill(&mut token).map_err(|_| io::ErrorKind::Other)?;
+                SystemRandom::new()
+                    .fill(&mut token)
+                    .map_err(|_| io::ErrorKind::Other)?;
                 Ok((cid, token))
             }
-            Self::Routed { owner, commands, .. } => {
+            Self::Routed {
+                owner, commands, ..
+            } => {
                 let (reply, result) = oneshot::channel();
-                commands.send(RouteCommand::Issue { owner: *owner, reply }).await.map_err(|_| io::ErrorKind::BrokenPipe)?;
+                commands
+                    .send(RouteCommand::Issue {
+                        owner: *owner,
+                        reply,
+                    })
+                    .await
+                    .map_err(|_| io::ErrorKind::BrokenPipe)?;
                 result.await.map_err(|_| io::ErrorKind::BrokenPipe)?
             }
         }
@@ -78,9 +99,18 @@ impl SessionIo {
     pub(crate) async fn retire_cid(&self, cid: Cid) -> io::Result<()> {
         match self {
             Self::Direct(_) => Ok(()),
-            Self::Routed { owner, commands, .. } => {
+            Self::Routed {
+                owner, commands, ..
+            } => {
                 let (reply, result) = oneshot::channel();
-                commands.send(RouteCommand::Retire { owner: *owner, cid, reply }).await.map_err(|_| io::ErrorKind::BrokenPipe)?;
+                commands
+                    .send(RouteCommand::Retire {
+                        owner: *owner,
+                        cid,
+                        reply,
+                    })
+                    .await
+                    .map_err(|_| io::ErrorKind::BrokenPipe)?;
                 result.await.map_err(|_| io::ErrorKind::BrokenPipe)?
             }
         }
@@ -89,7 +119,9 @@ impl SessionIo {
     pub(crate) async fn send_to(&self, bytes: &[u8], peer: SocketAddr) -> io::Result<usize> {
         match self {
             Self::Direct(s) => s.send_to(bytes, peer).await,
-            Self::Routed { socket, incoming, .. } => {
+            Self::Routed {
+                socket, incoming, ..
+            } => {
                 if incoming.is_closed() {
                     return Err(io::Error::from(io::ErrorKind::BrokenPipe));
                 }
@@ -138,7 +170,11 @@ impl Listener {
         Self::with_versions(socket, limit, VersionPolicy::both())
     }
 
-    pub fn with_versions(socket: UdpSocket, limit: usize, versions: VersionPolicy) -> io::Result<Self> {
+    pub fn with_versions(
+        socket: UdpSocket,
+        limit: usize,
+        versions: VersionPolicy,
+    ) -> io::Result<Self> {
         let local = socket.local_addr()?;
         if !local.ip().is_loopback()
             || socket.peer_addr().is_ok()
@@ -146,10 +182,18 @@ impl Listener {
         {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
-        let ingress = Ingress::for_listener(limit, versions.clone()).map_err(|_| io::ErrorKind::InvalidInput)?;
+        let ingress = Ingress::for_listener(limit, versions.clone())
+            .map_err(|_| io::ErrorKind::InvalidInput)?;
         let (tx, candidates) = mpsc::channel(limit);
         let (commands, requests) = mpsc::channel(limit);
-        let worker = tokio::spawn(run(Arc::new(socket), ingress, tx, versions, commands, requests));
+        let worker = tokio::spawn(run(
+            Arc::new(socket),
+            ingress,
+            tx,
+            versions,
+            commands,
+            requests,
+        ));
         Ok(Self {
             local,
             candidates,

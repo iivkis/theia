@@ -9,7 +9,10 @@ use super::{
     wire::Version,
 };
 use crate::reality_quic_wire::{long, retry_integrity_tag};
-use ring::{hmac, rand::{SecureRandom, SystemRandom}};
+use ring::{
+    hmac,
+    rand::{SecureRandom, SystemRandom},
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io,
@@ -65,17 +68,24 @@ impl Ingress {
     /// Separate active connections from the bounded CID/tombstone budget.
     /// A spare CID must not consume another connection's admission slot.
     pub(crate) fn for_listener(connections: usize, versions: VersionPolicy) -> Result<Self, Error> {
-        let routes = connections.checked_mul(MAX_OWNER_CIDS).ok_or(Error::Limit)?;
+        let routes = connections
+            .checked_mul(MAX_OWNER_CIDS)
+            .ok_or(Error::Limit)?;
         Self::with_limits(connections, routes, versions)
     }
 
-    fn with_limits(connection_limit: usize, limit: usize, versions: VersionPolicy) -> Result<Self, Error> {
+    fn with_limits(
+        connection_limit: usize,
+        limit: usize,
+        versions: VersionPolicy,
+    ) -> Result<Self, Error> {
         Ok(Self {
             routes: Demux::new(limit).map_err(|_| Error::Limit)?,
             owners: BTreeMap::new(),
             retired: BTreeMap::new(),
             tokens: Tokens::new().map_err(|_| Error::Random)?,
-            reset_key: hmac::Key::generate(hmac::HMAC_SHA256, &SystemRandom::new()).map_err(|_| Error::Random)?,
+            reset_key: hmac::Key::generate(hmac::HMAC_SHA256, &SystemRandom::new())
+                .map_err(|_| Error::Random)?,
             resettable: BTreeSet::new(),
             next_owner: 1,
             limit,
@@ -94,7 +104,8 @@ impl Ingress {
         let before = self.retired.len();
         self.retired.retain(|_, until| now <= *until);
         self.occupied -= before - self.retired.len();
-        self.resettable.retain(|cid| self.retired.contains_key(cid) || self.routes.owner(*cid).is_some());
+        self.resettable
+            .retain(|cid| self.retired.contains_key(cid) || self.routes.owner(*cid).is_some());
         Ok(())
     }
 
@@ -142,7 +153,9 @@ impl Ingress {
             return Ok(Action::Drop);
         }
         let mut packet = vec![0; (received - 1).min(43)];
-        SystemRandom::new().fill(&mut packet).map_err(|_| Error::Random)?;
+        SystemRandom::new()
+            .fill(&mut packet)
+            .map_err(|_| Error::Random)?;
         packet[0] = (packet[0] & 0x3f) | 0x40;
         let at = packet.len() - 16;
         packet[at..].copy_from_slice(&self.reset_token(cid));
@@ -222,9 +235,15 @@ impl Ingress {
             return Ok(Action::Existing(owner));
         }
         if head.kind == PacketKind::Application {
-            return match cid { Some(cid) => self.retired_reset(cid, datagram.len()), None => Ok(Action::Drop) };
+            return match cid {
+                Some(cid) => self.retired_reset(cid, datagram.len()),
+                None => Ok(Action::Drop),
+            };
         }
-        if head.kind != PacketKind::Initial || self.occupied >= self.limit || self.owners.len() >= self.connection_limit {
+        if head.kind != PacketKind::Initial
+            || self.occupied >= self.limit
+            || self.owners.len() >= self.connection_limit
+        {
             return Ok(Action::Drop);
         }
         if cid.is_some_and(|id| self.retired.contains_key(&id)) {
@@ -481,10 +500,12 @@ mod tests {
             );
             ingress.retire_local_cid(owner, alias, 1).unwrap();
             let probe = short(alias);
-            let Action::Reply(reset) = ingress.process(peer, &probe, 1).unwrap() else { panic!("retired alias reset") };
+            let Action::Reply(reset) = ingress.process(peer, &probe, 1).unwrap() else {
+                panic!("retired alias reset")
+            };
             assert!(reset.len() >= 21 && reset.len() < probe.len());
             assert_eq!(reset[0] & 0xc0, 0x40);
-            assert_eq!(&reset[reset.len()-16..], &ingress.reset_token(alias));
+            assert_eq!(&reset[reset.len() - 16..], &ingress.reset_token(alias));
             assert_eq!(ingress.process(peer, &short([0; 8]), 1), Ok(Action::Drop));
             assert_eq!(ingress.issue_local_cid(owner, 1), Err(Error::Limit));
             ingress.close(owner, 2).unwrap();
@@ -503,19 +524,37 @@ mod tests {
         for n in 1..=2u8 {
             let original = [n; 8];
             let client = [n + 10; 8];
-            let Action::Reply(retry) = ingress.process(peer, &initial(version, &original, &client, &[]), 0).unwrap() else { panic!("Retry"); };
-            let (cid, token) = negotiation::retry_token(&retry, version, &client, &original, false, false).unwrap();
-            let Action::Accepted { owner, .. } = ingress.process(peer, &initial(version, cid, &client, token), 0).unwrap() else { panic!("accept"); };
+            let Action::Reply(retry) = ingress
+                .process(peer, &initial(version, &original, &client, &[]), 0)
+                .unwrap()
+            else {
+                panic!("Retry");
+            };
+            let (cid, token) =
+                negotiation::retry_token(&retry, version, &client, &original, false, false)
+                    .unwrap();
+            let Action::Accepted { owner, .. } = ingress
+                .process(peer, &initial(version, cid, &client, token), 0)
+                .unwrap()
+            else {
+                panic!("accept");
+            };
             owners.push(owner);
             ingress.issue_local_cid(owner, 0).unwrap();
         }
         assert_eq!(ingress.owners.len(), 2);
         assert_eq!(ingress.occupied, 4);
-        assert_eq!(ingress.process(peer, &initial(version, &[7; 8], &[8; 8], &[]), 0), Ok(Action::Drop));
+        assert_eq!(
+            ingress.process(peer, &initial(version, &[7; 8], &[8; 8], &[]), 0),
+            Ok(Action::Drop)
+        );
         ingress.close(owners[0], 1).unwrap();
         assert_eq!(ingress.owners.len(), 1);
         assert_eq!(ingress.occupied, 4); // replay tombstones are still charged
-        assert!(matches!(ingress.process(peer, &initial(version, &[7; 8], &[8; 8], &[]), 1), Ok(Action::Reply(_))));
+        assert!(matches!(
+            ingress.process(peer, &initial(version, &[7; 8], &[8; 8], &[]), 1),
+            Ok(Action::Reply(_))
+        ));
     }
 
     #[test]

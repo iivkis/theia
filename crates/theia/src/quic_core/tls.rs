@@ -460,7 +460,9 @@ mod tests {
             for _ in 0..20 {
                 s.flush(Instant::now()).await.unwrap();
                 c.recv(Duration::from_millis(50)).await.unwrap();
-                if c.handshake_confirmed() { break; }
+                if c.handshake_confirmed() {
+                    break;
+                }
             }
             assert!(c.handshake_confirmed());
             let id = c.open_uni().unwrap();
@@ -471,8 +473,12 @@ mod tests {
             for _ in 0..40 {
                 c.flush(Instant::now()).await.unwrap();
                 if s.recv(Duration::from_millis(50)).await.unwrap() {
-                    if let Ok(n) = s.read(id, &mut out[read..]) { read += n; }
-                    if read == out.len() { break; }
+                    if let Ok(n) = s.read(id, &mut out[read..]) {
+                        read += n;
+                    }
+                    if read == out.len() {
+                        break;
+                    }
                 }
             }
             assert_eq!(read, 5);
@@ -482,7 +488,9 @@ mod tests {
 
     #[tokio::test]
     async fn routed_cid_rotation_migration_and_stateless_reset_v1_v2() {
-        use crate::quic_core::{endpoint::LabSession, handshake_udp, lifecycle::ShutdownPhase, listener::Listener};
+        use crate::quic_core::{
+            endpoint::LabSession, handshake_udp, lifecycle::ShutdownPhase, listener::Listener,
+        };
         use std::time::{Duration, Instant};
         use tokio::net::UdpSocket;
 
@@ -490,7 +498,9 @@ mod tests {
             for _ in 0..100 {
                 if from.flush(Instant::now()).await.unwrap() {
                     for _ in 0..8 {
-                        if to.recv(Duration::from_millis(100)).await.unwrap() { return; }
+                        if to.recv(Duration::from_millis(100)).await.unwrap() {
+                            return;
+                        }
                     }
                     panic!("expected authenticated packet");
                 }
@@ -502,13 +512,22 @@ mod tests {
         for version in [Version::V1, Version::V2] {
             let (cc, mut sc) = configs();
             sc.send_tls13_tickets = 0;
-            let mut listener = Listener::new(UdpSocket::bind("127.0.0.1:0").await.unwrap(), 8).unwrap();
+            let mut listener =
+                Listener::new(UdpSocket::bind("127.0.0.1:0").await.unwrap(), 8).unwrap();
             let addr = listener.local_addr();
             let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let old = socket.local_addr().unwrap();
             let (c, s) = tokio::join!(
-                handshake_udp::connect(socket, addr, version, Arc::new(cc), ServerName::try_from("localhost").unwrap()),
-                async { handshake_udp::accept(listener.accept().await.unwrap(), Arc::new(sc)).await },
+                handshake_udp::connect(
+                    socket,
+                    addr,
+                    version,
+                    Arc::new(cc),
+                    ServerName::try_from("localhost").unwrap()
+                ),
+                async {
+                    handshake_udp::accept(listener.accept().await.unwrap(), Arc::new(sc)).await
+                },
             );
             let (mut c, mut s) = (c.unwrap(), s.unwrap());
             pump(&mut s, &mut c).await; // HANDSHAKE_DONE
@@ -527,7 +546,11 @@ mod tests {
             // Linux's 127/8 permits an actual change of source IP in this
             // closed fixture. Windows covers the same CID rotation with a
             // new UDP port without assuming another loopback IP is assigned.
-            let bind = if cfg!(target_os = "linux") { "127.0.0.2:0" } else { "127.0.0.1:0" };
+            let bind = if cfg!(target_os = "linux") {
+                "127.0.0.2:0"
+            } else {
+                "127.0.0.1:0"
+            };
             let moved = UdpSocket::bind(bind).await.unwrap();
             let next = moved.local_addr().unwrap();
             c.rebind(moved, Instant::now()).await.unwrap();
@@ -566,7 +589,9 @@ mod tests {
                     c.flush(Instant::now()).await.unwrap();
                     c.recv(Duration::from_millis(20)).await.unwrap();
                 }
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
             assert!(!c.flush(Instant::now()).await.unwrap());
             assert!(c.open_bidi().is_err());
         }
@@ -578,18 +603,36 @@ mod tests {
         use tokio::net::UdpSocket;
         let (cc, mut sc) = configs();
         sc.send_tls13_tickets = 0;
-        let mut listener = Listener::with_versions(UdpSocket::bind("127.0.0.1:0").await.unwrap(), 2,
-            VersionPolicy::exact(Version::V1)).unwrap();
+        let mut listener = Listener::with_versions(
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            2,
+            VersionPolicy::exact(Version::V1),
+        )
+        .unwrap();
         let addr = listener.local_addr();
         let (client, server) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            tokio::join!(handshake_udp::connect_versions("127.0.0.1:0".parse().unwrap(), addr,
-                VersionPolicy::new(&[Version::V2, Version::V1]).unwrap(), Arc::new(cc), ServerName::try_from("localhost").unwrap()),
-                async { handshake_udp::accept(listener.accept().await.unwrap(), Arc::new(sc)).await })
-        }).await.unwrap();
+            tokio::join!(
+                handshake_udp::connect_versions(
+                    "127.0.0.1:0".parse().unwrap(),
+                    addr,
+                    VersionPolicy::new(&[Version::V2, Version::V1]).unwrap(),
+                    Arc::new(cc),
+                    ServerName::try_from("localhost").unwrap()
+                ),
+                async {
+                    handshake_udp::accept(listener.accept().await.unwrap(), Arc::new(sc)).await
+                }
+            )
+        })
+        .await
+        .unwrap();
         let (version, mut client) = client.unwrap();
         let mut server = server.unwrap();
         assert_eq!(version, Version::V1);
-        assert_eq!(&client.take_channel_binding().unwrap()[..], &server.take_channel_binding().unwrap()[..]);
+        assert_eq!(
+            &client.take_channel_binding().unwrap()[..],
+            &server.take_channel_binding().unwrap()[..]
+        );
     }
 
     #[tokio::test]
@@ -691,33 +734,63 @@ mod tests {
         let addr = listener.local_addr();
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         tokio::time::timeout(Duration::from_secs(30), async {
-            let (client, server) = tokio::join!(handshake_udp::connect(socket, addr, Version::V2, Arc::new(cc), ServerName::try_from("localhost").unwrap()),
-                async { handshake_udp::accept(listener.accept().await.unwrap(), Arc::new(sc)).await });
+            let (client, server) = tokio::join!(
+                handshake_udp::connect(
+                    socket,
+                    addr,
+                    Version::V2,
+                    Arc::new(cc),
+                    ServerName::try_from("localhost").unwrap()
+                ),
+                async {
+                    handshake_udp::accept(listener.accept().await.unwrap(), Arc::new(sc)).await
+                }
+            );
             let (client, _) = NativeConnection::start(client.unwrap()).unwrap();
             let (server, _) = NativeConnection::start(server.unwrap()).unwrap();
-            let (client, server) = tokio::join!(h3::client::new(client), async { h3::server::builder().build::<_, Bytes>(server).await });
+            let (client, server) = tokio::join!(h3::client::new(client), async {
+                h3::server::builder().build::<_, Bytes>(server).await
+            });
             let (mut driver, mut sender) = client.unwrap();
             let mut server = server.unwrap();
-            let driver = tokio::spawn(async move { let _ = poll_fn(|cx| driver.poll_close(cx)).await; });
-            tokio::join!(async {
-                for n in 0..96 {
-                    let mut stream = sender.send_request(http::Request::builder().uri(format!("https://localhost/{n}")).body(()).unwrap()).await.unwrap();
-                    stream.finish().await.unwrap();
-                    assert_eq!(stream.recv_response().await.unwrap().status(), 204);
-                    assert!(stream.recv_data().await.unwrap().is_none());
-                }
-            }, async {
-                for n in 0..96 {
-                    let resolver = server.accept().await.unwrap().unwrap();
-                    let (req, mut stream) = resolver.resolve_request().await.unwrap();
-                    assert_eq!(req.uri().path(), format!("/{n}"));
-                    assert!(stream.recv_data().await.unwrap().is_none());
-                    stream.send_response(http::Response::builder().status(204).body(()).unwrap()).await.unwrap();
-                    stream.finish().await.unwrap();
-                }
+            let driver = tokio::spawn(async move {
+                let _ = poll_fn(|cx| driver.poll_close(cx)).await;
             });
+            tokio::join!(
+                async {
+                    for n in 0..96 {
+                        let mut stream = sender
+                            .send_request(
+                                http::Request::builder()
+                                    .uri(format!("https://localhost/{n}"))
+                                    .body(())
+                                    .unwrap(),
+                            )
+                            .await
+                            .unwrap();
+                        stream.finish().await.unwrap();
+                        assert_eq!(stream.recv_response().await.unwrap().status(), 204);
+                        assert!(stream.recv_data().await.unwrap().is_none());
+                    }
+                },
+                async {
+                    for n in 0..96 {
+                        let resolver = server.accept().await.unwrap().unwrap();
+                        let (req, mut stream) = resolver.resolve_request().await.unwrap();
+                        assert_eq!(req.uri().path(), format!("/{n}"));
+                        assert!(stream.recv_data().await.unwrap().is_none());
+                        stream
+                            .send_response(http::Response::builder().status(204).body(()).unwrap())
+                            .await
+                            .unwrap();
+                        stream.finish().await.unwrap();
+                    }
+                }
+            );
             driver.abort();
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[test]

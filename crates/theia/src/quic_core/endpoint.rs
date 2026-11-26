@@ -152,11 +152,17 @@ impl LabSession {
         )?;
         // Application-space native laboratory defaults to BBR; the
         // fixed-key codec fixture keeps the CUBIC scheduler for comparison.
-        session.peer_ids = PeerIds::with_initial(remote_cid, peer_reset_token, 2).map_err(|_| Error::Protocol)?;
+        session.peer_ids =
+            PeerIds::with_initial(remote_cid, peer_reset_token, 2).map_err(|_| Error::Protocol)?;
         session.peer_cid_limit = peer_limits.active_cid_limit.min(8) as usize;
-        session.send = SendFlow::from_peer(server, peer_limits, MAX_STREAMS).map_err(Error::Send)?;
+        session.send =
+            SendFlow::from_peer(server, peer_limits, MAX_STREAMS).map_err(Error::Send)?;
         session.scheduler = Scheduler::with_bbr(Instant::now());
-        session.scheduler.application_ack_timing(peer_limits.ack_delay_exponent, peer_limits.max_ack_delay_ms, server);
+        session.scheduler.application_ack_timing(
+            peer_limits.ack_delay_exponent,
+            peer_limits.max_ack_delay_ms,
+            server,
+        );
         session.idle = Idle::new(Instant::now(), idle_timeout);
         session.binding = Some(binding);
         session.handshake_tail = tail;
@@ -183,7 +189,9 @@ impl LabSession {
         if !super::loopback_pair(local, peer)
             || local_cid.as_slice() == remote_cid
             || local_cid == [0; CID_LEN]
-            || remote_cid.is_empty() || remote_cid.len() > 20 || remote_cid.iter().all(|b| *b == 0)
+            || remote_cid.is_empty()
+            || remote_cid.len() > 20
+            || remote_cid.iter().all(|b| *b == 0)
         {
             return Err(Error::Scope);
         }
@@ -267,14 +275,20 @@ impl LabSession {
     }
 
     fn needs_cid(&self) -> bool {
-        self.auto_cids && self.confirmed && self.active()
+        self.auto_cids
+            && self.confirmed
+            && self.active()
             && self.local_ids.len() < self.peer_cid_limit.min(2)
             && self.next_local_sequence <= super::wire::MAX_VARINT
     }
 
     async fn replenish_cids(&mut self, now: Instant) -> Result<(), Error> {
-        if !self.needs_cid() || !self.scheduler.can_queue()
-            || self.cid_retry_at.is_some_and(|at| now < at) { return Ok(()); }
+        if !self.needs_cid()
+            || !self.scheduler.can_queue()
+            || self.cid_retry_at.is_some_and(|at| now < at)
+        {
+            return Ok(());
+        }
         match self.advertise_connection_id().await {
             Ok(_) => self.cid_retry_at = None,
             Err(Error::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -289,16 +303,24 @@ impl LabSession {
     /// Registration precedes transmission; never advertise an unroutable alias.
     /// This is still a laboratory operation, not production admission.
     pub async fn advertise_connection_id(&mut self) -> Result<u64, Error> {
-        if !self.confirmed || !self.active() || self.local_ids.len() >= self.peer_cid_limit
-            || !self.scheduler.can_queue() || self.next_local_sequence > super::wire::MAX_VARINT {
+        if !self.confirmed
+            || !self.active()
+            || self.local_ids.len() >= self.peer_cid_limit
+            || !self.scheduler.can_queue()
+            || self.next_local_sequence > super::wire::MAX_VARINT
+        {
             return Err(Error::Scope);
         }
         let (cid, token) = self.socket.issue_cid().await.map_err(Error::Io)?;
-        if cid == [0; CID_LEN] || self.local_ids.values().any(|old| *old == cid) { return Err(Error::Protocol); }
+        if cid == [0; CID_LEN] || self.local_ids.values().any(|old| *old == cid) {
+            return Err(Error::Protocol);
+        }
         let sequence = self.next_local_sequence;
         let mut frame = vec![0x18];
         let mut scratch = [0; 8];
-        frame.extend_from_slice(super::wire::encode_varint(sequence, &mut scratch).ok_or(Error::Protocol)?);
+        frame.extend_from_slice(
+            super::wire::encode_varint(sequence, &mut scratch).ok_or(Error::Protocol)?,
+        );
         frame.extend_from_slice(&[0, CID_LEN as u8]);
         frame.extend_from_slice(&cid);
         frame.extend_from_slice(&token);
@@ -311,7 +333,9 @@ impl LabSession {
     fn queue_retire_cid(&mut self, sequence: u64) -> Result<(), Error> {
         let mut frame = vec![0x19];
         let mut scratch = [0; 8];
-        frame.extend_from_slice(super::wire::encode_varint(sequence, &mut scratch).ok_or(Error::Protocol)?);
+        frame.extend_from_slice(
+            super::wire::encode_varint(sequence, &mut scratch).ok_or(Error::Protocol)?,
+        );
         self.scheduler.enqueue(frame).map_err(Error::Schedule)
     }
 
@@ -341,7 +365,9 @@ impl LabSession {
             let retired = self.peer_ids.rotate().ok_or(Error::Protocol)?;
             self.queue_retire_cid(retired)?;
         }
-        if cross_ip { self.scheduler.restart_path(now); }
+        if cross_ip {
+            self.scheduler.restart_path(now);
+        }
         self.socket = socket.into();
         let peer = self.paths.active();
         if let Err(e) = self.send_path(peer, &[1], now).await {
@@ -404,7 +430,9 @@ impl LabSession {
         if !self.active() {
             return Err(Error::Closed);
         }
-        if !self.receive.can_open_local_bidi() { return Err(Error::Send(super::send_flow::Error::Limit)); }
+        if !self.receive.can_open_local_bidi() {
+            return Err(Error::Send(super::send_flow::Error::Limit));
+        }
         let id = self.send.open_bidi().map_err(Error::Send)?;
         if let Err(e) = self.receive.register_local_bidi(id) {
             self.abort();
@@ -428,7 +456,9 @@ impl LabSession {
         if !self.active() {
             return Err(Error::Closed);
         }
-        if self.send.is_closed(id) { return Ok(()); }
+        if self.send.is_closed(id) {
+            return Ok(());
+        }
         if !self.scheduler.can_queue() {
             return Err(Error::Schedule(super::scheduler::Error::Limit));
         }
@@ -458,34 +488,54 @@ impl LabSession {
         self.receive.abandon(id).map_err(Error::Receive)
     }
 
-    pub(crate) fn send_capacity(&self, id: u64) -> usize { self.send.available(id) }
+    pub(crate) fn send_capacity(&self, id: u64) -> usize {
+        self.send.available(id)
+    }
 
-    pub(crate) fn lifetime_exhausted(&self, bidi: bool) -> bool { self.send.lifetime_exhausted(bidi) }
+    pub(crate) fn lifetime_exhausted(&self, bidi: bool) -> bool {
+        self.send.lifetime_exhausted(bidi)
+    }
 
     /// A peer stream earns a new stream ID only after both relevant halves
     /// terminate and reliable STREAM/RESET frames are acknowledged.
     pub(crate) fn retire_stream(&mut self, id: u64, tx: bool, rx: bool) -> Result<bool, Error> {
-        if tx && (!self.send.terminal(id) || self.scheduler.stream_pending(id)) { return Ok(false); }
+        if tx && (!self.send.terminal(id) || self.scheduler.stream_pending(id)) {
+            return Ok(false);
+        }
         if !rx {
-            if tx { self.send.retire(id); }
+            if tx {
+                self.send.retire(id);
+            }
             return Ok(true);
         }
-        if !self.scheduler.can_queue_n(2) { return Ok(false); }
-        let Some((grant, data)) = self.receive.retire(id) else { return Ok(false); };
+        if !self.scheduler.can_queue_n(2) {
+            return Ok(false);
+        }
+        let Some((grant, data)) = self.receive.retire(id) else {
+            return Ok(false);
+        };
         if let Some(limit) = grant {
             let bidi = id & 2 == 0;
-            if bidi { self.send.grant_peer_bidi(limit); }
+            if bidi {
+                self.send.grant_peer_bidi(limit);
+            }
             self.queue_credit(if bidi { 0x12 } else { 0x13 }, limit)?;
         }
-        if let Some(limit) = data { self.queue_credit(0x10, limit)?; }
-        if tx { self.send.retire(id); }
+        if let Some(limit) = data {
+            self.queue_credit(0x10, limit)?;
+        }
+        if tx {
+            self.send.retire(id);
+        }
         Ok(true)
     }
 
     fn queue_credit(&mut self, ty: u8, limit: u64) -> Result<(), Error> {
         let mut frame = vec![ty];
         let mut scratch = [0; 8];
-        frame.extend_from_slice(super::wire::encode_varint(limit, &mut scratch).ok_or(Error::Protocol)?);
+        frame.extend_from_slice(
+            super::wire::encode_varint(limit, &mut scratch).ok_or(Error::Protocol)?,
+        );
         self.scheduler.enqueue(frame).map_err(Error::Schedule)
     }
 
@@ -542,7 +592,12 @@ impl LabSession {
     fn register_implicit(&mut self, id: u64) -> Result<(), Error> {
         self.receive.register_implicit(id).map_err(Error::Receive)?;
         if id & 2 == 0 && id & 1 != u64::from(self.server) {
-            for prior in self.receive.peer_streams().into_iter().filter(|id| id & 2 == 0) {
+            for prior in self
+                .receive
+                .peer_streams()
+                .into_iter()
+                .filter(|id| id & 2 == 0)
+            {
                 self.send.register_peer_bidi(prior).map_err(Error::Send)?;
             }
         }
@@ -617,8 +672,12 @@ impl LabSession {
         };
         [
             self.shutdown.deadline(),
-            self.cid_retry_at.filter(|_| self.needs_cid() && self.scheduler.can_queue()),
-            self.handshake_tail.as_ref().map(HandshakeTail::deadline).filter(|_| self.active()),
+            self.cid_retry_at
+                .filter(|_| self.needs_cid() && self.scheduler.can_queue()),
+            self.handshake_tail
+                .as_ref()
+                .map(HandshakeTail::deadline)
+                .filter(|_| self.active()),
             old_keys,
             recovery,
             self.paths.deadline(),
@@ -690,8 +749,14 @@ impl LabSession {
 
     async fn flush_inner(&mut self, now: Instant) -> Result<bool, Error> {
         if let Some(tail) = self.handshake_tail.as_mut() {
-            if let Some(eliciting) = tail.flush(&self.socket, self.paths.active(), now).await.map_err(|_| Error::Protocol)? {
-                if eliciting { self.idle.sent(now); }
+            if let Some(eliciting) = tail
+                .flush(&self.socket, self.paths.active(), now)
+                .await
+                .map_err(|_| Error::Protocol)?
+            {
+                if eliciting {
+                    self.idle.sent(now);
+                }
                 return Ok(true);
             }
         }
@@ -747,7 +812,11 @@ impl LabSession {
 
     /// Wake only while waiting for UDP, never cancel an authenticated packet
     /// handler after it has consumed a datagram or reserved a packet number.
-    pub(crate) async fn recv_with_wake(&mut self, wait: Duration, wake: Option<&tokio::sync::Notify>) -> Result<bool, Error> {
+    pub(crate) async fn recv_with_wake(
+        &mut self,
+        wait: Duration,
+        wake: Option<&tokio::sync::Notify>,
+    ) -> Result<bool, Error> {
         if self.closed {
             return Err(Error::Closed);
         }
@@ -774,14 +843,26 @@ impl LabSession {
         result
     }
 
-    fn receive_stateless_reset(&mut self, packet: &[u8], source: SocketAddr, now: Instant) -> Result<bool, Error> {
-        if source != self.paths.active() || packet.len() > MTU || !self.peer_ids.matches_reset(packet) { return Ok(false); }
+    fn receive_stateless_reset(
+        &mut self,
+        packet: &[u8],
+        source: SocketAddr,
+        now: Instant,
+    ) -> Result<bool, Error> {
+        if source != self.paths.active()
+            || packet.len() > MTU
+            || !self.peer_ids.matches_reset(packet)
+        {
+            return Ok(false);
+        }
         self.enter_draining(now)?;
         Ok(true)
     }
 
     fn enter_draining(&mut self, now: Instant) -> Result<(), Error> {
-        self.shutdown.peer(now, self.scheduler.base_pto()).map_err(|_| Error::Protocol)?;
+        self.shutdown
+            .peer(now, self.scheduler.base_pto())
+            .map_err(|_| Error::Protocol)?;
         self.protection = None;
         self.handshake_tail = None;
         self.early_application.clear();
@@ -789,17 +870,25 @@ impl LabSession {
         Ok(())
     }
 
-    async fn recv_inner(&mut self, wait: Duration, wake: Option<&tokio::sync::Notify>) -> Result<bool, Error> {
+    async fn recv_inner(
+        &mut self,
+        wait: Duration,
+        wake: Option<&tokio::sync::Notify>,
+    ) -> Result<bool, Error> {
         let mut buf = [0; MTU + 1];
         let (n, source) = if let Some(packet) = self.early_application.pop_front() {
-            if packet.len() > MTU { return Err(Error::Protocol); }
+            if packet.len() > MTU {
+                return Err(Error::Protocol);
+            }
             buf[..packet.len()].copy_from_slice(&packet);
             (packet.len(), self.paths.active())
         } else {
             let incoming = tokio::time::timeout(wait, self.socket.recv_from(&mut buf));
             let received = if let Some(wake) = wake {
                 tokio::select! { biased; packet = incoming => packet, _ = wake.notified() => return Ok(false) }
-            } else { incoming.await };
+            } else {
+                incoming.await
+            };
             match received {
                 Ok(result) => result.map_err(Error::Io)?,
                 Err(_) => return Ok(false),
@@ -810,10 +899,7 @@ impl LabSession {
         }
         let new_path = source != self.paths.active();
         if new_path
-            && (!self.server
-                || !self.confirmed
-                || !self.active()
-                || !source.ip().is_loopback())
+            && (!self.server || !self.confirmed || !self.active() || !source.ip().is_loopback())
         {
             return Ok(false);
         }
@@ -821,8 +907,12 @@ impl LabSession {
         // A coalesced datagram can carry the last Handshake ACK and the
         // first HANDSHAKE_DONE/STREAM. Apply each protected space separately.
         if packet.first().is_some_and(|first| first & 0x80 != 0) {
-            if new_path || n > MTU { return Ok(false); }
-            let Ok(parts) = super::datagram::split(packet) else { return Ok(false); };
+            if new_path || n > MTU {
+                return Ok(false);
+            }
+            let Ok(parts) = super::datagram::split(packet) else {
+                return Ok(false);
+            };
             let mut application = None;
             for part in parts {
                 match part.kind {
@@ -830,23 +920,32 @@ impl LabSession {
                         if let Some(tail) = self.handshake_tail.as_mut() {
                             let now = Instant::now();
                             match tail.receive(part.bytes, now).map_err(|_| Error::Protocol)? {
-                                TailEvent::Ignored => {},
+                                TailEvent::Ignored => {}
                                 TailEvent::Authenticated => self.idle.received(now),
-                                TailEvent::Close => { self.enter_draining(now)?; return Ok(true); }
+                                TailEvent::Close => {
+                                    self.enter_draining(now)?;
+                                    return Ok(true);
+                                }
                             }
                         }
                     }
                     super::datagram::PacketKind::Application => application = Some(part.bytes),
-                    _ => {},
+                    _ => {}
                 }
             }
-            let Some(application) = application else { return Ok(false); };
+            let Some(application) = application else {
+                return Ok(false);
+            };
             packet = application;
         }
         let n = packet.len();
         let destination = if (1 + CID_LEN + 4 + 16..=MTU).contains(&n) && packet[0] & 0xc0 == 0x40 {
-            self.local_ids.iter().find_map(|(&seq, cid)| (packet[1..1+CID_LEN] == *cid).then_some((seq, *cid)))
-        } else { None };
+            self.local_ids
+                .iter()
+                .find_map(|(&seq, cid)| (packet[1..1 + CID_LEN] == *cid).then_some((seq, *cid)))
+        } else {
+            None
+        };
         let Some((destination_sequence, destination_cid)) = destination else {
             return self.receive_stateless_reset(packet, source, Instant::now());
         };
@@ -875,7 +974,9 @@ impl LabSession {
         let opened = match result {
             Ok(p) => p,
             Err(packet::Error::Reserved | packet::Error::Limit) => return Err(Error::Protocol),
-            Err(packet::Error::Crypto | packet::Error::Header | packet::Error::TooOld) => return self.receive_stateless_reset(packet, source, now),
+            Err(packet::Error::Crypto | packet::Error::Header | packet::Error::TooOld) => {
+                return self.receive_stateless_reset(packet, source, now)
+            }
             Err(_) => return Ok(false),
         };
         if matches!(&self.protection, Some(Protection::Fixed { .. }))
@@ -920,7 +1021,9 @@ impl LabSession {
             }
             // A validated cross-IP path starts a fresh congestion/RTT model;
             // same-IP NAT rebinding may preserve the old estimates.
-            if old_ip != source.ip() { self.scheduler.restart_path(now); }
+            if old_ip != source.ip() {
+                self.scheduler.restart_path(now);
+            }
         }
         self.idle.received(now);
         if let Some(Frame::Close {
@@ -955,15 +1058,38 @@ impl LabSession {
                         self.send_path(source, &response, now).await?;
                     }
                 }
-                Frame::NewConnectionId { sequence, retire_prior_to, cid, reset_token } => {
-                    let retired = self.peer_ids.insert(ConnectionId { sequence, cid: cid.to_vec(), reset_token }, retire_prior_to).map_err(|_| Error::Protocol)?;
-                    if !self.scheduler.can_queue_n(retired.len()) { return Err(Error::Protocol); }
-                    for sequence in retired { self.queue_retire_cid(sequence)?; }
+                Frame::NewConnectionId {
+                    sequence,
+                    retire_prior_to,
+                    cid,
+                    reset_token,
+                } => {
+                    let retired = self
+                        .peer_ids
+                        .insert(
+                            ConnectionId {
+                                sequence,
+                                cid: cid.to_vec(),
+                                reset_token,
+                            },
+                            retire_prior_to,
+                        )
+                        .map_err(|_| Error::Protocol)?;
+                    if !self.scheduler.can_queue_n(retired.len()) {
+                        return Err(Error::Protocol);
+                    }
+                    for sequence in retired {
+                        self.queue_retire_cid(sequence)?;
+                    }
                 }
                 Frame::RetireConnectionId(sequence) => {
-                    if sequence >= self.next_local_sequence || sequence == destination_sequence { return Err(Error::Protocol); }
+                    if sequence >= self.next_local_sequence || sequence == destination_sequence {
+                        return Err(Error::Protocol);
+                    }
                     if let Some(cid) = self.local_ids.get(&sequence).copied() {
-                        if self.local_ids.len() <= 1 { return Err(Error::Protocol); }
+                        if self.local_ids.len() <= 1 {
+                            return Err(Error::Protocol);
+                        }
                         self.socket.retire_cid(cid).await.map_err(Error::Io)?;
                         self.local_ids.remove(&sequence);
                     }
@@ -1011,28 +1137,30 @@ impl LabSession {
                     // No address-token cache or 0-RTT in this backend. Never
                     // accept a peer's token as identity or admission evidence.
                 }
-                Frame::DataBlocked(_) | Frame::StreamsBlocked { .. } => {},
+                Frame::DataBlocked(_) | Frame::StreamsBlocked { .. } => {}
                 Frame::StreamDataBlocked { id, .. } => {
                     self.receive.check_stop(id).map_err(Error::Receive)?;
                     self.register_implicit(id)?;
                 }
                 Frame::StopSending { id, code } => {
-                    if id & 2 == 0 && id & 1 != u64::from(self.server) { self.register_implicit(id)?; }
+                    if id & 2 == 0 && id & 1 != u64::from(self.server) {
+                        self.register_implicit(id)?;
+                    }
                     self.reset_stream(id, code)?;
                 }
                 Frame::MaxData(n) => self.send.max_data(n).map_err(Error::Send)?,
                 Frame::MaxStreamData { id, limit } => {
-                    if id & 2 == 0 && id & 1 != u64::from(self.server) { self.register_implicit(id)?; }
+                    if id & 2 == 0 && id & 1 != u64::from(self.server) {
+                        self.register_implicit(id)?;
+                    }
                     self.send.max_stream_data(id, limit).map_err(Error::Send)?
                 }
-                Frame::MaxStreams { bidi: false, limit } => self
-                    .send
-                    .max_streams(limit)
-                    .map_err(Error::Send)?,
-                Frame::MaxStreams { bidi: true, limit } => self
-                    .send
-                    .max_bidi(limit)
-                    .map_err(Error::Send)?,
+                Frame::MaxStreams { bidi: false, limit } => {
+                    self.send.max_streams(limit).map_err(Error::Send)?
+                }
+                Frame::MaxStreams { bidi: true, limit } => {
+                    self.send.max_bidi(limit).map_err(Error::Send)?
+                }
                 _ => return Err(Error::Protocol),
             }
         }

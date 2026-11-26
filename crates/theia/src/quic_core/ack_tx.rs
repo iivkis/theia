@@ -37,7 +37,9 @@ impl History {
         self.numbers.retain(|n| *n >= floor);
         let fresh = self.numbers.insert(number);
         self.pending |= eliciting;
-        if fresh { self.ecn.record(mark); }
+        if fresh {
+            self.ecn.record(mark);
+        }
         fresh
     }
 
@@ -80,7 +82,9 @@ impl History {
             add(pair[1].last - pair[1].first);
         }
         if let Some(counters) = counters {
-            for count in counters { add(count); }
+            for count in counters {
+                add(count);
+            }
         }
         Some(out)
     }
@@ -105,12 +109,20 @@ mod tests {
         let data = h.encode().unwrap();
         assert_eq!(data[0], 3);
         let mut pos = 1;
-        assert_eq!(Ack::decode(&data, &mut pos, true).unwrap().ecn, Some([1, 1, 1]));
+        assert_eq!(
+            Ack::decode(&data, &mut pos, true).unwrap().ecn,
+            Some([1, 1, 1])
+        );
         assert_eq!(pos, data.len());
         h.sent();
         assert!(h.record(140, true));
         assert!(!h.record_marked(0, true, Mark::Ce));
-        assert_eq!(Ack::decode(&h.encode().unwrap(), &mut 1usize, true).unwrap().ecn, Some([1, 1, 1]));
+        assert_eq!(
+            Ack::decode(&h.encode().unwrap(), &mut 1usize, true)
+                .unwrap()
+                .ecn,
+            Some([1, 1, 1])
+        );
     }
 
     #[test]

@@ -291,12 +291,17 @@ impl Bbr {
         if observed >= 4 * self.mtu && u128::from(self.round_lost) * 50 > u128::from(observed) {
             let bound = (self.cwnd.saturating_mul(7) / 10).max(floor);
             self.loss_ceiling = Some(self.loss_ceiling.map_or(bound, |old| old.min(bound)));
-            if self.mode == Mode::Startup { self.full_pipe = true; self.mode = Mode::Drain; }
+            if self.mode == Mode::Startup {
+                self.full_pipe = true;
+                self.mode = Mode::Drain;
+            }
             self.round_acked = 0;
             self.round_lost = 0;
         } else if round_start {
             if self.round_lost == 0 {
-                if let Some(old) = self.loss_ceiling { self.loss_ceiling = Some(old.saturating_add(self.mtu).min(MAX_CWND)); }
+                if let Some(old) = self.loss_ceiling {
+                    self.loss_ceiling = Some(old.saturating_add(self.mtu).min(MAX_CWND));
+                }
             }
             self.round_acked = 0;
             self.round_lost = 0;
@@ -370,7 +375,11 @@ impl Bbr {
             self.recovery_until = self.last_sent;
             self.cwnd = self.cwnd.saturating_sub(outcome.lost_bytes).max(floor);
         }
-        let target = self.bdp().saturating_mul(2).clamp(floor, MAX_CWND).min(self.loss_ceiling.unwrap_or(MAX_CWND));
+        let target = self
+            .bdp()
+            .saturating_mul(2)
+            .clamp(floor, MAX_CWND)
+            .min(self.loss_ceiling.unwrap_or(MAX_CWND));
         self.cwnd = if self.mode == Mode::ProbeRtt {
             floor
         } else if self.full_pipe {

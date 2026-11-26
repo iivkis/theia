@@ -592,13 +592,22 @@ async fn native_fixture(private: bool) -> (SocketAddr, JoinHandle<()>, RootCertS
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let der = cert.cert.der().clone();
     let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_protocol_versions(&[&rustls::version::TLS13]).unwrap().with_no_client_auth()
-        .with_single_cert(vec![der.clone()], key.into()).unwrap();
+    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(vec![der.clone()], key.into())
+    .unwrap();
     tls.alpn_protocols = vec![b"h3".to_vec()];
     tls.send_tls13_tickets = 0;
     let tls = Arc::new(tls);
-    let mut listener = Listener::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(), 64).unwrap();
+    let mut listener = Listener::new(
+        tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        64,
+    )
+    .unwrap();
     let remote = listener.local_addr().unwrap();
     let context = context(private);
     let mut roots = RootCertStore::empty();
@@ -635,7 +644,10 @@ async fn exact_relay_sample(client: &H3Client, payload: &[u8]) -> (Duration, Dur
         socket.shutdown().await.unwrap();
     });
     let started = std::time::Instant::now();
-    let tunnel = client.open(Address::V4([127, 0, 0, 1]), port).await.unwrap();
+    let tunnel = client
+        .open(Address::V4([127, 0, 0, 1]), port)
+        .await
+        .unwrap();
     let open = started.elapsed();
     let (mut app, local) = tokio::io::duplex(8192);
     let relay = tokio::spawn(tunnel.relay(local));
@@ -657,19 +669,37 @@ async fn native_xhttp_loopback_preserves_grants_and_both_stream_modes() {
         let (remote, server, roots) = native_fixture(true).await;
         for version in [Version::V1, Version::V2] {
             for split in [false, true] {
-                let client = H3Client::new(remote, "localhost", &token(), roots.clone()).unwrap()
-                    .with_native_lab(version).unwrap().with_stream_up(split).unwrap();
+                let client = H3Client::new(remote, "localhost", &token(), roots.clone())
+                    .unwrap()
+                    .with_native_lab(version)
+                    .unwrap()
+                    .with_stream_up(split)
+                    .unwrap();
                 exact_relay_sample(&client, &vec![0x6a; 96 * 1024]).await;
             }
         }
         let wrong = URL_SAFE_NO_PAD.encode([0x44; 32]);
-        let client = H3Client::new(remote, "localhost", &wrong, roots).unwrap()
-            .with_native_lab(Version::V2).unwrap();
+        let client = H3Client::new(remote, "localhost", &wrong, roots)
+            .unwrap()
+            .with_native_lab(Version::V2)
+            .unwrap();
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        assert!(matches!(client.open(Address::V4([127,0,0,1]), target.local_addr().unwrap().port()).await, Err(ClientError::Unauthorized)));
-        assert!(timeout(Duration::from_millis(250), target.accept()).await.is_err());
+        assert!(matches!(
+            client
+                .open(
+                    Address::V4([127, 0, 0, 1]),
+                    target.local_addr().unwrap().port()
+                )
+                .await,
+            Err(ClientError::Unauthorized)
+        ));
+        assert!(timeout(Duration::from_millis(250), target.accept())
+            .await
+            .is_err());
         server.abort();
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }
 
 /// Manual matched loopback workload: raw samples, no performance claim.
@@ -686,16 +716,33 @@ async fn quinn_native_xhttp_comparison_samples() {
         println!("backend,stream_up,sample,bytes,open_us,relay_us");
         for split in [false, true] {
             for sample in 0..5 {
-                for (label, version) in [("quinn", None), ("native-v1", Some(Version::V1)), ("native-v2", Some(Version::V2))] {
+                for (label, version) in [
+                    ("quinn", None),
+                    ("native-v1", Some(Version::V1)),
+                    ("native-v2", Some(Version::V2)),
+                ] {
                     let client = if let Some(version) = version {
-                        H3Client::new(naddr, "localhost", &token(), nroots.clone()).unwrap().with_native_lab(version).unwrap()
-                    } else { H3Client::new(qaddr, "localhost", &token(), qroots.clone()).unwrap() };
+                        H3Client::new(naddr, "localhost", &token(), nroots.clone())
+                            .unwrap()
+                            .with_native_lab(version)
+                            .unwrap()
+                    } else {
+                        H3Client::new(qaddr, "localhost", &token(), qroots.clone()).unwrap()
+                    };
                     let client = client.with_stream_up(split).unwrap();
                     let (open, relay) = exact_relay_sample(&client, &payload).await;
-                    println!("{label},{split},{sample},{},{},{}", payload.len(), open.as_micros(), relay.as_micros());
+                    println!(
+                        "{label},{split},{sample},{},{},{}",
+                        payload.len(),
+                        open.as_micros(),
+                        relay.as_micros()
+                    );
                 }
             }
         }
-        qserver.abort(); nserver.abort();
-    }).await.unwrap();
+        qserver.abort();
+        nserver.abort();
+    })
+    .await
+    .unwrap();
 }

@@ -71,7 +71,9 @@ impl ReceiveBuffer {
         }
         if self.abandoned {
             self.highest = self.highest.max(end);
-            if fin { self.final_size = Some(end); }
+            if fin {
+                self.final_size = Some(end);
+            }
             return Ok(());
         }
         if end.saturating_sub(self.read_offset) > self.window as u64 {
@@ -135,8 +137,12 @@ impl ReceiveBuffer {
     }
 
     pub(crate) fn release_terminal(&mut self) -> Option<u64> {
-        let terminal = self.finished() || self.reset_code.is_some() || (self.abandoned && self.final_size.is_some());
-        if !terminal { return None; }
+        let terminal = self.finished()
+            || self.reset_code.is_some()
+            || (self.abandoned && self.final_size.is_some());
+        if !terminal {
+            return None;
+        }
         let released = self.highest.saturating_sub(self.read_offset);
         self.read_offset = self.highest;
         self.bytes = VecDeque::new();
