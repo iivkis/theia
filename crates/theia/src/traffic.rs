@@ -96,6 +96,14 @@ pub(crate) fn udp_quic_flow(){UDP_QUIC.fetch_add(1,Ordering::Relaxed);}
 pub(crate) fn udp_stun_flow(){UDP_STUN.fetch_add(1,Ordering::Relaxed);}
 pub(crate) fn udp_stun_response(){UDP_STUN_RESPONSE.fetch_add(1,Ordering::Relaxed);}
 pub(crate) fn udp_dpi_fallback(){UDP_DPI_FALLBACK.fetch_add(1,Ordering::Relaxed);}
+#[cfg(test)]
+#[test]
+fn udp_routing_summary_reports_independent_counters(){
+    let report=routing_summary_from([0,0,0,0,0,0,0,0,0,0,1,2,3,4,5,6,7,8,9,10]);
+    assert!(report.contains("UDP VPS:"));
+    assert!(report.contains("QUIC Initial 7 · STUN 8 · совпавший ответ 9"));
+    assert!(report.contains("UDP Anti-DPI: только VPS, открыто 10"));
+}
 
 pub(crate) fn enter_direct() -> Relay<'static> {
     CLIENT_DIRECT.enter()

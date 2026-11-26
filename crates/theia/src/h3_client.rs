@@ -934,8 +934,7 @@ impl H3Tunnel {
         };
         let result=tokio::select! { result=send_loop=>result, result=receive_loop=>result, ()=activity.expire()=>Ok(()) };
         if writing.load(std::sync::atomic::Ordering::Relaxed) || result.is_err() {
-            tx.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
-            rx.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+            // Drop the interrupted request; never append FIN or retry.
             return result.and(Err(ClientError::Timeout));
         }
         send(tx,&Frame::Fin).await?;

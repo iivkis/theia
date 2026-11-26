@@ -1,6 +1,6 @@
 use theia::protocol::{
     decode, encode, Address, Decoder, Direction, ErrorCode, Frame, ProtocolError, Role, Session,
-    CAP_PADDING, HEADER_LEN, MAX_PAYLOAD, VERSION,
+    CAP_PADDING, HEADER_LEN, MAX_DATAGRAM, MAX_PAYLOAD, VERSION,
 };
 
 fn hello() -> Frame {
@@ -46,7 +46,10 @@ fn establish() -> (Session, Session) {
 
 #[test]
 fn documented_golden_vectors_are_exact() {
-    let fixtures: [(Frame, &[u8]); 4] = [
+    let fixtures: [(Frame, &[u8]); 7] = [
+        (Frame::OpenUdp { address: Address::V4([1,2,3,4]), port:443 }, &[0x06,0,0,0,0,9,1,0,4,1,2,3,4,1,187]),
+        (Frame::Datagram(vec![1,2,3]), &[0x14,0,0,0,0,3,1,2,3]),
+        (Frame::Datagram(vec![]), &[0x14,0,0,0,0,0]),
         (hello(), &[0x01, 0, 0, 0, 0, 6, 0, 1, 0, 0, 0, 0]),
         (ack(), &[0x02, 0, 0, 0, 0, 6, 0, 1, 0, 0, 0, 0]),
         (Frame::Fin, &[0x11, 0, 0, 0, 0, 0]),
@@ -75,6 +78,9 @@ fn all_frame_variants_round_trip_and_big_endian_address_length() {
             address: Address::V6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
             port: 1,
         },
+        Frame::OpenUdp { address: Address::Dns("example.org".into()), port:3478 },
+        Frame::Datagram(vec![]),
+        Frame::Datagram(vec![7;MAX_DATAGRAM]),
         Frame::OpenOk,
         Frame::OpenError(ErrorCode::DialTimeout),
         Frame::Data(vec![]),
@@ -118,6 +124,9 @@ fn size_boundaries_are_enforced_before_buffering() {
     let mut decoder = Decoder::new();
     assert_eq!(decoder.feed(&oversized), Err(ProtocolError::FrameTooLarge));
     assert_eq!(decoder.pending_len(), HEADER_LEN);
+    let n=(MAX_DATAGRAM as u32+1).to_be_bytes();
+    let header=[0x14,0,n[0],n[1],n[2],n[3]];
+    assert_eq!(Decoder::new().feed(&header),Err(ProtocolError::FrameTooLarge));
 }
 
 #[test]

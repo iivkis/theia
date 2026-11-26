@@ -17,6 +17,8 @@ impl Activity {
 }
 pub(crate) enum Target { Tcp(tokio::net::TcpStream), Udp(UdpSocket) }
 pub(crate) async fn connect(address:SocketAddr)->io::Result<UdpSocket>{
+    let normalized=match address.ip(){IpAddr::V6(ip)=>ip.to_ipv4_mapped().map_or(IpAddr::V6(ip),IpAddr::V4),ip=>ip};
+    if address.port()==0 || normalized.is_unspecified() || normalized.is_multicast() || normalized==IpAddr::V4(std::net::Ipv4Addr::BROADCAST){return Err(io::Error::from(io::ErrorKind::InvalidInput));}
     let bind=if address.is_ipv4() {"0.0.0.0:0"} else {"[::]:0"};
     let socket=UdpSocket::bind(bind).await?;
     socket.connect(address).await?;
@@ -125,6 +127,12 @@ mod tests {
         assert!(encode_socks(&Address::Dns("bad/name".into()),443,b"").is_none());
         assert!(valid_associate(&Address::V4([0;4]),"127.0.0.1".parse().unwrap()));
         assert!(!valid_associate(&Address::V4([8,8,8,8]),"127.0.0.1".parse().unwrap()));
+    }
+    #[tokio::test]
+    async fn rejects_nonunicast_before_open(){
+        for address in ["0.0.0.0:53","255.255.255.255:53","224.0.0.1:53","[::]:53","[ff02::1]:53","[::ffff:255.255.255.255]:53","127.0.0.1:0"] {
+            assert!(connect(address.parse().unwrap()).await.is_err());
+        }
     }
     #[tokio::test]
     async fn connected_udp_preserves_boundaries_and_empty_datagrams() {

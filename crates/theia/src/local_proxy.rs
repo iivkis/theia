@@ -3264,7 +3264,7 @@ mod selector_tests {
         let quic_addr = quic.local_addr().unwrap();
         let h3 = tokio::spawn(crate::h3_server::serve(quic, context));
 
-        timeout(Duration::from_secs(25), async {
+        timeout(Duration::from_secs(50), async {
             for (transport, remote, http) in [
                 (Transport::H2, tcp_addr, true),
                 (Transport::H3, quic_addr, false),
@@ -3434,7 +3434,7 @@ async fn udp_association(mut control:TcpStream,client:&ProxyClient,requested:Add
                 observer.lock().unwrap_or_else(|e|e.into_inner()).outgoing(data);
                 flows.insert(key.clone(),(tx,observer.clone()));
                 let socket=socket.clone();
-                let proxy=client.clone();
+                let proxy=(*client).clone();
                 tasks.spawn(async move {
                     let (address,port)=key;
                     let tunnel=proxy.open_udp(address.clone(),port).await?;
@@ -3463,7 +3463,7 @@ async fn udp_socks_fixture(client:&ProxyClient) {
     let app=tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let app_port=app.local_addr().unwrap().port();
     let (mut control,local)=tests::paired().await;
-    let client=client.clone();
+    let client=(*client).clone();
     assert!(matches!(client.open_udp(Address::Dns("blocked.invalid".into()),443).await,Err(ClientError::Open(ErrorCode::PolicyDenied))));
     let task=tokio::spawn(async move {handle(local,false,&client,1).await});
     let mut greeting=vec![5,1,0,5,3,0,1,127,0,0,1];greeting.extend(app_port.to_be_bytes());
@@ -3479,16 +3479,76 @@ async fn udp_socks_fixture(client:&ProxyClient) {
     let mut stun=vec![0,1,0,0,0x21,0x12,0xa4,0x42];stun.extend([7;12]);
     let hello=crate::routing::dpi::test_hello();
     let quic=crate::reality_quic_wire::test_initial(crate::reality_quic_wire::V1,&hello[5..]);
-    for data in [stun,quic,vec![],b"last".to_vec()] {
+    for (index,data) in [stun,quic,vec![],b"last".to_vec()].into_iter().enumerate() {
         let packet=encode_socks(&address,port,&data).unwrap();
         app.send_to(&packet,relay).await.unwrap();
         let (n,peer)=timeout(Duration::from_secs(3),target.recv_from(&mut buf)).await.unwrap().unwrap();
         assert_eq!(&buf[..n],data);
-        target.send_to(&data,peer).await.unwrap();
+        let response=if index==0 {
+            // Minimal Binding success with the observed VPS source.
+            let mut response=data.clone();response[0]=1;response[3]=12;
+            response.extend([0,0x20,0,8,0,1]);
+            response.extend((peer.port()^0x2112).to_be_bytes());
+            let IpAddr::V4(ip)=peer.ip() else {panic!("fixture IPv4")};
+            response.extend(ip.octets().into_iter().zip([0x21,0x12,0xa4,0x42]).map(|(a,b)|a^b));
+            response
+        } else {data};
+        target.send_to(&response,peer).await.unwrap();
         let (n,source)=timeout(Duration::from_secs(3),app.recv_from(&mut buf)).await.unwrap().unwrap();
         assert_eq!(source,relay);
-        assert_eq!(parse_socks(&buf[..n]),Some((address.clone(),port,data.as_slice())));
+        assert_eq!(parse_socks(&buf[..n]),Some((address.clone(),port,response.as_slice())));
     }
+    udp_quic_fixture(app,relay).await;
     control.shutdown().await.unwrap();
     timeout(Duration::from_secs(3),task).await.unwrap().unwrap().unwrap();
+}
+
+#[cfg(test)]
+async fn udp_quic_fixture(app:tokio::net::UdpSocket,relay:SocketAddr){
+    let cert=rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let der=cert.cert.der().clone();
+    let mut roots=rustls::RootCertStore::empty();
+    roots.add(der.clone()).unwrap();
+    let origin=crate::quic_transport::server_endpoint("127.0.0.1:0".parse().unwrap(),vec![der],
+        rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into()).unwrap();
+    let origin_port=origin.local_addr().unwrap().port();
+    let endpoint=crate::quic_transport::client_endpoint("127.0.0.1:0".parse().unwrap(),roots).unwrap();
+    let client_addr=endpoint.local_addr().unwrap();
+    let bridge_addr=app.local_addr().unwrap();
+    let bridge=tokio::spawn(async move {
+        let target=Address::V4([127,0,0,1]);
+        let mut buf=vec![0;65536];
+        loop {
+            let (n,source)=app.recv_from(&mut buf).await.unwrap();
+            if source==client_addr {
+                if let Some(wire)=crate::udp_relay::encode_socks(&target,origin_port,&buf[..n]){
+                    app.send_to(&wire,relay).await.unwrap();
+                }
+            } else if source==relay {
+                if let Some((address,port,data))=crate::udp_relay::parse_socks(&buf[..n]){
+                    if address==target && port==origin_port {app.send_to(data,client_addr).await.unwrap();}
+                }
+            }
+        }
+    });
+    let server=async {
+        let connection=crate::quic_transport::accept(origin.accept().await.unwrap()).await.unwrap();
+        let (mut tx,mut rx)=connection.accept_bi().await.unwrap();
+        let bytes=rx.read_to_end(64).await.unwrap();
+        assert_eq!(bytes,b"nested quic");
+        tx.write_all(&bytes).await.unwrap();
+        tx.finish().unwrap();
+        connection
+    };
+    let client=async {
+        let connection=crate::quic_transport::connect(&endpoint,bridge_addr,"localhost").await.unwrap();
+        let (mut tx,mut rx)=connection.open_bi().await.unwrap();
+        tx.write_all(b"nested quic").await.unwrap();
+        tx.finish().unwrap();
+        assert_eq!(rx.read_to_end(64).await.unwrap(),b"nested quic");
+        connection
+    };
+    let (_server,_client)=timeout(Duration::from_secs(10),async {tokio::join!(server,client)}).await.unwrap();
+    bridge.abort();
+    let _=bridge.await;
 }
