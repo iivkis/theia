@@ -4,7 +4,7 @@
 //! the owner must suppress frames already acknowledged by another packet.
 use super::{ack::Ack, wire::MAX_VARINT};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -54,6 +54,9 @@ pub enum Error {
     Clock,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Status { Pending, Acked, Lost }
+
 #[derive(Default)]
 pub struct Ledger {
     next: u64,
@@ -61,6 +64,7 @@ pub struct Ledger {
     last_send: Option<Instant>,
     largest_ack: Option<u64>,
     bytes_in_flight: u64,
+    congestion_history: BTreeMap<u64, (Instant, Status)>,
 }
 
 impl Ledger {
@@ -96,6 +100,12 @@ impl Ledger {
                 .checked_add(u64::from(packet.bytes))
                 .ok_or(Error::Limit)?;
         }
+        if packet.ack_eliciting {
+            self.congestion_history.insert(packet.number, (packet.at, Status::Pending));
+            if self.congestion_history.len() > MAX_OUTSTANDING * 2 {
+                self.congestion_history.pop_first();
+            }
+        }
         self.next += 1;
         self.last_send = Some(packet.at);
         // ACK-only packets still consume packet numbers, but do not need
@@ -112,6 +122,7 @@ impl Ledger {
         self.sent.clear();
         self.bytes_in_flight = 0;
         self.largest_ack = None;
+        self.congestion_history.clear();
     }
 
     pub fn bytes_in_flight(&self) -> u64 {
@@ -125,6 +136,16 @@ impl Ledger {
         ack: &Ack,
         now: Instant,
         loss_delay: Duration,
+    ) -> Result<Outcome, Error> {
+        self.acknowledge_with_delay(ack, now, |_| loss_delay)
+    }
+
+    /// The RFC 9002 ACK handler updates RTT before time-threshold loss detection.
+    pub(crate) fn acknowledge_with_delay(
+        &mut self,
+        ack: &Ack,
+        now: Instant,
+        delay: impl FnOnce(Option<Duration>) -> Duration,
     ) -> Result<Outcome, Error> {
         let first = ack.ranges.first().ok_or(Error::Ack)?;
         if ack.ranges.len() > super::ack::MAX_ACK_RANGES as usize + 1 || first.last >= self.next {
@@ -147,6 +168,13 @@ impl Ledger {
             self.largest_ack
                 .map_or(first.last, |old| old.max(first.last)),
         );
+        // Late ACK of a previously declared lost packet also breaks a
+        // future persistent-congestion interval. ACK-only PN gaps are absent.
+        for range in &ack.ranges {
+            for (_, (_, status)) in self.congestion_history.range_mut(range.first..=range.last) {
+                *status = Status::Acked;
+            }
+        }
         let mut result = Outcome::default();
         let mut pending = VecDeque::with_capacity(self.sent.len());
         while let Some(p) = self.sent.pop_front() {
@@ -165,6 +193,7 @@ impl Ledger {
             }
         }
         self.sent = pending;
+        let loss_delay = delay(result.rtt_sample);
         self.detect(now, loss_delay, &mut result);
         Ok(result)
     }
@@ -192,12 +221,34 @@ impl Ledger {
                     self.bytes_in_flight -= bytes;
                     out.lost_bytes += bytes;
                 }
+                if let Some((_, status)) = self.congestion_history.get_mut(&p.number) {
+                    *status = Status::Lost;
+                }
                 out.lost.push(p);
             } else {
                 pending.push_back(p);
             }
         }
         self.sent = pending;
+    }
+
+    /// RFC 9002 persistent congestion can span multiple ACK/loss events.
+    /// An unresolved or ACKed ack-eliciting packet breaks the run; ignored
+    /// ACK-only numbers do not. Bounded history eviction is conservative.
+    pub(crate) fn persistent_end(&self, first_rtt: Instant, threshold: Duration) -> Option<Instant> {
+        let mut start = None;
+        let mut end = None;
+        for &(at, status) in self.congestion_history.values() {
+            if status != Status::Lost || at < first_rtt {
+                start = None;
+                continue;
+            }
+            let begin = *start.get_or_insert(at);
+            if at.saturating_duration_since(begin) >= threshold {
+                end = Some(at);
+            }
+        }
+        end
     }
 
     /// Earliest time-threshold deadline; PTO for the no-ACK case belongs to
@@ -273,6 +324,45 @@ mod tests {
             .unwrap()
             .acknowledged
             .is_empty());
+    }
+
+    #[test]
+    fn persistent_congestion_spans_events_but_late_ack_breaks_interval() {
+        let now = Instant::now();
+        let tick = Duration::from_millis(10);
+        let mut l = Ledger::default();
+        l.record(packet(0, now)).unwrap();
+        let mut ack_only = packet(1, now + tick);
+        ack_only.ack_eliciting = false;
+        ack_only.in_flight = false;
+        l.record(ack_only).unwrap();
+        l.record(packet(2, now + tick * 2)).unwrap();
+        l.record(packet(3, now + tick * 3)).unwrap();
+        l.record(packet(4, now + tick * 4)).unwrap();
+        let at = now + tick * 4;
+        // Packet 0 is lost by packet threshold; 2 and 3 remain pending.
+        l.acknowledge(&ack(4), at, tick * 4).unwrap();
+        assert_eq!(l.persistent_end(now, tick * 2), None);
+        l.on_loss_timer(at + tick * 4, tick * 4).unwrap();
+        assert_eq!(l.persistent_end(now, tick * 2), Some(now + tick * 3));
+        // A late ACK splits the run, including across an ACK-only number.
+        l.acknowledge(&ack(2), at + tick * 4, tick * 4).unwrap();
+        assert_eq!(l.persistent_end(now, tick * 2), None);
+        l.restart_path();
+        assert_eq!(l.persistent_end(now, tick), None);
+    }
+
+    #[test]
+    fn updated_rtt_controls_time_threshold_in_same_ack() {
+        let now = Instant::now();
+        let mut l = Ledger::default();
+        l.record(packet(0, now)).unwrap();
+        l.record(packet(1, now + Duration::from_millis(20))).unwrap();
+        let out = l.acknowledge_with_delay(&ack(1), now + Duration::from_millis(30), |sample| {
+            assert_eq!(sample, Some(Duration::from_millis(10)));
+            Duration::from_millis(12)
+        }).unwrap();
+        assert_eq!(out.lost.len(), 1);
     }
 
     #[test]

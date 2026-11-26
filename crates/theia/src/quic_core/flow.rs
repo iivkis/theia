@@ -4,12 +4,14 @@ use super::{
     stream::{ReceiveBuffer, ReceiveError, MAX_WINDOW},
     wire::MAX_VARINT,
 };
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::{Duration, Instant}};
 
 const MAX_STREAMS: u64 = 64;
 const MAX_STREAM_COUNT: u64 = 1 << 60;
 const RECENT_CLOSED: usize = 64;
 const MAX_TOTAL_WINDOW: usize = 8 * 1024 * 1024;
+const MAX_ADAPTIVE_STREAM: usize = 256 * 1024;
+const MAX_ADAPTIVE_CONNECTION: u64 = 2 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -27,6 +29,10 @@ pub struct ReceiveFlow {
     window: usize,
     max_data: u64,
     used: u64,
+    adaptive_cap: Option<usize>,
+    connection_window: u64,
+    consumed: u64,
+    tune_epoch: Option<(Instant, u64)>,
     streams: BTreeMap<u64, ReceiveBuffer>,
     // Exclusive high-water mark by stream type. Every lower ID is either
     // active or closed, never reopened. Peer IDs are opened implicitly.
@@ -63,6 +69,10 @@ impl ReceiveFlow {
             window,
             max_data,
             used: 0,
+            adaptive_cap: None,
+            connection_window: max_data,
+            consumed: 0,
+            tune_epoch: None,
             streams: BTreeMap::new(),
             opened: [0; 4],
             recent_closed: BTreeMap::new(),
@@ -77,11 +87,29 @@ impl ReceiveFlow {
             .ok_or(Error::Limit)?;
         if count > MAX_STREAMS
             || (count as usize).saturating_mul(self.window) > MAX_TOTAL_WINDOW
+            || self.adaptive_cap.is_some()
             || limit < self.max_local_bidi
         {
             return Err(Error::Limit);
         }
         self.max_local_bidi = limit;
+        Ok(())
+    }
+
+    /// Called once, before any stream opens, after the TLS handshake.
+    /// Each active receive direction has a fixed maximum allocation, even
+    /// when cumulative MAX_STREAMS grows over the life of the connection.
+    pub(crate) fn enable_autotune(&mut self) -> Result<(), Error> {
+        if self.adaptive_cap.is_some() || !self.streams.is_empty() || self.stream_limit != self.window as u64
+            || self.max_data > MAX_ADAPTIVE_CONNECTION {
+            return Err(Error::Limit);
+        }
+        let count = (self.max_bidi + self.max_uni + self.max_local_bidi).max(1) as usize;
+        let cap = (MAX_TOTAL_WINDOW / count).min(MAX_ADAPTIVE_STREAM);
+        if cap < self.window {
+            return Err(Error::Limit);
+        }
+        self.adaptive_cap = Some(cap);
         Ok(())
     }
 
@@ -274,14 +302,39 @@ impl ReceiveFlow {
         id: u64,
         output: &mut [u8],
     ) -> Result<(usize, u64, u64), Error> {
+        self.read_replenish_at(id, output, Instant::now(), Duration::ZERO)
+    }
+
+    pub(crate) fn read_replenish_at(
+        &mut self,
+        id: u64,
+        output: &mut [u8],
+        now: Instant,
+        rtt: Duration,
+    ) -> Result<(usize, u64, u64), Error> {
         let stream = self.streams.get_mut(&id).ok_or(Error::StreamId)?;
         if let Some(code) = stream.reset_code() {
             return Err(Error::Receive(ReceiveError::Reset(code)));
         }
         let n = stream.read(output);
-        let limit = stream.limit().saturating_add(n as u64).min(MAX_VARINT);
+        let extra = self.adaptive_cap.map_or(0, |cap| stream.tune_window(n, now, rtt, cap));
+        let limit = stream.limit().saturating_add(n as u64).saturating_add(extra as u64).min(MAX_VARINT);
         stream.extend_limit(limit).map_err(Error::Receive)?;
-        self.max_data = self.max_data.saturating_add(n as u64).min(MAX_VARINT);
+        let before = self.consumed;
+        self.consumed = self.consumed.saturating_add(n as u64);
+        let mut growth = 0;
+        if self.adaptive_cap.is_some() && n != 0 && !rtt.is_zero() {
+            let (start, offset) = *self.tune_epoch.get_or_insert((now, before));
+            if now.saturating_duration_since(start) > rtt.saturating_mul(2) {
+                self.tune_epoch = Some((now, before));
+            } else if self.consumed.saturating_sub(offset) >= (self.connection_window / 2).max(1) {
+                let old = self.connection_window;
+                self.connection_window = old.saturating_mul(2).min(MAX_ADAPTIVE_CONNECTION);
+                growth = self.connection_window - old;
+                self.tune_epoch = Some((now, self.consumed));
+            }
+        }
+        self.max_data = self.max_data.saturating_add(n as u64).saturating_add(growth).min(MAX_VARINT);
         Ok((n, self.max_data, limit))
     }
 
@@ -323,6 +376,31 @@ impl ReceiveFlow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fast_consumption_grows_windows_but_retirement_does_not_multiply_budget() {
+        let now = Instant::now();
+        let rtt = Duration::from_millis(10);
+        let mut f = ReceiveFlow::new(true, 1, 1, 64, 64, 64).unwrap();
+        f.enable_autotune().unwrap();
+        f.insert(0, 0, &[7; 32], false).unwrap();
+        assert_eq!(f.read_replenish_at(0, &mut [0; 32], now, rtt), Ok((32, 160, 160)));
+        assert_eq!(f.read_replenish_at(0, &mut [0; 32], now, rtt), Ok((0, 160, 160)));
+        f.insert(0, 32, &[9; 64], false).unwrap();
+        assert_eq!(f.read_replenish_at(0, &mut [0; 64], now + rtt, rtt), Ok((64, 352, 352)));
+        let cap = f.adaptive_cap.unwrap();
+        assert!(cap <= MAX_ADAPTIVE_STREAM);
+        f.insert(0, 96, &[], true).unwrap();
+        assert!(f.retire(0).is_some());
+        // New streams start at the negotiated initial limit, not the
+        // previous stream's enlarged absolute limit.
+        assert_eq!(f.insert(4, 64, b"x", false), Err(Error::Receive(ReceiveError::Limit)));
+        f.insert(4, 0, &[1; 16], false).unwrap();
+        let slow = now + Duration::from_secs(1);
+        assert_eq!(f.read_replenish_at(4, &mut [0; 16], slow, rtt), Ok((16, 368, 80)));
+        f.insert(4, 16, &[1; 16], false).unwrap();
+        assert_eq!(f.read_replenish_at(4, &mut [0; 16], slow + rtt * 3, rtt), Ok((16, 384, 96)));
+    }
 
     #[test]
     fn connection_credit_counts_gaps_and_duplicates_once() {

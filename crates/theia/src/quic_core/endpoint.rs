@@ -157,6 +157,7 @@ impl LabSession {
         session.peer_cid_limit = peer_limits.active_cid_limit.min(8) as usize;
         session.send =
             SendFlow::from_peer(server, peer_limits, MAX_STREAMS).map_err(Error::Send)?;
+        session.receive.enable_autotune().map_err(Error::Receive)?;
         session.scheduler = Scheduler::with_bbr(Instant::now());
         session.scheduler.application_ack_timing(
             peer_limits.ack_delay_exponent,
@@ -565,7 +566,7 @@ impl LabSession {
         }
         let (n, connection, stream) = self
             .receive
-            .read_replenish(id, bytes)
+            .read_replenish_at(id, bytes, Instant::now(), self.scheduler.measured_rtt().unwrap_or_default())
             .map_err(Error::Receive)?;
         if n != 0 {
             for (ty, numbers) in [(0x10, vec![connection]), (0x11, vec![id, stream])] {

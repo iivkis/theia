@@ -47,6 +47,8 @@ pub struct Scheduler {
     pto_count: u32,
     next_send: Option<Instant>,
     cwnd_limited: BTreeSet<u64>,
+    first_rtt_at: Option<Instant>,
+    persistent_reported: Option<Instant>,
 }
 
 impl Default for Scheduler {
@@ -67,6 +69,8 @@ impl Default for Scheduler {
             pto_count: 0,
             next_send: None,
             cwnd_limited: BTreeSet::new(),
+            first_rtt_at: None,
+            persistent_reported: None,
         }
     }
 }
@@ -96,6 +100,8 @@ impl Scheduler {
             self.bbr = Some(Bbr::new(MTU, now).expect("valid MTU"));
         }
         self.rtt = Rtt::default();
+        self.first_rtt_at = None;
+        self.persistent_reported = None;
         self.queue.clear();
         for (&id, frame) in &mut self.frames {
             frame.queued = true;
@@ -354,10 +360,18 @@ impl Scheduler {
     }
 
     pub fn acknowledge(&mut self, ack: &Ack, now: Instant) -> Result<(), Error> {
-        let outcome = self
-            .ledger
-            .acknowledge(ack, now, self.rtt.loss_delay())
-            .map_err(|_| Error::Ledger)?;
+        let delay = Duration::from_micros(ack.delay.saturating_mul(1u64 << self.ack_delay_exponent));
+        let limit = self.ack_delay_limit();
+        let confirmed = self.confirmed;
+        let rtt = &mut self.rtt;
+        let first = &mut self.first_rtt_at;
+        let outcome = self.ledger.acknowledge_with_delay(ack, now, |sample| {
+            if let Some(sample) = sample {
+                first.get_or_insert(now);
+                rtt.update(sample, delay, limit, confirmed);
+            }
+            rtt.loss_delay()
+        }).map_err(|_| Error::Ledger)?;
         // Retain aliases for declared-lost packets until any copy is ACKed.
         let completed: Vec<u64> = self
             .aliases
@@ -375,12 +389,6 @@ impl Scheduler {
         if outcome.acknowledged.iter().any(|p| p.ack_eliciting) {
             self.pto_count = 0;
         }
-        if let Some(sample) = outcome.rtt_sample {
-            let delay =
-                Duration::from_micros(ack.delay.saturating_mul(1u64 << self.ack_delay_exponent));
-            let limit = self.ack_delay_limit();
-            self.rtt.update(sample, delay, limit, self.confirmed);
-        }
         self.apply_loss(outcome, now)
     }
 
@@ -396,10 +404,13 @@ impl Scheduler {
             self.window
                 .set_target(bbr.cwnd())
                 .map_err(|_| Error::Window)?;
-        } else if self.rtt.minimum().is_some()
-            && persistent_loss(&outcome, self.base_pto().saturating_mul(3))
-        {
-            self.window.persistent_congestion(now);
+        } else if let Some(end) = self.first_rtt_at.and_then(|first| {
+            self.ledger.persistent_end(first, self.base_pto().saturating_mul(3))
+        }) {
+            if self.persistent_reported.is_none_or(|old| end > old) {
+                self.window.persistent_congestion(now);
+                self.persistent_reported = Some(end);
+            }
         }
         // Apply loss before growth, so an ACK for a packet sent before
         // the new recovery boundary cannot undo the congestion event.
@@ -438,6 +449,10 @@ impl Scheduler {
         self.apply_loss(result, now)
     }
 
+    pub(crate) fn measured_rtt(&self) -> Option<Duration> {
+        self.rtt.minimum().map(|_| self.rtt.smoothed())
+    }
+
     pub fn base_pto(&self) -> Duration {
         self.rtt.pto(self.ack_delay_limit(), 0)
     }
@@ -462,29 +477,6 @@ impl Scheduler {
         };
         [loss, pto, pace].into_iter().flatten().min()
     }
-}
-
-/// Conservative persistent-congestion evidence: only one contiguous run
-/// of lost ACK-eliciting packets in the same authenticated loss outcome.
-/// Cross-event tracking remains a production recovery requirement.
-fn persistent_loss(outcome: &loss::Outcome, threshold: Duration) -> bool {
-    let mut start: Option<Instant> = None;
-    let mut last: Option<u64> = None;
-    for packet in &outcome.lost {
-        if !packet.in_flight || !packet.ack_eliciting {
-            start = None;
-            last = None;
-            continue;
-        }
-        if last.and_then(|n| n.checked_add(1)) != Some(packet.number) {
-            start = Some(packet.at);
-        }
-        last = Some(packet.number);
-        if start.is_some_and(|at| packet.at.saturating_duration_since(at) >= threshold) {
-            return true;
-        }
-    }
-    false
 }
 
 #[cfg(test)]
