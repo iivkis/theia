@@ -28,7 +28,7 @@ pub enum FrameRef {
     MtuProbe,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Sent {
     pub number: u64,
     pub at: Instant,
@@ -42,6 +42,8 @@ pub struct Sent {
 pub struct Outcome {
     pub acknowledged: Vec<Sent>,
     pub lost: Vec<Sent>,
+    /// Late ACKs carry delivery evidence, but no remaining flight credit.
+    pub late_acknowledged: Vec<Sent>,
     pub acknowledged_bytes: u64,
     pub lost_bytes: u64,
     pub rtt_sample: Option<Duration>,
@@ -68,6 +70,7 @@ pub struct Ledger {
     bytes_in_flight: u64,
     congestion_history: BTreeMap<u64, (Instant, Status)>,
     ack_only: BTreeMap<u64, Instant>,
+    recent_lost: BTreeMap<u64, Sent>,
     burned: BTreeSet<u64>,
 }
 
@@ -133,6 +136,7 @@ impl Ledger {
         self.largest_ack = None;
         self.congestion_history.clear();
         self.ack_only.clear();
+        self.recent_lost.clear();
     }
 
     /// A definitive local EMSGSIZE means this number was never transmitted.
@@ -207,6 +211,12 @@ impl Ledger {
             }
         }
         self.ack_only.retain(|number, _| !ack.acknowledges(*number));
+        self.recent_lost.retain(|number, packet| {
+            if ack.acknowledges(*number) {
+                result.late_acknowledged.push(packet.clone());
+                false
+            } else { true }
+        });
         let mut pending = VecDeque::with_capacity(self.sent.len());
         while let Some(p) = self.sent.pop_front() {
             if ack.acknowledges(p.number) {
@@ -255,6 +265,10 @@ impl Ledger {
                 }
                 if let Some((_, status)) = self.congestion_history.get_mut(&p.number) {
                     *status = if p.frames.contains(&FrameRef::MtuProbe) { Status::Neutral } else { Status::Lost };
+                }
+                self.recent_lost.insert(p.number, p.clone());
+                if self.recent_lost.len() > MAX_OUTSTANDING {
+                    self.recent_lost.pop_first();
                 }
                 out.lost.push(p);
             } else {
@@ -435,6 +449,23 @@ mod tests {
         pure.in_flight = false;
         l.record(pure).unwrap();
         assert_eq!(l.acknowledge(&ack(2), start + delta * 5, delta).unwrap().rtt_sample, None);
+    }
+
+    #[test]
+    fn late_ack_preserves_delivery_metadata_without_releasing_flight_twice() {
+        let start = Instant::now();
+        let delta = Duration::from_millis(10);
+        let mut l = Ledger::default();
+        for n in 0..4 { l.record(packet(n, start)).unwrap(); }
+        let first = l.acknowledge(&ack(3), start + delta, delta * 2).unwrap();
+        assert_eq!(first.lost[0].number, 0);
+        let flight = l.bytes_in_flight();
+        let late = l.acknowledge(&ack(0), start + delta, delta * 2).unwrap();
+        assert_eq!(late.late_acknowledged.len(), 1);
+        assert_eq!(late.late_acknowledged[0].bytes, 1200);
+        assert_eq!(late.acknowledged_bytes, 0);
+        assert_eq!(l.bytes_in_flight(), flight);
+        assert!(l.acknowledge(&ack(0), start + delta, delta * 2).unwrap().late_acknowledged.is_empty());
     }
 
     #[test]

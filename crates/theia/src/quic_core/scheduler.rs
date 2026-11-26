@@ -504,6 +504,7 @@ impl Scheduler {
                 }
             }
         }
+        let new_delivery = outcome.newly_acked_eliciting;
         self.apply_loss(outcome, now)?;
         if let Some(at) = self.ecn.acknowledge(ack) {
             if let Some(bbr) = self.bbr.as_mut() {
@@ -512,6 +513,8 @@ impl Scheduler {
             } else {
                 self.window.ecn(at, now).map_err(|_| Error::Window)?;
             }
+        } else if new_delivery && self.bbr.is_none() {
+            self.window.clean_ecn_ack(now, self.rtt.smoothed());
         }
         Ok(())
     }
@@ -563,7 +566,7 @@ impl Scheduler {
         }
         for p in outcome.acknowledged {
             let limited = self.cwnd_limited.remove(&p.number);
-            if p.in_flight && self.bbr.is_none() {
+            if p.in_flight && self.bbr.is_none() && persistent.is_none() {
                 self.window
                     .on_ack(p.at, now, u64::from(p.bytes), self.rtt.smoothed(), limited)
                     .map_err(|_| Error::Window)?;

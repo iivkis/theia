@@ -66,6 +66,7 @@ pub struct Bbr {
     last_sent: Option<u64>,
     app_limited_until: u64,
     samples: BTreeMap<u64, Sample>,
+    lost_samples: BTreeMap<u64, Sample>,
     bandwidth: VecDeque<(u64, u64)>,
     round: u64,
     next_round: u64,
@@ -116,6 +117,7 @@ impl Bbr {
             last_sent: None,
             app_limited_until: 0,
             samples: BTreeMap::new(),
+            lost_samples: BTreeMap::new(),
             bandwidth: VecDeque::new(),
             round: 0,
             next_round: 0,
@@ -316,9 +318,10 @@ impl Bbr {
         if now < self.delivered_at {
             return Err(Error::Clock);
         }
-        if outcome.acknowledged.is_empty() && outcome.lost.is_empty() { return Ok(()); }
+        if outcome.acknowledged.is_empty() && outcome.lost.is_empty() && outcome.late_acknowledged.is_empty() { return Ok(()); }
         let mut sample: Option<Sample> = None;
         let mut highest = None;
+        let mut delivered_bytes = outcome.acknowledged_bytes;
         for packet in &outcome.acknowledged {
             if !packet.in_flight {
                 continue;
@@ -337,10 +340,24 @@ impl Bbr {
             }
             highest = Some(highest.map_or(packet.number, |old: u64| old.max(packet.number)));
         }
+        // A late ACK is evidence of delivery, not a second release of
+        // flight credit or an instruction to grow the congestion window.
+        for packet in &outcome.late_acknowledged {
+            if let Some(value) = self.lost_samples.remove(&packet.number) {
+                if now < value.sent_at { return Err(Error::Clock); }
+                delivered_bytes = delivered_bytes.saturating_add(u64::from(packet.bytes));
+                if sample.is_none_or(|old| (value.delivered, value.sent_at) > (old.delivered, old.sent_at)) {
+                    sample = Some(value);
+                }
+                highest = Some(highest.map_or(packet.number, |old: u64| old.max(packet.number)));
+            }
+        }
         let mut probe_flight = None;
         for packet in &outcome.lost {
             if packet.in_flight {
                 let lost = self.samples.remove(&packet.number).ok_or(Error::Accounting)?;
+                self.lost_samples.insert(packet.number, lost);
+                if self.lost_samples.len() > MAX_SAMPLES { self.lost_samples.pop_first(); }
                 if lost.probing && !lost.app_limited && !packet.frames.contains(&super::loss::FrameRef::MtuProbe) {
                     probe_flight = Some(probe_flight.map_or(lost.tx_in_flight, |old: u64| old.min(lost.tx_in_flight)));
                 }
@@ -356,11 +373,11 @@ impl Bbr {
         if let Some(sample) = sample {
             self.delivered = self
                 .delivered
-                .checked_add(outcome.acknowledged_bytes)
+                .checked_add(delivered_bytes)
                 .ok_or(Error::Limit)?;
             self.delivered_at = now;
             self.idle_restart = false;
-            self.first_sent_at = sample.sent_at;
+            self.first_sent_at = self.first_sent_at.max(sample.sent_at);
             if sample.delivered >= self.next_round {
                 self.round = self.round.checked_add(1).ok_or(Error::Limit)?;
                 self.next_round = self.delivered;
@@ -371,7 +388,7 @@ impl Bbr {
             let elapsed = now
                 .duration_since(sample.delivered_at)
                 .max(sample.sent_at.duration_since(sample.first_sent_at));
-            if !elapsed.is_zero() {
+            if !elapsed.is_zero() && self.min_rtt.is_none_or(|minimum| elapsed >= minimum) {
                 let delivered = self
                     .delivered
                     .checked_sub(sample.delivered)
@@ -401,7 +418,7 @@ impl Bbr {
         let floor = 4 * self.mtu;
         self.bw_latest = self.bw_latest.max(measured_rate);
         self.inflight_latest = self.inflight_latest.max(delivered_sample);
-        self.round_acked = self.round_acked.saturating_add(outcome.acknowledged_bytes);
+        self.round_acked = self.round_acked.saturating_add(delivered_bytes);
         self.round_lost = self.round_lost.saturating_add(congestion_lost);
         let observed = self.round_acked.saturating_add(self.round_lost);
         let excessive = observed >= floor && u128::from(self.round_lost) * 50 > u128::from(observed);
@@ -430,7 +447,7 @@ impl Bbr {
             self.bw_latest = measured_rate;
             self.inflight_latest = delivered_sample;
         }
-        self.update_ack_aggregation(now, outcome.acknowledged_bytes);
+        self.update_ack_aggregation(now, delivered_bytes);
         let expired = now.saturating_duration_since(self.probe_rtt_stamp) >= PROBE_RTT_INTERVAL;
         if let Some(rtt) = outcome.rtt_sample.map(|r| r.max(Duration::from_micros(1))) {
             if self.min_rtt.is_none_or(|old| rtt <= old) {
@@ -441,7 +458,7 @@ impl Bbr {
                 // Retain the old minimum until a low-inflight probe validates a new one.
                 self.probe_rtt_stamp = self.min_stamp;
             }
-            if self.mode == Mode::ProbeRtt {
+            if self.mode == Mode::ProbeRtt && self.probe_done.is_some() {
                 self.probe_min = Some(self.probe_min.map_or(rtt, |old| old.min(rtt)));
             }
         }
@@ -474,6 +491,7 @@ impl Bbr {
         let floor = 4 * self.mtu;
         if self.mode == Mode::ProbeRtt {
             if in_flight <= self.probe_rtt_cwnd() && self.probe_done.is_none() {
+                self.probe_min = None;
                 self.probe_done = Some((
                     now.checked_add(PROBE_RTT_TIME).ok_or(Error::Clock)?,
                     self.round,
@@ -520,8 +538,10 @@ impl Bbr {
             self.cwnd
         };
         if self.full_pipe { self.cwnd = self.cwnd.min(target); }
-        if self.recovery_until.is_some() {
-            self.cwnd = self.cwnd.max(in_flight.saturating_add(outcome.acknowledged_bytes).max(floor)).min(MAX_CWND);
+        if self.recovery_until.is_some() && self.mode != Mode::ProbeRtt {
+            // Packet conservation during recovery, within the model's
+            // independently computed bounds; PTO remains a separate exception.
+            self.cwnd = self.cwnd.max(in_flight.saturating_add(outcome.acknowledged_bytes).max(floor)).min(target);
         }
         Ok(())
     }
@@ -573,14 +593,15 @@ impl Bbr {
     }
 
     fn set_phase(&mut self, phase: ProbePhase, now: Instant) {
+        if self.phase == ProbePhase::Up && phase == ProbePhase::Down {
+            self.cycle = self.cycle.saturating_add(1);
+            let cycle = self.cycle;
+            self.bandwidth.retain(|(old, _)| cycle.saturating_sub(*old) < 2);
+        }
         self.phase = phase;
         self.phase_at = now;
         self.phase_round = self.round;
         if phase == ProbePhase::Down {
-            if self.phase_round != 0 {
-                self.cycle = self.cycle.saturating_add(1);
-                self.bandwidth.retain(|(cycle, _)| self.cycle.saturating_sub(*cycle) < 2);
-            }
             // Randomize the next probe wait across flows without relying on
             // a global clock, with a conservative bounded RNG failure value.
             use ring::rand::{SecureRandom, SystemRandom};
@@ -708,6 +729,22 @@ mod tests {
         b.persistent_congestion(refill + Duration::from_secs(1));
         assert_eq!(b.cwnd(), 4800);
         assert_eq!(b.loss_ceiling, Some(4800));
+    }
+
+    #[test]
+    fn late_ack_counts_delivery_once_without_resurrecting_flight() {
+        let now = Instant::now();
+        let mut b = Bbr::new(1200, now).unwrap();
+        let rtt = Duration::from_millis(100);
+        b.sent(0, 1200, now, 0, false).unwrap();
+        b.feedback(&Outcome { lost: vec![packet(0, now)], lost_bytes: 1200, ..Outcome::default() }, now + rtt, 0).unwrap();
+        assert_eq!(b.delivered, 0);
+        let late = Outcome { late_acknowledged: vec![packet(0, now)], ..Outcome::default() };
+        b.feedback(&late, now + rtt * 2, 0).unwrap();
+        assert_eq!(b.delivered, 1200);
+        assert!(b.lost_samples.is_empty());
+        b.feedback(&late, now + rtt * 3, 0).unwrap();
+        assert_eq!(b.delivered, 1200);
     }
 
     #[test]

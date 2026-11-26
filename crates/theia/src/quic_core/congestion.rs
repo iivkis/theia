@@ -84,6 +84,7 @@ pub struct Window {
     slow: SlowStart,
     idle_since: Option<Instant>,
     ecn_backoff: u8,
+    last_ecn: Option<Instant>,
 }
 
 impl Window {
@@ -106,6 +107,7 @@ impl Window {
             slow: SlowStart::default(),
             idle_since: None,
             ecn_backoff: 0,
+            last_ecn: None,
         })
     }
 
@@ -243,8 +245,16 @@ impl Window {
             // QUIC minimum window remains two packets. Further CE reduces
             // the pacing rate, rather than violating the minimum cwnd.
             self.ecn_backoff = self.ecn_backoff.saturating_add(1).min(8);
+            self.last_ecn = Some(now);
         }
         Ok(())
+    }
+
+    pub(crate) fn clean_ecn_ack(&mut self, now: Instant, rtt: Duration) {
+        if self.ecn_backoff != 0 && self.last_ecn.is_some_and(|at| now.saturating_duration_since(at) >= rtt.max(Duration::from_millis(1))) {
+            self.ecn_backoff -= 1;
+            self.last_ecn = Some(now);
+        }
     }
 
     pub(crate) fn pacing_interval(&self, bytes: u64, rtt: Duration) -> Duration {
@@ -375,6 +385,8 @@ mod tests {
         let rate = w.pacing_interval(1200, rtt);
         w.ecn(now + rtt, now + rtt * 2).unwrap();
         assert_eq!(w.pacing_interval(1200, rtt), rate);
+        w.clean_ecn_ack(now + rtt * 3, rtt);
+        assert_eq!(w.pacing_interval(1200, rtt), original);
     }
 
     #[test]
