@@ -1,7 +1,6 @@
-//! Congestion-control building blocks for the future connection scheduler.
-//! CUBIC window growth, slow start and recovery for the isolated session.
-//! This remains a development controller: cross-space recovery, HyStart++,
-//! independent congestion fairness and full idle handling remain open.
+//! QUIC CUBIC window controller, following RFC 9438 with RFC 9002
+//! recovery and an RFC 9406-style conservative slow-start extension.
+//! Independent conformance and cross-space integration remain required.
 use std::time::{Duration, Instant};
 
 const MAX_CWND: u64 = 64 * 1024 * 1024;
@@ -24,6 +23,53 @@ pub fn cubic_target(w_max: f64, w_epoch: f64, elapsed: Duration) -> Option<f64> 
     w.is_finite().then_some(w.max(0.0))
 }
 
+// Packet-timed rounds: sample at least eight RTTs in each round before
+// comparing its minimum to the preceding round. No ACK-count growth.
+#[derive(Default)]
+struct SlowStart {
+    end: Option<u64>,
+    minimum: Option<Duration>,
+    previous: Option<Duration>,
+    samples: u32,
+    css_baseline: Option<Duration>,
+    css_rounds: u8,
+}
+
+impl SlowStart {
+    fn sample(&mut self, pn: u64, last_sent: u64, rtt: Duration) -> bool {
+        if self.end.is_some_and(|end| pn > end) {
+            if let Some(baseline) = self.css_baseline {
+                if self.samples >= 8 {
+                    if self.minimum.is_some_and(|rtt| rtt < baseline) {
+                        self.css_baseline = None;
+                        self.css_rounds = 0;
+                    } else {
+                        self.css_rounds = self.css_rounds.saturating_add(1);
+                        if self.css_rounds >= 5 { return true; }
+                    }
+                }
+            }
+            self.previous = self.minimum.filter(|_| self.samples >= 8);
+            self.minimum = None;
+            self.samples = 0;
+            self.end = Some(last_sent);
+        }
+        self.end.get_or_insert(last_sent);
+        self.minimum = Some(self.minimum.map_or(rtt, |old| old.min(rtt)));
+        self.samples = self.samples.saturating_add(1);
+        if self.samples >= 8 && self.css_baseline.is_none() {
+            if let (Some(previous), Some(current)) = (self.previous, self.minimum) {
+                let threshold = (previous / 8).clamp(Duration::from_millis(4), Duration::from_millis(16));
+                if current >= previous.saturating_add(threshold) {
+                    self.css_baseline = Some(current);
+                    self.css_rounds = 0;
+                }
+            }
+        }
+        false
+    }
+}
+
 pub struct Window {
     mtu: u64,
     cwnd: u64,
@@ -35,6 +81,9 @@ pub struct Window {
     epoch: Option<(Instant, f64)>,
     growth_credit: f64,
     friendly: f64,
+    slow: SlowStart,
+    idle_since: Option<Instant>,
+    ecn_backoff: u8,
 }
 
 impl Window {
@@ -54,6 +103,9 @@ impl Window {
             epoch: None,
             growth_credit: 0.0,
             friendly: 0.0,
+            slow: SlowStart::default(),
+            idle_since: None,
+            ecn_backoff: 0,
         })
     }
 
@@ -68,6 +120,7 @@ impl Window {
         self.ssthresh = self.ssthresh.max(2 * mtu);
         self.epoch = None;
         self.growth_credit = 0.0;
+        self.slow = SlowStart::default();
     }
 
     pub(crate) fn can_reserve_size(&self, bytes: u64) -> bool {
@@ -113,8 +166,7 @@ impl Window {
         Ok(())
     }
 
-    /// Apply a single congestion event for packets sent before the same
-    /// recovery boundary. Uses CUBIC's beta=0.7, not a full controller.
+    /// Apply a single congestion event per recovery boundary (beta=0.7).
     pub fn loss(&mut self, sent: Instant, now: Instant) -> Result<bool, Error> {
         if sent > now {
             return Err(Error::Accounting);
@@ -136,6 +188,8 @@ impl Window {
         self.ssthresh = self.cwnd;
         self.epoch = None;
         self.growth_credit = 0.0;
+        self.slow = SlowStart::default();
+        self.idle_since = None;
         Ok(true)
     }
 
@@ -143,19 +197,60 @@ impl Window {
     /// accounting for packets that have not yet been acknowledged/lost.
     pub fn persistent_congestion(&mut self, now: Instant) {
         self.recovery = Some(now);
-        self.last_max = self.cwnd as f64 / self.mtu as f64;
-        self.prior_cwnd = self.last_max;
+        let previous = self.cwnd;
+        self.prior_cwnd = previous as f64 / self.mtu as f64;
         self.cwnd = 2 * self.mtu;
-        self.ssthresh = self.cwnd;
+        self.ssthresh = (previous.saturating_mul(7) / 10).max(self.cwnd);
+        self.last_max = 0.0;
+        self.slow = SlowStart::default();
+        self.idle_since = None;
         self.epoch = None;
         self.growth_credit = 0.0;
     }
 
     pub(crate) fn application_limited(&mut self) {
-        // Rebase the next epoch rather than accumulating cubic time while
-        // the application is idle or flow-control limited.
+        // Conservative rebase on idle/flow-control limit: no wall-clock
+        // windfall on the next ACK. Keep the remembered saturation point.
         self.epoch = None;
         self.growth_credit = 0.0;
+        self.idle_since = None;
+    }
+
+    pub(crate) fn mark_idle(&mut self, now: Instant) {
+        self.idle_since.get_or_insert(now);
+    }
+
+    pub(crate) fn resume(&mut self, now: Instant) {
+        if let Some(idle) = self.idle_since.take() {
+            if let Some((epoch, initial)) = self.epoch {
+                self.epoch = epoch.checked_add(now.saturating_duration_since(idle)).map(|at| (at, initial));
+            }
+        }
+    }
+
+    pub(crate) fn rtt_sample(&mut self, pn: u64, last_sent: u64, rtt: Duration) {
+        if self.cwnd < self.ssthresh && self.slow.sample(pn, last_sent, rtt) {
+            self.ssthresh = self.cwnd;
+            self.prior_cwnd = self.cwnd as f64 / self.mtu as f64;
+            self.last_max = self.prior_cwnd;
+            self.epoch = None;
+            self.growth_credit = 0.0;
+        }
+    }
+
+    pub(crate) fn ecn(&mut self, sent: Instant, now: Instant) -> Result<(), Error> {
+        if self.loss(sent, now)? && self.cwnd == 2 * self.mtu {
+            // QUIC minimum window remains two packets. Further CE reduces
+            // the pacing rate, rather than violating the minimum cwnd.
+            self.ecn_backoff = self.ecn_backoff.saturating_add(1).min(8);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pacing_interval(&self, bytes: u64, rtt: Duration) -> Duration {
+        let factor = f64::from(1u32 << self.ecn_backoff);
+        rtt.mul_f64(factor * bytes as f64 / self.cwnd as f64)
+            .max(Duration::from_micros(1))
     }
 
     /// Called only for newly acknowledged in-flight bytes. Avoid growth
@@ -173,17 +268,23 @@ impl Window {
         if sent > now || bytes == 0 || bytes > self.mtu.max(super::mtu::MAX_UDP_PAYLOAD as u64) {
             return Err(Error::Accounting);
         }
+        if self.recovery.is_some_and(|start| sent <= start) {
+            return Ok(());
+        }
         if !cwnd_limited {
             self.application_limited();
             return Ok(());
         }
-        if self.recovery.is_some_and(|start| sent <= start) {
-            return Ok(());
-        }
         if self.cwnd < self.ssthresh {
+            let growth = if self.slow.css_baseline.is_some() {
+                self.growth_credit += bytes as f64 / 4.0;
+                let whole = self.growth_credit.floor() as u64;
+                self.growth_credit -= whole as f64;
+                whole
+            } else { bytes };
             self.cwnd = self
                 .cwnd
-                .saturating_add(bytes)
+                .saturating_add(growth)
                 .min(self.ssthresh)
                 .min(MAX_CWND);
             return Ok(());
@@ -240,6 +341,41 @@ impl Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slow_start_delay_increase_enters_css_then_avoidance() {
+        let mut w = Window::new(1200).unwrap();
+        let base = Duration::from_millis(40);
+        let elevated = Duration::from_millis(50);
+        for round in 0..7u64 {
+            for n in 0..8 {
+                w.rtt_sample(round * 8 + n, round * 8 + 7, if round == 0 { base } else { elevated });
+            }
+        }
+        assert_eq!(w.ssthresh, w.cwnd());
+        let mut s = SlowStart::default();
+        for n in 0..8 { assert!(!s.sample(n, 7, base)); }
+        for n in 8..16 { assert!(!s.sample(n, 15, elevated)); }
+        assert!(s.css_baseline.is_some());
+        for n in 16..24 { assert!(!s.sample(n, 23, base)); }
+        assert!(!s.sample(24, 31, base));
+        assert!(s.css_baseline.is_none());
+    }
+
+    #[test]
+    fn minimum_window_ecn_reduces_pacing_without_losing_accounting() {
+        let now = Instant::now();
+        let rtt = Duration::from_millis(50);
+        let mut w = Window::new(1200).unwrap();
+        w.persistent_congestion(now);
+        let original = w.pacing_interval(1200, rtt);
+        w.ecn(now + rtt, now + rtt * 2).unwrap();
+        assert_eq!(w.cwnd(), 2400);
+        assert!(w.pacing_interval(1200, rtt) > original);
+        let rate = w.pacing_interval(1200, rtt);
+        w.ecn(now + rtt, now + rtt * 2).unwrap();
+        assert_eq!(w.pacing_interval(1200, rtt), rate);
+    }
 
     #[test]
     fn cubic_curve_and_window_recovery() {

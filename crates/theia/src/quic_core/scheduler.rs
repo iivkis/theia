@@ -54,6 +54,7 @@ pub struct Scheduler {
     persistent_reported: Option<Instant>,
     mtu: Discovery,
     ecn: super::ecn::PathEcn,
+    last_sent_number: Option<u64>,
 }
 
 impl Default for Scheduler {
@@ -78,6 +79,7 @@ impl Default for Scheduler {
             persistent_reported: None,
             mtu: Discovery::default(),
             ecn: super::ecn::PathEcn::default(),
+            last_sent_number: None,
         }
     }
 }
@@ -120,6 +122,7 @@ impl Scheduler {
         self.last_eliciting = None;
         self.pto_count = 0;
         self.next_send = None;
+        self.last_sent_number = None;
     }
 
     pub fn can_queue(&self) -> bool {
@@ -333,7 +336,7 @@ impl Scheduler {
             }
             let before = self.window.in_flight();
             if before == 0 && self.bbr.is_none() {
-                self.window.application_limited();
+                self.window.resume(now);
             }
             let app_limited = probe
                 || (self.queue.iter().all(|queued| ids.contains(queued))
@@ -376,13 +379,11 @@ impl Scheduler {
                 self.pto_count += 1;
             }
             self.last_eliciting = Some(now);
+            self.last_sent_number = Some(number);
             let spacing = if let Some(bbr) = &self.bbr {
                 bbr.pacing_interval(bytes as u64)
             } else {
-                self.rtt
-                    .smoothed()
-                    .mul_f64(bytes as f64 / self.window.cwnd() as f64)
-                    .max(Duration::from_micros(1))
+                self.window.pacing_interval(bytes as u64, self.rtt.smoothed())
             };
             self.next_send = now.checked_add(spacing);
         } else {
@@ -439,6 +440,7 @@ impl Scheduler {
                 .map_err(|_| Error::Window)?;
         }
         self.last_eliciting = Some(now);
+        self.last_sent_number = Some(number);
         Ok(())
     }
 
@@ -495,13 +497,20 @@ impl Scheduler {
         if outcome.newly_acked_eliciting {
             self.pto_count = 0;
         }
+        if self.bbr.is_none() && outcome.lost_bytes == 0 {
+            if let (Some(sample), Some(last), Some(range)) = (outcome.rtt_sample, self.last_sent_number, ack.ranges.first()) {
+                if outcome.acknowledged.iter().any(|p| self.cwnd_limited.contains(&p.number)) {
+                    self.window.rtt_sample(range.last, last.max(range.last), sample);
+                }
+            }
+        }
         self.apply_loss(outcome, now)?;
         if let Some(at) = self.ecn.acknowledge(ack) {
             if let Some(bbr) = self.bbr.as_mut() {
                 bbr.ecn_congestion(now);
                 self.window.set_target(bbr.cwnd()).map_err(|_| Error::Window)?;
             } else {
-                self.window.loss(at, now).map_err(|_| Error::Window)?;
+                self.window.ecn(at, now).map_err(|_| Error::Window)?;
             }
         }
         Ok(())
@@ -559,6 +568,9 @@ impl Scheduler {
                     .on_ack(p.at, now, u64::from(p.bytes), self.rtt.smoothed(), limited)
                     .map_err(|_| Error::Window)?;
             }
+        }
+        if self.window.in_flight() == 0 && self.bbr.is_none() {
+            self.window.mark_idle(now);
         }
         Ok(())
     }
