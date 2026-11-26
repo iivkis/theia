@@ -124,8 +124,8 @@ fn header_type(version: Version, index: usize) -> u8 {
     }
 }
 
-/// Four-byte packet number and two-byte length, with padding INSIDE
-/// Initial AEAD. Exactly one long-header packet per datagram.
+/// Four-byte packet number and two-byte length. Initial padding is inside
+/// AEAD and sized against the entire datagram, including coalesced packets.
 fn header(
     version: Version,
     index: usize,
@@ -133,6 +133,7 @@ fn header(
     remote: &[u8; CID_LEN],
     token: &[u8],
     payload: &mut Vec<u8>,
+    minimum: usize,
 ) -> Result<Vec<u8>, Error> {
     let mut out = vec![header_type(version, index)];
     out.extend_from_slice(&version.wire().to_be_bytes());
@@ -151,8 +152,9 @@ fn header(
     if payload.is_empty() || overhead + payload.len() > MTU {
         return Err(Error::Protocol);
     }
-    if index == 0 {
-        payload.resize(MTU - overhead, 0);
+    if index == 0 && minimum > overhead + payload.len() {
+        if minimum > MTU { return Err(Error::Protocol); }
+        payload.resize(minimum - overhead, 0);
     }
     let len = (4 + 16 + payload.len()) as u16;
     out.extend_from_slice(&(len | 0x4000).to_be_bytes());
@@ -197,6 +199,16 @@ fn parse_header(
         return None;
     }
     Some((index, at))
+}
+
+struct FlightPacket {
+    index: usize,
+    header: Vec<u8>,
+    payload: Vec<u8>,
+    frame: Option<(u64, bool)>,
+}
+impl FlightPacket {
+    fn size(&self) -> usize { self.header.len() + self.payload.len() + 16 }
 }
 
 struct Handshake {
@@ -253,61 +265,73 @@ impl Handshake {
         Ok(())
     }
 
-    async fn flush(&mut self, socket: &SessionIo, peer: SocketAddr) -> Result<(), Error> {
+    /// Emit one datagram with up to two independently protected packets.
+    /// No PN is allocated until the complete amplification charge succeeds.
+    async fn emit(&mut self, socket: &SessionIo, peer: SocketAddr, packets: Vec<FlightPacket>,
+        now: Instant) -> Result<bool, Error> {
+        let total: usize = packets.iter().map(FlightPacket::size).sum();
+        if total > MTU || total == 0 { return Err(Error::Protocol); }
+        if self.server && !self.budget.reserve_send(total as u64) { return Ok(false); }
+        let mut datagram = Vec::with_capacity(total);
         let mut discard_initial = false;
-        for (index, epoch) in self.epochs.iter_mut().enumerate() {
-            let Some(epoch) = epoch else {
-                continue;
-            };
-            let now = Instant::now();
-            epoch.schedule.on_timer(now).map_err(Error::Schedule)?;
-            let (mut payload, frame) = if let Some(ack) = epoch.ack.encode() {
-                (ack, None)
-            } else if let Some((id, data, probe)) =
-                epoch.schedule.candidate(now).map_err(Error::Schedule)?
-            {
-                (data, Some((id, probe)))
-            } else {
-                continue;
-            };
-            let token = if self.server {
-                &[][..]
-            } else {
-                self.token.as_slice()
-            };
-            let h = header(
-                self.version,
-                index,
-                &self.local,
-                &self.remote,
-                token,
-                &mut payload,
-            )?;
-            let expected = h.len() + payload.len() + 16;
-            if self.server && !self.budget.reserve_send(expected as u64) {
-                continue;
-            }
-            let (number, packet) = epoch.writer.seal(&h, &payload).map_err(Error::Packet)?;
-            epoch
-                .schedule
-                .record(number, packet.len(), frame, now)
-                .map_err(Error::Schedule)?;
-            if socket.send_to(&packet, peer).await.map_err(Error::Io)? != packet.len() {
-                return Err(Error::Protocol);
-            }
-            if frame.is_none() {
-                epoch.ack.sent();
-            }
-            // Client discards Initial only after actually sending a
-            // protected Handshake packet (RFC 9001 section 4.9.1).
-            if !self.server && index == 1 {
-                discard_initial = true;
-            }
+        for packet in packets {
+            let epoch = self.epochs[packet.index].as_mut().ok_or(Error::Protocol)?;
+            let (number, protected) = epoch.writer.seal(&packet.header, &packet.payload).map_err(Error::Packet)?;
+            epoch.schedule.record(number, protected.len(), packet.frame, now).map_err(Error::Schedule)?;
+            datagram.extend_from_slice(&protected);
+            if packet.frame.is_none() { epoch.ack.sent(); }
+            discard_initial |= !self.server && packet.index == 1;
         }
-        if discard_initial {
-            self.epochs[0] = None;
+        if socket.send_to(&datagram, peer).await.map_err(Error::Io)? != datagram.len() {
+            return Err(Error::Protocol);
         }
+        if discard_initial { self.epochs[0] = None; }
+        Ok(true)
+    }
+
+    fn pad_initial(&self, packet: &mut FlightPacket, minimum: usize) -> Result<(), Error> {
+        if packet.index != 0 { return Ok(()); }
+        let token = if self.server { &[][..] } else { self.token.as_slice() };
+        packet.header = header(self.version, 0, &self.local, &self.remote, token, &mut packet.payload, minimum)?;
         Ok(())
+    }
+
+    async fn flush(&mut self, socket: &SessionIo, peer: SocketAddr) -> Result<bool, Error> {
+        let now = Instant::now();
+        let mut packets = Vec::with_capacity(2);
+        for (index, epoch) in self.epochs.iter_mut().enumerate() {
+            let Some(epoch) = epoch else { continue; };
+            epoch.schedule.on_timer(now).map_err(Error::Schedule)?;
+            let (mut payload, frame) = if let Some(ack) = epoch.ack.encode() { (ack, None) }
+                else if let Some((id, data, probe)) = epoch.schedule.candidate(now).map_err(Error::Schedule)? {
+                    (data, Some((id, probe)))
+                } else { continue; };
+            let token = if self.server { &[][..] } else { self.token.as_slice() };
+            let header = header(self.version, index, &self.local, &self.remote, token, &mut payload, 0)?;
+            packets.push(FlightPacket { index, header, payload, frame });
+        }
+        if packets.len() == 2 && packets.iter().map(FlightPacket::size).sum::<usize>() <= MTU {
+            let initial_size = MTU - packets[1].size();
+            self.pad_initial(&mut packets[0], initial_size)?;
+            // Coalescing is opportunistic; if unvalidated budget is smaller
+            // than a padded Initial, a standalone Handshake may still fit.
+            if !self.server || self.budget.can_send(MTU as u64) {
+                return self.emit(socket, peer, packets, now).await;
+            }
+        }
+        let mut sent = false;
+        for mut packet in packets {
+            self.pad_initial(&mut packet, MTU)?;
+            sent |= self.emit(socket, peer, vec![packet], now).await?;
+        }
+        Ok(sent)
+    }
+
+    fn wait(&self, now: Instant, sent: bool) -> Duration {
+        if sent { return Duration::ZERO; }
+        self.epochs.iter().flatten().filter_map(|epoch| epoch.schedule.deadline())
+            .filter(|at| *at > now).min()
+            .map_or(DEADLINE, |at| at.saturating_duration_since(now).min(DEADLINE))
     }
 
     fn apply_retry(&mut self, packet: &[u8]) -> Result<(), Error> {
@@ -336,13 +360,11 @@ impl Handshake {
             .ok_or(Error::Protocol)?
             .writer
             .next();
-        let keys = initial_keys(self.version, &cid, false)?;
-        let mut epoch = Epoch::new(keys);
         // Keep TLS and CRYPTO offsets; only Initial protection and recovery
         // are reset. The packet number MUST continue across Retry.
         let keys = initial_keys(self.version, &cid, false)?;
-        epoch.writer = Writer::with_next(keys.local, next);
-        epoch.schedule = Scheduler::after_retry(next);
+        let mut epoch = Epoch { reader: Reader::new(keys.remote), writer: Writer::with_next(keys.local, next),
+            ack: History::default(), schedule: Scheduler::after_retry(next) };
         for frame in self.initial_frames.drain(..) {
             epoch.schedule.enqueue(frame).map_err(Error::Schedule)?;
         }
@@ -661,12 +683,13 @@ async fn establish_inner(
         let mut buffer = [0; MTU + 1];
         loop {
             handshake.collect()?;
-            handshake.flush(&socket, peer).await?;
+            let sent = handshake.flush(&socket, peer).await?;
             if handshake.done() {
                 break;
             }
-            match tokio::time::timeout(Duration::from_millis(2), socket.recv_from(&mut buffer))
-                .await
+            let wait = handshake.wait(Instant::now(), sent);
+            if sent { tokio::task::yield_now().await; }
+            match tokio::time::timeout(wait, socket.recv_from(&mut buffer)).await
             {
                 Ok(Ok((n, source))) if source == peer && n <= MTU => {
                     handshake.receive_datagram(&buffer[..n])?
@@ -733,4 +756,29 @@ async fn establish_inner(
     )
     .await
     .map_err(Error::Endpoint)
+}
+
+#[cfg(test)]
+mod coalescing_tests {
+    use super::*;
+    #[test]
+    fn initial_padding_counts_coalesced_handshake_bytes() {
+        for version in [Version::V1, Version::V2] {
+            let local = [1; CID_LEN];
+            let remote = [2; CID_LEN];
+            let mut handshake = vec![1];
+            let h = header(version, 1, &local, &remote, &[], &mut handshake, 0).unwrap();
+            let (_, second) = Writer::new(initial_keys(version, &remote, false).unwrap().local).seal(&h, &handshake).unwrap();
+            let mut initial = vec![1];
+            let h = header(version, 0, &local, &remote, &[], &mut initial, MTU - second.len()).unwrap();
+            let (_, mut first) = Writer::new(initial_keys(version, &remote, false).unwrap().local).seal(&h, &initial).unwrap();
+            let first_len = first.len();
+            first.extend_from_slice(&second);
+            assert_eq!(first.len(), MTU);
+            let packets = super::super::datagram::split(&first).unwrap();
+            assert_eq!(packets.len(), 2);
+            assert_eq!(packets[0].bytes.len(), first_len);
+            assert_eq!(packets[1].bytes, second.as_slice());
+        }
+    }
 }
