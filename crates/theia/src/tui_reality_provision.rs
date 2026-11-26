@@ -2543,7 +2543,7 @@ mod tests {
         wizard.fields[2] = "edge.example.org".into();
         wizard.fields[3] = "93.184.216.1".into();
         wizard.fields[5] = "owner".into();
-        let input = WizardInput::parse(path.clone(), None, &wizard.fields).unwrap();
+        let input = WizardInput::parse(path.clone(), None, &wizard.effective_fields()).unwrap();
         assert_eq!(
             input.candidates.len(),
             crate::camouflage_discovery::POPULAR_HTTPS_DOMAINS.len()

@@ -692,10 +692,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         assert!(p.body().contains("ОТКАЗ"));
-        for error in [
-            SaveError::Refused(Error::Indeterminate),
-            SaveError::SavedReloadFailed,
-            SaveError::Refused(Error::Approval),
+        for (error, expected, done) in [
+            (SaveError::Refused(Error::Indeterminate), "Повтор запрещён до проверки", true),
+            (SaveError::SavedReloadFailed, "TOML сохранён, перечитать редактор не удалось", true),
+            (SaveError::Refused(Error::Approval), "ОТКАЗ", false),
         ] {
             let (tx, rx) = mpsc::channel();
             p.stage = Stage::Saving(rx);
@@ -703,11 +703,8 @@ mod tests {
             assert!(!p.key(key(KeyCode::Esc)));
             tx.send(Err(error)).unwrap();
             assert!(p.poll().is_none());
-            assert!(
-                p.body().contains("запись")
-                    || p.body().contains("ОТКАЗ")
-                    || p.body().contains("TOML сохранён")
-            );
+            assert!(p.body().contains(expected), "{}", p.body());
+            assert_eq!(matches!(p.stage, Stage::Done(_)), done);
         }
         assert!(!path.exists());
     }
