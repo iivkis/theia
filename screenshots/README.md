@@ -1,6 +1,6 @@
 # Theia TUI visual review
 
-Source: 20988863f40c03d5fae226a8849d1b8f6b74b179
+Source: 9f3821dcf70b7a5e8a6b46e1dd4e69ebb3f2ac70
 
 Linux · 120×40 · actual production renderer cells. State fixtures and unavailable actions are not runtime success.
 
@@ -26,17 +26,9 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![client-action-new-profile](client-action-new-profile.png)
 
-## client-action-reality-import
-
-![client-action-reality-import](client-action-reality-import.png)
-
 ## client-action-trust-material
 
 ![client-action-trust-material](client-action-trust-material.png)
-
-## client-command-menu
-
-![client-command-menu](client-command-menu.png)
 
 ## client-connection-modes
 
@@ -82,10 +74,6 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![client-first-run-key-import](client-first-run-key-import.png)
 
-## client-focus-actions
-
-![client-focus-actions](client-focus-actions.png)
-
 ## client-focus-fields
 
 ![client-focus-fields](client-focus-fields.png)
@@ -106,9 +94,9 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![client-local-proxy-start-confirm](client-local-proxy-start-confirm.png)
 
-## client-page-diagnostics
+## client-overview-next-step
 
-![client-page-diagnostics](client-page-diagnostics.png)
+![client-overview-next-step](client-overview-next-step.png)
 
 ## client-page-import
 
@@ -166,6 +154,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![client-reality-local-proxy-start-selected](client-reality-local-proxy-start-selected.png)
 
+## client-sections-focus
+
+![client-sections-focus](client-sections-focus.png)
+
 ## client-traffic-monitor-idle
 
 ![client-traffic-monitor-idle](client-traffic-monitor-idle.png)
@@ -189,6 +181,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## home-role-selection
 
 ![home-role-selection](home-role-selection.png)
+
+## server-action-apply-rights
+
+![server-action-apply-rights](server-action-apply-rights.png)
 
 ## server-action-certificate
 
@@ -238,6 +234,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![server-action-recover-user](server-action-recover-user.png)
 
+## server-action-restart-preflight
+
+![server-action-restart-preflight](server-action-restart-preflight.png)
+
 ## server-action-rotate-token
 
 ![server-action-rotate-token](server-action-rotate-token.png)
@@ -249,10 +249,6 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## server-action-server-process
 
 ![server-action-server-process](server-action-server-process.png)
-
-## server-command-menu
-
-![server-command-menu](server-command-menu.png)
 
 ## server-discovery-actions
 
@@ -290,10 +286,6 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![server-first-run-reality](server-first-run-reality.png)
 
-## server-focus-actions
-
-![server-focus-actions](server-focus-actions.png)
-
 ## server-focus-fields
 
 ![server-focus-fields](server-focus-fields.png)
@@ -306,6 +298,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![server-focus-records](server-focus-records.png)
 
+## server-overview-next-step
+
+![server-overview-next-step](server-overview-next-step.png)
+
 ## server-page-connections
 
 ![server-page-connections](server-page-connections.png)
@@ -314,9 +310,9 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![server-page-diagnostics](server-page-diagnostics.png)
 
-## server-page-invitations
+## server-page-management
 
-![server-page-invitations](server-page-invitations.png)
+![server-page-management](server-page-management.png)
 
 ## server-page-overview
 
@@ -329,6 +325,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## server-page-traffic
 
 ![server-page-traffic](server-page-traffic.png)
+
+## server-page-users-disabled
+
+![server-page-users-disabled](server-page-users-disabled.png)
 
 ## server-page-users
 
@@ -349,6 +349,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## server-reference-cidr-input
 
 ![server-reference-cidr-input](server-reference-cidr-input.png)
+
+## server-sections-focus
+
+![server-sections-focus](server-sections-focus.png)
 
 ## server-start-confirmation
 
