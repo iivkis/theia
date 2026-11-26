@@ -106,6 +106,14 @@ impl Ledger {
         Ok(())
     }
 
+    /// Abandon flight accounting for the old physical path, but never
+    /// reset the connection-wide packet number or permit ACKs of unsent PN.
+    pub(crate) fn restart_path(&mut self) {
+        self.sent.clear();
+        self.bytes_in_flight = 0;
+        self.largest_ack = None;
+    }
+
     pub fn bytes_in_flight(&self) -> u64 {
         self.bytes_in_flight
     }

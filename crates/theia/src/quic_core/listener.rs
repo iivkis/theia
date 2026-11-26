@@ -13,7 +13,15 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle};
+use tokio::{net::UdpSocket, sync::{mpsc, oneshot}, task::JoinHandle};
+use ring::rand::{SecureRandom, SystemRandom};
+
+type Cid = [u8; 8];
+type IssuedCid = (Cid, [u8; 16]);
+enum RouteCommand {
+    Issue { owner: u64, reply: oneshot::Sender<io::Result<IssuedCid>> },
+    Retire { owner: u64, cid: Cid, reply: oneshot::Sender<io::Result<()>> },
+}
 
 const MTU: usize = 1200;
 const MAX_CONNECTIONS: usize = 128;
@@ -25,6 +33,8 @@ pub(crate) enum SessionIo {
     Routed {
         socket: Arc<UdpSocket>,
         incoming: mpsc::Receiver<Datagram>,
+        owner: u64,
+        commands: mpsc::Sender<RouteCommand>,
     },
 }
 
@@ -49,10 +59,37 @@ impl SessionIo {
         }
     }
 
+    pub(crate) async fn issue_cid(&self) -> io::Result<IssuedCid> {
+        match self {
+            Self::Direct(_) => {
+                let cid = super::negotiation::random_cid().map_err(|_| io::ErrorKind::Other)?;
+                let mut token = [0; 16];
+                SystemRandom::new().fill(&mut token).map_err(|_| io::ErrorKind::Other)?;
+                Ok((cid, token))
+            }
+            Self::Routed { owner, commands, .. } => {
+                let (reply, result) = oneshot::channel();
+                commands.send(RouteCommand::Issue { owner: *owner, reply }).await.map_err(|_| io::ErrorKind::BrokenPipe)?;
+                result.await.map_err(|_| io::ErrorKind::BrokenPipe)?
+            }
+        }
+    }
+
+    pub(crate) async fn retire_cid(&self, cid: Cid) -> io::Result<()> {
+        match self {
+            Self::Direct(_) => Ok(()),
+            Self::Routed { owner, commands, .. } => {
+                let (reply, result) = oneshot::channel();
+                commands.send(RouteCommand::Retire { owner: *owner, cid, reply }).await.map_err(|_| io::ErrorKind::BrokenPipe)?;
+                result.await.map_err(|_| io::ErrorKind::BrokenPipe)?
+            }
+        }
+    }
+
     pub(crate) async fn send_to(&self, bytes: &[u8], peer: SocketAddr) -> io::Result<usize> {
         match self {
             Self::Direct(s) => s.send_to(bytes, peer).await,
-            Self::Routed { socket, incoming } => {
+            Self::Routed { socket, incoming, .. } => {
                 if incoming.is_closed() {
                     return Err(io::Error::from(io::ErrorKind::BrokenPipe));
                 }
@@ -111,7 +148,8 @@ impl Listener {
         }
         let ingress = Ingress::with_versions(limit, versions.clone()).map_err(|_| io::ErrorKind::InvalidInput)?;
         let (tx, candidates) = mpsc::channel(limit);
-        let worker = tokio::spawn(run(Arc::new(socket), ingress, tx, versions));
+        let (commands, requests) = mpsc::channel(limit);
+        let worker = tokio::spawn(run(Arc::new(socket), ingress, tx, versions, commands, requests));
         Ok(Self {
             local,
             candidates,
@@ -142,6 +180,8 @@ async fn run(
     mut ingress: Ingress,
     accepts: mpsc::Sender<Candidate>,
     versions: VersionPolicy,
+    commands: mpsc::Sender<RouteCommand>,
+    mut requests: mpsc::Receiver<RouteCommand>,
 ) -> io::Result<()> {
     let clock = Instant::now();
     let mut routes: BTreeMap<u64, mpsc::Sender<Datagram>> = BTreeMap::new();
@@ -155,6 +195,23 @@ async fn run(
                 for owner in expired {
                     routes.remove(&owner);
                     ingress.close(owner, clock.elapsed().as_secs()).map_err(|_| io::ErrorKind::InvalidData)?;
+                }
+            }
+            Some(command) = requests.recv() => {
+                let now = clock.elapsed().as_secs();
+                match command {
+                    RouteCommand::Issue { owner, reply } => {
+                        if reply.is_closed() { continue; }
+                        let issued = ingress.issue_local_cid(owner, now).map(|cid| (cid, ingress.reset_token(cid)))
+                            .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock));
+                        if let Err(Ok((cid, _))) = reply.send(issued) {
+                            let _ = ingress.retire_local_cid(owner, cid, now);
+                        }
+                    }
+                    RouteCommand::Retire { owner, cid, reply } => {
+                        let result = ingress.retire_local_cid(owner, cid, now).map_err(|_| io::Error::from(io::ErrorKind::InvalidData));
+                        let _ = reply.send(result);
+                    }
                 }
             }
             received = socket.recv_from(&mut buffer) => {
@@ -181,7 +238,7 @@ async fn run(
                             let (tx, incoming) = mpsc::channel(MAILBOX);
                             tx.try_send((bytes.to_vec(), peer)).map_err(|_| io::ErrorKind::InvalidData)?;
                             routes.insert(owner, tx);
-                            permit.send(Candidate { io: SessionIo::Routed { socket: socket.clone(), incoming },
+                            permit.send(Candidate { io: SessionIo::Routed { socket: socket.clone(), incoming, owner, commands: commands.clone() },
                                 peer, binding, token, versions: versions.clone() });
                         } else {
                             ingress.close(owner, now).map_err(|_| io::ErrorKind::InvalidData)?;

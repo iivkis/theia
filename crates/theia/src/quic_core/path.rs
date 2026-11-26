@@ -2,6 +2,7 @@
 //! routing is performed here. Only authenticated packets may call the
 //! receive/challenge methods; Initial AEAD alone is not authentication.
 use super::recovery::PathBudget;
+use subtle::ConstantTimeEq;
 use ring::rand::{SecureRandom, SystemRandom};
 use std::{
     collections::BTreeMap,
@@ -32,6 +33,7 @@ pub struct PeerIds {
     entries: BTreeMap<u64, ConnectionId>,
     floor: u64,
     limit: usize,
+    initial: Option<(Vec<u8>, Option<[u8; 16]>)>,
 }
 
 impl PeerIds {
@@ -43,7 +45,49 @@ impl PeerIds {
             entries: BTreeMap::new(),
             floor: 0,
             limit,
+            initial: None,
         })
+    }
+
+    /// Seed sequence zero from the authenticated handshake. An absent
+    /// reset token is not replaced with a guessed or synthetic token.
+    pub(crate) fn with_initial(cid: &[u8], token: Option<[u8; 16]>, limit: usize) -> Result<Self, Error> {
+        if cid.is_empty() || cid.len() > 20 { return Err(Error::Invalid); }
+        let mut ids = Self::new(limit)?;
+        ids.initial = Some((cid.to_vec(), token));
+        Ok(ids)
+    }
+
+    pub(crate) fn current(&self) -> Option<&[u8]> {
+        if let Some((cid, _)) = &self.initial { return Some(cid); }
+        self.entries.first_key_value().map(|(_, id)| id.cid.as_slice())
+    }
+
+    pub(crate) fn has_spare(&self) -> bool {
+        self.entries.len() + usize::from(self.initial.is_some()) > 1
+    }
+
+    /// Select the lowest unused CID and retire the previous sequence. The
+    /// monotone floor prevents a retransmitted NEW_CONNECTION_ID from
+    /// resurrecting a CID already used on a different physical path.
+    pub(crate) fn rotate(&mut self) -> Option<u64> {
+        if !self.has_spare() { return None; }
+        let retired = if self.initial.take().is_some() { 0 } else {
+            self.entries.pop_first()?.0
+        };
+        self.floor = *self.entries.first_key_value()?.0;
+        Some(retired)
+    }
+
+    /// Constant-time comparison of the trailing token against live peer
+    /// CIDs. Caller must first rule out successful packet protection.
+    pub(crate) fn matches_reset(&self, packet: &[u8]) -> bool {
+        if packet.len() < 21 || packet[0] & 0x80 != 0 { return false; }
+        let tail = &packet[packet.len()-16..];
+        let mut matched = subtle::Choice::from(0);
+        if let Some((_, Some(token))) = &self.initial { matched |= token.as_slice().ct_eq(tail); }
+        for id in self.entries.values() { matched |= id.reset_token.as_slice().ct_eq(tail); }
+        bool::from(matched)
     }
 
     /// Accept one authenticated NEW_CONNECTION_ID. Return sequences that
@@ -56,6 +100,18 @@ impl PeerIds {
             || retire_prior_to > id.sequence
         {
             return Err(Error::Invalid);
+        }
+        if let Some((initial, token)) = &mut self.initial {
+            if id.sequence == 0 {
+                if *initial != id.cid || token.is_some_and(|old| old != id.reset_token) {
+                    return Err(Error::Conflict);
+                }
+                *token = Some(id.reset_token);
+                return Ok(Vec::new());
+            }
+            if *initial == id.cid || token.is_some_and(|old| old == id.reset_token) {
+                return Err(Error::Conflict);
+            }
         }
         if let Some(old) = self.entries.get(&id.sequence) {
             if old != &id {
@@ -72,16 +128,18 @@ impl PeerIds {
             return Ok(vec![id.sequence]);
         }
         let count = self.entries.keys().filter(|&&n| n >= floor).count()
-            + usize::from(!self.entries.contains_key(&id.sequence));
+            + usize::from(!self.entries.contains_key(&id.sequence))
+            + usize::from(self.initial.is_some() && floor == 0);
         if count > self.limit {
             return Err(Error::Limit);
         }
-        let retired: Vec<u64> = self
+        let mut retired: Vec<u64> = self
             .entries
             .keys()
             .copied()
             .filter(|n| *n < floor)
             .collect();
+        if floor > 0 && self.initial.take().is_some() { retired.insert(0, 0); }
         self.entries.retain(|n, _| *n >= floor);
         self.floor = floor;
         self.entries.insert(id.sequence, id);
@@ -266,6 +324,27 @@ mod tests {
         assert!(ids.get(0).is_none());
         assert_eq!(ids.insert(cid(0), 0), Ok(vec![0]));
         assert_eq!(ids.get(2), Some(&cid(2)));
+    }
+
+    #[test]
+    fn live_reset_tokens_and_cid_rotation() {
+        let mut ids = PeerIds::with_initial(&[9; 8], Some([9; 16]), 2).unwrap();
+        assert_eq!(ids.current(), Some([9; 8].as_slice()));
+        let mut reset = vec![0x40; 21];
+        reset[5..].fill(9);
+        assert!(ids.matches_reset(&reset));
+        assert!(!ids.matches_reset(&reset[1..]));
+        ids.insert(cid(1), 0).unwrap();
+        assert_eq!(ids.insert(cid(2), 0), Err(Error::Limit));
+        assert_eq!(ids.rotate(), Some(0));
+        assert_eq!(ids.current(), Some([1; 8].as_slice()));
+        assert!(!ids.matches_reset(&reset));
+        reset[5..].fill(1);
+        assert!(ids.matches_reset(&reset));
+        assert_eq!(ids.insert(cid(0), 0), Ok(vec![0]));
+        assert_eq!(ids.rotate(), None);
+        assert_eq!(ids.insert(cid(2), 2), Ok(vec![1]));
+        assert_eq!(ids.current(), Some([2; 8].as_slice()));
     }
 
     #[test]

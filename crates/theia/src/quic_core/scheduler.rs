@@ -80,6 +80,22 @@ impl Scheduler {
         }
     }
 
+    /// Cross-IP migration resets RTT, congestion and pacing. Reliable
+    /// frames are queued again; retained aliases still recognize a late
+    /// ACK from the old path without adding old-path RTT or delivery samples.
+    pub(crate) fn restart_path(&mut self, now: Instant) {
+        self.ledger.restart_path();
+        self.window = Window::new(MTU).expect("valid MTU");
+        if self.bbr.is_some() { self.bbr = Some(Bbr::new(MTU, now).expect("valid MTU")); }
+        self.rtt = Rtt::default();
+        self.queue.clear();
+        for (&id, frame) in &mut self.frames { frame.queued = true; self.queue.push_back(id); }
+        self.cwnd_limited.clear();
+        self.last_eliciting = None;
+        self.pto_count = 0;
+        self.next_send = None;
+    }
+
     pub fn can_queue(&self) -> bool {
         self.can_queue_n(1)
     }
@@ -452,6 +468,30 @@ mod tests {
         assert!(s.candidate(later).unwrap().is_none());
         s.acknowledge(&ack(1), later).unwrap();
         assert_eq!(s.window.in_flight(), 0);
+    }
+
+    #[test]
+    fn migration_requeues_reliable_data_without_reusing_packet_numbers() {
+        for bbr in [false, true] {
+            let now = Instant::now();
+            let mut s = if bbr { Scheduler::with_bbr(now) } else { Scheduler::default() };
+            s.enqueue(vec![1]).unwrap();
+            let (id, _, _) = s.candidate(now).unwrap().unwrap();
+            s.record(0, 100, Some((id, false)), now).unwrap();
+            let next = now + Duration::from_millis(50);
+            s.restart_path(next);
+            assert_eq!(s.window.in_flight(), 0);
+            assert!(s.rtt.minimum().is_none());
+            assert_eq!(s.candidate(next).unwrap().unwrap().0, id);
+            s.record(1, 100, Some((id, false)), next).unwrap();
+            s.acknowledge(&ack(0), next).unwrap();
+            assert_eq!(s.pending(), 0);
+            assert!(s.rtt.minimum().is_none());
+            assert_eq!(s.window.in_flight(), 100);
+            s.acknowledge(&ack(1), next + Duration::from_millis(5)).unwrap();
+            assert_eq!(s.window.in_flight(), 0);
+            assert_eq!(s.rtt.minimum(), Some(Duration::from_millis(5)));
+        }
     }
 
     #[test]

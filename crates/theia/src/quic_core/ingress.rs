@@ -9,6 +9,7 @@ use super::{
     wire::Version,
 };
 use crate::reality_quic_wire::{long, retry_integrity_tag};
+use ring::{hmac, rand::{SecureRandom, SystemRandom}};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io,
@@ -42,6 +43,8 @@ pub struct Ingress {
     owners: BTreeMap<u64, BTreeSet<Cid>>,
     retired: BTreeMap<Cid, u64>,
     tokens: Tokens,
+    reset_key: hmac::Key,
+    resettable: BTreeSet<Cid>,
     next_owner: u64,
     limit: usize,
     occupied: usize,
@@ -60,6 +63,8 @@ impl Ingress {
             owners: BTreeMap::new(),
             retired: BTreeMap::new(),
             tokens: Tokens::new().map_err(|_| Error::Random)?,
+            reset_key: hmac::Key::generate(hmac::HMAC_SHA256, &SystemRandom::new()).map_err(|_| Error::Random)?,
+            resettable: BTreeSet::new(),
             next_owner: 1,
             limit,
             occupied: 0,
@@ -76,6 +81,7 @@ impl Ingress {
         let before = self.retired.len();
         self.retired.retain(|_, until| now <= *until);
         self.occupied -= before - self.retired.len();
+        self.resettable.retain(|cid| self.retired.contains_key(cid) || self.routes.owner(*cid).is_some());
         Ok(())
     }
 
@@ -105,7 +111,29 @@ impl Ingress {
         self.routes.register(cid, owner).map_err(|_| Error::Limit)?;
         self.owners.get_mut(&owner).ok_or(Error::Owner)?.insert(cid);
         self.occupied += 1;
+        self.resettable.insert(cid);
         Ok(cid)
+    }
+
+    pub(crate) fn reset_token(&self, cid: Cid) -> [u8; 16] {
+        let tag = hmac::sign(&self.reset_key, &cid);
+        let mut token = [0; 16];
+        token.copy_from_slice(&tag.as_ref()[..16]);
+        token
+    }
+
+    /// Reply only for previously issued, retired aliases, never unknown
+    /// CIDs. A strictly smaller response prevents reset loops/amplification.
+    fn retired_reset(&self, cid: Cid, received: usize) -> Result<Action, Error> {
+        if received <= 21 || !self.retired.contains_key(&cid) || !self.resettable.contains(&cid) {
+            return Ok(Action::Drop);
+        }
+        let mut packet = vec![0; (received - 1).min(43)];
+        SystemRandom::new().fill(&mut packet).map_err(|_| Error::Random)?;
+        packet[0] = (packet[0] & 0x3f) | 0x40;
+        let at = packet.len() - 16;
+        packet[at..].copy_from_slice(&self.reset_token(cid));
+        Ok(Action::Reply(packet))
     }
 
     /// Do not retire the last CID separately from connection teardown.
@@ -179,6 +207,9 @@ impl Ingress {
         let cid = <Cid>::try_from(head.destination).ok();
         if let Some(owner) = cid.and_then(|id| self.routes.owner(id)) {
             return Ok(Action::Existing(owner));
+        }
+        if head.kind == PacketKind::Application {
+            return match cid { Some(cid) => self.retired_reset(cid, datagram.len()), None => Ok(Action::Drop) };
         }
         if head.kind != PacketKind::Initial || self.occupied >= self.limit {
             return Ok(Action::Drop);
@@ -436,7 +467,12 @@ mod tests {
                 Err(Error::Owner)
             );
             ingress.retire_local_cid(owner, alias, 1).unwrap();
-            assert_eq!(ingress.process(peer, &short(alias), 1), Ok(Action::Drop));
+            let probe = short(alias);
+            let Action::Reply(reset) = ingress.process(peer, &probe, 1).unwrap() else { panic!("retired alias reset") };
+            assert!(reset.len() >= 21 && reset.len() < probe.len());
+            assert_eq!(reset[0] & 0xc0, 0x40);
+            assert_eq!(&reset[reset.len()-16..], &ingress.reset_token(alias));
+            assert_eq!(ingress.process(peer, &short([0; 8]), 1), Ok(Action::Drop));
             assert_eq!(ingress.issue_local_cid(owner, 1), Err(Error::Limit));
             ingress.close(owner, 2).unwrap();
             assert_eq!(ingress.process(peer, &packet, 2), Ok(Action::Drop));

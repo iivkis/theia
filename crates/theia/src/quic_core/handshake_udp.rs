@@ -744,6 +744,7 @@ async fn establish_inner(
             idle_timeout,
             binding,
             peer_limits: limits,
+            peer_reset_token: peer_params.get(0x02).and_then(|token| token.try_into().ok()),
         },
     )
     .await

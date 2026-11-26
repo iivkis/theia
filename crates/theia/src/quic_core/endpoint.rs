@@ -15,10 +15,11 @@ use super::{
 use super::{
     key_update,
     lifecycle::{Idle, Shutdown, ShutdownPhase},
-    path::Paths,
+    path::{ConnectionId, Paths, PeerIds},
 };
 use rustls::quic::{Keys, Secrets};
 use std::{
+    collections::BTreeMap,
     io,
     net::SocketAddr,
     time::{Duration, Instant},
@@ -59,13 +60,16 @@ pub(crate) struct Established {
     pub idle_timeout: Duration,
     pub binding: zeroize::Zeroizing<[u8; 32]>,
     pub peer_limits: super::parameters::Limits,
+    pub peer_reset_token: Option<[u8; 16]>,
 }
 
 pub struct LabSession {
     socket: SessionIo,
     paths: Paths,
-    local_cid: [u8; CID_LEN],
-    remote_cid: [u8; CID_LEN],
+    local_ids: BTreeMap<u64, [u8; CID_LEN]>,
+    next_local_sequence: u64,
+    peer_cid_limit: usize,
+    peer_ids: PeerIds,
     protection: Option<Protection>,
     acknowledgments: History,
     send: SendFlow,
@@ -123,6 +127,7 @@ impl LabSession {
             idle_timeout,
             binding,
             peer_limits,
+            peer_reset_token,
         } = established;
         let mut session = Self::connect_inner(
             socket,
@@ -138,6 +143,8 @@ impl LabSession {
         )?;
         // Application-space native laboratory defaults to BBR; the
         // fixed-key codec fixture keeps the CUBIC scheduler for comparison.
+        session.peer_ids = PeerIds::with_initial(&remote_cid, peer_reset_token, 2).map_err(|_| Error::Protocol)?;
+        session.peer_cid_limit = peer_limits.active_cid_limit.min(8) as usize;
         session.send = SendFlow::from_peer(server, peer_limits, MAX_STREAMS).map_err(Error::Send)?;
         session.scheduler = Scheduler::with_bbr(Instant::now());
         session.idle = Idle::new(Instant::now(), idle_timeout);
@@ -190,8 +197,10 @@ impl LabSession {
         Ok(Self {
             socket,
             paths: Paths::new_validated(peer),
-            local_cid,
-            remote_cid,
+            local_ids: BTreeMap::from([(0, local_cid)]),
+            next_local_sequence: 1,
+            peer_cid_limit: 2,
+            peer_ids: PeerIds::with_initial(&remote_cid, None, 2).map_err(|_| Error::Protocol)?,
             protection: Some(protection),
             acknowledgments: History::default(),
             send,
@@ -237,8 +246,38 @@ impl LabSession {
         self.paths.active()
     }
 
-    /// Controlled NAT-rebinding fixture: replace only the client's UDP
-    /// port on the same loopback IP. No CID rotation or cross-IP migration.
+    /// Advertise one fresh, registered local CID over authenticated 1-RTT.
+    /// Registration precedes transmission; never advertise an unroutable alias.
+    /// This is still a laboratory operation, not production admission.
+    pub async fn advertise_connection_id(&mut self) -> Result<u64, Error> {
+        if !self.confirmed || !self.active() || self.local_ids.len() >= self.peer_cid_limit
+            || !self.scheduler.can_queue() || self.next_local_sequence > super::wire::MAX_VARINT {
+            return Err(Error::Scope);
+        }
+        let (cid, token) = self.socket.issue_cid().await.map_err(Error::Io)?;
+        if cid == [0; CID_LEN] || self.local_ids.values().any(|old| *old == cid) { return Err(Error::Protocol); }
+        let sequence = self.next_local_sequence;
+        let mut frame = vec![0x18];
+        let mut scratch = [0; 8];
+        frame.extend_from_slice(super::wire::encode_varint(sequence, &mut scratch).ok_or(Error::Protocol)?);
+        frame.extend_from_slice(&[0, CID_LEN as u8]);
+        frame.extend_from_slice(&cid);
+        frame.extend_from_slice(&token);
+        self.scheduler.enqueue(frame).map_err(Error::Schedule)?;
+        self.local_ids.insert(sequence, cid);
+        self.next_local_sequence += 1;
+        Ok(sequence)
+    }
+
+    fn queue_retire_cid(&mut self, sequence: u64) -> Result<(), Error> {
+        let mut frame = vec![0x19];
+        let mut scratch = [0; 8];
+        frame.extend_from_slice(super::wire::encode_varint(sequence, &mut scratch).ok_or(Error::Protocol)?);
+        self.scheduler.enqueue(frame).map_err(Error::Schedule)
+    }
+
+    /// Controlled rebinding: a different loopback IP requires a fresh peer
+    /// CID and recovery reset. This does not enable public addresses.
     /// Existing streams and cryptographic packet numbers remain intact.
     pub async fn rebind(&mut self, socket: UdpSocket, now: Instant) -> Result<(), Error> {
         if self.server || !self.confirmed || !self.active() {
@@ -246,8 +285,11 @@ impl LabSession {
         }
         let previous = self.socket.local_addr().map_err(Error::Io)?;
         let next = socket.local_addr().map_err(Error::Io)?;
+        let cross_ip = next.ip() != previous.ip();
+        let rotate = self.peer_ids.has_spare();
         if !next.ip().is_loopback()
-            || next.ip() != previous.ip()
+            || (cross_ip && !rotate)
+            || (rotate && !self.scheduler.can_queue())
             || next == previous
             || next == self.paths.active()
             || socket.peer_addr().is_ok()
@@ -255,6 +297,11 @@ impl LabSession {
         {
             return Err(Error::Scope);
         }
+        if rotate {
+            let retired = self.peer_ids.rotate().ok_or(Error::Protocol)?;
+            self.queue_retire_cid(retired)?;
+        }
+        if cross_ip { self.scheduler.restart_path(now); }
         self.socket = socket.into();
         let peer = self.paths.active();
         if let Err(e) = self.send_path(peer, &[1], now).await {
@@ -275,7 +322,8 @@ impl LabSession {
         }
         let mut payload = frame.to_vec();
         // Fixed four-byte PN and the 16-byte AEAD tag used by this fixture.
-        payload.resize(MTU - 1 - CID_LEN - 4 - 16, 0);
+        let cid_len = self.peer_ids.current().ok_or(Error::Protocol)?.len();
+        payload.resize(MTU - 1 - cid_len - 4 - 16, 0);
         let (number, packet) = self.seal(&payload)?;
         self.scheduler
             .record_path(number, packet.len(), now)
@@ -581,11 +629,12 @@ impl LabSession {
 
     fn seal(&mut self, payload: &[u8]) -> Result<(u64, Vec<u8>), Error> {
         let mut header = vec![0x43];
-        header.extend_from_slice(&self.remote_cid);
+        let remote_cid = self.peer_ids.current().ok_or(Error::Protocol)?;
+        header.extend_from_slice(remote_cid);
         header.extend_from_slice(&[0; 4]);
         match self.protection.as_mut().ok_or(Error::Closed)? {
             Protection::Fixed { writer, .. } => writer.seal(&header, payload),
-            Protection::Rotating { writer, .. } => writer.seal(&self.remote_cid, payload),
+            Protection::Rotating { writer, .. } => writer.seal(remote_cid, payload),
         }
         .map_err(Error::Packet)
     }
@@ -669,6 +718,14 @@ impl LabSession {
         result
     }
 
+    fn receive_stateless_reset(&mut self, packet: &[u8], source: SocketAddr, now: Instant) -> Result<bool, Error> {
+        if source != self.paths.active() || packet.len() > MTU || !self.peer_ids.matches_reset(packet) { return Ok(false); }
+        self.shutdown.peer(now, self.scheduler.base_pto()).map_err(|_| Error::Protocol)?;
+        self.protection = None;
+        self.binding = None;
+        Ok(true)
+    }
+
     async fn recv_inner(&mut self, wait: Duration, wake: Option<&tokio::sync::Notify>) -> Result<bool, Error> {
         let mut buf = [0; MTU + 1];
         let incoming = tokio::time::timeout(wait, self.socket.recv_from(&mut buf));
@@ -687,16 +744,16 @@ impl LabSession {
             && (!self.server
                 || !self.confirmed
                 || !self.active()
-                || source.ip() != self.paths.active().ip())
+                || !source.ip().is_loopback())
         {
             return Ok(false);
         }
-        if !(1 + CID_LEN + 4 + 16..=MTU).contains(&n)
-            || buf[0] & 0xc0 != 0x40
-            || buf[1..1 + CID_LEN] != self.local_cid
-        {
-            return Ok(false);
-        }
+        let destination = if (1 + CID_LEN + 4 + 16..=MTU).contains(&n) && buf[0] & 0xc0 == 0x40 {
+            self.local_ids.iter().find_map(|(&seq, cid)| (buf[1..1+CID_LEN] == *cid).then_some((seq, *cid)))
+        } else { None };
+        let Some((destination_sequence, destination_cid)) = destination else {
+            return self.receive_stateless_reset(&buf[..n], source, Instant::now());
+        };
         let now = Instant::now();
         let old_key_deadline = now
             .checked_add(self.scheduler.base_pto().saturating_mul(3))
@@ -705,7 +762,7 @@ impl LabSession {
             Protection::Fixed { reader, .. } => reader.open(&buf[..n], 1 + CID_LEN),
             Protection::Rotating { reader, writer } => {
                 match reader.open(
-                    &self.local_cid,
+                    &destination_cid,
                     &buf[..n],
                     now,
                     old_key_deadline,
@@ -722,6 +779,7 @@ impl LabSession {
         let opened = match result {
             Ok(p) => p,
             Err(packet::Error::Reserved | packet::Error::Limit) => return Err(Error::Protocol),
+            Err(packet::Error::Crypto | packet::Error::Header) => return self.receive_stateless_reset(&buf[..n], source, now),
             Err(_) => return Ok(false),
         };
         if matches!(&self.protection, Some(Protection::Fixed { .. }))
@@ -734,6 +792,7 @@ impl LabSession {
         if new_path {
             // Only authenticated 1-RTT packets can establish a candidate.
             // Never apply stream data, ACKs or close from an unvalidated path.
+            let old_ip = self.paths.active().ip();
             let Ok(challenge) = self.paths.begin(source, n as u64, now) else {
                 return Ok(false);
             };
@@ -763,8 +822,9 @@ impl LabSession {
                 }
                 return Ok(false);
             }
-            // Same-IP NAT rebinding may retain congestion and RTT state.
-            // Cross-IP path changes require independent recovery state.
+            // A validated cross-IP path starts a fresh congestion/RTT model;
+            // same-IP NAT rebinding may preserve the old estimates.
+            if old_ip != source.ip() { self.scheduler.restart_path(now); }
         }
         self.idle.received(now);
         if let Some(Frame::Close {
@@ -801,6 +861,19 @@ impl LabSession {
                         let mut response = vec![0x1b];
                         response.extend_from_slice(&value);
                         self.send_path(source, &response, now).await?;
+                    }
+                }
+                Frame::NewConnectionId { sequence, retire_prior_to, cid, reset_token } if self.confirmed => {
+                    let retired = self.peer_ids.insert(ConnectionId { sequence, cid: cid.to_vec(), reset_token }, retire_prior_to).map_err(|_| Error::Protocol)?;
+                    if !self.scheduler.can_queue_n(retired.len()) { return Err(Error::Protocol); }
+                    for sequence in retired { self.queue_retire_cid(sequence)?; }
+                }
+                Frame::RetireConnectionId(sequence) if self.confirmed => {
+                    if sequence >= self.next_local_sequence || sequence == destination_sequence { return Err(Error::Protocol); }
+                    if let Some(cid) = self.local_ids.get(&sequence).copied() {
+                        if self.local_ids.len() <= 1 { return Err(Error::Protocol); }
+                        self.socket.retire_cid(cid).await.map_err(Error::Io)?;
+                        self.local_ids.remove(&sequence);
                     }
                 }
                 Frame::Ack(ack) => {
