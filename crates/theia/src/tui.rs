@@ -447,6 +447,7 @@ fn page_has_users(role: Role, page: usize) -> bool {
 }
 
 /// Each operation has one visible owner. The overview only navigates there.
+#[cfg(test)]
 fn page_actions(role: Role, page: usize, editor: Option<&Editor>) -> Vec<ActionItem> {
     page_actions_for(role, page, editor, 0, false)
 }
@@ -456,14 +457,14 @@ fn page_actions_for(role: Role, page: usize, editor: Option<&Editor>, user: usiz
         (_, 0) => &[('>', "Перейти к следующему шагу")],
         (Role::Server, 1) => &[
             ('N', "Создать подключение"),
-            ('l', "Публичная ссылка (без ключа доступа)"),
             ('V', "Состояние REALITY"),
             ('E', "Свой TLS-сертификат"),
+            ('D', "Удалить подключение"),
+            ('z', "Расширенные настройки"),
+            ('l', "Публичная ссылка (без ключа доступа)"),
             ('K', "Заменить доверие REALITY"),
             ('M', "Регистрация материалов"),
             ('w', "Комплект по готовому плану"),
-            ('D', "Удалить подключение"),
-            ('z', "Расширенные настройки"),
         ],
         (Role::Server, 2) => &[
             ('u', "Добавить пользователя и выдать ключ"),
@@ -489,11 +490,11 @@ fn page_actions_for(role: Role, page: usize, editor: Option<&Editor>, user: usiz
         (Role::Client, 1) => &[
             ('N', "Добавить профиль вручную (Own-TLS)"),
             ('E', "Доверенный сертификат и ключ"),
+            ('D', "Удалить профиль"),
+            ('z', "Расширенные настройки"),
             ('K', "Подтвердить доверие REALITY"),
             ('M', "Регистрация материалов"),
             ('l', "Публичная ссылка (без ключа доступа)"),
-            ('D', "Удалить профиль"),
-            ('z', "Расширенные настройки"),
         ],
         (Role::Client, 2) => &[('i', "Ввести ключ")],
         (Role::Client, 3) if cfg!(windows) => &[
@@ -888,13 +889,25 @@ impl Interaction {
     }
 
     /// Bracketed-paste source text stays in memory and is never rendered.
-    fn paste_import_source(&mut self, text: &str) {
-        // Pasting in the import section edits the masked field directly.
-        if self.workspace_page == 2 && self.workspace_focus == WorkspaceFocus::Actions
-            && self.workspace_visible() && self.editor_for(Role::Client).is_some_and(|e| !e.dirty() && !e.write_uncertain())
+    fn paste_workspace_import(&mut self, model: &Model, text: &str) {
+        // Only the visible client import section may begin a new draft.
+        // A paste on Help/Home or another role must not begin an import.
+        if Self::panel_role(model) == Some(Role::Client)
+            && self.workspace_page == 2 && self.workspace_focus == WorkspaceFocus::Actions
+            && self.workspace_visible()
         {
-            self.importing = Some(ImportFlow::Input(Zeroizing::new(String::new())));
+            if let Some(editor) = self.editor.as_mut().filter(|e| e.role() == Role::Client) {
+                if editor.dirty() || editor.write_uncertain() {
+                    editor.error = Some("Сохраните или отмените черновик перед импортом.".into());
+                    return;
+                }
+                self.importing = Some(ImportFlow::Input(Zeroizing::new(String::new())));
+            }
         }
+        self.paste_import_source(text);
+    }
+
+    fn paste_import_source(&mut self, text: &str) {
         if self.import_browser.is_some() {
             return;
         }
@@ -1054,8 +1067,10 @@ impl Interaction {
         }
     }
 
-    fn visible_workspace_action(&self, _role: Role) -> usize {
-        if self.workspace_page == 0 { 0 } else { self.workspace_action }
+    fn visible_workspace_action(&self, role: Role) -> usize {
+        if self.workspace_page == 0 { return 0; }
+        let count = page_actions_for(role, self.workspace_page, self.editor_for(role), self.workspace_user, self.workspace_advanced).len();
+        self.workspace_action.min(count.saturating_sub(1))
     }
 
     fn follow_recommendation(&mut self, role: Role) {
@@ -1196,6 +1211,7 @@ impl Interaction {
                 } else {
                     (self.workspace_user + 1).min(users.saturating_sub(1))
                 };
+                self.workspace_action = 0;
             }
             (WorkspaceFocus::Actions, KeyCode::Up)
                 if self.workspace_action == 0 && detail != WorkspaceFocus::Actions =>
@@ -1907,6 +1923,11 @@ impl Interaction {
                 let content = page_layout_for(body, role, self.workspace_page, Some(editor), self.workspace_user, self.workspace_advanced)
                     .map(|p| p[0])
                     .unwrap_or(body);
+                if role == Role::Client && self.workspace_page == 2 && inside(content) {
+                    self.workspace_focus = WorkspaceFocus::Actions;
+                    self.workspace_action = 0;
+                    return;
+                }
                 if self.workspace_page == 1 {
                     if let Some(id) = editor_field_hit(content, editor, event.column, event.row) {
                         editor.workspace_select_field(id);
@@ -1922,6 +1943,7 @@ impl Interaction {
                         + usize::from(event.row - content.y - 2);
                     if i < users.len() {
                         self.workspace_user = i;
+                        self.workspace_action = 0;
                         self.workspace_focus = WorkspaceFocus::Users;
                     }
                 }
@@ -1973,6 +1995,11 @@ impl Interaction {
                     self.workspace_focus = WorkspaceFocus::Actions;
                     return;
                 }
+                if role == Role::Client && self.workspace_page == 2 && inside(content) {
+                    self.workspace_focus = WorkspaceFocus::Actions;
+                    self.workspace_action = 0;
+                    return;
+                }
                 if page_has_users(role, self.workspace_page)
                     && inside(content)
                     && event.row >= content.y + 2
@@ -1982,6 +2009,7 @@ impl Interaction {
                     let i = start + usize::from(event.row - content.y - 2);
                     if i < users.len() && event.row < content.bottom().saturating_sub(1) {
                         self.workspace_user = i;
+                        self.workspace_action = 0;
                         self.workspace_focus = WorkspaceFocus::Users;
                     }
                     return;
@@ -2644,6 +2672,7 @@ impl Interaction {
                     }
                     if self.workspace_focus == WorkspaceFocus::Actions {
                         let items = page_actions_for(role, self.workspace_page, self.editor_for(role), self.workspace_user, self.workspace_advanced);
+                        self.workspace_action = self.workspace_action.min(items.len().saturating_sub(1));
                         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
                             self.workspace_focus = if key.code == KeyCode::Tab {
                                 WorkspaceFocus::Navigation
@@ -2680,8 +2709,8 @@ impl Interaction {
                                 let selected = if page_has_users(role, self.workspace_page)
                                 {
                                     self.editor_for(role).and_then(|e| {
-                                        e.workspace_users()
-                                            .get(self.workspace_user)
+                                        let users = e.workspace_users();
+                                        users.get(self.workspace_user.min(users.len().saturating_sub(1)))
                                             .map(|u| u.0.clone())
                                     })
                                 } else if role == Role::Server
@@ -3651,7 +3680,11 @@ impl Interaction {
                         self.workspace_focus = WorkspaceFocus::Actions;
                     }
                     KeyCode::Enter => self.importing = Some(ImportFlow::ActivateConfirm),
-                    KeyCode::Esc => {}
+                    KeyCode::Esc => {
+                        self.workspace_page = 3;
+                        self.workspace_focus = WorkspaceFocus::Actions;
+                        self.workspace_action = 0;
+                    }
                     _ => self.importing = Some(ImportFlow::Done),
                 },
                 ImportFlow::ActivateConfirm => match key.code {
@@ -6254,7 +6287,10 @@ fn draw_page(
         };
         let (next_key, help) = recommended_step(editor, ui.is_some_and(|u| u.owned_running(role)));
         let (next_page, action_key) = recommendation_page(role, next_key);
-        let next_items = page_actions(role, next_page, Some(editor));
+        let next_user = if next_key == 'b' && role == Role::Server {
+            users.iter().position(|(_, disabled, granted)| *disabled && *granted).unwrap_or(0)
+        } else { ui.map_or(0, |u| u.workspace_user) };
+        let next_items = page_actions_for(role, next_page, Some(editor), next_user, false);
         let next_label = next_items.iter().find(|item| item.key == action_key)
             .map_or(pages(role)[next_page], |item| item.label);
         if role == Role::Server {
@@ -6444,7 +6480,7 @@ fn draw_page(
             let hint = match users.get(selected) {
                 Some((_, true, true)) => "Пользователь отключён. «Восстановить доступ и выдать ключ» подготовит новый ключ.\nИзменения действуют после применения прав.",
                 Some((_, _, false)) => "У пользователя нет права на это подключение. Измените права доступа.\nУдаление возможно только без прав на всех подключениях.",
-                Some(_) => "Личный ключ показывается один раз. При потере выберите «Заменить ключ пользователя».\nУдаление доступно только после снятия прав во всех подключениях.",
+                Some(_) => "Личный ключ показывается один раз. Замена лишит старый ключ доступа после применения прав.\nУдаление доступно только после снятия прав во всех подключениях.",
                 None => "Добавьте пользователя и выдайте ему ключ.",
             };
             frame.render_widget(
@@ -7134,7 +7170,7 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
                 }
                 Event::Paste(text) => {
                     interaction.paste_record_field(&text);
-                    interaction.paste_import_source(&text);
+                    interaction.paste_workspace_import(&model, &text);
                     if let Some(editor) = interaction.editor.as_mut().filter(|e| e.editing) {
                         if !text.chars().any(char::is_control) {
                             for ch in text.chars() {
@@ -8138,7 +8174,9 @@ mod tests {
         let screen = rendered_interaction(120, 40, &model, &ui);
         assert!(screen.contains("Вставьте ключ (скрыто)"));
         assert!(screen.contains("Разделы"));
-        ui.paste_import_source("theia://v1/test");
+        ui.paste_workspace_import(&Model::new(None), "theia://v1/test");
+        assert!(ui.importing.is_none());
+        ui.paste_workspace_import(&model, "theia://v1/test");
         assert!(ui.inline_import());
         let screen = rendered_interaction(120, 40, &model, &ui);
         assert!(screen.contains("Введено 15 байт (скрыто)"));
