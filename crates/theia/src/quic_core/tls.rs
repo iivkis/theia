@@ -150,4 +150,68 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn tls_application_keys_protect_bidirectional_loopback_streams() {
+        use crate::quic_core::endpoint::LabSession;
+        use rustls::quic::{KeyChange, Keys};
+        use std::time::{Duration, Instant};
+        use tokio::net::UdpSocket;
+
+        fn move_hs(source: &mut quic::Connection, target: &mut quic::Connection,
+                   application: &mut Option<Keys>) -> bool {
+            let mut activity = false;
+            for _ in 0..8 {
+                let mut bytes = Vec::new();
+                let change = source.write_hs(&mut bytes);
+                let changed = change.is_some();
+                if let Some(KeyChange::OneRtt { keys, .. }) = change { *application = Some(keys); }
+                if !bytes.is_empty() { target.read_hs(&bytes).unwrap(); activity = true; }
+                if !changed && bytes.is_empty() { break; }
+            }
+            activity
+        }
+
+        for version in [Version::V1, Version::V2] {
+            let (cc, sc) = configs();
+            let mut c = client(Arc::new(cc), version, ServerName::try_from("localhost").unwrap(), vec![1, 1, 1]).unwrap();
+            let mut s = server(Arc::new(sc), version, vec![1, 1, 2]).unwrap();
+            let mut ck = None;
+            let mut sk = None;
+            for _ in 0..16 {
+                let a = move_hs(&mut c, &mut s, &mut ck);
+                let b = move_hs(&mut s, &mut c, &mut sk);
+                if !a && !b { break; }
+            }
+            assert!(!c.is_handshaking() && !s.is_handshaking());
+            let ca = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let sa = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let caddr = ca.local_addr().unwrap();
+            let saddr = sa.local_addr().unwrap();
+            let mut c = LabSession::connect(ca, saddr, false, [1; 8], [2; 8], ck.unwrap()).await.unwrap();
+            let mut s = LabSession::connect(sa, caddr, true, [2; 8], [1; 8], sk.unwrap()).await.unwrap();
+            let ci = c.open_uni().unwrap();
+            let si = s.open_uni().unwrap();
+            c.queue(ci, b"client stream", true).unwrap();
+            s.queue(si, b"server stream", true).unwrap();
+            let wait = Duration::from_secs(1);
+            assert!(c.flush(Instant::now()).await.unwrap());
+            assert!(s.recv(wait).await.unwrap());
+            let mut data = [0; 13];
+            assert_eq!(s.read(ci, &mut data).unwrap(), 13);
+            assert_eq!(&data, b"client stream");
+            assert!(s.finished(ci));
+            assert!(s.flush(Instant::now()).await.unwrap()); // ACK first
+            assert!(c.recv(wait).await.unwrap());
+            assert_eq!(c.pending(), 0);
+            assert!(s.flush(Instant::now()).await.unwrap());
+            assert!(c.recv(wait).await.unwrap());
+            assert_eq!(c.read(si, &mut data).unwrap(), 13);
+            assert_eq!(&data, b"server stream");
+            assert!(c.finished(si));
+            assert!(c.flush(Instant::now()).await.unwrap());
+            assert!(s.recv(wait).await.unwrap());
+            assert_eq!(s.pending(), 0);
+        }
+    }
+
 }

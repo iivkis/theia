@@ -5,6 +5,7 @@
 pub mod ack;
 pub mod ack_tx;
 pub mod congestion;
+pub mod endpoint;
 pub mod flow;
 pub mod frames;
 pub mod handshake;
