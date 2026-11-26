@@ -427,7 +427,7 @@ fn pages(role: Role) -> &'static [&'static str] {
     match role {
         Role::Server => &[
             "Обзор", "Подключения", "Пользователи и ключи", "Управление",
-            "Статистика", "Настройки", "Диагностика",
+            "Статистика", "Настройки", "Диагностика", "Маршрутизация",
         ],
         Role::Client => &[
             "Обзор", "Профили", "Импорт ключа", "Подключение",
@@ -487,6 +487,7 @@ fn page_actions_for(role: Role, page: usize, editor: Option<&Editor>, user: usiz
             ('Q', "Лимиты подключений"),
         ],
         (Role::Server, 6) => &[('p', "Сетевая диагностика")],
+        (Role::Server, 7) => &[('J', "Редактор правил и GeoData")],
         (Role::Client, 1) => &[
             ('N', "Добавить профиль вручную (Own-TLS)"),
             ('E', "Доверенный сертификат и ключ"),
@@ -702,6 +703,161 @@ fn invitation_actions(flow: &IssueFlow) -> Vec<ActionItem> {
     }
 }
 
+// Independent keyboard-first draft. No mutation of the saved file until
+// the existing guarded save/Apply workflows are explicitly invoked.
+struct RoutingPanel {
+    settings: crate::routing::Settings,
+    selected: usize,
+    fields: Option<(Option<usize>, [String; 4], usize)>,
+    message: String,
+    directory: PathBuf,
+    download: Option<mpsc::Receiver<Result<(String, crate::routing::geodata::Manifest), String>>>,
+}
+
+impl RoutingPanel {
+    fn new(editor: &Editor) -> Self {
+        let settings = editor.routing_settings().cloned().unwrap_or(crate::routing::Settings {
+            revision: 2, geodata_directory: None, rules: Vec::new(), datasets: None,
+        });
+        let directory = settings.geodata_directory.as_ref().map(PathBuf::from).unwrap_or_else(|| {
+            editor.saved_path().parent().unwrap_or(Path::new(".")).join("geodata")
+        });
+        Self { settings, selected: 0, fields: None, message: String::new(), directory, download: None }
+    }
+    fn action_name(action: crate::routing::Action) -> &'static str {
+        match action { crate::routing::Action::Direct => "direct", crate::routing::Action::Blocked => "blocked", crate::routing::Action::Allowed => "allowed" }
+    }
+    fn edit(&mut self, index: Option<usize>) {
+        let values = index.and_then(|i| self.settings.rules.get(i)).map(|r| [
+            r.name.clone(), Self::action_name(r.action).into(), r.domains.join(", "), r.ips.join(", "),
+        ]).unwrap_or_else(|| [String::new(), "allowed".into(), String::new(), String::new()]);
+        self.fields = Some((index, values, 0));
+        self.message.clear();
+    }
+    fn paste(&mut self, input: &str) {
+        if let Some((_, fields, focus)) = &mut self.fields {
+            let input = input.trim_end_matches(['\r', '\n']);
+            if !input.chars().any(char::is_control) && fields[*focus].len().saturating_add(input.len()) <= 8192 {
+                fields[*focus].push_str(input);
+            }
+        }
+    }
+    fn poll(&mut self) {
+        let Some(rx) = &self.download else { return; };
+        match rx.try_recv() {
+            Ok(Ok((directory, manifest))) => {
+                self.settings.geodata_directory = Some(directory);
+                self.settings.datasets = Some(manifest);
+                self.download = None;
+                self.message = "Базы проверены. Подтвердите черновик клавишей s.".into();
+            }
+            Ok(Err(error)) => { self.download = None; self.message = error; }
+            Err(TryRecvError::Disconnected) => { self.download = None; self.message = "Обновление не подтверждено.".into(); }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+    fn refresh(&mut self) {
+        let directory = self.directory.clone();
+        let rules = self.settings.rules.clone();
+        let (tx, rx) = mpsc::channel();
+        self.download = Some(rx);
+        self.message = "Загрузка XTLS и проверка SHA-256. Действующие правила не изменены.".into();
+        std::thread::spawn(move || {
+            let work = || -> Result<(String, crate::routing::geodata::Manifest), String> {
+                if !directory.exists() {
+                    let mut builder = std::fs::DirBuilder::new();
+                    #[cfg(unix)] { use std::os::unix::fs::DirBuilderExt; builder.mode(0o700); }
+                    builder.create(&directory).map_err(|_| "Не удалось создать каталог баз.".to_owned())?;
+                }
+                if !std::fs::symlink_metadata(&directory).is_ok_and(|m| m.file_type().is_dir()) {
+                    return Err("Небезопасный каталог баз.".into());
+                }
+                let directory = directory.canonicalize().map_err(|_| "Некорректный каталог баз.".to_owned())?;
+                let store = crate::routing::geodata::Store::new(directory.clone()).map_err(|e| format!("GeoData: {e:?}"))?;
+                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| "Не удалось запустить загрузчик.".to_owned())?;
+                let pair = runtime.block_on(store.refresh(&rules)).map_err(|e| format!("GeoData: {e:?}"))?;
+                let path = directory.to_str().ok_or("Путь не UTF-8.")?.to_owned();
+                Ok((path, pair.manifest().clone()))
+            };
+            let _ = tx.send(work());
+        });
+    }
+    // true keeps the draft open; false returns to the workspace.
+    fn key(&mut self, key: KeyEvent, editor: Option<&mut Editor>) -> bool {
+        if self.download.is_some() { return true; }
+        if let Some((index, fields, focus)) = &mut self.fields {
+            match key.code {
+                KeyCode::Esc => { self.fields = None; }
+                KeyCode::Up | KeyCode::BackTab => *focus = focus.saturating_sub(1),
+                KeyCode::Down | KeyCode::Tab => *focus = (*focus + 1).min(3),
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => fields[*focus].clear(),
+                KeyCode::Backspace => { fields[*focus].pop(); }
+                KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) && !c.is_control() && fields[*focus].len() + c.len_utf8() <= 8192 => fields[*focus].push(c),
+                KeyCode::Enter => {
+                    let action = match fields[1].trim() {
+                        "direct" => crate::routing::Action::Direct,
+                        "blocked" => crate::routing::Action::Blocked,
+                        "allowed" => crate::routing::Action::Allowed,
+                        _ => { self.message = "Действие: direct, blocked или allowed.".into(); return true; }
+                    };
+                    let split = |s: &str| s.split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty()).map(str::to_owned).collect::<Vec<_>>();
+                    let rule = crate::routing::Rule { name: fields[0].trim().into(), action, domains: split(&fields[2]), ips: split(&fields[3]) };
+                    if crate::routing::Policy::validate_rules(std::slice::from_ref(&rule)).is_err() {
+                        self.message = "Правило не прошло проверку.".into(); return true;
+                    }
+                    if let Some(i) = *index { self.settings.rules[i] = rule; self.selected = i; }
+                    else if self.settings.rules.len() < 1024 { self.settings.rules.push(rule); self.selected = self.settings.rules.len() - 1; }
+                    self.fields = None;
+                    self.message.clear();
+                }
+                _ => {}
+            }
+            return true;
+        }
+        let len = self.settings.rules.len();
+        match key.code {
+            KeyCode::Esc => return false,
+            KeyCode::Up => self.selected = self.selected.saturating_sub(1),
+            KeyCode::Down => self.selected = (self.selected + 1).min(len.saturating_sub(1)),
+            KeyCode::Char('n') if len < 1024 => self.edit(None),
+            KeyCode::Enter if self.selected < len => self.edit(Some(self.selected)),
+            KeyCode::Delete if self.selected < len => { self.settings.rules.remove(self.selected); self.selected = self.selected.min(self.settings.rules.len().saturating_sub(1)); }
+            KeyCode::Char('[') if self.selected > 0 && self.selected < len => { self.settings.rules.swap(self.selected, self.selected - 1); self.selected -= 1; }
+            KeyCode::Char(']') if self.selected + 1 < len => { self.settings.rules.swap(self.selected, self.selected + 1); self.selected += 1; }
+            KeyCode::Char('g') => self.refresh(),
+            KeyCode::Char('s') => {
+                if let Some(editor) = editor {
+                    match editor.stage_routing(self.settings.clone()) {
+                        Ok(()) => return false,
+                        Err(e) => self.message = e.into(),
+                    }
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+    fn body(&self) -> String {
+        let mut body = String::new();
+        if let Some((_, fields, focus)) = &self.fields {
+            for (i, (label, value)) in ["Имя", "Действие", "Домены / geosite:", "IP / CIDR / geoip:"].iter().zip(fields).enumerate() {
+                body.push_str(&format!("{} {label}: {value}\n", if i == *focus { "›" } else { " " }));
+            }
+            body.push_str("\n↑↓ / Tab: поле · Ctrl+U: очистить · Enter: принять · Esc: отменить");
+        } else {
+            body.push_str(&format!("GeoData: {}\nПервое совпадение; иначе allowed.\n", self.settings.datasets.as_ref().map_or("не выбраны", |m| m.release.as_str())));
+            let start = self.selected.saturating_sub(3);
+            for (i, rule) in self.settings.rules.iter().enumerate().skip(start).take(7) {
+                body.push_str(&format!("{} {}. {} · {}\n", if i == self.selected { "›" } else { " " }, i+1, rule.name, Self::action_name(rule.action)));
+            }
+            if self.settings.rules.is_empty() { body.push_str("Нет правил.\n"); }
+            body.push_str("\n↑↓ выбрать · n создать · Enter изменить · Delete удалить\n[ / ] переместить · g загрузить базы XTLS · s принять черновик · Esc отменить");
+        }
+        if !self.message.is_empty() { body.push_str(&format!("\n\n{}", self.message)); }
+        body
+    }
+}
+
 struct Interaction {
     workspace_page: usize,
     workspace_focus: WorkspaceFocus,
@@ -731,6 +887,7 @@ struct Interaction {
     import_browser: Option<FileBrowser>,
     qr_scan: Option<QrScan>,
     records: Option<RecordFlow>,
+    routing_panel: Option<RoutingPanel>,
     discovery: Option<DiscoveryPanel>,
     candidates: Option<CandidateReview>,
     candidate_batch: Option<CandidateBatchPanel>,
@@ -781,6 +938,7 @@ impl Interaction {
             import_browser: None,
             qr_scan: None,
             records: None,
+            routing_panel: None,
             discovery: None,
             candidates: None,
             candidate_batch: None,
@@ -858,6 +1016,10 @@ impl Interaction {
     }
 
     fn paste_record_field(&mut self, text: &str) {
+        if let Some(panel) = self.routing_panel.as_mut() {
+            panel.paste(text);
+            return;
+        }
         if let Some(dialog) = self.config_dialog.as_mut() {
             dialog.paste(text.trim_end_matches(['\r', '\n']));
             return;
@@ -1289,6 +1451,7 @@ impl Interaction {
     }
 
     fn poll_navigation(&mut self, model: &mut Model) {
+        if let Some(panel) = self.routing_panel.as_mut() { panel.poll(); }
         if let Some(scan) = self.qr_scan.as_ref() {
             let result = match scan.done.try_recv() {
                 Ok(result) => Some(result),
@@ -1533,6 +1696,7 @@ impl Interaction {
             && self.importing.is_none()
             && self.qr_scan.is_none()
             && self.records.is_none()
+            && self.routing_panel.is_none()
             && self.discovery.is_none()
             && self.candidates.is_none()
             && self.candidate_batch.is_none()
@@ -1555,6 +1719,7 @@ impl Interaction {
     }
 
     fn mouse(&mut self, model: &mut Model, event: MouseEvent, area: Rect) {
+        if self.routing_panel.is_some() { return; }
         if area.width < 32 || area.height < 10 {
             return;
         }
@@ -2083,6 +2248,10 @@ impl Interaction {
             || self.sharing.is_some()
             || self.clipboard.is_some()
         {
+            return false;
+        }
+        if let Some(mut panel) = self.routing_panel.take() {
+            if panel.key(key, self.editor.as_mut()) { self.routing_panel = Some(panel); }
             return false;
         }
         // Cancel is the safe default. Selection never executes an operation.
@@ -2702,6 +2871,16 @@ impl Interaction {
                                 &mut self.workspace_action,
                                 key.code,
                             ) {
+                                if ch == 'J' && role == Role::Server && self.workspace_page == 7 {
+                                    if let Some(editor) = self.editor.as_mut() {
+                                        if editor.dirty() || editor.write_uncertain() {
+                                            editor.error = Some("Сначала сохраните или отмените текущие изменения.".into());
+                                        } else {
+                                            self.routing_panel = Some(RoutingPanel::new(editor));
+                                        }
+                                    }
+                                    return false;
+                                }
                                 if ch == '>' && self.workspace_page == 0 {
                                     self.follow_recommendation(role);
                                     return false;
@@ -5108,6 +5287,8 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             "Проверка изменений и безопасная запись файла выполняются.\nРаботающий процесс не перезапускается.\nДождитесь результата операции.",
             true,
         );
+    } else if let Some(routing) = interaction.and_then(|ui| ui.routing_panel.as_ref()) {
+        modal_panel!(frame, parts[1], "Маршрутизация", &routing.body(), true);
     } else if let Some(flow) = interaction.and_then(|ui| ui.records.as_ref()) {
         let mut body = flow.body();
         if let Some(editor) = interaction.and_then(|ui| ui.editor.as_ref()) {
@@ -6504,6 +6685,7 @@ fn draw_page(
                     .map_or_else(|| "Работа с сохранёнными настройками не подтверждена".into(), |(_, kind, revision)| format!("Последнее подтверждение: {kind}, rev {revision}"));
                 format!("Сервер: {status}\n{applied}\nВнешний сервис: проверьте через «Состояние».\nСохранение файла не применяет изменения.")
             }
+            (Role::Server,7) => editor.routing_settings().map_or_else(|| "Правил нет. По умолчанию: allowed (через сервер).".into(), |s| format!("Ревизия: {} · правил: {}\nGeoData: {}\nСохраните TOML, затем примените через Управление.", s.revision, s.rules.len(), s.datasets.as_ref().map_or("не выбраны", |m| m.release.as_str()))),
             (_,5) => format!("Файл: {}\n{}\nСохранение не меняет работающий процесс.", editor.saved_path().display(), editor.settings_summary()),
             _ => "Проверьте состояние подключения.\nСетевые проверки требуют согласия.".into(),
         };

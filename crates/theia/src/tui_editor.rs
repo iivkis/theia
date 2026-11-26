@@ -205,6 +205,26 @@ pub struct Editor {
 }
 
 impl Editor {
+    pub(crate) fn routing_settings(&self) -> Option<&crate::routing::Settings> {
+        match &self.draft { Config::Server(doc) => doc.server.policy.routing.as_ref(), _ => None }
+    }
+
+    pub(crate) fn stage_routing(&mut self, mut settings: crate::routing::Settings) -> Result<(), &'static str> {
+        self.require_clean_records()?;
+        let Config::Server(doc) = &self.original else { return Err("Требуется серверная конфигурация."); };
+        let old = doc.server.policy.routing.as_ref();
+        settings.revision = old.map_or(1, |s| s.revision).checked_add(1).ok_or("Исчерпана ревизия правил.")?;
+        settings.validate().map_err(|_| "Некорректные правила или отсутствуют проверенные базы.")?;
+        let mut candidate = self.original.clone();
+        let Config::Server(doc) = &mut candidate else { unreachable!() };
+        doc.server.policy.routing = Some(settings);
+        candidate.validate().map_err(|_| "Конфигурация не прошла проверку.")?;
+        self.draft = candidate;
+        self.error = None;
+        self.notice = "Правила подготовлены. Сохраните TOML, затем примените через Управление.";
+        Ok(())
+    }
+
     pub fn load(role: Role, path: &Path) -> Result<Self, &'static str> {
         let source = config::editor_bytes(path).map_err(|_| "cannot read config file")?;
         let utf8 = std::str::from_utf8(&source).map_err(|_| "configuration is not UTF-8")?;

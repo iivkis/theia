@@ -337,6 +337,11 @@ mod tests {
         };
         let live = LiveAuthorization::new(doc.clone()).unwrap();
         assert_eq!(live.revision(), Ok(1));
+        let mut routed = doc.clone();
+        routed.server.policy.routing = Some(crate::routing::Settings { revision: 2, geodata_directory: None, rules: vec![], datasets: None });
+        let (_, staged_routing) = live.prepare_tls_rebase(&routed, 1).unwrap();
+        assert_eq!(live.shared().load().unwrap().routing["alpha"].snapshot.manifest().revision, 1);
+        drop(staged_routing);
         let mut changed = doc;
         changed.server.users[0].disabled = true;
         let staged = live.stage(&changed, 1).unwrap();

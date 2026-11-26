@@ -3193,6 +3193,28 @@ async fn run_supervised_file(
         .with_reality_ledger(limits.ledger.clone()),
     );
 
+    // Download candidates only; pinned TOML remains the authority until guarded Apply.
+    let _geodata_refresh = SupervisorTask(tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            loop {
+                let settings = runtime.snapshot().ok().and_then(|view| view.document.server.policy.routing.clone());
+                if let Some(settings) = settings {
+                    if let Some(directory) = settings.geodata_directory {
+                        if let Ok(store) = crate::routing::geodata::Store::new(directory.into()) {
+                            if store.refresh(&settings.rules).await.is_err() {
+                                crate::diag!(Warn, "server", "geodata_refresh_failed");
+                            } else {
+                                crate::diag!(Info, "server", "geodata_candidate_ready");
+                            }
+                        }
+                    }
+                }
+                tokio::time::sleep(crate::routing::geodata::REFRESH_INTERVAL).await;
+            }
+        }
+    }));
+
     // Only the original, protected management listener survives cutover.
     // Never expose a new administrative TCP port or loosen Named Pipe DACL.
     let (requests, mut queue) =
