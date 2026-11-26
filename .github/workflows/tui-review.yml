@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # Exact source snapshot for this review, not a moving branch.
-          ref: dce73bf1fd7f78f285b4e6150edb826639b257b6
+          ref: 20988863f40c03d5fae226a8849d1b8f6b74b179
           path: source
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -155,7 +155,7 @@ jobs:
           from pathlib import Path
           src = Path(os.environ["RUNNER_TEMP"]) / "tui-gallery"
           manifest = json.loads((src / "manifest.json").read_text())
-          assert manifest["source_sha"] == "dce73bf1fd7f78f285b4e6150edb826639b257b6"
+          assert manifest["source_sha"] == "20988863f40c03d5fae226a8849d1b8f6b74b179"
           assert (manifest["platform"], manifest["columns"], manifest["rows"]) == ("linux",120,40)
           expected = {"manifest.json", "README.md"}
           for entry in manifest["screens"]:
