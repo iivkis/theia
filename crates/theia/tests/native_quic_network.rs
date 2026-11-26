@@ -256,10 +256,15 @@ async fn client(backend: &str, bind: SocketAddr, peer: SocketAddr, count: usize,
     }
 }
 
+fn require_release_profile() {
+    #[cfg(debug_assertions)]
+    panic!("use the release test executable");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "explicitly provisioned two-host transport benchmark"]
 async fn native_quic_two_host_release() {
-    assert!(!cfg!(debug_assertions), "use the release test executable");
+    require_release_profile();
     let backend = env("THEIA_BENCH_BACKEND");
     assert!(matches!(
         backend.as_str(),
