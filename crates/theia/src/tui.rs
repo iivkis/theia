@@ -495,7 +495,7 @@ fn page_actions_for(role: Role, page: usize, editor: Option<&Editor>, user: usiz
             ('D', "Удалить профиль"),
             ('z', "Расширенные настройки"),
         ],
-        (Role::Client, 2) => &[('i', "Импорт ключа, файла или QR")],
+        (Role::Client, 2) => &[('i', "Ввести ключ")],
         (Role::Client, 3) if cfg!(windows) => &[
             ('p', "Включить / выключить системный прокси"),
             ('V', "Запустить / остановить локальный прокси"),
@@ -534,7 +534,7 @@ fn page_actions_for(role: Role, page: usize, editor: Option<&Editor>, user: usiz
             (Role::Server, 'b') => can_recover,
             (Role::Server, 'x' | 't') => can_rotate,
             (_, 'l' | 'M') => has_record,
-            (Role::Server, 'U') => !users.is_empty(),
+            (Role::Server, 'U') => selected.is_some_and(|(id, _, _)| editor.user_deletable(id)),
             _ => true,
         };
         let label = match (role, key) {
@@ -891,7 +891,7 @@ impl Interaction {
     fn paste_import_source(&mut self, text: &str) {
         // Pasting in the import section edits the masked field directly.
         if self.workspace_page == 2 && self.workspace_focus == WorkspaceFocus::Actions
-            && self.workspace_visible() && self.editor_for(Role::Client).is_some_and(|e| !e.dirty())
+            && self.workspace_visible() && self.editor_for(Role::Client).is_some_and(|e| !e.dirty() && !e.write_uncertain())
         {
             self.importing = Some(ImportFlow::Input(Zeroizing::new(String::new())));
         }
@@ -2519,6 +2519,18 @@ impl Interaction {
                     }
                     if key.code == KeyCode::F(7) && self.workspace_page == 1 {
                         self.value_preview = true;
+                        return false;
+                    }
+                    if role == Role::Client && self.workspace_page == 2
+                        && matches!(self.workspace_focus, WorkspaceFocus::Actions | WorkspaceFocus::Fields)
+                        && key.code == KeyCode::F(6)
+                    {
+                        // The visible input owns the file shortcut. No parsing,
+                        // network or save is started merely by opening the picker.
+                        self.update(model, KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+                        if self.importing.is_some() {
+                            self.update(model, key);
+                        }
                         return false;
                     }
                     if key.code == KeyCode::F(6) {
@@ -5299,7 +5311,9 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             );
         }
     }
-    let footer = if viewport.is_some_and(|v| v.guided.get()) {
+    let footer = if interaction.is_some_and(Interaction::inline_import) {
+        "Enter проверить · F6 файл / QR · Ctrl+U очистить · Esc отменить"
+    } else if viewport.is_some_and(|v| v.guided.get()) {
         ""
     } else if viewport.is_some_and(|v| v.action_rect.get().is_some()) {
         "↑ ↓ выбор · Enter открыть · Esc назад · Shift+PgUp/PgDn прокрутка"
@@ -6030,6 +6044,7 @@ fn draw_role_card(frame: &mut Frame<'_>, area: Rect, role: Role, selected: bool)
     );
 }
 
+#[cfg(test)]
 fn page_layout(area: Rect, role: Role, page: usize, editor: Option<&Editor>) -> Option<[Rect; 2]> {
     page_layout_for(area, role, page, editor, 0, false)
 }
@@ -6071,7 +6086,9 @@ fn page_layout_for(area: Rect, role: Role, page: usize, editor: Option<&Editor>,
                 .clamp(9, 12)
         })
     } else if page == 0 {
-        9
+        10
+    } else if role == Role::Client && page == 2 {
+        7
     } else if page == 5 {
         8
     } else if role == Role::Server && page == 3 {
@@ -6312,12 +6329,22 @@ fn draw_page(
             );
         }
     } else if role == Role::Client && page == 2 {
-        let empty = ImportFlow::Input(Zeroizing::new(String::new()));
-        let flow = ui.and_then(|u| u.importing.as_ref()).unwrap_or(&empty);
-        if matches!(flow, ImportFlow::Input(_)) {
-            // Input stays inside the workspace. Subsequent trust/save reviews
-            // retain the existing modal state machine and guarded transitions.
-            draw_import(frame, area, flow, Some(editor), ui.map(|u| &u.viewport));
+        let input = ui.and_then(|u| u.importing.as_ref()).and_then(|flow| {
+            if let ImportFlow::Input(source) = flow { Some(source.len()) } else { None }
+        });
+        let focused = focus == WorkspaceFocus::Actions;
+        let lines = vec![
+            Line::raw("Вставьте личный ключ Theia или выберите файл / QR (F6)."),
+            Line::raw("Тип подключения определится автоматически."),
+            Line::styled(
+                input.filter(|n| *n > 0).map_or_else(|| " Вставьте ключ (скрыто) ".to_owned(), |n| format!(" Введено {n} байт (скрыто) ")),
+                Style::default().fg(if focused { TEXT } else { MUTED }).bg(if focused { FOCUS } else { SURFACE }),
+            ),
+            Line::raw("Сохранение и запуск требуют отдельных подтверждений."),
+        ];
+        frame.render_widget(Paragraph::new(lines).block(tui_widgets::section("Импорт ключа", focused)).wrap(Wrap { trim: false }), content);
+        if input.is_some() {
+            frame.render_widget(Paragraph::new("Enter — проверить · F6 — файл / QR · Esc — отменить").wrap(Wrap { trim: true }), controls);
             return;
         }
     } else if page == 4 {
@@ -6417,7 +6444,7 @@ fn draw_page(
             let hint = match users.get(selected) {
                 Some((_, true, true)) => "Пользователь отключён. «Восстановить доступ и выдать ключ» подготовит новый ключ.\nИзменения действуют после применения прав.",
                 Some((_, _, false)) => "У пользователя нет права на это подключение. Измените права доступа.\nУдаление возможно только без прав на всех подключениях.",
-                Some(_) => "Личный ключ показывается один раз. При потере выберите «Заменить ключ пользователя».\nСтарый ключ перестанет работать для новых сеансов после применения прав.",
+                Some(_) => "Личный ключ показывается один раз. При потере выберите «Заменить ключ пользователя».\nУдаление доступно только после снятия прав во всех подключениях.",
                 None => "Добавьте пользователя и выдайте ему ключ.",
             };
             frame.render_widget(
@@ -7443,7 +7470,7 @@ mod tests {
             std::env::temp_dir().join(crate::tui_editor::generated_id("server-controls").unwrap());
         std::fs::create_dir(&root).unwrap();
         let path = root.join("server.toml");
-        let original = server_issuance_fixture().replace("allowed_user_ids = [\"device-a\"]", "allowed_user_ids = [\"device-a\", \"device-b\"]").replace("[server.policy]", &format!("[[server.users]]\nid = \"device-b\"\ntoken_sha256 = \"{}\"\ndisabled = false\n\n[server.policy]", "11".repeat(32)));
+        let original = server_issuance_fixture().replace("allowed_user_ids = [\"device-a\"]", "allowed_user_ids = [\"device-a\", \"device-b\"]").replace("[server.policy]", &format!("[[server.users]]\nid = \"device-b\"\ntoken_sha256 = \"{}\"\ndisabled = false\n\n[[server.users]]\nid = \"device-c\"\ntoken_sha256 = \"{}\"\ndisabled = false\n\n[server.policy]", "11".repeat(32), "22".repeat(32)));
         std::fs::write(&path, &original).unwrap();
         let mut ui = Interaction::new(Some(Editor::load(Role::Server, &path).unwrap()));
         let mut model = Model::new(Some(Role::Server));
@@ -7456,7 +7483,12 @@ mod tests {
             ui.update(&mut model, press(KeyCode::Down));
             assert_eq!(ui.workspace_user, 1);
             ui.update(&mut model, press(KeyCode::Enter));
-            let items = page_actions(Role::Server, 2, ui.editor.as_ref());
+            if command == 'U' {
+                ui.update(&mut model, press(KeyCode::Up));
+                ui.workspace_user = 2;
+                ui.workspace_focus = WorkspaceFocus::Actions;
+            }
+            let items = page_actions_for(Role::Server, 2, ui.editor.as_ref(), ui.workspace_user, false);
             ui.workspace_action = items.iter().position(|item| item.key == command).unwrap();
             ui.update(&mut model, press(KeyCode::Enter));
             match command {
@@ -7467,7 +7499,7 @@ mod tests {
                     assert!(matches!(&ui.issuance, Some(IssueFlow::Input(id)) if id == "device-b"))
                 }
                 'U' => assert!(
-                    matches!(&ui.records, Some(RecordFlow::Input { action: RecordAction::DeleteUser, fields, .. }) if fields.first().is_some_and(|id| id == "device-b"))
+                    matches!(&ui.records, Some(RecordFlow::Input { action: RecordAction::DeleteUser, fields, .. }) if fields.first().is_some_and(|id| id == "device-c"))
                 ),
                 _ => unreachable!(),
             }
@@ -8089,6 +8121,65 @@ mod tests {
             assert!(!screen.contains("доступ пользователю."));
             assert!(!screen.contains("theia://"));
         }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn workspace_import_and_monitor_are_inline_and_read_only() {
+        let path = std::env::temp_dir().join(crate::tui_editor::generated_id("inline-pages").unwrap());
+        let original = include_str!("../../../examples/client.toml");
+        std::fs::write(&path, original).unwrap();
+        let mut model = Model::new(Some(Role::Client));
+        let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
+        ui.select_workspace_page(Role::Client, 2);
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(ui.importing.is_none());
+        let screen = rendered_interaction(120, 40, &model, &ui);
+        assert!(screen.contains("Вставьте ключ (скрыто)"));
+        assert!(screen.contains("Разделы"));
+        ui.paste_import_source("theia://v1/test");
+        assert!(ui.inline_import());
+        let screen = rendered_interaction(120, 40, &model, &ui);
+        assert!(screen.contains("Введено 15 байт (скрыто)"));
+        assert!(!screen.contains("theia://v1/test"));
+        assert!(screen.contains("Разделы"));
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.importing.is_none());
+        ui.update(&mut model, press(KeyCode::F(6)));
+        assert!(ui.import_browser.is_some());
+        ui.update(&mut model, press(KeyCode::Esc));
+        ui.update(&mut model, press(KeyCode::Esc));
+        ui.select_workspace_page(Role::Client, 4);
+        ui.update(&mut model, press(KeyCode::Enter));
+        let screen = rendered_interaction(120, 40, &model, &ui);
+        assert!(screen.contains("Разделы"));
+        assert!(screen.contains("H2") && screen.contains("H3"));
+        assert!(ui.workspace_monitor.is_some());
+        assert!(ui.traffic_monitor.is_none());
+        assert!(!ui.owned_running(Role::Client));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn workspace_selected_user_and_advanced_actions_are_contextual() {
+        let path = std::env::temp_dir().join(crate::tui_editor::generated_id("context-actions").unwrap());
+        let original = server_issuance_fixture()
+            .replace("allowed_user_ids = [\"device-a\"]", "allowed_user_ids = [\"device-a\", \"device-b\"]")
+            .replace("[server.policy]", &format!("[[server.users]]\nid = \"device-b\"\ntoken_sha256 = \"{}\"\ndisabled = true\n\n[[server.users]]\nid = \"device-c\"\ntoken_sha256 = \"{}\"\ndisabled = false\n\n[server.policy]", "11".repeat(32), "22".repeat(32)));
+        std::fs::write(&path, &original).unwrap();
+        let editor = Editor::load(Role::Server, &path).unwrap();
+        let keys = |user| page_actions_for(Role::Server, 2, Some(&editor), user, false).into_iter().map(|a| a.key).collect::<Vec<_>>();
+        assert!(keys(0).contains(&'t') && keys(0).contains(&'x'));
+        assert!(!keys(0).contains(&'b') && !keys(0).contains(&'U'));
+        assert!(keys(1).contains(&'b') && !keys(1).contains(&'t') && !keys(1).contains(&'U'));
+        assert!(keys(2).contains(&'U') && !keys(2).contains(&'b') && !keys(2).contains(&'x'));
+        assert!(editor.review_record(RecordAction::DeleteUser, &["device-a".into()]).is_err());
+        let review = editor.review_record(RecordAction::DeleteUser, &["device-c".into()]).unwrap();
+        assert_eq!(review.confirmation_label(), "Удалить пользователя");
+        assert!(!page_actions_for(Role::Server, 1, Some(&editor), 0, false).iter().any(|a| a.key == 'M'));
+        assert!(page_actions_for(Role::Server, 1, Some(&editor), 0, true).iter().any(|a| a.key == 'M'));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         std::fs::remove_file(path).unwrap();
     }

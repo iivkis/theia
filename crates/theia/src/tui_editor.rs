@@ -874,6 +874,12 @@ impl Editor {
             .collect()
     }
 
+    pub(crate) fn user_deletable(&self, id: &str) -> bool {
+        let Config::Server(doc) = &self.draft else { return false; };
+        doc.server.users.iter().any(|u| u.id == id)
+            && !doc.server.inbounds.iter().any(|i| i.allowed_user_ids.iter().any(|u| u == id))
+    }
+
     pub(crate) fn workspace_selected(&self) -> usize {
         self.selected_record
     }
