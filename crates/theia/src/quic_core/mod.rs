@@ -30,3 +30,25 @@ pub mod spaces;
 pub mod stream;
 pub mod tls;
 pub mod wire;
+
+/// The experimental native transport must never become an externally reachable
+/// carrier before independent admission and interoperability acceptance.
+pub(crate) fn loopback_pair(local: std::net::SocketAddr, peer: std::net::SocketAddr) -> bool {
+    local.ip().is_loopback() && peer.ip().is_loopback() && peer.port() != 0 && local != peer
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::loopback_pair;
+    #[test]
+    fn laboratory_scope_rejects_external_and_invalid_peers() {
+        let local = "127.0.0.1:1234".parse().unwrap();
+        let peer = "127.0.0.1:4321".parse().unwrap();
+        assert!(loopback_pair(local, peer));
+        assert!(!loopback_pair(local, local));
+        assert!(!loopback_pair(local, "127.0.0.1:0".parse().unwrap()));
+        assert!(!loopback_pair(local, "192.0.2.1:443".parse().unwrap()));
+        assert!(!loopback_pair("0.0.0.0:1234".parse().unwrap(), peer));
+        assert!(loopback_pair("[::1]:1234".parse().unwrap(), "[::1]:4321".parse().unwrap()));
+    }
+}

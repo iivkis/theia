@@ -158,10 +158,7 @@ impl LabSession {
         confirmed: bool,
     ) -> Result<Self, Error> {
         let local = socket.local_addr().map_err(Error::Io)?;
-        if !local.ip().is_loopback()
-            || !peer.ip().is_loopback()
-            || peer.port() == 0
-            || local == peer
+        if !super::loopback_pair(local, peer)
             || local_cid == remote_cid
             || local_cid == [0; CID_LEN]
             || remote_cid == [0; CID_LEN]
