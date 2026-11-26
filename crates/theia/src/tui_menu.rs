@@ -1033,6 +1033,7 @@ pub(crate) struct ConfigDialog {
     first_invite: Option<FirstInvite>,
     imported: bool,
     import_after_load: bool,
+    direct_import: bool,
     creating: bool,
     browser: Option<FileBrowser>,
 }
@@ -1062,6 +1063,7 @@ impl ConfigDialog {
             first_invite: None,
             imported: false,
             import_after_load: false,
+            direct_import: false,
             creating: false,
             browser: None,
         }
@@ -1078,6 +1080,7 @@ impl ConfigDialog {
         if self.role != Role::Client {
             return;
         }
+        self.direct_import = true;
         if std::path::Path::new(&self.input).is_file() {
             self.choice = 0;
             self.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -1170,6 +1173,7 @@ impl ConfigDialog {
                 FirstInviteAction::Stay => {}
                 FirstInviteAction::Back => {
                     self.first_invite = None;
+                    return self.direct_import;
                 }
                 FirstInviteAction::Save(invite, ca, reference) => {
                     let path = std::path::PathBuf::from(&self.input);
@@ -1962,6 +1966,24 @@ mod tests {
             doc.server.inbounds[0].quic_listen
         );
         assert!(matches!(setup.key(press(KeyCode::Esc)), SetupAction::Back));
+    }
+
+    #[test]
+    fn direct_import_cancel_closes_shortcut_but_nested_import_returns_to_config() {
+        let root = std::env::temp_dir().join(crate::tui_editor::generated_id("direct-import-cancel").unwrap());
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("client.toml");
+        let mut direct = ConfigDialog::new(Role::Client, Some(&path));
+        direct.begin_client_import();
+        assert!(direct.first_invite.is_some());
+        assert!(direct.key(press(KeyCode::Esc)));
+        let mut nested = ConfigDialog::new(Role::Client, Some(&path));
+        nested.key(press(KeyCode::F(4)));
+        assert!(nested.first_invite.is_some());
+        assert!(!nested.key(press(KeyCode::Esc)));
+        assert!(nested.first_invite.is_none());
+        assert!(!path.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
