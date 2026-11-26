@@ -44,6 +44,11 @@ fn fixture_with_roots(private: bool) -> (quinn::Endpoint, SocketAddr, ServerTask
     let mut roots = RootCertStore::empty();
     roots.add(der).unwrap();
     let client = quic_transport::client_endpoint(bind, roots.clone()).unwrap();
+    let server = tokio::spawn(h3_server::serve(endpoint, context(private)));
+    (client, remote, server, roots)
+}
+
+fn context(private: bool) -> Arc<ServerContext> {
     let inbound = Inbound {
         id: "test".into(),
         path_prefix: Some("/v1/theia-example".into()),
@@ -75,9 +80,7 @@ fn fixture_with_roots(private: bool) -> (quinn::Endpoint, SocketAddr, ServerTask
         max_connections_total: 8,
         connect_timeout_ms: 2000,
     };
-    let context = Arc::new(ServerContext::new(&inbound, &users, &policy));
-    let server = tokio::spawn(h3_server::serve(endpoint, context));
-    (client, remote, server, roots)
+    Arc::new(ServerContext::new(&inbound, &users, &policy))
 }
 
 fn request(auth: Option<&str>) -> Request<()> {
@@ -582,4 +585,117 @@ async fn h3_rejects_unnegotiated_padding_before_target_dial() {
     })
     .await
     .unwrap();
+}
+
+async fn native_fixture(private: bool) -> (SocketAddr, JoinHandle<()>, RootCertStore) {
+    use theia::quic_core::{handshake_udp, listener::Listener};
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let der = cert.cert.der().clone();
+    let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_protocol_versions(&[&rustls::version::TLS13]).unwrap().with_no_client_auth()
+        .with_single_cert(vec![der.clone()], key.into()).unwrap();
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    tls.send_tls13_tickets = 0;
+    let tls = Arc::new(tls);
+    let mut listener = Listener::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(), 64).unwrap();
+    let remote = listener.local_addr().unwrap();
+    let context = context(private);
+    let mut roots = RootCertStore::empty();
+    roots.add(der).unwrap();
+    let task = tokio::spawn(async move {
+        let mut tasks = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                incoming = listener.accept() => {
+                    let Ok(candidate) = incoming else { break; };
+                    let tls = tls.clone();
+                    let context = context.clone();
+                    tasks.spawn(async move {
+                        if let Ok(session) = handshake_udp::accept(candidate, tls).await {
+                            let _ = h3_server::run_native_lab(session, context).await;
+                        }
+                    });
+                }
+                _ = tasks.join_next(), if !tasks.is_empty() => {}
+            }
+        }
+    });
+    (remote, task, roots)
+}
+
+async fn exact_relay_sample(client: &H3Client, payload: &[u8]) -> (Duration, Duration) {
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = target.local_addr().unwrap().port();
+    let echo = tokio::spawn(async move {
+        let (mut socket, _) = target.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        socket.read_to_end(&mut bytes).await.unwrap();
+        socket.write_all(&bytes).await.unwrap();
+        socket.shutdown().await.unwrap();
+    });
+    let started = std::time::Instant::now();
+    let tunnel = client.open(Address::V4([127, 0, 0, 1]), port).await.unwrap();
+    let open = started.elapsed();
+    let (mut app, local) = tokio::io::duplex(8192);
+    let relay = tokio::spawn(tunnel.relay(local));
+    let started = std::time::Instant::now();
+    app.write_all(payload).await.unwrap();
+    app.shutdown().await.unwrap();
+    let mut received = Vec::new();
+    app.read_to_end(&mut received).await.unwrap();
+    assert_eq!(received, payload);
+    relay.await.unwrap().unwrap();
+    echo.await.unwrap();
+    (open, started.elapsed())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_xhttp_loopback_preserves_grants_and_both_stream_modes() {
+    use theia::quic_core::wire::Version;
+    timeout(Duration::from_secs(60), async {
+        let (remote, server, roots) = native_fixture(true).await;
+        for version in [Version::V1, Version::V2] {
+            for split in [false, true] {
+                let client = H3Client::new(remote, "localhost", &token(), roots.clone()).unwrap()
+                    .with_native_lab(version).unwrap().with_stream_up(split).unwrap();
+                exact_relay_sample(&client, &vec![0x6a; 96 * 1024]).await;
+            }
+        }
+        let wrong = URL_SAFE_NO_PAD.encode([0x44; 32]);
+        let client = H3Client::new(remote, "localhost", &wrong, roots).unwrap()
+            .with_native_lab(Version::V2).unwrap();
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        assert!(matches!(client.open(Address::V4([127,0,0,1]), target.local_addr().unwrap().port()).await, Err(ClientError::Unauthorized)));
+        assert!(timeout(Duration::from_millis(250), target.accept()).await.is_err());
+        server.abort();
+    }).await.unwrap();
+}
+
+/// Manual matched loopback workload: raw samples, no performance claim.
+/// Run in release mode on a quiet machine; independent network/CPU/RSS
+/// measurements remain separate acceptance requirements.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual comparative loopback benchmark"]
+async fn quinn_native_xhttp_comparison_samples() {
+    use theia::quic_core::wire::Version;
+    timeout(Duration::from_secs(240), async {
+        let (_endpoint, qaddr, qserver, qroots) = fixture_with_roots(true);
+        let (naddr, nserver, nroots) = native_fixture(true).await;
+        let payload: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+        println!("backend,stream_up,sample,bytes,open_us,relay_us");
+        for split in [false, true] {
+            for sample in 0..5 {
+                for (label, version) in [("quinn", None), ("native-v1", Some(Version::V1)), ("native-v2", Some(Version::V2))] {
+                    let client = if let Some(version) = version {
+                        H3Client::new(naddr, "localhost", &token(), nroots.clone()).unwrap().with_native_lab(version).unwrap()
+                    } else { H3Client::new(qaddr, "localhost", &token(), qroots.clone()).unwrap() };
+                    let client = client.with_stream_up(split).unwrap();
+                    let (open, relay) = exact_relay_sample(&client, &payload).await;
+                    println!("{label},{split},{sample},{},{},{}", payload.len(), open.as_micros(), relay.as_micros());
+                }
+            }
+        }
+        qserver.abort(); nserver.abort();
+    }).await.unwrap();
 }

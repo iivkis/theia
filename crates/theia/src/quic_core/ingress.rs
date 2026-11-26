@@ -5,10 +5,11 @@
 //! connection driver and its security/interop gates are integrated.
 use super::{
     datagram::{self, Demux, PacketKind, CID_LEN},
-    negotiation::{self, Binding, Tokens, TOKEN_TTL},
+    negotiation::{self, Binding, Tokens, VersionPolicy, TOKEN_TTL},
     wire::Version,
 };
 use crate::reality_quic_wire::{long, retry_integrity_tag};
+use ring::{hmac, rand::{SecureRandom, SystemRandom}};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io,
@@ -42,23 +43,46 @@ pub struct Ingress {
     owners: BTreeMap<u64, BTreeSet<Cid>>,
     retired: BTreeMap<Cid, u64>,
     tokens: Tokens,
+    reset_key: hmac::Key,
+    resettable: BTreeSet<Cid>,
     next_owner: u64,
     limit: usize,
+    connection_limit: usize,
     occupied: usize,
     now: u64,
+    versions: VersionPolicy,
 }
 
 impl Ingress {
     pub fn new(limit: usize) -> Result<Self, Error> {
+        Self::with_versions(limit, VersionPolicy::both())
+    }
+
+    pub fn with_versions(limit: usize, versions: VersionPolicy) -> Result<Self, Error> {
+        Self::with_limits(limit, limit, versions)
+    }
+
+    /// Separate active connections from the bounded CID/tombstone budget.
+    /// A spare CID must not consume another connection's admission slot.
+    pub(crate) fn for_listener(connections: usize, versions: VersionPolicy) -> Result<Self, Error> {
+        let routes = connections.checked_mul(MAX_OWNER_CIDS).ok_or(Error::Limit)?;
+        Self::with_limits(connections, routes, versions)
+    }
+
+    fn with_limits(connection_limit: usize, limit: usize, versions: VersionPolicy) -> Result<Self, Error> {
         Ok(Self {
             routes: Demux::new(limit).map_err(|_| Error::Limit)?,
             owners: BTreeMap::new(),
             retired: BTreeMap::new(),
             tokens: Tokens::new().map_err(|_| Error::Random)?,
+            reset_key: hmac::Key::generate(hmac::HMAC_SHA256, &SystemRandom::new()).map_err(|_| Error::Random)?,
+            resettable: BTreeSet::new(),
             next_owner: 1,
             limit,
+            connection_limit,
             occupied: 0,
             now: 0,
+            versions,
         })
     }
 
@@ -70,6 +94,7 @@ impl Ingress {
         let before = self.retired.len();
         self.retired.retain(|_, until| now <= *until);
         self.occupied -= before - self.retired.len();
+        self.resettable.retain(|cid| self.retired.contains_key(cid) || self.routes.owner(*cid).is_some());
         Ok(())
     }
 
@@ -99,7 +124,29 @@ impl Ingress {
         self.routes.register(cid, owner).map_err(|_| Error::Limit)?;
         self.owners.get_mut(&owner).ok_or(Error::Owner)?.insert(cid);
         self.occupied += 1;
+        self.resettable.insert(cid);
         Ok(cid)
+    }
+
+    pub(crate) fn reset_token(&self, cid: Cid) -> [u8; 16] {
+        let tag = hmac::sign(&self.reset_key, &cid);
+        let mut token = [0; 16];
+        token.copy_from_slice(&tag.as_ref()[..16]);
+        token
+    }
+
+    /// Reply only for previously issued, retired aliases, never unknown
+    /// CIDs. A strictly smaller response prevents reset loops/amplification.
+    fn retired_reset(&self, cid: Cid, received: usize) -> Result<Action, Error> {
+        if received <= 21 || !self.retired.contains_key(&cid) || !self.resettable.contains(&cid) {
+            return Ok(Action::Drop);
+        }
+        let mut packet = vec![0; (received - 1).min(43)];
+        SystemRandom::new().fill(&mut packet).map_err(|_| Error::Random)?;
+        packet[0] = (packet[0] & 0x3f) | 0x40;
+        let at = packet.len() - 16;
+        packet[at..].copy_from_slice(&self.reset_token(cid));
+        Ok(Action::Reply(packet))
     }
 
     /// Do not retire the last CID separately from connection teardown.
@@ -139,9 +186,9 @@ impl Ingress {
         if peer.port() == 0 || datagram.is_empty() || datagram.len() > MAX_DATAGRAM {
             return Ok(Action::Drop);
         }
-        if let Some((version, dcid, scid)) = unsupported_header(datagram) {
+        if let Some((version, dcid, scid)) = invariant_header(datagram) {
             if version != 0
-                && Version::from_wire(version).is_none()
+                && Version::from_wire(version).is_none_or(|v| !self.versions.supports(v))
                 && <Cid>::try_from(dcid)
                     .ok()
                     .is_none_or(|cid| self.available(cid))
@@ -152,7 +199,7 @@ impl Ingress {
                 reply.extend_from_slice(scid);
                 reply.push(dcid.len() as u8);
                 reply.extend_from_slice(dcid);
-                for v in [Version::V1, Version::V2] {
+                for v in self.versions.versions() {
                     reply.extend(v.wire().to_be_bytes());
                 }
                 return Ok(Action::Reply(reply));
@@ -174,7 +221,10 @@ impl Ingress {
         if let Some(owner) = cid.and_then(|id| self.routes.owner(id)) {
             return Ok(Action::Existing(owner));
         }
-        if head.kind != PacketKind::Initial || self.occupied >= self.limit {
+        if head.kind == PacketKind::Application {
+            return match cid { Some(cid) => self.retired_reset(cid, datagram.len()), None => Ok(Action::Drop) };
+        }
+        if head.kind != PacketKind::Initial || self.occupied >= self.limit || self.owners.len() >= self.connection_limit {
             return Ok(Action::Drop);
         }
         if cid.is_some_and(|id| self.retired.contains_key(&id)) {
@@ -183,7 +233,7 @@ impl Ingress {
         let Some(header) = long(head.bytes) else {
             return Ok(Action::Drop);
         };
-        let Some(version) = head.version else {
+        let Some(version) = head.version.filter(|v| self.versions.supports(*v)) else {
             return Ok(Action::Drop);
         };
         if header.token.is_empty() {
@@ -226,12 +276,12 @@ impl Ingress {
 
 /// QUIC invariant header only. No type interpretation for unknown
 /// versions. Bounded by the native endpoint's supported CID lengths.
-fn unsupported_header(bytes: &[u8]) -> Option<(u32, &[u8], &[u8])> {
+fn invariant_header(bytes: &[u8]) -> Option<(u32, &[u8], &[u8])> {
     if bytes.len() < 1200 || bytes.first()? & 0x80 == 0 {
         return None;
     }
     let version = u32::from_be_bytes(bytes.get(1..5)?.try_into().ok()?);
-    if version == 0 || Version::from_wire(version).is_some() {
+    if version == 0 {
         return None;
     }
     let dlen = usize::from(*bytes.get(5)?);
@@ -430,13 +480,42 @@ mod tests {
                 Err(Error::Owner)
             );
             ingress.retire_local_cid(owner, alias, 1).unwrap();
-            assert_eq!(ingress.process(peer, &short(alias), 1), Ok(Action::Drop));
+            let probe = short(alias);
+            let Action::Reply(reset) = ingress.process(peer, &probe, 1).unwrap() else { panic!("retired alias reset") };
+            assert!(reset.len() >= 21 && reset.len() < probe.len());
+            assert_eq!(reset[0] & 0xc0, 0x40);
+            assert_eq!(&reset[reset.len()-16..], &ingress.reset_token(alias));
+            assert_eq!(ingress.process(peer, &short([0; 8]), 1), Ok(Action::Drop));
             assert_eq!(ingress.issue_local_cid(owner, 1), Err(Error::Limit));
             ingress.close(owner, 2).unwrap();
             assert_eq!(ingress.process(peer, &packet, 2), Ok(Action::Drop));
             assert_eq!(ingress.process(peer, &packet, 33), Ok(Action::Drop));
             assert_eq!(ingress.process(peer, &packet, 32), Err(Error::Clock));
         }
+    }
+
+    #[test]
+    fn listener_connection_limit_is_independent_of_cid_slots() {
+        let version = Version::V1;
+        let mut ingress = Ingress::for_listener(2, VersionPolicy::both()).unwrap();
+        let peer = "127.0.0.1:1000".parse().unwrap();
+        let mut owners = Vec::new();
+        for n in 1..=2u8 {
+            let original = [n; 8];
+            let client = [n + 10; 8];
+            let Action::Reply(retry) = ingress.process(peer, &initial(version, &original, &client, &[]), 0).unwrap() else { panic!("Retry"); };
+            let (cid, token) = negotiation::retry_token(&retry, version, &client, &original, false, false).unwrap();
+            let Action::Accepted { owner, .. } = ingress.process(peer, &initial(version, cid, &client, token), 0).unwrap() else { panic!("accept"); };
+            owners.push(owner);
+            ingress.issue_local_cid(owner, 0).unwrap();
+        }
+        assert_eq!(ingress.owners.len(), 2);
+        assert_eq!(ingress.occupied, 4);
+        assert_eq!(ingress.process(peer, &initial(version, &[7; 8], &[8; 8], &[]), 0), Ok(Action::Drop));
+        ingress.close(owners[0], 1).unwrap();
+        assert_eq!(ingress.owners.len(), 1);
+        assert_eq!(ingress.occupied, 4); // replay tombstones are still charged
+        assert!(matches!(ingress.process(peer, &initial(version, &[7; 8], &[8; 8], &[]), 1), Ok(Action::Reply(_))));
     }
 
     #[test]

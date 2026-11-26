@@ -529,6 +529,16 @@ jobs:
         run: python -m pip install h2==4.2.0 aioquic==1.2.0
       - name: Independent native client PKI and ALPN matrix over H2/H3
         run: cargo test --workspace --locked --test independent_native_tls native_clients_require_pki_and_exact_alpn -- --ignored --exact --nocapture
+      - name: Independent aioquic v1/v2 against native QUIC core (laboratory)
+        run: cargo test --workspace --locked --test independent_native_quic independent_aioquic_v1_v2_bidirectional_h3 -- --ignored --exact --nocapture
+      - name: Measure matched native and Quinn loopback samples (diagnostic)
+        run: python tests/benchmark/run_native_quic_comparison.py --revision "${{ needs.specification.outputs.tested_sha }}" --output native-quic-comparison.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-quic-comparison-${{ matrix.os }}
+          path: native-quic-comparison.json
+          if-no-files-found: error
+          retention-days: 7
       - name: Independent external TLS and QUIC through registered REALITY dispatchers
         run: cargo test --workspace --locked --lib server::hardening_tests::independent_external_reference_through_registered_reality_dispatchers -- --ignored --exact --nocapture
       - name: Install pinned native benchmark measurement dependency

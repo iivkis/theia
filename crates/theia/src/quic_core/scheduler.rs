@@ -9,7 +9,7 @@ use super::{
     recovery::Rtt,
 };
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -36,6 +36,9 @@ pub struct Scheduler {
     window: Window,
     bbr: Option<Bbr>,
     rtt: Rtt,
+    ack_delay_exponent: u32,
+    max_ack_delay: Duration,
+    confirmed: bool,
     frames: BTreeMap<u64, Pending>,
     queue: VecDeque<u64>,
     aliases: BTreeMap<u64, u64>,
@@ -43,6 +46,7 @@ pub struct Scheduler {
     last_eliciting: Option<Instant>,
     pto_count: u32,
     next_send: Option<Instant>,
+    cwnd_limited: BTreeSet<u64>,
 }
 
 impl Default for Scheduler {
@@ -52,6 +56,9 @@ impl Default for Scheduler {
             window: Window::new(MTU).expect("valid MTU"),
             bbr: None,
             rtt: Rtt::default(),
+            ack_delay_exponent: 0,
+            max_ack_delay: Duration::ZERO,
+            confirmed: false,
             frames: BTreeMap::new(),
             queue: VecDeque::new(),
             aliases: BTreeMap::new(),
@@ -59,6 +66,7 @@ impl Default for Scheduler {
             last_eliciting: None,
             pto_count: 0,
             next_send: None,
+            cwnd_limited: BTreeSet::new(),
         }
     }
 }
@@ -76,6 +84,22 @@ impl Scheduler {
             bbr: Some(Bbr::new(MTU, now).expect("valid MTU")),
             ..Self::default()
         }
+    }
+
+    /// Cross-IP migration resets RTT, congestion and pacing. Reliable
+    /// frames are queued again; retained aliases still recognize a late
+    /// ACK from the old path without adding old-path RTT or delivery samples.
+    pub(crate) fn restart_path(&mut self, now: Instant) {
+        self.ledger.restart_path();
+        self.window = Window::new(MTU).expect("valid MTU");
+        if self.bbr.is_some() { self.bbr = Some(Bbr::new(MTU, now).expect("valid MTU")); }
+        self.rtt = Rtt::default();
+        self.queue.clear();
+        for (&id, frame) in &mut self.frames { frame.queued = true; self.queue.push_back(id); }
+        self.cwnd_limited.clear();
+        self.last_eliciting = None;
+        self.pto_count = 0;
+        self.next_send = None;
     }
 
     pub fn can_queue(&self) -> bool {
@@ -103,6 +127,16 @@ impl Scheduler {
         Ok(())
     }
 
+    pub(crate) fn stream_pending(&self, stream: u64) -> bool {
+        use super::{frames::{decode, Frame}, spaces::Space};
+        self.frames.values().any(|pending| matches!(decode(&pending.bytes, Space::Application).as_deref(),
+            Ok([Frame::Stream { id, .. } | Frame::ResetStream { id, .. }]) if *id == stream))
+    }
+
+    pub(crate) fn has_queued(&self) -> bool {
+        self.frames.values().any(|frame| frame.queued)
+    }
+
     pub fn pending(&self) -> usize {
         self.frames.len()
     }
@@ -120,7 +154,7 @@ impl Scheduler {
         });
         self.aliases.retain(|_, id| self.frames.contains_key(id));
         self.queue.retain(|id| self.frames.contains_key(id));
-        if self.frames.is_empty() {
+        if self.frames.is_empty() && self.ledger.bytes_in_flight() == 0 {
             self.last_eliciting = None;
         }
     }
@@ -129,7 +163,7 @@ impl Scheduler {
     /// congestion window; ordinary sends remain paced and window-limited.
     pub fn candidate(&mut self, now: Instant) -> Result<Option<(u64, Vec<u8>, bool)>, Error> {
         self.queue.retain(|id| self.frames.contains_key(id));
-        let probe_due = !self.frames.is_empty() && self.pto_deadline().is_some_and(|at| now >= at);
+        let probe_due = self.pto_deadline().is_some_and(|at| now >= at);
         if probe_due {
             if self.pto_count >= MAX_PTO {
                 return Err(Error::Timeout);
@@ -137,6 +171,9 @@ impl Scheduler {
             if self.aliases.len() >= MAX_ALIASES {
                 return Err(Error::Limit);
             }
+            // A PATH probe or canceled STREAM can leave flight bytes but
+            // no retransmittable frame. PTO still needs an eliciting probe.
+            if self.frames.is_empty() { self.enqueue(vec![1])?; }
             if let Some((&id, f)) = self.frames.first_key_value() {
                 return Ok(Some((id, f.bytes.clone(), true)));
             }
@@ -172,6 +209,9 @@ impl Scheduler {
                 return Err(Error::Limit);
             }
             let before = self.window.in_flight();
+            if before == 0 && self.bbr.is_none() {
+                self.window.application_limited();
+            }
             let app_limited = probe
                 || (self.queue.iter().all(|queued| *queued == id)
                     && before.saturating_add(2 * MTU) <= self.window.cwnd());
@@ -201,6 +241,7 @@ impl Scheduler {
                 bbr.sent(number, bytes as u64, now, before, app_limited)
                     .map_err(|_| Error::Window)?;
             }
+            if !app_limited && self.bbr.is_none() { self.cwnd_limited.insert(number); }
             self.aliases.insert(number, id);
             self.queue.retain(|queued| *queued != id);
             if let Some(f) = self.frames.get_mut(&id) {
@@ -274,6 +315,21 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Only application-space schedulers receive negotiated ACK timing.
+    pub(crate) fn application_ack_timing(&mut self, exponent: u64, max_delay_ms: u64, confirmed: bool) {
+        self.ack_delay_exponent = exponent.min(20) as u32;
+        self.max_ack_delay = Duration::from_millis(max_delay_ms.min((1 << 14) - 1));
+        self.confirmed = confirmed;
+    }
+
+    pub(crate) fn confirm_handshake(&mut self) {
+        self.confirmed = true;
+    }
+
+    fn ack_delay_limit(&self) -> Duration {
+        if self.confirmed { self.max_ack_delay } else { Duration::ZERO }
+    }
+
     pub fn acknowledge(&mut self, ack: &Ack, now: Instant) -> Result<(), Error> {
         let outcome = self
             .ledger
@@ -290,21 +346,21 @@ impl Scheduler {
             self.aliases.retain(|_, value| *value != id);
         }
         self.queue.retain(|id| self.frames.contains_key(id));
-        if self.frames.is_empty() {
+        if self.frames.is_empty() && self.ledger.bytes_in_flight() == 0 {
             self.last_eliciting = None;
         }
         if outcome.acknowledged.iter().any(|p| p.ack_eliciting) {
             self.pto_count = 0;
         }
         if let Some(sample) = outcome.rtt_sample {
-            self.rtt
-                .update(sample, Duration::ZERO, Duration::ZERO, true);
+            let delay = Duration::from_micros(ack.delay.saturating_mul(1u64 << self.ack_delay_exponent));
+            let limit = self.ack_delay_limit();
+            self.rtt.update(sample, delay, limit, self.confirmed);
         }
         self.apply_loss(outcome, now)
     }
 
     fn apply_loss(&mut self, outcome: loss::Outcome, now: Instant) -> Result<(), Error> {
-        let limited = self.window.in_flight().saturating_add(MTU) > self.window.cwnd();
         self.window
             .retire(outcome.acknowledged_bytes + outcome.lost_bytes)
             .map_err(|_| Error::Window)?;
@@ -324,6 +380,7 @@ impl Scheduler {
         // Apply loss before growth, so an ACK for a packet sent before
         // the new recovery boundary cannot undo the congestion event.
         for p in outcome.lost {
+            self.cwnd_limited.remove(&p.number);
             if p.in_flight && self.bbr.is_none() {
                 self.window.loss(p.at, now).map_err(|_| Error::Window)?;
             }
@@ -339,6 +396,7 @@ impl Scheduler {
             }
         }
         for p in outcome.acknowledged {
+            let limited = self.cwnd_limited.remove(&p.number);
             if p.in_flight && self.bbr.is_none() {
                 self.window
                     .on_ack(p.at, now, u64::from(p.bytes), self.rtt.smoothed(), limited)
@@ -357,15 +415,15 @@ impl Scheduler {
     }
 
     pub fn base_pto(&self) -> Duration {
-        self.rtt.pto(Duration::ZERO, 0)
+        self.rtt.pto(self.ack_delay_limit(), 0)
     }
 
     fn pto_deadline(&self) -> Option<Instant> {
-        if self.frames.is_empty() {
+        if self.ledger.bytes_in_flight() == 0 {
             return None;
         }
         self.last_eliciting?
-            .checked_add(self.rtt.pto(Duration::ZERO, self.pto_count))
+            .checked_add(self.rtt.pto(self.ack_delay_limit(), self.pto_count))
     }
 
     pub fn deadline(&self) -> Option<Instant> {
@@ -419,6 +477,24 @@ mod tests {
     }
 
     #[test]
+    fn negotiated_ack_delay_applies_only_after_confirmation() {
+        let now = Instant::now();
+        let mut s = Scheduler::default();
+        let initial_pto = s.base_pto();
+        s.application_ack_timing(3, 25, false);
+        assert_eq!(s.base_pto(), initial_pto);
+        s.confirm_handshake();
+        assert_eq!(s.base_pto(), initial_pto + Duration::from_millis(25));
+        s.rtt.update(Duration::from_millis(100), Duration::ZERO, Duration::ZERO, true);
+        s.enqueue(vec![1]).unwrap();
+        s.record(0, 100, Some((0, false)), now).unwrap();
+        let mut a = ack(0);
+        a.delay = 2500; // 20ms at exponent 3
+        s.acknowledge(&a, now + Duration::from_millis(150)).unwrap();
+        assert_eq!(s.rtt.smoothed(), Duration::from_micros(103750));
+    }
+
+    #[test]
     fn pto_retransmission_and_late_ack_cancel() {
         let now = Instant::now();
         let mut s = Scheduler::default();
@@ -439,6 +515,30 @@ mod tests {
         assert!(s.candidate(later).unwrap().is_none());
         s.acknowledge(&ack(1), later).unwrap();
         assert_eq!(s.window.in_flight(), 0);
+    }
+
+    #[test]
+    fn migration_requeues_reliable_data_without_reusing_packet_numbers() {
+        for bbr in [false, true] {
+            let now = Instant::now();
+            let mut s = if bbr { Scheduler::with_bbr(now) } else { Scheduler::default() };
+            s.enqueue(vec![1]).unwrap();
+            let (id, _, _) = s.candidate(now).unwrap().unwrap();
+            s.record(0, 100, Some((id, false)), now).unwrap();
+            let next = now + Duration::from_millis(50);
+            s.restart_path(next);
+            assert_eq!(s.window.in_flight(), 0);
+            assert!(s.rtt.minimum().is_none());
+            assert_eq!(s.candidate(next).unwrap().unwrap().0, id);
+            s.record(1, 100, Some((id, false)), next).unwrap();
+            s.acknowledge(&ack(0), next).unwrap();
+            assert_eq!(s.pending(), 0);
+            assert!(s.rtt.minimum().is_none());
+            assert_eq!(s.window.in_flight(), 100);
+            s.acknowledge(&ack(1), next + Duration::from_millis(5)).unwrap();
+            assert_eq!(s.window.in_flight(), 0);
+            assert_eq!(s.rtt.minimum(), Some(Duration::from_millis(5)));
+        }
     }
 
     #[test]
@@ -477,6 +577,21 @@ mod tests {
         s.acknowledge(&ack(0), now + Duration::from_millis(10))
             .unwrap();
         assert_eq!(s.window.in_flight(), 0);
+    }
+
+    #[test]
+    fn path_only_flight_arms_pto_and_ping_releases_lost_probe() {
+        let now = Instant::now();
+        let mut s = Scheduler::default();
+        s.record_path(0, 1200, now).unwrap();
+        let at = s.deadline().unwrap();
+        let (id, bytes, probe) = s.candidate(at).unwrap().unwrap();
+        assert_eq!(bytes, [1]);
+        assert!(probe);
+        s.record(1, 32, Some((id, probe)), at).unwrap();
+        s.acknowledge(&ack(1), at + Duration::from_millis(10)).unwrap();
+        assert_eq!(s.window.in_flight(), 0);
+        assert_eq!(s.pending(), 0);
     }
 
     #[test]

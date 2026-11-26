@@ -51,6 +51,10 @@ impl Driver {
         }
     }
 
+    pub(crate) fn consumed_handshake(&self) -> u64 {
+        self.receive[Level::Handshake as usize].consumed_offset()
+    }
+
     pub fn tls_complete(&self) -> bool {
         !self.failed && !self.tls.is_handshaking()
     }

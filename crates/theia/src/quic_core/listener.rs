@@ -4,7 +4,7 @@
 //! connection driver and external acceptance remain mandatory.
 use super::{
     ingress::{Action, Ingress},
-    negotiation::Binding,
+    negotiation::{Binding, VersionPolicy},
 };
 use std::{
     collections::BTreeMap,
@@ -13,7 +13,15 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle};
+use tokio::{net::UdpSocket, sync::{mpsc, oneshot}, task::JoinHandle};
+use ring::rand::{SecureRandom, SystemRandom};
+
+type Cid = [u8; 8];
+type IssuedCid = (Cid, [u8; 16]);
+pub(crate) enum RouteCommand {
+    Issue { owner: u64, reply: oneshot::Sender<io::Result<IssuedCid>> },
+    Retire { owner: u64, cid: Cid, reply: oneshot::Sender<io::Result<()>> },
+}
 
 const MTU: usize = 1200;
 const MAX_CONNECTIONS: usize = 128;
@@ -25,6 +33,8 @@ pub(crate) enum SessionIo {
     Routed {
         socket: Arc<UdpSocket>,
         incoming: mpsc::Receiver<Datagram>,
+        owner: u64,
+        commands: mpsc::Sender<RouteCommand>,
     },
 }
 
@@ -49,10 +59,37 @@ impl SessionIo {
         }
     }
 
+    pub(crate) async fn issue_cid(&self) -> io::Result<IssuedCid> {
+        match self {
+            Self::Direct(_) => {
+                let cid = super::negotiation::random_cid().map_err(|_| io::ErrorKind::Other)?;
+                let mut token = [0; 16];
+                SystemRandom::new().fill(&mut token).map_err(|_| io::ErrorKind::Other)?;
+                Ok((cid, token))
+            }
+            Self::Routed { owner, commands, .. } => {
+                let (reply, result) = oneshot::channel();
+                commands.send(RouteCommand::Issue { owner: *owner, reply }).await.map_err(|_| io::ErrorKind::BrokenPipe)?;
+                result.await.map_err(|_| io::ErrorKind::BrokenPipe)?
+            }
+        }
+    }
+
+    pub(crate) async fn retire_cid(&self, cid: Cid) -> io::Result<()> {
+        match self {
+            Self::Direct(_) => Ok(()),
+            Self::Routed { owner, commands, .. } => {
+                let (reply, result) = oneshot::channel();
+                commands.send(RouteCommand::Retire { owner: *owner, cid, reply }).await.map_err(|_| io::ErrorKind::BrokenPipe)?;
+                result.await.map_err(|_| io::ErrorKind::BrokenPipe)?
+            }
+        }
+    }
+
     pub(crate) async fn send_to(&self, bytes: &[u8], peer: SocketAddr) -> io::Result<usize> {
         match self {
             Self::Direct(s) => s.send_to(bytes, peer).await,
-            Self::Routed { socket, incoming } => {
+            Self::Routed { socket, incoming, .. } => {
                 if incoming.is_closed() {
                     return Err(io::Error::from(io::ErrorKind::BrokenPipe));
                 }
@@ -81,11 +118,12 @@ pub struct Candidate {
     peer: SocketAddr,
     binding: Binding,
     token: Vec<u8>,
+    versions: VersionPolicy,
 }
 
 impl Candidate {
-    pub(crate) fn into_parts(self) -> (SessionIo, SocketAddr, Binding, Vec<u8>) {
-        (self.io, self.peer, self.binding, self.token)
+    pub(crate) fn into_parts(self) -> (SessionIo, SocketAddr, Binding, Vec<u8>, VersionPolicy) {
+        (self.io, self.peer, self.binding, self.token, self.versions)
     }
 }
 
@@ -97,6 +135,10 @@ pub struct Listener {
 
 impl Listener {
     pub fn new(socket: UdpSocket, limit: usize) -> io::Result<Self> {
+        Self::with_versions(socket, limit, VersionPolicy::both())
+    }
+
+    pub fn with_versions(socket: UdpSocket, limit: usize, versions: VersionPolicy) -> io::Result<Self> {
         let local = socket.local_addr()?;
         if !local.ip().is_loopback()
             || socket.peer_addr().is_ok()
@@ -104,9 +146,10 @@ impl Listener {
         {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
-        let ingress = Ingress::new(limit).map_err(|_| io::ErrorKind::InvalidInput)?;
+        let ingress = Ingress::for_listener(limit, versions.clone()).map_err(|_| io::ErrorKind::InvalidInput)?;
         let (tx, candidates) = mpsc::channel(limit);
-        let worker = tokio::spawn(run(Arc::new(socket), ingress, tx));
+        let (commands, requests) = mpsc::channel(limit);
+        let worker = tokio::spawn(run(Arc::new(socket), ingress, tx, versions, commands, requests));
         Ok(Self {
             local,
             candidates,
@@ -136,6 +179,9 @@ async fn run(
     socket: Arc<UdpSocket>,
     mut ingress: Ingress,
     accepts: mpsc::Sender<Candidate>,
+    versions: VersionPolicy,
+    commands: mpsc::Sender<RouteCommand>,
+    mut requests: mpsc::Receiver<RouteCommand>,
 ) -> io::Result<()> {
     let clock = Instant::now();
     let mut routes: BTreeMap<u64, mpsc::Sender<Datagram>> = BTreeMap::new();
@@ -151,16 +197,51 @@ async fn run(
                     ingress.close(owner, clock.elapsed().as_secs()).map_err(|_| io::ErrorKind::InvalidData)?;
                 }
             }
+            Some(command) = requests.recv() => {
+                let now = clock.elapsed().as_secs();
+                match command {
+                    RouteCommand::Issue { owner, reply } => {
+                        if reply.is_closed() { continue; }
+                        let issued = ingress.issue_local_cid(owner, now).map(|cid| (cid, ingress.reset_token(cid)))
+                            .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock));
+                        if let Err(Ok((cid, _))) = reply.send(issued) {
+                            let _ = ingress.retire_local_cid(owner, cid, now);
+                        }
+                    }
+                    RouteCommand::Retire { owner, cid, reply } => {
+                        let result = ingress.retire_local_cid(owner, cid, now).map_err(|_| io::Error::from(io::ErrorKind::InvalidData));
+                        let _ = reply.send(result);
+                    }
+                }
+            }
             received = socket.recv_from(&mut buffer) => {
-                let (n, peer) = received?;
+                let (n, peer) = match received {
+                    Ok(value) => value,
+                    // Windows can surface ICMP Port Unreachable on an
+                    // unconnected UDP socket. It is not a listener failure.
+                    Err(e) if matches!(e.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused) || (cfg!(windows) && e.raw_os_error() == Some(10040)) => continue,
+                    Err(e) => return Err(e),
+                };
                 if !peer.ip().is_loopback() || n > MTU { continue; }
                 let bytes = &buffer[..n];
                 let now = clock.elapsed().as_secs();
-                match ingress.process(peer, bytes, now).map_err(|_| io::ErrorKind::InvalidData)? {
+                let action = match ingress.process(peer, bytes, now) {
+                    Ok(action) => action,
+                    // A saturated route table or failed CID allocation is
+                    // not permission to stop unrelated established sessions.
+                    Err(super::ingress::Error::Limit | super::ingress::Error::Random) => continue,
+                    Err(_) => return Err(io::Error::from(io::ErrorKind::InvalidData)),
+                };
+                match action {
                     Action::Drop => {}
                     Action::Reply(reply) => {
-                        if reply.len() <= n && socket.send_to(&reply, peer).await? != reply.len() {
-                            return Err(io::Error::from(io::ErrorKind::WriteZero));
+                        if reply.len() <= n {
+                            match socket.send_to(&reply, peer).await {
+                                Ok(written) if written == reply.len() => {},
+                                Ok(_) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+                                Err(e) if matches!(e.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused | io::ErrorKind::NetworkUnreachable | io::ErrorKind::HostUnreachable) => {},
+                                Err(e) => return Err(e),
+                            }
                         }
                     }
                     Action::Existing(owner) => {
@@ -175,8 +256,8 @@ async fn run(
                             let (tx, incoming) = mpsc::channel(MAILBOX);
                             tx.try_send((bytes.to_vec(), peer)).map_err(|_| io::ErrorKind::InvalidData)?;
                             routes.insert(owner, tx);
-                            permit.send(Candidate { io: SessionIo::Routed { socket: socket.clone(), incoming },
-                                peer, binding, token });
+                            permit.send(Candidate { io: SessionIo::Routed { socket: socket.clone(), incoming, owner, commands: commands.clone() },
+                                peer, binding, token, versions: versions.clone() });
                         } else {
                             ingress.close(owner, now).map_err(|_| io::ErrorKind::InvalidData)?;
                         }

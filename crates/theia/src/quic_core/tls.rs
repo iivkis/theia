@@ -451,22 +451,145 @@ mod tests {
         assert_eq!(x.peer_addr(), a_addr);
         assert_eq!(y.peer_addr(), b_addr);
         assert!(x.handshake_confirmed() && y.handshake_confirmed());
-        for (c, data) in [(&mut a, b"alpha".as_slice()), (&mut b, b"bravo".as_slice())] {
+        for (c, s, expected) in [
+            (&mut a, &mut x, b"alpha".as_slice()),
+            (&mut b, &mut y, b"bravo".as_slice()),
+        ] {
+            // TLS completion is no longer conditional on the final Handshake
+            // ACK. Drive HANDSHAKE_DONE before asserting application delivery.
+            for _ in 0..20 {
+                s.flush(Instant::now()).await.unwrap();
+                c.recv(Duration::from_millis(50)).await.unwrap();
+                if c.handshake_confirmed() { break; }
+            }
+            assert!(c.handshake_confirmed());
             let id = c.open_uni().unwrap();
             assert_eq!(id, 2);
-            c.queue(id, data, true).unwrap();
-            assert!(c.flush(Instant::now()).await.unwrap());
-        }
-        for (s, expected) in [(&mut x, b"alpha".as_slice()), (&mut y, b"bravo".as_slice())] {
-            for _ in 0..8 {
-                if s.recv(Duration::from_millis(100)).await.unwrap() {
-                    break;
+            c.queue(id, expected, true).unwrap();
+            let mut out = [0; 5];
+            let mut read = 0;
+            for _ in 0..40 {
+                c.flush(Instant::now()).await.unwrap();
+                if s.recv(Duration::from_millis(50)).await.unwrap() {
+                    if let Ok(n) = s.read(id, &mut out[read..]) { read += n; }
+                    if read == out.len() { break; }
                 }
             }
-            let mut out = [0; 5];
-            assert_eq!(s.read(2, &mut out).unwrap(), 5);
+            assert_eq!(read, 5);
             assert_eq!(out.as_slice(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn routed_cid_rotation_migration_and_stateless_reset_v1_v2() {
+        use crate::quic_core::{endpoint::LabSession, handshake_udp, lifecycle::ShutdownPhase, listener::Listener};
+        use std::time::{Duration, Instant};
+        use tokio::net::UdpSocket;
+
+        async fn pump(from: &mut LabSession, to: &mut LabSession) {
+            for _ in 0..100 {
+                if from.flush(Instant::now()).await.unwrap() {
+                    for _ in 0..8 {
+                        if to.recv(Duration::from_millis(100)).await.unwrap() { return; }
+                    }
+                    panic!("expected authenticated packet");
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            panic!("no scheduled packet");
+        }
+
+        for version in [Version::V1, Version::V2] {
+            let (cc, mut sc) = configs();
+            sc.send_tls13_tickets = 0;
+            let mut listener = Listener::new(UdpSocket::bind("127.0.0.1:0").await.unwrap(), 8).unwrap();
+            let addr = listener.local_addr();
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let old = socket.local_addr().unwrap();
+            let (c, s) = tokio::join!(
+                handshake_udp::connect(socket, addr, version, Arc::new(cc), ServerName::try_from("localhost").unwrap()),
+                async { handshake_udp::accept(listener.accept().await.unwrap(), Arc::new(sc)).await },
+            );
+            let (mut c, mut s) = (c.unwrap(), s.unwrap());
+            pump(&mut s, &mut c).await; // HANDSHAKE_DONE
+            pump(&mut c, &mut s).await;
+            assert_eq!(s.advertise_connection_id().await.unwrap(), 1);
+            pump(&mut s, &mut c).await;
+            pump(&mut c, &mut s).await;
+            let stream = c.open_bidi().unwrap();
+            c.queue(stream, b"before", false).unwrap();
+            pump(&mut c, &mut s).await;
+            let mut out = [0; 16];
+            assert_eq!(s.read(stream, &mut out).unwrap(), 6);
+            assert_eq!(&out[..6], b"before");
+            pump(&mut s, &mut c).await;
+
+            // Linux's 127/8 permits an actual change of source IP in this
+            // closed fixture. Windows covers the same CID rotation with a
+            // new UDP port without assuming another loopback IP is assigned.
+            let bind = if cfg!(target_os = "linux") { "127.0.0.2:0" } else { "127.0.0.1:0" };
+            let moved = UdpSocket::bind(bind).await.unwrap();
+            let next = moved.local_addr().unwrap();
+            c.rebind(moved, Instant::now()).await.unwrap();
+            let wait = Duration::from_secs(1);
+            assert!(!s.recv(wait).await.unwrap());
+            assert_eq!(s.peer_addr(), old);
+            assert!(c.recv(wait).await.unwrap());
+            assert!(s.recv(wait).await.unwrap());
+            assert_eq!(s.peer_addr(), next);
+            pump(&mut s, &mut c).await;
+            pump(&mut c, &mut s).await; // ACK the challenge
+            pump(&mut c, &mut s).await; // retire sequence zero
+            pump(&mut s, &mut c).await;
+            // Retirement released the active-ID slot, not the Retry replay tombstone.
+            assert_eq!(s.advertise_connection_id().await.unwrap(), 2);
+            pump(&mut s, &mut c).await;
+            pump(&mut c, &mut s).await;
+            c.queue(stream, b"after", false).unwrap();
+            pump(&mut c, &mut s).await;
+            assert_eq!(s.read(stream, &mut out).unwrap(), 5);
+            assert_eq!(&out[..5], b"after");
+            pump(&mut s, &mut c).await;
+            s.queue(stream, b"reply", true).unwrap();
+            pump(&mut s, &mut c).await;
+            assert_eq!(c.read(stream, &mut out).unwrap(), 5);
+            assert_eq!(&out[..5], b"reply");
+            pump(&mut c, &mut s).await;
+
+            // Simulate loss of the server connection object while the
+            // endpoint still owns its reset key and bounded CID tombstones.
+            drop(s);
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            c.queue(stream, b"gone", true).unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while c.shutdown_phase() != ShutdownPhase::Draining {
+                    c.flush(Instant::now()).await.unwrap();
+                    c.recv(Duration::from_millis(20)).await.unwrap();
+                }
+            }).await.unwrap();
+            assert!(!c.flush(Instant::now()).await.unwrap());
+            assert!(c.open_bidi().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn version_negotiation_restarts_with_fresh_connection_and_authenticated_choice() {
+        use crate::quic_core::{handshake_udp, listener::Listener, negotiation::VersionPolicy};
+        use tokio::net::UdpSocket;
+        let (cc, mut sc) = configs();
+        sc.send_tls13_tickets = 0;
+        let mut listener = Listener::with_versions(UdpSocket::bind("127.0.0.1:0").await.unwrap(), 2,
+            VersionPolicy::exact(Version::V1)).unwrap();
+        let addr = listener.local_addr();
+        let (client, server) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            tokio::join!(handshake_udp::connect_versions("127.0.0.1:0".parse().unwrap(), addr,
+                VersionPolicy::new(&[Version::V2, Version::V1]).unwrap(), Arc::new(cc), ServerName::try_from("localhost").unwrap()),
+                async { handshake_udp::accept(listener.accept().await.unwrap(), Arc::new(sc)).await })
+        }).await.unwrap();
+        let (version, mut client) = client.unwrap();
+        let mut server = server.unwrap();
+        assert_eq!(version, Version::V1);
+        assert_eq!(&client.take_channel_binding().unwrap()[..], &server.take_channel_binding().unwrap()[..]);
     }
 
     #[tokio::test]
@@ -554,6 +677,47 @@ mod tests {
             .await
             .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn native_h3_reuses_connection_beyond_initial_stream_credit() {
+        use crate::quic_core::{h3_adapter::NativeConnection, handshake_udp, listener::Listener};
+        use bytes::Bytes;
+        use std::{future::poll_fn, time::Duration};
+        use tokio::net::UdpSocket;
+        let (cc, mut sc) = configs();
+        sc.send_tls13_tickets = 0;
+        let mut listener = Listener::new(UdpSocket::bind("127.0.0.1:0").await.unwrap(), 2).unwrap();
+        let addr = listener.local_addr();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let (client, server) = tokio::join!(handshake_udp::connect(socket, addr, Version::V2, Arc::new(cc), ServerName::try_from("localhost").unwrap()),
+                async { handshake_udp::accept(listener.accept().await.unwrap(), Arc::new(sc)).await });
+            let (client, _) = NativeConnection::start(client.unwrap()).unwrap();
+            let (server, _) = NativeConnection::start(server.unwrap()).unwrap();
+            let (client, server) = tokio::join!(h3::client::new(client), async { h3::server::builder().build::<_, Bytes>(server).await });
+            let (mut driver, mut sender) = client.unwrap();
+            let mut server = server.unwrap();
+            let driver = tokio::spawn(async move { let _ = poll_fn(|cx| driver.poll_close(cx)).await; });
+            tokio::join!(async {
+                for n in 0..96 {
+                    let mut stream = sender.send_request(http::Request::builder().uri(format!("https://localhost/{n}")).body(()).unwrap()).await.unwrap();
+                    stream.finish().await.unwrap();
+                    assert_eq!(stream.recv_response().await.unwrap().status(), 204);
+                    assert!(stream.recv_data().await.unwrap().is_none());
+                }
+            }, async {
+                for n in 0..96 {
+                    let resolver = server.accept().await.unwrap().unwrap();
+                    let (req, mut stream) = resolver.resolve_request().await.unwrap();
+                    assert_eq!(req.uri().path(), format!("/{n}"));
+                    assert!(stream.recv_data().await.unwrap().is_none());
+                    stream.send_response(http::Response::builder().status(204).body(()).unwrap()).await.unwrap();
+                    stream.finish().await.unwrap();
+                }
+            });
+            driver.abort();
+        }).await.unwrap();
     }
 
     #[test]

@@ -17,7 +17,12 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_HANDLERS: usize = crate::transport_policy::MAX_BIDI_STREAMS as usize;
 
-type Stream = RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
+type Stream<S> = RequestStream<S, Bytes>;
+
+// Both carriers must enter the very same request handlers; the native lab
+// does not get its own less restrictive authorization path.
+trait CarrierStream: quic::BidiStream<Bytes> + quic::RecvStream<Buf = Bytes> + Send + 'static {}
+impl<S: quic::BidiStream<Bytes> + quic::RecvStream<Buf = Bytes> + Send + 'static> CarrierStream for S {}
 
 struct ConnectionGuard(quinn::Connection);
 
@@ -120,7 +125,7 @@ pub(crate) async fn serve_generation(
 pub(crate) async fn run_connection(
     connection: quinn::Connection,
     context: Arc<ServerContext>,
-    mut phase: watch::Receiver<GenerationPhase>,
+    phase: watch::Receiver<GenerationPhase>,
 ) {
     let guard = ConnectionGuard(connection);
     let peer = guard.0.remote_address().ip();
@@ -141,11 +146,38 @@ pub(crate) async fn run_connection(
     } else {
         None
     };
+    let transport = h3_quinn::Connection::new(guard.0.clone());
+    run_h3(transport, context, phase, peer, binding, async { let _ = guard.0.closed().await; }).await;
+}
+
+/// Experimental loopback entry point; no external listener or configuration
+/// switch. Requires TLS exporter material even for own-TLS; raw fixed-key
+/// sessions cannot enter the shared admission/relay handlers.
+pub async fn run_native_lab(session: crate::quic_core::endpoint::LabSession, context: Arc<ServerContext>) -> Result<(), ServerError> {
+    let peer = session.peer_addr().ip();
+    // REALITY dispatch and pinned-identity admission are not yet integrated.
+    if !peer.is_loopback() || !context.allows_native_lab() { return Err(ServerError::Io); }
+    let _slot = context.connection_slot().ok_or(ServerError::Io)?;
+    let (transport, _key) = crate::quic_core::h3_adapter::NativeConnection::start(session).map_err(|_| ServerError::Io)?;
+    let binding = None;
+    let (_owner, phase) = watch::channel(GenerationPhase::Active);
+    run_h3(transport, context, phase, peer, binding, std::future::pending::<()>()).await;
+    Ok(())
+}
+
+async fn run_h3<C, F>(transport: C, context: Arc<ServerContext>, mut phase: watch::Receiver<GenerationPhase>, peer: IpAddr,
+    binding: Option<Arc<crate::channel_binding::Admission>>, closed: F)
+where C: quic::Connection<Bytes>, C::BidiStream: CarrierStream,
+    <C::BidiStream as quic::BidiStream<Bytes>>::SendStream: Send + 'static,
+    <C::BidiStream as quic::BidiStream<Bytes>>::RecvStream: quic::RecvStream<Buf = Bytes> + Send + 'static,
+    F: std::future::Future<Output = ()>,
+{
+    tokio::pin!(closed);
     let mut builder = h3::server::builder();
     builder.max_field_section_size(u64::from(crate::transport_policy::MAX_HEADER_LIST_BYTES));
     let Ok(Ok(mut h3)) = timeout(
         HANDSHAKE_TIMEOUT,
-        builder.build::<_, Bytes>(h3_quinn::Connection::new(guard.0.clone())),
+        builder.build::<_, Bytes>(transport),
     )
     .await
     else {
@@ -171,7 +203,7 @@ pub(crate) async fn run_connection(
             }
             _ = handlers.join_next(), if !idle => continue,
             request = h3.accept(), if handlers.len() < MAX_HANDLERS => request,
-            _ = guard.0.closed() => break,
+            _ = &mut closed => break,
             _ = tokio::time::sleep(IDLE_TIMEOUT), if idle => break,
         };
         let resolver = match request {
@@ -180,7 +212,7 @@ pub(crate) async fn run_connection(
                 // Do not drop already-admitted streams when the H3 accept
                 // side reports no further requests. Quinn drives DATA/FIN.
                 while handlers.join_next().await.is_some() {}
-                let _ = timeout(CLOSE_TIMEOUT, guard.0.closed()).await;
+                let _ = timeout(CLOSE_TIMEOUT, &mut closed).await;
                 break;
             }
             _ => break,
@@ -219,9 +251,9 @@ pub(crate) async fn run_connection(
     }
 }
 
-async fn handle_descriptor(
+async fn handle_descriptor<S: CarrierStream>(
     request: Request<()>,
-    mut stream: Stream,
+    mut stream: Stream<S>,
     context: &ServerContext,
     peer: IpAddr,
 ) {
@@ -273,9 +305,9 @@ async fn handle_descriptor(
     }
 }
 
-async fn handle_routing(
+async fn handle_routing<S: CarrierStream>(
     request: Request<()>,
-    mut stream: Stream,
+    mut stream: Stream<S>,
     context: &ServerContext,
     peer: IpAddr,
     binding: Option<&crate::channel_binding::Admission>,
@@ -344,9 +376,9 @@ async fn handle_routing(
     }
 }
 
-async fn handle_request(
+async fn handle_request<S: CarrierStream>(
     request: Request<()>,
-    mut stream: Stream,
+    mut stream: Stream<S>,
     context: &ServerContext,
     peer: IpAddr,
     binding: Option<&crate::channel_binding::Admission>,
@@ -399,20 +431,20 @@ async fn handle_request(
     drop(permit);
 }
 
-type SplitPair = crate::split_http::Pair<(Request<()>, Stream)>;
+type SplitPair<S> = crate::split_http::Pair<(Request<()>, Stream<S>)>;
 
-async fn reject_split(stream: &mut Stream, status: StatusCode) {
+async fn reject_split<S: CarrierStream>(stream: &mut Stream<S>, status: StatusCode) {
     let _ = timeout(CLOSE_TIMEOUT, respond(stream, status)).await;
     let _ = timeout(CLOSE_TIMEOUT, stream.finish()).await;
     stream.stop_sending(Code::H3_REQUEST_CANCELLED);
 }
 
-async fn handle_split_request(
+async fn handle_split_request<S: CarrierStream>(
     request: Request<()>,
-    mut stream: Stream,
+    mut stream: Stream<S>,
     context: &ServerContext,
     peer: IpAddr,
-    pair: &SplitPair,
+    pair: &SplitPair<S>,
     binding: Option<&crate::channel_binding::Admission>,
 ) {
     let Some(leg) = context.split_leg(&request) else {
@@ -475,9 +507,9 @@ async fn handle_split_request(
     drop(permit);
 }
 
-async fn relay_request(
-    mut tx: RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
-    mut rx: RequestStream<h3_quinn::RecvStream, Bytes>,
+async fn relay_request<T: quic::SendStream<Bytes>, R: quic::RecvStream>(
+    mut tx: RequestStream<T, Bytes>,
+    mut rx: RequestStream<R, Bytes>,
     context: &ServerContext,
     session_id: u64,
 ) {
@@ -511,7 +543,7 @@ async fn relay_request(
     }
 }
 
-async fn respond_admitted(stream: &mut Stream, context: &ServerContext) -> Result<(), ServerError> {
+async fn respond_admitted<S: CarrierStream>(stream: &mut Stream<S>, context: &ServerContext) -> Result<(), ServerError> {
     let response = Response::builder()
         .status(StatusCode::OK)
         .body(())
@@ -522,7 +554,7 @@ async fn respond_admitted(stream: &mut Stream, context: &ServerContext) -> Resul
         .map_err(|_| ServerError::Io)
 }
 
-async fn respond(stream: &mut Stream, status: StatusCode) -> Result<(), ServerError> {
+async fn respond<S: CarrierStream>(stream: &mut Stream<S>, status: StatusCode) -> Result<(), ServerError> {
     let response = Response::builder()
         .status(status)
         .body(())
@@ -587,9 +619,9 @@ async fn send<S: quic::SendStream<Bytes>>(
         .map_err(|_| ServerError::Io)
 }
 
-async fn handle_frames(
-    tx: &mut RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
-    rx: &mut RequestStream<h3_quinn::RecvStream, Bytes>,
+async fn handle_frames<T: quic::SendStream<Bytes>, R: quic::RecvStream>(
+    tx: &mut RequestStream<T, Bytes>,
+    rx: &mut RequestStream<R, Bytes>,
     context: &ServerContext,
     session_id: u64,
 ) -> Result<(), ServerError> {
@@ -701,10 +733,10 @@ async fn handle_frames(
     }
 }
 
-async fn relay(
+async fn relay<T: quic::SendStream<Bytes>, R: quic::RecvStream>(
     tcp: TcpStream,
-    tx: &mut RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
-    rx: &mut RequestStream<h3_quinn::RecvStream, Bytes>,
+    tx: &mut RequestStream<T, Bytes>,
+    rx: &mut RequestStream<R, Bytes>,
     mut incoming: Incoming,
     mut state: Session,
     session_id: u64,
@@ -828,10 +860,10 @@ async fn relay(
     state.finish().map_err(|_| ServerError::Protocol)
 }
 
-async fn relay_udp(
+async fn relay_udp<T: quic::SendStream<Bytes>, R: quic::RecvStream>(
     socket: tokio::net::UdpSocket,
-    tx: &mut RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
-    rx: &mut RequestStream<h3_quinn::RecvStream, Bytes>,
+    tx: &mut RequestStream<T, Bytes>,
+    rx: &mut RequestStream<R, Bytes>,
     mut decoder: Incoming,
     state: Session,
 ) -> Result<(), ServerError> {

@@ -8,6 +8,7 @@ pub mod bbr;
 pub mod congestion;
 pub mod datagram;
 pub mod endpoint;
+pub mod ecn;
 pub mod flow;
 pub mod frames;
 pub mod h3_adapter;
@@ -30,6 +31,9 @@ pub mod spaces;
 pub mod stream;
 pub mod tls;
 pub mod wire;
+
+#[cfg(test)]
+mod mutation_tests;
 
 /// The experimental native transport must never become an externally reachable
 /// carrier before independent admission and interoperability acceptance.

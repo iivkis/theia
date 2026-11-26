@@ -1,6 +1,6 @@
 //! Experimental h3 0.0.8 transport bridge, using only the TLS-established
-//! native loopback session. Not a product carrier: fixed lifetime stream
-//! caps, no external interoperability, no independent admission or acceptance.
+//! native loopback session. Not a product carrier: no external
+//! interoperability, independent admission or acceptance.
 //! The worker serializes all packet/stream state. Synchronous trait calls
 //! never hold the state mutex across UDP I/O. Each direction has one bounded
 //! handoff slot and one waker. There is no task per stream or per datagram.
@@ -24,12 +24,13 @@ use std::{
     task::{Context, Poll, Waker},
     time::{Duration, Instant},
 };
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Notify};
 
 // Include HTTP/3 framing overhead for a 64 KiB application write.
 const SLOT_LIMIT: usize = 128 * 1024;
 const OPEN_LIMIT: usize = 16;
-const TICK: Duration = Duration::from_millis(2);
+const MAX_BURST: usize = 32;
+const IDLE_WAIT: Duration = Duration::from_secs(60);
 const CANCEL: u64 = 0x10c;
 
 fn internal() -> CE {
@@ -49,7 +50,18 @@ fn terminated(code: u64) -> SE {
     SE::StreamTerminated { error_code: code }
 }
 
-type Shared = Arc<Mutex<State>>;
+struct Bridge {
+    state: Mutex<State>,
+    ready: Arc<Notify>,
+}
+impl std::ops::Deref for Bridge {
+    type Target = Mutex<State>;
+    fn deref(&self) -> &Self::Target { &self.state }
+}
+impl Drop for Bridge {
+    fn drop(&mut self) { self.ready.notify_one(); }
+}
+type Shared = Arc<Bridge>;
 type OpenResult = Result<u64, CE>;
 struct OpenRequest {
     bidi: bool,
@@ -71,6 +83,8 @@ struct StreamState {
     stop: Option<u64>,
     stop_sent: bool,
     recv_reset: Option<u64>,
+    send_dropped: bool,
+    recv_dropped: bool,
     send_waker: Option<Waker>,
     recv_waker: Option<Waker>,
 }
@@ -95,6 +109,7 @@ struct State {
     bidi_waker: Option<Waker>,
     error: Option<CE>,
     close: Option<u64>,
+    cursor: Option<u64>,
 }
 
 fn wake(slot: &mut Option<Waker>, wakes: &mut Vec<Waker>) {
@@ -154,9 +169,12 @@ fn progress(
     session: &mut LabSession,
     state: &mut State,
     wakes: &mut Vec<Waker>,
+    ready: &Notify,
 ) -> Result<(), NativeError> {
     state.discover(session, wakes);
-    while let Some(request) = state.open.pop_front() {
+    // Visit each queued open once: a blocked bidi must not starve uni.
+    for _ in 0..state.open.len() {
+        let Some(request) = state.open.pop_front() else { break; };
         if request.result.is_closed() {
             continue;
         }
@@ -169,21 +187,33 @@ fn progress(
                 let mut stream = StreamState::new(true, request.bidi);
                 if request.result.send(Ok(id)).is_err() {
                     stream.reset = Some(CANCEL);
+                    stream.send_dropped = true;
                     if request.bidi {
                         stream.stop = Some(CANCEL);
+                        stream.recv_dropped = true;
                     }
                 }
                 state.streams.insert(id, stream);
             }
+            Err(NativeError::Send(send_flow::Error::Limit)) if !session.lifetime_exhausted(request.bidi) => {
+                state.open.push_back(request);
+            }
             Err(_) => {
-                // Fixed lifetime cap, no false promise of dynamic MAX_STREAMS.
+                // Only exhaustion of the protocol ID space is permanent.
                 let _ = request
                     .result
                     .send(Err(CE::InternalError("native stream limit".into())));
             }
         }
     }
-    for (&id, s) in &mut state.streams {
+    let mut ids: Vec<_> = state.streams.keys().copied().collect();
+    if let Some(cursor) = state.cursor {
+        let pivot = ids.partition_point(|id| *id <= cursor);
+        ids.rotate_left(pivot);
+    }
+    state.cursor = ids.first().copied();
+    for id in ids {
+        let s = state.streams.get_mut(&id).expect("known stream");
         if s.tx && !s.reset_sent {
             if let Some(code) = session.send_reset_code(id) {
                 if s.reset.is_none() {
@@ -203,8 +233,8 @@ fn progress(
                     Err(e) => return Err(e),
                 }
             } else if let Some(data) = s.outgoing.as_mut() {
-                let n = data.len().min(send_flow::MAX_CHUNK);
-                match session.queue(id, &data[..n], false) {
+                let n = data.len().min(session.send_capacity(id));
+                if n != 0 { match session.queue(id, &data[..n], false) {
                     Ok(()) => {
                         data.advance(n);
                         if data.is_empty() {
@@ -214,6 +244,7 @@ fn progress(
                     }
                     Err(e) if blocked(&e) => {}
                     Err(e) => return Err(e),
+                }
                 }
             } else if s.finish && !s.fin_queued {
                 match session.queue(id, &[], true) {
@@ -262,11 +293,15 @@ fn progress(
                 }
             }
         }
+        if (!s.tx || s.send_dropped) && (!s.rx || s.recv_dropped) && session.retire_stream(id, s.tx, s.rx)? {
+            state.streams.remove(&id);
+            ready.notify_one();
+        }
     }
     Ok(())
 }
 
-fn fail(weak: &Weak<Mutex<State>>, error: CE) {
+fn fail(weak: &Weak<Bridge>, error: CE) {
     if let Some(shared) = weak.upgrade() {
         let mut wakes = Vec::new();
         shared.lock().expect("bridge mutex").fail(error, &mut wakes);
@@ -274,7 +309,8 @@ fn fail(weak: &Weak<Mutex<State>>, error: CE) {
     }
 }
 
-async fn drive(mut session: LabSession, weak: Weak<Mutex<State>>) {
+async fn drive(mut session: LabSession, weak: Weak<Bridge>, ready: Arc<Notify>) {
+    let mut burst = 0;
     loop {
         let mut wakes = Vec::new();
         let phase = session.shutdown_phase();
@@ -284,7 +320,7 @@ async fn drive(mut session: LabSession, weak: Weak<Mutex<State>>) {
                 if let Some(code) = state.close.take() {
                     session.close(code, Instant::now())
                 } else if state.error.is_none() {
-                    progress(&mut session, &mut state, &mut wakes)
+                    progress(&mut session, &mut state, &mut wakes, &ready)
                 } else {
                     Ok(())
                 }
@@ -313,18 +349,24 @@ async fn drive(mut session: LabSession, weak: Weak<Mutex<State>>) {
             fail(&weak, internal());
             return;
         }
-        match session.flush(Instant::now()).await {
-            Ok(_) => {}
+        let sent = match session.flush(Instant::now()).await {
+            Ok(sent) => sent,
             Err(_) => {
                 fail(&weak, internal());
                 return;
             }
-        }
+        };
         if session.shutdown_phase() == ShutdownPhase::Closed {
             fail(&weak, internal());
             return;
         }
-        if session.recv(TICK).await.is_err() {
+        // Bound immediate sends so a full socket cannot starve ingress or other connections.
+        if sent && burst < MAX_BURST { burst += 1; continue; }
+        let wait = if sent { tokio::task::yield_now().await; Duration::ZERO } else {
+            session.deadline().map_or(IDLE_WAIT, |at| at.saturating_duration_since(Instant::now()).min(IDLE_WAIT))
+        };
+        burst = 0;
+        if session.recv_with_wake(wait, Some(&ready)).await.is_err() {
             fail(&weak, internal());
             return;
         }
@@ -341,8 +383,10 @@ impl NativeConnection {
     /// enter this API. This is intentionally not selectable in product config.
     pub fn start(mut session: LabSession) -> Result<(Self, zeroize::Zeroizing<[u8; 32]>), CE> {
         let key = session.take_channel_binding().ok_or_else(internal)?;
-        let shared = Arc::new(Mutex::new(State::default()));
-        tokio::spawn(drive(session, Arc::downgrade(&shared)));
+        session.enable_auto_cids();
+        let ready = Arc::new(Notify::new());
+        let shared = Arc::new(Bridge { state: Mutex::new(State::default()), ready: ready.clone() });
+        tokio::spawn(drive(session, Arc::downgrade(&shared), ready));
         Ok((
             Self {
                 opener: Opener::new(shared),
@@ -385,6 +429,26 @@ impl Clone for Opener {
     }
 }
 
+impl Drop for Opener {
+    fn drop(&mut self) {
+        // If a completed open was never polled by its caller, ownership
+        // never reached a stream handle. Cancel that stream exactly once.
+        for pending in [&mut self.uni, &mut self.bidi] {
+            if let Some(mut pending) = pending.take() {
+                pending.close();
+                if let Ok(Ok(id)) = pending.try_recv() {
+                    if let Some(s) = self.shared.lock().expect("bridge mutex").streams.get_mut(&id) {
+                        s.reset = Some(CANCEL);
+                        s.send_dropped = true;
+                        if s.rx { s.stop = Some(CANCEL); s.recv_dropped = true; }
+                    }
+                }
+            }
+        }
+        self.shared.ready.notify_one();
+    }
+}
+
 impl Opener {
     fn new(shared: Shared) -> Self {
         Self {
@@ -406,6 +470,7 @@ impl Opener {
             }
             let (result, rx) = oneshot::channel();
             state.open.push_back(OpenRequest { bidi, result });
+            self.shared.ready.notify_one();
             *slot = Some(rx);
         }
         match Pin::new(slot.as_mut().expect("pending open")).poll(cx) {
@@ -431,6 +496,7 @@ impl Opener {
                 state.fail(CE::ApplicationClose { error_code: code }, &mut wakes);
             }
         }
+        self.shared.ready.notify_one();
         notify(wakes);
     }
 }
@@ -504,6 +570,7 @@ impl SendSide {
         }
         if !bytes.is_empty() {
             s.outgoing = Some(bytes);
+            self.shared.ready.notify_one();
         }
         Ok(())
     }
@@ -514,6 +581,7 @@ impl SendSide {
             if !s.fin_queued && !s.reset_sent && s.reset.is_none() {
                 s.reset = Some(code);
                 s.outgoing = None;
+                self.shared.ready.notify_one();
             }
         }
     }
@@ -521,6 +589,8 @@ impl SendSide {
 impl Drop for SendSide {
     fn drop(&mut self) {
         self.cancel(CANCEL);
+        if let Some(s) = self.shared.lock().expect("bridge mutex").streams.get_mut(&self.id) { s.send_dropped = true; }
+        self.shared.ready.notify_one();
     }
 }
 
@@ -573,6 +643,7 @@ impl quic::SendStream<Bytes> for SendSide {
             return Poll::Ready(Ok(()));
         }
         s.finish = true;
+        self.shared.ready.notify_one();
         s.send_waker = Some(cx.waker().clone());
         Poll::Pending
     }
@@ -612,6 +683,7 @@ impl RecvSide {
             if !s.eof && s.stop.is_none() {
                 s.stop = Some(code);
                 s.incoming = None;
+                self.shared.ready.notify_one();
             }
         }
     }
@@ -619,6 +691,8 @@ impl RecvSide {
 impl Drop for RecvSide {
     fn drop(&mut self) {
         self.stop(CANCEL);
+        if let Some(s) = self.shared.lock().expect("bridge mutex").streams.get_mut(&self.id) { s.recv_dropped = true; }
+        self.shared.ready.notify_one();
     }
 }
 impl quic::RecvStream for RecvSide {
@@ -635,6 +709,7 @@ impl quic::RecvStream for RecvSide {
             return Poll::Ready(Err(terminated(code)));
         }
         if let Some(data) = s.incoming.take() {
+            self.shared.ready.notify_one();
             return Poll::Ready(Ok(Some(data)));
         }
         if s.eof || s.stop.is_some() {
