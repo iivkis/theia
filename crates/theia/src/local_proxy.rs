@@ -918,9 +918,9 @@ impl Carrier {
     }
     async fn fetch_routing(&self) -> Result<Vec<u8>, ClientError> {
         match self {
-            Self::H2(c) => c.fetch_routing().await,
-            Self::H3(c) => c.fetch_routing().await,
-            Self::Auto(c) => c.fetch_routing().await,
+            Self::H2(c) => Box::pin(c.fetch_routing()).await,
+            Self::H3(c) => Box::pin(c.fetch_routing()).await,
+            Self::Auto(c) => Box::pin(c.fetch_routing()).await,
         }
     }
     async fn resolve_routing(
@@ -1184,7 +1184,7 @@ impl ProxyTunnel {
 }
 
 pub async fn run_file(config_path: &Path) -> Result<(), ClientError> {
-    run_file_inner(config_path, false).await
+    Box::pin(run_file_inner(config_path, false)).await
 }
 
 /// Windows-only, explicitly confirmed user WinINet proxy operation. The
@@ -1192,7 +1192,7 @@ pub async fn run_file(config_path: &Path) -> Result<(), ClientError> {
 /// loopback TCP listeners are bound, never on plain client run or server run.
 #[cfg(windows)]
 pub async fn run_file_with_system_proxy(config_path: &Path) -> Result<(), ClientError> {
-    run_file_inner(config_path, true).await
+    Box::pin(run_file_inner(config_path, true)).await
 }
 
 // The process-level generation owns the exact saved config. Old accepted
@@ -1323,7 +1323,7 @@ impl ClientRuntime {
             )
             .await?
         };
-        client.routing_policy().await?;
+        Box::pin(client.routing_policy()).await?;
         saved_client_bytes(&self.path, digest)?;
         Ok((candidate, client))
     }
@@ -1385,7 +1385,7 @@ async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result
     else {
         return Err(ClientError::Configuration);
     };
-    let (http, socks, client) = prepare_proxy(&document, config_path).await?;
+    let (http, socks, client) = Box::pin(prepare_proxy(&document, config_path)).await?;
     #[cfg(windows)]
     let http_bound = http.local_addr().map_err(|_| ClientError::Io)?;
     #[cfg(any(target_os = "linux", target_os = "windows"))]

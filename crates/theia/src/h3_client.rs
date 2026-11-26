@@ -289,7 +289,7 @@ impl H3Client {
                 .clone();
             let mut parts = self.uri.clone().into_parts();
             parts.path_and_query = Some(
-                (&routes.routing)
+                routes.routing
                     .parse()
                     .map_err(|_| ClientError::Configuration)?,
             );

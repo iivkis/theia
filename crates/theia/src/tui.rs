@@ -841,12 +841,14 @@ impl RoutingPanel {
         let _worker = std::thread::spawn(move || {
             let work = || -> Result<(String, crate::routing::geodata::Manifest), String> {
                 if !directory.exists() {
-                    let mut builder = std::fs::DirBuilder::new();
+                    let builder = std::fs::DirBuilder::new();
                     #[cfg(unix)]
-                    {
+                    let builder = {
                         use std::os::unix::fs::DirBuilderExt;
+                        let mut builder = builder;
                         builder.mode(0o700);
-                    }
+                        builder
+                    };
                     builder
                         .create(&directory)
                         .map_err(|_| "Не удалось создать каталог баз.".to_owned())?;
