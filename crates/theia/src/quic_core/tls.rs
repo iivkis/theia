@@ -451,20 +451,31 @@ mod tests {
         assert_eq!(x.peer_addr(), a_addr);
         assert_eq!(y.peer_addr(), b_addr);
         assert!(x.handshake_confirmed() && y.handshake_confirmed());
-        for (c, data) in [(&mut a, b"alpha".as_slice()), (&mut b, b"bravo".as_slice())] {
+        for (c, s, expected) in [
+            (&mut a, &mut x, b"alpha".as_slice()),
+            (&mut b, &mut y, b"bravo".as_slice()),
+        ] {
+            // TLS completion is no longer conditional on the final Handshake
+            // ACK. Drive HANDSHAKE_DONE before asserting application delivery.
+            for _ in 0..20 {
+                s.flush(Instant::now()).await.unwrap();
+                c.recv(Duration::from_millis(50)).await.unwrap();
+                if c.handshake_confirmed() { break; }
+            }
+            assert!(c.handshake_confirmed());
             let id = c.open_uni().unwrap();
             assert_eq!(id, 2);
-            c.queue(id, data, true).unwrap();
-            assert!(c.flush(Instant::now()).await.unwrap());
-        }
-        for (s, expected) in [(&mut x, b"alpha".as_slice()), (&mut y, b"bravo".as_slice())] {
-            for _ in 0..8 {
-                if s.recv(Duration::from_millis(100)).await.unwrap() {
-                    break;
+            c.queue(id, expected, true).unwrap();
+            let mut out = [0; 5];
+            let mut read = 0;
+            for _ in 0..40 {
+                c.flush(Instant::now()).await.unwrap();
+                if s.recv(Duration::from_millis(50)).await.unwrap() {
+                    if let Ok(n) = s.read(id, &mut out[read..]) { read += n; }
+                    if read == out.len() { break; }
                 }
             }
-            let mut out = [0; 5];
-            assert_eq!(s.read(2, &mut out).unwrap(), 5);
+            assert_eq!(read, 5);
             assert_eq!(out.as_slice(), expected);
         }
     }

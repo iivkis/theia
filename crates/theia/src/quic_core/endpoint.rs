@@ -151,6 +151,7 @@ impl LabSession {
         session.peer_cid_limit = peer_limits.active_cid_limit.min(8) as usize;
         session.send = SendFlow::from_peer(server, peer_limits, MAX_STREAMS).map_err(Error::Send)?;
         session.scheduler = Scheduler::with_bbr(Instant::now());
+        session.scheduler.application_ack_timing(peer_limits.ack_delay_exponent, peer_limits.max_ack_delay_ms, server);
         session.idle = Idle::new(Instant::now(), idle_timeout);
         session.binding = Some(binding);
         session.handshake_tail = tail;
@@ -935,6 +936,7 @@ impl LabSession {
                         && matches!(&self.protection, Some(Protection::Rotating { .. })) =>
                 {
                     self.confirmed = true;
+                    self.scheduler.confirm_handshake();
                     self.handshake_tail = None;
                 }
                 Frame::Stream {

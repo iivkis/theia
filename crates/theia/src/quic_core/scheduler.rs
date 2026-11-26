@@ -36,6 +36,9 @@ pub struct Scheduler {
     window: Window,
     bbr: Option<Bbr>,
     rtt: Rtt,
+    ack_delay_exponent: u32,
+    max_ack_delay: Duration,
+    confirmed: bool,
     frames: BTreeMap<u64, Pending>,
     queue: VecDeque<u64>,
     aliases: BTreeMap<u64, u64>,
@@ -53,6 +56,9 @@ impl Default for Scheduler {
             window: Window::new(MTU).expect("valid MTU"),
             bbr: None,
             rtt: Rtt::default(),
+            ack_delay_exponent: 0,
+            max_ack_delay: Duration::ZERO,
+            confirmed: false,
             frames: BTreeMap::new(),
             queue: VecDeque::new(),
             aliases: BTreeMap::new(),
@@ -306,6 +312,21 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Only application-space schedulers receive negotiated ACK timing.
+    pub(crate) fn application_ack_timing(&mut self, exponent: u64, max_delay_ms: u64, confirmed: bool) {
+        self.ack_delay_exponent = exponent.min(20) as u32;
+        self.max_ack_delay = Duration::from_millis(max_delay_ms.min((1 << 14) - 1));
+        self.confirmed = confirmed;
+    }
+
+    pub(crate) fn confirm_handshake(&mut self) {
+        self.confirmed = true;
+    }
+
+    fn ack_delay_limit(&self) -> Duration {
+        if self.confirmed { self.max_ack_delay } else { Duration::ZERO }
+    }
+
     pub fn acknowledge(&mut self, ack: &Ack, now: Instant) -> Result<(), Error> {
         let outcome = self
             .ledger
@@ -329,8 +350,9 @@ impl Scheduler {
             self.pto_count = 0;
         }
         if let Some(sample) = outcome.rtt_sample {
-            self.rtt
-                .update(sample, Duration::ZERO, Duration::ZERO, true);
+            let delay = Duration::from_micros(ack.delay.saturating_mul(1u64 << self.ack_delay_exponent));
+            let limit = self.ack_delay_limit();
+            self.rtt.update(sample, delay, limit, self.confirmed);
         }
         self.apply_loss(outcome, now)
     }
@@ -390,7 +412,7 @@ impl Scheduler {
     }
 
     pub fn base_pto(&self) -> Duration {
-        self.rtt.pto(Duration::ZERO, 0)
+        self.rtt.pto(self.ack_delay_limit(), 0)
     }
 
     fn pto_deadline(&self) -> Option<Instant> {
@@ -398,7 +420,7 @@ impl Scheduler {
             return None;
         }
         self.last_eliciting?
-            .checked_add(self.rtt.pto(Duration::ZERO, self.pto_count))
+            .checked_add(self.rtt.pto(self.ack_delay_limit(), self.pto_count))
     }
 
     pub fn deadline(&self) -> Option<Instant> {
@@ -449,6 +471,24 @@ mod tests {
             ranges: vec![Range { first: n, last: n }],
             ecn: None,
         }
+    }
+
+    #[test]
+    fn negotiated_ack_delay_applies_only_after_confirmation() {
+        let now = Instant::now();
+        let mut s = Scheduler::default();
+        let initial_pto = s.base_pto();
+        s.application_ack_timing(3, 25, false);
+        assert_eq!(s.base_pto(), initial_pto);
+        s.confirm_handshake();
+        assert_eq!(s.base_pto(), initial_pto + Duration::from_millis(25));
+        s.rtt.update(Duration::from_millis(100), Duration::ZERO, Duration::ZERO, true);
+        s.enqueue(vec![1]).unwrap();
+        s.record(0, 100, Some((0, false)), now).unwrap();
+        let mut a = ack(0);
+        a.delay = 2500; // 20ms at exponent 3
+        s.acknowledge(&a, now + Duration::from_millis(150)).unwrap();
+        assert_eq!(s.rtt.smoothed(), Duration::from_micros(103750));
     }
 
     #[test]
