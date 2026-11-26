@@ -191,7 +191,7 @@ fn header(
 fn parse_header(
     packet: &[u8],
     version: Version,
-    local: &[u8; CID_LEN],
+    local: &[u8],
     remote: &[u8],
     expected_token: &[u8],
 ) -> Option<(usize, usize)> {
@@ -203,15 +203,16 @@ fn parse_header(
     } else {
         return None;
     };
+    let end = 6 + local.len();
     if packet.get(1..5)? != version.wire().to_be_bytes()
-        || *packet.get(5)? != CID_LEN as u8
-        || packet.get(6..14)? != local
-        || usize::from(*packet.get(14)?) != remote.len()
-        || packet.get(15..15 + remote.len())? != remote
+        || usize::from(*packet.get(5)?) != local.len()
+        || packet.get(6..end)? != local
+        || usize::from(*packet.get(end)?) != remote.len()
+        || packet.get(end + 1..end + 1 + remote.len())? != remote
     {
         return None;
     }
-    let mut at = 15 + remote.len();
+    let mut at = end + 1 + remote.len();
     if index == 0 {
         let len = usize::try_from(varint(packet, &mut at)?).ok()?;
         let end = at.checked_add(len)?;
@@ -769,10 +770,16 @@ impl Handshake {
             None
         };
         let remote = proposed.unwrap_or(self.remote.as_slice());
-        let Some((index, at)) = parse_header(packet, self.version, &self.local, remote, token)
-        else {
-            return Ok(());
-        };
+        let header = parse_header(packet, self.version, &self.local, remote, token)
+            .or_else(|| {
+                // REALITY preadmission does not validate the path and does
+                // not issue Retry. Original DCID is an Initial-only alias.
+                if self.server && self.retry.is_none() {
+                    parse_header(packet, self.version, &self.original, remote, token)
+                        .filter(|(index, _)| *index == 0)
+                } else { None }
+            });
+        let Some((index, at)) = header else { return Ok(()); };
         let Some(epoch) = self.epochs[index].as_mut() else {
             return Ok(());
         };
@@ -1050,7 +1057,7 @@ pub async fn accept_with_congestion(
     tls: Arc<ServerConfig>,
     congestion: Congestion,
 ) -> Result<LabSession, Error> {
-    let (socket, peer, binding, token, initial_reset, versions) = candidate.into_parts();
+    let (socket, peer, binding, token, initial_reset, versions, retry_validated) = candidate.into_parts();
     let original = binding.original;
     let remote = binding.client;
     if !(8..=20).contains(&original.len())
@@ -1070,7 +1077,7 @@ pub async fn accept_with_congestion(
             local: binding.retry,
             remote,
             original,
-            retry: Some(binding.retry.to_vec()),
+            retry: retry_validated.then(|| binding.retry.to_vec()),
             initial_reset: Some(initial_reset),
             token,
             versions,

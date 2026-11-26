@@ -43,7 +43,7 @@ pub(crate) enum RouteCommand {
 const MTU: usize = super::mtu::MAX_UDP_PAYLOAD;
 const MAX_CONNECTIONS: usize = 128;
 const MAILBOX: usize = 16;
-type Datagram = (Vec<u8>, SocketAddr, Mark);
+pub(crate) type Datagram = (Vec<u8>, SocketAddr, Mark);
 
 pub(crate) enum SessionIo {
     Direct {
@@ -216,9 +216,17 @@ pub struct Candidate {
     token: Vec<u8>,
     initial_reset: [u8; 16],
     versions: VersionPolicy,
+    retry_validated: bool,
 }
 
 impl Candidate {
+    pub(crate) fn admitted(
+        io: SessionIo, peer: SocketAddr, binding: Binding,
+        initial_reset: [u8; 16], versions: VersionPolicy,
+    ) -> Self {
+        Self { io, peer, binding, token: Vec::new(), initial_reset, versions, retry_validated: false }
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -228,6 +236,7 @@ impl Candidate {
         Vec<u8>,
         [u8; 16],
         VersionPolicy,
+        bool,
     ) {
         (
             self.io,
@@ -236,6 +245,7 @@ impl Candidate {
             self.token,
             self.initial_reset,
             self.versions,
+            self.retry_validated,
         )
     }
 }
@@ -418,7 +428,7 @@ async fn run(
                             let initial_reset = ingress.initial_reset(owner, binding.retry).map_err(|_| io::ErrorKind::InvalidData)?;
                             routes.insert(owner, (local, tx));
                             permit.send(Candidate { io: SessionIo::Routed { socket: socket.clone(), local, scope, options, incoming, owner, commands: commands.clone() },
-                                peer, binding, token, initial_reset, versions: versions.clone() });
+                                peer, binding, token, initial_reset, versions: versions.clone(), retry_validated: true });
                         } else {
                             ingress.close(owner, now).map_err(|_| io::ErrorKind::InvalidData)?;
                         }

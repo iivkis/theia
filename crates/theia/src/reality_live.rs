@@ -23,7 +23,7 @@ pub(crate) struct Route {
     reference: usize,
     pub(crate) context: Arc<ServerContext>,
     pub(crate) tcp: TlsAcceptor,
-    pub(crate) quic: Option<Arc<quinn::ServerConfig>>,
+    pub(crate) quic: Option<Arc<rustls::ServerConfig>>,
 }
 impl Route {
     fn material(&self) -> &PublishedIdentity {
@@ -142,15 +142,7 @@ impl Generation {
                         index,
                     )
                     .map_err(|_| ServerError::Tls)?;
-                    let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
-                        .map_err(|_| ServerError::Tls)?;
-                    let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-                    cfg.transport_config(crate::quic_transport::transport_config());
-                    // The native endpoint authenticates packets and validates
-                    // new physical paths itself; the passive relay never
-                    // grants equivalent validation or amplification credit.
-                    cfg.migration(true);
-                    Some(Arc::new(cfg))
+                    Some(Arc::new(tls))
                 } else {
                     None
                 };
@@ -184,7 +176,7 @@ impl Generation {
     pub(crate) fn relay_value(&self, now: u64) -> Option<&Verified> {
         relay_value(&self.lease, now)
     }
-    pub(crate) fn default_quic(&self) -> Option<quinn::ServerConfig> {
+    pub(crate) fn default_quic(&self) -> Option<rustls::ServerConfig> {
         self.routes
             .iter()
             .find_map(|r| r.quic.as_ref().map(|cfg| (**cfg).clone()))

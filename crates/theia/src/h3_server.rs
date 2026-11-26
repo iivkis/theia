@@ -446,7 +446,7 @@ where
     Ok(())
 }
 
-async fn run_native_session(
+pub(crate) async fn run_native_session(
     session: crate::quic_core::endpoint::LabSession,
     context: Arc<ServerContext>,
     phase: watch::Receiver<GenerationPhase>,
