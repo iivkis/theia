@@ -4091,6 +4091,76 @@ async fn run_document_with_config(
     }
 }
 
+async fn relay_udp(
+    socket: tokio::net::UdpSocket,
+    incoming: &mut h2::RecvStream,
+    outgoing: &mut h2::SendStream<Bytes>,
+    mut decoder: IncomingFrames,
+    state: Session,
+) -> Result<(), ServerError> {
+    let traffic = crate::traffic::enter_udp(crate::Role::Server, false, false);
+    let mut rx_state = state.clone();
+    let mut tx_state = state;
+    let activity = crate::udp_relay::Activity::new();
+    let writing = std::sync::atomic::AtomicBool::new(false);
+    let upload = async {
+        loop {
+            let frame = decoder.next(incoming).await?.ok_or(ServerError::Protocol)?;
+            rx_state
+                .apply(Direction::Receive, &frame)
+                .map_err(|_| ServerError::Protocol)?;
+            match frame {
+                Frame::Datagram(data) => {
+                    crate::udp_relay::send_datagram(&socket, &data)
+                        .await
+                        .map_err(|_| ServerError::Io)?;
+                    traffic.upload(data.len());
+                    activity.touch();
+                }
+                Frame::Padding(_) => tokio::task::yield_now().await,
+                Frame::Fin => return Ok::<(), ServerError>(()),
+                _ => return Err(ServerError::Protocol),
+            }
+        }
+    };
+    let download = async {
+        let mut buf = vec![0; crate::protocol::MAX_DATAGRAM + 1];
+        loop {
+            let n = socket.recv(&mut buf).await.map_err(|_| ServerError::Io)?;
+            if n > crate::protocol::MAX_DATAGRAM {
+                continue;
+            }
+            let frame = Frame::Datagram(buf[..n].to_vec());
+            tx_state
+                .apply(Direction::Send, &frame)
+                .map_err(|_| ServerError::Protocol)?;
+            writing.store(true, std::sync::atomic::Ordering::Relaxed);
+            timeout(FRAME_IDLE_TIMEOUT, send_frame(outgoing, &frame))
+                .await
+                .map_err(|_| ServerError::TimedOut)??;
+            writing.store(false, std::sync::atomic::Ordering::Relaxed);
+            traffic.download(n);
+            activity.touch();
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), ServerError>(())
+    };
+    // UDP FIN terminates the association (no TCP-style half close).
+    let result = tokio::select! { result=upload=>result, result=download=>result, ()=activity.expire()=>Ok(()) };
+    if writing.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(ServerError::TimedOut);
+    }
+    result?;
+    let frame = Frame::Fin;
+    tx_state
+        .apply(Direction::Send, &frame)
+        .map_err(|_| ServerError::Protocol)?;
+    timeout(FRAME_IDLE_TIMEOUT, send_frame(outgoing, &frame))
+        .await
+        .map_err(|_| ServerError::TimedOut)??;
+    Ok(())
+}
+
 #[cfg(test)]
 mod hardening_tests {
     use super::*;
@@ -5204,74 +5274,4 @@ mod hardening_tests {
         // dropping the test-owned group cancels every listener task.
         running.tasks.shutdown().await;
     }
-}
-
-async fn relay_udp(
-    socket: tokio::net::UdpSocket,
-    incoming: &mut h2::RecvStream,
-    outgoing: &mut h2::SendStream<Bytes>,
-    mut decoder: IncomingFrames,
-    state: Session,
-) -> Result<(), ServerError> {
-    let traffic = crate::traffic::enter_udp(crate::Role::Server, false, false);
-    let mut rx_state = state.clone();
-    let mut tx_state = state;
-    let activity = crate::udp_relay::Activity::new();
-    let writing = std::sync::atomic::AtomicBool::new(false);
-    let upload = async {
-        loop {
-            let frame = decoder.next(incoming).await?.ok_or(ServerError::Protocol)?;
-            rx_state
-                .apply(Direction::Receive, &frame)
-                .map_err(|_| ServerError::Protocol)?;
-            match frame {
-                Frame::Datagram(data) => {
-                    crate::udp_relay::send_datagram(&socket, &data)
-                        .await
-                        .map_err(|_| ServerError::Io)?;
-                    traffic.upload(data.len());
-                    activity.touch();
-                }
-                Frame::Padding(_) => tokio::task::yield_now().await,
-                Frame::Fin => return Ok::<(), ServerError>(()),
-                _ => return Err(ServerError::Protocol),
-            }
-        }
-    };
-    let download = async {
-        let mut buf = vec![0; crate::protocol::MAX_DATAGRAM + 1];
-        loop {
-            let n = socket.recv(&mut buf).await.map_err(|_| ServerError::Io)?;
-            if n > crate::protocol::MAX_DATAGRAM {
-                continue;
-            }
-            let frame = Frame::Datagram(buf[..n].to_vec());
-            tx_state
-                .apply(Direction::Send, &frame)
-                .map_err(|_| ServerError::Protocol)?;
-            writing.store(true, std::sync::atomic::Ordering::Relaxed);
-            timeout(FRAME_IDLE_TIMEOUT, send_frame(outgoing, &frame))
-                .await
-                .map_err(|_| ServerError::TimedOut)??;
-            writing.store(false, std::sync::atomic::Ordering::Relaxed);
-            traffic.download(n);
-            activity.touch();
-        }
-        #[allow(unreachable_code)]
-        Ok::<(), ServerError>(())
-    };
-    // UDP FIN terminates the association (no TCP-style half close).
-    let result = tokio::select! { result=upload=>result, result=download=>result, ()=activity.expire()=>Ok(()) };
-    if writing.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(ServerError::TimedOut);
-    }
-    result?;
-    let frame = Frame::Fin;
-    tx_state
-        .apply(Direction::Send, &frame)
-        .map_err(|_| ServerError::Protocol)?;
-    timeout(FRAME_IDLE_TIMEOUT, send_frame(outgoing, &frame))
-        .await
-        .map_err(|_| ServerError::TimedOut)??;
-    Ok(())
 }

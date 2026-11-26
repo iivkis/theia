@@ -228,6 +228,11 @@ impl Tunnel {
 }
 
 #[cfg(test)]
+pub(crate) fn test_hello() -> Vec<u8> {
+    tls::fixture("example.org")
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[tokio::test]
@@ -292,9 +297,4 @@ mod tests {
         .await
         .unwrap();
     }
-}
-
-#[cfg(test)]
-pub(crate) fn test_hello() -> Vec<u8> {
-    tls::fixture("example.org")
 }

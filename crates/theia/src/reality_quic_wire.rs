@@ -484,6 +484,19 @@ impl Flight {
 }
 
 #[cfg(test)]
+pub(crate) fn test_initial(version: u32, hello: &[u8]) -> Vec<u8> {
+    assert!(hello.len() < 1024);
+    let mut frames = vec![6, 0];
+    if hello.len() < 64 {
+        frames.push(hello.len() as u8);
+    } else {
+        frames.extend(((hello.len() as u16) | 0x4000).to_be_bytes());
+    }
+    frames.extend(hello);
+    tests::initial_packet(0, &frames, version)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     fn hex(s: &str) -> Vec<u8> {
@@ -649,17 +662,4 @@ mod tests {
             Inspection::Invalid
         ));
     }
-}
-
-#[cfg(test)]
-pub(crate) fn test_initial(version: u32, hello: &[u8]) -> Vec<u8> {
-    assert!(hello.len() < 1024);
-    let mut frames = vec![6, 0];
-    if hello.len() < 64 {
-        frames.push(hello.len() as u8);
-    } else {
-        frames.extend(((hello.len() as u16) | 0x4000).to_be_bytes());
-    }
-    frames.extend(hello);
-    tests::initial_packet(0, &frames, version)
 }

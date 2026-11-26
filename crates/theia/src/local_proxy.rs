@@ -2169,6 +2169,265 @@ async fn handle(
 }
 
 #[cfg(test)]
+async fn socks_target(socket: &mut TcpStream) -> Result<(Address, u16), ClientError> {
+    match socks_request(socket).await? {
+        SocksRequest::Connect(a, p) => Ok((a, p)),
+        _ => Err(ClientError::Protocol),
+    }
+}
+
+async fn udp_association(
+    mut control: TcpStream,
+    client: &ProxyClient,
+    requested: Address,
+    port: u16,
+) -> Result<(), ClientError> {
+    use crate::udp_relay::{self, MAX_FLOWS, QUEUE};
+    use tokio::sync::mpsc;
+    let peer = control.peer_addr().map_err(|_| ClientError::Io)?;
+    let local = control.local_addr().map_err(|_| ClientError::Io)?;
+    if !peer.ip().is_loopback()
+        || !local.ip().is_loopback()
+        || !udp_relay::valid_associate(&requested, peer.ip())
+    {
+        socks_reply(&mut control, 2).await?;
+        return Err(ClientError::Open(ErrorCode::PolicyDenied));
+    }
+    let socket = Arc::new(
+        tokio::net::UdpSocket::bind(SocketAddr::new(local.ip(), 0))
+            .await
+            .map_err(|_| ClientError::Io)?,
+    );
+    let bound = socket.local_addr().map_err(|_| ClientError::Io)?;
+    timeout(
+        REPLY_TIMEOUT,
+        control.write_all(&udp_relay::associate_reply(bound)),
+    )
+    .await
+    .map_err(|_| ClientError::Timeout)?
+    .map_err(|_| ClientError::Io)?;
+    let mut pinned = if port == 0 {
+        None
+    } else {
+        Some(SocketAddr::new(peer.ip(), port))
+    };
+    type Observer = Arc<std::sync::Mutex<crate::routing::dpi::udp::Observer>>;
+    let mut flows =
+        std::collections::HashMap::<(Address, u16), (mpsc::Sender<Vec<u8>>, Observer)>::new();
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut buf = vec![0; 65536];
+    let mut control_byte = [0; 1];
+    loop {
+        tokio::select! {
+            result=control.read(&mut control_byte)=>{
+                return match result { Ok(0)=>Ok(()), Ok(_)=>Err(ClientError::Protocol), Err(_)=>Err(ClientError::Io) };
+            }
+            _=tasks.join_next(), if !tasks.is_empty()=>{ flows.retain(|_,(tx,_)|!tx.is_closed()); }
+            result=socket.recv_from(&mut buf)=>{
+                let (n,source)=result.map_err(|_|ClientError::Io)?;
+                if source.ip()!=peer.ip() || pinned.is_some_and(|old|old!=source) { continue; }
+                let Some((address,port,data))=udp_relay::parse_socks(&buf[..n]) else { continue; };
+                if pinned.is_none() { pinned=Some(source); }
+                let key=(address,port);
+                if let Some((tx,observer))=flows.get(&key) {
+                    // Full queue drops the datagram, never replays it.
+                    if !tx.is_closed() {
+                        if tx.try_send(data.to_vec()).is_ok(){observer.lock().unwrap_or_else(|e|e.into_inner()).outgoing(data);}
+                        continue;
+                    }
+                }
+                flows.retain(|_,(tx,_)|!tx.is_closed());
+                if tasks.len()>=MAX_FLOWS { continue; }
+                let (tx,rx)=mpsc::channel(QUEUE);
+                let _=tx.try_send(data.to_vec());
+                let observer=Arc::new(std::sync::Mutex::new(crate::routing::dpi::udp::Observer::default()));
+                observer.lock().unwrap_or_else(|e|e.into_inner()).outgoing(data);
+                flows.insert(key.clone(),(tx,observer.clone()));
+                let socket=socket.clone();
+                let proxy=(*client).clone();
+                tasks.spawn(async move {
+                    let (address,port)=key;
+                    let tunnel=proxy.open_udp(address.clone(),port).await?;
+                    let (down_tx,mut down_rx)=mpsc::channel(QUEUE);
+                    let relay=tunnel.relay(rx,down_tx);
+                    let deliver=async {
+                        while let Some(data)=down_rx.recv().await {
+                            observer.lock().unwrap_or_else(|e|e.into_inner()).incoming(&data);
+                            let Some(packet)=udp_relay::encode_socks(&address,port,&data) else { continue; };
+                            let _=socket.send_to(&packet,source).await.map_err(|_|ClientError::Io)?;
+                        }
+                        Ok::<(),ClientError>(())
+                    };
+                    tokio::select! { result=relay=>result, result=deliver=>result }
+                });
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+async fn udp_socks_fixture(client: &ProxyClient) {
+    use crate::udp_relay::{encode_socks, parse_socks};
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = target.local_addr().unwrap().port();
+    let app = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let app_port = app.local_addr().unwrap().port();
+    let (mut control, local) = selector_tests::paired().await;
+    let client = (*client).clone();
+    assert!(matches!(
+        client
+            .open_udp(Address::Dns("blocked.invalid".into()), 443)
+            .await,
+        Err(ClientError::Open(ErrorCode::PolicyDenied))
+    ));
+    let task = tokio::spawn(async move { handle(local, false, &client, 1).await });
+    let mut greeting = vec![5, 1, 0, 5, 3, 0, 1, 127, 0, 0, 1];
+    greeting.extend(app_port.to_be_bytes());
+    control.write_all(&greeting).await.unwrap();
+    let mut reply = [0; 12];
+    control.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply[..6], &[5, 0, 5, 0, 0, 1]);
+    let relay = SocketAddr::from((
+        [reply[6], reply[7], reply[8], reply[9]],
+        u16::from_be_bytes([reply[10], reply[11]]),
+    ));
+    let address = Address::V4([127, 0, 0, 1]);
+    let attacker = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    attacker
+        .send_to(
+            &encode_socks(&address, port, b"wrong source").unwrap(),
+            relay,
+        )
+        .await
+        .unwrap();
+    let mut buf = vec![0; 65536];
+    assert!(
+        timeout(Duration::from_millis(40), target.recv_from(&mut buf))
+            .await
+            .is_err()
+    );
+    let mut stun = vec![0, 1, 0, 0, 0x21, 0x12, 0xa4, 0x42];
+    stun.extend([7; 12]);
+    let hello = crate::routing::dpi::test_hello();
+    let quic = crate::reality_quic_wire::test_initial(crate::reality_quic_wire::V1, &hello[5..]);
+    for (index, data) in [stun, quic, vec![], b"last".to_vec()]
+        .into_iter()
+        .enumerate()
+    {
+        let packet = encode_socks(&address, port, &data).unwrap();
+        app.send_to(&packet, relay).await.unwrap();
+        let (n, peer) = timeout(Duration::from_secs(3), target.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..n], data);
+        let response = if index == 0 {
+            // Minimal Binding success with the observed VPS source.
+            let mut response = data.clone();
+            response[0] = 1;
+            response[3] = 12;
+            response.extend([0, 0x20, 0, 8, 0, 1]);
+            response.extend((peer.port() ^ 0x2112).to_be_bytes());
+            let IpAddr::V4(ip) = peer.ip() else {
+                panic!("fixture IPv4")
+            };
+            response.extend(
+                ip.octets()
+                    .into_iter()
+                    .zip([0x21, 0x12, 0xa4, 0x42])
+                    .map(|(a, b)| a ^ b),
+            );
+            response
+        } else {
+            data
+        };
+        target.send_to(&response, peer).await.unwrap();
+        let (n, source) = timeout(Duration::from_secs(3), app.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(source, relay);
+        assert_eq!(
+            parse_socks(&buf[..n]),
+            Some((address.clone(), port, response.as_slice()))
+        );
+    }
+    udp_quic_fixture(app, relay).await;
+    control.shutdown().await.unwrap();
+    timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[cfg(test)]
+async fn udp_quic_fixture(app: tokio::net::UdpSocket, relay: SocketAddr) {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let der = cert.cert.der().clone();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(der.clone()).unwrap();
+    let origin = crate::quic_transport::server_endpoint(
+        "127.0.0.1:0".parse().unwrap(),
+        vec![der],
+        rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
+    )
+    .unwrap();
+    let origin_port = origin.local_addr().unwrap().port();
+    let endpoint =
+        crate::quic_transport::client_endpoint("127.0.0.1:0".parse().unwrap(), roots).unwrap();
+    let client_addr = endpoint.local_addr().unwrap();
+    let bridge_addr = app.local_addr().unwrap();
+    let bridge = tokio::spawn(async move {
+        let target = Address::V4([127, 0, 0, 1]);
+        let mut buf = vec![0; 65536];
+        loop {
+            let (n, source) = app.recv_from(&mut buf).await.unwrap();
+            if source == client_addr {
+                if let Some(wire) = crate::udp_relay::encode_socks(&target, origin_port, &buf[..n])
+                {
+                    app.send_to(&wire, relay).await.unwrap();
+                }
+            } else if source == relay {
+                if let Some((address, port, data)) = crate::udp_relay::parse_socks(&buf[..n]) {
+                    if address == target && port == origin_port {
+                        app.send_to(data, client_addr).await.unwrap();
+                    }
+                }
+            }
+        }
+    });
+    let server = async {
+        let connection = crate::quic_transport::accept(origin.accept().await.unwrap())
+            .await
+            .unwrap();
+        let (mut tx, mut rx) = connection.accept_bi().await.unwrap();
+        let bytes = rx.read_to_end(64).await.unwrap();
+        assert_eq!(bytes, b"nested quic");
+        tx.write_all(&bytes).await.unwrap();
+        tx.finish().unwrap();
+        connection
+    };
+    let client = async {
+        let connection = crate::quic_transport::connect(&endpoint, bridge_addr, "localhost")
+            .await
+            .unwrap();
+        let (mut tx, mut rx) = connection.open_bi().await.unwrap();
+        tx.write_all(b"nested quic").await.unwrap();
+        tx.finish().unwrap();
+        assert_eq!(rx.read_to_end(64).await.unwrap(), b"nested quic");
+        connection
+    };
+    let (_server, _client) = timeout(Duration::from_secs(10), async {
+        tokio::join!(server, client)
+    })
+    .await
+    .unwrap();
+    bridge.abort();
+    let _ = bridge.await;
+}
+
+#[cfg(test)]
 mod selector_tests {
     use super::*;
 
@@ -3483,263 +3742,4 @@ mod selector_tests {
         h2.abort();
         h3.abort();
     }
-}
-
-#[cfg(test)]
-async fn socks_target(socket: &mut TcpStream) -> Result<(Address, u16), ClientError> {
-    match socks_request(socket).await? {
-        SocksRequest::Connect(a, p) => Ok((a, p)),
-        _ => Err(ClientError::Protocol),
-    }
-}
-
-async fn udp_association(
-    mut control: TcpStream,
-    client: &ProxyClient,
-    requested: Address,
-    port: u16,
-) -> Result<(), ClientError> {
-    use crate::udp_relay::{self, MAX_FLOWS, QUEUE};
-    use tokio::sync::mpsc;
-    let peer = control.peer_addr().map_err(|_| ClientError::Io)?;
-    let local = control.local_addr().map_err(|_| ClientError::Io)?;
-    if !peer.ip().is_loopback()
-        || !local.ip().is_loopback()
-        || !udp_relay::valid_associate(&requested, peer.ip())
-    {
-        socks_reply(&mut control, 2).await?;
-        return Err(ClientError::Open(ErrorCode::PolicyDenied));
-    }
-    let socket = Arc::new(
-        tokio::net::UdpSocket::bind(SocketAddr::new(local.ip(), 0))
-            .await
-            .map_err(|_| ClientError::Io)?,
-    );
-    let bound = socket.local_addr().map_err(|_| ClientError::Io)?;
-    timeout(
-        REPLY_TIMEOUT,
-        control.write_all(&udp_relay::associate_reply(bound)),
-    )
-    .await
-    .map_err(|_| ClientError::Timeout)?
-    .map_err(|_| ClientError::Io)?;
-    let mut pinned = if port == 0 {
-        None
-    } else {
-        Some(SocketAddr::new(peer.ip(), port))
-    };
-    type Observer = Arc<std::sync::Mutex<crate::routing::dpi::udp::Observer>>;
-    let mut flows =
-        std::collections::HashMap::<(Address, u16), (mpsc::Sender<Vec<u8>>, Observer)>::new();
-    let mut tasks = tokio::task::JoinSet::new();
-    let mut buf = vec![0; 65536];
-    let mut control_byte = [0; 1];
-    loop {
-        tokio::select! {
-            result=control.read(&mut control_byte)=>{
-                return match result { Ok(0)=>Ok(()), Ok(_)=>Err(ClientError::Protocol), Err(_)=>Err(ClientError::Io) };
-            }
-            _=tasks.join_next(), if !tasks.is_empty()=>{ flows.retain(|_,(tx,_)|!tx.is_closed()); }
-            result=socket.recv_from(&mut buf)=>{
-                let (n,source)=result.map_err(|_|ClientError::Io)?;
-                if source.ip()!=peer.ip() || pinned.is_some_and(|old|old!=source) { continue; }
-                let Some((address,port,data))=udp_relay::parse_socks(&buf[..n]) else { continue; };
-                if pinned.is_none() { pinned=Some(source); }
-                let key=(address,port);
-                if let Some((tx,observer))=flows.get(&key) {
-                    // Full queue drops the datagram, never replays it.
-                    if !tx.is_closed() {
-                        if tx.try_send(data.to_vec()).is_ok(){observer.lock().unwrap_or_else(|e|e.into_inner()).outgoing(data);}
-                        continue;
-                    }
-                }
-                flows.retain(|_,(tx,_)|!tx.is_closed());
-                if tasks.len()>=MAX_FLOWS { continue; }
-                let (tx,rx)=mpsc::channel(QUEUE);
-                let _=tx.try_send(data.to_vec());
-                let observer=Arc::new(std::sync::Mutex::new(crate::routing::dpi::udp::Observer::default()));
-                observer.lock().unwrap_or_else(|e|e.into_inner()).outgoing(data);
-                flows.insert(key.clone(),(tx,observer.clone()));
-                let socket=socket.clone();
-                let proxy=(*client).clone();
-                tasks.spawn(async move {
-                    let (address,port)=key;
-                    let tunnel=proxy.open_udp(address.clone(),port).await?;
-                    let (down_tx,mut down_rx)=mpsc::channel(QUEUE);
-                    let relay=tunnel.relay(rx,down_tx);
-                    let deliver=async {
-                        while let Some(data)=down_rx.recv().await {
-                            observer.lock().unwrap_or_else(|e|e.into_inner()).incoming(&data);
-                            let Some(packet)=udp_relay::encode_socks(&address,port,&data) else { continue; };
-                            let _=socket.send_to(&packet,source).await.map_err(|_|ClientError::Io)?;
-                        }
-                        Ok::<(),ClientError>(())
-                    };
-                    tokio::select! { result=relay=>result, result=deliver=>result }
-                });
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-async fn udp_socks_fixture(client: &ProxyClient) {
-    use crate::udp_relay::{encode_socks, parse_socks};
-    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let port = target.local_addr().unwrap().port();
-    let app = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let app_port = app.local_addr().unwrap().port();
-    let (mut control, local) = selector_tests::paired().await;
-    let client = (*client).clone();
-    assert!(matches!(
-        client
-            .open_udp(Address::Dns("blocked.invalid".into()), 443)
-            .await,
-        Err(ClientError::Open(ErrorCode::PolicyDenied))
-    ));
-    let task = tokio::spawn(async move { handle(local, false, &client, 1).await });
-    let mut greeting = vec![5, 1, 0, 5, 3, 0, 1, 127, 0, 0, 1];
-    greeting.extend(app_port.to_be_bytes());
-    control.write_all(&greeting).await.unwrap();
-    let mut reply = [0; 12];
-    control.read_exact(&mut reply).await.unwrap();
-    assert_eq!(&reply[..6], &[5, 0, 5, 0, 0, 1]);
-    let relay = SocketAddr::from((
-        [reply[6], reply[7], reply[8], reply[9]],
-        u16::from_be_bytes([reply[10], reply[11]]),
-    ));
-    let address = Address::V4([127, 0, 0, 1]);
-    let attacker = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    attacker
-        .send_to(
-            &encode_socks(&address, port, b"wrong source").unwrap(),
-            relay,
-        )
-        .await
-        .unwrap();
-    let mut buf = vec![0; 65536];
-    assert!(
-        timeout(Duration::from_millis(40), target.recv_from(&mut buf))
-            .await
-            .is_err()
-    );
-    let mut stun = vec![0, 1, 0, 0, 0x21, 0x12, 0xa4, 0x42];
-    stun.extend([7; 12]);
-    let hello = crate::routing::dpi::test_hello();
-    let quic = crate::reality_quic_wire::test_initial(crate::reality_quic_wire::V1, &hello[5..]);
-    for (index, data) in [stun, quic, vec![], b"last".to_vec()]
-        .into_iter()
-        .enumerate()
-    {
-        let packet = encode_socks(&address, port, &data).unwrap();
-        app.send_to(&packet, relay).await.unwrap();
-        let (n, peer) = timeout(Duration::from_secs(3), target.recv_from(&mut buf))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(&buf[..n], data);
-        let response = if index == 0 {
-            // Minimal Binding success with the observed VPS source.
-            let mut response = data.clone();
-            response[0] = 1;
-            response[3] = 12;
-            response.extend([0, 0x20, 0, 8, 0, 1]);
-            response.extend((peer.port() ^ 0x2112).to_be_bytes());
-            let IpAddr::V4(ip) = peer.ip() else {
-                panic!("fixture IPv4")
-            };
-            response.extend(
-                ip.octets()
-                    .into_iter()
-                    .zip([0x21, 0x12, 0xa4, 0x42])
-                    .map(|(a, b)| a ^ b),
-            );
-            response
-        } else {
-            data
-        };
-        target.send_to(&response, peer).await.unwrap();
-        let (n, source) = timeout(Duration::from_secs(3), app.recv_from(&mut buf))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(source, relay);
-        assert_eq!(
-            parse_socks(&buf[..n]),
-            Some((address.clone(), port, response.as_slice()))
-        );
-    }
-    udp_quic_fixture(app, relay).await;
-    control.shutdown().await.unwrap();
-    timeout(Duration::from_secs(3), task)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-}
-
-#[cfg(test)]
-async fn udp_quic_fixture(app: tokio::net::UdpSocket, relay: SocketAddr) {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    let der = cert.cert.der().clone();
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(der.clone()).unwrap();
-    let origin = crate::quic_transport::server_endpoint(
-        "127.0.0.1:0".parse().unwrap(),
-        vec![der],
-        rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
-    )
-    .unwrap();
-    let origin_port = origin.local_addr().unwrap().port();
-    let endpoint =
-        crate::quic_transport::client_endpoint("127.0.0.1:0".parse().unwrap(), roots).unwrap();
-    let client_addr = endpoint.local_addr().unwrap();
-    let bridge_addr = app.local_addr().unwrap();
-    let bridge = tokio::spawn(async move {
-        let target = Address::V4([127, 0, 0, 1]);
-        let mut buf = vec![0; 65536];
-        loop {
-            let (n, source) = app.recv_from(&mut buf).await.unwrap();
-            if source == client_addr {
-                if let Some(wire) = crate::udp_relay::encode_socks(&target, origin_port, &buf[..n])
-                {
-                    app.send_to(&wire, relay).await.unwrap();
-                }
-            } else if source == relay {
-                if let Some((address, port, data)) = crate::udp_relay::parse_socks(&buf[..n]) {
-                    if address == target && port == origin_port {
-                        app.send_to(data, client_addr).await.unwrap();
-                    }
-                }
-            }
-        }
-    });
-    let server = async {
-        let connection = crate::quic_transport::accept(origin.accept().await.unwrap())
-            .await
-            .unwrap();
-        let (mut tx, mut rx) = connection.accept_bi().await.unwrap();
-        let bytes = rx.read_to_end(64).await.unwrap();
-        assert_eq!(bytes, b"nested quic");
-        tx.write_all(&bytes).await.unwrap();
-        tx.finish().unwrap();
-        connection
-    };
-    let client = async {
-        let connection = crate::quic_transport::connect(&endpoint, bridge_addr, "localhost")
-            .await
-            .unwrap();
-        let (mut tx, mut rx) = connection.open_bi().await.unwrap();
-        tx.write_all(b"nested quic").await.unwrap();
-        tx.finish().unwrap();
-        assert_eq!(rx.read_to_end(64).await.unwrap(), b"nested quic");
-        connection
-    };
-    let (_server, _client) = timeout(Duration::from_secs(10), async {
-        tokio::join!(server, client)
-    })
-    .await
-    .unwrap();
-    bridge.abort();
-    let _ = bridge.await;
 }
