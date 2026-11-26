@@ -1970,7 +1970,8 @@ mod tests {
 
     #[test]
     fn direct_import_cancel_closes_shortcut_but_nested_import_returns_to_config() {
-        let root = std::env::temp_dir().join(crate::tui_editor::generated_id("direct-import-cancel").unwrap());
+        let root = std::env::temp_dir()
+            .join(crate::tui_editor::generated_id("direct-import-cancel").unwrap());
         std::fs::create_dir(&root).unwrap();
         let path = root.join("client.toml");
         let mut direct = ConfigDialog::new(Role::Client, Some(&path));
