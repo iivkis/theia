@@ -10,6 +10,17 @@ pub(crate) struct Scope {
 }
 
 impl Scope {
+    pub(crate) fn bind_address(self) -> SocketAddr {
+        let mut source = self.source;
+        source.set_port(0);
+        source
+    }
+
+    pub(crate) fn matches_local(self, mut address: SocketAddr) -> bool {
+        address.set_port(0);
+        address == self.bind_address()
+    }
+
     #[cfg(test)]
     pub(crate) fn fixture(source: SocketAddr, epoch: u64) -> Self {
         Self { source, epoch }

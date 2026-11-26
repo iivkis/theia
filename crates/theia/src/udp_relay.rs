@@ -140,7 +140,7 @@ impl Tunnel {
         match self {
             Self::VerifiedQuic(verified, fallback) => {
                 let Some(first) = upload.recv().await else { return Ok(()); };
-                if !verified.admissible() {
+                if !verified.admissible()? {
                     drop(verified);
                     let tunnel = fallback.await?;
                     if !matches!(tunnel, Self::H2(_) | Self::H3(_)) {

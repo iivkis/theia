@@ -93,6 +93,7 @@ impl Observer {
 pub(super) async fn probe_quic(
     name: &str,
     address: std::net::SocketAddr,
+    scope: Option<crate::network_scope::Scope>,
     config: std::sync::Arc<rustls::ClientConfig>,
 ) -> Option<()> {
     let mut tls = (*config).clone();
@@ -100,8 +101,11 @@ pub(super) async fn probe_quic(
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).ok()?;
     let mut config = quinn::ClientConfig::new(std::sync::Arc::new(crypto));
     config.transport_config(crate::quic_transport::transport_config());
-    let bind = if address.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
-    let mut endpoint = quinn::Endpoint::client(bind.parse().ok()?).ok()?;
+    let bind = match scope {
+        Some(scope) => scope.bind_address(),
+        None => if address.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }.parse().ok()?,
+    };
+    let mut endpoint = quinn::Endpoint::client(bind).ok()?;
     endpoint.set_default_client_config(config);
     let connection = crate::quic_transport::connect(&endpoint, address, name).await.ok()?;
     connection.close(quinn::VarInt::from_u32(0), b"");
@@ -133,8 +137,8 @@ mod tests {
             }
         });
         let deadline = std::time::Duration::from_secs(5);
-        assert!(tokio::time::timeout(deadline, probe_quic("localhost", addr, config.clone())).await.unwrap().is_some());
-        assert!(tokio::time::timeout(deadline, probe_quic("wrong.invalid", addr, config)).await.unwrap().is_none());
+        assert!(tokio::time::timeout(deadline, probe_quic("localhost", addr, None, config.clone())).await.unwrap().is_some());
+        assert!(tokio::time::timeout(deadline, probe_quic("wrong.invalid", addr, None, config)).await.unwrap().is_none());
         serving.abort();
     }
 

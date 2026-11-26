@@ -69,6 +69,34 @@ struct Floor {
     checkpoint: Checkpoint,
 }
 
+/// Local route permission is scoped to the exact accepted checkpoint and
+/// deadline. A changed/deleted durable floor invalidates outstanding opens.
+pub(super) struct LocalPolicy {
+    checkpoint: Checkpoint,
+    deadline: Instant,
+    floor: Option<(PathBuf, String)>,
+}
+
+impl LocalPolicy {
+    pub(super) fn valid(&self, digest: [u8; 32]) -> bool {
+        if self.checkpoint.digest != digest || Instant::now() >= self.deadline {
+            return false;
+        }
+        match &self.floor {
+            None => true,
+            Some((path, scope)) => floor_bytes(path)
+                .ok().flatten()
+                .and_then(|bytes| read_floor(&bytes, scope).ok())
+                .is_some_and(|floor| floor.checkpoint == self.checkpoint),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn fixture(digest: [u8; 32]) -> Self {
+        Self { checkpoint: Checkpoint { revision: 1, digest }, deadline: Instant::now() + TTL, floor: None }
+    }
+}
+
 struct State {
     snapshot: Option<Arc<Snapshot>>,
     expires: Option<Instant>,
@@ -148,6 +176,14 @@ impl Cache {
             .map_err(|_| ClientError::Configuration)
     }
 
+    fn authorize_local(&self, snapshot: &Snapshot, deadline: Instant) {
+        self.dpi.authorize_policy(Some(LocalPolicy {
+            checkpoint: snapshot.checkpoint(),
+            deadline,
+            floor: self.checkpoint.clone().map(|path| (path, self.scope.clone())),
+        }));
+    }
+
     pub(crate) async fn get<F, Fut>(&self, fetch: F) -> Result<Arc<Snapshot>, ClientError>
     where
         F: FnOnce(Option<[u8; 32]>) -> Fut,
@@ -155,20 +191,28 @@ impl Cache {
     {
         let mut state = self.state.lock().await;
         let now = Instant::now();
-        if state.expires.is_some_and(|until| now < until) {
-            if let Some(snapshot) = &state.snapshot {
-                if let Some(path) = &self.checkpoint {
-                    let bytes = floor_bytes(path)?.ok_or(ClientError::Configuration)?;
-                    let floor = read_floor(&bytes, &self.scope)?;
-                    if floor.checkpoint == snapshot.checkpoint() {
-                        return Ok(snapshot.clone());
-                    }
-                    // Another cooperating client has advanced the floor.
-                } else {
+        if let (Some(deadline), Some(snapshot)) = (state.expires.filter(|until| now < *until), state.snapshot.as_ref()) {
+            let result = if let Some(path) = &self.checkpoint {
+                floor_bytes(path).and_then(|bytes| bytes.ok_or(ClientError::Configuration))
+                    .and_then(|bytes| read_floor(&bytes, &self.scope))
+                    .map(|floor| floor.checkpoint == snapshot.checkpoint())
+            } else {
+                Ok(true)
+            };
+            match result {
+                Ok(true) => {
+                    self.authorize_local(snapshot, deadline);
                     return Ok(snapshot.clone());
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    self.dpi.authorize_policy(None);
+                    return Err(error);
                 }
             }
         }
+        // Invalidate before any refresh await, including cancellation/failure.
+        self.dpi.authorize_policy(None);
         if state.retry.is_some_and(|until| now < until) {
             return Err(ClientError::Open(ErrorCode::PolicyDenied));
         }
@@ -192,7 +236,9 @@ impl Cache {
         // The durable floor is checked even for an unchanged receipt.
         self.persist(&snapshot, state.snapshot.as_deref())?;
         state.snapshot = Some(snapshot.clone());
-        state.expires = Some(Instant::now() + TTL);
+        let deadline = Instant::now() + TTL;
+        state.expires = Some(deadline);
+        self.authorize_local(&snapshot, deadline);
         state.retry = None;
         Ok(snapshot)
     }
@@ -311,7 +357,7 @@ async fn copy_direction(
 }
 
 pub(crate) async fn relay_direct(client: TcpStream, target: TcpStream) -> Result<(), ClientError> {
-    relay_direct_after_first(client, target, 0, 0).await
+    relay_direct_after_first(client, target, 0, 0).await.0
 }
 
 pub(crate) async fn relay_direct_after_first(
@@ -319,7 +365,7 @@ pub(crate) async fn relay_direct_after_first(
     target: TcpStream,
     upload: usize,
     download: usize,
-) -> Result<(), ClientError> {
+) -> (Result<(), ClientError>, bool) {
     let meter = crate::traffic::enter_direct();
     meter.upload(upload);
     meter.download(download);
@@ -327,18 +373,40 @@ pub(crate) async fn relay_direct_after_first(
     let evidence = (upload != 0 && download != 0).then(|| ExchangeEvidence(std::sync::atomic::AtomicU8::new(0)));
     let (cr, cw) = client.into_split();
     let (tr, tw) = target.into_split();
-    activity
+    let result = activity
         .run(
             copy_direction(cr, tw, &activity, &meter, true, evidence.as_ref()),
             copy_direction(tr, cw, &activity, &meter, false, evidence.as_ref()),
             ClientError::Timeout,
         )
-        .await
+        .await;
+    let exchanged = evidence.is_some_and(|value| value.0.load(std::sync::atomic::Ordering::Relaxed) == 3);
+    (result, exchanged)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn local_policy_lease_fails_closed_on_expiry_refresh_and_digest_change() {
+        let cache = Cache::new("scope".into(), None);
+        let (_, wire) = Snapshot::build("scope", 1, &[], &[], &[]).unwrap();
+        let first = cache.get(|_| async { Ok(wire) }).await.unwrap();
+        let digest = first.digest();
+        assert!(cache.dpi.policy_current(digest));
+        assert!(!cache.dpi.policy_current([0; 32]));
+        cache.state.lock().await.expires = None;
+        assert!(cache.get(|_| async { Err(ClientError::Io) }).await.is_err());
+        assert!(!cache.dpi.policy_current(digest));
+        cache.state.lock().await.retry = None;
+        let (_, wire) = Snapshot::build("scope", 2, &[], &[], &[]).unwrap();
+        let second = cache.get(|_| async { Ok(wire) }).await.unwrap();
+        assert!(!cache.dpi.policy_current(digest));
+        assert!(cache.dpi.policy_current(second.digest()));
+        let expired = LocalPolicy { checkpoint: second.checkpoint(), deadline: Instant::now(), floor: None };
+        assert!(!expired.valid(second.digest()));
+    }
+
     #[tokio::test]
     async fn cache_rejects_rollback_and_equivocation() {
         let cache = Cache::new("scope".into(), None);

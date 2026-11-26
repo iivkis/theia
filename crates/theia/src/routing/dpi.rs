@@ -26,6 +26,7 @@ const FIRST_FLIGHT: Duration = Duration::from_secs(5);
 /// Consent is local configuration, not a command in the server snapshot.
 pub(crate) struct Engine {
     enabled: AtomicBool,
+    policy: std::sync::Mutex<Option<super::client_state::LocalPolicy>>,
     cache: strategy::Cache,
     udp_cache: std::sync::Mutex<std::collections::VecDeque<UdpEvidence>>,
     probes: Semaphore,
@@ -45,9 +46,14 @@ pub(crate) struct VerifiedUdp {
     key: Key,
 }
 impl VerifiedUdp {
-    pub(crate) fn admissible(&self) -> bool {
-        self.engine.enabled() && network_scope::observe(self.key.address) == Some(self.key.network)
-            && self.engine.cached_udp(&self.key) == Some(true)
+    pub(crate) fn admissible(&self) -> Result<bool, ClientError> {
+        if !self.engine.policy_current(self.key.policy) {
+            return Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied));
+        }
+        Ok(self.engine.enabled()
+            && network_scope::observe(self.key.address) == Some(self.key.network)
+            && self.socket.local_addr().is_ok_and(|local| self.key.network.matches_local(local))
+            && self.engine.cached_udp(&self.key) == Some(true))
     }
     pub(crate) fn failed(&self) {
         self.engine.remember_udp(self.key.clone(), false);
@@ -56,9 +62,11 @@ impl VerifiedUdp {
     #[cfg(test)]
     pub(crate) fn disabled_fixture(socket: tokio::net::UdpSocket) -> Self {
         let address = socket.peer_addr().unwrap();
+        let engine = Arc::new(Engine::default());
+        engine.authorize_policy(Some(super::client_state::LocalPolicy::fixture([1; 32])));
         Self {
             socket,
-            engine: Arc::new(Engine::default()),
+            engine,
             key: Key { name: "example.org".into(), address, policy: [1; 32], network: network_scope::Scope::fixture(address, 0) },
         }
     }
@@ -68,6 +76,7 @@ impl Default for Engine {
     fn default() -> Self {
         Self {
             enabled: AtomicBool::new(false),
+            policy: std::sync::Mutex::new(None),
             cache: strategy::Cache::default(),
             udp_cache: std::sync::Mutex::new(std::collections::VecDeque::new()),
             probes: Semaphore::new(4),
@@ -79,6 +88,14 @@ impl Default for Engine {
 impl Engine {
     pub(crate) fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub(super) fn authorize_policy(&self, lease: Option<super::client_state::LocalPolicy>) {
+        if let Ok(mut policy) = self.policy.lock() { *policy = lease; }
+    }
+
+    pub(crate) fn policy_current(&self, digest: [u8; 32]) -> bool {
+        self.policy.lock().ok().is_some_and(|policy| policy.as_ref().is_some_and(|lease| lease.valid(digest)))
     }
 
     pub(crate) fn enabled(&self) -> bool {
@@ -116,7 +133,7 @@ impl Engine {
         ips: &[IpAddr],
         policy: [u8; 32],
     ) -> Option<VerifiedUdp> {
-        if !self.enabled() || port != 443 || ips.is_empty() || ips.len() > 64
+        if !self.enabled() || !self.policy_current(policy) || port != 443 || ips.is_empty() || ips.len() > 64
             || !ips.iter().all(|ip| crate::server::allowed_destination(*ip, false)) {
             return None;
         }
@@ -128,22 +145,23 @@ impl Engine {
                 let key = Key { name: name.clone(), address, policy, network };
                 let slot = self.probe_slot(&name, address, policy);
                 let guard = self.probe_slots[slot].lock().await;
-                if !self.enabled() || network_scope::observe(address) != Some(network) { continue; }
+                if !self.enabled() || !self.policy_current(policy) || network_scope::observe(address) != Some(network) { continue; }
                 let good = if let Some(good) = self.cached_udp(&key) {
                     crate::traffic::dpi_cache_hit();
                     good
                 } else {
                     let _permit = self.probes.try_acquire().ok()?;
                     let config = tokio::task::spawn_blocking(tls::native_config).await.ok()??;
-                    let good = timeout(ATTEMPT, udp::probe_quic(&name, address, config)).await.ok().flatten().is_some();
+                    let good = timeout(ATTEMPT, udp::probe_quic(&name, address, Some(network), config)).await.ok().flatten().is_some();
                     crate::traffic::dpi_probe(good);
                     self.remember_udp(key.clone(), good);
                     good
                 };
                 drop(guard);
-                if !good || !self.enabled() || network_scope::observe(address) != Some(network) { continue; }
+                if !good || !self.enabled() || !self.policy_current(policy) || network_scope::observe(address) != Some(network) { continue; }
                 if let Ok(socket) = crate::udp_relay::connect(address).await {
-                    if self.enabled() && network_scope::observe(address) == Some(network) {
+                    if self.enabled() && self.policy_current(policy) && network_scope::observe(address) == Some(network)
+                        && socket.local_addr().is_ok_and(|local| network.matches_local(local)) {
                         return Some(VerifiedUdp { socket, engine: self.clone(), key });
                     }
                 }
@@ -161,6 +179,7 @@ impl Engine {
         policy: [u8; 32],
     ) -> Option<Tunnel> {
         if !self.enabled()
+            || !self.policy_current(policy)
             || !matches!(port, 443 | 8443)
             || ips.is_empty()
             || ips.len() > 64
@@ -180,7 +199,7 @@ impl Engine {
                 let key = Key { name: name.clone(), address, policy, network };
                 let slot = self.probe_slot(&key.name, address, policy);
                 let guard = self.probe_slots[slot].lock().await;
-                if !self.enabled() || network_scope::observe(address) != Some(network) { continue; }
+                if !self.enabled() || !self.policy_current(policy) || network_scope::observe(address) != Some(network) { continue; }
                 let strategy = match self.cache.cached(&key) {
                     Some(Verdict::Verified(strategy)) => { crate::traffic::dpi_cache_hit(); strategy },
                     Some(Verdict::Unavailable) => continue,
@@ -189,10 +208,10 @@ impl Engine {
                         let config = tokio::task::spawn_blocking(tls::native_config).await.ok()??;
                         let mut verified = None;
                         for strategy in self.cache.ranked(&key) {
-                            if !self.enabled() || network_scope::observe(address) != Some(network) { break; }
+                            if !self.enabled() || !self.policy_current(policy) || network_scope::observe(address) != Some(network) { break; }
                             if matches!(previous, Some(Verdict::Avoid { strategy: failed, .. }) if failed == strategy) { continue; }
                             let started = std::time::Instant::now();
-                            let good = timeout(ATTEMPT, tls::probe(&name, address, strategy, config.clone()))
+                            let good = timeout(ATTEMPT, tls::probe(&name, address, Some(network), strategy, config.clone()))
                                 .await.ok().flatten().is_some();
                             self.cache.observe(&key, strategy, good, started.elapsed());
                             crate::traffic::dpi_probe(good);
@@ -210,11 +229,13 @@ impl Engine {
                     }
                 };
                 drop(guard);
-                if !self.enabled() || network_scope::observe(address) != Some(network) {
+                if !self.enabled() || !self.policy_current(policy) || network_scope::observe(address) != Some(network) {
                     continue;
                 }
                 match timeout(ATTEMPT, tcp::connect(address)).await {
-                    Ok(Ok(target)) if network_scope::observe(address) == Some(network) => {
+                    Ok(Ok(target)) if self.enabled() && self.policy_current(policy)
+                        && network_scope::observe(address) == Some(network)
+                        && target.local_addr().is_ok_and(|local| network.matches_local(local)) => {
                         return Some(Tunnel {
                             target,
                             strategy,
@@ -258,6 +279,10 @@ impl Tunnel {
             Ok(Err(error)) => return Err(error),
             Err(_) => false,
         };
+        // A superseded/expired policy is not permission for VPS fallback.
+        if !self.engine.policy_current(self.key.policy) {
+            return Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied));
+        }
         let transformed = if ready {
             tls::transform(&prefix, &self.key.name, self.strategy)
         } else {
@@ -270,6 +295,8 @@ impl Tunnel {
         };
         if !self.engine.enabled()
             || network_scope::observe(self.key.address) != Some(self.key.network)
+            || !self.target.local_addr().is_ok_and(|local| self.key.network.matches_local(local))
+            || self.engine.cache.cached(&self.key) != Some(Verdict::Verified(self.strategy))
         {
             return Ok(RelayOutcome::Fallback { client, prefix });
         }
@@ -312,25 +339,36 @@ impl Tunnel {
             .await
             .map_err(|_| ClientError::Timeout)?
             .map_err(|_| ClientError::Io)?;
-        self.engine.cache.observe(&self.key, self.strategy, true, started.elapsed());
+        let hello_elapsed = started.elapsed();
         crate::traffic::dpi_first_response();
-        super::client_state::relay_direct_after_first(
+        let (result, exchanged) = super::client_state::relay_direct_after_first(
             client,
             self.target,
             prefix.len(),
             response.len(),
         )
-        .await?;
+        .await;
+        // A ServerHello alone is insufficient evidence of usable application
+        // traffic. Do not penalize a clean early application disconnect.
+        if exchanged {
+            self.engine.cache.observe(&self.key, self.strategy, true, hello_elapsed);
+        } else if result.is_err() {
+            self.engine.cache.failed(&self.key, self.strategy);
+            crate::traffic::dpi_first_failure();
+        }
+        result?;
         Ok(RelayOutcome::Finished)
     }
 
     #[cfg(test)]
     pub(crate) fn fixture(target: TcpStream, name: &str) -> Self {
         let address = target.peer_addr().unwrap();
+        let engine = Arc::new(Engine::default());
+        engine.authorize_policy(Some(super::client_state::LocalPolicy::fixture([1; 32])));
         Self {
             target,
             strategy: Strategy::Header,
-            engine: Arc::new(Engine::default()),
+            engine,
             key: Key {
                 name: name.into(),
                 address,
@@ -407,7 +445,7 @@ mod tests {
                     let (socket, _) = listener.accept().await.unwrap();
                     acceptor.accept(socket).await.is_ok()
                 };
-                let client = tls::probe(name, address, strategy, config.clone());
+                let client = tls::probe(name, address, None, strategy, config.clone());
                 let (server_ok, client_ok) = tokio::join!(server, client);
                 assert_eq!(client_ok.is_some(), expected);
                 assert_eq!(server_ok, expected);

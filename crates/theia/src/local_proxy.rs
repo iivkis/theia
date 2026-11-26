@@ -1155,6 +1155,8 @@ async fn routed_open(
                     }
                 }
             }
+            // A changed local policy does not authorize an older fallback.
+            if !cache.dpi.policy_current(snapshot.digest()) { return Err(denied()); }
             // Failed local probe/dial or unsupported traffic uses the same
             // authenticated VPS carrier. No silent unprotected direct route.
             let tunnel = carrier.open(address, port).await?;
@@ -1213,6 +1215,9 @@ async fn routed_udp(
                         }
                     }
                 }
+            }
+            if !cache.dpi.policy_current(snapshot.digest()) {
+                return Err(ClientError::Open(ErrorCode::PolicyDenied));
             }
             let tunnel = carrier.open_udp(address, port).await?;
             crate::traffic::udp_dpi_fallback();

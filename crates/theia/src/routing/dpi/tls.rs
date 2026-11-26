@@ -267,12 +267,14 @@ pub(super) fn native_config() -> Option<Arc<rustls::ClientConfig>> {
 pub(super) async fn probe(
     name: &str,
     address: SocketAddr,
+    scope: Option<crate::network_scope::Scope>,
     strategy: Strategy,
     config: Arc<rustls::ClientConfig>,
 ) -> Option<()> {
     let server_name = rustls::pki_types::ServerName::try_from(name.to_owned()).ok()?;
     let mut tls = rustls::ClientConnection::new(config, server_name).ok()?;
     let mut socket = super::tcp::connect(address).await.ok()?;
+    if scope.is_some_and(|scope| !socket.local_addr().is_ok_and(|local| scope.matches_local(local))) { return None; }
     let mut first = true;
     let mut input = [0; RECORD_LIMIT];
     loop {
