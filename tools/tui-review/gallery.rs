@@ -298,11 +298,11 @@ fn visual_review_gallery() {
         let labels: &[(&str, &str)] = if role == Role::Server {
             &[("overview", "Обзор"), ("connections", "Подключения"),
               ("users", "Пользователи и ключи"), ("management", "Управление"),
-              ("traffic", "Статистика"), ("settings", "Настройки"), ("diagnostics", "Диагностика")]
+              ("traffic", "Статистика"), ("settings", "Настройки"), ("diagnostics", "Диагностика"), ("routing", "Маршрутизация")]
         } else {
             &[("overview", "Обзор"), ("profiles", "Профили"),
               ("import", "Импорт ключа"), ("proxy", "Подключение"),
-              ("traffic", "Статистика"), ("settings", "Настройки")]
+              ("traffic", "Статистика"), ("settings", "Настройки"), ("routing", "Маршрутизация")]
         };
         assert_eq!(labels.len(), pages(role).len());
         let mut action_keys = std::collections::HashSet::new();
@@ -322,6 +322,37 @@ fn visual_review_gallery() {
                 assert!(screen.contains(path.to_str().unwrap()));
             }
             review_capture(&format!("{prefix}-page-{label}"), &model, &ui);
+        }
+        if role == Role::Server {
+            let mut ui = Interaction::new(Some(Editor::load(role, path).unwrap()));
+            ui.select_workspace_page(role, 7);
+            let mut panel = RoutingPanel::new(ui.editor.as_ref().unwrap());
+            panel.settings.rules = vec![
+                crate::routing::Rule { name: "Локальная сеть".into(), action: crate::routing::Action::Direct, domains: vec!["domain:example.test".into()], ips: vec![] },
+                crate::routing::Rule { name: "Заблокированные адреса".into(), action: crate::routing::Action::Blocked, domains: vec!["full:blocked.invalid".into()], ips: vec![] },
+            ];
+            ui.routing_panel = Some(panel);
+            review_capture("server-routing-rules", &model, &ui);
+            ui.routing_panel.as_mut().unwrap().edit(Some(0));
+            review_capture("server-routing-edit", &model, &ui);
+        } else {
+            let mut ui = Interaction::new(Some(Editor::load(role, path).unwrap()));
+            ui.select_workspace_page(role, 6);
+            ui.workspace_focus = WorkspaceFocus::Actions;
+            let digest = ui.editor.as_ref().unwrap().saved_sha256();
+            for (name, state, revision) in [("fresh", 1, 5), ("expired", 2, 5), ("unconfirmed", 0, 0)] {
+                let mut observation = RoutingObservation::new(digest);
+                let (tx, rx) = mpsc::channel();
+                observation.pending = Some(rx);
+                tx.send(Ok(crate::management::StatusReply::ClientRunning {
+                    revision: 1, config_sha256: digest, descriptor_revision: 0,
+                    transport: 2, xhttp: 1, fallback: false, routing_revision: revision,
+                    routing_state: state, routing_totals: [1024,2048,5120,10240,2,1,2],
+                })).unwrap();
+                observation.poll();
+                ui.routing_observation = Some(observation);
+                review_capture(&format!("client-routing-{name}"), &model, &ui);
+            }
         }
         let mut ui = Interaction::new(Some(Editor::load(role, path).unwrap()));
         ui.select_workspace_page(role, 0);
