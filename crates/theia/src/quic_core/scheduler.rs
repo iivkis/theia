@@ -930,6 +930,91 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct SimAck {
+        flow: usize,
+        pn: u64,
+        frame: u64,
+    }
+
+    fn shared_bottleneck(
+        algorithms: [bool; 2],
+        rtt_ms: [u64; 2],
+        seconds: u64,
+        periodic_loss: bool,
+    ) -> ([u64; 2], u64) {
+        let start = Instant::now();
+        let mut flows = algorithms.map(|bbr| if bbr { Scheduler::with_bbr(start) } else { Scheduler::default() });
+        let mut numbers = [0u64; 2];
+        let mut completed = [BTreeSet::new(), BTreeSet::new()];
+        let mut ack_events: BTreeMap<u64, Vec<SimAck>> = BTreeMap::new();
+        // One 1200-byte packet per ms (9.6 Mbit/s), FIFO of 24
+        // packets, no artificial per-flow service reservation.
+        let mut link_free = 0u64;
+        let mut dropped = 0u64;
+        for tick in 0..seconds * 1000 {
+            let now = start + Duration::from_millis(tick);
+            for ack_event in ack_events.remove(&tick).unwrap_or_default() {
+                flows[ack_event.flow].acknowledge(&ack(ack_event.pn), now).unwrap();
+                completed[ack_event.flow].insert(ack_event.frame);
+            }
+            // Alternate iteration order to avoid a fixed equal-time tie bias.
+            for k in 0..2 {
+                let i = (k + tick as usize) % 2;
+                let flow = &mut flows[i];
+                flow.on_timer(now).unwrap();
+                while flow.can_queue() { flow.enqueue(vec![1]).unwrap(); }
+                if let Some((id, _, probe)) = flow.candidate(now).unwrap() {
+                    let number = numbers[i];
+                    numbers[i] += 1;
+                    flow.record(number, 1200, Some((id, probe)), now).unwrap();
+                    let queue = link_free.saturating_sub(tick);
+                    if queue >= 24 || (periodic_loss && number % 97 == 13) {
+                        dropped += 1;
+                    } else {
+                        link_free = link_free.max(tick) + 1;
+                        // Deterministic occasional reordering, independent of controller.
+                        let reorder = if periodic_loss && number % 131 == 19 { 12 } else { 0 };
+                        let due = link_free + rtt_ms[i] + reorder;
+                        ack_events.entry(due).or_default().push(SimAck { flow: i, pn: number, frame: id });
+                    }
+                }
+                let path = flow.path.lock().unwrap();
+                assert_eq!(path.window.in_flight(), flow.ledger.bytes_in_flight());
+                assert!(path.window.cwnd() >= 2400);
+                assert!(path.window.cwnd() <= 64 * 1024 * 1024);
+            }
+        }
+        (completed.map(|frames| frames.len() as u64 * 1200), dropped)
+    }
+
+    #[test]
+    fn both_controllers_make_progress_on_a_shared_bounded_link() {
+        let (bytes, _) = shared_bottleneck([false, true], [30, 30], 2, false);
+        assert!(bytes.iter().all(|n| *n > 0));
+    }
+
+    /// Diagnostic rather than a fairness gate. Report nominal unique-frame
+    /// delivery, not actual H3 goodput. Probe jitter is intentionally real.
+    #[test]
+    #[ignore = "extended virtual-time congestion diagnostics"]
+    fn competing_congestion_models_diagnostic() {
+        println!("controller_a,controller_b,rtt_a_ms,rtt_b_ms,loss_reorder,bytes_a,bytes_b,dropped,jain");
+        for algorithms in [[false, false], [true, true], [false, true], [true, false]] {
+            for rtt in [[30, 30], [20, 80]] {
+                for loss in [false, true] {
+                    let (bytes, dropped) = shared_bottleneck(algorithms, rtt, 30, loss);
+                    let a = bytes[0] as f64;
+                    let b = bytes[1] as f64;
+                    assert!(a > 0.0 && b > 0.0);
+                    let jain = (a + b).powi(2) / (2.0 * (a*a + b*b));
+                    let name = |bbr| if bbr { "bbr" } else { "cubic" };
+                    println!("{},{},{},{},{},{},{},{},{:.6}", name(algorithms[0]), name(algorithms[1]), rtt[0], rtt[1], loss, bytes[0], bytes[1], dropped, jain);
+                }
+            }
+        }
+    }
+
     #[test]
     fn negotiated_ack_delay_applies_only_after_confirmation() {
         let now = Instant::now();

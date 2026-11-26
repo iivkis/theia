@@ -5,16 +5,28 @@ use h3::quic;
 use rustls::{pki_types::ServerName, ClientConfig, RootCertStore, ServerConfig};
 use std::{
     fs::File, future::poll_fn, io::BufReader, net::{IpAddr, SocketAddr},
-    sync::Arc, time::{Duration, Instant},
+    sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use theia::quic_core::{
-    h3_adapter::NativeConnection, handshake_udp, listener::Listener,
+    h3_adapter::NativeConnection, handshake_udp::{self, Congestion}, listener::Listener,
     negotiation::VersionPolicy, scope::NetworkScope, wire::Version,
 };
 use tokio::net::UdpSocket;
 
 const MAX_BYTES: usize = 8 * 1024 * 1024;
 const CHUNK: usize = 32 * 1024;
+
+fn native_backend(backend: &str) -> (Version, Congestion) {
+    match backend {
+        "native-v1" => (Version::V1, Congestion::Bbr),
+        "native-v2" => (Version::V2, Congestion::Bbr),
+        "native-cubic-v1" => (Version::V1, Congestion::Cubic),
+        "native-cubic-v2" => (Version::V2, Congestion::Cubic),
+        _ => panic!("invalid native backend"),
+    }
+}
+
+fn wall_ns() -> u128 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() }
 
 fn env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("missing {name}"))
@@ -69,7 +81,7 @@ where C: quic::Connection<Bytes> + 'static,
     let _ = tokio::time::timeout(Duration::from_secs(3), server.accept()).await;
 }
 
-async fn exchange<C>(connection: C, payload: &[u8]) -> (u128, u128)
+async fn exchange<C>(connection: C, payload: &[u8]) -> (u128, u128, u128, u128)
 where C: quic::Connection<Bytes> + 'static,
     C::BidiStream: quic::BidiStream<Bytes>,
 {
@@ -80,6 +92,7 @@ where C: quic::Connection<Bytes> + 'static,
         .method("POST").uri("https://benchmark.invalid/transport-benchmark").body(()).unwrap()).await.unwrap();
     let opened = start.elapsed().as_micros().max(1);
     let start = Instant::now();
+    let wall_start = wall_ns();
     for chunk in payload.chunks(CHUNK) {
         stream.send_data(Bytes::copy_from_slice(chunk)).await.unwrap();
     }
@@ -94,7 +107,7 @@ where C: quic::Connection<Bytes> + 'static,
     }
     assert_eq!(offset, payload.len());
     let relay = start.elapsed().as_micros().max(1);
-    (opened, relay)
+    (opened, relay, wall_start, wall_ns())
     };
     tokio::pin!(request);
     tokio::select! {
@@ -127,13 +140,13 @@ async fn server(backend: &str, bind: SocketAddr, peer: IpAddr, count: usize, siz
             .with_single_cert(certs, key).unwrap();
         tls.alpn_protocols = vec![b"h3".to_vec()];
         tls.send_tls13_tickets = 0;
-        let version = if backend == "native-v1" { Version::V1 } else { Version::V2 };
+        let (version, congestion) = native_backend(backend);
         let scope = NetworkScope::pinned([bind.ip(); 2], [peer; 2]).unwrap();
         let mut listener = Listener::with_scope(UdpSocket::bind(bind).await.unwrap(), 8, VersionPolicy::exact(version), scope).unwrap();
         println!("BENCH_READY");
         let tls = Arc::new(tls);
         for _ in 0..count {
-            let session = handshake_udp::accept(listener.accept().await.unwrap(), tls.clone()).await.unwrap();
+            let session = handshake_udp::accept_with_congestion(listener.accept().await.unwrap(), tls.clone(), congestion).await.unwrap();
             let (connection, _) = NativeConnection::start(session).unwrap();
             echo(connection, size).await;
         }
@@ -147,26 +160,26 @@ async fn client(backend: &str, bind: SocketAddr, peer: SocketAddr, count: usize,
     let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
     for sample in 0..count {
         let start = Instant::now();
-        let (handshake, opened, relay) = if backend == "quinn" {
+        let (handshake, opened, relay, wall_start, wall_end) = if backend == "quinn" {
             let endpoint = theia::quic_transport::client_endpoint(bind, roots.clone()).unwrap();
             let connection = theia::quic_transport::connect(&endpoint, peer, &name).await.unwrap();
             let elapsed = start.elapsed().as_micros().max(1);
-            let (opened, relay) = exchange(h3_quinn::Connection::new(connection), &data).await;
+            let (opened, relay, wall_start, wall_end) = exchange(h3_quinn::Connection::new(connection), &data).await;
             endpoint.close(0u32.into(), b"benchmark complete");
             endpoint.wait_idle().await;
-            (elapsed, opened, relay)
+            (elapsed, opened, relay, wall_start, wall_end)
         } else {
-            let version = if backend == "native-v1" { Version::V1 } else { Version::V2 };
+            let (version, congestion) = native_backend(backend);
             let scope = NetworkScope::pinned([bind.ip(); 2], [peer.ip(); 2]).unwrap();
-            let (actual, session) = handshake_udp::connect_versions_scoped(bind, peer, VersionPolicy::exact(version),
-                native_tls(roots.clone()), ServerName::try_from(name.clone()).unwrap(), scope).await.unwrap();
+            let (actual, session) = handshake_udp::connect_versions_scoped_with_congestion(bind, peer, VersionPolicy::exact(version),
+                native_tls(roots.clone()), ServerName::try_from(name.clone()).unwrap(), scope, congestion).await.unwrap();
             assert_eq!(actual, version);
             let elapsed = start.elapsed().as_micros().max(1);
             let (connection, _) = NativeConnection::start(session).unwrap();
-            let (opened, relay) = exchange(connection, &data).await;
-            (elapsed, opened, relay)
+            let (opened, relay, wall_start, wall_end) = exchange(connection, &data).await;
+            (elapsed, opened, relay, wall_start, wall_end)
         };
-        println!("BENCH_SAMPLE,{backend},{sample},{size},{handshake},{opened},{relay}");
+        println!("BENCH_SAMPLE,{backend},{sample},{size},{handshake},{opened},{relay},{wall_start},{wall_end}");
     }
 }
 
@@ -175,7 +188,7 @@ async fn client(backend: &str, bind: SocketAddr, peer: SocketAddr, count: usize,
 async fn native_quic_two_host_release() {
     assert!(!cfg!(debug_assertions), "use the release test executable");
     let backend = env("THEIA_BENCH_BACKEND");
-    assert!(matches!(backend.as_str(), "quinn" | "native-v1" | "native-v2"));
+    assert!(matches!(backend.as_str(), "quinn" | "native-v1" | "native-v2" | "native-cubic-v1" | "native-cubic-v2"));
     let role = env("THEIA_BENCH_ROLE");
     let bind: SocketAddr = env("THEIA_BENCH_BIND").parse().unwrap();
     let peer: SocketAddr = env("THEIA_BENCH_PEER").parse().unwrap();

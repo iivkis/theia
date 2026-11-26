@@ -54,6 +54,16 @@ pub enum Error {
     Endpoint(super::endpoint::Error),
 }
 
+/// Explicit controller selection for interoperability and benchmark trials.
+/// Existing native entry points retain their BBR default; production
+/// configuration and the accepted Quinn backend are not changed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Congestion {
+    Cubic,
+    #[default]
+    Bbr,
+}
+
 pub enum Config {
     Client {
         tls: Arc<ClientConfig>,
@@ -806,6 +816,7 @@ pub async fn establish(
             restarted: false,
         },
         config,
+        Congestion::Bbr,
     )
     .await
 }
@@ -853,6 +864,18 @@ pub async fn connect_versions_scoped(
     name: ServerName<'static>,
     scope: super::scope::NetworkScope,
 ) -> Result<(Version, LabSession), Error> {
+    connect_versions_scoped_with_congestion(local, peer, versions, tls, name, scope, Congestion::Bbr).await
+}
+
+pub async fn connect_versions_scoped_with_congestion(
+    local: SocketAddr,
+    peer: SocketAddr,
+    versions: VersionPolicy,
+    tls: Arc<ClientConfig>,
+    name: ServerName<'static>,
+    scope: super::scope::NetworkScope,
+    congestion: Congestion,
+) -> Result<(Version, LabSession), Error> {
     let mut version = versions.preferred();
     for restarted in [false, true] {
         let socket = UdpSocket::bind(local).await.map_err(Error::Io)?;
@@ -883,6 +906,7 @@ pub async fn connect_versions_scoped(
                 tls: tls.clone(),
                 name: name.clone(),
             },
+            congestion,
         )
         .await
         {
@@ -901,6 +925,10 @@ pub async fn connect_versions_scoped(
 /// The candidate is created exclusively after the listener validates Retry.
 /// TLS and CID parameters must still authenticate before returning a session.
 pub async fn accept(candidate: Candidate, tls: Arc<ServerConfig>) -> Result<LabSession, Error> {
+    accept_with_congestion(candidate, tls, Congestion::Bbr).await
+}
+
+pub async fn accept_with_congestion(candidate: Candidate, tls: Arc<ServerConfig>, congestion: Congestion) -> Result<LabSession, Error> {
     let (socket, peer, binding, token, initial_reset, versions) = candidate.into_parts();
     let original = binding.original;
     let remote = binding.client;
@@ -928,6 +956,7 @@ pub async fn accept(candidate: Candidate, tls: Arc<ServerConfig>) -> Result<LabS
             restarted: false,
         },
         Config::Server(tls),
+        congestion,
     )
     .await
 }
@@ -965,6 +994,7 @@ async fn establish_inner(
     peer: SocketAddr,
     route: InitialRoute,
     config: Config,
+    congestion: Congestion,
 ) -> Result<LabSession, Error> {
     let InitialRoute {
         version,
@@ -1000,7 +1030,7 @@ async fn establish_inner(
     .map_err(Error::Tls)?;
     let destination = retry.as_deref().unwrap_or(&original);
     let keys = initial_keys(version, destination, server)?;
-    let initial = Scheduler::with_bbr(Instant::now());
+    let initial = match congestion { Congestion::Bbr => Scheduler::with_bbr(Instant::now()), Congestion::Cubic => Scheduler::default() };
     let application_schedule = initial.fork_space();
     let mut handshake = Handshake {
         driver: Driver::new(connection),

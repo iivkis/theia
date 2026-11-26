@@ -25,7 +25,7 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--revision", required=True)
     parser.add_argument("--role", choices=("server", "client"), required=True)
-    parser.add_argument("--backend", choices=("quinn", "native-v1", "native-v2"), required=True)
+    parser.add_argument("--backend", choices=("quinn", "native-v1", "native-v2", "native-cubic-v1", "native-cubic-v2"), required=True)
     parser.add_argument("--bind", required=True)
     parser.add_argument("--peer", required=True)
     parser.add_argument("--samples", type=int, default=30)
@@ -65,13 +65,17 @@ def main():
                    "child_maxrss_bytes": usage.ru_maxrss * (1 if platform.system() == "Darwin" else 1024)}
     rows = []
     for line in lines:
+        line = line.removeprefix("test native_quic_two_host_release ... ")
         if not line.startswith("BENCH_SAMPLE,"):
             continue
-        _, backend, sample, size, handshake, opened, relay = line.strip().split(",")
+        _, backend, sample, size, handshake, opened, relay, wall_start, wall_end = line.strip().split(",")
         if backend != args.backend or int(size) != args.bytes:
             raise ValueError("unexpected workload")
+        if min(int(handshake), int(opened), int(relay)) <= 0 or int(wall_end) <= int(wall_start):
+            raise ValueError("invalid measured duration")
         rows.append(dict(sample=int(sample), bytes=int(size), handshake_us=int(handshake),
                          open_us=int(opened), relay_us=int(relay),
+                         wall_start_ns=int(wall_start), wall_end_ns=int(wall_end),
                          duplex_mbps=16 * int(size) / int(relay)))
     if args.role == "client" and (len(rows) != args.samples or {r["sample"] for r in rows} != set(range(args.samples))):
         raise ValueError("incomplete or duplicate sample matrix")
