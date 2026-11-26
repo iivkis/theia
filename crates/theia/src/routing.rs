@@ -5,8 +5,9 @@ pub(crate) mod dpi;
 pub(crate) mod exchange;
 pub(crate) mod flow;
 pub mod packet;
+pub mod packet_modify;
 #[cfg(target_os = "linux")]
-pub(crate) mod linux_ingress;
+pub mod linux_ingress;
 #[cfg(any(target_os = "windows", test))]
 mod wfp_context;
 #[cfg(target_os = "windows")]

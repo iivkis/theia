@@ -1941,8 +1941,9 @@ impl NativeIngress {
     #[cfg(target_os = "linux")]
     pub async fn verdict(&self, packet: crate::routing::nfqueue::Packet<'_>) -> std::io::Result<crate::routing::PacketAction> {
         use crate::routing::PacketAction;
+        let meta = packet.metadata();
         let action = if packet.local_output() {
-            match packet.metadata() {
+            match meta {
                 Some(meta) => self.raw_verdict(meta).await,
                 None => PacketAction::Drop,
             }
@@ -1950,13 +1951,24 @@ impl NativeIngress {
             PacketAction::Drop
         };
         let gate = self.verdict_gate.lock();
-        let action = if gate.is_ok() && self.ensure_running().is_ok() { action } else { PacketAction::Drop };
+        let mut action = if gate.is_ok() && self.ensure_running().is_ok() { action } else { PacketAction::Drop };
+        if action == PacketAction::Pass {
+            let current = meta.and_then(|m| {
+                let key = crate::routing::packet::FlowKey { interface: 0, ..m.flow };
+                let mut raw = self.raw.lock().ok()?;
+                let entry = raw.get_mut(&key)?;
+                if self.client.routing_cache().dpi.check_policy(entry.digest).is_err() { entry.denied = true; }
+                Some(!entry.denied)
+            }).unwrap_or(false);
+            if !current { action = PacketAction::Drop; }
+        }
         packet.finish(action)
     }
 
     #[cfg(target_os = "linux")]
-    async fn raw_verdict(&self, meta: crate::routing::packet::PacketMeta) -> crate::routing::PacketAction {
+    async fn raw_verdict(&self, mut meta: crate::routing::packet::PacketMeta) -> crate::routing::PacketAction {
         use crate::routing::{Evidence, PacketAction, packet::Transport};
+        meta.flow.interface = 0;
         if self.ensure_running().is_err() { return PacketAction::Drop; }
         let snapshot = match timeout(Duration::from_millis(250), self.client.routing_policy()).await {
             Ok(Ok(snapshot)) => snapshot,
@@ -2027,14 +2039,17 @@ impl NativeIngress {
 
     /// Common UDP handoff for a trusted platform adapter with a terminated
     /// datagram flow. The OS-specific receiver/response injection is not
-    /// implemented here. Channels remain bounded by the platform adapter.
+    /// supplied by the platform adapter. Linux UdpCapture retrieves the
+    /// original destination; reverse-path injection remains external.
     pub async fn relay_terminated_udp(
         &self,
         key: crate::routing::packet::FlowKey,
         upload: tokio::sync::mpsc::Receiver<Vec<u8>>,
         download: tokio::sync::mpsc::Sender<Vec<u8>>,
     ) -> Result<(), ClientError> {
-        if key.transport != crate::routing::packet::Transport::Udp {
+        if key.transport != crate::routing::packet::Transport::Udp
+            || upload.max_capacity() > crate::udp_relay::QUEUE
+            || download.max_capacity() > crate::udp_relay::QUEUE {
             return Err(ClientError::Protocol);
         }
         tokio::select! {
