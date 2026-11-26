@@ -1,6 +1,7 @@
 //! Shared route matching primitives for server and client.
 //! No DNS, transport, file I/O or implicit bypass occurs in this module.
 pub(crate) mod client_state;
+pub(crate) mod dpi;
 pub(crate) mod exchange;
 pub mod geodata;
 mod settings;
@@ -30,6 +31,16 @@ pub enum Action {
     Direct,
     Blocked,
     Allowed,
+    /// Prefer an explicitly authorized proxy-based DPI strategy; otherwise use the VPS.
+    #[serde(rename = "direct_dpi")]
+    DirectDpi,
+}
+
+impl Action {
+    /// Server fallback is allowed only for a route that explicitly permits it.
+    pub(crate) fn permits_server_egress(self) -> bool {
+        matches!(self, Self::Allowed | Self::DirectDpi)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

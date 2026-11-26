@@ -248,6 +248,7 @@ pub(crate) fn first_client_candidate(r: &ClientRequest, now: u64) -> Result<Conf
                 http_listen: "127.0.0.1:7890".into(),
                 socks5_listen: "127.0.0.1:7891".into(),
                 system_proxy: config::SystemProxy::Off,
+                direct_dpi: None,
             },
         },
     });

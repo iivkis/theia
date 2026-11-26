@@ -78,6 +78,7 @@ pub(crate) struct Cache {
     scope: String,
     checkpoint: Option<PathBuf>,
     state: tokio::sync::Mutex<State>,
+    pub(crate) dpi: Arc<super::dpi::Engine>,
 }
 
 fn floor_bytes(path: &Path) -> Result<Option<Vec<u8>>, ClientError> {
@@ -104,6 +105,7 @@ impl Cache {
         Self {
             scope,
             checkpoint,
+            dpi: Arc::new(super::dpi::Engine::default()),
             state: tokio::sync::Mutex::new(State {
                 snapshot: None,
                 expires: None,
@@ -297,7 +299,18 @@ async fn copy_direction(
 }
 
 pub(crate) async fn relay_direct(client: TcpStream, target: TcpStream) -> Result<(), ClientError> {
+    relay_direct_after_first(client, target, 0, 0).await
+}
+
+pub(crate) async fn relay_direct_after_first(
+    client: TcpStream,
+    target: TcpStream,
+    upload: usize,
+    download: usize,
+) -> Result<(), ClientError> {
     let meter = crate::traffic::enter_direct();
+    meter.upload(upload);
+    meter.download(download);
     let activity = crate::relay_liveness::Activity::new();
     let (cr, cw) = client.into_split();
     let (tr, tw) = target.into_split();

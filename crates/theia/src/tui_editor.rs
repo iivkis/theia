@@ -335,6 +335,7 @@ impl Editor {
                     http_listen: "127.0.0.1:7890".into(),
                     socks5_listen: "127.0.0.1:7891".into(),
                     system_proxy: config::SystemProxy::Off,
+                    direct_dpi: None,
                 },
             },
         });
@@ -1305,6 +1306,37 @@ impl Editor {
             .inbounds
             .get(self.selected_record)
             .map(|inbound| inbound.server_name.as_str())
+    }
+
+    /// Saved local consent is not an observation of a working DPI route.
+    pub(crate) fn direct_dpi_allowed(&self) -> bool {
+        matches!(&self.original, Config::Client(doc) if doc.client.proxy.direct_dpi == Some(true))
+    }
+
+    pub(crate) fn review_direct_dpi_permission(&self) -> Result<RecordReview, &'static str> {
+        self.require_clean_records()?;
+        if self.write_uncertain {
+            return Err("Откройте настройки заново.");
+        }
+        let enable = !self.direct_dpi_allowed();
+        let mut candidate = self.original.clone();
+        let Config::Client(doc) = &mut candidate else {
+            return Err("Требуется клиентская конфигурация.");
+        };
+        doc.client.proxy.direct_dpi = Some(enable);
+        candidate.validate().map_err(|_| "Настройки клиента не прошли проверку.")?;
+        Ok(RecordReview {
+            source: self.saved_sha256(),
+            selected: self.selected_record_id().to_owned(),
+            candidate,
+            next_selection: self.selected_record,
+            confirmation_label: if enable { "Разрешить Anti-DPI" } else { "Отключить Anti-DPI" },
+            body: if enable {
+                "Разрешить локальный Anti-DPI для этого файла клиента?\n\nДля правил direct_dpi возможен прямой выход и TLS-проверка назначения: сайт увидит IP вашего устройства. DNS запрашивается через Theia. Остальные правила не меняются.\nСохранение не запускает режим; перезапустите клиент.\n\ny: разрешить · n/Esc: отменить".into()
+            } else {
+                "Отключить локальный Anti-DPI?\nПравила direct_dpi будут использовать VPS после перезапуска клиента. Текущие соединения не изменятся.\n\ny: отключить · n/Esc: отменить".into()
+            },
+        })
     }
 
     /// Display the saved permission, never infer the operating-system state.

@@ -1,0 +1,242 @@
+//! Native proxy-based Anti-DPI coordinator. All processing is on owned
+//! TCP streams; no raw packets, drivers or platform-specific DPI modules.
+mod strategy;
+mod tcp;
+mod tls;
+pub(crate) mod udp;
+mod quic;
+
+use crate::{client::ClientError, network_scope};
+use std::{net::{IpAddr,SocketAddr},sync::{atomic::{AtomicBool,Ordering},Arc},time::Duration};
+use tokio::{io::AsyncWriteExt,net::TcpStream,sync::Semaphore,time::timeout};
+use strategy::{Key,Strategy,Verdict};
+
+const ATTEMPT: Duration=Duration::from_secs(2);
+const OPEN_BUDGET: Duration=Duration::from_secs(6);
+const FIRST_FLIGHT: Duration=Duration::from_secs(5);
+
+/// Profile-local, bounded strategy evidence. No state on disk or in logs.
+/// Consent is local configuration, not a command in the server snapshot.
+pub(crate) struct Engine {
+    enabled: AtomicBool,
+    cache: strategy::Cache,
+    probes: Semaphore,
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            cache: strategy::Cache::default(),
+            probes: Semaphore::new(4),
+        }
+    }
+}
+
+impl Engine {
+    pub(crate) fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    pub(crate) async fn open(
+        self: &Arc<Self>,
+        name: &str,
+        port: u16,
+        ips: &[IpAddr],
+        policy: [u8; 32],
+    ) -> Option<Tunnel> {
+        if !self.enabled() || port != 443 || ips.is_empty() || ips.len() > 64
+            || !ips.iter().all(|ip| crate::server::allowed_destination(*ip, false))
+        {
+            return None;
+        }
+        let name = super::domain_name(name).ok()?;
+        let _permit = self.probes.try_acquire().ok()?;
+        timeout(OPEN_BUDGET, async {
+            for ip in ips.iter().take(2) {
+                let address = SocketAddr::new(*ip, port);
+                let Some(network) = network_scope::observe(address) else {
+                    continue;
+                };
+                let key = Key { name: name.clone(), address, policy, network };
+                let strategy = match self.cache.cached(&key) {
+                    Some(Verdict::Verified(strategy)) => strategy,
+                    Some(Verdict::Unavailable) => continue,
+                    previous => {
+                        let config = tokio::task::spawn_blocking(tls::native_config).await.ok()??;
+                        let mut verified = None;
+                        for strategy in Strategy::ALL {
+                            if matches!(previous, Some(Verdict::Avoid { strategy: failed, .. }) if failed == strategy) { continue; }
+                            if timeout(ATTEMPT, tls::probe(&name, address, strategy, config.clone()))
+                                .await
+                                .ok()
+                                .flatten()
+                                .is_some()
+                            {
+                                verified = Some(strategy);
+                                break;
+                            }
+                        }
+                        let Some(strategy) = verified else {
+                            self.cache.remember(&key, Verdict::Unavailable);
+                            continue;
+                        };
+                        self.cache.remember(&key, Verdict::Verified(strategy));
+                        strategy
+                    }
+                };
+                if network_scope::observe(address) != Some(network) {
+                    continue;
+                }
+                match timeout(ATTEMPT, tcp::connect(address)).await {
+                    Ok(Ok(target)) if network_scope::observe(address) == Some(network) => {
+                        return Some(Tunnel {
+                            target,
+                            strategy,
+                            engine: self.clone(),
+                            key,
+                        });
+                    }
+                    _ => self.cache.remember(&key, Verdict::Unavailable),
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+}
+
+
+pub(crate) struct Tunnel {
+    target: TcpStream,
+    strategy: Strategy,
+    engine: Arc<Engine>,
+    key: Key,
+}
+
+/// Fallback is legal only before the first write to the selected origin.
+/// The prefix belongs exclusively to the application and is sent once.
+pub(crate) enum RelayOutcome {
+    Finished,
+    Fallback { client: TcpStream, prefix: Vec<u8> },
+}
+
+impl Tunnel {
+    pub(crate) async fn relay(mut self, mut client: TcpStream) -> Result<RelayOutcome,ClientError> {
+        let mut prefix=Vec::new();
+        let ready=match timeout(FIRST_FLIGHT,tcp::read_hello(&mut client,&mut prefix)).await {
+            Ok(Ok(ready))=>ready,
+            Ok(Err(error))=>return Err(error),
+            Err(_)=>false,
+        };
+        let transformed=if ready { tls::transform(&prefix,&self.key.name,self.strategy) } else { None };
+        let Some(transformed)=transformed else {
+            // Unsupported protocol, ECH, SNI mismatch, partial input or
+            // timeout: no origin application bytes have left this process.
+            return Ok(RelayOutcome::Fallback { client,prefix });
+        };
+        if !self.engine.enabled() || network_scope::observe(self.key.address)!=Some(self.key.network) {
+            return Ok(RelayOutcome::Fallback { client,prefix });
+        }
+        // From the first attempted write onward, even a partial write or
+        // timeout is terminal for this stream. Never replay it over the VPS.
+        let response=timeout(FIRST_FLIGHT,async {
+            self.target.write_all(&transformed).await.map_err(|_|ClientError::Io)?;
+            let response=tcp::read_record(&mut self.target).await?;
+            if response[0]!=22 || response[1]!=3 || !(1..=3).contains(&response[2]) || response[5]!=2 {
+                return Err(ClientError::Protocol);
+            }
+            Ok(response)
+        }).await;
+        let response=match response {
+            Ok(Ok(response))=>response,
+            Ok(Err(error))=>{
+                self.engine.cache.failed(&self.key,self.strategy);
+                crate::traffic::dpi_first_failure();
+                return Err(error);
+            }
+            Err(_)=>{
+                self.engine.cache.failed(&self.key,self.strategy);
+                crate::traffic::dpi_first_failure();
+                return Err(ClientError::Timeout);
+            }
+        };
+        timeout(FIRST_FLIGHT,client.write_all(&response)).await.map_err(|_|ClientError::Timeout)?.map_err(|_|ClientError::Io)?;
+        crate::traffic::dpi_first_response();
+        super::client_state::relay_direct_after_first(client,self.target,prefix.len(),response.len()).await?;
+        Ok(RelayOutcome::Finished)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(target: TcpStream, name: &str) -> Self {
+        let address=target.peer_addr().unwrap();
+        Self {
+            target,
+            strategy:Strategy::Header,
+            engine:Arc::new(Engine::default()),
+            key:Key { name:name.into(),address,policy:[1;32],network:network_scope::Scope::fixture(address,0) },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn disabled_or_private_targets_never_probe() {
+        let engine = Arc::new(Engine::default());
+        assert!(engine.open("example.org", 443, &["8.8.8.8".parse().unwrap()], [1; 32]).await.is_none());
+        engine.set_enabled(true);
+        assert!(engine.open("localhost", 443, &["127.0.0.1".parse().unwrap()], [1; 32]).await.is_none());
+        assert!(engine.open("example.org", 80, &["8.8.8.8".parse().unwrap()], [1; 32]).await.is_none());
+        assert!(engine.open("example.org", 443, &[], [1; 32]).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn real_tls_peer_accepts_both_native_record_strategies_and_rejects_wrong_name() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let certificate = cert.cert.der().clone();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate.clone()).unwrap();
+        let config = tls::tls_config(roots).unwrap();
+        let server = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![certificate],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
+        )
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        timeout(Duration::from_secs(10), async {
+            for (name, strategy, expected) in [
+                ("localhost", Strategy::Header, true),
+                ("localhost", Strategy::Middle, true),
+                ("wrong.invalid", Strategy::Header, false),
+            ] {
+                let server = async {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    acceptor.accept(socket).await.is_ok()
+                };
+                let client = tls::probe(name, address, strategy, config.clone());
+                let (server_ok, client_ok) = tokio::join!(server, client);
+                assert_eq!(client_ok.is_some(), expected);
+                assert_eq!(server_ok, expected);
+            }
+        }).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_hello()->Vec<u8>{tls::fixture("example.org")}

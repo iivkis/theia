@@ -177,13 +177,13 @@ pub(crate) async fn response_data(
     if headers.get(DIGEST_HEADER).and_then(|v| v.to_str().ok()) != Some(expected.as_str()) {
         return Err(StatusCode::CONFLICT);
     }
-    if publication
-        .snapshot
-        .policy()
-        .domain_decision(&domain)
-        .map_err(|_| StatusCode::BAD_REQUEST)?
-        .is_some()
-    {
+    // An explicitly selected direct_dpi route may request authenticated
+    // DNS pins even when its domain decision is already conclusive.
+    if matches!(
+        publication.snapshot.policy().domain_decision(&domain)
+            .map_err(|_| StatusCode::BAD_REQUEST)?,
+        Some(action) if action != super::Action::DirectDpi
+    ) {
         return Err(StatusCode::BAD_REQUEST);
     }
     let addresses = tokio::time::timeout(deadline, tokio::net::lookup_host((domain.as_str(), 1)))
@@ -360,6 +360,26 @@ mod tests {
                 .unwrap_err(),
             http::StatusCode::BAD_REQUEST
         );
+    }
+
+    #[tokio::test]
+    async fn direct_dpi_dns_is_explicit_digest_bound_and_acl_checked() {
+        use crate::routing::{Action, Rule};
+        let (snapshot, wire) = snapshot::Snapshot::build(
+            "scope", 2, &[Rule {
+                name: "dpi".into(), action: Action::DirectDpi,
+                domains: vec!["full:localhost".into()], ips: vec![],
+            }], &[], &[],
+        ).unwrap();
+        let published = Published { snapshot, wire: wire.into() };
+        let mut request = http::Request::new(());
+        let deadline = Duration::from_secs(2);
+        request_domain(&mut request, "localhost", [0; 32]).unwrap();
+        assert_eq!(response_data(&published, request.headers(), true, deadline).await.unwrap_err(), StatusCode::CONFLICT);
+        request_domain(&mut request, "localhost", published.snapshot.digest()).unwrap();
+        assert_eq!(response_data(&published, request.headers(), false, deadline).await.unwrap_err(), StatusCode::FORBIDDEN);
+        let ips = decode_ips(&response_data(&published, request.headers(), true, deadline).await.unwrap()).unwrap();
+        assert!(!ips.is_empty() && ips.iter().all(IpAddr::is_loopback));
     }
 
     #[tokio::test]

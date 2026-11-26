@@ -525,7 +525,7 @@ fn page_actions_for(
             ('L', "Выбрать другой профиль"),
             ('A', "Выбрать активный профиль"),
         ],
-        (Role::Client, 6) => &[('j', "Обновить состояние")],
+        (Role::Client, 6) => &[('j', "Обновить состояние"), ('d', "Разрешить / отключить Anti-DPI")],
         (Role::Client, 5) => &[('S', "Сохранить файл"), ('o', "Открыть другой файл")],
         _ => &[],
     };
@@ -566,6 +566,8 @@ fn page_actions_for(
                 (Role::Client, 'p') if !editor.system_proxy_allowed() => {
                     "Настроить и включить системный прокси"
                 }
+                (Role::Client, 'd') if editor.direct_dpi_allowed() => "Отключить Anti-DPI",
+                (Role::Client, 'd') => "Разрешить Anti-DPI",
                 (Role::Client, 'V') if !active => "Состояние выбранного профиля",
                 (_, 'z') if advanced => "Скрыть расширенные настройки",
                 _ => label,
@@ -774,6 +776,7 @@ impl RoutingPanel {
     fn action_name(action: crate::routing::Action) -> &'static str {
         match action {
             crate::routing::Action::Direct => "direct",
+            crate::routing::Action::DirectDpi => "direct_dpi",
             crate::routing::Action::Blocked => "blocked",
             crate::routing::Action::Allowed => "allowed",
         }
@@ -781,6 +784,7 @@ impl RoutingPanel {
     fn action_label(value: &str) -> &str {
         match value {
             "direct" => "Напрямую",
+            "direct_dpi" => "Anti-DPI / резерв VPS",
             "blocked" => "Блокировать",
             "allowed" => "Через сервер",
             _ => value,
@@ -905,12 +909,12 @@ impl RoutingPanel {
                     fields[*focus].clear()
                 }
                 KeyCode::Left | KeyCode::Right if *focus == 1 => {
-                    let options = ["allowed", "direct", "blocked"];
+                    let options = ["allowed", "direct", "blocked", "direct_dpi"];
                     let index = options.iter().position(|a| *a == fields[1]).unwrap_or(0);
                     let next = if key.code == KeyCode::Right {
-                        (index + 1) % 3
+                        (index + 1) % options.len()
                     } else {
-                        (index + 2) % 3
+                        (index + options.len() - 1) % options.len()
                     };
                     fields[1] = options[next].into();
                 }
@@ -929,6 +933,7 @@ impl RoutingPanel {
                 KeyCode::Enter => {
                     let action = match fields[1].trim() {
                         "direct" => crate::routing::Action::Direct,
+                        "direct_dpi" => crate::routing::Action::DirectDpi,
                         "blocked" => crate::routing::Action::Blocked,
                         "allowed" => crate::routing::Action::Allowed,
                         _ => {
@@ -1105,7 +1110,7 @@ impl RoutingObservation {
                         3 => "Синхронизация выполняется".into(),
                         _ => "Правила ещё не подтверждены".into(),
                     };
-                    self.report = format!("Источник: защищённый IPC фонового клиента\n{status}\n{}\nСчётчики всего процесса, не отдельного профиля; полезные TCP-байты.", crate::traffic::routing_summary_from(routing_totals));
+                    self.report = format!("Источник: защищённый IPC фонового клиента\n{status}\n{}\nСчётчики всего процесса, не отдельного профиля; полезные TCP/UDP-байты.", crate::traffic::routing_summary_from(routing_totals));
                     self.observed = Some(std::time::Instant::now());
                 }
                 Err(TryRecvError::Empty) => return,
@@ -3256,6 +3261,18 @@ impl Interaction {
                                 if ch == 'j' && role == Role::Client && self.workspace_page == 6 {
                                     if let Some(observation) = self.routing_observation.as_mut() {
                                         observation.refresh();
+                                    }
+                                    return false;
+                                }
+                                if ch == 'd' && role == Role::Client && self.workspace_page == 6 {
+                                    if let Some(editor) = self.editor.as_mut() {
+                                        match editor.review_direct_dpi_permission() {
+                                            Ok(review) => {
+                                                self.records = Some(RecordFlow::Confirm(Box::new(review)));
+                                                editor.error = None;
+                                            }
+                                            Err(message) => editor.error = Some(message.into()),
+                                        }
                                     }
                                     return false;
                                 }
@@ -7170,12 +7187,13 @@ fn draw_page(
                 format!("Сервер: {status}\n{applied}\nВнешний сервис: проверьте через «Состояние».\nСохранение файла не применяет изменения.")
             }
             (Role::Client,6) => {
-                if editor.dirty() || editor.write_uncertain() { "Сохранённые настройки изменились. Состояние выбранного файла не подтверждено.".into() }
+                let observation = if editor.dirty() || editor.write_uncertain() { "Сохранённые настройки изменились. Состояние выбранного файла не подтверждено.".into() }
                 else if let Some(local) = ui.and_then(|u| u.client_background.as_ref()).and_then(|p| p.routing_observation(editor.saved_sha256())) {
-                    format!("Источник: локальный процесс этой панели\n{local}\nСчётчики с запуска процесса, полезные TCP-байты.")
+                    format!("Источник: локальный процесс этой панели\n{local}\nСчётчики с запуска процесса, полезные TCP/UDP-байты.")
                 } else {
                     ui.and_then(|u| u.routing_observation.as_ref()).filter(|o| o.digest == editor.saved_sha256()).map_or_else(|| "Проверяем состояние клиента…".into(), RoutingObservation::body)
-                }
+                };
+                format!("Anti-DPI в сохранённом файле: {}\n{observation}", if editor.direct_dpi_allowed() { "разрешён; TCP/TLS, экспериментально" } else { "выключен (резерв VPS)" })
             }
             (Role::Server,7) => editor.routing_settings().map_or_else(|| "Правил нет. По умолчанию весь трафик Theia идёт через сервер.".into(), |s| format!("Ревизия: {} · правил: {}\nGeoData: {}\nСохраните TOML, затем примените через Управление.", s.revision, s.rules.len(), s.datasets.as_ref().map_or("не выбраны", |m| m.release.as_str()))),
             (_,5) => format!("Файл: {}\n{}\nСохранение не меняет работающий процесс.", editor.saved_path().display(), editor.settings_summary()),
@@ -8996,7 +9014,7 @@ mod tests {
             fallback: false,
             routing_revision: 5,
             routing_state: 1,
-            routing_totals: [10, 20, 30, 40, 2, 1, 1],
+            routing_totals: [10,20,30,40,2,1,1,3,4,5,10,20,30,40,1,2,3,4,5,6],
         }))
         .unwrap();
         observation.poll();
@@ -9004,6 +9022,15 @@ mod tests {
         let screen = rendered_interaction(120, 40, &Model::new(Some(Role::Client)), &client);
         assert!(screen.contains("ревизия 5"));
         assert!(screen.contains("IPC"));
+        assert!(screen.contains("Anti-DPI"));
+        assert!(screen.contains("резерв VPS"));
+        let editor = client.editor.as_mut().unwrap();
+        assert!(!editor.direct_dpi_allowed());
+        let review = editor.review_direct_dpi_permission().unwrap();
+        assert_eq!(review.confirmation_label(), "Разрешить Anti-DPI");
+        editor.stage_record(review).unwrap();
+        assert!(editor.dirty());
+        assert!(!editor.direct_dpi_allowed());
         assert_eq!(
             std::fs::read_to_string(&client_path).unwrap(),
             client_source
@@ -9026,6 +9053,13 @@ mod tests {
         ];
         assert!(panel.key(press(KeyCode::Enter), Some(&mut editor)));
         assert_eq!(panel.settings.rules.len(), 1);
+        assert_eq!(panel.settings.rules[0].action, crate::routing::Action::Direct);
+        panel.edit(None);
+        let (_, fields, _) = panel.fields.as_mut().unwrap();
+        *fields = ["DPI".into(), "direct_dpi".into(), "example.org".into(), String::new()];
+        assert!(panel.key(press(KeyCode::Enter), Some(&mut editor)));
+        assert_eq!(panel.settings.rules[1].action, crate::routing::Action::DirectDpi);
+        assert!(panel.body().contains("Anti-DPI / резерв VPS"));
         assert!(!panel.key(press(KeyCode::Char('s')), Some(&mut editor)));
         assert!(editor.dirty());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);

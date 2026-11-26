@@ -850,6 +850,15 @@ impl AutoClient {
         self.h2.fetch_identity_document(successor).await
     }
 
+    async fn open_udp(&self,address:Address,port:u16)->Result<crate::udp_relay::Tunnel,ClientError> {
+        let (generation,cached)=self.prepare().await?;
+        if !cached {
+            if let Some(tunnel)=self.attempt_h3(generation,||self.h3.open_udp(address.clone(),port)).await? { return Ok(crate::udp_relay::Tunnel::H3(Box::new(tunnel))); }
+        }
+        if !self.same_scope(generation)? { return Err(ClientError::QuicUnreachable); }
+        self.h2.open_udp(address,port).await.map(Box::new).map(crate::udp_relay::Tunnel::H2)
+    }
+
     async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
         let (generation, cached) = self.prepare().await?;
         crate::diag!(
@@ -904,8 +913,16 @@ impl AutoClient {
 
 enum ProxyTunnel {
     Direct(TcpStream),
+    Dpi(Box<DpiRoute>),
     H2(Box<Tunnel>),
     H3(Box<H3Tunnel>),
+}
+
+struct DpiRoute {
+    tunnel: crate::routing::dpi::Tunnel,
+    carrier: Carrier,
+    address: Address,
+    port: u16,
 }
 
 impl Carrier {
@@ -973,6 +990,14 @@ impl Carrier {
         }
     }
 
+    async fn open_udp(&self,address:Address,port:u16)->Result<crate::udp_relay::Tunnel,ClientError> {
+        match self {
+            Self::H2(c)=>c.open_udp(address,port).await.map(Box::new).map(crate::udp_relay::Tunnel::H2),
+            Self::H3(c)=>c.open_udp(address,port).await.map(Box::new).map(crate::udp_relay::Tunnel::H3),
+            Self::Auto(c)=>c.open_udp(address,port).await,
+        }
+    }
+
     async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
         match self {
             Self::H2(client) => client
@@ -1005,17 +1030,12 @@ impl Carrier {
     }
 }
 
-async fn routed_open(
-    carrier: &Carrier,
-    cache: &Cache,
-    address: Address,
-    port: u16,
-) -> Result<ProxyTunnel, ClientError> {
+async fn route_decision(carrier:&Carrier,cache:&Cache,address:&Address)->Result<(Arc<Snapshot>,Action,Option<Vec<IpAddr>>),ClientError> {
     let snapshot = cache.get(|known| carrier.fetch_routing(known)).await?;
     let policy = snapshot.policy();
     let denied = || ClientError::Open(ErrorCode::PolicyDenied);
     let mut pinned = None;
-    let action = match &address {
+    let action = match address {
         Address::V4(ip) => policy
             .matching_action(None, Some(IpAddr::V4(Ipv4Addr::from(*ip))))
             .map_err(|_| denied())?
@@ -1050,15 +1070,60 @@ async fn routed_open(
             }
         },
     };
+    Ok((snapshot,action,pinned))
+}
+
+async fn routed_open(carrier:&Carrier,cache:&Cache,address:Address,port:u16)->Result<ProxyTunnel,ClientError> {
+    let (snapshot,action,pinned)=route_decision(carrier,cache,&address).await?;
+    let policy=snapshot.policy();
+    let denied=||ClientError::Open(ErrorCode::PolicyDenied);
     match action {
         Action::Blocked => {
             crate::traffic::blocked();
             Err(denied())
         }
         Action::Allowed => carrier.open(address, port).await,
+        Action::DirectDpi => {
+            // Initial native backend supports domain HTTPS TCP only. Resolve
+            // via the authenticated policy endpoint, never the local resolver.
+            if cache.dpi.enabled() && port == 443 {
+                if let Address::Dns(name) = &address {
+                    let ips = match pinned {
+                        Some(ips) => ips,
+                        None => carrier.resolve_routing(name, snapshot.digest()).await?,
+                    };
+                    let permitted = ips.iter().all(|ip| {
+                        policy.matching_action(Some(name), Some(*ip))
+                            == Ok(Some(Action::DirectDpi))
+                    });
+                    if permitted {
+                        if let Some(tunnel) = cache.dpi.open(name, port, &ips, snapshot.digest()).await {
+                            return Ok(ProxyTunnel::Dpi(Box::new(DpiRoute {
+                                tunnel, carrier: carrier.clone(), address, port,
+                            })));
+                        }
+                    }
+                }
+            }
+            // Failed local probe/dial or unsupported traffic uses the same
+            // authenticated VPS carrier. No silent unprotected direct route.
+            let tunnel = carrier.open(address, port).await?;
+            crate::traffic::dpi_fallback_open();
+            Ok(tunnel)
+        }
         Action::Direct => client_state::dial_direct(address, port, pinned)
             .await
             .map(ProxyTunnel::Direct),
+    }
+}
+
+async fn routed_udp(carrier:&Carrier,cache:&Cache,address:Address,port:u16)->Result<crate::udp_relay::Tunnel,ClientError> {
+    let (_,action,pinned)=route_decision(carrier,cache,&address).await?;
+    match action {
+        Action::Blocked=>{ crate::traffic::blocked(); Err(ClientError::Open(ErrorCode::PolicyDenied)) },
+        Action::Direct=>crate::udp_relay::direct(address,port,pinned).await.map(crate::udp_relay::Tunnel::Direct),
+        Action::Allowed=>carrier.open_udp(address,port).await,
+        Action::DirectDpi=>{ let tunnel=carrier.open_udp(address,port).await?; crate::traffic::udp_dpi_fallback(); Ok(tunnel) },
     }
 }
 
@@ -1096,8 +1161,9 @@ impl ProxyClient {
             }
         };
         format!(
-            "{report}\n{}\n{}",
+            "{report}\n{}\nЛокальный Anti-DPI: {}\n{}",
             self.routing_cache().report(),
+            if self.routing_cache().dpi.enabled() { "разрешён (экспериментальный TCP/TLS)" } else { "выключен; резерв VPS" },
             crate::traffic::routing_summary()
         )
     }
@@ -1117,6 +1183,13 @@ impl ProxyClient {
                     .get(|known| generation.carrier.fetch_routing(known))
                     .await
             }
+        }
+    }
+
+    async fn open_udp(&self,address:Address,port:u16)->Result<crate::udp_relay::Tunnel,ClientError> {
+        match self {
+            Self::Direct(c)=>routed_udp(&c.carrier,&c.routing,address,port).await,
+            Self::Reality(c)=>{ let generation=c.generation().await?; routed_udp(&generation.carrier,&c.routing,address,port).await }
         }
     }
 
@@ -1169,7 +1242,7 @@ pub(crate) fn xhttp_observation(code: u8) -> &'static str {
 impl ProxyTunnel {
     fn open_code(&self) -> u8 {
         let (transport, up) = match self {
-            Self::Direct(_) => return 0,
+            Self::Direct(_) | Self::Dpi(_) => return 0,
             Self::H2(t) => (2, t.opened_stream_up()),
             Self::H3(t) => (3, t.opened_stream_up()),
         };
@@ -1179,6 +1252,24 @@ impl ProxyTunnel {
     async fn relay(self, socket: TcpStream) -> Result<(), ClientError> {
         match self {
             Self::Direct(target) => client_state::relay_direct(socket, target).await,
+            Self::Dpi(route) => {
+                let DpiRoute { tunnel, carrier, address, port } = *route;
+                match tunnel.relay(socket).await? {
+                    crate::routing::dpi::RelayOutcome::Finished => Ok(()),
+                    crate::routing::dpi::RelayOutcome::Fallback { client, prefix } => {
+                        // The origin received no application bytes. The carrier
+                        // repeats server admission/ACL for the original target.
+                        let tunnel = carrier.open(address, port).await?;
+                        let local = crate::reality_tcp::Prefixed::new(client, prefix.into());
+                        crate::traffic::dpi_fallback_open();
+                        match tunnel {
+                            Self::H2(tunnel) => tunnel.relay(local).await,
+                            Self::H3(tunnel) => tunnel.relay(local).await,
+                            _ => Err(ClientError::Protocol),
+                        }
+                    }
+                }
+            },
             Self::H2(tunnel) => tunnel.relay(socket).await,
             Self::H3(tunnel) => tunnel.relay(socket).await,
         }
@@ -1233,7 +1324,7 @@ impl ClientRuntime {
             stage: tokio::sync::Mutex::new(()),
         })
     }
-    pub(crate) async fn status(&self) -> (u64, [u8; 32], u64, u8, u8, bool, (u64, u8), [u64; 7]) {
+    pub(crate) async fn status(&self) -> (u64, [u8; 32], u64, u8, u8, bool, (u64, u8), [u64; 20]) {
         let view = self.slot.borrow().clone();
         let (desc, observed, fallback) = match &view.client {
             ProxyClient::Reality(r) => {
@@ -1325,6 +1416,7 @@ impl ClientRuntime {
             )
             .await?
         };
+        client.routing_cache().dpi.set_enabled(candidate.client.proxy.direct_dpi.unwrap_or(false));
         Box::pin(client.routing_policy()).await?;
         saved_client_bytes(&self.path, digest)?;
         Ok((candidate, client))
@@ -1472,6 +1564,7 @@ async fn prepare_proxy(
         Some(path),
     )
     .await?;
+    client.routing_cache().dpi.set_enabled(document.client.proxy.direct_dpi.unwrap_or(false));
     client.routing_policy().await?;
     crate::diag!(Info, "client.proxy", "transport_preflight_passed");
     // All startup validation and both binds must succeed before accepting.
@@ -1793,7 +1886,9 @@ async fn socks_reply(socket: &mut TcpStream, code: u8) -> Result<(), ClientError
         .map_err(|_| ClientError::Io)
 }
 
-async fn socks_target(socket: &mut TcpStream) -> Result<(Address, u16), ClientError> {
+enum SocksRequest { Connect(Address,u16), Associate(Address,u16) }
+
+async fn socks_request(socket: &mut TcpStream) -> Result<SocksRequest, ClientError> {
     let mut greeting = [0; 2];
     socket
         .read_exact(&mut greeting)
@@ -1828,7 +1923,7 @@ async fn socks_target(socket: &mut TcpStream) -> Result<(Address, u16), ClientEr
         socks_reply(socket, 1).await?;
         return Err(ClientError::Protocol);
     }
-    if request[1] != 1 {
+    if !matches!(request[1],1|3) {
         socks_reply(socket, 7).await?;
         return Err(ClientError::Protocol);
     }
@@ -1870,8 +1965,9 @@ async fn socks_target(socket: &mut TcpStream) -> Result<(Address, u16), ClientEr
         }
     };
     let port = socket.read_u16().await.map_err(|_| ClientError::Io)?;
+    if request[1]==3 { return Ok(SocksRequest::Associate(address,port)); }
     match validate_target(address, port) {
-        Ok(target) => Ok(target),
+        Ok((address,port)) => Ok(SocksRequest::Connect(address,port)),
         Err(error) => {
             socks_reply(socket, 8).await?;
             Err(error)
@@ -1907,9 +2003,10 @@ async fn handle(
             Err(_) => return Err(ClientError::Timeout),
         }
     } else {
-        timeout(NEGOTIATE_TIMEOUT, socks_target(&mut socket))
-            .await
-            .map_err(|_| ClientError::Timeout)??
+        match timeout(NEGOTIATE_TIMEOUT,socks_request(&mut socket)).await.map_err(|_|ClientError::Timeout)?? {
+            SocksRequest::Connect(address,port)=>(address,port),
+            SocksRequest::Associate(address,port)=>return udp_association(socket,client,address,port).await,
+        }
     };
     crate::diag!(
         Debug,
@@ -2919,7 +3016,7 @@ mod selector_tests {
         );
     }
 
-    async fn paired() -> (TcpStream, TcpStream) {
+    pub(super) async fn paired() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (left, right) = tokio::join!(TcpStream::connect(address), listener.accept());
@@ -3125,6 +3222,12 @@ mod selector_tests {
                         domains: vec!["full:blocked.invalid".into()],
                         ips: vec![],
                     },
+                    crate::routing::Rule {
+                        name: "dpi fallback".into(),
+                        action: Action::DirectDpi,
+                        domains: vec![],
+                        ips: vec!["127.0.0.1/32".into()],
+                    },
                 ],
             }),
             allow_private_ips: true,
@@ -3161,7 +3264,7 @@ mod selector_tests {
         let quic_addr = quic.local_addr().unwrap();
         let h3 = tokio::spawn(crate::h3_server::serve(quic, context));
 
-        timeout(Duration::from_secs(25), async {
+        timeout(Duration::from_secs(50), async {
             for (transport, remote, http) in [
                 (Transport::H2, tcp_addr, true),
                 (Transport::H3, quic_addr, false),
@@ -3172,6 +3275,44 @@ mod selector_tests {
                 let proxy_client = load_client(&profile).await.unwrap();
                 let policy = proxy_client.routing_policy().await.unwrap();
                 assert_eq!(policy.manifest().revision, 2);
+                assert_eq!(
+                    policy.policy().matching_action(None, Some("127.0.0.1".parse().unwrap())).unwrap(),
+                    Some(Action::DirectDpi)
+                );
+                let dpi_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let dpi_port = dpi_listener.local_addr().unwrap().port();
+                let dpi_tunnel = proxy_client.open(Address::V4([127, 0, 0, 1]), dpi_port).await.unwrap();
+                assert!(matches!(dpi_tunnel, ProxyTunnel::H2(_) | ProxyTunnel::H3(_)));
+                let _dpi_accepted = dpi_listener.accept().await.unwrap();
+                drop(dpi_tunnel);
+                drop(_dpi_accepted);
+                // Exercise deferred fallback on both carriers without making
+                // any public connections or weakening production IP checks.
+                let fallback = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let fallback_port = fallback.local_addr().unwrap().port();
+                let (origin, mut observer) = paired().await;
+                let (mut app, local) = paired().await;
+                let ProxyClient::Direct(client) = &proxy_client else { panic!("expected own TLS") };
+                let route = ProxyTunnel::Dpi(Box::new(DpiRoute {
+                    tunnel: crate::routing::dpi::Tunnel::fixture(origin,"example.org"),
+                    carrier: client.carrier.clone(), address: Address::V4([127,0,0,1]), port: fallback_port,
+                }));
+                let task = tokio::spawn(route.relay(local));
+                app.write_all(b"not TLS, exact prefix").await.unwrap();
+                app.shutdown().await.unwrap();
+                let (mut destination, _) = fallback.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                destination.read_to_end(&mut bytes).await.unwrap();
+                assert_eq!(bytes,b"not TLS, exact prefix");
+                destination.write_all(b"ok").await.unwrap();
+                destination.shutdown().await.unwrap();
+                let mut reply = Vec::new();
+                app.read_to_end(&mut reply).await.unwrap();
+                assert_eq!(reply,b"ok");
+                task.await.unwrap().unwrap();
+                let mut leaked = Vec::new();
+                observer.read_to_end(&mut leaked).await.unwrap();
+                assert!(leaked.is_empty());
                 assert!(matches!(
                     proxy_client
                         .open(Address::Dns("blocked.invalid".into()), 443)
@@ -3195,6 +3336,7 @@ mod selector_tests {
                         Err(ClientError::Open(ErrorCode::PolicyDenied))
                     ));
                 }
+                udp_socks_fixture(&proxy_client).await;
                 let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let port = target.local_addr().unwrap().port();
                 let echo = tokio::spawn(async move {
@@ -3242,4 +3384,171 @@ mod selector_tests {
         h2.abort();
         h3.abort();
     }
+}
+
+#[cfg(test)]
+async fn socks_target(socket:&mut TcpStream)->Result<(Address,u16),ClientError>{ match socks_request(socket).await? { SocksRequest::Connect(a,p)=>Ok((a,p)), _=>Err(ClientError::Protocol) } }
+
+async fn udp_association(mut control:TcpStream,client:&ProxyClient,requested:Address,port:u16)->Result<(),ClientError> {
+    use crate::udp_relay::{self, MAX_FLOWS, QUEUE};
+    use tokio::sync::mpsc;
+    let peer=control.peer_addr().map_err(|_|ClientError::Io)?;
+    let local=control.local_addr().map_err(|_|ClientError::Io)?;
+    if !peer.ip().is_loopback() || !local.ip().is_loopback() || !udp_relay::valid_associate(&requested,peer.ip()) {
+        socks_reply(&mut control,2).await?;
+        return Err(ClientError::Open(ErrorCode::PolicyDenied));
+    }
+    let socket=Arc::new(tokio::net::UdpSocket::bind(SocketAddr::new(local.ip(),0)).await.map_err(|_|ClientError::Io)?);
+    let bound=socket.local_addr().map_err(|_|ClientError::Io)?;
+    timeout(REPLY_TIMEOUT,control.write_all(&udp_relay::associate_reply(bound))).await.map_err(|_|ClientError::Timeout)?.map_err(|_|ClientError::Io)?;
+    let mut pinned=if port==0 {None} else {Some(SocketAddr::new(peer.ip(),port))};
+    type Observer=Arc<std::sync::Mutex<crate::routing::dpi::udp::Observer>>;
+    let mut flows=std::collections::HashMap::<(Address,u16),(mpsc::Sender<Vec<u8>>,Observer)>::new();
+    let mut tasks=tokio::task::JoinSet::new();
+    let mut buf=vec![0;65536];
+    let mut control_byte=[0;1];
+    loop {
+        tokio::select! {
+            result=control.read(&mut control_byte)=>{
+                return match result { Ok(0)=>Ok(()), Ok(_)=>Err(ClientError::Protocol), Err(_)=>Err(ClientError::Io) };
+            }
+            _=tasks.join_next(), if !tasks.is_empty()=>{ flows.retain(|_,(tx,_)|!tx.is_closed()); }
+            result=socket.recv_from(&mut buf)=>{
+                let (n,source)=result.map_err(|_|ClientError::Io)?;
+                if source.ip()!=peer.ip() || pinned.is_some_and(|old|old!=source) { continue; }
+                let Some((address,port,data))=udp_relay::parse_socks(&buf[..n]) else { continue; };
+                if pinned.is_none() { pinned=Some(source); }
+                let key=(address,port);
+                if let Some((tx,observer))=flows.get(&key) {
+                    // Full queue drops the datagram, never replays it.
+                    if !tx.is_closed() {
+                        if tx.try_send(data.to_vec()).is_ok(){observer.lock().unwrap_or_else(|e|e.into_inner()).outgoing(data);}
+                        continue;
+                    }
+                }
+                flows.retain(|_,(tx,_)|!tx.is_closed());
+                if tasks.len()>=MAX_FLOWS { continue; }
+                let (tx,rx)=mpsc::channel(QUEUE);
+                let _=tx.try_send(data.to_vec());
+                let observer=Arc::new(std::sync::Mutex::new(crate::routing::dpi::udp::Observer::default()));
+                observer.lock().unwrap_or_else(|e|e.into_inner()).outgoing(data);
+                flows.insert(key.clone(),(tx,observer.clone()));
+                let socket=socket.clone();
+                let proxy=(*client).clone();
+                tasks.spawn(async move {
+                    let (address,port)=key;
+                    let tunnel=proxy.open_udp(address.clone(),port).await?;
+                    let (down_tx,mut down_rx)=mpsc::channel(QUEUE);
+                    let relay=tunnel.relay(rx,down_tx);
+                    let deliver=async {
+                        while let Some(data)=down_rx.recv().await {
+                            observer.lock().unwrap_or_else(|e|e.into_inner()).incoming(&data);
+                            let Some(packet)=udp_relay::encode_socks(&address,port,&data) else { continue; };
+                            let _=socket.send_to(&packet,source).await.map_err(|_|ClientError::Io)?;
+                        }
+                        Ok::<(),ClientError>(())
+                    };
+                    tokio::select! { result=relay=>result, result=deliver=>result }
+                });
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+async fn udp_socks_fixture(client:&ProxyClient) {
+    use crate::udp_relay::{encode_socks,parse_socks};
+    let target=tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port=target.local_addr().unwrap().port();
+    let app=tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let app_port=app.local_addr().unwrap().port();
+    let (mut control,local)=tests::paired().await;
+    let client=(*client).clone();
+    assert!(matches!(client.open_udp(Address::Dns("blocked.invalid".into()),443).await,Err(ClientError::Open(ErrorCode::PolicyDenied))));
+    let task=tokio::spawn(async move {handle(local,false,&client,1).await});
+    let mut greeting=vec![5,1,0,5,3,0,1,127,0,0,1];greeting.extend(app_port.to_be_bytes());
+    control.write_all(&greeting).await.unwrap();
+    let mut reply=[0;12];control.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply[..6],&[5,0,5,0,0,1]);
+    let relay=SocketAddr::from(([reply[6],reply[7],reply[8],reply[9]],u16::from_be_bytes([reply[10],reply[11]])));
+    let address=Address::V4([127,0,0,1]);
+    let attacker=tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    attacker.send_to(&encode_socks(&address,port,b"wrong source").unwrap(),relay).await.unwrap();
+    let mut buf=vec![0;65536];
+    assert!(timeout(Duration::from_millis(40),target.recv_from(&mut buf)).await.is_err());
+    let mut stun=vec![0,1,0,0,0x21,0x12,0xa4,0x42];stun.extend([7;12]);
+    let hello=crate::routing::dpi::test_hello();
+    let quic=crate::reality_quic_wire::test_initial(crate::reality_quic_wire::V1,&hello[5..]);
+    for (index,data) in [stun,quic,vec![],b"last".to_vec()].into_iter().enumerate() {
+        let packet=encode_socks(&address,port,&data).unwrap();
+        app.send_to(&packet,relay).await.unwrap();
+        let (n,peer)=timeout(Duration::from_secs(3),target.recv_from(&mut buf)).await.unwrap().unwrap();
+        assert_eq!(&buf[..n],data);
+        let response=if index==0 {
+            // Minimal Binding success with the observed VPS source.
+            let mut response=data.clone();response[0]=1;response[3]=12;
+            response.extend([0,0x20,0,8,0,1]);
+            response.extend((peer.port()^0x2112).to_be_bytes());
+            let IpAddr::V4(ip)=peer.ip() else {panic!("fixture IPv4")};
+            response.extend(ip.octets().into_iter().zip([0x21,0x12,0xa4,0x42]).map(|(a,b)|a^b));
+            response
+        } else {data};
+        target.send_to(&response,peer).await.unwrap();
+        let (n,source)=timeout(Duration::from_secs(3),app.recv_from(&mut buf)).await.unwrap().unwrap();
+        assert_eq!(source,relay);
+        assert_eq!(parse_socks(&buf[..n]),Some((address.clone(),port,response.as_slice())));
+    }
+    udp_quic_fixture(app,relay).await;
+    control.shutdown().await.unwrap();
+    timeout(Duration::from_secs(3),task).await.unwrap().unwrap().unwrap();
+}
+
+#[cfg(test)]
+async fn udp_quic_fixture(app:tokio::net::UdpSocket,relay:SocketAddr){
+    let cert=rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let der=cert.cert.der().clone();
+    let mut roots=rustls::RootCertStore::empty();
+    roots.add(der.clone()).unwrap();
+    let origin=crate::quic_transport::server_endpoint("127.0.0.1:0".parse().unwrap(),vec![der],
+        rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into()).unwrap();
+    let origin_port=origin.local_addr().unwrap().port();
+    let endpoint=crate::quic_transport::client_endpoint("127.0.0.1:0".parse().unwrap(),roots).unwrap();
+    let client_addr=endpoint.local_addr().unwrap();
+    let bridge_addr=app.local_addr().unwrap();
+    let bridge=tokio::spawn(async move {
+        let target=Address::V4([127,0,0,1]);
+        let mut buf=vec![0;65536];
+        loop {
+            let (n,source)=app.recv_from(&mut buf).await.unwrap();
+            if source==client_addr {
+                if let Some(wire)=crate::udp_relay::encode_socks(&target,origin_port,&buf[..n]){
+                    app.send_to(&wire,relay).await.unwrap();
+                }
+            } else if source==relay {
+                if let Some((address,port,data))=crate::udp_relay::parse_socks(&buf[..n]){
+                    if address==target && port==origin_port {app.send_to(data,client_addr).await.unwrap();}
+                }
+            }
+        }
+    });
+    let server=async {
+        let connection=crate::quic_transport::accept(origin.accept().await.unwrap()).await.unwrap();
+        let (mut tx,mut rx)=connection.accept_bi().await.unwrap();
+        let bytes=rx.read_to_end(64).await.unwrap();
+        assert_eq!(bytes,b"nested quic");
+        tx.write_all(&bytes).await.unwrap();
+        tx.finish().unwrap();
+        connection
+    };
+    let client=async {
+        let connection=crate::quic_transport::connect(&endpoint,bridge_addr,"localhost").await.unwrap();
+        let (mut tx,mut rx)=connection.open_bi().await.unwrap();
+        tx.write_all(b"nested quic").await.unwrap();
+        tx.finish().unwrap();
+        assert_eq!(rx.read_to_end(64).await.unwrap(),b"nested quic");
+        connection
+    };
+    let (_server,_client)=timeout(Duration::from_secs(10),async {tokio::join!(server,client)}).await.unwrap();
+    bridge.abort();
+    let _=bridge.await;
 }
