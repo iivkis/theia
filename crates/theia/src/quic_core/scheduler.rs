@@ -161,6 +161,8 @@ impl Scheduler {
         self.apply_loss(result, now)
     }
 
+    pub fn base_pto(&self) -> Duration { self.rtt.pto(Duration::ZERO, 0) }
+
     fn pto_deadline(&self) -> Option<Instant> {
         if self.frames.is_empty() { return None; }
         self.last_eliciting?.checked_add(self.rtt.pto(Duration::ZERO, self.pto_count))

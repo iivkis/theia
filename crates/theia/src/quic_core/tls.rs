@@ -235,21 +235,44 @@ mod tests {
             );
             let mut c = c.unwrap();
             let mut s = s.unwrap();
-            let stream = c.open_uni().unwrap();
-            c.queue(stream, b"udp handshake", true).unwrap();
-            assert!(c.flush(Instant::now()).await.unwrap());
-            // A final handshake ACK may remain in the connected socket.
-            for _ in 0..8 {
-                s.recv(Duration::from_millis(100)).await.unwrap();
-                if s.finished(stream) { break; }
-                let mut out = [0; 13];
-                if s.read(stream, &mut out).ok() == Some(13) {
-                    assert_eq!(&out, b"udp handshake");
-                    assert!(s.finished(stream));
-                    break;
+            assert!(s.handshake_confirmed());
+            assert!(!c.handshake_confirmed());
+            assert!(c.update_keys().is_err());
+            async fn pump(from: &mut crate::quic_core::endpoint::LabSession, to: &mut crate::quic_core::endpoint::LabSession) {
+                for _ in 0..50 {
+                    if from.flush(Instant::now()).await.unwrap() {
+                        // Allow for stale handshake packets before the next 1-RTT.
+                        for _ in 0..8 {
+                            if to.recv(Duration::from_millis(100)).await.unwrap() { return; }
+                        }
+                        panic!("no protected application packet received");
+                    }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
                 }
+                panic!("scheduler did not send");
             }
+            pump(&mut s, &mut c).await;
+            assert!(c.handshake_confirmed());
+            pump(&mut c, &mut s).await;
+            let stream = c.open_bidi().unwrap();
+            c.queue(stream, b"udp handshake", true).unwrap();
+            pump(&mut c, &mut s).await;
+            let mut out = [0; 13];
+            assert_eq!(s.read(stream, &mut out).unwrap(), 13);
+            assert_eq!(&out, b"udp handshake");
             assert!(s.finished(stream));
+            pump(&mut s, &mut c).await;
+            c.update_keys().unwrap();
+            let second = c.open_uni().unwrap();
+            c.queue(second, b"new key", true).unwrap();
+            pump(&mut c, &mut s).await;
+            assert_eq!(s.read(second, &mut out).unwrap(), 7);
+            assert_eq!(&out[..7], b"new key");
+            pump(&mut s, &mut c).await;
+            s.queue(stream, b"response", true).unwrap();
+            pump(&mut s, &mut c).await;
+            assert_eq!(c.read(stream, &mut out).unwrap(), 8);
+            assert_eq!(&out[..8], b"response");
         }
     }
 

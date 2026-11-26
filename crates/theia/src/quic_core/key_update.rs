@@ -1,6 +1,6 @@
 //! Independent 1-RTT key-phase codec. The endpoint must supply authenticated
 //! ACKs, handshake confirmation and the old-key retirement deadline.
-//! Not wired into the production or loopback endpoint yet.
+//! Used by the isolated loopback endpoint; not a production key lifecycle.
 use super::{packet::{Error, Opened, ReplayWindow}, wire::decode_number};
 use rustls::quic::{DirectionalKeys, HeaderProtectionKey, PacketKey, Secrets};
 use std::time::Instant;
@@ -14,11 +14,12 @@ pub struct Sender {
     first: u64,
     phase: bool,
     acknowledged: bool,
+    generation: u64,
 }
 
 impl Sender {
     pub fn new(keys: DirectionalKeys, secrets: Secrets) -> Self {
-        Self { keys, secrets, next: 0, first: 0, phase: false, acknowledged: false }
+        Self { keys, secrets, next: 0, first: 0, phase: false, acknowledged: false, generation: 0 }
     }
 
     /// The caller must validate the ACK against its sent-packet ledger.
@@ -28,6 +29,19 @@ impl Sender {
 
     pub fn update(&mut self, handshake_confirmed: bool) -> Result<(), Error> {
         if !handshake_confirmed || !self.acknowledged { return Err(Error::Crypto); }
+        self.advance()
+    }
+
+    /// The caller obtained generation from an authenticated receive-key
+    /// transition. A response is not a new locally initiated update.
+    pub(crate) fn respond(&mut self, generation: u64) -> Result<(), Error> {
+        if generation <= self.generation { return Ok(()); }
+        if self.generation.checked_add(1) != Some(generation) { return Err(Error::Crypto); }
+        self.advance()
+    }
+
+    fn advance(&mut self) -> Result<(), Error> {
+        self.generation = self.generation.checked_add(1).ok_or(Error::Limit)?;
         self.keys.packet = self.secrets.next_packet_keys().local;
         self.first = self.next;
         self.phase = !self.phase;
@@ -81,14 +95,17 @@ pub struct Receiver {
     first_current: u64,
     replay: ReplayWindow,
     failures: u64,
+    generation: u64,
 }
 
 impl Receiver {
     pub fn new(keys: DirectionalKeys, mut secrets: Secrets) -> Self {
         let next = secrets.next_packet_keys().remote;
         Self { header: keys.header, current: keys.packet, next, secrets, previous: None,
-            phase: false, first_current: 0, replay: ReplayWindow::default(), failures: 0 }
+            phase: false, first_current: 0, replay: ReplayWindow::default(), failures: 0, generation: 0 }
     }
+
+    pub fn generation(&self) -> u64 { self.generation }
 
     pub fn expire(&mut self, now: Instant) {
         if self.previous.as_ref().is_some_and(|p| now >= p.expires) {
@@ -146,6 +163,7 @@ impl Receiver {
         if first & 0x18 != 0 { return Err(Error::Reserved); }
         self.replay.accept(pn)?;
         if is_next {
+            self.generation = self.generation.checked_add(1).ok_or(Error::Limit)?;
             let next = self.secrets.next_packet_keys().remote;
             let old = std::mem::replace(&mut self.current, std::mem::replace(&mut self.next, next));
             self.previous = Some(Previous { key: old, expires: old_key_deadline });

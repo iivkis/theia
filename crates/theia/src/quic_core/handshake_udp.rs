@@ -9,7 +9,7 @@ use super::{
     scheduler::Scheduler, spaces::Space, tls, wire::{encode_varint, varint, Version},
 };
 use rustls::{crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256, pki_types::ServerName,
-    quic::{self, KeyChange, Keys}, ClientConfig, ServerConfig, Side};
+    quic::{self, KeyChange, Keys, Secrets}, ClientConfig, ServerConfig, Side};
 use std::{io, net::SocketAddr, sync::Arc, time::{Duration, Instant}};
 use tokio::net::UdpSocket;
 
@@ -113,7 +113,7 @@ fn parse_header(packet: &[u8], version: Version, local: &[u8; CID_LEN],
 struct Handshake {
     driver: Driver,
     epochs: [Option<Epoch>; 2],
-    application: Option<Keys>,
+    application: Option<(Keys, Secrets)>,
     budget: PathBudget,
     server: bool,
     version: Version,
@@ -134,7 +134,7 @@ impl Handshake {
             }
             match flight.keys {
                 Some(KeyChange::Handshake { keys }) if self.epochs[1].is_none() => self.epochs[1] = Some(Epoch::new(keys)),
-                Some(KeyChange::OneRtt { keys, .. }) if self.application.is_none() => self.application = Some(keys),
+                Some(KeyChange::OneRtt { keys, next }) if self.application.is_none() => self.application = Some((keys, next)),
                 Some(_) => return Err(Error::Protocol),
                 None => {}
             }
@@ -254,6 +254,7 @@ pub async fn establish(socket: UdpSocket, peer: SocketAddr, version: Version,
         || [0x05, 0x06, 0x07].into_iter().any(|id| peer_params.integer(id) != Ok(Some(CREDIT))) {
         return Err(Error::Protocol);
     }
-    LabSession::connect(socket, peer, server, local, remote, handshake.application.take().ok_or(Error::Protocol)?)
+    let (keys, secrets) = handshake.application.take().ok_or(Error::Protocol)?;
+    LabSession::after_handshake(socket, peer, server, local, remote, keys, secrets)
         .await.map_err(Error::Endpoint)
 }

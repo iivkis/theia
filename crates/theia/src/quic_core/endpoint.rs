@@ -4,7 +4,8 @@
 //! endpoint, interoperable H3 backend or an admitted Theia user tunnel.
 use super::{ack_tx::History, flow::ReceiveFlow, frames::{self, Frame}, packet::{self, Reader, Writer},
     scheduler::Scheduler, send_flow::SendFlow, spaces::Space};
-use rustls::quic::Keys;
+use rustls::quic::{Keys, Secrets};
+use super::key_update;
 use std::{io, net::SocketAddr, time::{Duration, Instant}};
 use tokio::net::UdpSocket;
 
@@ -25,18 +26,23 @@ pub enum Error {
     Schedule(super::scheduler::Error),
 }
 
+enum Protection {
+    Fixed { reader: Reader, writer: Writer },
+    Rotating { reader: key_update::Receiver, writer: key_update::Sender },
+}
+
 pub struct LabSession {
     socket: UdpSocket,
     local_cid: [u8; CID_LEN],
     remote_cid: [u8; CID_LEN],
-    reader: Reader,
-    writer: Writer,
+    protection: Protection,
     acknowledgments: History,
     send: SendFlow,
     receive: ReceiveFlow,
     scheduler: Scheduler,
     closed: bool,
     server: bool,
+    confirmed: bool,
 }
 
 impl LabSession {
@@ -46,6 +52,26 @@ impl LabSession {
     pub async fn connect(socket: UdpSocket, peer: SocketAddr, server: bool,
                          local_cid: [u8; CID_LEN], remote_cid: [u8; CID_LEN],
                          keys: Keys) -> Result<Self, Error> {
+        Self::connect_inner(socket, peer, server, local_cid, remote_cid,
+            Protection::Fixed { reader: Reader::new(keys.remote), writer: Writer::new(keys.local) }, false).await
+    }
+
+    /// Only the UDP handshake driver can construct this session. Server
+    /// TLS completion confirms its handshake; the client waits for the
+    /// authenticated HANDSHAKE_DONE frame.
+    pub(crate) async fn after_handshake(socket: UdpSocket, peer: SocketAddr, server: bool,
+                         local_cid: [u8; CID_LEN], remote_cid: [u8; CID_LEN],
+                         keys: Keys, secrets: Secrets) -> Result<Self, Error> {
+        let mut session = Self::connect_inner(socket, peer, server, local_cid, remote_cid,
+            Protection::Rotating { reader: key_update::Receiver::new(keys.remote, secrets.clone()),
+                writer: key_update::Sender::new(keys.local, secrets) }, server).await?;
+        if server { session.scheduler.enqueue(vec![0x1e]).map_err(Error::Schedule)?; }
+        Ok(session)
+    }
+
+    async fn connect_inner(socket: UdpSocket, peer: SocketAddr, server: bool,
+                         local_cid: [u8; CID_LEN], remote_cid: [u8; CID_LEN],
+                         protection: Protection, confirmed: bool) -> Result<Self, Error> {
         let local = socket.local_addr().map_err(Error::Io)?;
         if !local.ip().is_loopback() || !peer.ip().is_loopback() || peer.port() == 0
             || local == peer || local_cid == remote_cid || local_cid == [0; CID_LEN]
@@ -56,10 +82,19 @@ impl LabSession {
         let mut receive = ReceiveFlow::new(server, MAX_STREAMS, MAX_STREAMS, FLOW_LIMIT,
             FLOW_LIMIT as usize, FLOW_LIMIT).map_err(Error::Receive)?;
         receive.enable_local_bidi(MAX_STREAMS).map_err(Error::Receive)?;
-        Ok(Self { socket, local_cid, remote_cid, reader: Reader::new(keys.remote),
-            writer: Writer::new(keys.local), acknowledgments: History::default(),
+        Ok(Self { socket, local_cid, remote_cid, protection, acknowledgments: History::default(),
             send, receive,
-            scheduler: Scheduler::default(), closed: false, server })
+            scheduler: Scheduler::default(), closed: false, server, confirmed })
+    }
+
+    pub fn handshake_confirmed(&self) -> bool { self.confirmed }
+
+    pub fn update_keys(&mut self) -> Result<(), Error> {
+        if self.closed { return Err(Error::Closed); }
+        match &mut self.protection {
+            Protection::Rotating { writer, .. } => writer.update(self.confirmed).map_err(Error::Packet),
+            Protection::Fixed { .. } => Err(Error::Protocol),
+        }
     }
 
     pub fn open_uni(&mut self) -> Result<u64, Error> {
@@ -161,7 +196,10 @@ impl LabSession {
         let mut header = vec![0x43];
         header.extend_from_slice(&self.remote_cid);
         header.extend_from_slice(&[0; 4]);
-        let (number, packet) = self.writer.seal(&header, &payload).map_err(Error::Packet)?;
+        let (number, packet) = match &mut self.protection {
+            Protection::Fixed { writer, .. } => writer.seal(&header, &payload),
+            Protection::Rotating { writer, .. } => writer.seal(&self.remote_cid, &payload),
+        }.map_err(Error::Packet)?;
         self.scheduler.record(number, packet.len(), frame, now).map_err(Error::Schedule)?;
         if self.socket.send(&packet).await.map_err(Error::Io)? != packet.len() {
             return Err(Error::Protocol);
@@ -187,20 +225,41 @@ impl LabSession {
         };
         if n > MTU || n < 1 + CID_LEN + 4 + 16 || buf[0] & 0xc0 != 0x40
             || buf[1..1 + CID_LEN] != self.local_cid { return Ok(false); }
-        let opened = match self.reader.open(&buf[..n], 1 + CID_LEN) {
+        let now = Instant::now();
+        let old_key_deadline = now.checked_add(self.scheduler.base_pto().saturating_mul(3)).ok_or(Error::Protocol)?;
+        let result = match &mut self.protection {
+            Protection::Fixed { reader, .. } => reader.open(&buf[..n], 1 + CID_LEN),
+            Protection::Rotating { reader, writer } => {
+                match reader.open(&self.local_cid, &buf[..n], now, old_key_deadline, self.confirmed) {
+                    Ok(packet) => {
+                        writer.respond(reader.generation()).map_err(Error::Packet)?;
+                        Ok(packet)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        };
+        let opened = match result {
             Ok(p) => p,
             Err(packet::Error::Reserved | packet::Error::Limit) => return Err(Error::Protocol),
             Err(_) => return Ok(false),
         };
-        // No key phase changes or negotiated fixed-bit greasing in this fixture.
-        if opened.header[0] & 0x04 != 0 { return Err(Error::Protocol); }
+        if matches!(&self.protection, Protection::Fixed { .. }) && opened.header[0] & 0x04 != 0 { return Err(Error::Protocol); }
         let parsed = frames::decode(&opened.payload, Space::Application).map_err(|_| Error::Protocol)?;
         let eliciting = parsed.iter().any(|f| !matches!(f, Frame::Ack(_) | Frame::Padding | Frame::Close { .. }));
         let now = Instant::now();
         for frame in parsed {
             match frame {
                 Frame::Padding | Frame::Ping => {}
-                Frame::Ack(ack) => self.scheduler.acknowledge(&ack, now).map_err(Error::Schedule)?,
+                Frame::Ack(ack) => {
+                    self.scheduler.acknowledge(&ack, now).map_err(Error::Schedule)?;
+                    if let Protection::Rotating { writer, .. } = &mut self.protection {
+                        if let Some(range) = ack.ranges.first() { writer.acknowledged(range.last); }
+                    }
+                }
+                Frame::HandshakeDone if !self.server && matches!(&self.protection, Protection::Rotating { .. }) => {
+                    self.confirmed = true;
+                }
                 Frame::Stream { id, offset, data, fin } => {
                     self.receive.insert(id, offset, data, fin).map_err(Error::Receive)?;
                     if id & 2 == 0 && id & 1 != u64::from(self.server) {
