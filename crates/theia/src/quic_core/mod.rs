@@ -31,6 +31,9 @@ pub mod stream;
 pub mod tls;
 pub mod wire;
 
+#[cfg(test)]
+mod mutation_tests;
+
 /// The experimental native transport must never become an externally reachable
 /// carrier before independent admission and interoperability acceptance.
 pub(crate) fn loopback_pair(local: std::net::SocketAddr, peer: std::net::SocketAddr) -> bool {

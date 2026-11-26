@@ -994,9 +994,22 @@ impl LabSession {
                         .map_err(Error::Receive)?;
                     self.register_implicit(id)?;
                 }
-                Frame::StopSending { id, code } => self.reset_stream(id, code)?,
+                Frame::NewToken(_) if !self.server => {
+                    // No address-token cache or 0-RTT in this backend. Never
+                    // accept a peer's token as identity or admission evidence.
+                }
+                Frame::DataBlocked(_) | Frame::StreamsBlocked { .. } => {},
+                Frame::StreamDataBlocked { id, .. } => {
+                    self.receive.check_stop(id).map_err(Error::Receive)?;
+                    self.register_implicit(id)?;
+                }
+                Frame::StopSending { id, code } => {
+                    if id & 2 == 0 && id & 1 != u64::from(self.server) { self.register_implicit(id)?; }
+                    self.reset_stream(id, code)?;
+                }
                 Frame::MaxData(n) => self.send.max_data(n).map_err(Error::Send)?,
                 Frame::MaxStreamData { id, limit } => {
+                    if id & 2 == 0 && id & 1 != u64::from(self.server) { self.register_implicit(id)?; }
                     self.send.max_stream_data(id, limit).map_err(Error::Send)?
                 }
                 Frame::MaxStreams { bidi: false, limit } => self
