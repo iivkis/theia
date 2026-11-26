@@ -1176,7 +1176,14 @@ impl Tunnel {
 
     /// Relay a local duplex byte stream after OPEN_OK. Each direction has
     /// independent flow control, one bounded frame buffer and FIN state.
-    pub async fn relay<S>(mut self, local: S) -> Result<(), ClientError>
+    pub async fn relay<S>(self, local: S) -> Result<(), ClientError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        self.relay_guarded(local, None).await
+    }
+
+    pub(crate) async fn relay_guarded<S>(mut self, local: S, flow: Option<&crate::routing::flow::FlowLease>) -> Result<(), ClientError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -1202,6 +1209,7 @@ impl Tunnel {
         let upload = async {
             let mut buffer = [0; crate::relay_batch::MAX_BATCH];
             let mut batch = crate::relay_batch::ReadyBatch::default();
+            let mut first_send = crate::routing::flow::FirstSend::new(flow, crate::routing::PacketAction::Redirect);
             loop {
                 let size = batch
                     .read(&mut read, &mut buffer)
@@ -1223,6 +1231,7 @@ impl Tunnel {
                 upload_state
                     .apply(Direction::Send, &frame)
                     .map_err(|_| ClientError::Protocol)?;
+                if size != 0 { first_send.attempt()?; }
                 timeout(IO_TIMEOUT, send_frame(outgoing, &frame, size == 0))
                     .await
                     .map_err(|_| ClientError::Timeout)??;

@@ -1528,9 +1528,8 @@ impl ProxyTunnel {
     }
 
     async fn relay_guarded(self, socket: TcpStream, flow: Option<&crate::routing::flow::FlowLease>) -> Result<(), ClientError> {
-        use crate::routing::{flow::GuardedIo, PacketAction};
         match self {
-            Self::Direct(target) => client_state::relay_direct(GuardedIo::new(socket, flow, PacketAction::Pass), target).await,
+            Self::Direct(target) => client_state::relay_direct_guarded(socket, target, flow).await,
             Self::Dpi(route) => {
                 let DpiRoute {
                     tunnel,
@@ -1555,15 +1554,15 @@ impl ProxyTunnel {
                         let local = crate::reality_tcp::Prefixed::new(client, prefix.into());
                         crate::traffic::dpi_fallback_open();
                         match tunnel {
-                            Self::H2(tunnel) => tunnel.relay(GuardedIo::new(local, flow, PacketAction::Redirect)).await,
-                            Self::H3(tunnel) => tunnel.relay(GuardedIo::new(local, flow, PacketAction::Redirect)).await,
+                            Self::H2(tunnel) => tunnel.relay_guarded(local, flow).await,
+                            Self::H3(tunnel) => tunnel.relay_guarded(local, flow).await,
                             _ => Err(ClientError::Protocol),
                         }
                     }
                 }
             }
-            Self::H2(tunnel) => tunnel.relay(GuardedIo::new(socket, flow, PacketAction::Redirect)).await,
-            Self::H3(tunnel) => tunnel.relay(GuardedIo::new(socket, flow, PacketAction::Redirect)).await,
+            Self::H2(tunnel) => tunnel.relay_guarded(socket, flow).await,
+            Self::H3(tunnel) => tunnel.relay_guarded(socket, flow).await,
         }
     }
 }
@@ -1741,6 +1740,7 @@ impl ClientRuntime {
         let revision = expected.checked_add(1).ok_or(ClientError::Configuration)?;
         // No await between final exact-byte recheck and publication.
         saved_client_bytes(&self.path, digest)?;
+        previous.client.routing_cache().dpi.retire();
         self.slot.send_replace(Arc::new(ClientView {
             document,
             digest,

@@ -1045,7 +1045,14 @@ impl H3Tunnel {
         self._lease.shares_connection(&other._lease)
     }
 
-    pub async fn relay<S>(mut self, local: S) -> Result<(), ClientError>
+    pub async fn relay<S>(self, local: S) -> Result<(), ClientError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        self.relay_guarded(local, None).await
+    }
+
+    pub(crate) async fn relay_guarded<S>(mut self, local: S, flow: Option<&crate::routing::flow::FlowLease>) -> Result<(), ClientError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -1071,6 +1078,7 @@ impl H3Tunnel {
         let upload = async {
             let mut buffer = [0; crate::relay_batch::MAX_BATCH];
             let mut batch = crate::relay_batch::ReadyBatch::default();
+            let mut first_send = crate::routing::flow::FirstSend::new(flow, crate::routing::PacketAction::Redirect);
             loop {
                 let n = batch
                     .read(&mut read, &mut buffer)
@@ -1092,6 +1100,7 @@ impl H3Tunnel {
                 upload_state
                     .apply(Direction::Send, &frame)
                     .map_err(|_| ClientError::Protocol)?;
+                if n != 0 { first_send.attempt()?; }
                 send(tx, &frame).await?;
                 if n == 0 {
                     timeout(IO_TIMEOUT, tx.finish())

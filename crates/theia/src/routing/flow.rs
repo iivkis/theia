@@ -5,12 +5,8 @@ use super::{dpi::Engine, PacketAction};
 use crate::{client::ClientError, protocol::{Address, ErrorCode}};
 use std::{
     collections::HashMap,
-    io,
-    pin::Pin,
     sync::{Arc, Mutex, OnceLock},
-    task::{Context, Poll},
 };
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 const MAX_FLOWS: usize = 4096;
 
@@ -129,54 +125,31 @@ impl Drop for FlowLease {
     }
 }
 
-/// Gates the first nonempty application read before its bytes can be handed
-/// to an egress writer. Subsequent reads stay on the committed egress.
-pub(crate) struct GuardedIo<'a, S> {
-    inner: S,
+/// A cheap local latch, used directly at the actual egress writer.
+/// Only the first send acquires the shared table lock.
+pub(crate) struct FirstSend<'a> {
     flow: Option<&'a FlowLease>,
     action: PacketAction,
     started: bool,
 }
-
-impl<'a, S> GuardedIo<'a, S> {
-    pub(crate) fn new(inner: S, flow: Option<&'a FlowLease>, action: PacketAction) -> Self {
-        Self { inner, flow, action, started: false }
+impl<'a> FirstSend<'a> {
+    pub(crate) fn new(flow: Option<&'a FlowLease>, action: PacketAction) -> Self {
+        Self { flow, action, started: false }
     }
-}
-
-impl<S: AsyncRead + Unpin> AsyncRead for GuardedIo<'_, S> {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        let before = buf.filled().len();
-        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if matches!(result, Poll::Ready(Ok(()))) && buf.filled().len() > before && !self.started {
+    pub(crate) fn attempt(&mut self) -> Result<(), ClientError> {
+        if !self.started {
             if let Some(flow) = self.flow {
-                if flow.commit(self.action).is_err() {
-                    buf.set_filled(before);
-                    return Poll::Ready(Err(io::Error::from(io::ErrorKind::PermissionDenied)));
-                }
+                flow.commit(self.action)?;
             }
             self.started = true;
         }
-        result
-    }
-}
-
-impl<S: AsyncWrite + Unpin> AsyncWrite for GuardedIo<'_, S> {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, bytes)
-    }
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn setup() -> (Arc<FlowTable>, Arc<Engine>) {
         let table = Arc::new(FlowTable::new(1));
@@ -208,16 +181,25 @@ mod tests {
         assert!(flow.commit(PacketAction::Modify).is_err());
     }
 
-    #[tokio::test]
-    async fn revoked_policy_never_releases_first_payload() {
+    #[test]
+    fn retired_generation_cannot_commit_first_payload() {
         let (table, engine) = setup();
         let flow = begin(&table, &engine, PacketAction::Redirect).unwrap();
-        let (mut writer, reader) = tokio::io::duplex(16);
-        let mut guarded = GuardedIo::new(reader, Some(&flow), PacketAction::Redirect);
-        writer.write_all(b"secret").await.unwrap();
-        engine.authorize_policy(None);
-        let mut bytes = Vec::new();
-        assert_eq!(guarded.read_buf(&mut bytes).await.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
-        assert!(bytes.is_empty());
+        let mut send = FirstSend::new(Some(&flow), PacketAction::Redirect);
+        engine.retire();
+        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture([1; 32])));
+        assert_eq!(send.attempt(), Err(denied()));
+        assert!(begin(&table, &engine, PacketAction::Pass).is_err());
+    }
+
+    #[test]
+    fn committed_flow_keeps_egress_after_retirement() {
+        let (table, engine) = setup();
+        let flow = begin(&table, &engine, PacketAction::Pass).unwrap();
+        let mut send = FirstSend::new(Some(&flow), PacketAction::Pass);
+        send.attempt().unwrap();
+        engine.retire();
+        send.attempt().unwrap();
+        assert_eq!(flow.commit(PacketAction::Redirect), Err(denied()));
     }
 }

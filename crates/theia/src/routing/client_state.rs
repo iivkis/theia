@@ -203,6 +203,9 @@ impl Cache {
         Fut: Future<Output = Result<Vec<u8>, ClientError>>,
     {
         let mut state = self.state.lock().await;
+        if self.dpi.retired() {
+            return Err(super::dpi::stale_policy());
+        }
         let now = Instant::now();
         if let (Some(deadline), Some(snapshot)) = (
             state.expires.filter(|until| now < *until),
@@ -250,12 +253,18 @@ impl Cache {
                     .map_err(|_| ClientError::Protocol)?,
             )
         };
+        if self.dpi.retired() {
+            return Err(super::dpi::stale_policy());
+        }
         // The durable floor is checked even for an unchanged receipt.
         self.persist(&snapshot, state.snapshot.as_deref())?;
         state.snapshot = Some(snapshot.clone());
         let deadline = Instant::now() + TTL;
         state.expires = Some(deadline);
         self.authorize_local(&snapshot, deadline);
+        if self.dpi.retired() {
+            return Err(super::dpi::stale_policy());
+        }
         state.retry = None;
         Ok(snapshot)
     }
@@ -364,7 +373,9 @@ async fn copy_direction(
     meter: &crate::traffic::Relay<'_>,
     upload: bool,
     evidence: Option<&ExchangeEvidence>,
+    flow: Option<&super::flow::FlowLease>,
 ) -> Result<(), DirectRelayError> {
+    let mut first_send = super::flow::FirstSend::new(flow, super::PacketAction::Pass);
     let mut bytes = [0u8; 16 * 1024];
     loop {
         let count = input
@@ -378,6 +389,9 @@ async fn copy_direction(
                 .map_err(|_| DirectRelayError::io(upload))?;
             activity.half_closed();
             return Ok(());
+        }
+        if upload {
+            first_send.attempt().map_err(|error| DirectRelayError { error, peer: false })?;
         }
         output
             .write_all(&bytes[..count])
@@ -395,15 +409,30 @@ async fn copy_direction(
     }
 }
 
-pub(crate) async fn relay_direct(client: impl AsyncRead + AsyncWrite + Unpin, target: TcpStream) -> Result<(), ClientError> {
-    relay_direct_after_first(client, target, 0, 0).await.0
+#[cfg(test)]
+pub(crate) async fn relay_direct(client: TcpStream, target: TcpStream) -> Result<(), ClientError> {
+    relay_direct_guarded(client, target, None).await
+}
+
+pub(crate) async fn relay_direct_guarded(client: TcpStream, target: TcpStream, flow: Option<&super::flow::FlowLease>) -> Result<(), ClientError> {
+    relay_direct_inner(client, target, 0, 0, flow).await.0
 }
 
 pub(crate) async fn relay_direct_after_first(
-    client: impl AsyncRead + AsyncWrite + Unpin,
+    client: TcpStream,
     target: TcpStream,
     upload: usize,
     download: usize,
+) -> (Result<(), ClientError>, bool, bool) {
+    relay_direct_inner(client, target, upload, download, None).await
+}
+
+async fn relay_direct_inner(
+    client: TcpStream,
+    target: TcpStream,
+    upload: usize,
+    download: usize,
+    flow: Option<&super::flow::FlowLease>,
 ) -> (Result<(), ClientError>, bool, bool) {
     let meter = crate::traffic::enter_direct();
     meter.upload(upload);
@@ -411,12 +440,12 @@ pub(crate) async fn relay_direct_after_first(
     let activity = crate::relay_liveness::Activity::new();
     let evidence = (upload != 0 && download != 0)
         .then(|| ExchangeEvidence(std::sync::atomic::AtomicU8::new(0)));
-    let (cr, cw) = tokio::io::split(client);
+    let (cr, cw) = client.into_split();
     let (tr, tw) = target.into_split();
     let result = activity
         .run(
-            copy_direction(cr, tw, &activity, &meter, true, evidence.as_ref()),
-            copy_direction(tr, cw, &activity, &meter, false, evidence.as_ref()),
+            copy_direction(cr, tw, &activity, &meter, true, evidence.as_ref(), flow),
+            copy_direction(tr, cw, &activity, &meter, false, evidence.as_ref(), None),
             DirectRelayError {
                 error: ClientError::Timeout,
                 peer: false,

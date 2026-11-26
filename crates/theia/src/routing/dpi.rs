@@ -31,6 +31,7 @@ pub(crate) fn stale_policy() -> ClientError {
 /// Consent is local configuration, not a command in the server snapshot.
 pub(crate) struct Engine {
     enabled: AtomicBool,
+    retired: AtomicBool,
     stun_enabled: AtomicBool,
     policy: std::sync::Mutex<Option<super::client_state::LocalPolicy>>,
     cache: strategy::Cache,
@@ -121,6 +122,7 @@ impl Default for Engine {
     fn default() -> Self {
         Self {
             enabled: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
             stun_enabled: AtomicBool::new(false),
             policy: std::sync::Mutex::new(None),
             cache: strategy::Cache::default(),
@@ -146,15 +148,26 @@ impl Engine {
 
     pub(super) fn authorize_policy(&self, lease: Option<super::client_state::LocalPolicy>) {
         if let Ok(mut policy) = self.policy.lock() {
-            *policy = lease;
+            *policy = if self.retired() { None } else { lease };
         }
+    }
+
+    pub(crate) fn retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
+    }
+
+    /// Retired runtime generations may drain committed flows, but cannot
+    /// authorize a new first send or refresh their old policy lease.
+    pub(crate) fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+        self.authorize_policy(None);
     }
 
     pub(crate) fn policy_current(&self, digest: [u8; 32]) -> bool {
         self.policy
             .lock()
             .ok()
-            .is_some_and(|policy| policy.as_ref().is_some_and(|lease| lease.valid(digest)))
+            .is_some_and(|policy| !self.retired() && policy.as_ref().is_some_and(|lease| lease.valid(digest)))
     }
 
     pub(crate) fn check_policy(&self, digest: [u8; 32]) -> Result<(), ClientError> {
@@ -553,7 +566,7 @@ impl Tunnel {
         } else {
             None
         };
-        let Some(transformed) = transformed else {
+        let Some(transformed) = transformed.filter(|bytes| bytes != &prefix) else {
             // Unsupported protocol, ECH, SNI mismatch, partial input or
             // timeout: no origin application bytes have left this process.
             return Ok(RelayOutcome::Fallback { client, prefix });

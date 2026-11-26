@@ -185,7 +185,7 @@ impl Tunnel {
                 };
                 let unmodified = flow.is_some() && stun.is_none_or(|strategy| {
                     crate::routing::dpi::udp::prepare_binding(&first, strategy)
-                        .is_none_or(|bytes| bytes == first)
+                        .is_none_or(|bytes| bytes.as_ref() == first.as_slice())
                 });
                 if !verified.admissible()?
                     || unmodified
