@@ -450,70 +450,15 @@ impl ReferenceReview {
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )];
         let wide = width >= 96;
-        if wide {
-            lines.push(Line::styled(
-                format!(
-                    "{:<30} {:<25} {:<18} {}",
-                    "Референс", "Адрес", "TLS / H2 / H3", "Результат"
-                ),
-                Style::default().fg(MUTED),
-            ));
-        }
-        for row in &self.rows {
-            let status = match row.selected {
-                Some(0) => "Основной".into(),
-                Some(index) => format!("Резерв {index}"),
-                None if row.h2 => "Подходит".into(),
-                None => "Исключён".into(),
-            };
-            let color = if row.selected == Some(0) {
-                ACCENT
-            } else if row.selected.is_some() {
-                WARNING
-            } else if row.h2 {
-                MUTED
-            } else {
-                ERROR
-            };
-            let transports = format!(
-                "{} TLS {} H2 {} H3",
-                if row.h2 || row.h3 { "✓" } else { "?" },
-                if row.h2 { "✓" } else { "×" },
-                if row.h3 { "✓" } else { "×" }
-            );
-            // Long names and IPv6 addresses must remain visible, not elided.
-            if wide && Span::raw(row.name.as_str()).width() <= 28 && row.address.len() <= 23 {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{:<30} {:<25} ", row.name, row.address),
-                        Style::default().fg(TEXT),
-                    ),
-                    Span::styled(format!("{transports:<18} "), Style::default().fg(MUTED)),
-                    Span::styled(
-                        format!("{status} · {}", row.score),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-            } else {
-                append_wrapped(
-                    &mut lines,
-                    &row.name,
-                    width,
-                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-                );
-                append_wrapped(
-                    &mut lines,
-                    &format!("  {}", row.address),
-                    width,
-                    Style::default().fg(MUTED),
-                );
-                append_wrapped(
-                    &mut lines,
-                    &format!("  {transports} · {status} · {}", row.score),
-                    width,
-                    Style::default().fg(color),
-                );
-            }
+        let eligible = self.rows.iter().filter(|row| row.h2).count();
+        let selected = self.rows.iter().filter(|row| row.selected.is_some()).count();
+        append_wrapped(&mut lines, &format!("Всего: {} · Подходит: {eligible} · Выбрано: {selected}", self.rows.len()), width, Style::default().fg(TEXT));
+        append_wrapped(&mut lines, &self.note, width, Style::default().fg(WARNING));
+        append_wrapped(&mut lines, "H2 — подтверждённый основной транспорт; H3 — дополнительный. ? — нет подтверждения.", width, Style::default().fg(MUTED));
+        if selected > 0 {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled("Выбранные сайты", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
+            Self::append_rows(&mut lines, width, self.rows.iter().filter(|row| row.selected.is_some()));
         }
         lines.push(Line::raw(""));
         if !self.details.is_empty() {
@@ -533,9 +478,84 @@ impl ReferenceReview {
                 append_wrapped(&mut lines, value, width, Style::default().fg(TEXT));
             }
         }
-        lines.push(Line::raw(""));
-        append_wrapped(&mut lines, &self.note, width, Style::default().fg(WARNING));
+
+        if selected < self.rows.len() {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled("Остальные проверенные сайты", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
+            Self::append_rows(&mut lines, width, self.rows.iter().filter(|row| row.selected.is_none()));
+        }
         lines
+    }
+
+    fn append_rows<'a>(lines: &mut Vec<Line<'static>>, width: u16, rows: impl Iterator<Item = &'a ReferenceRow>) {
+        let wide = width >= 96;
+        if wide {
+            lines.push(Line::styled(
+                format!(
+                    "{:<30} {:<25} {:<18} {}",
+                    "Референс", "Адрес", "TLS / H2 / H3", "Результат"
+                ),
+                Style::default().fg(MUTED),
+            ));
+        }
+        for row in rows {
+            let status = match row.selected {
+                Some(0) => "Основной".into(),
+                Some(index) => format!("Резерв {index}"),
+                None if row.h2 => "Подходит".into(),
+                None => "Исключён".into(),
+            };
+            let color = if row.selected == Some(0) {
+                ACCENT
+            } else if row.selected.is_some() {
+                WARNING
+            } else if row.h2 {
+                MUTED
+            } else {
+                ERROR
+            };
+            let has_pin = row.address.parse::<std::net::SocketAddr>().is_ok();
+            let transports = format!(
+                "{} TLS {} H2 {} H3",
+                if row.h2 || row.h3 { "✓" } else { "?" },
+                if row.h2 { "✓" } else if has_pin { "×" } else { "?" },
+                if row.h3 { "✓" } else if has_pin { "×" } else { "?" }
+            );
+            // Long names and IPv6 addresses must remain visible, not elided.
+            if wide && Span::raw(row.name.as_str()).width() <= 28 && row.address.len() <= 23 {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:<30} {:<25} ", row.name, row.address),
+                        Style::default().fg(TEXT),
+                    ),
+                    Span::styled(format!("{transports:<18} "), Style::default().fg(MUTED)),
+                    Span::styled(
+                        format!("{status} · {}", row.score),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            } else {
+                append_wrapped(
+                    lines,
+                    &row.name,
+                    width,
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                );
+                append_wrapped(
+                    lines,
+                    &format!("  {}", row.address),
+                    width,
+                    Style::default().fg(MUTED),
+                );
+                append_wrapped(
+                    lines,
+                    &format!("  {transports} · {status} · {}", row.score),
+                    width,
+                    Style::default().fg(color),
+                );
+            }
+        }
+
     }
 }
 
@@ -910,6 +930,8 @@ mod tests {
                 assert!(text.contains(expected), "{expected}");
             }
             assert!(text.contains(&"a".repeat(150)));
+            assert!(text.find("Сервер не запускается.").unwrap() < text.find("failed.example.org").unwrap());
+            assert!(text.find("Конфигурация к сохранению").unwrap() < text.find("failed.example.org").unwrap());
         }
     }
 

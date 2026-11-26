@@ -782,6 +782,7 @@ struct Wizard {
     focus: usize,
     advanced: bool,
     sources: bool,
+    suggested_ip: Option<String>,
     users: String,
     available_users: Vec<String>,
     grant_picker: Option<GrantPicker>,
@@ -816,6 +817,7 @@ impl Wizard {
             focus: 2,
             advanced: false,
             sources: false,
+            suggested_ip: None,
             users: editor
                 .record_user_catalog(crate::tui_editor::RecordAction::NewInbound)
                 .unwrap_or_default(),
@@ -856,6 +858,7 @@ impl Wizard {
             focus: 2,
             advanced: false,
             sources: false,
+            suggested_ip: None,
             users: "Введите ID первого пользователя. Он будет отключён до явного выпуска токена."
                 .into(),
             available_users: Vec::new(),
@@ -870,10 +873,10 @@ impl Wizard {
     // A literal endpoint can be copied to the own-address field. Never
     // infer public ownership from a local interface or provider range.
     fn suggest_own_ip(&mut self) {
-        if self.fields[3].trim().is_empty() {
-            if let Ok(ip) = self.fields[2].trim_matches(['[', ']']).parse::<IpAddr>() {
-                self.fields[3] = ip.to_string();
-            }
+        let still_suggested = self.suggested_ip.as_ref().is_some_and(|value| value == &self.fields[3]);
+        if self.fields[3].trim().is_empty() || still_suggested {
+            self.suggested_ip = self.fields[2].trim_matches(['[', ']']).parse::<IpAddr>().ok().map(|ip| ip.to_string());
+            self.fields[3] = self.suggested_ip.clone().unwrap_or_default();
         }
     }
 
@@ -914,6 +917,7 @@ impl Wizard {
         if self.focus == 4 {
             self.set_custom_domains(value, self.catalogue_enabled());
         } else {
+            if self.focus == 3 { self.suggested_ip = None; }
             self.fields[self.focus] = value;
         }
         self.error.clear();
@@ -984,6 +988,15 @@ impl Wizard {
             .any(|v| v.trim().parse::<IpAddr>().is_err())
         {
             return Some((3, "Введите IP вашего сервера. Если их несколько, разделите запятыми. Не вводите домены или адреса сторонних сайтов."));
+        }
+        let own: Vec<IpAddr> = self.fields[3].split(',').filter_map(|v| v.trim().parse().ok()).collect();
+        if let Ok(ip) = self.fields[2].trim_matches(['[', ']']).parse::<IpAddr>() {
+            if !own.contains(&ip) {
+                return Some((3, "Добавьте IP из адреса для клиентов в список собственных IP сервера."));
+            }
+        }
+        if own.len() != own.iter().collect::<std::collections::HashSet<_>>().len() {
+            return Some((3, "Один IP указан несколько раз. Удалите повторения."));
         }
         if self.fields[5].trim().is_empty() {
             return Some((
@@ -1398,7 +1411,7 @@ impl Wizard {
                 out
             }
             WizardStage::DnsConfirm(input) => {
-                let mut body = format!("Поиск: {} доменов, {} IP из разрешённых CIDR.\nDNS и обратный DNS; без TLS и записи. Только адреса с подтверждённым SNI попадут в следующий этап.\nCIDR: подтверждайте только адреса, на проверку которых у вас есть разрешение.\ny: разрешить DNS; n/Esc: отменить.\n\nДОМЕНЫ\n", input.candidates.len(), input.range_targets.len());
+                let mut body = format!("Найти адреса: {} сайтов, {} IP из разрешённых диапазонов.\nTheia узнает адреса и имена сайтов через DNS. Подключения к сайтам и записи настроек ещё не будет.\nПодтверждайте только разрешённые IP-диапазоны.\ny: разрешить DNS; n/Esc: отменить.\n\nДОМЕНЫ\n", input.candidates.len(), input.range_targets.len());
                 for (name, ip) in &input.candidates {
                     body.push_str(&format!("{name}: {}\n", ip.map_or("DNS".into(), |ip| ip.to_string())));
                 }
@@ -1410,17 +1423,17 @@ impl Wizard {
                 }
                 body
             }
-            WizardStage::Resolving(_, _) => format!("Получение DNS/PTR: {} / {}.\nEsc: отменить, без TLS и записи.", self.progress.load(Ordering::Relaxed), self.total),
+            WizardStage::Resolving(_, _) => format!("Поиск адресов сайтов: {} из {}.\nEsc — отменить; настройки не изменятся.", self.progress.load(Ordering::Relaxed), self.total),
             WizardStage::ProbeConfirm(value) => {
                 let search = value.1.plan.as_ref().map_or_else(String::new, |plan| plan.preview());
-                format!("Проверить {} согласованных IP:443 и SNI (public PKI, TLS 1.3, H2/H3 HEAD).\nDNS/PTR исключено: {}. Никаких иных адресов, портов, bearer или записи.\nDNS будет повторно сверён, включая endpoint.\nЛучшие кандидаты будут повторно проверены до сохранения.\ny: проверить; n/Esc: отменить.\n\n{}", value.1.plan.as_ref().map_or(0, |plan| plan.targets().len()), value.1.unresolved.len(), search)
+                format!("Проверить защищённое соединение с {} перечисленными адресами на порту 443.\nНе удалось подтвердить адрес или имя: {}. Ключи доступа не отправляются, настройки не записываются.\nDNS, имена и сертификаты проверяются. Лучшие результаты будут перепроверены.\ny: проверить; n/Esc: отменить.\n\n{}", value.1.plan.as_ref().map_or(0, |plan| plan.targets().len()), value.1.unresolved.len(), search)
             }
             WizardStage::Checking(_, _) => {
                 let done = self.progress.load(Ordering::Relaxed);
                 if done >= self.total {
                     "Повторная проверка выбранных референсов.\nEsc: отменить без записи.".into()
                 } else {
-                    format!("Проверка TLS / QUIC: {done} / {}.\nEsc: отменить без записи.", self.total)
+                    format!("Проверка защищённых соединений: {done} из {}.\nEsc — отменить; настройки не изменятся.", self.total)
                 }
             },
             WizardStage::NoEligible(report) => report.text.clone(),
@@ -1489,8 +1502,8 @@ impl ProvisionPanel {
             if let Some(panel) = &wizard.registration { return panel.confirmation_choice(); }
             if wizard.grant_picker.is_some() { return None; }
             return match wizard.stage {
-                WizardStage::DnsConfirm(_) => Some(('y', "Разрешить DNS")),
-                WizardStage::ProbeConfirm(_) => Some(('y', "Проверить адреса")),
+                WizardStage::DnsConfirm(_) => Some(('y', "Найти адреса")),
+                WizardStage::ProbeConfirm(_) => Some(('y', "Проверить сайты")),
                 WizardStage::CreateConfirm(_) => Some(('y', "Сохранить")),
                 _ => None,
             };
@@ -1748,7 +1761,7 @@ impl ProvisionPanel {
             return Some(crate::tui_widgets::ReferenceReview {
                 rows: report.rows.clone(),
                 details: Vec::new(),
-                note: "Нет допустимого набора. Ничего не сохранено. Esc: вернуться к источникам.".into(),
+                note: "Подходящих сайтов не найдено. Ничего не сохранено. Enter или Esc — вернуться к источникам и повторить.".into(),
             });
         }
         let WizardStage::CreateConfirm(value) = &wizard.stage else { return None; };
@@ -1768,11 +1781,11 @@ impl ProvisionPanel {
             ("TOML", input.config.display().to_string()),
         ];
         let mut note = if first {
-            "Создание защищённых материалов и нового TOML. Сервер не запускается.".to_owned()
+            "Будут созданы защищённые файлы и конфигурация. Сервер не запускается. Затем на обзоре сервера выпустите ключ первого пользователя и запустите сервер.".to_owned()
         } else {
             "Создание защищённых материалов. TOML сохраняется после отдельного подтверждения; сервер не запускается.".to_owned()
         };
-        note.push_str("\nВыбранные адреса перепроверены; прочие оценки предварительные. Если результаты устареют, потребуется повторная проверка выбранных адресов.");
+        note.push_str("\nВыбранные сайты перепроверены. Остальные оценки предварительные. Если результаты устареют, мастер предложит повторную проверку.");
         if input
             .endpoint
             .parse::<SocketAddr>()
@@ -1956,6 +1969,9 @@ mod tests {
         wizard.paste("93.184.216.1");
         wizard.key(press(KeyCode::Tab));
         assert_eq!(wizard.fields[3], "93.184.216.1");
+        wizard.fields[2] = "93.184.216.2".into();
+        wizard.suggest_own_ip();
+        assert_eq!(wizard.fields[3], "93.184.216.2");
         wizard.fields[5] = "phone".into();
         wizard.key(press(KeyCode::Enter));
         assert!(wizard.sources && matches!(wizard.stage, WizardStage::Input));
