@@ -28,6 +28,13 @@ MERGED_JOBS = EXPECTED_JOBS | frozenset({
     "Production line coverage >= 80%",
 })
 
+SHARDED_MERGED_JOBS = MERGED_JOBS | frozenset({
+    "F-14 native build (ubuntu-latest)", "F-14 native build (windows-latest)",
+    "Native performance (ubuntu-latest)", "Native performance (windows-latest)",
+    "F-19 native performance (ubuntu-latest)", "F-19 native performance (windows-latest)",
+})
+
+
 class EvidenceError(ValueError):
     """Incomplete or incomparable timing evidence."""
 
@@ -74,6 +81,8 @@ def summarize(run: dict, response: dict) -> dict:
     require(created <= started <= updated, "inconsistent run timestamps")
 
     jobs = response.get("jobs")
+    if merged and isinstance(jobs, list) and len(jobs) == len(SHARDED_MERGED_JOBS):
+        expected_jobs = SHARDED_MERGED_JOBS
     require(isinstance(jobs, list) and response.get("total_count") == len(jobs)
             and len(jobs) in ({len(expected_jobs)} if merged else
                               {len(expected_jobs), len(expected_jobs) + 1}),

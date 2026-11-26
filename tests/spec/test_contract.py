@@ -297,8 +297,8 @@ class SpecContractTests(unittest.TestCase):
         workflow = read(".github/workflows/ci.yml")
         self.assertIn("Swatinem/rust-cache@v2", workflow)
         self.assertIn("scripts/check-spec.sh", workflow)
-        self.assertIn("cargo test --workspace --all-targets --locked", workflow)
-        self.assertLess(workflow.index("cargo test --workspace --all-targets --locked"),
+        self.assertIn("cargo nextest run --workspace --all-targets --locked --no-fail-fast", workflow)
+        self.assertLess(workflow.index("cargo nextest run --workspace --all-targets --locked --no-fail-fast"),
                         workflow.index("cargo clippy"))
         self.assertIn("Cargo.lock", workflow)
 
@@ -331,7 +331,7 @@ class SpecContractTests(unittest.TestCase):
                      "connection.graceful_shutdown()", "connection.shutdown(0).await",
                      "shares_transport_with", "h2_scenario(true)", "h3_scenario(true)"):
             self.assertIn(term, code)
-        self.assertIn("cargo test --workspace --all-targets --locked", read(".github/workflows/ci.yml"))
+        self.assertIn("cargo nextest run --workspace --all-targets --locked --no-fail-fast", read(".github/workflows/ci.yml"))
 
     def test_m22_local_proxy_gate_and_cli_wiring(self):
         implementation = read("crates/theia/src/local_proxy.rs")

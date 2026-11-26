@@ -158,6 +158,95 @@ jobs:
           echo "tested_sha=$FORMATTED_SHA" >> "$GITHUB_OUTPUT"
           printf 'Merged SHA: %s\nTested source SHA: %s\n' "$MERGED_SHA" "$FORMATTED_SHA" >> "$GITHUB_STEP_SUMMARY"
 
+  f14-build:
+    name: F-14 native build (${{ matrix.os }})
+    needs: specification
+    if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    env:
+      THEIA_TRACE_DIR: ${{ github.workspace }}/theia-traces
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.specification.outputs.tested_sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: native-default-deps-v4
+          cache-workspace-crates: false
+          cache-bin: false
+          save-if: false
+      - name: Build genuine Linux server for Windows cross-OS F-14 E2E
+        if: runner.os == 'Linux'
+        run: cargo build --workspace --locked --bin theia
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: f14-linux-server
+          path: target/debug/theia
+          if-no-files-found: error
+          retention-days: 1
+      - name: Stage Windows E2E binaries from Cargo JSON artifact paths
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Cargo may use target/debug/build/<crate>/<hash>/out instead of
+          # target/debug/deps. Compiler-artifact JSON is the authoritative path.
+          $testEvents = @(cargo test --workspace --locked --test f14_cross_host --no-run --message-format=json |
+            ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } })
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot identify compiled native F-14 harness' }
+          $tests = @($testEvents | Where-Object {
+            $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'f14_cross_host' -and $_.executable
+          })
+          if ($tests.Count -ne 1) { throw 'Expected exactly one compiled native F-14 test harness' }
+          # Integration-test compilation normally builds the executable too.
+          # Reuse only a real non-harness bin from this exact Cargo invocation.
+          $bins = @($testEvents | Where-Object {
+            $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'theia' -and
+              $_.target.kind -contains 'bin' -and $_.profile.test -eq $false -and $_.executable
+          })
+          if ($bins.Count -eq 0) {
+            $binEvents = @(cargo build --workspace --locked --bin theia --message-format=json |
+              ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } })
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot identify compiled native Windows client' }
+            $bins = @($binEvents | Where-Object {
+              $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'theia' -and
+                $_.target.kind -contains 'bin' -and $_.profile.test -eq $false -and $_.executable
+            })
+          }
+          if ($bins.Count -ne 1) { throw 'Expected exactly one compiled Windows client executable' }
+          if (!(Test-Path $tests[0].executable -PathType Leaf)) { throw 'Missing compiled F-14 test harness' }
+          if (!(Test-Path $bins[0].executable -PathType Leaf)) { throw 'Missing compiled Windows client' }
+          Copy-Item $tests[0].executable (Join-Path $env:RUNNER_TEMP 'f14_cross_host.exe')
+          Copy-Item $bins[0].executable (Join-Path $env:RUNNER_TEMP 'theia.exe')
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: f14-windows-compiled
+          path: |
+            ${{ runner.temp }}/f14_cross_host.exe
+            ${{ runner.temp }}/theia.exe
+          if-no-files-found: error
+          retention-days: 1
+      - name: Upload sanitized trace logs on CI failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic-traces-f14-build-${{ matrix.os }}
+          path: ${{ env.THEIA_TRACE_DIR }}/*.log*
+          if-no-files-found: ignore
+          retention-days: 3
+
   m0-1-api-spike:
     name: m0-1-api-spike (Linux)
     needs: specification
@@ -301,6 +390,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.140
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: native-default-deps-v4
@@ -312,7 +404,7 @@ jobs:
       - name: Install pinned CI-only VT screen driver for real Linux PTY
         run: python -m pip install pyte==0.8.2
       - name: Native Linux tests
-        run: cargo test --workspace --all-targets --locked
+        run: cargo nextest run --workspace --all-targets --locked --no-fail-fast
       - name: Lints
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       # Optional release-profile compilation uses the same post-merge CI.
@@ -352,6 +444,9 @@ jobs:
           ref: ${{ needs.specification.outputs.tested_sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.140
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: native-default-deps-v4
@@ -363,7 +458,7 @@ jobs:
       - name: Install pinned CI-only Windows ConPTY and VT screen drivers
         run: python -m pip install pywinpty==3.0.5 pyte==0.8.2
       - name: Native Windows tests
-        run: cargo test --workspace --all-targets --locked
+        run: cargo nextest run --workspace --all-targets --locked --no-fail-fast
       - name: Disposable Windows user WinINet proxy CAS and restore (F-07)
         shell: pwsh
         env:
@@ -392,9 +487,9 @@ jobs:
 
   f14-cross-host:
     name: F-14 Linux VM server to native Windows client
-    # Native browser jobs already build the real Theia binaries; do not wait
-    # for the unrelated full native suites or the long liveness regression.
-    needs: [specification, browser-e2e]
+    # Start WSL2 as soon as the exact native binaries exist; do not wait
+    # for browser, performance, or full native test suites.
+    needs: [specification, f14-build]
     if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
     runs-on: windows-2025
     timeout-minutes: 50
@@ -477,40 +572,6 @@ jobs:
       - name: Provision Chromium on Windows
         if: runner.os == 'Windows'
         run: python -m playwright install chromium
-      - name: Checkout immutable stage-3 benchmark reference
-        uses: actions/checkout@v4
-        with:
-          ref: abbb89834a406b4c53be0f1ac0b3ab1a65e66f8d
-          path: .perf-baseline
-          persist-credentials: false
-      - name: Build exact native baseline before candidate
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $actual = (git -C .perf-baseline rev-parse HEAD).Trim()
-          if ($LASTEXITCODE -ne 0 -or $actual -ne 'abbb89834a406b4c53be0f1ac0b3ab1a65e66f8d') { throw 'Wrong benchmark reference SHA' }
-          cargo build --manifest-path .perf-baseline/Cargo.toml --locked --bin theia --target-dir target
-          if ($LASTEXITCODE -ne 0) { throw 'Native baseline build failed' }
-          $name = if ($IsWindows) { 'theia.exe' } else { 'theia' }
-          Copy-Item (Join-Path 'target/debug' $name) (Join-Path $env:RUNNER_TEMP "perf-baseline-$name")
-          "THEIA_PERF_BASELINE_BIN=$(Join-Path $env:RUNNER_TEMP "perf-baseline-$name")" >> $env:GITHUB_ENV
-      - name: Checkout exact pre-batch F-19 comparison reference
-        uses: actions/checkout@v4
-        with:
-          ref: 917417b09f209334939c38551112081c480eb958
-          path: .f19-baseline
-          persist-credentials: false
-      - name: Build exact pre-batch native reference
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $actual = (git -C .f19-baseline rev-parse HEAD).Trim()
-          if ($LASTEXITCODE -ne 0 -or $actual -ne '917417b09f209334939c38551112081c480eb958') { throw 'Wrong F-19 reference SHA' }
-          cargo build --manifest-path .f19-baseline/Cargo.toml --locked --bin theia --target-dir target
-          if ($LASTEXITCODE -ne 0) { throw 'F-19 baseline build failed' }
-          $name = if ($IsWindows) { 'theia.exe' } else { 'theia' }
-          Copy-Item (Join-Path 'target/debug' $name) (Join-Path $env:RUNNER_TEMP "f19-baseline-$name")
-          "THEIA_F19_BASELINE_BIN=$(Join-Path $env:RUNNER_TEMP "f19-baseline-$name")" >> $env:GITHUB_ENV
       - name: Verify Chromium navigation through the built Theia client
         run: cargo test --workspace --locked --test client_h2 client_binary_chromium_socks5 -- --ignored --exact --nocapture
       - name: Verify Chromium navigation over the explicit Theia H3 transport
@@ -541,6 +602,62 @@ jobs:
           retention-days: 7
       - name: Independent external TLS and QUIC through registered REALITY dispatchers
         run: cargo test --workspace --locked --lib server::hardening_tests::independent_external_reference_through_registered_reality_dispatchers -- --ignored --exact --nocapture
+      - name: Upload sanitized trace logs on CI failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic-traces-browser-e2e-${{ matrix.os }}
+          path: ${{ env.THEIA_TRACE_DIR }}/*.log*
+          if-no-files-found: ignore
+          retention-days: 3
+
+  native-performance:
+    name: Native performance (${{ matrix.os }})
+    needs: specification
+    if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    env:
+      THEIA_TRACE_DIR: ${{ github.workspace }}/theia-traces
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.specification.outputs.tested_sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: native-default-deps-v4
+          cache-workspace-crates: false
+          cache-bin: false
+          save-if: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Checkout immutable stage-3 benchmark reference
+        uses: actions/checkout@v4
+        with:
+          ref: abbb89834a406b4c53be0f1ac0b3ab1a65e66f8d
+          path: .perf-baseline
+          persist-credentials: false
+      - name: Build exact native baseline before candidate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $actual = (git -C .perf-baseline rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -ne 'abbb89834a406b4c53be0f1ac0b3ab1a65e66f8d') { throw 'Wrong benchmark reference SHA' }
+          cargo build --manifest-path .perf-baseline/Cargo.toml --locked --bin theia --target-dir target
+          if ($LASTEXITCODE -ne 0) { throw 'Native baseline build failed' }
+          $name = if ($IsWindows) { 'theia.exe' } else { 'theia' }
+          Copy-Item (Join-Path 'target/debug' $name) (Join-Path $env:RUNNER_TEMP "perf-baseline-$name")
+          "THEIA_PERF_BASELINE_BIN=$(Join-Path $env:RUNNER_TEMP "perf-baseline-$name")" >> $env:GITHUB_ENV
       - name: Install pinned native benchmark measurement dependency
         run: python -m pip install psutil==7.0.0
       - name: Verify native benchmark port reservations on this OS
@@ -572,6 +689,64 @@ jobs:
           path: native-comparison.json
           if-no-files-found: error
           retention-days: 7
+      - name: Upload sanitized trace logs on CI failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic-traces-native-performance-${{ matrix.os }}
+          path: ${{ env.THEIA_TRACE_DIR }}/*.log*
+          if-no-files-found: ignore
+          retention-days: 3
+
+  f19-performance:
+    name: F-19 native performance (${{ matrix.os }})
+    needs: specification
+    if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    env:
+      THEIA_TRACE_DIR: ${{ github.workspace }}/theia-traces
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.specification.outputs.tested_sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: native-default-deps-v4
+          cache-workspace-crates: false
+          cache-bin: false
+          save-if: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Checkout exact pre-batch F-19 comparison reference
+        uses: actions/checkout@v4
+        with:
+          ref: 917417b09f209334939c38551112081c480eb958
+          path: .f19-baseline
+          persist-credentials: false
+      - name: Build exact pre-batch native reference
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $actual = (git -C .f19-baseline rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -ne '917417b09f209334939c38551112081c480eb958') { throw 'Wrong F-19 reference SHA' }
+          cargo build --manifest-path .f19-baseline/Cargo.toml --locked --bin theia --target-dir target
+          if ($LASTEXITCODE -ne 0) { throw 'F-19 baseline build failed' }
+          $name = if ($IsWindows) { 'theia.exe' } else { 'theia' }
+          Copy-Item (Join-Path 'target/debug' $name) (Join-Path $env:RUNNER_TEMP "f19-baseline-$name")
+          "THEIA_F19_BASELINE_BIN=$(Join-Path $env:RUNNER_TEMP "f19-baseline-$name")" >> $env:GITHUB_ENV
+      - name: Install pinned native benchmark measurement dependency
+        run: python -m pip install psutil==7.0.0
       - name: Measure isolated pre-batch vs candidate native overhead
         env:
           THEIA_PERF_TESTED_SHA: ${{ needs.specification.outputs.tested_sha }}
@@ -590,64 +765,11 @@ jobs:
           path: f19-comparison.json
           if-no-files-found: error
           retention-days: 7
-      - name: Build genuine Linux server for Windows cross-OS F-14 E2E
-        if: runner.os == 'Linux'
-        run: cargo build --workspace --locked --bin theia
-      - uses: actions/upload-artifact@v4
-        if: runner.os == 'Linux'
-        with:
-          name: f14-linux-server
-          path: target/debug/theia
-          if-no-files-found: error
-          retention-days: 1
-      - name: Stage Windows E2E binaries from Cargo JSON artifact paths
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          # Cargo may use target/debug/build/<crate>/<hash>/out instead of
-          # target/debug/deps. Compiler-artifact JSON is the authoritative path.
-          $testEvents = @(cargo test --workspace --locked --test f14_cross_host --no-run --message-format=json |
-            ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } })
-          if ($LASTEXITCODE -ne 0) { throw 'Cannot identify compiled native F-14 harness' }
-          $tests = @($testEvents | Where-Object {
-            $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'f14_cross_host' -and $_.executable
-          })
-          if ($tests.Count -ne 1) { throw 'Expected exactly one compiled native F-14 test harness' }
-          # Integration-test compilation normally builds the executable too.
-          # Reuse only a real non-harness bin from this exact Cargo invocation.
-          $bins = @($testEvents | Where-Object {
-            $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'theia' -and
-              $_.target.kind -contains 'bin' -and $_.profile.test -eq $false -and $_.executable
-          })
-          if ($bins.Count -eq 0) {
-            $binEvents = @(cargo build --workspace --locked --bin theia --message-format=json |
-              ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } })
-            if ($LASTEXITCODE -ne 0) { throw 'Cannot identify compiled native Windows client' }
-            $bins = @($binEvents | Where-Object {
-              $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'theia' -and
-                $_.target.kind -contains 'bin' -and $_.profile.test -eq $false -and $_.executable
-            })
-          }
-          if ($bins.Count -ne 1) { throw 'Expected exactly one compiled Windows client executable' }
-          if (!(Test-Path $tests[0].executable -PathType Leaf)) { throw 'Missing compiled F-14 test harness' }
-          if (!(Test-Path $bins[0].executable -PathType Leaf)) { throw 'Missing compiled Windows client' }
-          Copy-Item $tests[0].executable (Join-Path $env:RUNNER_TEMP 'f14_cross_host.exe')
-          Copy-Item $bins[0].executable (Join-Path $env:RUNNER_TEMP 'theia.exe')
-      - uses: actions/upload-artifact@v4
-        if: runner.os == 'Windows'
-        with:
-          name: f14-windows-compiled
-          path: |
-            ${{ runner.temp }}/f14_cross_host.exe
-            ${{ runner.temp }}/theia.exe
-          if-no-files-found: error
-          retention-days: 1
       - name: Upload sanitized trace logs on CI failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: diagnostic-traces-browser-e2e-${{ matrix.os }}
+          name: diagnostic-traces-f19-performance-${{ matrix.os }}
           path: ${{ env.THEIA_TRACE_DIR }}/*.log*
           if-no-files-found: ignore
           retention-days: 3
@@ -768,6 +890,9 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov@0.9.1
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.140
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
@@ -786,7 +911,7 @@ jobs:
       - name: Purge any restored profile counters before instrumenting this SHA
         run: cargo llvm-cov clean --profraw-only
       - name: Instrument full native workspace tests
-        run: cargo llvm-cov test --workspace --all-targets --all-features --locked --no-report
+        run: cargo llvm-cov nextest --workspace --all-targets --all-features --locked --no-report --no-fail-fast
       - name: Instrument real disposable Windows proxy and ConPTY lifecycle
         if: runner.os == 'Windows'
         shell: pwsh
@@ -860,7 +985,7 @@ jobs:
 
   ci-gate:
     name: ci-gate
-    needs: [specification, m0-1-api-spike, m0-1-windows-spike, rust-tests, windows-smoke, f14-cross-host, browser-e2e, m3-4-btls-spike, m3-4e-btls-production-feature, coverage-native, coverage-gate]
+    needs: [specification, m0-1-api-spike, m0-1-windows-spike, rust-tests, windows-smoke, f14-cross-host, f14-build, browser-e2e, native-performance, f19-performance, m3-4-btls-spike, m3-4e-btls-production-feature, coverage-native, coverage-gate]
     if: ${{ always() && github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'dev' && github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -878,7 +1003,7 @@ jobs:
           import re
 
           results = json.loads(os.environ["JOB_RESULTS"])
-          expected = {"specification", "m0-1-api-spike", "m0-1-windows-spike", "rust-tests", "windows-smoke", "f14-cross-host", "browser-e2e", "m3-4-btls-spike", "m3-4e-btls-production-feature", "coverage-native", "coverage-gate"}
+          expected = {"specification", "m0-1-api-spike", "m0-1-windows-spike", "rust-tests", "windows-smoke", "f14-cross-host", "f14-build", "browser-e2e", "native-performance", "f19-performance", "m3-4-btls-spike", "m3-4e-btls-production-feature", "coverage-native", "coverage-gate"}
           native = os.environ["NATIVE_REQUIRED"]
           if native != "true":
               raise SystemExit("Every merge requires full native CI; fail closed")
