@@ -96,11 +96,16 @@ pub(crate) struct RecordReview {
     candidate: Config,
     next_selection: usize,
     body: String,
+    confirmation_label: &'static str,
 }
 
 impl RecordReview {
     pub(crate) fn body(&self) -> &str {
         &self.body
+    }
+
+    pub(crate) fn confirmation_label(&self) -> &'static str {
+        self.confirmation_label
     }
 }
 
@@ -1112,7 +1117,7 @@ impl Editor {
                 }
                 doc.client.profiles.remove(self.selected_record);
                 next_selection = next_selection.min(doc.client.profiles.len() - 1);
-                format!("Удалить профиль {selected}. Файлы CA и credential сохраняются.")
+                format!("Удалить профиль {selected}. Файлы сертификата и ключа доступа сохраняются.")
             }
             (Config::Client(doc), RecordAction::ActivateProfile) => {
                 if doc.client.active_profile == selected {
@@ -1120,7 +1125,7 @@ impl Editor {
                 }
                 let previous = std::mem::replace(&mut doc.client.active_profile, selected.clone());
                 format!(
-                    "Активный профиль в TOML: {previous} → {selected}. Runtime не переключается."
+                    "Активный профиль в TOML: {previous} → {selected}. Работающий процесс не переключается."
                 )
             }
             (Config::Server(doc), RecordAction::SetQuota) => {
@@ -1209,8 +1214,19 @@ impl Editor {
             selected,
             candidate,
             next_selection,
+            confirmation_label: match action {
+                RecordAction::NewInbound => "Создать подключение",
+                RecordAction::NewProfile => "Создать профиль",
+                RecordAction::DeleteRecord if self.role() == Role::Server => "Удалить подключение",
+                RecordAction::DeleteRecord => "Удалить профиль",
+                RecordAction::DeleteUser => "Удалить пользователя",
+                RecordAction::ActivateProfile => "Сделать активным",
+                RecordAction::SetGrants => "Сохранить права",
+                RecordAction::SetQuota => "Сохранить лимиты",
+                RecordAction::EditTls | RecordAction::EditTrust => "Заменить настройки доверия",
+            },
             body: format!(
-                "{}\n{detail}\n\nТолько сохранение TOML, без запуска, Apply и удаления файлов.\ny: подтвердить; n/Esc: отменить",
+                "{}\n{detail}\n\nИзменяется только файл настроек. Работающий процесс и остальные файлы не изменяются.\ny: подтвердить; n/Esc: отменить",
                 action.title()
             ),
         })
@@ -1268,8 +1284,24 @@ impl Editor {
             selected: self.selected_record_id().to_owned(),
             candidate,
             next_selection: self.selected_record,
+            confirmation_label: "Сохранить разрешение",
             body: "Разрешить управление системным прокси?\n\nTheia сможет менять HTTP(S)-прокси текущего пользователя Windows только после отдельного подтверждения.\nСейчас сохраняется только разрешение в файле настроек. Прокси Windows и соединение не изменятся.\n\ny: сохранить разрешение · n/Esc: отменить".into(),
         })
+    }
+
+    /// Non-secret values for the settings page. These are saved, not live.
+    pub(crate) fn settings_summary(&self) -> String {
+        match &self.original {
+            Config::Server(doc) => format!(
+                "Лимит на пользователя: {}\nОбщий лимит соединений: {}",
+                doc.server.policy.max_connections_per_user, doc.server.policy.max_connections_total
+            ),
+            Config::Client(doc) => format!(
+                "HTTP: {}\nSOCKS5: {}\nРазрешение управления системным прокси: {}",
+                doc.client.proxy.http_listen, doc.client.proxy.socks5_listen,
+                if self.system_proxy_allowed() { "разрешено" } else { "нет" }
+            ),
+        }
     }
 
     pub(crate) fn client_proxy_addresses(&self) -> Option<(&str, &str)> {
