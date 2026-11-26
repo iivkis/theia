@@ -971,7 +971,7 @@ impl Wizard {
         if fields[4].trim().is_empty() && fields[7].trim().is_empty() {
             return Some((8, "Выберите хотя бы один источник: каталог, свои домены или разрешённые IP-диапазоны."));
         }
-        if fields[6] == "manual" && (self.catalogue_enabled() || !fields[7].trim().is_empty() || self.custom_domains().split(',').count() > 3) {
+        if fields[6] == "manual" && (self.catalogue_enabled() || !fields[7].trim().is_empty() || fields[4].split(',').count() > 3) {
             return Some((6, "Ручной порядок: только 1–3 своих домена без каталога и IP-диапазонов. Выберите автоматический подбор."));
         }
         for item in fields[4].split(',').filter(|s| !s.trim().is_empty() && s.trim() != "catalog") {
@@ -1115,6 +1115,7 @@ impl Wizard {
                         .filter_map(|(id, chosen)| chosen.then_some(id.as_str()))
                         .collect::<Vec<_>>()
                         .join(",");
+                    self.error.clear();
                     return false;
                 }
                 KeyCode::Up | KeyCode::BackTab => picker.focus = (picker.focus + count - 1) % count,
@@ -2072,6 +2073,15 @@ mod tests {
         assert_eq!(wizard.custom_domains(), "example.org");
         wizard.key(press(KeyCode::Char(' ')));
         assert_eq!(wizard.effective_fields()[4], "catalog,example.org");
+        wizard.fields[7] = "203.0.113.8/29".into();
+        assert!(wizard.effective_fields()[7].is_empty());
+        wizard.focus = 10;
+        wizard.key(press(KeyCode::Char(' ')));
+        assert!(wizard.visible_fields().contains(&7));
+        assert_eq!(wizard.effective_fields()[7], "203.0.113.8/29");
+        wizard.key(press(KeyCode::Char(' ')));
+        assert!(wizard.effective_fields()[7].is_empty());
+        assert!(!wizard.visible_fields().contains(&7));
         wizard.key(press(KeyCode::Esc));
         assert!(!wizard.sources);
         assert_eq!(wizard.fields[5], "phone");

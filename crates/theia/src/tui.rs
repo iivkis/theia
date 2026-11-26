@@ -4307,7 +4307,7 @@ fn draw_guided(
         ));
         frame.render_widget(
             Paragraph::new(vec![
-                Line::styled(caption.as_str(), Style::default().fg(MUTED)),
+                Line::styled(title, Style::default().fg(MUTED)),
                 Line::from(segments),
             ])
             .style(Style::default().bg(SURFACE)),
@@ -4317,6 +4317,8 @@ fn draw_guided(
     if let Some(form) = form {
         let title = if parts[0].height == 0 {
             caption.as_str()
+        } else if title == "Мастер REALITY" || matches!(heading, "Настройка сервера" | "Источники поиска") {
+            ""
         } else {
             "Параметры"
         };
@@ -7732,7 +7734,7 @@ mod tests {
             ui.update(&mut model, press(KeyCode::Down));
             ui.update(&mut model, press(KeyCode::Enter));
             let snapshot = rendered_interaction(120, 40, &model, &ui);
-            assert!(snapshot.contains("ШАГ 1/"));
+            assert!(snapshot.contains("1/"));
             assert!(snapshot.contains("Следующее действие"));
             if role == Role::Server {
                 assert!(snapshot.contains("443"));

@@ -230,7 +230,16 @@ impl Form {
             (end - start) as u16 * stride,
         );
         let help = if side {
-            Rect::new(rows.right().saturating_add(3), rows.y, 31, room.min(12))
+            let field = self.fields.iter().find(|f| f.id == self.selected);
+            let message = if self.error.is_empty() {
+                field.map_or("Выберите строку стрелками или мышью.", |f| f.hint)
+            } else { self.error.as_str() };
+            // Measure wrapped text in terminal cells; never fill unused rows
+            // with an empty side panel. A little extra room handles word wrap.
+            let mut wrapped = Vec::new();
+            append_wrapped(&mut wrapped, message, 29, Style::default());
+            let height = (wrapped.len() as u16).saturating_add(3).min(room);
+            Rect::new(rows.right().saturating_add(3), rows.y, 31, height)
         } else {
             Rect::new(inner.x, rows.bottom(), inner.width, help_h)
         };
@@ -299,7 +308,17 @@ impl Form {
                 g.stride,
             );
             let marker = if selected { "▎ " } else { "  " };
-            let label = if picker && !field.label.starts_with('[') {
+            // Explicit presentation conventions for choice rows. The owner
+            // still handles keys and mouse hit-tests never execute actions.
+            let control = !picker && (field.label.starts_with("[x] ") || field.label.starts_with("[ ] ") || field.label.starts_with("› "));
+            let control_label = if let Some(name) = field.label.strip_prefix("[x] ") {
+                format!("{marker}☑  {name}")
+            } else if let Some(name) = field.label.strip_prefix("[ ] ") {
+                format!("{marker}☐  {name}")
+            } else {
+                format!("{marker}{}", field.label)
+            };
+            let label = if control { control_label } else if picker && !field.label.starts_with('[') {
                 format!(
                     "{marker}{}  {}",
                     if selected { "●" } else { "○" },
@@ -312,7 +331,7 @@ impl Form {
                 if picker {
                     "Выбрать"
                 } else {
-                    "Введите значение"
+                    field.hint.strip_prefix("Пример: ").and_then(|hint| hint.split_once(" · ").map(|(example, _)| example)).unwrap_or("Введите значение")
                 }
             } else {
                 field.value.as_str()
@@ -321,18 +340,30 @@ impl Form {
                 .fg(if selected { ACCENT } else { TEXT })
                 .add_modifier(Modifier::BOLD);
             let value_style = Style::default()
-                .fg(if field.value.is_empty() || picker {
+                .fg(if field.value.is_empty() || picker || control {
                     MUTED
                 } else {
                     TEXT
                 })
                 .bg(if selected {
                     FOCUS
-                } else if picker {
+                } else if picker || control {
                     BG
                 } else {
                     INPUT
                 });
+            if control && g.stride >= 2 {
+                frame.render_widget(
+                    Paragraph::new(label).style(label_style.bg(if selected { FOCUS } else { BG })),
+                    Rect::new(rect.x, rect.y, rect.width, 1),
+                );
+                frame.render_widget(
+                    Paragraph::new(format!("    {}", fit_value(value, rect.width.saturating_sub(4), false)))
+                        .style(Style::default().fg(MUTED).bg(BG)),
+                    Rect::new(rect.x, rect.y + 1, rect.width, 1),
+                );
+                continue;
+            }
             if picker && g.stride >= 2 {
                 let style = label_style.bg(if selected { FOCUS } else { SURFACE });
                 frame.render_widget(
@@ -374,7 +405,7 @@ impl Form {
                         .split(rect);
                 frame.render_widget(Paragraph::new(label).style(label_style), columns[0]);
                 frame.render_widget(
-                    Paragraph::new(fit_value(value, columns[1].width, selected)).style(value_style),
+                    Paragraph::new(fit_value(value, columns[1].width, selected && !control)).style(value_style),
                     columns[1],
                 );
             }
@@ -399,11 +430,6 @@ impl Form {
                         Style::default()
                             .fg(if self.error.is_empty() { ACCENT } else { ERROR })
                             .add_modifier(Modifier::BOLD),
-                    ),
-                    Line::raw(""),
-                    Line::styled(
-                        field.map_or("", |f| f.label),
-                        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
                     ),
                     Line::styled(message, Style::default().fg(color)),
                 ];
