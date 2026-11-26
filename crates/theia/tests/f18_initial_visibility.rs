@@ -13,7 +13,10 @@ use quinn::{
 };
 use rustls::{pki_types::PrivatePkcs8KeyDer, RootCertStore};
 use std::{sync::Arc, time::Duration};
-use theia::quic_transport::{accept, client_endpoint, connect, server_endpoint};
+#[path = "support/quinn_reference.rs"]
+mod quinn_reference;
+
+use quinn_reference::{accept, client_endpoint, connect, server_endpoint};
 use tokio::{net::UdpSocket, sync::oneshot, time::timeout};
 use zeroize::Zeroize;
 

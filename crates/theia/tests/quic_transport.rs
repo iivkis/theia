@@ -1,13 +1,17 @@
-//! CI-only loopback proof of the production QUIC/TLS composition root.
+//! CI-only independent Quinn baseline loopback proof. Native product interoperability is tested separately.
 use bytes::{Buf, Bytes};
+#[path = "support/quinn_reference.rs"]
+mod quinn_reference;
+
 use quinn::Endpoint;
 use rustls::{pki_types::PrivatePkcs8KeyDer, RootCertStore};
 use std::{net::SocketAddr, time::Duration};
 use theia::{
     protocol::{self, Decoder, Direction, Frame, Role, Session, VERSION},
-    quic_transport::{accept, client_endpoint, connect, server_endpoint, QuicError},
 };
 use tokio::time::timeout;
+use quinn_reference::{accept, client_endpoint, connect, server_endpoint};
+use theia::quic_transport::QuicError;
 
 fn endpoints() -> (Endpoint, Endpoint, SocketAddr) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -23,7 +27,7 @@ fn endpoints() -> (Endpoint, Endpoint, SocketAddr) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn production_quic_endpoints_exchange_smarttheia_over_h3() {
+async fn reference_quic_endpoints_exchange_smarttheia_over_h3() {
     timeout(Duration::from_secs(15), async {
         let (server, client, address) = endpoints();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
@@ -115,7 +119,7 @@ async fn production_quic_endpoints_exchange_smarttheia_over_h3() {
 }
 
 #[tokio::test]
-async fn production_quic_rejects_wrong_name_and_untrusted_ca() {
+async fn reference_quic_rejects_wrong_name_and_untrusted_ca() {
     timeout(Duration::from_secs(15), async {
         let (server, client, address) = endpoints();
         let server_task = tokio::spawn(async move {
@@ -143,7 +147,7 @@ async fn production_quic_rejects_wrong_name_and_untrusted_ca() {
 }
 
 #[tokio::test]
-async fn production_quic_empty_trust_fails_before_binding() {
+async fn reference_quic_empty_trust_fails_before_binding() {
     assert!(matches!(
         client_endpoint("127.0.0.1:0".parse().unwrap(), RootCertStore::empty()),
         Err(QuicError::Configuration)

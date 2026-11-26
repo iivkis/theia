@@ -1,5 +1,8 @@
 //! Opt-in two-host, release-profile transport benchmark. No bearer,
 //! arbitrary destination relay, production activation or pass thresholds.
+#[path = "support/quinn_reference.rs"]
+mod quinn_reference;
+
 use bytes::{Buf, Bytes};
 use h3::quic;
 use rustls::{pki_types::ServerName, ClientConfig, RootCertStore, ServerConfig};
@@ -164,7 +167,7 @@ async fn server(backend: &str, bind: SocketAddr, peer: IpAddr, count: usize, siz
     .unwrap()
     .unwrap();
     if backend == "quinn" {
-        let endpoint = theia::quic_transport::server_endpoint(bind, certs, key).unwrap();
+        let endpoint = quinn_reference::server_endpoint(bind, certs, key).unwrap();
         println!("BENCH_READY");
         for _ in 0..count {
             let incoming = loop {
@@ -174,7 +177,7 @@ async fn server(backend: &str, bind: SocketAddr, peer: IpAddr, count: usize, siz
                 }
                 incoming.refuse();
             };
-            let connection = theia::quic_transport::accept(incoming).await.unwrap();
+            let connection = quinn_reference::accept(incoming).await.unwrap();
             echo(h3_quinn::Connection::new(connection), size).await;
         }
         endpoint.close(0u32.into(), b"benchmark complete");
@@ -222,8 +225,8 @@ async fn client(backend: &str, bind: SocketAddr, peer: SocketAddr, count: usize,
     for sample in 0..count {
         let start = Instant::now();
         let (handshake, opened, relay, wall_start, wall_end) = if backend == "quinn" {
-            let endpoint = theia::quic_transport::client_endpoint(bind, roots.clone()).unwrap();
-            let connection = theia::quic_transport::connect(&endpoint, peer, &name)
+            let endpoint = quinn_reference::client_endpoint(bind, roots.clone()).unwrap();
+            let connection = quinn_reference::connect(&endpoint, peer, &name)
                 .await
                 .unwrap();
             let elapsed = start.elapsed().as_micros().max(1);

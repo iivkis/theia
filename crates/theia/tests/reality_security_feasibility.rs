@@ -18,10 +18,11 @@ use std::{sync::Arc, time::Duration};
 use theia::{
     config::{self, Config},
     invite::Invitation,
-    quic_transport::{
-        accept as accept_quic, client_endpoint, connect as connect_quic, server_endpoint,
-    },
 };
+#[path = "support/quinn_reference.rs"]
+mod quinn_reference;
+
+use quinn_reference::{accept as accept_quic, client_endpoint, connect as connect_quic, server_endpoint};
 use tokio::{
     net::{TcpListener, TcpStream},
     time::timeout,

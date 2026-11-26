@@ -4396,7 +4396,7 @@ mod hardening_tests {
             let remote = endpoint.local_addr().unwrap();
             (
                 remote,
-                tokio::spawn(crate::h3_server::serve_generation(endpoint, context, phase)),
+                tokio::spawn(endpoint.serve_generation(context, phase)),
             )
         } else {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
