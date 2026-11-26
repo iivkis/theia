@@ -3589,7 +3589,7 @@ async fn udp_socks_fixture(client: &ProxyClient) {
     let port = target.local_addr().unwrap().port();
     let app = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let app_port = app.local_addr().unwrap().port();
-    let (mut control, local) = tests::paired().await;
+    let (mut control, local) = selector_tests::paired().await;
     let client = (*client).clone();
     assert!(matches!(
         client

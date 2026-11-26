@@ -389,14 +389,14 @@ mod tests {
             response_data(&published, request.headers(), true, deadline)
                 .await
                 .unwrap_err(),
-            StatusCode::CONFLICT
+            http::StatusCode::CONFLICT
         );
         request_domain(&mut request, "localhost", published.snapshot.digest()).unwrap();
         assert_eq!(
             response_data(&published, request.headers(), false, deadline)
                 .await
                 .unwrap_err(),
-            StatusCode::FORBIDDEN
+            http::StatusCode::FORBIDDEN
         );
         let ips = decode_ips(
             &response_data(&published, request.headers(), true, deadline)
