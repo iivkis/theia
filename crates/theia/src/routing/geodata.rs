@@ -490,7 +490,7 @@ mod tests {
             document: Arc::new(doc.clone()), inbounds: doc.server.inbounds.len(),
             preflight: Arc::new(ReloadPreflight::new(path.clone(), doc.clone(), vec![])),
             live: live.clone(),
-        }).with_reality_ledger(Arc::new(crate::quota::Ledger::new(&doc.server.policy, &doc.server.users)));
+        }).with_reality_ledger(crate::quota::Ledger::new(&doc.server.policy, &doc.server.users));
         let view = state.snapshot().unwrap();
         let stage = state.prepare_geodata(&view, &path, next.manifest().clone()).unwrap().unwrap();
         let mut edit = doc.clone();
