@@ -136,6 +136,29 @@ impl Scheduler {
         Ok(())
     }
 
+    /// One path probe is charged to the normal flight window and ledger.
+    /// No generic STREAM retransmission is created for PATH_* frames.
+    /// The path owner decides whether and where a later probe may be sent.
+    pub fn can_send_path(&self) -> bool {
+        self.window.in_flight().saturating_add(MTU) <= self.window.cwnd()
+    }
+
+    pub fn record_path(&mut self, number: u64, bytes: usize, now: Instant) -> Result<(), Error> {
+        if bytes != MTU as usize || !self.can_send_path() { return Err(Error::Window); }
+        let before = self.window.in_flight();
+        self.window.reserve(bytes as u64).map_err(|_| Error::Window)?;
+        if self.ledger.record(Sent { number, at: now, bytes: bytes as u32, ack_eliciting: true,
+            in_flight: true, frames: vec![] }).is_err() {
+            self.window.retire(bytes as u64).map_err(|_| Error::Window)?;
+            return Err(Error::Ledger);
+        }
+        if let Some(bbr) = self.bbr.as_mut() {
+            bbr.sent(number, bytes as u64, now, before, true).map_err(|_| Error::Window)?;
+        }
+        self.last_eliciting = Some(now);
+        Ok(())
+    }
+
     pub fn acknowledge(&mut self, ack: &Ack, now: Instant) -> Result<(), Error> {
         let outcome = self.ledger.acknowledge(ack, now, self.rtt.loss_delay()).map_err(|_| Error::Ledger)?;
         // Retain aliases for declared-lost packets until any copy is ACKed.
@@ -161,7 +184,7 @@ impl Scheduler {
         if let Some(bbr) = self.bbr.as_mut() {
             bbr.feedback(&outcome, now, self.window.in_flight()).map_err(|_| Error::Window)?;
             self.window.set_target(bbr.cwnd()).map_err(|_| Error::Window)?;
-        } else if persistent_loss(&outcome, self.base_pto().saturating_mul(3)) {
+        } else if self.rtt.minimum().is_some() && persistent_loss(&outcome, self.base_pto().saturating_mul(3)) {
             self.window.persistent_congestion(now);
         }
         // Apply loss before growth, so an ACK for a packet sent before
@@ -279,6 +302,18 @@ mod tests {
         assert_eq!(s.window.in_flight(), 0);
         assert_eq!(s.pending(), 0);
         assert_eq!(s.bbr.as_ref().unwrap().bandwidth(), 5000);
+    }
+
+    #[test]
+    fn path_packets_share_flight_accounting_without_stream_aliases() {
+        let now = Instant::now();
+        let mut s = Scheduler::with_bbr(now);
+        assert!(s.can_send_path());
+        s.record_path(0, 1200, now).unwrap();
+        assert_eq!(s.window.in_flight(), 1200);
+        assert_eq!(s.pending(), 0);
+        s.acknowledge(&ack(0), now + Duration::from_millis(10)).unwrap();
+        assert_eq!(s.window.in_flight(), 0);
     }
 
     #[test]

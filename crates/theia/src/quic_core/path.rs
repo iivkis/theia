@@ -63,6 +63,7 @@ struct Candidate {
     challenge: [u8; 8],
     expires: Instant,
     budget: PathBudget,
+    last_challenge: Option<Instant>,
 }
 
 /// One already validated active path and one bounded candidate. A valid
@@ -93,7 +94,7 @@ impl Paths {
         let expires = now.checked_add(CHALLENGE_TTL).ok_or(Error::Limit)?;
         let mut budget = PathBudget::default();
         budget.received(received);
-        self.candidate = Some(Candidate { address, challenge, expires, budget });
+        self.candidate = Some(Candidate { address, challenge, expires, budget, last_challenge: None });
         Ok(challenge)
     }
 
@@ -102,9 +103,26 @@ impl Paths {
             && c.budget.reserve_send(bytes))
     }
 
+    pub fn reserve_challenge(&mut self, address: SocketAddr, bytes: u64, now: Instant,
+                             interval: Duration) -> bool {
+        let Some(c) = self.candidate.as_mut() else { return false; };
+        if c.address != address || now >= c.expires || c.last_challenge.is_some_and(|sent|
+            now.saturating_duration_since(sent) < interval) || !c.budget.reserve_send(bytes) {
+            return false;
+        }
+        c.last_challenge = Some(now);
+        true
+    }
+
+    pub fn deadline(&self) -> Option<Instant> { self.candidate.as_ref().map(|c| c.expires) }
+
+    pub fn expire(&mut self, now: Instant) {
+        if self.deadline().is_some_and(|at| now >= at) { self.candidate = None; }
+    }
+
     pub fn response(&mut self, address: SocketAddr, response: [u8; 8], now: Instant) -> bool {
         if !self.candidate.as_ref().is_some_and(|c| address == c.address && now < c.expires
-            && response == c.challenge) { return false; }
+            && c.last_challenge.is_some() && response == c.challenge) { return false; }
         self.active = address;
         self.candidate = None;
         true
@@ -142,13 +160,17 @@ mod tests {
         let now = Instant::now();
         let mut paths = Paths::new_validated(active);
         let challenge = paths.begin(next, 100, now).unwrap();
-        assert!(paths.reserve_candidate_send(next, 300, now));
+        assert!(!paths.response(next, challenge, now));
+        assert!(paths.reserve_challenge(next, 300, now, Duration::from_secs(1)));
+        assert!(!paths.reserve_challenge(next, 1, now, Duration::from_secs(1)));
         assert!(!paths.reserve_candidate_send(next, 1, now));
         assert_eq!(paths.begin(other, 100, now), Err(Error::Path));
         assert!(!paths.response(other, challenge, now));
         assert!(!paths.response(next, challenge, now + CHALLENGE_TTL));
         assert_eq!(paths.active(), active);
         let challenge = paths.begin(next, 100, now + CHALLENGE_TTL).unwrap();
+        assert!(!paths.response(next, challenge, now + CHALLENGE_TTL));
+        assert!(paths.reserve_challenge(next, 300, now + CHALLENGE_TTL, Duration::from_secs(1)));
         assert!(paths.response(next, challenge, now + CHALLENGE_TTL));
         assert_eq!(paths.active(), next);
         assert!(!paths.response(next, challenge, now + CHALLENGE_TTL));

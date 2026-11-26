@@ -273,6 +273,36 @@ mod tests {
             pump(&mut s, &mut c).await;
             assert_eq!(c.read(stream, &mut out).unwrap(), 8);
             assert_eq!(&out[..8], b"response");
+            pump(&mut c, &mut s).await;
+            let ongoing = c.open_bidi().unwrap();
+            c.queue(ongoing, b"before", false).unwrap();
+            pump(&mut c, &mut s).await;
+            assert_eq!(s.read(ongoing, &mut out).unwrap(), 6);
+            assert_eq!(&out[..6], b"before");
+            pump(&mut s, &mut c).await;
+
+            let moved = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let moved_addr = moved.local_addr().unwrap();
+            c.rebind(moved, Instant::now()).await.unwrap();
+            let wait = Duration::from_secs(1);
+            // The first authenticated packet only initiates validation.
+            assert!(!s.recv(wait).await.unwrap());
+            assert_eq!(s.peer_addr(), caddr);
+            assert!(c.recv(wait).await.unwrap()); // challenge, sends response
+            assert!(s.recv(wait).await.unwrap()); // authenticated response
+            assert_eq!(s.peer_addr(), moved_addr);
+            pump(&mut s, &mut c).await; // ACK the response
+            pump(&mut c, &mut s).await; // ACK the challenge
+            c.queue(ongoing, b"after", true).unwrap();
+            pump(&mut c, &mut s).await;
+            assert_eq!(s.read(ongoing, &mut out).unwrap(), 5);
+            assert_eq!(&out[..5], b"after");
+            assert!(s.finished(ongoing));
+            pump(&mut s, &mut c).await;
+            s.queue(ongoing, b"still open", true).unwrap();
+            pump(&mut s, &mut c).await;
+            assert_eq!(c.read(ongoing, &mut out).unwrap(), 10);
+            assert_eq!(&out[..10], b"still open");
             use crate::quic_core::lifecycle::ShutdownPhase;
             c.close(42, Instant::now()).unwrap();
             assert!(c.open_uni().is_err());

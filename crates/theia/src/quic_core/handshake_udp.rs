@@ -142,7 +142,7 @@ impl Handshake {
         Ok(())
     }
 
-    async fn flush(&mut self, socket: &UdpSocket) -> Result<(), Error> {
+    async fn flush(&mut self, socket: &UdpSocket, peer: SocketAddr) -> Result<(), Error> {
         let mut discard_initial = false;
         for (index, epoch) in self.epochs.iter_mut().enumerate() {
             let Some(epoch) = epoch else { continue; };
@@ -158,7 +158,7 @@ impl Handshake {
             if self.server && !self.budget.reserve_send(expected as u64) { continue; }
             let (number, packet) = epoch.writer.seal(&h, &payload).map_err(Error::Packet)?;
             epoch.schedule.record(number, packet.len(), frame, now).map_err(Error::Schedule)?;
-            if socket.send(&packet).await.map_err(Error::Io)? != packet.len() { return Err(Error::Protocol); }
+            if socket.send_to(&packet, peer).await.map_err(Error::Io)? != packet.len() { return Err(Error::Protocol); }
             if frame.is_none() { epoch.ack.sent(); }
             // Client discards Initial only after actually sending a
             // protected Handshake packet (RFC 9001 section 4.9.1).
@@ -251,15 +251,15 @@ pub async fn establish(socket: UdpSocket, peer: SocketAddr, version: Version,
     let keys = suite.keys(&original, if server { Side::Server } else { Side::Client }, version_tls);
     let mut handshake = Handshake { driver: Driver::new(connection), epochs: [Some(Epoch::new(keys)), None],
         application: None, budget: PathBudget::default(), server, version, local, remote };
-    socket.connect(peer).await.map_err(Error::Io)?;
+    if socket.peer_addr().is_ok() { return Err(Error::Scope); }
     tokio::time::timeout(DEADLINE, async {
         let mut buffer = [0; MTU + 1];
         loop {
             handshake.collect()?;
-            handshake.flush(&socket).await?;
+            handshake.flush(&socket, peer).await?;
             if handshake.done() { break; }
-            match tokio::time::timeout(Duration::from_millis(2), socket.recv(&mut buffer)).await {
-                Ok(Ok(n)) if n <= MTU => handshake.receive_datagram(&buffer[..n])?,
+            match tokio::time::timeout(Duration::from_millis(2), socket.recv_from(&mut buffer)).await {
+                Ok(Ok((n, source))) if source == peer && n <= MTU => handshake.receive_datagram(&buffer[..n])?,
                 Ok(Ok(_)) | Err(_) => {}
                 Ok(Err(e)) => return Err(Error::Io(e)),
             }

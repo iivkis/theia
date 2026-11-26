@@ -1,11 +1,11 @@
 //! Isolated development UDP session for exercising application-space
 //! packet protection, STREAM, ACK and retransmission. Loopback only,
-//! pre-established TLS keys, fixed CID and peer; NOT a QUIC handshake
+//! pre-established TLS keys, fixed CID, bounded same-IP rebinding; NOT a QUIC handshake
 //! endpoint, interoperable H3 backend or an admitted Theia user tunnel.
 use super::{ack_tx::History, flow::ReceiveFlow, frames::{self, Frame}, packet::{self, Reader, Writer},
     scheduler::Scheduler, send_flow::SendFlow, spaces::Space};
 use rustls::quic::{Keys, Secrets};
-use super::{key_update, lifecycle::{Shutdown, ShutdownPhase}};
+use super::{key_update, lifecycle::{Shutdown, ShutdownPhase}, path::Paths};
 use std::{io, net::SocketAddr, time::{Duration, Instant}};
 use tokio::net::UdpSocket;
 
@@ -33,6 +33,7 @@ enum Protection {
 
 pub struct LabSession {
     socket: UdpSocket,
+    paths: Paths,
     local_cid: [u8; CID_LEN],
     remote_cid: [u8; CID_LEN],
     protection: Option<Protection>,
@@ -54,7 +55,7 @@ impl LabSession {
                          local_cid: [u8; CID_LEN], remote_cid: [u8; CID_LEN],
                          keys: Keys) -> Result<Self, Error> {
         Self::connect_inner(socket, peer, server, local_cid, remote_cid,
-            Protection::Fixed { reader: Reader::new(keys.remote), writer: Writer::new(keys.local) }, false).await
+            Protection::Fixed { reader: Reader::new(keys.remote), writer: Writer::new(keys.local) }, false)
     }
 
     /// Only the UDP handshake driver can construct this session. Server
@@ -65,7 +66,7 @@ impl LabSession {
                          keys: Keys, secrets: Secrets) -> Result<Self, Error> {
         let mut session = Self::connect_inner(socket, peer, server, local_cid, remote_cid,
             Protection::Rotating { reader: key_update::Receiver::new(keys.remote, secrets.clone()),
-                writer: key_update::Sender::new(keys.local, secrets) }, server).await?;
+                writer: key_update::Sender::new(keys.local, secrets) }, server)?;
         // Application-space native laboratory defaults to BBR; the
         // fixed-key codec fixture keeps the CUBIC scheduler for comparison.
         session.scheduler = Scheduler::with_bbr(Instant::now());
@@ -73,25 +74,59 @@ impl LabSession {
         Ok(session)
     }
 
-    async fn connect_inner(socket: UdpSocket, peer: SocketAddr, server: bool,
+    fn connect_inner(socket: UdpSocket, peer: SocketAddr, server: bool,
                          local_cid: [u8; CID_LEN], remote_cid: [u8; CID_LEN],
                          protection: Protection, confirmed: bool) -> Result<Self, Error> {
         let local = socket.local_addr().map_err(Error::Io)?;
         if !local.ip().is_loopback() || !peer.ip().is_loopback() || peer.port() == 0
             || local == peer || local_cid == remote_cid || local_cid == [0; CID_LEN]
             || remote_cid == [0; CID_LEN] { return Err(Error::Scope); }
-        socket.connect(peer).await.map_err(Error::Io)?;
+        if socket.peer_addr().is_ok() { return Err(Error::Scope); }
         let mut send = SendFlow::new(server, MAX_STREAMS, FLOW_LIMIT, FLOW_LIMIT).map_err(Error::Send)?;
         send.enable_bidi(MAX_STREAMS, MAX_STREAMS).map_err(Error::Send)?;
         let mut receive = ReceiveFlow::new(server, MAX_STREAMS, MAX_STREAMS, FLOW_LIMIT,
             FLOW_LIMIT as usize, FLOW_LIMIT).map_err(Error::Receive)?;
         receive.enable_local_bidi(MAX_STREAMS).map_err(Error::Receive)?;
-        Ok(Self { socket, local_cid, remote_cid, protection: Some(protection), acknowledgments: History::default(),
+        Ok(Self { socket, paths: Paths::new_validated(peer), local_cid, remote_cid, protection: Some(protection), acknowledgments: History::default(),
             send, receive,
             scheduler: Scheduler::default(), closed: false, shutdown: Shutdown::default(), server, confirmed })
     }
 
     pub fn handshake_confirmed(&self) -> bool { self.confirmed }
+
+    pub fn peer_addr(&self) -> SocketAddr { self.paths.active() }
+
+    /// Controlled NAT-rebinding fixture: replace only the client's UDP
+    /// port on the same loopback IP. No CID rotation or cross-IP migration.
+    /// Existing streams and cryptographic packet numbers remain intact.
+    pub async fn rebind(&mut self, socket: UdpSocket, now: Instant) -> Result<(), Error> {
+        if self.server || !self.confirmed || !self.active() { return Err(Error::Scope); }
+        let previous = self.socket.local_addr().map_err(Error::Io)?;
+        let next = socket.local_addr().map_err(Error::Io)?;
+        if !next.ip().is_loopback() || next.ip() != previous.ip()
+            || next == previous || next == self.paths.active() || socket.peer_addr().is_ok()
+            || !self.scheduler.can_send_path() { return Err(Error::Scope); }
+        self.socket = socket;
+        let peer = self.paths.active();
+        if let Err(e) = self.send_path(peer, &[1], now).await {
+            self.abort();
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    async fn send_path(&mut self, peer: SocketAddr, frame: &[u8], now: Instant) -> Result<(), Error> {
+        if !self.scheduler.can_send_path() { return Err(Error::Protocol); }
+        let mut payload = frame.to_vec();
+        // Fixed four-byte PN and the 16-byte AEAD tag used by this fixture.
+        payload.resize(MTU - 1 - CID_LEN - 4 - 16, 0);
+        let (number, packet) = self.seal(&payload)?;
+        self.scheduler.record_path(number, packet.len(), now).map_err(Error::Schedule)?;
+        if self.socket.send_to(&packet, peer).await.map_err(Error::Io)? != packet.len() {
+            return Err(Error::Protocol);
+        }
+        Ok(())
+    }
 
     pub fn update_keys(&mut self) -> Result<(), Error> {
         if !self.active() { return Err(Error::Closed); }
@@ -195,6 +230,7 @@ impl LabSession {
     pub fn shutdown_phase(&self) -> ShutdownPhase { self.shutdown.phase() }
 
     fn tick(&mut self, now: Instant) {
+        self.paths.expire(now);
         if self.shutdown.expire(now) {
             self.abort();
         } else if let Some(Protection::Rotating { reader, .. }) = &mut self.protection {
@@ -208,7 +244,7 @@ impl LabSession {
             _ => None,
         };
         let recovery = if self.active() { self.scheduler.deadline() } else { None };
-        [self.shutdown.deadline(), old_keys, recovery].into_iter().flatten().min()
+        [self.shutdown.deadline(), old_keys, recovery, self.paths.deadline()].into_iter().flatten().min()
     }
 
     /// Send at most one datagram per call, ACKs first. The caller owns the
@@ -235,7 +271,7 @@ impl LabSession {
         // CONNECTION_CLOSE is not ACK-eliciting. Once closing, no normal
         // recovery or application frames are driven, but PN never resets.
         let (_, packet) = self.seal(&payload)?;
-        if self.socket.send(&packet).await.map_err(Error::Io)? != packet.len() { return Err(Error::Protocol); }
+        if self.socket.send_to(&packet, self.paths.active()).await.map_err(Error::Io)? != packet.len() { return Err(Error::Protocol); }
         Ok(true)
     }
 
@@ -259,7 +295,7 @@ impl LabSession {
         } else { return Ok(false); };
         let (number, packet) = self.seal(&payload)?;
         self.scheduler.record(number, packet.len(), frame, now).map_err(Error::Schedule)?;
-        if self.socket.send(&packet).await.map_err(Error::Io)? != packet.len() {
+        if self.socket.send_to(&packet, self.paths.active()).await.map_err(Error::Io)? != packet.len() {
             return Err(Error::Protocol);
         }
         if frame.is_none() { self.acknowledgments.sent(); }
@@ -281,11 +317,14 @@ impl LabSession {
 
     async fn recv_inner(&mut self, wait: Duration) -> Result<bool, Error> {
         let mut buf = [0; MTU + 1];
-        let n = match tokio::time::timeout(wait, self.socket.recv(&mut buf)).await {
+        let (n, source) = match tokio::time::timeout(wait, self.socket.recv_from(&mut buf)).await {
             Ok(result) => result.map_err(Error::Io)?,
             Err(_) => return Ok(false),
         };
         if self.shutdown.phase() == ShutdownPhase::Draining { return Ok(false); }
+        let new_path = source != self.paths.active();
+        if new_path && (!self.server || !self.confirmed || !self.active()
+            || source.ip() != self.paths.active().ip()) { return Ok(false); }
         if n > MTU || n < 1 + CID_LEN + 4 + 16 || buf[0] & 0xc0 != 0x40
             || buf[1..1 + CID_LEN] != self.local_cid { return Ok(false); }
         let now = Instant::now();
@@ -309,6 +348,25 @@ impl LabSession {
         };
         if matches!(&self.protection, Some(Protection::Fixed { .. })) && opened.header[0] & 0x04 != 0 { return Err(Error::Protocol); }
         let parsed = frames::decode(&opened.payload, Space::Application).map_err(|_| Error::Protocol)?;
+        if new_path {
+            // Only authenticated 1-RTT packets can establish a candidate.
+            // Never apply stream data, ACKs or close from an unvalidated path.
+            let Ok(challenge) = self.paths.begin(source, n as u64, now) else { return Ok(false); };
+            let probing = parsed.iter().all(|f| matches!(f, Frame::Padding | Frame::Ping
+                | Frame::PathChallenge(_) | Frame::PathResponse(_)));
+            if !probing || !parsed.iter().any(|f| matches!(f, Frame::PathResponse(value)
+                if self.paths.response(source, *value, now))) {
+                if self.scheduler.can_send_path() && self.paths.reserve_challenge(
+                    source, MTU as u64, now, self.scheduler.base_pto()) {
+                    let mut frame = vec![0x1a];
+                    frame.extend_from_slice(&challenge);
+                    self.send_path(source, &frame, now).await?;
+                }
+                return Ok(false);
+            }
+            // Same-IP NAT rebinding may retain congestion and RTT state.
+            // Cross-IP path changes require independent recovery state.
+        }
         if parsed.iter().any(|frame| matches!(frame, Frame::Close { .. })) {
             self.shutdown.peer(now, self.scheduler.base_pto()).map_err(|_| Error::Protocol)?;
             // Draining is silent. Drop keys now; retain the connection
@@ -324,7 +382,14 @@ impl LabSession {
         let now = Instant::now();
         for frame in parsed {
             match frame {
-                Frame::Padding | Frame::Ping => {}
+                Frame::Padding | Frame::Ping | Frame::PathResponse(_) => {}
+                Frame::PathChallenge(value) if self.confirmed => {
+                    if self.scheduler.can_send_path() {
+                        let mut response = vec![0x1b];
+                        response.extend_from_slice(&value);
+                        self.send_path(source, &response, now).await?;
+                    }
+                }
                 Frame::Ack(ack) => {
                     self.scheduler.acknowledge(&ack, now).map_err(Error::Schedule)?;
                     if let Some(Protection::Rotating { writer, .. }) = &mut self.protection {
