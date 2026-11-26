@@ -314,11 +314,19 @@ impl Tunnel {
     pub(crate) async fn relay(mut self, mut client: TcpStream) -> Result<(), ClientError> {
         // The application owns the actual TLS session. The probe does not
         // authorize modifying its certificate checks or replaying its bytes.
-        let original = timeout(FIRST_FLIGHT, read_record(&mut client))
-            .await
-            .map_err(|_| ClientError::Timeout)??;
+        let original = match timeout(FIRST_FLIGHT, read_record(&mut client)).await {
+            Ok(Ok(record)) => record,
+            Ok(Err(error @ ClientError::Protocol)) => {
+                self.engine.remember(&self.key, Verdict::Unavailable);
+                crate::traffic::dpi_first_failure();
+                return Err(error);
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Err(ClientError::Timeout),
+        };
         let Some(transformed) = fragment_flight(&original, self.strategy) else {
             self.engine.remember(&self.key, Verdict::Unavailable);
+            crate::traffic::dpi_first_failure();
             return Err(ClientError::Protocol);
         };
         if network_scope::observe(self.key.address) != Some(self.key.network) {
@@ -339,10 +347,12 @@ impl Tunnel {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => {
                 self.engine.remember(&self.key, Verdict::Unavailable);
+                crate::traffic::dpi_first_failure();
                 return Err(error);
             }
             Err(_) => {
                 self.engine.remember(&self.key, Verdict::Unavailable);
+                crate::traffic::dpi_first_failure();
                 return Err(ClientError::Timeout);
             }
         };
@@ -350,6 +360,7 @@ impl Tunnel {
             .await
             .map_err(|_| ClientError::Timeout)?
             .map_err(|_| ClientError::Io)?;
+        crate::traffic::dpi_first_response();
         // No rerouting of this live stream. A failed first flight only affects
         // subsequent opens. TLS record overhead is excluded from app counters.
         super::client_state::relay_direct_after_first(

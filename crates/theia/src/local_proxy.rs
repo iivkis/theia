@@ -1079,7 +1079,9 @@ async fn routed_open(
             }
             // Failed local probe/dial or unsupported traffic uses the same
             // authenticated VPS carrier. No silent unprotected direct route.
-            carrier.open(address, port).await
+            let tunnel = carrier.open(address, port).await?;
+            crate::traffic::dpi_fallback_open();
+            Ok(tunnel)
         }
         Action::Direct => client_state::dial_direct(address, port, pinned)
             .await
@@ -1121,8 +1123,9 @@ impl ProxyClient {
             }
         };
         format!(
-            "{report}\n{}\n{}",
+            "{report}\n{}\nЛокальный Anti-DPI: {}\n{}",
             self.routing_cache().report(),
+            if self.routing_cache().dpi.enabled() { "разрешён (экспериментальный TCP/TLS)" } else { "выключен; резерв VPS" },
             crate::traffic::routing_summary()
         )
     }
@@ -1259,7 +1262,7 @@ impl ClientRuntime {
             stage: tokio::sync::Mutex::new(()),
         })
     }
-    pub(crate) async fn status(&self) -> (u64, [u8; 32], u64, u8, u8, bool, (u64, u8), [u64; 7]) {
+    pub(crate) async fn status(&self) -> (u64, [u8; 32], u64, u8, u8, bool, (u64, u8), [u64; 10]) {
         let view = self.slot.borrow().clone();
         let (desc, observed, fallback) = match &view.client {
             ProxyClient::Reality(r) => {

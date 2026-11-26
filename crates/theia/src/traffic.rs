@@ -76,6 +76,9 @@ static CLIENT_H2: Counters = Counters::new();
 static CLIENT_H3: Counters = Counters::new();
 static CLIENT_DIRECT: Counters = Counters::new();
 static CLIENT_BLOCKED: AtomicU64 = AtomicU64::new(0);
+static DPI_FIRST_RESPONSE: AtomicU64 = AtomicU64::new(0);
+static DPI_FALLBACK_OPEN: AtomicU64 = AtomicU64::new(0);
+static DPI_FIRST_FAILURE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn enter_direct() -> Relay<'static> {
     CLIENT_DIRECT.enter()
@@ -83,7 +86,16 @@ pub(crate) fn enter_direct() -> Relay<'static> {
 pub(crate) fn blocked() {
     CLIENT_BLOCKED.fetch_add(1, Ordering::Relaxed);
 }
-pub(crate) fn routing_totals() -> [u64; 7] {
+pub(crate) fn dpi_first_response() {
+    DPI_FIRST_RESPONSE.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn dpi_fallback_open() {
+    DPI_FALLBACK_OPEN.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn dpi_first_failure() {
+    DPI_FIRST_FAILURE.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn routing_totals() -> [u64; 10] {
     let direct = CLIENT_DIRECT.snapshot();
     let proxied = snapshot(Role::Client);
     [
@@ -94,6 +106,9 @@ pub(crate) fn routing_totals() -> [u64; 7] {
         CLIENT_BLOCKED.load(Ordering::Relaxed),
         direct.active,
         proxied[0].active.saturating_add(proxied[1].active),
+        DPI_FIRST_RESPONSE.load(Ordering::Relaxed),
+        DPI_FALLBACK_OPEN.load(Ordering::Relaxed),
+        DPI_FIRST_FAILURE.load(Ordering::Relaxed),
     ]
 }
 
@@ -101,11 +116,11 @@ pub(crate) fn routing_summary() -> String {
     routing_summary_from(routing_totals())
 }
 
-pub(crate) fn routing_summary_from(totals: [u64; 7]) -> String {
-    let [direct_up, direct_down, proxy_up, proxy_down, blocked, direct_active, proxy_active] =
-        totals;
+pub(crate) fn routing_summary_from(totals: [u64; 10]) -> String {
+    let [direct_up, direct_down, proxy_up, proxy_down, blocked, direct_active, proxy_active,
+        dpi_first_response, dpi_fallback_open, dpi_first_failure] = totals;
     format!(
-        "Через VPS: ↑ {} ↓ {} · активно {proxy_active}\nНапрямую: ↑ {} ↓ {} · активно {direct_active}\nЗаблокировано: {blocked}",
+        "Через VPS: ↑ {} ↓ {} · активно {proxy_active}\nНапрямую: ↑ {} ↓ {} · активно {direct_active}\nЗаблокировано: {blocked}\nAnti-DPI: первый ответ TLS {dpi_first_response} · резерв VPS {dpi_fallback_open}\nОшибки первого обмена: {dpi_first_failure}",
         bytes(proxy_up),
         bytes(proxy_down),
         bytes(direct_up),
