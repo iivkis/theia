@@ -53,6 +53,7 @@ pub struct Scheduler {
     first_rtt_at: Option<Instant>,
     persistent_reported: Option<Instant>,
     mtu: Discovery,
+    ecn: super::ecn::PathEcn,
 }
 
 impl Default for Scheduler {
@@ -76,6 +77,7 @@ impl Default for Scheduler {
             first_rtt_at: None,
             persistent_reported: None,
             mtu: Discovery::default(),
+            ecn: super::ecn::PathEcn::default(),
         }
     }
 }
@@ -101,6 +103,7 @@ impl Scheduler {
     pub(crate) fn restart_path(&mut self, now: Instant) {
         self.ledger.restart_path();
         self.mtu.reset_path(now);
+        self.ecn.disable();
         self.window = Window::new(MTU).expect("valid MTU");
         if self.bbr.is_some() {
             self.bbr = Some(Bbr::new(MTU, now).expect("valid MTU"));
@@ -248,10 +251,21 @@ impl Scheduler {
     pub(crate) fn current_mtu(&self) -> usize { self.mtu.current() }
 
     pub(crate) fn reset_mtu(&mut self, now: Instant) {
+        self.ecn.disable();
         let before = self.mtu.current();
         self.mtu.reset_path(now);
         self.apply_mtu(before);
     }
+
+    pub(crate) fn disable_mtu(&mut self) {
+        let before = self.mtu.current();
+        self.mtu = Discovery::default();
+        self.apply_mtu(before);
+    }
+
+    pub(crate) fn enable_ecn(&mut self, supported: bool) { self.ecn.enable(supported); }
+    pub(crate) fn should_mark_ecn(&self) -> bool { self.ecn.should_mark() }
+    pub(crate) fn record_ecn(&mut self, number: u64, mark: super::ecn::Mark, now: Instant) { self.ecn.sent(number, mark, now); }
 
     fn mtu_deadline(&self) -> Option<Instant> {
         let size = self.mtu.candidate()?;
@@ -477,7 +491,16 @@ impl Scheduler {
         if outcome.acknowledged.iter().any(|p| p.ack_eliciting) {
             self.pto_count = 0;
         }
-        self.apply_loss(outcome, now)
+        self.apply_loss(outcome, now)?;
+        if let Some(at) = self.ecn.acknowledge(ack) {
+            if let Some(bbr) = self.bbr.as_mut() {
+                bbr.ecn_congestion();
+                self.window.set_target(bbr.cwnd()).map_err(|_| Error::Window)?;
+            } else {
+                self.window.loss(at, now).map_err(|_| Error::Window)?;
+            }
+        }
+        Ok(())
     }
 
     fn apply_loss(&mut self, outcome: loss::Outcome, now: Instant) -> Result<(), Error> {
@@ -533,6 +556,7 @@ impl Scheduler {
     }
 
     pub fn on_timer(&mut self, now: Instant) -> Result<(), Error> {
+        self.ecn.tick(now, self.base_pto());
         let result = self
             .ledger
             .on_loss_timer(now, self.rtt.loss_delay())

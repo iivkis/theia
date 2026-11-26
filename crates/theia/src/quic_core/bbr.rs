@@ -68,6 +68,7 @@ pub struct Bbr {
     loss_ceiling: Option<u64>,
     round_acked: u64,
     round_lost: u64,
+    last_ecn_round: Option<u64>,
 }
 
 impl Bbr {
@@ -102,6 +103,7 @@ impl Bbr {
             loss_ceiling: None,
             round_acked: 0,
             round_lost: 0,
+            last_ecn_round: None,
         })
     }
 
@@ -112,6 +114,20 @@ impl Bbr {
         self.mtu = mtu;
         self.cwnd = self.cwnd.max(4 * mtu);
         self.loss_ceiling = self.loss_ceiling.map(|limit| limit.max(4 * mtu));
+    }
+
+    /// Conservative CE response, at most once per packet-timed round.
+    /// This does not claim BBRv3 ECN/L4S conformance.
+    pub(crate) fn ecn_congestion(&mut self) {
+        if self.last_ecn_round == Some(self.round) { return; }
+        self.last_ecn_round = Some(self.round);
+        let bound = (self.cwnd.saturating_mul(7) / 10).max(4 * self.mtu);
+        self.loss_ceiling = Some(self.loss_ceiling.map_or(bound, |old| old.min(bound)));
+        self.cwnd = self.cwnd.min(bound);
+        if self.mode == Mode::Startup {
+            self.full_pipe = true;
+            self.mode = Mode::Drain;
+        }
     }
 
     pub fn cwnd(&self) -> u64 {

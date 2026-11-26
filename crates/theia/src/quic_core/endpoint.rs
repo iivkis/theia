@@ -163,7 +163,9 @@ impl LabSession {
             SendFlow::from_peer(server, peer_limits, MAX_STREAMS).map_err(Error::Send)?;
         session.receive.enable_autotune().map_err(Error::Receive)?;
         session.scheduler = Scheduler::with_bbr(Instant::now());
-        session.scheduler.enable_mtu(peer_limits.max_udp_payload, Instant::now());
+        let options = session.socket.options();
+        if options.df { session.scheduler.enable_mtu(peer_limits.max_udp_payload, Instant::now()); }
+        session.scheduler.enable_ecn(options.ecn);
         session.scheduler.application_ack_timing(
             peer_limits.ack_delay_exponent,
             peer_limits.max_ack_delay_ms,
@@ -378,6 +380,7 @@ impl LabSession {
             self.scheduler.reset_mtu(now);
         }
         self.socket = SessionIo::direct(socket, scope);
+        if !self.socket.options().df { self.scheduler.disable_mtu(); }
         let peer = self.paths.active();
         if let Err(e) = self.send_path(peer, &[1], now).await {
             self.abort();
@@ -819,8 +822,12 @@ impl LabSession {
             return Ok(false);
         };
         let (number, packet) = self.seal(&payload)?;
-        match self.socket.send_to(&packet, self.paths.active()).await {
-            Ok(n) if n == packet.len() => self.scheduler.record_batch(number, n, &ids, probe, now).map_err(Error::Schedule)?,
+        let ect = self.confirmed && !ids.is_empty() && !probe && self.scheduler.should_mark_ecn();
+        match self.socket.send_marked(&packet, self.paths.active(), ect).await {
+            Ok((n, mark)) if n == packet.len() => {
+                self.scheduler.record_batch(number, n, &ids, probe, now).map_err(Error::Schedule)?;
+                if ect { self.scheduler.record_ecn(number, mark, now); }
+            }
             Err(e) if packet.len() > MTU && super::mtu::message_too_large(&e) => {
                 self.scheduler.reject_mtu(number, packet.len(), now).map_err(Error::Schedule)?;
                 return Ok(true);
@@ -904,12 +911,12 @@ impl LabSession {
         wake: Option<&tokio::sync::Notify>,
     ) -> Result<bool, Error> {
         let mut buf = [0; super::mtu::MAX_UDP_PAYLOAD + 1];
-        let (n, source) = if let Some(packet) = self.early_application.pop_front() {
+        let (n, source, mark) = if let Some(packet) = self.early_application.pop_front() {
             if packet.len() > super::mtu::MAX_UDP_PAYLOAD {
                 return Err(Error::Protocol);
             }
             buf[..packet.len()].copy_from_slice(&packet);
-            (packet.len(), self.paths.active())
+            (packet.len(), self.paths.active(), super::ecn::Mark::NotEct)
         } else {
             let incoming = tokio::time::timeout(wait, self.socket.recv_from(&mut buf));
             let received = if let Some(wake) = wake {
@@ -1208,7 +1215,7 @@ impl LabSession {
                 _ => return Err(Error::Protocol),
             }
         }
-        self.acknowledgments.record(opened.number, eliciting);
+        self.acknowledgments.record_marked(opened.number, eliciting, mark);
         Ok(true)
     }
 }

@@ -7,6 +7,8 @@ use super::{
     negotiation::{Binding, VersionPolicy},
     scope::NetworkScope,
 };
+use crate::udp_metadata::Options;
+use super::ecn::Mark;
 use ring::rand::{SecureRandom, SystemRandom};
 use std::{
     collections::BTreeMap,
@@ -39,13 +41,14 @@ pub(crate) enum RouteCommand {
 const MTU: usize = super::mtu::MAX_UDP_PAYLOAD;
 const MAX_CONNECTIONS: usize = 128;
 const MAILBOX: usize = 16;
-type Datagram = (Vec<u8>, SocketAddr);
+type Datagram = (Vec<u8>, SocketAddr, Mark);
 
 pub(crate) enum SessionIo {
-    Direct { socket: UdpSocket, scope: NetworkScope },
+    Direct { socket: UdpSocket, scope: NetworkScope, options: Options },
     Routed {
         socket: Arc<UdpSocket>,
         scope: NetworkScope,
+        options: Options,
         incoming: mpsc::Receiver<Datagram>,
         owner: u64,
         commands: mpsc::Sender<RouteCommand>,
@@ -60,11 +63,16 @@ impl From<UdpSocket> for SessionIo {
 
 impl SessionIo {
     pub(crate) fn direct(socket: UdpSocket, scope: NetworkScope) -> Self {
-        Self::Direct { socket, scope }
+        let options = Options::configure(&socket);
+        Self::Direct { socket, scope, options }
     }
 
     pub(crate) fn scope(&self) -> NetworkScope {
         match self { Self::Direct { scope, .. } | Self::Routed { scope, .. } => *scope }
+    }
+
+    pub(crate) fn options(&self) -> Options {
+        match self { Self::Direct { options, .. } | Self::Routed { options, .. } => *options }
     }
 
     pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -141,14 +149,24 @@ impl SessionIo {
         }
     }
 
-    pub(crate) async fn recv_from(&mut self, out: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+    pub(crate) async fn send_marked(&self, bytes: &[u8], peer: SocketAddr, ect: bool) -> io::Result<(usize, Mark)> {
         match self {
-            Self::Direct { socket: s, .. } => s.recv_from(out).await,
+            Self::Direct { socket, options, .. } => options.send(socket, bytes, peer, ect).await,
+            Self::Routed { socket, options, incoming, .. } => {
+                if incoming.is_closed() { return Err(io::ErrorKind::BrokenPipe.into()); }
+                options.send(socket, bytes, peer, ect).await
+            }
+        }
+    }
+
+    pub(crate) async fn recv_from(&mut self, out: &mut [u8]) -> io::Result<(usize, SocketAddr, Mark)> {
+        match self {
+            Self::Direct { socket, options, .. } => options.receive(socket, out).await,
             Self::Routed { incoming, .. } => {
-                let (bytes, peer) = incoming.recv().await.ok_or(io::ErrorKind::BrokenPipe)?;
+                let (bytes, peer, mark) = incoming.recv().await.ok_or(io::ErrorKind::BrokenPipe)?;
                 let n = bytes.len().min(out.len());
                 out[..n].copy_from_slice(&bytes[..n]);
-                Ok((n, peer))
+                Ok((n, peer, mark))
             }
         }
     }
@@ -254,6 +272,7 @@ async fn run(
     scope: NetworkScope,
 ) -> io::Result<()> {
     let local = socket.local_addr()?;
+    let options = Options::configure(&socket);
     let clock = Instant::now();
     let mut routes: BTreeMap<u64, mpsc::Sender<Datagram>> = BTreeMap::new();
     let mut buffer = [0; MTU + 1];
@@ -289,8 +308,8 @@ async fn run(
                     }
                 }
             }
-            received = socket.recv_from(&mut buffer) => {
-                let (n, peer) = match received {
+            received = options.receive(&socket, &mut buffer) => {
+                let (n, peer, mark) = match received {
                     Ok(value) => value,
                     // Windows can surface ICMP Port Unreachable on an
                     // unconnected UDP socket. It is not a listener failure.
@@ -322,17 +341,17 @@ async fn run(
                     Action::Existing(owner) => {
                         if let Some(tx) = routes.get(&owner) {
                             // Drop on mailbox saturation; never block unrelated CIDs.
-                            if let Ok(permit) = tx.try_reserve() { permit.send((bytes.to_vec(), peer)); }
+                            if let Ok(permit) = tx.try_reserve() { permit.send((bytes.to_vec(), peer, mark)); }
                         }
                     }
                     Action::Accepted { owner, binding } => {
                         let token = crate::reality_quic_wire::long(bytes).map(|h| h.token.to_vec());
                         if let (Some(token), Ok(permit)) = (token, accepts.try_reserve()) {
                             let (tx, incoming) = mpsc::channel(MAILBOX);
-                            tx.try_send((bytes.to_vec(), peer)).map_err(|_| io::ErrorKind::InvalidData)?;
+                            tx.try_send((bytes.to_vec(), peer, mark)).map_err(|_| io::ErrorKind::InvalidData)?;
                             let initial_reset = ingress.initial_reset(owner, binding.retry).map_err(|_| io::ErrorKind::InvalidData)?;
                             routes.insert(owner, tx);
-                            permit.send(Candidate { io: SessionIo::Routed { socket: socket.clone(), scope, incoming, owner, commands: commands.clone() },
+                            permit.send(Candidate { io: SessionIo::Routed { socket: socket.clone(), scope, options, incoming, owner, commands: commands.clone() },
                                 peer, binding, token, initial_reset, versions: versions.clone() });
                         } else {
                             ingress.close(owner, now).map_err(|_| io::ErrorKind::InvalidData)?;

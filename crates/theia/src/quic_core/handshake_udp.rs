@@ -1012,7 +1012,7 @@ async fn establish_inner(
                 tokio::task::yield_now().await;
             }
             match tokio::time::timeout(wait, socket.recv_from(&mut buffer)).await {
-                Ok(Ok((n, source))) if source == peer && n <= super::mtu::MAX_UDP_PAYLOAD => {
+                Ok(Ok((n, source, _mark))) if source == peer && n <= super::mtu::MAX_UDP_PAYLOAD => {
                     handshake.receive_datagram(&buffer[..n])?
                 }
                 Ok(Ok(_)) | Err(_) => {}
