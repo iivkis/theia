@@ -170,7 +170,7 @@ fn parse_header(
     } else {
         return None;
     };
-    if packet.get(1..5)? != version.wire()
+    if packet.get(1..5)? != version.wire().to_be_bytes()
         || *packet.get(5)? != CID_LEN as u8
         || packet.get(6..14)? != local
         || *packet.get(14)? != CID_LEN as u8
