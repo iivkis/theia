@@ -1948,7 +1948,17 @@ mod strict_wire_matrix_tests {
                 })
             );
         }
+        // Maximal counters still fit the fixed response budget.
+        let max_counters = [u64::MAX; 38].iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+        let max_response = format!("theia-client-v1 r={} sha256={hex} d={} t=3 x=2 f=0 rr={} rs=1 rt={max_counters}\n", u64::MAX, u64::MAX, u64::MAX);
+        assert!(max_response.len() as u64 <= MAX_RESPONSE_BYTES);
+        assert!(matches!(peer(status, "client-status\n", max_response.as_bytes()).await,
+            Ok(StatusReply::ClientRunning { routing_totals, .. }) if routing_totals == [u64::MAX; 38]));
+        let zeros = ["0"; 38].join(",");
+        let noncanonical = format!("{},01", ["0"; 37].join(","));
         for response in [
+            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=0 rs=1 rt={zeros}\n"),
+            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=2 rs=1 rt={noncanonical}\n"),
             format!(
                 "theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=0 rs=1 rt=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n"
             ),

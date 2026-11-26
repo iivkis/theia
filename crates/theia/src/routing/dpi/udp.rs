@@ -91,8 +91,7 @@ fn binding_success(data: &[u8]) -> Option<Stun> {
             0x8028 if len == 4 && end == rest.len() && fingerprint(data) => {},
             // Unknown comprehension-required attributes or integrity fields
             // cannot be validated by this deliberately credential-free mode.
-            0x0000..=0x7fff => return None,
-            0x8028 => return None,
+            0x0000..=0x7fff | 0x8028 => return None,
             _ => {},
         }
         rest = &rest[end..];
@@ -108,7 +107,17 @@ pub(crate) enum BindingStrategy { Fingerprint, Plain }
 /// preserved. No MESSAGE-INTEGRITY, TURN or ICE messages can enter this path.
 pub(crate) fn prepare_binding(data: &[u8], strategy: BindingStrategy) -> Option<std::borrow::Cow<'_, [u8]>> {
     plain_binding(data)?;
-    if strategy == BindingStrategy::Plain || fingerprint(data) {
+    // Walk validated TLVs: a SOFTWARE value can contain arbitrary bytes
+    // resembling the final attribute header, but is not a FINGERPRINT.
+    let mut rest = &data[20..];
+    let mut has_fingerprint = false;
+    while !rest.is_empty() {
+        let kind = u16::from_be_bytes(rest[..2].try_into().ok()?);
+        let len = usize::from(u16::from_be_bytes(rest[2..4].try_into().ok()?));
+        has_fingerprint |= kind == 0x8028;
+        rest = &rest[4 + ((len + 3) & !3)..];
+    }
+    if strategy == BindingStrategy::Plain || has_fingerprint {
         return Some(std::borrow::Cow::Borrowed(data));
     }
     let len = u16::try_from(data.len().checked_sub(20)?.checked_add(8)?).ok()?;
@@ -372,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn quic_candidate_requires_v1_h3_and_complete_initial() {
+    fn quic_candidate_requires_h3_and_distinguishes_v1_v2() {
         let hello = h3_hello();
         for version in [crate::reality_quic_wire::V1, crate::reality_quic_wire::V2] {
             let packet = crate::reality_quic_wire::test_initial(version, &hello);
@@ -409,7 +418,7 @@ mod tests {
         assert!(observer.requests.is_empty());
     }
 
-    pub(crate) fn binding_response(request: &[u8]) -> Vec<u8> {
+    fn binding_response(request: &[u8]) -> Vec<u8> {
         let mut response = request[..20].to_vec();
         response[0] = 1;
         response[2..4].copy_from_slice(&12u16.to_be_bytes());
@@ -476,6 +485,25 @@ mod tests {
             tokio::join!(probe_stun(&socket, BindingStrategy::Fingerprint), server)
         }).await.unwrap();
         assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn plain_probe_is_independent_and_invalid_responses_do_not_pass() {
+        let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = crate::udp_relay::connect(target.local_addr().unwrap()).await.unwrap();
+        let server = async {
+            let mut buf = [0; 512];
+            let (n, peer) = target.recv_from(&mut buf).await.unwrap();
+            assert_eq!(n, 20);
+            assert!(plain_binding(&buf[..n]).is_some());
+            let mut wrong = binding_response(&buf[..n]);
+            wrong[19] ^= 1;
+            for _ in 0..8 { target.send_to(&wrong, peer).await.unwrap(); }
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(probe_stun(&socket, BindingStrategy::Plain), server)
+        }).await.unwrap();
+        assert!(result.is_none());
     }
 
     #[test]

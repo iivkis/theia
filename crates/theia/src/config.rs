@@ -1092,6 +1092,20 @@ mod tests {
     }
 
     #[test]
+    fn local_stun_requires_separate_explicit_consent() {
+        let original = client();
+        let Config::Client(default) = parse(&original).unwrap() else { panic!("client"); };
+        assert_ne!(default.client.proxy.direct_dpi_stun, Some(true));
+        let stun_only = original.replacen("system_proxy = \"off\"", "system_proxy = \"off\"\ndirect_dpi_stun = true", 1);
+        assert_eq!(parse(&stun_only).unwrap_err().field, "client.proxy.direct_dpi_stun");
+        let consent = original.replacen("system_proxy = \"off\"", "system_proxy = \"off\"\ndirect_dpi = true\ndirect_dpi_stun = true", 1);
+        let accepted = parse(&consent).unwrap();
+        let Config::Client(doc) = &accepted else { panic!("client"); };
+        assert_eq!(doc.client.proxy.direct_dpi_stun, Some(true));
+        assert_eq!(parse(&accepted.to_toml().unwrap()).unwrap(), accepted);
+    }
+
+    #[test]
     fn rejects_unsafe_client_settings() {
         let original = client();
         for (from, to, expected) in [

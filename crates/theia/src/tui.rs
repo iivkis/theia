@@ -9037,6 +9037,8 @@ mod tests {
         assert!(screen.contains("резерв VPS"));
         let editor = client.editor.as_mut().unwrap();
         assert!(!editor.direct_dpi_allowed());
+        assert!(!editor.direct_dpi_stun_allowed());
+        assert!(editor.review_direct_dpi_stun_permission().is_err());
         let review = editor.review_direct_dpi_permission().unwrap();
         assert_eq!(review.confirmation_label(), "Разрешить Anti-DPI");
         editor.stage_record(review).unwrap();
