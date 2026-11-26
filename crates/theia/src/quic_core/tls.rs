@@ -317,6 +317,52 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn shared_listener_retry_two_connections_v1_v2() {
+        use crate::quic_core::{handshake_udp, listener::Listener};
+        use std::time::{Duration, Instant};
+        use tokio::net::UdpSocket;
+        let (cc, mut sc) = configs();
+        sc.send_tls13_tickets = 0;
+        let cc = Arc::new(cc);
+        let sc = Arc::new(sc);
+        let mut listener = Listener::new(UdpSocket::bind("127.0.0.1:0").await.unwrap(), 4).unwrap();
+        let addr = listener.local_addr();
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = a.local_addr().unwrap();
+        let b_addr = b.local_addr().unwrap();
+        let (a, b, servers) = tokio::time::timeout(Duration::from_secs(12), async {
+            tokio::join!(
+                handshake_udp::connect(a, addr, Version::V1, cc.clone(), ServerName::try_from("localhost").unwrap()),
+                handshake_udp::connect(b, addr, Version::V2, cc.clone(), ServerName::try_from("localhost").unwrap()),
+                async {
+                    let x = listener.accept().await.unwrap();
+                    let y = listener.accept().await.unwrap();
+                    tokio::join!(handshake_udp::accept(x, sc.clone()), handshake_udp::accept(y, sc.clone()))
+                },
+            )
+        }).await.unwrap();
+        let (mut a, mut b) = (a.unwrap(), b.unwrap());
+        let (mut x, mut y) = (servers.0.unwrap(), servers.1.unwrap());
+        if x.peer_addr() != a_addr { std::mem::swap(&mut x, &mut y); }
+        assert_eq!(x.peer_addr(), a_addr);
+        assert_eq!(y.peer_addr(), b_addr);
+        assert!(x.handshake_confirmed() && y.handshake_confirmed());
+        for (c, data) in [(&mut a, b"alpha".as_slice()), (&mut b, b"bravo".as_slice())] {
+            let id = c.open_uni().unwrap();
+            assert_eq!(id, 2);
+            c.queue(id, data, true).unwrap();
+            assert!(c.flush(Instant::now()).await.unwrap());
+        }
+        for (s, expected) in [(&mut x, b"alpha".as_slice()), (&mut y, b"bravo".as_slice())] {
+            for _ in 0..8 { if s.recv(Duration::from_millis(100)).await.unwrap() { break; } }
+            let mut out = [0; 5];
+            assert_eq!(s.read(2, &mut out).unwrap(), 5);
+            assert_eq!(out.as_slice(), expected);
+        }
+    }
+
     #[test]
     fn bidi_and_replenishment_respects_direction_and_consumption() {
         use crate::quic_core::{flow::ReceiveFlow, send_flow::SendFlow};

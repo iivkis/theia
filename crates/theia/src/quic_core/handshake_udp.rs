@@ -1,6 +1,6 @@
 //! Loopback-only QUIC v1/v2 handshake experiment over UDP. TLS messages
-//! travel exclusively in protected Initial and Handshake packets. Fixed
-//! pre-arranged CIDs, no Retry/VN, no resumption, no H3.
+//! travel exclusively in protected Initial and Handshake packets. Retry and
+//! shared listener support remain loopback-only; no VN restart, resumption or H3.
 //! This is not a production listener or Theia admission.
 use super::{
     ack_tx::History, endpoint::LabSession, frames::{self, Frame},
@@ -12,6 +12,7 @@ use rustls::{crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256, pki_types::Se
     quic::{self, KeyChange, Keys, Secrets}, ClientConfig, ServerConfig, Side};
 use std::{io, net::SocketAddr, sync::Arc, time::{Duration, Instant}};
 use tokio::net::UdpSocket;
+use super::listener::{Candidate, SessionIo};
 
 const MTU: usize = 1200;
 const CHUNK: usize = 900;
@@ -162,7 +163,7 @@ impl Handshake {
         Ok(())
     }
 
-    async fn flush(&mut self, socket: &UdpSocket, peer: SocketAddr) -> Result<(), Error> {
+    async fn flush(&mut self, socket: &SessionIo, peer: SocketAddr) -> Result<(), Error> {
         let mut discard_initial = false;
         for (index, epoch) in self.epochs.iter_mut().enumerate() {
             let Some(epoch) = epoch else { continue; };
@@ -291,7 +292,26 @@ pub async fn establish(socket: UdpSocket, peer: SocketAddr, version: Version,
     }
     let server = matches!(&config, Config::Server(_));
     let original = if server { local } else { remote };
-    establish_inner(socket, peer, version, local, remote, original, None, Vec::new(), config).await
+    establish_inner(socket.into(), peer, version, local, remote, original, None, Vec::new(), config).await
+}
+
+/// Client with fresh unpredictable CIDs, for the shared loopback listener.
+pub async fn connect(socket: UdpSocket, peer: SocketAddr, version: Version,
+    tls: Arc<ClientConfig>, name: ServerName<'static>) -> Result<LabSession, Error> {
+    let local = super::negotiation::random_cid().map_err(|_| Error::Protocol)?;
+    let original = super::negotiation::random_cid().map_err(|_| Error::Protocol)?;
+    establish(socket, peer, version, local, original, Config::Client { tls, name }).await
+}
+
+/// The candidate is created exclusively after the listener validates Retry.
+/// TLS and CID parameters must still authenticate before returning a session.
+pub async fn accept(candidate: Candidate, tls: Arc<ServerConfig>) -> Result<LabSession, Error> {
+    let (socket, peer, binding, token) = candidate.into_parts();
+    let original = <[u8; CID_LEN]>::try_from(binding.original.as_slice()).map_err(|_| Error::Protocol)?;
+    let remote = <[u8; CID_LEN]>::try_from(binding.client.as_slice()).map_err(|_| Error::Protocol)?;
+    if remote == binding.retry || remote == [0; CID_LEN] || original == [0; CID_LEN] { return Err(Error::Scope); }
+    establish_inner(socket, peer, binding.version, binding.retry, remote, original,
+        Some(binding.retry), token, Config::Server(tls)).await
 }
 
 fn initial_keys(version: Version, destination: &[u8], server: bool) -> Result<Keys, Error> {
@@ -300,7 +320,7 @@ fn initial_keys(version: Version, destination: &[u8], server: bool) -> Result<Ke
     Ok(suite.keys(destination, if server { Side::Server } else { Side::Client }, version_tls))
 }
 
-async fn establish_inner(socket: UdpSocket, peer: SocketAddr, version: Version,
+async fn establish_inner(mut socket: SessionIo, peer: SocketAddr, version: Version,
     local: [u8; CID_LEN], remote: [u8; CID_LEN], original: [u8; CID_LEN],
     retry: Option<[u8; CID_LEN]>, token: Vec<u8>, config: Config) -> Result<LabSession, Error> {
     let server = matches!(&config, Config::Server(_));

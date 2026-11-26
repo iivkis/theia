@@ -8,6 +8,7 @@ use rustls::quic::{Keys, Secrets};
 use super::{key_update, lifecycle::{Shutdown, ShutdownPhase}, path::Paths};
 use std::{io, net::SocketAddr, time::{Duration, Instant}};
 use tokio::net::UdpSocket;
+use super::listener::SessionIo;
 
 const CID_LEN: usize = 8;
 const MTU: usize = 1200;
@@ -32,7 +33,7 @@ enum Protection {
 }
 
 pub struct LabSession {
-    socket: UdpSocket,
+    socket: SessionIo,
     paths: Paths,
     local_cid: [u8; CID_LEN],
     remote_cid: [u8; CID_LEN],
@@ -54,14 +55,14 @@ impl LabSession {
     pub async fn connect(socket: UdpSocket, peer: SocketAddr, server: bool,
                          local_cid: [u8; CID_LEN], remote_cid: [u8; CID_LEN],
                          keys: Keys) -> Result<Self, Error> {
-        Self::connect_inner(socket, peer, server, local_cid, remote_cid,
+        Self::connect_inner(socket.into(), peer, server, local_cid, remote_cid,
             Protection::Fixed { reader: Reader::new(keys.remote), writer: Writer::new(keys.local) }, false)
     }
 
     /// Only the UDP handshake driver can construct this session. Server
     /// TLS completion confirms its handshake; the client waits for the
     /// authenticated HANDSHAKE_DONE frame.
-    pub(crate) async fn after_handshake(socket: UdpSocket, peer: SocketAddr, server: bool,
+    pub(crate) async fn after_handshake(socket: SessionIo, peer: SocketAddr, server: bool,
                          local_cid: [u8; CID_LEN], remote_cid: [u8; CID_LEN],
                          keys: Keys, secrets: Secrets) -> Result<Self, Error> {
         let mut session = Self::connect_inner(socket, peer, server, local_cid, remote_cid,
@@ -74,7 +75,7 @@ impl LabSession {
         Ok(session)
     }
 
-    fn connect_inner(socket: UdpSocket, peer: SocketAddr, server: bool,
+    fn connect_inner(socket: SessionIo, peer: SocketAddr, server: bool,
                          local_cid: [u8; CID_LEN], remote_cid: [u8; CID_LEN],
                          protection: Protection, confirmed: bool) -> Result<Self, Error> {
         let local = socket.local_addr().map_err(Error::Io)?;
@@ -106,7 +107,7 @@ impl LabSession {
         if !next.ip().is_loopback() || next.ip() != previous.ip()
             || next == previous || next == self.paths.active() || socket.peer_addr().is_ok()
             || !self.scheduler.can_send_path() { return Err(Error::Scope); }
-        self.socket = socket;
+        self.socket = socket.into();
         let peer = self.paths.active();
         if let Err(e) = self.send_path(peer, &[1], now).await {
             self.abort();
