@@ -525,10 +525,13 @@ impl H3Client {
         Ok(self)
     }
 
-    async fn native_connection(
+    // Keep the large laboratory handshake future out of production client
+    // futures, especially on the Windows executable's small main stack.
+    fn native_connection(
         &self,
         version: crate::quic_core::wire::Version,
-    ) -> Result<crate::quic_core::endpoint::LabSession, ClientError> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<crate::quic_core::endpoint::LabSession, ClientError>> + Send + '_>> {
+        Box::pin(async move {
         if !self.remote.ip().is_loopback()
             || self.identity_quic.is_some()
             || self.certificate_pin.is_some()
@@ -561,7 +564,9 @@ impl H3Client {
         .await
         .map_err(|_| ClientError::Timeout)?
         .map_err(|_| ClientError::Tls)
+        })
     }
+
 
     async fn verified_connection(
         &self,
