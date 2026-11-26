@@ -97,11 +97,14 @@ impl UdpCapture {
         if local.is_ipv6() && sockopt_int(&socket, libc::SOL_IPV6, libc::IPV6_V6ONLY)? != 1 {
             return Err(invalid());
         }
-        let (level, option) = if local.is_ipv4() {
-            (libc::SOL_IP, IP_ORIGDSTADDR)
+        let (level, option, transparent) = if local.is_ipv4() {
+            (libc::SOL_IP, IP_ORIGDSTADDR, 19) // IP_TRANSPARENT
         } else {
-            (libc::SOL_IPV6, IPV6_ORIGDSTADDR)
+            (libc::SOL_IPV6, IPV6_ORIGDSTADDR, 75) // IPV6_TRANSPARENT
         };
+        if sockopt_int(&socket, level, transparent)? != 1 {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
         let enabled: libc::c_int = 1;
         let result = unsafe {
             libc::setsockopt(socket.as_raw_fd(), level, option, (&enabled as *const libc::c_int).cast(),
@@ -150,7 +153,7 @@ fn original_ancillary(mut bytes: &[u8], ipv4: bool) -> io::Result<SocketAddr> {
     while !bytes.is_empty() {
         if bytes.len() < header { return Err(invalid()); }
         let cmsg = unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<libc::cmsghdr>()) };
-        let len = cmsg.cmsg_len;
+        let len = cmsg.cmsg_len as usize;
         if len < header || len > bytes.len() { return Err(invalid()); }
         let expected = if ipv4 {
             (libc::SOL_IP, IP_ORIGDSTADDR)
@@ -183,21 +186,24 @@ fn receive_udp(socket: &std::net::UdpSocket) -> io::Result<CapturedDatagram> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = mem::size_of_val(&control);
+    msg.msg_controllen = mem::size_of_val(&control) as _;
     // SAFETY: all output buffers are initialized, live and bounded.
     let read = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut msg, libc::MSG_DONTWAIT) };
     if read < 0 { return Err(io::Error::last_os_error()); }
     if msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
         || read as usize > crate::protocol::MAX_DATAGRAM
         || msg.msg_namelen as usize > mem::size_of_val(&source)
-        || msg.msg_controllen > mem::size_of_val(&control) {
+        || msg.msg_controllen as usize > mem::size_of_val(&control) {
         return Err(invalid());
     }
     let source_bytes = unsafe { std::slice::from_raw_parts((&source as *const libc::sockaddr_storage).cast::<u8>(), msg.msg_namelen as usize) };
-    let control_bytes = unsafe { std::slice::from_raw_parts(control.as_ptr().cast::<u8>(), msg.msg_controllen) };
+    let control_bytes = unsafe { std::slice::from_raw_parts(control.as_ptr().cast::<u8>(), msg.msg_controllen as usize) };
     let source = read_address(source_bytes)?;
     let local = socket.local_addr()?;
     let destination = original_ancillary(control_bytes, local.is_ipv4())?;
+    // Ordinary datagrams sent to the listener port cannot become relay
+    // requests. Conservatively refuse this port even on a wildcard bind.
+    if destination.port() == local.port() { return Err(invalid()); }
     let mut key = validate_redirect(local, source, destination)?;
     key.transport = Transport::Udp;
     data.truncate(read as usize);
@@ -212,7 +218,7 @@ mod tests {
         let size = mem::size_of::<libc::sockaddr_in>();
         let len = header + size;
         let mut bytes = vec![0u8; align_cmsg(len).unwrap()];
-        let cmsg = libc::cmsghdr { cmsg_len: len, cmsg_level: libc::SOL_IP, cmsg_type: IP_ORIGDSTADDR };
+        let cmsg = libc::cmsghdr { cmsg_len: len as _, cmsg_level: libc::SOL_IP, cmsg_type: IP_ORIGDSTADDR };
         let mut address: libc::sockaddr_in = unsafe { mem::zeroed() };
         address.sin_family = libc::AF_INET as libc::sa_family_t;
         address.sin_port = 53u16.to_be();

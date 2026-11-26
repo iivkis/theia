@@ -1868,12 +1868,52 @@ struct RawLease {
 static NATIVE_OWNER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-struct NativeOwner;
+struct NativeOwner {
+    #[cfg(target_os = "linux")]
+    _scope: std::os::unix::net::UnixDatagram,
+    #[cfg(target_os = "windows")]
+    _scope: std::os::windows::io::OwnedHandle,
+}
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 impl NativeOwner {
     fn acquire() -> Result<Self, ClientError> {
         NATIVE_OWNER.compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire)
-            .map(|_| Self).map_err(|_| ClientError::Configuration)
+            .map_err(|_| ClientError::Configuration)?;
+        match Self::scope() {
+            Ok(owner) => Ok(owner),
+            Err(error) => {
+                NATIVE_OWNER.store(false, std::sync::atomic::Ordering::Release);
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn scope() -> Result<Self, ClientError> {
+        use std::os::linux::net::SocketAddrExt;
+        // Abstract Unix socket names are scoped to the network namespace.
+        // Kernel closes the ownership handle on crash; no stale PID file.
+        let address = std::os::unix::net::SocketAddr::from_abstract_name(b"theia-native-ingress-v1")
+            .map_err(|_| ClientError::Configuration)?;
+        let socket = std::os::unix::net::UnixDatagram::bind_addr(&address)
+            .map_err(|_| ClientError::Configuration)?;
+        Ok(Self { _scope: socket })
+    }
+
+    #[cfg(target_os = "windows")]
+    fn scope() -> Result<Self, ClientError> {
+        use std::{os::windows::io::{FromRawHandle, OwnedHandle}, ptr};
+        use windows_sys::Win32::{Foundation::{GetLastError, ERROR_ALREADY_EXISTS}, System::Threading::CreateEventW};
+        // An event is a lifetime handle, not a thread-affine mutex. We
+        // reject an existing object instead of sharing or stealing it.
+        let name: Vec<u16> = "Global\\Theia.NativeIngress.v1".encode_utf16().chain([0]).collect();
+        let raw = unsafe { CreateEventW(ptr::null(), 1, 0, name.as_ptr()) };
+        if raw.is_null() { return Err(ClientError::Configuration); }
+        let existed = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+        // SAFETY: CreateEventW returned one owned non-null kernel handle.
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
+        if existed { return Err(ClientError::Configuration); }
+        Ok(Self { _scope: handle })
     }
 }
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1969,6 +2009,9 @@ impl NativeIngress {
     async fn raw_verdict(&self, mut meta: crate::routing::packet::PacketMeta) -> crate::routing::PacketAction {
         use crate::routing::{Evidence, PacketAction, packet::Transport};
         meta.flow.interface = 0;
+        if [meta.flow.source.ip(), meta.flow.destination.ip()].iter().any(|ip| ip.is_unspecified() || ip.is_multicast() || matches!(ip, IpAddr::V6(v6) if v6.is_unicast_link_local() || v6.to_ipv4_mapped().is_some())) {
+            return PacketAction::Drop;
+        }
         if self.ensure_running().is_err() { return PacketAction::Drop; }
         let snapshot = match timeout(Duration::from_millis(250), self.client.routing_policy()).await {
             Ok(Ok(snapshot)) => snapshot,

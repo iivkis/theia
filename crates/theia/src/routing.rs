@@ -8,6 +8,8 @@ pub mod packet;
 pub mod packet_modify;
 #[cfg(target_os = "linux")]
 pub mod linux_ingress;
+#[cfg(target_os = "linux")]
+pub mod linux_attribution;
 #[cfg(any(target_os = "windows", test))]
 mod wfp_context;
 #[cfg(target_os = "windows")]
