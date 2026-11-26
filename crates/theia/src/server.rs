@@ -915,7 +915,7 @@ async fn connect_target(
                 .matching_action(domain, Some(candidate.ip()))
                 .map_err(|_| ErrorCode::PolicyDenied)?
                 .unwrap_or(crate::routing::Action::Allowed)
-                == crate::routing::Action::Allowed
+                .permits_server_egress()
             {
                 routed.push(candidate);
             }

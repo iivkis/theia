@@ -309,6 +309,27 @@ mod tests {
     }
 
     #[test]
+    fn direct_dpi_is_distinct_and_round_trips_with_geosite() {
+        let data = site("TEST", "example.com");
+        let mut dpi = rule();
+        dpi.action = Action::DirectDpi;
+        let text = toml::to_string(&dpi).unwrap();
+        assert!(text.contains("direct_dpi"));
+        assert_eq!(toml::from_str::<Rule>(&text).unwrap(), dpi);
+        assert!(toml::from_str::<Rule>(&text.replace("direct_dpi", "directdpi")).is_err());
+        let (server, wire) = Snapshot::build("inbound", 2, &[dpi], &data, &[]).unwrap();
+        let client = Snapshot::decode(&wire, "inbound").unwrap();
+        assert_eq!(server.digest(), client.digest());
+        assert_eq!(client.policy().domain_decision("www.example.com").unwrap(), Some(Action::DirectDpi));
+        assert!(Action::DirectDpi.permits_server_egress());
+        assert!(Action::Allowed.permits_server_egress());
+        assert!(!Action::Direct.permits_server_egress());
+        assert!(!Action::Blocked.permits_server_egress());
+        let (original, _) = Snapshot::build("inbound", 2, &[rule()], &data, &[]).unwrap();
+        assert_eq!(original.checkpoint().accepts(&client), Err(SnapshotError::Equivocation));
+    }
+
+    #[test]
     fn revision_guards_and_corruption() {
         let data = site("TEST", "example.com");
         let (old, wire) = Snapshot::build("inbound", 2, &[rule()], &data, &[]).unwrap();

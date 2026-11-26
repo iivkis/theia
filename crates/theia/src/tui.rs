@@ -774,6 +774,7 @@ impl RoutingPanel {
     fn action_name(action: crate::routing::Action) -> &'static str {
         match action {
             crate::routing::Action::Direct => "direct",
+            crate::routing::Action::DirectDpi => "direct_dpi",
             crate::routing::Action::Blocked => "blocked",
             crate::routing::Action::Allowed => "allowed",
         }
@@ -781,6 +782,7 @@ impl RoutingPanel {
     fn action_label(value: &str) -> &str {
         match value {
             "direct" => "Напрямую",
+            "direct_dpi" => "Anti-DPI (пока через VPS)",
             "blocked" => "Блокировать",
             "allowed" => "Через сервер",
             _ => value,
@@ -905,12 +907,12 @@ impl RoutingPanel {
                     fields[*focus].clear()
                 }
                 KeyCode::Left | KeyCode::Right if *focus == 1 => {
-                    let options = ["allowed", "direct", "blocked"];
+                    let options = ["allowed", "direct", "blocked", "direct_dpi"];
                     let index = options.iter().position(|a| *a == fields[1]).unwrap_or(0);
                     let next = if key.code == KeyCode::Right {
-                        (index + 1) % 3
+                        (index + 1) % options.len()
                     } else {
-                        (index + 2) % 3
+                        (index + options.len() - 1) % options.len()
                     };
                     fields[1] = options[next].into();
                 }
@@ -929,6 +931,7 @@ impl RoutingPanel {
                 KeyCode::Enter => {
                     let action = match fields[1].trim() {
                         "direct" => crate::routing::Action::Direct,
+                        "direct_dpi" => crate::routing::Action::DirectDpi,
                         "blocked" => crate::routing::Action::Blocked,
                         "allowed" => crate::routing::Action::Allowed,
                         _ => {
@@ -9019,13 +9022,15 @@ mod tests {
         panel.edit(None);
         let (_, fields, _) = panel.fields.as_mut().unwrap();
         *fields = [
-            "local".into(),
-            "direct".into(),
+            "dpi fallback".into(),
+            "direct_dpi".into(),
             "full:localhost".into(),
             String::new(),
         ];
         assert!(panel.key(press(KeyCode::Enter), Some(&mut editor)));
         assert_eq!(panel.settings.rules.len(), 1);
+        assert_eq!(panel.settings.rules[0].action, crate::routing::Action::DirectDpi);
+        assert!(panel.body().contains("Anti-DPI (пока через VPS)"));
         assert!(!panel.key(press(KeyCode::Char('s')), Some(&mut editor)));
         assert!(editor.dirty());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);

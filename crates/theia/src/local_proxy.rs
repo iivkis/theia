@@ -1056,6 +1056,9 @@ async fn routed_open(
             Err(denied())
         }
         Action::Allowed => carrier.open(address, port).await,
+        // No verified local packet backend is available yet. Never substitute
+        // a plain direct connection, resolve locally, or replay application data.
+        Action::DirectDpi => carrier.open(address, port).await,
         Action::Direct => client_state::dial_direct(address, port, pinned)
             .await
             .map(ProxyTunnel::Direct),
@@ -3125,6 +3128,12 @@ mod selector_tests {
                         domains: vec!["full:blocked.invalid".into()],
                         ips: vec![],
                     },
+                    crate::routing::Rule {
+                        name: "dpi fallback".into(),
+                        action: Action::DirectDpi,
+                        domains: vec![],
+                        ips: vec!["127.0.0.1/32".into()],
+                    },
                 ],
             }),
             allow_private_ips: true,
@@ -3172,6 +3181,17 @@ mod selector_tests {
                 let proxy_client = load_client(&profile).await.unwrap();
                 let policy = proxy_client.routing_policy().await.unwrap();
                 assert_eq!(policy.manifest().revision, 2);
+                assert_eq!(
+                    policy.policy().matching_action(None, Some("127.0.0.1".parse().unwrap())).unwrap(),
+                    Some(Action::DirectDpi)
+                );
+                let dpi_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let dpi_port = dpi_listener.local_addr().unwrap().port();
+                let dpi_tunnel = proxy_client.open(Address::V4([127, 0, 0, 1]), dpi_port).await.unwrap();
+                assert!(matches!(dpi_tunnel, ProxyTunnel::H2(_) | ProxyTunnel::H3(_)));
+                let _dpi_accepted = dpi_listener.accept().await.unwrap();
+                drop(dpi_tunnel);
+                drop(_dpi_accepted);
                 assert!(matches!(
                     proxy_client
                         .open(Address::Dns("blocked.invalid".into()), 443)
