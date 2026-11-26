@@ -1,7 +1,10 @@
 //! Bounded receive-side byte reassembly for future CRYPTO/STREAM users.
 //! This is not a connection-level flow controller or a complete stream FSM.
 use super::wire::MAX_VARINT;
-use std::{collections::VecDeque, time::{Duration, Instant}};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
 pub const MAX_WINDOW: usize = 1024 * 1024;
 
@@ -172,8 +175,19 @@ impl ReceiveBuffer {
     /// Grow only when the application actually consumes at least half the
     /// receive window within two measured RTTs. Never grant more memory
     /// than the connection's fixed per-stream allocation budget.
-    pub(crate) fn tune_window(&mut self, consumed: usize, now: Instant, rtt: Duration, cap: usize) -> usize {
-        if consumed == 0 || rtt.is_zero() || self.final_size.is_some() || self.abandoned || self.window >= cap {
+    pub(crate) fn tune_window(
+        &mut self,
+        consumed: usize,
+        now: Instant,
+        rtt: Duration,
+        cap: usize,
+    ) -> usize {
+        if consumed == 0
+            || rtt.is_zero()
+            || self.final_size.is_some()
+            || self.abandoned
+            || self.window >= cap
+        {
             return 0;
         }
         let before = self.read_offset.saturating_sub(consumed as u64);

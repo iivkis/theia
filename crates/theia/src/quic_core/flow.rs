@@ -4,7 +4,10 @@ use super::{
     stream::{ReceiveBuffer, ReceiveError, MAX_WINDOW},
     wire::MAX_VARINT,
 };
-use std::{collections::BTreeMap, time::{Duration, Instant}};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 const MAX_STREAMS: u64 = 64;
 const MAX_STREAM_COUNT: u64 = 1 << 60;
@@ -100,8 +103,11 @@ impl ReceiveFlow {
     /// Each active receive direction has a fixed maximum allocation, even
     /// when cumulative MAX_STREAMS grows over the life of the connection.
     pub(crate) fn enable_autotune(&mut self) -> Result<(), Error> {
-        if self.adaptive_cap.is_some() || !self.streams.is_empty() || self.stream_limit != self.window as u64
-            || self.max_data > MAX_ADAPTIVE_CONNECTION {
+        if self.adaptive_cap.is_some()
+            || !self.streams.is_empty()
+            || self.stream_limit != self.window as u64
+            || self.max_data > MAX_ADAPTIVE_CONNECTION
+        {
             return Err(Error::Limit);
         }
         let count = (self.max_bidi + self.max_uni + self.max_local_bidi).max(1) as usize;
@@ -317,8 +323,14 @@ impl ReceiveFlow {
             return Err(Error::Receive(ReceiveError::Reset(code)));
         }
         let n = stream.read(output);
-        let extra = self.adaptive_cap.map_or(0, |cap| stream.tune_window(n, now, rtt, cap));
-        let limit = stream.limit().saturating_add(n as u64).saturating_add(extra as u64).min(MAX_VARINT);
+        let extra = self
+            .adaptive_cap
+            .map_or(0, |cap| stream.tune_window(n, now, rtt, cap));
+        let limit = stream
+            .limit()
+            .saturating_add(n as u64)
+            .saturating_add(extra as u64)
+            .min(MAX_VARINT);
         stream.extend_limit(limit).map_err(Error::Receive)?;
         let before = self.consumed;
         self.consumed = self.consumed.saturating_add(n as u64);
@@ -334,7 +346,11 @@ impl ReceiveFlow {
                 self.tune_epoch = Some((now, self.consumed));
             }
         }
-        self.max_data = self.max_data.saturating_add(n as u64).saturating_add(growth).min(MAX_VARINT);
+        self.max_data = self
+            .max_data
+            .saturating_add(n as u64)
+            .saturating_add(growth)
+            .min(MAX_VARINT);
         Ok((n, self.max_data, limit))
     }
 
@@ -384,22 +400,40 @@ mod tests {
         let mut f = ReceiveFlow::new(true, 1, 1, 64, 64, 64).unwrap();
         f.enable_autotune().unwrap();
         f.insert(0, 0, &[7; 32], false).unwrap();
-        assert_eq!(f.read_replenish_at(0, &mut [0; 32], now, rtt), Ok((32, 160, 160)));
-        assert_eq!(f.read_replenish_at(0, &mut [0; 32], now, rtt), Ok((0, 160, 160)));
+        assert_eq!(
+            f.read_replenish_at(0, &mut [0; 32], now, rtt),
+            Ok((32, 160, 160))
+        );
+        assert_eq!(
+            f.read_replenish_at(0, &mut [0; 32], now, rtt),
+            Ok((0, 160, 160))
+        );
         f.insert(0, 32, &[9; 64], false).unwrap();
-        assert_eq!(f.read_replenish_at(0, &mut [0; 64], now + rtt, rtt), Ok((64, 352, 352)));
+        assert_eq!(
+            f.read_replenish_at(0, &mut [0; 64], now + rtt, rtt),
+            Ok((64, 352, 352))
+        );
         let cap = f.adaptive_cap.unwrap();
         assert!(cap <= MAX_ADAPTIVE_STREAM);
         f.insert(0, 96, &[], true).unwrap();
         assert!(f.retire(0).is_some());
         // New streams start at the negotiated initial limit, not the
         // previous stream's enlarged absolute limit.
-        assert_eq!(f.insert(4, 64, b"x", false), Err(Error::Receive(ReceiveError::Limit)));
+        assert_eq!(
+            f.insert(4, 64, b"x", false),
+            Err(Error::Receive(ReceiveError::Limit))
+        );
         f.insert(4, 0, &[1; 16], false).unwrap();
         let slow = now + Duration::from_secs(1);
-        assert_eq!(f.read_replenish_at(4, &mut [0; 16], slow, rtt), Ok((16, 368, 80)));
+        assert_eq!(
+            f.read_replenish_at(4, &mut [0; 16], slow, rtt),
+            Ok((16, 368, 80))
+        );
         f.insert(4, 16, &[1; 16], false).unwrap();
-        assert_eq!(f.read_replenish_at(4, &mut [0; 16], slow + rtt * 3, rtt), Ok((16, 384, 96)));
+        assert_eq!(
+            f.read_replenish_at(4, &mut [0; 16], slow + rtt * 3, rtt),
+            Ok((16, 384, 96))
+        );
     }
 
     #[test]

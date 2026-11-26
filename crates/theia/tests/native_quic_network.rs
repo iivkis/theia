@@ -4,12 +4,20 @@ use bytes::{Buf, Bytes};
 use h3::quic;
 use rustls::{pki_types::ServerName, ClientConfig, RootCertStore, ServerConfig};
 use std::{
-    fs::File, future::poll_fn, io::BufReader, net::{IpAddr, SocketAddr},
-    sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    fs::File,
+    future::poll_fn,
+    io::BufReader,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use theia::quic_core::{
-    h3_adapter::NativeConnection, handshake_udp::{self, Congestion}, listener::Listener,
-    negotiation::VersionPolicy, scope::NetworkScope, wire::Version,
+    h3_adapter::NativeConnection,
+    handshake_udp::{self, Congestion},
+    listener::Listener,
+    negotiation::VersionPolicy,
+    scope::NetworkScope,
+    wire::Version,
 };
 use tokio::net::UdpSocket;
 
@@ -26,7 +34,12 @@ fn native_backend(backend: &str) -> (Version, Congestion) {
     }
 }
 
-fn wall_ns() -> u128 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() }
+fn wall_ns() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+}
 
 fn env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("missing {name}"))
@@ -34,7 +47,8 @@ fn env(name: &str) -> String {
 
 fn certificates(path: &str) -> Vec<rustls::pki_types::CertificateDer<'static>> {
     rustls_pemfile::certs(&mut BufReader::new(File::open(path).unwrap()))
-        .collect::<Result<Vec<_>, _>>().unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
 }
 
 fn roots() -> RootCertStore {
@@ -47,9 +61,12 @@ fn roots() -> RootCertStore {
 }
 
 fn native_tls(roots: RootCertStore) -> Arc<ClientConfig> {
-    let mut config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_protocol_versions(&[&rustls::version::TLS13]).unwrap()
-        .with_root_certificates(roots).with_no_client_auth();
+    let mut config =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
     config.alpn_protocols = vec![b"h3".to_vec()];
     config.enable_early_data = false;
     config.resumption = rustls::client::Resumption::disabled();
@@ -57,10 +74,14 @@ fn native_tls(roots: RootCertStore) -> Arc<ClientConfig> {
 }
 
 async fn echo<C>(connection: C, limit: usize)
-where C: quic::Connection<Bytes> + 'static,
+where
+    C: quic::Connection<Bytes> + 'static,
     C::BidiStream: quic::BidiStream<Bytes>,
 {
-    let mut server = h3::server::builder().build::<_, Bytes>(connection).await.unwrap();
+    let mut server = h3::server::builder()
+        .build::<_, Bytes>(connection)
+        .await
+        .unwrap();
     let resolver = server.accept().await.unwrap().unwrap();
     let (request, mut stream) = resolver.resolve_request().await.unwrap();
     assert_eq!(request.method(), http::Method::POST);
@@ -71,9 +92,15 @@ where C: quic::Connection<Bytes> + 'static,
         body.extend_from_slice(&buf.copy_to_bytes(buf.remaining()));
     }
     assert_eq!(body.len(), limit);
-    stream.send_response(http::Response::builder().status(200).body(()).unwrap()).await.unwrap();
+    stream
+        .send_response(http::Response::builder().status(200).body(()).unwrap())
+        .await
+        .unwrap();
     for chunk in body.chunks(CHUNK) {
-        stream.send_data(Bytes::copy_from_slice(chunk)).await.unwrap();
+        stream
+            .send_data(Bytes::copy_from_slice(chunk))
+            .await
+            .unwrap();
     }
     stream.finish().await.unwrap();
     drop(stream);
@@ -82,32 +109,44 @@ where C: quic::Connection<Bytes> + 'static,
 }
 
 async fn exchange<C>(connection: C, payload: &[u8]) -> (u128, u128, u128, u128)
-where C: quic::Connection<Bytes> + 'static,
+where
+    C: quic::Connection<Bytes> + 'static,
     C::BidiStream: quic::BidiStream<Bytes>,
 {
     let start = Instant::now();
     let (mut driver, mut sender) = h3::client::new(connection).await.unwrap();
     let request = async {
-    let mut stream = sender.send_request(http::Request::builder()
-        .method("POST").uri("https://benchmark.invalid/transport-benchmark").body(()).unwrap()).await.unwrap();
-    let opened = start.elapsed().as_micros().max(1);
-    let start = Instant::now();
-    let wall_start = wall_ns();
-    for chunk in payload.chunks(CHUNK) {
-        stream.send_data(Bytes::copy_from_slice(chunk)).await.unwrap();
-    }
-    stream.finish().await.unwrap();
-    assert_eq!(stream.recv_response().await.unwrap().status(), 200);
-    let mut offset = 0;
-    while let Some(mut buf) = stream.recv_data().await.unwrap() {
-        let data = buf.copy_to_bytes(buf.remaining());
-        let end = offset + data.len();
-        assert_eq!(payload.get(offset..end), Some(data.as_ref()));
-        offset = end;
-    }
-    assert_eq!(offset, payload.len());
-    let relay = start.elapsed().as_micros().max(1);
-    (opened, relay, wall_start, wall_ns())
+        let mut stream = sender
+            .send_request(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("https://benchmark.invalid/transport-benchmark")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let opened = start.elapsed().as_micros().max(1);
+        let start = Instant::now();
+        let wall_start = wall_ns();
+        for chunk in payload.chunks(CHUNK) {
+            stream
+                .send_data(Bytes::copy_from_slice(chunk))
+                .await
+                .unwrap();
+        }
+        stream.finish().await.unwrap();
+        assert_eq!(stream.recv_response().await.unwrap().status(), 200);
+        let mut offset = 0;
+        while let Some(mut buf) = stream.recv_data().await.unwrap() {
+            let data = buf.copy_to_bytes(buf.remaining());
+            let end = offset + data.len();
+            assert_eq!(payload.get(offset..end), Some(data.as_ref()));
+            offset = end;
+        }
+        assert_eq!(offset, payload.len());
+        let relay = start.elapsed().as_micros().max(1);
+        (opened, relay, wall_start, wall_ns())
     };
     tokio::pin!(request);
     tokio::select! {
@@ -119,14 +158,20 @@ where C: quic::Connection<Bytes> + 'static,
 
 async fn server(backend: &str, bind: SocketAddr, peer: IpAddr, count: usize, size: usize) {
     let certs = certificates(&env("THEIA_BENCH_CERT"));
-    let key = rustls_pemfile::private_key(&mut BufReader::new(File::open(env("THEIA_BENCH_KEY")).unwrap())).unwrap().unwrap();
+    let key = rustls_pemfile::private_key(&mut BufReader::new(
+        File::open(env("THEIA_BENCH_KEY")).unwrap(),
+    ))
+    .unwrap()
+    .unwrap();
     if backend == "quinn" {
         let endpoint = theia::quic_transport::server_endpoint(bind, certs, key).unwrap();
         println!("BENCH_READY");
         for _ in 0..count {
             let incoming = loop {
                 let incoming = endpoint.accept().await.unwrap();
-                if incoming.remote_address().ip() == peer { break incoming; }
+                if incoming.remote_address().ip() == peer {
+                    break incoming;
+                }
                 incoming.refuse();
             };
             let connection = theia::quic_transport::accept(incoming).await.unwrap();
@@ -135,18 +180,34 @@ async fn server(backend: &str, bind: SocketAddr, peer: IpAddr, count: usize, siz
         endpoint.close(0u32.into(), b"benchmark complete");
         endpoint.wait_idle().await;
     } else {
-        let mut tls = ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(&[&rustls::version::TLS13]).unwrap().with_no_client_auth()
-            .with_single_cert(certs, key).unwrap();
+        let mut tls =
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .unwrap();
         tls.alpn_protocols = vec![b"h3".to_vec()];
         tls.send_tls13_tickets = 0;
         let (version, congestion) = native_backend(backend);
         let scope = NetworkScope::pinned([bind.ip(); 2], [peer; 2]).unwrap();
-        let mut listener = Listener::with_scope(UdpSocket::bind(bind).await.unwrap(), 8, VersionPolicy::exact(version), scope).unwrap();
+        let mut listener = Listener::with_scope(
+            UdpSocket::bind(bind).await.unwrap(),
+            8,
+            VersionPolicy::exact(version),
+            scope,
+        )
+        .unwrap();
         println!("BENCH_READY");
         let tls = Arc::new(tls);
         for _ in 0..count {
-            let session = handshake_udp::accept_with_congestion(listener.accept().await.unwrap(), tls.clone(), congestion).await.unwrap();
+            let session = handshake_udp::accept_with_congestion(
+                listener.accept().await.unwrap(),
+                tls.clone(),
+                congestion,
+            )
+            .await
+            .unwrap();
             let (connection, _) = NativeConnection::start(session).unwrap();
             echo(connection, size).await;
         }
@@ -162,17 +223,29 @@ async fn client(backend: &str, bind: SocketAddr, peer: SocketAddr, count: usize,
         let start = Instant::now();
         let (handshake, opened, relay, wall_start, wall_end) = if backend == "quinn" {
             let endpoint = theia::quic_transport::client_endpoint(bind, roots.clone()).unwrap();
-            let connection = theia::quic_transport::connect(&endpoint, peer, &name).await.unwrap();
+            let connection = theia::quic_transport::connect(&endpoint, peer, &name)
+                .await
+                .unwrap();
             let elapsed = start.elapsed().as_micros().max(1);
-            let (opened, relay, wall_start, wall_end) = exchange(h3_quinn::Connection::new(connection), &data).await;
+            let (opened, relay, wall_start, wall_end) =
+                exchange(h3_quinn::Connection::new(connection), &data).await;
             endpoint.close(0u32.into(), b"benchmark complete");
             endpoint.wait_idle().await;
             (elapsed, opened, relay, wall_start, wall_end)
         } else {
             let (version, congestion) = native_backend(backend);
             let scope = NetworkScope::pinned([bind.ip(); 2], [peer.ip(); 2]).unwrap();
-            let (actual, session) = handshake_udp::connect_versions_scoped_with_congestion(bind, peer, VersionPolicy::exact(version),
-                native_tls(roots.clone()), ServerName::try_from(name.clone()).unwrap(), scope, congestion).await.unwrap();
+            let (actual, session) = handshake_udp::connect_versions_scoped_with_congestion(
+                bind,
+                peer,
+                VersionPolicy::exact(version),
+                native_tls(roots.clone()),
+                ServerName::try_from(name.clone()).unwrap(),
+                scope,
+                congestion,
+            )
+            .await
+            .unwrap();
             assert_eq!(actual, version);
             let elapsed = start.elapsed().as_micros().max(1);
             let (connection, _) = NativeConnection::start(session).unwrap();
@@ -188,7 +261,10 @@ async fn client(backend: &str, bind: SocketAddr, peer: SocketAddr, count: usize,
 async fn native_quic_two_host_release() {
     assert!(!cfg!(debug_assertions), "use the release test executable");
     let backend = env("THEIA_BENCH_BACKEND");
-    assert!(matches!(backend.as_str(), "quinn" | "native-v1" | "native-v2" | "native-cubic-v1" | "native-cubic-v2"));
+    assert!(matches!(
+        backend.as_str(),
+        "quinn" | "native-v1" | "native-v2" | "native-cubic-v1" | "native-cubic-v2"
+    ));
     let role = env("THEIA_BENCH_ROLE");
     let bind: SocketAddr = env("THEIA_BENCH_BIND").parse().unwrap();
     let peer: SocketAddr = env("THEIA_BENCH_PEER").parse().unwrap();
@@ -208,5 +284,7 @@ async fn native_quic_two_host_release() {
             assert_ne!(peer.port(), 0);
             client(&backend, bind, peer, count, size).await;
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }

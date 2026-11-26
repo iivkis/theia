@@ -60,7 +60,12 @@ pub enum Error {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum Status { Pending, Acked, Lost, Neutral }
+enum Status {
+    Pending,
+    Acked,
+    Lost,
+    Neutral,
+}
 
 #[derive(Default)]
 pub struct Ledger {
@@ -109,7 +114,8 @@ impl Ledger {
                 .ok_or(Error::Limit)?;
         }
         if packet.ack_eliciting {
-            self.congestion_history.insert(packet.number, (packet.at, Status::Pending));
+            self.congestion_history
+                .insert(packet.number, (packet.at, Status::Pending));
             if self.congestion_history.len() > MAX_OUTSTANDING * 2 {
                 self.congestion_history.pop_first();
             }
@@ -143,9 +149,15 @@ impl Ledger {
     /// A definitive local EMSGSIZE means this number was never transmitted.
     /// Keep a bounded set for ACK validation; fail closed rather than forget.
     pub(crate) fn burn(&mut self, number: u64, now: Instant) -> Result<(), Error> {
-        if number != self.next || number > MAX_VARINT { return Err(Error::Sequence); }
-        if self.burned.len() >= MAX_OUTSTANDING { return Err(Error::Limit); }
-        if self.last_send.is_some_and(|last| now < last) { return Err(Error::Clock); }
+        if number != self.next || number > MAX_VARINT {
+            return Err(Error::Sequence);
+        }
+        if self.burned.len() >= MAX_OUTSTANDING {
+            return Err(Error::Limit);
+        }
+        if self.last_send.is_some_and(|last| now < last) {
+            return Err(Error::Clock);
+        }
         self.burned.insert(number);
         self.next += 1;
         self.last_send = Some(now);
@@ -204,7 +216,9 @@ impl Ledger {
         // packet, provided at least one newly ACKed packet is eliciting.
         // The largest itself can be ACK-only. Old-path timestamps were
         // cleared on migration, and an ACK can never sample twice.
-        let largest_at = self.congestion_history.get(&first.last)
+        let largest_at = self
+            .congestion_history
+            .get(&first.last)
             .filter(|(_, status)| *status != Status::Acked)
             .map(|(at, _)| *at)
             .or_else(|| self.ack_only.get(&first.last).copied());
@@ -220,7 +234,9 @@ impl Ledger {
             if ack.acknowledges(*number) {
                 result.late_acknowledged.push(packet.clone());
                 false
-            } else { true }
+            } else {
+                true
+            }
         });
         let mut pending = VecDeque::with_capacity(self.sent.len());
         while let Some(p) = self.sent.pop_front() {
@@ -269,7 +285,11 @@ impl Ledger {
                     out.lost_bytes += bytes;
                 }
                 if let Some((_, status)) = self.congestion_history.get_mut(&p.number) {
-                    *status = if p.frames.contains(&FrameRef::MtuProbe) { Status::Neutral } else { Status::Lost };
+                    *status = if p.frames.contains(&FrameRef::MtuProbe) {
+                        Status::Neutral
+                    } else {
+                        Status::Lost
+                    };
                 }
                 self.recent_lost.insert(p.number, p.clone());
                 if self.recent_lost.len() > MAX_OUTSTANDING {
@@ -287,7 +307,11 @@ impl Ledger {
     /// An unresolved or ACKed ack-eliciting packet breaks the run; ignored
     /// ACK-only numbers do not. Bounded history eviction is conservative.
     #[cfg(test)]
-    pub(crate) fn persistent_end(&self, first_rtt: Instant, threshold: Duration) -> Option<Instant> {
+    pub(crate) fn persistent_end(
+        &self,
+        first_rtt: Instant,
+        threshold: Duration,
+    ) -> Option<Instant> {
         let mut start = None;
         let mut end = None;
         for &(at, status) in self.congestion_history.values() {
@@ -409,11 +433,14 @@ mod tests {
         let now = Instant::now();
         let mut l = Ledger::default();
         l.record(packet(0, now)).unwrap();
-        l.record(packet(1, now + Duration::from_millis(20))).unwrap();
-        let out = l.acknowledge_with_delay(&ack(1), now + Duration::from_millis(30), |sample| {
-            assert_eq!(sample, Some(Duration::from_millis(10)));
-            Duration::from_millis(12)
-        }).unwrap();
+        l.record(packet(1, now + Duration::from_millis(20)))
+            .unwrap();
+        let out = l
+            .acknowledge_with_delay(&ack(1), now + Duration::from_millis(30), |sample| {
+                assert_eq!(sample, Some(Duration::from_millis(10)));
+                Duration::from_millis(12)
+            })
+            .unwrap();
         assert_eq!(out.lost.len(), 1);
     }
 
@@ -424,11 +451,21 @@ mod tests {
         l.record(packet(0, now)).unwrap();
         l.burn(1, now).unwrap();
         l.record(packet(2, now)).unwrap();
-        let a = Ack { delay: 0, ranges: vec![Range { first: 0, last: 2 }], ecn: None };
-        assert_eq!(l.acknowledge(&a, now, Duration::ZERO).unwrap_err(), Error::Ack);
+        let a = Ack {
+            delay: 0,
+            ranges: vec![Range { first: 0, last: 2 }],
+            ecn: None,
+        };
+        assert_eq!(
+            l.acknowledge(&a, now, Duration::ZERO).unwrap_err(),
+            Error::Ack
+        );
         assert_eq!(l.bytes_in_flight(), 2400);
         l.restart_path();
-        assert_eq!(l.acknowledge(&ack(1), now, Duration::ZERO).unwrap_err(), Error::Ack);
+        assert_eq!(
+            l.acknowledge(&ack(1), now, Duration::ZERO).unwrap_err(),
+            Error::Ack
+        );
         l.record(packet(3, now)).unwrap();
     }
 
@@ -442,7 +479,11 @@ mod tests {
         pure.ack_eliciting = false;
         pure.in_flight = false;
         l.record(pure).unwrap();
-        let both = Ack { delay: 0, ranges: vec![Range { first: 0, last: 1 }], ecn: None };
+        let both = Ack {
+            delay: 0,
+            ranges: vec![Range { first: 0, last: 1 }],
+            ecn: None,
+        };
         let outcome = l.acknowledge(&both, start + delta * 3, delta * 4).unwrap();
         assert_eq!(outcome.rtt_sample, Some(delta * 2));
         assert!(outcome.newly_acked_eliciting);
@@ -454,7 +495,12 @@ mod tests {
         pure.ack_eliciting = false;
         pure.in_flight = false;
         l.record(pure).unwrap();
-        assert_eq!(l.acknowledge(&ack(2), start + delta * 5, delta).unwrap().rtt_sample, None);
+        assert_eq!(
+            l.acknowledge(&ack(2), start + delta * 5, delta)
+                .unwrap()
+                .rtt_sample,
+            None
+        );
     }
 
     #[test]
@@ -462,7 +508,9 @@ mod tests {
         let start = Instant::now();
         let delta = Duration::from_millis(10);
         let mut l = Ledger::default();
-        for n in 0..4 { l.record(packet(n, start)).unwrap(); }
+        for n in 0..4 {
+            l.record(packet(n, start)).unwrap();
+        }
         let first = l.acknowledge(&ack(3), start + delta, delta * 2).unwrap();
         assert_eq!(first.lost[0].number, 0);
         let flight = l.bytes_in_flight();
@@ -471,7 +519,11 @@ mod tests {
         assert_eq!(late.late_acknowledged[0].bytes, 1200);
         assert_eq!(late.acknowledged_bytes, 0);
         assert_eq!(l.bytes_in_flight(), flight);
-        assert!(l.acknowledge(&ack(0), start + delta, delta * 2).unwrap().late_acknowledged.is_empty());
+        assert!(l
+            .acknowledge(&ack(0), start + delta, delta * 2)
+            .unwrap()
+            .late_acknowledged
+            .is_empty());
     }
 
     #[test]

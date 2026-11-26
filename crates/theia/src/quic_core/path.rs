@@ -228,7 +228,13 @@ impl Paths {
         self.begin_with_timeout(address, received, now, CHALLENGE_TTL)
     }
 
-    pub(crate) fn begin_with_timeout(&mut self, address: SocketAddr, received: u64, now: Instant, timeout: Duration) -> Result<[u8; 8], Error> {
+    pub(crate) fn begin_with_timeout(
+        &mut self,
+        address: SocketAddr,
+        received: u64,
+        now: Instant,
+        timeout: Duration,
+    ) -> Result<[u8; 8], Error> {
         if address == self.active || address.port() == 0 || received == 0 {
             return Err(Error::Path);
         }
@@ -245,7 +251,9 @@ impl Paths {
         SystemRandom::new()
             .fill(&mut challenge)
             .map_err(|_| Error::Random)?;
-        let expires = now.checked_add(timeout.clamp(CHALLENGE_TTL, Duration::from_secs(30))).ok_or(Error::Limit)?;
+        let expires = now
+            .checked_add(timeout.clamp(CHALLENGE_TTL, Duration::from_secs(30)))
+            .ok_or(Error::Limit)?;
         let mut budget = PathBudget::default();
         budget.received(received);
         self.candidate = Some(Candidate {
@@ -405,7 +413,9 @@ mod tests {
         assert!(!paths.reserve_challenge(next, 1200, now, pto));
         assert!(paths.reserve_candidate_send(next, 38, now));
         assert!(!paths.response(next, challenge, now));
-        paths.begin_with_timeout(next, 1200, now + pto, pto * 3).unwrap();
+        paths
+            .begin_with_timeout(next, 1200, now + pto, pto * 3)
+            .unwrap();
         assert!(paths.reserve_challenge(next, 1200, now + pto, pto));
         assert!(paths.response(next, challenge, now + pto * 2));
         assert_eq!(paths.active(), next);

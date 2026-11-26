@@ -110,13 +110,17 @@ mod mutation_tests {
         // length-prefixed datagrams to exercise stateful routing and Retry.
         let mut pos = 0usize;
         for tick in 1..=32 {
-            let Some(prefix) = bytes.get(pos..pos + 2) else { break; };
+            let Some(prefix) = bytes.get(pos..pos + 2) else {
+                break;
+            };
             let size = usize::from(u16::from_be_bytes([prefix[0], prefix[1]])).min(1452);
             pos += 2;
             let end = pos.saturating_add(size).min(bytes.len());
             exercise(&bytes[pos..end], &mut ingress, tick);
             pos = end;
-            if pos == bytes.len() { break; }
+            if pos == bytes.len() {
+                break;
+            }
         }
     }
 

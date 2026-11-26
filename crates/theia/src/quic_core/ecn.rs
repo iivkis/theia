@@ -2,7 +2,10 @@
 //! An owner must supply actual sent IP marks and authenticated, ledger-checked
 //! ACKs. Do not enable ECN until the platform can send and receive codepoints.
 use super::{ack::Ack, wire::MAX_VARINT};
-use std::{collections::BTreeMap, time::{Duration, Instant}};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Mark {
@@ -147,21 +150,26 @@ pub(crate) struct PathEcn {
 }
 
 impl PathEcn {
-    pub(crate) fn enable(&mut self, supported: bool) { self.enabled = supported; }
+    pub(crate) fn enable(&mut self, supported: bool) {
+        self.enabled = supported;
+    }
     pub(crate) fn disable(&mut self) {
         self.enabled = false;
         self.pending.clear();
         self.validator.fail();
     }
     pub(crate) fn should_mark(&self) -> bool {
-        self.enabled && match self.validator.state() {
-            State::Testing => self.testing_sent < 10,
-            State::Capable => true,
-            State::Failed => false,
-        }
+        self.enabled
+            && match self.validator.state() {
+                State::Testing => self.testing_sent < 10,
+                State::Capable => true,
+                State::Failed => false,
+            }
     }
     pub(crate) fn sent(&mut self, pn: u64, mark: Mark, now: Instant) {
-        if !self.enabled { return; }
+        if !self.enabled {
+            return;
+        }
         if mark != Mark::Ect0 || self.pending.len() >= 8192 {
             self.disable();
             return;
@@ -172,13 +180,19 @@ impl PathEcn {
         self.testing_sent = self.testing_sent.saturating_add(1);
     }
     pub(crate) fn tick(&mut self, now: Instant, pto: Duration) {
-        if self.enabled && self.validator.state() == State::Testing
-            && self.first.is_some_and(|at| now.saturating_duration_since(at) >= pto.saturating_mul(3)) {
+        if self.enabled
+            && self.validator.state() == State::Testing
+            && self
+                .first
+                .is_some_and(|at| now.saturating_duration_since(at) >= pto.saturating_mul(3))
+        {
             self.disable();
         }
     }
     pub(crate) fn acknowledge(&mut self, ack: &Ack) -> Option<Instant> {
-        if !self.enabled { return None; }
+        if !self.enabled {
+            return None;
+        }
         let largest = ack.ranges.first()?.last;
         let mut newly = 0u64;
         let mut newest = None;
@@ -187,10 +201,15 @@ impl PathEcn {
                 newly += 1;
                 newest = Some(newest.map_or(*at, |old: Instant| old.max(*at)));
                 false
-            } else { true }
+            } else {
+                true
+            }
         });
         match self.validator.acknowledge(largest, [newly, 0], ack.ecn) {
-            Feedback::Failed => { self.disable(); None },
+            Feedback::Failed => {
+                self.disable();
+                None
+            }
             Feedback::Valid { ce_increase } if ce_increase != 0 => newest,
             _ => None,
         }
@@ -209,7 +228,11 @@ mod tests {
         p.enable(true);
         assert!(p.should_mark());
         p.sent(1, Mark::Ect0, now);
-        let ack = Ack { delay: 0, ranges: vec![Range { first: 1, last: 1 }], ecn: Some([0, 0, 1]) };
+        let ack = Ack {
+            delay: 0,
+            ranges: vec![Range { first: 1, last: 1 }],
+            ecn: Some([0, 0, 1]),
+        };
         assert_eq!(p.acknowledge(&ack), Some(now));
         assert!(p.should_mark());
         p.disable();

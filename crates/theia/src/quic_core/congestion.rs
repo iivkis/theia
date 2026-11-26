@@ -45,7 +45,9 @@ impl SlowStart {
                         self.css_rounds = 0;
                     } else {
                         self.css_rounds = self.css_rounds.saturating_add(1);
-                        if self.css_rounds >= 5 { return true; }
+                        if self.css_rounds >= 5 {
+                            return true;
+                        }
                     }
                 }
             }
@@ -59,7 +61,8 @@ impl SlowStart {
         self.samples = self.samples.saturating_add(1);
         if self.samples >= 8 && self.css_baseline.is_none() {
             if let (Some(previous), Some(current)) = (self.previous, self.minimum) {
-                let threshold = (previous / 8).clamp(Duration::from_millis(4), Duration::from_millis(16));
+                let threshold =
+                    (previous / 8).clamp(Duration::from_millis(4), Duration::from_millis(16));
                 if current >= previous.saturating_add(threshold) {
                     self.css_baseline = Some(current);
                     self.css_rounds = 0;
@@ -136,25 +139,37 @@ impl Window {
     }
 
     pub(crate) fn can_reserve_size(&self, bytes: u64) -> bool {
-        bytes != 0 && bytes <= super::mtu::MAX_UDP_PAYLOAD as u64
-            && self.in_flight.checked_add(bytes).is_some_and(|n| n <= self.cwnd)
+        bytes != 0
+            && bytes <= super::mtu::MAX_UDP_PAYLOAD as u64
+            && self
+                .in_flight
+                .checked_add(bytes)
+                .is_some_and(|n| n <= self.cwnd)
     }
 
     pub(crate) fn reserve_discovery(&mut self, bytes: u64) -> Result<(), Error> {
-        if !self.can_reserve_size(bytes) { return Err(Error::Limit); }
+        if !self.can_reserve_size(bytes) {
+            return Err(Error::Limit);
+        }
         self.in_flight += bytes;
         Ok(())
     }
 
     pub(crate) fn checkpoint(&self) -> Undo {
         Undo {
-            cwnd: self.cwnd, ssthresh: self.ssthresh, last_max: self.last_max,
-            prior_cwnd: self.prior_cwnd, friendly: self.friendly, recovery: self.recovery,
+            cwnd: self.cwnd,
+            ssthresh: self.ssthresh,
+            last_max: self.last_max,
+            prior_cwnd: self.prior_cwnd,
+            friendly: self.friendly,
+            recovery: self.recovery,
         }
     }
 
     pub(crate) fn undo_loss(&mut self, prior: Undo) {
-        if self.cwnd >= prior.cwnd { return; }
+        if self.cwnd >= prior.cwnd {
+            return;
+        }
         self.cwnd = prior.cwnd;
         self.ssthresh = prior.ssthresh;
         self.last_max = prior.last_max;
@@ -255,7 +270,9 @@ impl Window {
     pub(crate) fn resume(&mut self, now: Instant) {
         if let Some(idle) = self.idle_since.take() {
             if let Some((epoch, initial)) = self.epoch {
-                self.epoch = epoch.checked_add(now.saturating_duration_since(idle)).map(|at| (at, initial));
+                self.epoch = epoch
+                    .checked_add(now.saturating_duration_since(idle))
+                    .map(|at| (at, initial));
             }
         }
     }
@@ -281,7 +298,11 @@ impl Window {
     }
 
     pub(crate) fn clean_ecn_ack(&mut self, now: Instant, rtt: Duration) {
-        if self.ecn_backoff != 0 && self.last_ecn.is_some_and(|at| now.saturating_duration_since(at) >= rtt.max(Duration::from_millis(1))) {
+        if self.ecn_backoff != 0
+            && self.last_ecn.is_some_and(|at| {
+                now.saturating_duration_since(at) >= rtt.max(Duration::from_millis(1))
+            })
+        {
             self.ecn_backoff -= 1;
             self.last_ecn = Some(now);
         }
@@ -321,7 +342,9 @@ impl Window {
                 let whole = self.growth_credit.floor() as u64;
                 self.growth_credit -= whole as f64;
                 whole
-            } else { bytes };
+            } else {
+                bytes
+            };
             self.cwnd = self
                 .cwnd
                 .saturating_add(growth)
@@ -389,15 +412,25 @@ mod tests {
         let elevated = Duration::from_millis(50);
         for round in 0..7u64 {
             for n in 0..8 {
-                w.rtt_sample(round * 8 + n, round * 8 + 7, if round == 0 { base } else { elevated });
+                w.rtt_sample(
+                    round * 8 + n,
+                    round * 8 + 7,
+                    if round == 0 { base } else { elevated },
+                );
             }
         }
         assert_eq!(w.ssthresh, w.cwnd());
         let mut s = SlowStart::default();
-        for n in 0..8 { assert!(!s.sample(n, 7, base)); }
-        for n in 8..16 { assert!(!s.sample(n, 15, elevated)); }
+        for n in 0..8 {
+            assert!(!s.sample(n, 7, base));
+        }
+        for n in 8..16 {
+            assert!(!s.sample(n, 15, elevated));
+        }
         assert!(s.css_baseline.is_some());
-        for n in 16..24 { assert!(!s.sample(n, 23, base)); }
+        for n in 16..24 {
+            assert!(!s.sample(n, 23, base));
+        }
         assert!(!s.sample(24, 31, base));
         assert!(s.css_baseline.is_none());
     }

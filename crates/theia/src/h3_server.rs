@@ -183,9 +183,12 @@ pub async fn serve_native_pinned<F>(
     context: Arc<ServerContext>,
     shutdown: F,
 ) -> Result<(), ServerError>
-where F: std::future::Future<Output = ()> + Send,
+where
+    F: std::future::Future<Output = ()> + Send,
 {
-    if !scope.is_pinned() { return Err(ServerError::Io); }
+    if !scope.is_pinned() {
+        return Err(ServerError::Io);
+    }
     serve_native_scoped(socket, scope, tls, context, shutdown).await
 }
 
@@ -198,10 +201,12 @@ pub async fn serve_native_external<F>(
     context: Arc<ServerContext>,
     shutdown: F,
 ) -> Result<(), ServerError>
-where F: std::future::Future<Output = ()> + Send,
+where
+    F: std::future::Future<Output = ()> + Send,
 {
     let local = socket.local_addr().map_err(|_| ServerError::Io)?;
-    let scope = crate::quic_core::scope::NetworkScope::external_server(local.ip()).ok_or(ServerError::Io)?;
+    let scope = crate::quic_core::scope::NetworkScope::external_server(local.ip())
+        .ok_or(ServerError::Io)?;
     serve_native_scoped(socket, scope, tls, context, shutdown).await
 }
 
@@ -212,13 +217,15 @@ async fn serve_native_scoped<F>(
     context: Arc<ServerContext>,
     shutdown: F,
 ) -> Result<(), ServerError>
-where F: std::future::Future<Output = ()> + Send,
+where
+    F: std::future::Future<Output = ()> + Send,
 {
     use crate::quic_core::{handshake_udp, listener::Listener, negotiation::VersionPolicy};
     if !context.allows_native_lab() || tls.send_tls13_tickets != 0 || tls.max_early_data_size != 0 {
         return Err(ServerError::Io);
     }
-    let mut listener = Listener::with_scope(socket, 128, VersionPolicy::both(), scope).map_err(|_| ServerError::Io)?;
+    let mut listener = Listener::with_scope(socket, 128, VersionPolicy::both(), scope)
+        .map_err(|_| ServerError::Io)?;
     let (owner, phase) = watch::channel(GenerationPhase::Active);
     let mut connections = JoinSet::new();
     tokio::pin!(shutdown);
@@ -241,7 +248,10 @@ where F: std::future::Future<Output = ()> + Send,
             }
         }
     }
-    listener.stop_accepting().await.map_err(|_| ServerError::Io)?;
+    listener
+        .stop_accepting()
+        .await
+        .map_err(|_| ServerError::Io)?;
     let _ = owner.send(GenerationPhase::Drain);
     let _ = timeout(server::GENERATION_DRAIN, async {
         while !connections.is_empty() {
@@ -250,7 +260,8 @@ where F: std::future::Future<Output = ()> + Send,
                 incoming = listener.accept() => { if incoming.is_err() { break; } }
             }
         }
-    }).await;
+    })
+    .await;
     Ok(())
 }
 
@@ -265,14 +276,9 @@ async fn run_native_session(
     let mut closed = transport.closed_signal();
     let mut drained = closed.clone();
     let binding = None;
-    run_h3(
-        transport,
-        context,
-        phase,
-        peer,
-        binding,
-        async move { let _ = closed.changed().await; },
-    )
+    run_h3(transport, context, phase, peer, binding, async move {
+        let _ = closed.changed().await;
+    })
     .await;
     // Keep the connection quota and listener ownership during the native
     // driver's closing/draining period, not merely until H3 drops.

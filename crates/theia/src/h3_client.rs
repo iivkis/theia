@@ -532,9 +532,19 @@ impl H3Client {
 
     /// Explicit non-production pinned own-TLS carrier. Uses the identical
     /// H3/XHTTP pool and request FSM, without bypassing certificate validation.
-    pub fn with_native_pinned(mut self, version: crate::quic_core::wire::Version, local: SocketAddr, scope: crate::quic_core::scope::NetworkScope) -> Result<Self, ClientError> {
-        if !scope.is_pinned() || !scope.allows_local(local.ip()) || !scope.allows_peer(self.remote.ip())
-            || local.is_ipv4() != self.remote.is_ipv4() || self.identity_quic.is_some() || self.certificate_pin.is_some() {
+    pub fn with_native_pinned(
+        mut self,
+        version: crate::quic_core::wire::Version,
+        local: SocketAddr,
+        scope: crate::quic_core::scope::NetworkScope,
+    ) -> Result<Self, ClientError> {
+        if !scope.is_pinned()
+            || !scope.allows_local(local.ip())
+            || !scope.allows_peer(self.remote.ip())
+            || local.is_ipv4() != self.remote.is_ipv4()
+            || self.identity_quic.is_some()
+            || self.certificate_pin.is_some()
+        {
             return Err(ClientError::Configuration);
         }
         self.pool = crate::connection_pool::Pool::default();
@@ -564,9 +574,21 @@ impl H3Client {
             let name =
                 ServerName::try_from(self.name.clone()).map_err(|_| ClientError::Configuration)?;
             if let Some((local, scope)) = self.native_pins {
-                return timeout(self.connect_timeout, crate::quic_core::handshake_udp::connect_versions_scoped(
-                    local, self.remote, crate::quic_core::negotiation::VersionPolicy::exact(version), Arc::new(tls), name, scope,
-                )).await.map_err(|_| ClientError::Timeout)?.map(|(_, session)| session).map_err(|_| ClientError::Tls);
+                return timeout(
+                    self.connect_timeout,
+                    crate::quic_core::handshake_udp::connect_versions_scoped(
+                        local,
+                        self.remote,
+                        crate::quic_core::negotiation::VersionPolicy::exact(version),
+                        Arc::new(tls),
+                        name,
+                        scope,
+                    ),
+                )
+                .await
+                .map_err(|_| ClientError::Timeout)?
+                .map(|(_, session)| session)
+                .map_err(|_| ClientError::Tls);
             }
             let bind = if self.remote.is_ipv4() {
                 "127.0.0.1:0"
@@ -627,11 +649,20 @@ impl H3Client {
         if let Some(version) = self.native_lab {
             return timeout(self.connect_timeout, async {
                 let mut session = self.native_connection(version).await?;
-                crate::camouflage_h3_probe::finish_native_handshake(&mut session).await.map_err(|_| ClientError::Tls)?;
-                session.close(0x100, std::time::Instant::now()).map_err(|_| ClientError::Tls)?;
-                session.flush(std::time::Instant::now()).await.map_err(|_| ClientError::Tls)?;
+                crate::camouflage_h3_probe::finish_native_handshake(&mut session)
+                    .await
+                    .map_err(|_| ClientError::Tls)?;
+                session
+                    .close(0x100, std::time::Instant::now())
+                    .map_err(|_| ClientError::Tls)?;
+                session
+                    .flush(std::time::Instant::now())
+                    .await
+                    .map_err(|_| ClientError::Tls)?;
                 Ok(())
-            }).await.map_err(|_| ClientError::Timeout)?;
+            })
+            .await
+            .map_err(|_| ClientError::Timeout)?;
         }
         self.verified_connection().await.map(|_| ())
     }

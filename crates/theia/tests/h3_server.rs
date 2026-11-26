@@ -715,7 +715,9 @@ async fn exercise_pinned_native_endpoint(ip: std::net::IpAddr, external: bool) {
     let scope = NetworkScope::pinned([ip; 2], [ip; 2]).unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
-        let shutdown = async move { let _ = stopped.await; };
+        let shutdown = async move {
+            let _ = stopped.await;
+        };
         if external {
             h3_server::serve_native_external(socket, tls, context(true), shutdown).await
         } else {
@@ -724,8 +726,12 @@ async fn exercise_pinned_native_endpoint(ip: std::net::IpAddr, external: bool) {
     });
     for version in [Version::V1, Version::V2] {
         let client = H3Client::new(remote, "localhost", &token(), roots.clone())
-            .unwrap().with_native_pinned(version, local, scope).unwrap()
-            .with_connection_pool().with_auto_stream_up(Duration::from_secs(60)).unwrap();
+            .unwrap()
+            .with_native_pinned(version, local, scope)
+            .unwrap()
+            .with_connection_pool()
+            .with_auto_stream_up(Duration::from_secs(60))
+            .unwrap();
         let data: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
         // Repeated opens exercise the same common connection pool and
         // per-request authorization rather than a new fixture-only relay.
@@ -734,14 +740,29 @@ async fn exercise_pinned_native_endpoint(ip: std::net::IpAddr, external: bool) {
     }
     let wrong = URL_SAFE_NO_PAD.encode([0x44; 32]);
     let client = H3Client::new(remote, "localhost", &wrong, roots)
-        .unwrap().with_native_pinned(Version::V2, local, scope).unwrap();
+        .unwrap()
+        .with_native_pinned(Version::V2, local, scope)
+        .unwrap();
     let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    assert!(matches!(client.open(Address::V4([127, 0, 0, 1]), target.local_addr().unwrap().port()).await,
-        Err(ClientError::Unauthorized)));
-    assert!(timeout(Duration::from_millis(250), target.accept()).await.is_err());
+    assert!(matches!(
+        client
+            .open(
+                Address::V4([127, 0, 0, 1]),
+                target.local_addr().unwrap().port()
+            )
+            .await,
+        Err(ClientError::Unauthorized)
+    ));
+    assert!(timeout(Duration::from_millis(250), target.accept())
+        .await
+        .is_err());
     drop(client);
     stop.send(()).unwrap();
-    timeout(Duration::from_secs(25), server).await.unwrap().unwrap().unwrap();
+    timeout(Duration::from_secs(25), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -749,7 +770,9 @@ async fn pinned_native_h3_ipv4_ipv6_pool_auth_and_drain() {
     timeout(Duration::from_secs(90), async {
         exercise_pinned_native_endpoint("127.0.0.1".parse().unwrap(), false).await;
         exercise_pinned_native_endpoint("::1".parse().unwrap(), true).await;
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }
 
 /// Explicitly opt in using a locally assigned, non-loopback interface.
@@ -757,28 +780,60 @@ async fn pinned_native_h3_ipv4_ipv6_pool_auth_and_drain() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires an explicitly provisioned network interface"]
 async fn pinned_native_h3_non_loopback_interface() {
-    let ip: std::net::IpAddr = std::env::var("THEIA_QUIC_TEST_LOCAL").unwrap().parse().unwrap();
+    let ip: std::net::IpAddr = std::env::var("THEIA_QUIC_TEST_LOCAL")
+        .unwrap()
+        .parse()
+        .unwrap();
     assert!(!ip.is_loopback());
-    timeout(Duration::from_secs(60), exercise_pinned_native_endpoint(ip, false)).await.unwrap();
+    timeout(
+        Duration::from_secs(60),
+        exercise_pinned_native_endpoint(ip, false),
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn native_version_specific_probe_rejects_bad_trust_and_unapproved_endpoint() {
-    use theia::{camouflage_h3_probe::{probe_quic_h3_native, H3ProbeError}, camouflage_probe::{ProbeApproval, ProbeRequest}, quic_core::wire::Version};
+    use theia::{
+        camouflage_h3_probe::{probe_quic_h3_native, H3ProbeError},
+        camouflage_probe::{ProbeApproval, ProbeRequest},
+        quic_core::wire::Version,
+    };
     let (remote, server, roots) = native_fixture(true).await;
-    let request = ProbeRequest { address: remote, server_name: "localhost".into(), deadline: Duration::from_secs(5) };
+    let request = ProbeRequest {
+        address: remote,
+        server_name: "localhost".into(),
+        deadline: Duration::from_secs(5),
+    };
     let source = remote.ip();
     let approval = ProbeApproval::isolated_loopback_fixture(remote);
-    assert!(matches!(probe_quic_h3_native(request.clone(), roots.clone(), ProbeApproval::Denied, source, Version::V2).await, Err(H3ProbeError::NotApproved)));
+    assert!(matches!(
+        probe_quic_h3_native(
+            request.clone(),
+            roots.clone(),
+            ProbeApproval::Denied,
+            source,
+            Version::V2
+        )
+        .await,
+        Err(H3ProbeError::NotApproved)
+    ));
     for version in [Version::V1, Version::V2] {
-        let report = probe_quic_h3_native(request.clone(), roots.clone(), approval, source, version).await.unwrap();
+        let report =
+            probe_quic_h3_native(request.clone(), roots.clone(), approval, source, version)
+                .await
+                .unwrap();
         assert_eq!(report.version, version);
         assert_eq!(report.source, source);
         assert_eq!(report.transport.connected_ip, remote.ip());
     }
     let mut wrong = request.clone();
     wrong.server_name = "wrong.invalid".into();
-    assert!(matches!(probe_quic_h3_native(wrong, roots, approval, source, Version::V2).await, Err(H3ProbeError::HandshakeRejected)));
+    assert!(matches!(
+        probe_quic_h3_native(wrong, roots, approval, source, Version::V2).await,
+        Err(H3ProbeError::HandshakeRejected)
+    ));
     server.abort();
 }
 

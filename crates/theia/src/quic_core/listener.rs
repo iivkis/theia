@@ -2,13 +2,13 @@
 //! Address validation is NOT TLS identity or Theia admission. The listener
 //! owns CID routes, not application authorization. A full production
 //! connection driver and external acceptance remain mandatory.
+use super::ecn::Mark;
 use super::{
     ingress::{Action, Ingress},
     negotiation::{Binding, VersionPolicy},
     scope::NetworkScope,
 };
 use crate::udp_metadata::Options;
-use super::ecn::Mark;
 use ring::rand::{SecureRandom, SystemRandom};
 use std::{
     collections::BTreeMap,
@@ -26,7 +26,9 @@ use tokio::{
 type Cid = [u8; 8];
 type IssuedCid = (Cid, [u8; 16]);
 pub(crate) enum RouteCommand {
-    StopAccepting { reply: oneshot::Sender<()> },
+    StopAccepting {
+        reply: oneshot::Sender<()>,
+    },
     Issue {
         owner: u64,
         reply: oneshot::Sender<io::Result<IssuedCid>>,
@@ -44,7 +46,11 @@ const MAILBOX: usize = 16;
 type Datagram = (Vec<u8>, SocketAddr, Mark);
 
 pub(crate) enum SessionIo {
-    Direct { socket: UdpSocket, scope: NetworkScope, options: Options },
+    Direct {
+        socket: UdpSocket,
+        scope: NetworkScope,
+        options: Options,
+    },
     Routed {
         socket: Arc<UdpSocket>,
         scope: NetworkScope,
@@ -64,15 +70,23 @@ impl From<UdpSocket> for SessionIo {
 impl SessionIo {
     pub(crate) fn direct(socket: UdpSocket, scope: NetworkScope) -> Self {
         let options = Options::configure(&socket);
-        Self::Direct { socket, scope, options }
+        Self::Direct {
+            socket,
+            scope,
+            options,
+        }
     }
 
     pub(crate) fn scope(&self) -> NetworkScope {
-        match self { Self::Direct { scope, .. } | Self::Routed { scope, .. } => *scope }
+        match self {
+            Self::Direct { scope, .. } | Self::Routed { scope, .. } => *scope,
+        }
     }
 
     pub(crate) fn options(&self) -> Options {
-        match self { Self::Direct { options, .. } | Self::Routed { options, .. } => *options }
+        match self {
+            Self::Direct { options, .. } | Self::Routed { options, .. } => *options,
+        }
     }
 
     pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -149,19 +163,38 @@ impl SessionIo {
         }
     }
 
-    pub(crate) async fn send_marked(&self, bytes: &[u8], peer: SocketAddr, ect: bool) -> io::Result<(usize, Mark)> {
+    pub(crate) async fn send_marked(
+        &self,
+        bytes: &[u8],
+        peer: SocketAddr,
+        ect: bool,
+    ) -> io::Result<(usize, Mark)> {
         match self {
-            Self::Direct { socket, options, .. } => options.send(socket, bytes, peer, ect).await,
-            Self::Routed { socket, options, incoming, .. } => {
-                if incoming.is_closed() { return Err(io::ErrorKind::BrokenPipe.into()); }
+            Self::Direct {
+                socket, options, ..
+            } => options.send(socket, bytes, peer, ect).await,
+            Self::Routed {
+                socket,
+                options,
+                incoming,
+                ..
+            } => {
+                if incoming.is_closed() {
+                    return Err(io::ErrorKind::BrokenPipe.into());
+                }
                 options.send(socket, bytes, peer, ect).await
             }
         }
     }
 
-    pub(crate) async fn recv_from(&mut self, out: &mut [u8]) -> io::Result<(usize, SocketAddr, Mark)> {
+    pub(crate) async fn recv_from(
+        &mut self,
+        out: &mut [u8],
+    ) -> io::Result<(usize, SocketAddr, Mark)> {
         match self {
-            Self::Direct { socket, options, .. } => options.receive(socket, out).await,
+            Self::Direct {
+                socket, options, ..
+            } => options.receive(socket, out).await,
             Self::Routed { incoming, .. } => {
                 let (bytes, peer, mark) = incoming.recv().await.ok_or(io::ErrorKind::BrokenPipe)?;
                 let n = bytes.len().min(out.len());
@@ -184,8 +217,24 @@ pub struct Candidate {
 }
 
 impl Candidate {
-    pub(crate) fn into_parts(self) -> (SessionIo, SocketAddr, Binding, Vec<u8>, [u8; 16], VersionPolicy) {
-        (self.io, self.peer, self.binding, self.token, self.initial_reset, self.versions)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        SessionIo,
+        SocketAddr,
+        Binding,
+        Vec<u8>,
+        [u8; 16],
+        VersionPolicy,
+    ) {
+        (
+            self.io,
+            self.peer,
+            self.binding,
+            self.token,
+            self.initial_reset,
+            self.versions,
+        )
     }
 }
 
@@ -209,7 +258,12 @@ impl Listener {
         Self::with_scope(socket, limit, versions, NetworkScope::loopback())
     }
 
-    pub fn with_scope(socket: UdpSocket, limit: usize, versions: VersionPolicy, scope: NetworkScope) -> io::Result<Self> {
+    pub fn with_scope(
+        socket: UdpSocket,
+        limit: usize,
+        versions: VersionPolicy,
+        scope: NetworkScope,
+    ) -> io::Result<Self> {
         let local = socket.local_addr()?;
         if !scope.allows_local(local.ip())
             || socket.peer_addr().is_ok()
@@ -219,7 +273,9 @@ impl Listener {
         }
         let mut ingress = Ingress::for_listener(limit, versions.clone())
             .map_err(|_| io::ErrorKind::InvalidInput)?;
-        if scope.is_external_server() { ingress.set_source_limit(16); }
+        if scope.is_external_server() {
+            ingress.set_source_limit(16);
+        }
         let (tx, candidates) = mpsc::channel(limit);
         let (commands, requests) = mpsc::channel(limit);
         let worker = tokio::spawn(run(
@@ -245,7 +301,10 @@ impl Listener {
 
     pub(crate) async fn stop_accepting(&self) -> io::Result<()> {
         let (reply, result) = oneshot::channel();
-        self.commands.send(RouteCommand::StopAccepting { reply }).await.map_err(|_| io::ErrorKind::BrokenPipe)?;
+        self.commands
+            .send(RouteCommand::StopAccepting { reply })
+            .await
+            .map_err(|_| io::ErrorKind::BrokenPipe)?;
         result.await.map_err(|_| io::ErrorKind::BrokenPipe.into())
     }
 

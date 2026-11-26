@@ -429,7 +429,9 @@ impl NativeConnection {
         ))
     }
 
-    pub(crate) fn closed_signal(&self) -> watch::Receiver<()> { self.closed.clone() }
+    pub(crate) fn closed_signal(&self) -> watch::Receiver<()> {
+        self.closed.clone()
+    }
 
     fn accept(&self, cx: &mut Context<'_>, bidi: bool) -> Poll<Result<u64, CE>> {
         let mut s = self.opener.shared.lock().expect("bridge mutex");

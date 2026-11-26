@@ -81,7 +81,9 @@ struct Epoch {
 
 impl Epoch {
     #[cfg(test)]
-    fn new(keys: Keys) -> Self { Self::with_schedule(keys, Scheduler::default()) }
+    fn new(keys: Keys) -> Self {
+        Self::with_schedule(keys, Scheduler::default())
+    }
 
     fn with_schedule(keys: Keys, schedule: Scheduler) -> Self {
         Self {
@@ -108,7 +110,9 @@ fn params(
     parameters::append(&mut out, 0x0f, local).map_err(|_| Error::Protocol)?;
     if server {
         parameters::append(&mut out, 0x00, original).map_err(|_| Error::Protocol)?;
-        if let Some(token) = initial_reset { parameters::append(&mut out, 0x02, &token).map_err(|_| Error::Protocol)?; }
+        if let Some(token) = initial_reset {
+            parameters::append(&mut out, 0x02, &token).map_err(|_| Error::Protocol)?;
+        }
     }
     if server {
         if let Some(cid) = retry {
@@ -407,7 +411,10 @@ impl Handshake {
             }
             match flight.keys {
                 Some(KeyChange::Handshake { keys }) if self.epochs[1].is_none() => {
-                    self.epochs[1] = Some(Epoch::with_schedule(keys, self.application_schedule.fork_space()))
+                    self.epochs[1] = Some(Epoch::with_schedule(
+                        keys,
+                        self.application_schedule.fork_space(),
+                    ))
                 }
                 Some(KeyChange::OneRtt { keys, next }) if self.application.is_none() => {
                     self.application = Some((keys, next))
@@ -432,11 +439,32 @@ impl Handshake {
         if total > MTU || total == 0 {
             return Err(Error::Protocol);
         }
-        let ordinary: u64 = packets.iter().filter(|p| p.padded_ack || p.frame.is_some_and(|(_, probe)| !probe)).map(|p| p.size() as u64).sum();
-        let probes: u64 = packets.iter().filter(|p| p.frame.is_some_and(|(_, probe)| probe)).map(|p| p.size() as u64).sum();
-        let stale_probe = packets.iter().any(|p| p.frame.is_some_and(|(_, probe)| probe)
-            && self.epochs[p.index].as_ref().is_none_or(|epoch| epoch.schedule.pto_deadline().is_none_or(|at| now < at)));
-        if stale_probe || packets.iter().filter(|p| p.frame.is_some_and(|(_, probe)| probe)).count() > 1 || !self.application_schedule.permits_flight(ordinary, probes, now) {
+        let ordinary: u64 = packets
+            .iter()
+            .filter(|p| p.padded_ack || p.frame.is_some_and(|(_, probe)| !probe))
+            .map(|p| p.size() as u64)
+            .sum();
+        let probes: u64 = packets
+            .iter()
+            .filter(|p| p.frame.is_some_and(|(_, probe)| probe))
+            .map(|p| p.size() as u64)
+            .sum();
+        let stale_probe = packets.iter().any(|p| {
+            p.frame.is_some_and(|(_, probe)| probe)
+                && self.epochs[p.index]
+                    .as_ref()
+                    .is_none_or(|epoch| epoch.schedule.pto_deadline().is_none_or(|at| now < at))
+        });
+        if stale_probe
+            || packets
+                .iter()
+                .filter(|p| p.frame.is_some_and(|(_, probe)| probe))
+                .count()
+                > 1
+            || !self
+                .application_schedule
+                .permits_flight(ordinary, probes, now)
+        {
             return Ok(false);
         }
         if self.server && !self.budget.reserve_send(total as u64) {
@@ -451,9 +479,15 @@ impl Handshake {
                 .seal(&packet.header, &packet.payload)
                 .map_err(Error::Packet)?;
             if packet.padded_ack {
-                epoch.schedule.record_padded_ack(number, protected.len(), now).map_err(Error::Schedule)?;
+                epoch
+                    .schedule
+                    .record_padded_ack(number, protected.len(), now)
+                    .map_err(Error::Schedule)?;
             } else {
-                epoch.schedule.record(number, protected.len(), packet.frame, now).map_err(Error::Schedule)?;
+                epoch
+                    .schedule
+                    .record(number, protected.len(), packet.frame, now)
+                    .map_err(Error::Schedule)?;
             }
             datagram.extend_from_slice(&protected);
             if packet.frame.is_none() {
@@ -532,10 +566,22 @@ impl Handshake {
                 frame,
             });
         }
-        if packets.iter().filter(|p| p.frame.is_some_and(|(_, probe)| probe)).count() > 1 {
-            let first = packets.iter().filter(|p| p.frame.is_some_and(|(_, probe)| probe))
-                .min_by_key(|p| self.epochs[p.index].as_ref().and_then(|epoch| epoch.schedule.pto_deadline()))
-                .map(|p| p.index).ok_or(Error::Protocol)?;
+        if packets
+            .iter()
+            .filter(|p| p.frame.is_some_and(|(_, probe)| probe))
+            .count()
+            > 1
+        {
+            let first = packets
+                .iter()
+                .filter(|p| p.frame.is_some_and(|(_, probe)| probe))
+                .min_by_key(|p| {
+                    self.epochs[p.index]
+                        .as_ref()
+                        .and_then(|epoch| epoch.schedule.pto_deadline())
+                })
+                .map(|p| p.index)
+                .ok_or(Error::Protocol)?;
             packets.retain(|p| !p.frame.is_some_and(|(_, probe)| probe) || p.index == first);
         }
         if packets.len() == 2 && packets.iter().map(FlightPacket::size).sum::<usize>() <= MTU {
@@ -544,9 +590,25 @@ impl Handshake {
             // Coalescing is opportunistic; if unvalidated budget is smaller
             // than a padded Initial, a standalone Handshake may still fit.
             if !self.server || self.budget.can_send(MTU as u64) {
-                let ordinary = packets.iter().filter(|p| p.padded_ack || p.frame.is_some_and(|(_, probe)| !probe)).map(|p| p.size() as u64).sum();
-                let probes = packets.iter().filter(|p| p.frame.is_some_and(|(_, probe)| probe)).map(|p| p.size() as u64).sum();
-                if packets.iter().filter(|p| p.frame.is_some_and(|(_, probe)| probe)).count() <= 1 && self.application_schedule.permits_flight(ordinary, probes, now) {
+                let ordinary = packets
+                    .iter()
+                    .filter(|p| p.padded_ack || p.frame.is_some_and(|(_, probe)| !probe))
+                    .map(|p| p.size() as u64)
+                    .sum();
+                let probes = packets
+                    .iter()
+                    .filter(|p| p.frame.is_some_and(|(_, probe)| probe))
+                    .map(|p| p.size() as u64)
+                    .sum();
+                if packets
+                    .iter()
+                    .filter(|p| p.frame.is_some_and(|(_, probe)| probe))
+                    .count()
+                    <= 1
+                    && self
+                        .application_schedule
+                        .permits_flight(ordinary, probes, now)
+                {
                     return self.emit(socket, peer, packets, now).await;
                 }
             }
@@ -570,7 +632,9 @@ impl Handshake {
                 let deadline = epoch.schedule.deadline();
                 // Client Initial ACK-only packets require padding and can
                 // be deferred by the shared pacing window.
-                let ack_pace = (!self.server && epoch.ack.pending()).then(|| epoch.schedule.pacing_deadline()).flatten();
+                let ack_pace = (!self.server && epoch.ack.pending())
+                    .then(|| epoch.schedule.pacing_deadline())
+                    .flatten();
                 [deadline, ack_pace].into_iter().flatten().min()
             })
             .filter(|at| *at > now || !self.server || self.budget.can_send(MTU as u64))
@@ -860,7 +924,15 @@ pub async fn connect_versions(
     tls: Arc<ClientConfig>,
     name: ServerName<'static>,
 ) -> Result<(Version, LabSession), Error> {
-    connect_versions_scoped(local, peer, versions, tls, name, super::scope::NetworkScope::loopback()).await
+    connect_versions_scoped(
+        local,
+        peer,
+        versions,
+        tls,
+        name,
+        super::scope::NetworkScope::loopback(),
+    )
+    .await
 }
 
 /// Explicit pinned-interface client for controlled non-loopback acceptance.
@@ -872,7 +944,16 @@ pub async fn connect_versions_scoped(
     name: ServerName<'static>,
     scope: super::scope::NetworkScope,
 ) -> Result<(Version, LabSession), Error> {
-    connect_versions_scoped_with_congestion(local, peer, versions, tls, name, scope, Congestion::Bbr).await
+    connect_versions_scoped_with_congestion(
+        local,
+        peer,
+        versions,
+        tls,
+        name,
+        scope,
+        Congestion::Bbr,
+    )
+    .await
 }
 
 pub async fn connect_versions_scoped_with_congestion(
@@ -936,7 +1017,11 @@ pub async fn accept(candidate: Candidate, tls: Arc<ServerConfig>) -> Result<LabS
     accept_with_congestion(candidate, tls, Congestion::Bbr).await
 }
 
-pub async fn accept_with_congestion(candidate: Candidate, tls: Arc<ServerConfig>, congestion: Congestion) -> Result<LabSession, Error> {
+pub async fn accept_with_congestion(
+    candidate: Candidate,
+    tls: Arc<ServerConfig>,
+    congestion: Congestion,
+) -> Result<LabSession, Error> {
     let (socket, peer, binding, token, initial_reset, versions) = candidate.into_parts();
     let original = binding.original;
     let remote = binding.client;
@@ -1015,7 +1100,12 @@ async fn establish_inner(
         versions,
         restarted,
     } = route;
-    if !socket.scope().permits(socket.local_addr().map_err(Error::Io)?, peer) { return Err(Error::Scope); }
+    if !socket
+        .scope()
+        .permits(socket.local_addr().map_err(Error::Io)?, peer)
+    {
+        return Err(Error::Scope);
+    }
     let server = matches!(&config, Config::Server(_));
     let parameters = params(
         server,
@@ -1038,7 +1128,10 @@ async fn establish_inner(
     .map_err(Error::Tls)?;
     let destination = retry.as_deref().unwrap_or(&original);
     let keys = initial_keys(version, destination, server)?;
-    let initial = match congestion { Congestion::Bbr => Scheduler::with_bbr(Instant::now()), Congestion::Cubic => Scheduler::default() };
+    let initial = match congestion {
+        Congestion::Bbr => Scheduler::with_bbr(Instant::now()),
+        Congestion::Cubic => Scheduler::default(),
+    };
     let application_schedule = initial.fork_space();
     let mut handshake = Handshake {
         driver: Driver::new(connection),
@@ -1078,7 +1171,9 @@ async fn establish_inner(
                 tokio::task::yield_now().await;
             }
             match tokio::time::timeout(wait, socket.recv_from(&mut buffer)).await {
-                Ok(Ok((n, source, _mark))) if source == peer && n <= super::mtu::MAX_UDP_PAYLOAD => {
+                Ok(Ok((n, source, _mark)))
+                    if source == peer && n <= super::mtu::MAX_UDP_PAYLOAD =>
+                {
                     handshake.receive_datagram(&buffer[..n])?
                 }
                 Ok(Ok(_)) | Err(_) => {}

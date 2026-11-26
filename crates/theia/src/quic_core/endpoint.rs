@@ -166,7 +166,11 @@ impl LabSession {
         session.receive.enable_autotune().map_err(Error::Receive)?;
         session.scheduler = scheduler;
         let options = session.socket.options();
-        if options.df { session.scheduler.enable_mtu(peer_limits.max_udp_payload, Instant::now()); }
+        if options.df {
+            session
+                .scheduler
+                .enable_mtu(peer_limits.max_udp_payload, Instant::now());
+        }
         session.scheduler.enable_ecn(options.ecn);
         session.scheduler.application_ack_timing(
             peer_limits.ack_delay_exponent,
@@ -382,7 +386,9 @@ impl LabSession {
             self.scheduler.reset_mtu(now);
         }
         self.socket = SessionIo::direct(socket, scope);
-        if !self.socket.options().df { self.scheduler.disable_mtu(); }
+        if !self.socket.options().df {
+            self.scheduler.disable_mtu();
+        }
         let peer = self.paths.active();
         if let Err(e) = self.send_path(peer, &[1], now).await {
             self.abort();
@@ -400,30 +406,52 @@ impl LabSession {
         self.send_path_sized(peer, frame, MTU, now).await
     }
 
-    async fn send_path_sized(&mut self, peer: SocketAddr, frame: &[u8], size: usize, now: Instant) -> Result<(), Error> {
+    async fn send_path_sized(
+        &mut self,
+        peer: SocketAddr,
+        frame: &[u8],
+        size: usize,
+        now: Instant,
+    ) -> Result<(), Error> {
         if !self.scheduler.can_send_path() {
             return Err(Error::Protocol);
         }
         let mut payload = frame.to_vec();
         // Fixed four-byte PN and the 16-byte AEAD tag used by this fixture.
         let cid_len = self.peer_ids.current().ok_or(Error::Protocol)?.len();
-        let capacity = size.checked_sub(1 + cid_len + 4 + 16).ok_or(Error::Protocol)?;
-        if capacity < frame.len() { return Err(Error::Protocol); }
+        let capacity = size
+            .checked_sub(1 + cid_len + 4 + 16)
+            .ok_or(Error::Protocol)?;
+        if capacity < frame.len() {
+            return Err(Error::Protocol);
+        }
         payload.resize(capacity, 0);
         let (number, packet) = self.seal(&payload)?;
         match self.socket.send_to(&packet, peer).await {
             Ok(n) if n == packet.len() => {
-                self.scheduler.record_path(number, n, now).map_err(Error::Schedule)?;
-                if peer == self.paths.active() { self.idle.sent(now); }
+                self.scheduler
+                    .record_path(number, n, now)
+                    .map_err(Error::Schedule)?;
+                if peer == self.paths.active() {
+                    self.idle.sent(now);
+                }
                 Ok(())
             }
             // A failed candidate must not kill the old validated route.
             // These synchronous failures did not transmit this packet;
             // its PN remains burned and its amplification reservation stays charged.
-            Err(e) if peer != self.paths.active() && (matches!(e.kind(),
-                io::ErrorKind::NetworkUnreachable | io::ErrorKind::HostUnreachable |
-                io::ErrorKind::AddrNotAvailable) || super::mtu::message_too_large(&e)) => {
-                self.scheduler.burn_unsent(number, now).map_err(Error::Schedule)
+            Err(e)
+                if peer != self.paths.active()
+                    && (matches!(
+                        e.kind(),
+                        io::ErrorKind::NetworkUnreachable
+                            | io::ErrorKind::HostUnreachable
+                            | io::ErrorKind::AddrNotAvailable
+                    ) || super::mtu::message_too_large(&e)) =>
+            {
+                self.scheduler
+                    .burn_unsent(number, now)
+                    .map_err(Error::Schedule)
             }
             Ok(_) => Err(Error::Protocol),
             Err(e) => Err(Error::Io(e)),
@@ -588,7 +616,12 @@ impl LabSession {
         }
         let (n, connection, stream) = self
             .receive
-            .read_replenish_at(id, bytes, Instant::now(), self.scheduler.measured_rtt().unwrap_or_default())
+            .read_replenish_at(
+                id,
+                bytes,
+                Instant::now(),
+                self.scheduler.measured_rtt().unwrap_or_default(),
+            )
             .map_err(Error::Receive)?;
         if n != 0 {
             for (ty, numbers) in [(0x10, vec![connection]), (0x11, vec![id, stream])] {
@@ -807,11 +840,15 @@ impl LabSession {
                 let (number, packet) = self.seal(&payload)?;
                 match self.socket.send_to(&packet, self.paths.active()).await {
                     Ok(n) if n == packet.len() => {
-                        self.scheduler.record_mtu_probe(number, n, now).map_err(Error::Schedule)?;
+                        self.scheduler
+                            .record_mtu_probe(number, n, now)
+                            .map_err(Error::Schedule)?;
                         self.idle.sent(now);
                     }
                     Err(e) if super::mtu::message_too_large(&e) => {
-                        self.scheduler.reject_mtu(number, packet.len(), now).map_err(Error::Schedule)?;
+                        self.scheduler
+                            .reject_mtu(number, packet.len(), now)
+                            .map_err(Error::Schedule)?;
                     }
                     Ok(_) => return Err(Error::Protocol),
                     Err(e) => return Err(Error::Io(e)),
@@ -821,26 +858,44 @@ impl LabSession {
         }
         let (payload, ids, probe) = if let Some(ack) = ack {
             (ack, Vec::new(), false)
-        } else if let Some((ids, frame, probe)) = self.scheduler.candidate_batch(now, self.scheduler.current_mtu() - overhead).map_err(Error::Schedule)? {
+        } else if let Some((ids, frame, probe)) = self
+            .scheduler
+            .candidate_batch(now, self.scheduler.current_mtu() - overhead)
+            .map_err(Error::Schedule)?
+        {
             (frame, ids, probe)
         } else {
             return Ok(false);
         };
         let (number, packet) = self.seal(&payload)?;
         let ect = self.confirmed && !ids.is_empty() && !probe && self.scheduler.should_mark_ecn();
-        match self.socket.send_marked(&packet, self.paths.active(), ect).await {
+        match self
+            .socket
+            .send_marked(&packet, self.paths.active(), ect)
+            .await
+        {
             Ok((n, mark)) if n == packet.len() => {
-                self.scheduler.record_batch(number, n, &ids, probe, now).map_err(Error::Schedule)?;
-                if ect { self.scheduler.record_ecn(number, mark, now); }
+                self.scheduler
+                    .record_batch(number, n, &ids, probe, now)
+                    .map_err(Error::Schedule)?;
+                if ect {
+                    self.scheduler.record_ecn(number, mark, now);
+                }
             }
             Err(e) if packet.len() > MTU && super::mtu::message_too_large(&e) => {
-                self.scheduler.reject_mtu(number, packet.len(), now).map_err(Error::Schedule)?;
+                self.scheduler
+                    .reject_mtu(number, packet.len(), now)
+                    .map_err(Error::Schedule)?;
                 return Ok(true);
             }
             Ok(_) => return Err(Error::Protocol),
             Err(e) => return Err(Error::Io(e)),
         }
-        if ids.is_empty() { self.acknowledgments.sent(); } else { self.idle.sent(now); }
+        if ids.is_empty() {
+            self.acknowledgments.sent();
+        } else {
+            self.idle.sent(now);
+        }
         Ok(true)
     }
 
@@ -938,10 +993,18 @@ impl LabSession {
         if self.shutdown.phase() == ShutdownPhase::Draining {
             return Ok(false);
         }
-        if n > super::mtu::MAX_UDP_PAYLOAD { return Ok(false); }
+        if n > super::mtu::MAX_UDP_PAYLOAD {
+            return Ok(false);
+        }
         let new_path = source != self.paths.active();
         if new_path
-            && (!self.server || !self.confirmed || !self.active() || !self.socket.scope().permits(self.socket.local_addr().map_err(Error::Io)?, source))
+            && (!self.server
+                || !self.confirmed
+                || !self.active()
+                || !self
+                    .socket
+                    .scope()
+                    .permits(self.socket.local_addr().map_err(Error::Io)?, source))
         {
             return Ok(false);
         }
@@ -981,7 +1044,9 @@ impl LabSession {
             packet = application;
         }
         let n = packet.len();
-        let destination = if (1 + CID_LEN + 4 + 16..=super::mtu::MAX_UDP_PAYLOAD).contains(&n) && packet[0] & 0xc0 == 0x40 {
+        let destination = if (1 + CID_LEN + 4 + 16..=super::mtu::MAX_UDP_PAYLOAD).contains(&n)
+            && packet[0] & 0xc0 == 0x40
+        {
             self.local_ids
                 .iter()
                 .find_map(|(&seq, cid)| (packet[1..1 + CID_LEN] == *cid).then_some((seq, *cid)))
@@ -1033,7 +1098,10 @@ impl LabSession {
             // Never apply stream data, ACKs or close from an unvalidated path.
             let old_ip = self.paths.active().ip();
             let pto = self.scheduler.base_pto();
-            let Ok(challenge) = self.paths.begin_with_timeout(source, n as u64, now, pto.saturating_mul(3)) else {
+            let Ok(challenge) =
+                self.paths
+                    .begin_with_timeout(source, n as u64, now, pto.saturating_mul(3))
+            else {
                 return Ok(false);
             };
             if !parsed.iter().any(|f| {
@@ -1044,14 +1112,21 @@ impl LabSession {
                 // only the first challenge, within this candidate's budget.
                 // No stream data, ACK or close is applied before validation.
                 if self.scheduler.can_send_path() {
-                    if let Some(Frame::PathChallenge(value)) = parsed.iter().find(|f| matches!(f, Frame::PathChallenge(_))) {
+                    if let Some(Frame::PathChallenge(value)) =
+                        parsed.iter().find(|f| matches!(f, Frame::PathChallenge(_)))
+                    {
                         let cid_len = self.peer_ids.current().ok_or(Error::Protocol)?.len();
                         let minimum = 1 + cid_len + 4 + 16 + 9;
                         let size = if self.paths.reserve_candidate_send(source, MTU as u64, now) {
                             Some(MTU)
-                        } else if self.paths.reserve_candidate_send(source, minimum as u64, now) {
+                        } else if self
+                            .paths
+                            .reserve_candidate_send(source, minimum as u64, now)
+                        {
                             Some(minimum)
-                        } else { None };
+                        } else {
+                            None
+                        };
                         if let Some(size) = size {
                             let mut frame = vec![0x1b];
                             frame.extend_from_slice(value);
@@ -1220,7 +1295,8 @@ impl LabSession {
                 _ => return Err(Error::Protocol),
             }
         }
-        self.acknowledgments.record_marked(opened.number, eliciting, mark);
+        self.acknowledgments
+            .record_marked(opened.number, eliciting, mark);
         Ok(true)
     }
 }

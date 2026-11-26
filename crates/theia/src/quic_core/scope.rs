@@ -10,7 +10,10 @@ pub struct NetworkScope {
 
 impl NetworkScope {
     pub(crate) const fn loopback() -> Self {
-        Self { pins: None, server: None }
+        Self {
+            pins: None,
+            server: None,
+        }
     }
 
     /// The caller explicitly authorizes one or two local and peer addresses.
@@ -18,42 +21,64 @@ impl NetworkScope {
     /// bound to one concrete address and a single IP family.
     pub fn pinned(local: [IpAddr; 2], peer: [IpAddr; 2]) -> Option<Self> {
         if local.iter().chain(peer.iter()).any(|ip| !unicast(*ip))
-            || local.iter().chain(peer.iter()).any(|ip| ip.is_ipv4() != local[0].is_ipv4())
+            || local
+                .iter()
+                .chain(peer.iter())
+                .any(|ip| ip.is_ipv4() != local[0].is_ipv4())
         {
             return None;
         }
-        Some(Self { pins: Some((local, peer)), server: None })
+        Some(Self {
+            pins: Some((local, peer)),
+            server: None,
+        })
     }
 
     pub(crate) fn external_server(local: IpAddr) -> Option<Self> {
-        unicast(local).then_some(Self { pins: None, server: Some(local) })
+        unicast(local).then_some(Self {
+            pins: None,
+            server: Some(local),
+        })
     }
 
-    pub(crate) fn is_external_server(self) -> bool { self.server.is_some() }
+    pub(crate) fn is_external_server(self) -> bool {
+        self.server.is_some()
+    }
 
     pub(crate) fn is_pinned(self) -> bool {
         self.pins.is_some()
     }
 
     pub(crate) fn allows_local(self, ip: IpAddr) -> bool {
-        if let Some(local) = self.server { return ip == local; }
-        self.pins.map_or_else(|| ip.is_loopback(), |(local, _)| local.contains(&ip))
+        if let Some(local) = self.server {
+            return ip == local;
+        }
+        self.pins
+            .map_or_else(|| ip.is_loopback(), |(local, _)| local.contains(&ip))
     }
 
     pub(crate) fn allows_peer(self, ip: IpAddr) -> bool {
-        if let Some(local) = self.server { return unicast(ip) && ip.is_ipv4() == local.is_ipv4(); }
-        self.pins.map_or_else(|| ip.is_loopback(), |(_, peer)| peer.contains(&ip))
+        if let Some(local) = self.server {
+            return unicast(ip) && ip.is_ipv4() == local.is_ipv4();
+        }
+        self.pins
+            .map_or_else(|| ip.is_loopback(), |(_, peer)| peer.contains(&ip))
     }
 
     pub(crate) fn permits(self, local: SocketAddr, peer: SocketAddr) -> bool {
-        self.allows_local(local.ip()) && self.allows_peer(peer.ip())
+        self.allows_local(local.ip())
+            && self.allows_peer(peer.ip())
             && local.is_ipv4() == peer.is_ipv4()
-            && local.port() != 0 && peer.port() != 0 && local != peer
+            && local.port() != 0
+            && peer.port() != 0
+            && local != peer
     }
 }
 
 fn unicast(ip: IpAddr) -> bool {
-    if ip.is_unspecified() || ip.is_multicast() { return false; }
+    if ip.is_unspecified() || ip.is_multicast() {
+        return false;
+    }
     match ip {
         IpAddr::V4(ip) => !ip.is_broadcast() && !ip.is_link_local(),
         IpAddr::V6(ip) => !ip.is_unicast_link_local() && ip.to_ipv4_mapped().is_none(),
@@ -74,7 +99,10 @@ mod tests {
         assert!(!scope.permits(local, "224.0.0.1:2000".parse().unwrap()));
         assert!(!scope.permits(local, "0.0.0.0:2000".parse().unwrap()));
         assert!(!scope.permits(local, "[::1]:2000".parse().unwrap()));
-        assert!(!scope.permits("192.0.2.2:443".parse().unwrap(), "198.51.100.10:2000".parse().unwrap()));
+        assert!(!scope.permits(
+            "192.0.2.2:443".parse().unwrap(),
+            "198.51.100.10:2000".parse().unwrap()
+        ));
         assert!(NetworkScope::external_server("0.0.0.0".parse().unwrap()).is_none());
     }
 
@@ -87,13 +115,20 @@ mod tests {
         let scope = NetworkScope::pinned([local, other], [peer, next]).unwrap();
         assert!(scope.permits(SocketAddr::new(local, 10), SocketAddr::new(peer, 20)));
         assert!(scope.permits(SocketAddr::new(other, 11), SocketAddr::new(next, 21)));
-        assert!(!scope.permits(SocketAddr::new(local, 10), "203.0.113.1:20".parse().unwrap()));
+        assert!(!scope.permits(
+            SocketAddr::new(local, 10),
+            "203.0.113.1:20".parse().unwrap()
+        ));
         assert!(!scope.permits(SocketAddr::new(local, 10), SocketAddr::new(peer, 0)));
         assert!(NetworkScope::pinned(["0.0.0.0".parse().unwrap(), other], [peer, next]).is_none());
         assert!(NetworkScope::pinned([local, other], [peer, "::1".parse().unwrap()]).is_none());
         let v6 = "::1".parse().unwrap();
-        assert!(NetworkScope::pinned([v6; 2], [v6; 2]).unwrap()
+        assert!(NetworkScope::pinned([v6; 2], [v6; 2])
+            .unwrap()
             .permits("[::1]:1000".parse().unwrap(), "[::1]:1001".parse().unwrap()));
-        assert!(!NetworkScope::loopback().permits("127.0.0.1:1000".parse().unwrap(), "[::1]:1001".parse().unwrap()));
+        assert!(!NetworkScope::loopback().permits(
+            "127.0.0.1:1000".parse().unwrap(),
+            "[::1]:1001".parse().unwrap()
+        ));
     }
 }

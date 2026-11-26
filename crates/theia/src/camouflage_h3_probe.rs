@@ -154,19 +154,32 @@ pub async fn probe_quic_h3_native(
     if roots.is_empty() {
         return Err(H3ProbeError::NoTrustAnchors);
     }
-    let name = ServerName::try_from(request.server_name).map_err(|_| H3ProbeError::InvalidServerName)?;
+    let name =
+        ServerName::try_from(request.server_name).map_err(|_| H3ProbeError::InvalidServerName)?;
     if !matches!(&name, ServerName::DnsName(_)) {
         return Err(H3ProbeError::InvalidServerName);
     }
-    let scope = NetworkScope::pinned([source; 2], [request.address.ip(); 2]).ok_or(H3ProbeError::BindFailed)?;
+    let scope = NetworkScope::pinned([source; 2], [request.address.ip(); 2])
+        .ok_or(H3ProbeError::BindFailed)?;
     let start = Instant::now();
     timeout(request.deadline.min(MAX_HANDSHAKE_DEADLINE), async move {
-        let _permit = ACTIVE_H3_PROBES.acquire().await.map_err(|_| H3ProbeError::BindFailed)?;
-        let tls = crate::transport_policy::Carrier::H3.client_tls(roots).map_err(|_| H3ProbeError::HandshakeRejected)?;
+        let _permit = ACTIVE_H3_PROBES
+            .acquire()
+            .await
+            .map_err(|_| H3ProbeError::BindFailed)?;
+        let tls = crate::transport_policy::Carrier::H3
+            .client_tls(roots)
+            .map_err(|_| H3ProbeError::HandshakeRejected)?;
         let (actual, mut session) = handshake_udp::connect_versions_scoped(
-            SocketAddr::new(source, 0), request.address, VersionPolicy::exact(version),
-            std::sync::Arc::new(tls), name, scope,
-        ).await.map_err(|error| match error {
+            SocketAddr::new(source, 0),
+            request.address,
+            VersionPolicy::exact(version),
+            std::sync::Arc::new(tls),
+            name,
+            scope,
+        )
+        .await
+        .map_err(|error| match error {
             handshake_udp::Error::Timeout => H3ProbeError::TimedOut,
             // A native I/O error is not sufficient evidence for fallback.
             _ => H3ProbeError::HandshakeRejected,
@@ -194,10 +207,17 @@ pub async fn probe_quic_h3_native(
             },
         };
         // Close only after authenticated confirmation, with no HTTP bytes.
-        session.close(0x100, Instant::now()).map_err(|_| H3ProbeError::HandshakeRejected)?;
-        session.flush(Instant::now()).await.map_err(|_| H3ProbeError::HandshakeRejected)?;
+        session
+            .close(0x100, Instant::now())
+            .map_err(|_| H3ProbeError::HandshakeRejected)?;
+        session
+            .flush(Instant::now())
+            .await
+            .map_err(|_| H3ProbeError::HandshakeRejected)?;
         Ok(report)
-    }).await.map_err(|_| H3ProbeError::TimedOut)?
+    })
+    .await
+    .map_err(|_| H3ProbeError::TimedOut)?
 }
 
 pub(crate) async fn finish_native_handshake(
@@ -207,11 +227,18 @@ pub(crate) async fn finish_native_handshake(
         if session.shutdown_phase() != crate::quic_core::lifecycle::ShutdownPhase::Open {
             return Err(H3ProbeError::HandshakeRejected);
         }
-        session.flush(Instant::now()).await.map_err(|_| H3ProbeError::HandshakeRejected)?;
+        session
+            .flush(Instant::now())
+            .await
+            .map_err(|_| H3ProbeError::HandshakeRejected)?;
         let wait = session.deadline().map_or(Duration::from_millis(100), |at| {
-            at.saturating_duration_since(Instant::now()).min(Duration::from_millis(100))
+            at.saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(100))
         });
-        session.recv(wait).await.map_err(|_| H3ProbeError::HandshakeRejected)?;
+        session
+            .recv(wait)
+            .await
+            .map_err(|_| H3ProbeError::HandshakeRejected)?;
     }
     Ok(())
 }
