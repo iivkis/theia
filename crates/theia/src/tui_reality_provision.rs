@@ -861,6 +861,8 @@ async fn screen_and_recheck(
     Ok((state, report))
 }
 
+type CheckResult = Result<(WizardInput, Option<reference_health::State>, RankedReview), Error>;
+
 enum WizardStage {
     Input,
     DnsConfirm(Box<WizardInput>),
@@ -870,7 +872,7 @@ enum WizardStage {
     ),
     ProbeConfirm(Box<(WizardInput, ResolvedSearch)>),
     Checking(
-        Receiver<Result<(WizardInput, Option<reference_health::State>, RankedReview), Error>>,
+        Receiver<CheckResult>,
         tokio::sync::oneshot::Sender<()>,
     ),
     CreateConfirm(Box<(WizardInput, reference_health::State, RankedReview)>),
@@ -914,16 +916,8 @@ fn save_failed(root: PathBuf, error: Option<Error>) -> WizardStage {
 
 fn progress_text(label: &str, done: usize, total: usize) -> String {
     let done = done.min(total);
-    let filled = if total == 0 {
-        0
-    } else {
-        done.saturating_mul(24) / total
-    };
-    let percent = if total == 0 {
-        0
-    } else {
-        done.saturating_mul(100) / total
-    };
+    let filled = done.saturating_mul(24).checked_div(total).unwrap_or(0);
+    let percent = done.saturating_mul(100).checked_div(total).unwrap_or(0);
     format!(
         "{label}\n[{}{}] {percent}% · {done} из {total}\nНастройки не изменяются.",
         "█".repeat(filled),

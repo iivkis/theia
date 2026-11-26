@@ -652,9 +652,7 @@ impl ReferenceReview {
                 None if row.address.parse::<std::net::SocketAddr>().is_err() => "Нет адреса".into(),
                 None => "H2 не подтверждён".into(),
             };
-            let color = if row.selected == Some(0) {
-                ACCENT
-            } else if row.selected.is_some() {
+            let color = if row.selected.is_some() {
                 ACCENT
             } else if row.h2 {
                 MUTED
@@ -806,11 +804,7 @@ impl Actions<'_> {
             .collect::<Vec<_>>();
         frame.render_widget(
             List::new(items).block(section(
-                if focused {
-                    " Действия "
-                } else {
-                    " Действия "
-                },
+                " Действия ",
                 focused,
             )),
             area,
@@ -868,10 +862,6 @@ pub(crate) fn confirmation_bar(
             Rect::new(x, area.bottom() - 1, width, 1),
         );
     }
-}
-
-pub(crate) fn action_layout(area: Rect, count: usize) -> Option<[Rect; 2]> {
-    action_layout_rows(area, count, 20)
 }
 
 /// Fit actions immediately below the wrapped report, leaving room for
@@ -1036,7 +1026,7 @@ mod tests {
         );
         for (w, h) in [(60, 12), (120, 30)] {
             let area = Rect::new(0, 0, w, h);
-            let [_, controls] = action_layout(area, items.len()).unwrap();
+            let [_, controls] = action_layout_rows(area, items.len(), 20).unwrap();
             let actions = Actions {
                 items: &items,
                 selected: focus,
