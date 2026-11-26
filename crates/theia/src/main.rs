@@ -45,18 +45,18 @@ async fn main() {
         Ok(Command::TuiEdit { role, config }) => tui::run(Some(role), Some(Path::new(&config)))
             .map(|_| "tui closed".to_owned())
             .map_err(|error| CliError::Tui(error.message())),
-        Ok(Command::ServerRun { config }) => server::run_file(Path::new(&config))
+        Ok(Command::ServerRun { config }) => Box::pin(server::run_file(Path::new(&config)))
             .await
             .map(|_| "server stopped".to_owned())
             .map_err(CliError::Server),
-        Ok(Command::ClientRun { config }) => local_proxy::run_file(Path::new(&config))
+        Ok(Command::ClientRun { config }) => Box::pin(local_proxy::run_file(Path::new(&config)))
             .await
             .map(|_| "client stopped".to_owned())
             .map_err(CliError::Client),
         Ok(Command::ClientRunSystemProxy { config }) => {
             #[cfg(windows)]
             {
-                local_proxy::run_file_with_system_proxy(Path::new(&config))
+                Box::pin(local_proxy::run_file_with_system_proxy(Path::new(&config)))
                     .await
                     .map(|_| "client stopped; conditional WinINet proxy restore completed".to_owned())
                     .map_err(CliError::Client)
