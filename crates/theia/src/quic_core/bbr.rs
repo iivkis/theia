@@ -108,6 +108,12 @@ impl Bbr {
     pub fn mode(&self) -> Mode {
         self.mode
     }
+    pub(crate) fn set_mtu(&mut self, mtu: u64) {
+        self.mtu = mtu;
+        self.cwnd = self.cwnd.max(4 * mtu);
+        self.loss_ceiling = self.loss_ceiling.map(|limit| limit.max(4 * mtu));
+    }
+
     pub fn cwnd(&self) -> u64 {
         self.cwnd
     }
@@ -170,7 +176,7 @@ impl Bbr {
         app_limited: bool,
     ) -> Result<(), Error> {
         if bytes == 0
-            || bytes > self.mtu
+            || bytes > super::mtu::MAX_UDP_PAYLOAD as u64
             || self.samples.len() >= MAX_SAMPLES
             || self.last_sent.is_some_and(|last| number <= last)
         {
@@ -282,10 +288,12 @@ impl Bbr {
                 }
             }
         }
+        let probe_lost = outcome.lost.iter().filter(|p| p.frames.contains(&super::loss::FrameRef::MtuProbe)).map(|p| u64::from(p.bytes)).sum::<u64>();
+        let congestion_lost = outcome.lost_bytes.saturating_sub(probe_lost);
         // A bounded loss signal complements the delivery-rate estimate. It is
         // deliberately conservative and does not claim the full v3 model.
         self.round_acked = self.round_acked.saturating_add(outcome.acknowledged_bytes);
-        self.round_lost = self.round_lost.saturating_add(outcome.lost_bytes);
+        self.round_lost = self.round_lost.saturating_add(congestion_lost);
         let floor = 4 * self.mtu;
         let observed = self.round_acked.saturating_add(self.round_lost);
         if observed >= 4 * self.mtu && u128::from(self.round_lost) * 50 > u128::from(observed) {
@@ -371,9 +379,9 @@ impl Bbr {
         {
             self.recovery_until = None;
         }
-        if outcome.lost_bytes != 0 {
+        if congestion_lost != 0 {
             self.recovery_until = self.last_sent;
-            self.cwnd = self.cwnd.saturating_sub(outcome.lost_bytes).max(floor);
+            self.cwnd = self.cwnd.saturating_sub(congestion_lost).max(floor);
         }
         let target = self
             .bdp()

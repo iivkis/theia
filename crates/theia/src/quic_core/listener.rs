@@ -36,7 +36,7 @@ pub(crate) enum RouteCommand {
     },
 }
 
-const MTU: usize = 1200;
+const MTU: usize = super::mtu::MAX_UDP_PAYLOAD;
 const MAX_CONNECTIONS: usize = 128;
 const MAILBOX: usize = 16;
 type Datagram = (Vec<u8>, SocketAddr);

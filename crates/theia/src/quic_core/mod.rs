@@ -20,6 +20,7 @@ pub mod key_update;
 pub mod lifecycle;
 pub mod listener;
 pub mod loss;
+pub mod mtu;
 pub mod negotiation;
 pub mod packet;
 pub mod parameters;

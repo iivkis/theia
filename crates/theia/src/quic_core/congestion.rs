@@ -57,6 +57,26 @@ impl Window {
         })
     }
 
+    pub(crate) fn set_mtu(&mut self, mtu: u64) {
+        debug_assert!((1200..=super::mtu::MAX_UDP_PAYLOAD as u64).contains(&mtu));
+        self.mtu = mtu;
+        self.cwnd = self.cwnd.max(2 * mtu);
+        self.ssthresh = self.ssthresh.max(2 * mtu);
+        self.epoch = None;
+        self.growth_credit = 0.0;
+    }
+
+    pub(crate) fn can_reserve_size(&self, bytes: u64) -> bool {
+        bytes != 0 && bytes <= super::mtu::MAX_UDP_PAYLOAD as u64
+            && self.in_flight.checked_add(bytes).is_some_and(|n| n <= self.cwnd)
+    }
+
+    pub(crate) fn reserve_discovery(&mut self, bytes: u64) -> Result<(), Error> {
+        if !self.can_reserve_size(bytes) { return Err(Error::Limit); }
+        self.in_flight += bytes;
+        Ok(())
+    }
+
     pub fn cwnd(&self) -> u64 {
         self.cwnd
     }
@@ -146,7 +166,7 @@ impl Window {
         rtt: Duration,
         cwnd_limited: bool,
     ) -> Result<(), Error> {
-        if sent > now || bytes == 0 || bytes > self.mtu {
+        if sent > now || bytes == 0 || bytes > super::mtu::MAX_UDP_PAYLOAD as u64 {
             return Err(Error::Accounting);
         }
         if !cwnd_limited {

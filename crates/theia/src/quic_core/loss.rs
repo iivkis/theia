@@ -4,7 +4,7 @@
 //! the owner must suppress frames already acknowledged by another packet.
 use super::{ack::Ack, wire::MAX_VARINT};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -25,6 +25,7 @@ pub enum FrameRef {
         fin: bool,
     },
     Control(u64),
+    MtuProbe,
 }
 
 #[derive(Debug)]
@@ -55,7 +56,7 @@ pub enum Error {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum Status { Pending, Acked, Lost }
+enum Status { Pending, Acked, Lost, Neutral }
 
 #[derive(Default)]
 pub struct Ledger {
@@ -65,6 +66,7 @@ pub struct Ledger {
     largest_ack: Option<u64>,
     bytes_in_flight: u64,
     congestion_history: BTreeMap<u64, (Instant, Status)>,
+    burned: BTreeSet<u64>,
 }
 
 impl Ledger {
@@ -125,6 +127,18 @@ impl Ledger {
         self.congestion_history.clear();
     }
 
+    /// A definitive local EMSGSIZE means this number was never transmitted.
+    /// Keep a bounded set for ACK validation; fail closed rather than forget.
+    pub(crate) fn burn(&mut self, number: u64, now: Instant) -> Result<(), Error> {
+        if number != self.next || number > MAX_VARINT { return Err(Error::Sequence); }
+        if self.burned.len() >= MAX_OUTSTANDING { return Err(Error::Limit); }
+        if self.last_send.is_some_and(|last| now < last) { return Err(Error::Clock); }
+        self.burned.insert(number);
+        self.next += 1;
+        self.last_send = Some(now);
+        Ok(())
+    }
+
     pub fn bytes_in_flight(&self) -> u64 {
         self.bytes_in_flight
     }
@@ -155,6 +169,7 @@ impl Ledger {
         for r in &ack.ranges {
             if r.first > r.last
                 || r.last >= self.next
+                || (r.first <= r.last && self.burned.range(r.first..=r.last).next().is_some())
                 || previous.is_some_and(|low| low.checked_sub(2).is_none_or(|bound| r.last > bound))
             {
                 return Err(Error::Ack);
@@ -222,7 +237,7 @@ impl Ledger {
                     out.lost_bytes += bytes;
                 }
                 if let Some((_, status)) = self.congestion_history.get_mut(&p.number) {
-                    *status = Status::Lost;
+                    *status = if p.frames.contains(&FrameRef::MtuProbe) { Status::Neutral } else { Status::Lost };
                 }
                 out.lost.push(p);
             } else {
@@ -363,6 +378,21 @@ mod tests {
             Duration::from_millis(12)
         }).unwrap();
         assert_eq!(out.lost.len(), 1);
+    }
+
+    #[test]
+    fn burned_packet_numbers_never_become_acknowledgeable_after_migration() {
+        let now = Instant::now();
+        let mut l = Ledger::default();
+        l.record(packet(0, now)).unwrap();
+        l.burn(1, now).unwrap();
+        l.record(packet(2, now)).unwrap();
+        let a = Ack { delay: 0, ranges: vec![Range { first: 0, last: 2 }], ecn: None };
+        assert_eq!(l.acknowledge(&a, now, Duration::ZERO).unwrap_err(), Error::Ack);
+        assert_eq!(l.bytes_in_flight(), 2400);
+        l.restart_path();
+        assert_eq!(l.acknowledge(&ack(1), now, Duration::ZERO).unwrap_err(), Error::Ack);
+        l.record(packet(3, now)).unwrap();
     }
 
     #[test]

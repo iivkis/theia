@@ -7,6 +7,7 @@ use super::{
     congestion::Window,
     loss::{self, FrameRef, Ledger, Sent},
     recovery::Rtt,
+    mtu::Discovery,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -41,7 +42,7 @@ pub struct Scheduler {
     confirmed: bool,
     frames: BTreeMap<u64, Pending>,
     queue: VecDeque<u64>,
-    aliases: BTreeMap<u64, u64>,
+    aliases: BTreeMap<u64, Vec<u64>>,
     next_id: u64,
     last_eliciting: Option<Instant>,
     pto_count: u32,
@@ -49,6 +50,7 @@ pub struct Scheduler {
     cwnd_limited: BTreeSet<u64>,
     first_rtt_at: Option<Instant>,
     persistent_reported: Option<Instant>,
+    mtu: Discovery,
 }
 
 impl Default for Scheduler {
@@ -71,6 +73,7 @@ impl Default for Scheduler {
             cwnd_limited: BTreeSet::new(),
             first_rtt_at: None,
             persistent_reported: None,
+            mtu: Discovery::default(),
         }
     }
 }
@@ -95,6 +98,7 @@ impl Scheduler {
     /// ACK from the old path without adding old-path RTT or delivery samples.
     pub(crate) fn restart_path(&mut self, now: Instant) {
         self.ledger.restart_path();
+        self.mtu.reset_path(now);
         self.window = Window::new(MTU).expect("valid MTU");
         if self.bbr.is_some() {
             self.bbr = Some(Bbr::new(MTU, now).expect("valid MTU"));
@@ -168,7 +172,10 @@ impl Scheduler {
             !matches!(decode(&pending.bytes, Space::Application).as_deref(),
                 Ok([Frame::Stream { id, .. }]) if *id == stream)
         });
-        self.aliases.retain(|_, id| self.frames.contains_key(id));
+        self.aliases.retain(|_, ids| {
+            ids.retain(|id| self.frames.contains_key(id));
+            !ids.is_empty()
+        });
         self.queue.retain(|id| self.frames.contains_key(id));
         if self.frames.is_empty() && self.ledger.bytes_in_flight() == 0 {
             self.last_eliciting = None;
@@ -197,7 +204,7 @@ impl Scheduler {
             }
         }
         if self.next_send.is_some_and(|at| now < at)
-            || self.window.in_flight().saturating_add(MTU) > self.window.cwnd()
+            || self.window.in_flight().saturating_add(self.mtu.current() as u64) > self.window.cwnd()
         {
             return Ok(None);
         }
@@ -210,6 +217,71 @@ impl Scheduler {
             .and_then(|id| self.frames.get(id).map(|f| (*id, f.bytes.clone(), false))))
     }
 
+    /// Coalesce length-delimited reliable application frames into the
+    /// discovered packet size. Each original frame retains its own alias;
+    /// after a path MTU reduction they can be retransmitted individually.
+    pub(crate) fn candidate_batch(&mut self, now: Instant, capacity: usize) -> Result<Option<(Vec<u64>, Vec<u8>, bool)>, Error> {
+        let Some((id, mut bytes, probe)) = self.candidate(now)? else { return Ok(None); };
+        if bytes.len() > capacity { return Err(Error::Limit); }
+        let mut ids = vec![id];
+        if !probe {
+            for &next in &self.queue {
+                if next == id { continue; }
+                let Some(frame) = self.frames.get(&next) else { continue; };
+                if ids.len() == 32 || bytes.len() + frame.bytes.len() > capacity { break; }
+                // A STREAM without LEN consumes the remaining packet. Our
+                // send encoder always writes LEN; preserve this invariant.
+                if frame.bytes.first().is_some_and(|ty| (8..=15).contains(ty) && ty & 2 == 0) { break; }
+                bytes.extend_from_slice(&frame.bytes);
+                ids.push(next);
+            }
+        }
+        Ok(Some((ids, bytes, probe)))
+    }
+
+    pub(crate) fn enable_mtu(&mut self, peer_cap: u64, now: Instant) {
+        self.mtu = Discovery::new(peer_cap, now);
+    }
+
+    pub(crate) fn current_mtu(&self) -> usize { self.mtu.current() }
+
+    fn mtu_deadline(&self) -> Option<Instant> {
+        let size = self.mtu.candidate()?;
+        (self.confirmed && self.window.can_reserve_size(size as u64)).then_some(())?;
+        self.mtu.deadline()
+    }
+
+    pub(crate) fn mtu_probe(&self, now: Instant) -> Option<usize> {
+        (now >= self.mtu_deadline()?).then(|| self.mtu.candidate()).flatten()
+    }
+
+    fn apply_mtu(&mut self, before: usize) {
+        let mtu = self.mtu.current();
+        if before != mtu {
+            self.window.set_mtu(mtu as u64);
+            if let Some(bbr) = self.bbr.as_mut() {
+                bbr.set_mtu(mtu as u64);
+                // BBR's minimum may be larger than CUBIC's minimum.
+                self.window.set_target(bbr.cwnd()).expect("bounded BBR window");
+            }
+        }
+    }
+
+    pub(crate) fn reject_mtu(&mut self, number: u64, size: usize, now: Instant) -> Result<(), Error> {
+        self.ledger.burn(number, now).map_err(|_| Error::Ledger)?;
+        let before = self.mtu.current();
+        self.mtu.local_reject(size, now);
+        self.apply_mtu(before);
+        Ok(())
+    }
+
+    pub(crate) fn record_mtu_probe(&mut self, number: u64, bytes: usize, now: Instant) -> Result<(), Error> {
+        if self.mtu_probe(now) != Some(bytes) { return Err(Error::Window); }
+        self.record_unreliable(number, bytes, now, true)?;
+        self.mtu.sent(number, bytes);
+        Ok(())
+    }
+
     /// Called once after successful packet sealing. If the I/O attempt fails,
     /// the owner must terminate rather than reuse packet numbers.
     pub fn record(
@@ -219,11 +291,18 @@ impl Scheduler {
         frame: Option<(u64, bool)>,
         now: Instant,
     ) -> Result<(), Error> {
-        if bytes == 0 || bytes > MTU as usize {
+        match frame {
+            Some((id, probe)) => self.record_batch(number, bytes, &[id], probe, now),
+            None => self.record_batch(number, bytes, &[], false, now),
+        }
+    }
+
+    pub(crate) fn record_batch(&mut self, number: u64, bytes: usize, ids: &[u64], probe: bool, now: Instant) -> Result<(), Error> {
+        if bytes == 0 || bytes > self.mtu.current() || ids.len() > 32 {
             return Err(Error::Limit);
         }
-        if let Some((id, probe)) = frame {
-            if !self.frames.contains_key(&id) || self.aliases.len() >= MAX_ALIASES {
+        if !ids.is_empty() {
+            if ids.iter().any(|id| !self.frames.contains_key(id)) || self.aliases.len() >= MAX_ALIASES {
                 return Err(Error::Limit);
             }
             let before = self.window.in_flight();
@@ -231,8 +310,8 @@ impl Scheduler {
                 self.window.application_limited();
             }
             let app_limited = probe
-                || (self.queue.iter().all(|queued| *queued == id)
-                    && before.saturating_add(2 * MTU) <= self.window.cwnd());
+                || (self.queue.iter().all(|queued| ids.contains(queued))
+                    && before.saturating_add(2 * self.mtu.current() as u64) <= self.window.cwnd());
             if probe {
                 self.window
                     .reserve_probe(bytes as u64)
@@ -248,7 +327,7 @@ impl Scheduler {
                 bytes: bytes as u32,
                 ack_eliciting: true,
                 in_flight: true,
-                frames: vec![FrameRef::Control(id)],
+                frames: ids.iter().map(|&id| FrameRef::Control(id)).collect(),
             }) {
                 self.window
                     .retire(bytes as u64)
@@ -262,10 +341,10 @@ impl Scheduler {
             if !app_limited && self.bbr.is_none() {
                 self.cwnd_limited.insert(number);
             }
-            self.aliases.insert(number, id);
-            self.queue.retain(|queued| *queued != id);
-            if let Some(f) = self.frames.get_mut(&id) {
-                f.queued = false;
+            self.aliases.insert(number, ids.to_vec());
+            self.queue.retain(|queued| !ids.contains(queued));
+            for id in ids {
+                if let Some(f) = self.frames.get_mut(id) { f.queued = false; }
             }
             if probe {
                 self.pto_count += 1;
@@ -303,13 +382,15 @@ impl Scheduler {
     }
 
     pub fn record_path(&mut self, number: u64, bytes: usize, now: Instant) -> Result<(), Error> {
-        if bytes != MTU as usize || !self.can_send_path() {
+        if bytes == 0 || bytes > MTU as usize || !self.can_send_path() {
             return Err(Error::Window);
         }
+        self.record_unreliable(number, bytes, now, false)
+    }
+
+    fn record_unreliable(&mut self, number: u64, bytes: usize, now: Instant, discovery: bool) -> Result<(), Error> {
         let before = self.window.in_flight();
-        self.window
-            .reserve(bytes as u64)
-            .map_err(|_| Error::Window)?;
+        self.window.reserve_discovery(bytes as u64).map_err(|_| Error::Window)?;
         if self
             .ledger
             .record(Sent {
@@ -318,7 +399,7 @@ impl Scheduler {
                 bytes: bytes as u32,
                 ack_eliciting: true,
                 in_flight: true,
-                frames: vec![],
+                frames: if discovery { vec![FrameRef::MtuProbe] } else { vec![] },
             })
             .is_err()
         {
@@ -373,15 +454,14 @@ impl Scheduler {
             rtt.loss_delay()
         }).map_err(|_| Error::Ledger)?;
         // Retain aliases for declared-lost packets until any copy is ACKed.
-        let completed: Vec<u64> = self
-            .aliases
-            .iter()
-            .filter_map(|(n, id)| ack.acknowledges(*n).then_some(*id))
-            .collect();
-        for id in completed {
-            self.frames.remove(&id);
-            self.aliases.retain(|_, value| *value != id);
-        }
+        let completed: BTreeSet<u64> = self.aliases.iter()
+            .filter(|(n, _)| ack.acknowledges(**n))
+            .flat_map(|(_, ids)| ids.iter().copied()).collect();
+        for id in &completed { self.frames.remove(id); }
+        self.aliases.retain(|_, ids| {
+            ids.retain(|id| !completed.contains(id));
+            !ids.is_empty()
+        });
         self.queue.retain(|id| self.frames.contains_key(id));
         if self.frames.is_empty() && self.ledger.bytes_in_flight() == 0 {
             self.last_eliciting = None;
@@ -396,6 +476,9 @@ impl Scheduler {
         self.window
             .retire(outcome.acknowledged_bytes + outcome.lost_bytes)
             .map_err(|_| Error::Window)?;
+        let before = self.mtu.current();
+        self.mtu.feedback(&outcome, now);
+        self.apply_mtu(before);
         // BBR uses the same authoritative in-flight ledger, but does not
         // apply CUBIC's multiplicative decrease/growth to its model.
         if let Some(bbr) = self.bbr.as_mut() {
@@ -416,7 +499,7 @@ impl Scheduler {
         // the new recovery boundary cannot undo the congestion event.
         for p in outcome.lost {
             self.cwnd_limited.remove(&p.number);
-            if p.in_flight && self.bbr.is_none() {
+            if p.in_flight && self.bbr.is_none() && !p.frames.contains(&FrameRef::MtuProbe) {
                 self.window.loss(p.at, now).map_err(|_| Error::Window)?;
             }
             for f in p.frames {
@@ -469,13 +552,13 @@ impl Scheduler {
         let loss = self.ledger.loss_deadline(self.rtt.loss_delay());
         let pto = self.pto_deadline();
         let pace = if !self.queue.is_empty()
-            && self.window.in_flight().saturating_add(MTU) <= self.window.cwnd()
+            && self.window.in_flight().saturating_add(self.mtu.current() as u64) <= self.window.cwnd()
         {
             self.next_send
         } else {
             None
         };
-        [loss, pto, pace].into_iter().flatten().min()
+        [loss, pto, pace, self.mtu_deadline()].into_iter().flatten().min()
     }
 }
 
@@ -513,6 +596,32 @@ mod tests {
         a.delay = 2500; // 20ms at exponent 3
         s.acknowledge(&a, now + Duration::from_millis(150)).unwrap();
         assert_eq!(s.rtt.smoothed(), Duration::from_micros(103750));
+    }
+
+    #[test]
+    fn discovery_uses_real_packet_ack_and_batch_retransmission_aliases() {
+        let now = Instant::now();
+        let mut s = Scheduler::default();
+        s.confirm_handshake();
+        s.enable_mtu(1452, now);
+        let at = s.deadline().unwrap();
+        let size = s.mtu_probe(at).unwrap();
+        s.record_mtu_probe(0, size, at).unwrap();
+        assert_eq!(s.current_mtu(), 1200);
+        s.acknowledge(&ack(0), at + Duration::from_millis(10)).unwrap();
+        assert_eq!(s.current_mtu(), size);
+        s.enqueue(vec![1]).unwrap();
+        s.enqueue(vec![1]).unwrap();
+        let later = at + Duration::from_millis(10);
+        let (ids, bytes, probe) = s.candidate_batch(later, size - 29).unwrap().unwrap();
+        assert_eq!(bytes, [1, 1]);
+        assert_eq!(ids.len(), 2);
+        s.record_batch(1, 31, &ids, probe, later).unwrap();
+        s.acknowledge(&ack(1), later).unwrap();
+        assert_eq!(s.pending(), 0);
+        s.reject_mtu(2, size, later).unwrap();
+        assert_eq!(s.current_mtu(), 1200);
+        assert_eq!(s.acknowledge(&ack(2), later), Err(Error::Ledger));
     }
 
     #[test]

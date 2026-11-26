@@ -163,6 +163,7 @@ impl LabSession {
             SendFlow::from_peer(server, peer_limits, MAX_STREAMS).map_err(Error::Send)?;
         session.receive.enable_autotune().map_err(Error::Receive)?;
         session.scheduler = Scheduler::with_bbr(Instant::now());
+        session.scheduler.enable_mtu(peer_limits.max_udp_payload, Instant::now());
         session.scheduler.application_ack_timing(
             peer_limits.ack_delay_exponent,
             peer_limits.max_ack_delay_ms,
@@ -780,33 +781,46 @@ impl LabSession {
             }
         }
         let ack = self.acknowledgments.encode();
-        let (payload, frame) = if let Some(ack) = ack {
-            (ack, None)
-        } else if let Some((id, frame, probe)) =
-            self.scheduler.candidate(now).map_err(Error::Schedule)?
-        {
-            (frame, Some((id, probe)))
+        let cid_len = self.peer_ids.current().ok_or(Error::Protocol)?.len();
+        let overhead = 1 + cid_len + 4 + 16;
+        // Discover only after confirmation and when ACK/path work is clear.
+        if ack.is_none() {
+            if let Some(size) = self.scheduler.mtu_probe(now) {
+                let mut payload = vec![1];
+                payload.resize(size - overhead, 0);
+                let (number, packet) = self.seal(&payload)?;
+                match self.socket.send_to(&packet, self.paths.active()).await {
+                    Ok(n) if n == packet.len() => {
+                        self.scheduler.record_mtu_probe(number, n, now).map_err(Error::Schedule)?;
+                        self.idle.sent(now);
+                    }
+                    Err(e) if super::mtu::message_too_large(&e) => {
+                        self.scheduler.reject_mtu(number, packet.len(), now).map_err(Error::Schedule)?;
+                    }
+                    Ok(_) => return Err(Error::Protocol),
+                    Err(e) => return Err(Error::Io(e)),
+                }
+                return Ok(true);
+            }
+        }
+        let (payload, ids, probe) = if let Some(ack) = ack {
+            (ack, Vec::new(), false)
+        } else if let Some((ids, frame, probe)) = self.scheduler.candidate_batch(now, self.scheduler.current_mtu() - overhead).map_err(Error::Schedule)? {
+            (frame, ids, probe)
         } else {
             return Ok(false);
         };
         let (number, packet) = self.seal(&payload)?;
-        self.scheduler
-            .record(number, packet.len(), frame, now)
-            .map_err(Error::Schedule)?;
-        if self
-            .socket
-            .send_to(&packet, self.paths.active())
-            .await
-            .map_err(Error::Io)?
-            != packet.len()
-        {
-            return Err(Error::Protocol);
+        match self.socket.send_to(&packet, self.paths.active()).await {
+            Ok(n) if n == packet.len() => self.scheduler.record_batch(number, n, &ids, probe, now).map_err(Error::Schedule)?,
+            Err(e) if packet.len() > MTU && super::mtu::message_too_large(&e) => {
+                self.scheduler.reject_mtu(number, packet.len(), now).map_err(Error::Schedule)?;
+                return Ok(true);
+            }
+            Ok(_) => return Err(Error::Protocol),
+            Err(e) => return Err(Error::Io(e)),
         }
-        if frame.is_none() {
-            self.acknowledgments.sent();
-        } else {
-            self.idle.sent(now);
-        }
+        if ids.is_empty() { self.acknowledgments.sent(); } else { self.idle.sent(now); }
         Ok(true)
     }
 
@@ -856,7 +870,7 @@ impl LabSession {
         now: Instant,
     ) -> Result<bool, Error> {
         if source != self.paths.active()
-            || packet.len() > MTU
+            || packet.len() > super::mtu::MAX_UDP_PAYLOAD
             || !self.peer_ids.matches_reset(packet)
         {
             return Ok(false);
@@ -881,9 +895,9 @@ impl LabSession {
         wait: Duration,
         wake: Option<&tokio::sync::Notify>,
     ) -> Result<bool, Error> {
-        let mut buf = [0; MTU + 1];
+        let mut buf = [0; super::mtu::MAX_UDP_PAYLOAD + 1];
         let (n, source) = if let Some(packet) = self.early_application.pop_front() {
-            if packet.len() > MTU {
+            if packet.len() > super::mtu::MAX_UDP_PAYLOAD {
                 return Err(Error::Protocol);
             }
             buf[..packet.len()].copy_from_slice(&packet);
@@ -903,6 +917,7 @@ impl LabSession {
         if self.shutdown.phase() == ShutdownPhase::Draining {
             return Ok(false);
         }
+        if n > super::mtu::MAX_UDP_PAYLOAD { return Ok(false); }
         let new_path = source != self.paths.active();
         if new_path
             && (!self.server || !self.confirmed || !self.active() || !self.socket.scope().permits(self.socket.local_addr().map_err(Error::Io)?, source))
@@ -913,7 +928,7 @@ impl LabSession {
         // A coalesced datagram can carry the last Handshake ACK and the
         // first HANDSHAKE_DONE/STREAM. Apply each protected space separately.
         if packet.first().is_some_and(|first| first & 0x80 != 0) {
-            if new_path || n > MTU {
+            if new_path || n > super::mtu::MAX_UDP_PAYLOAD {
                 return Ok(false);
             }
             let Ok(parts) = super::datagram::split(packet) else {
@@ -945,7 +960,7 @@ impl LabSession {
             packet = application;
         }
         let n = packet.len();
-        let destination = if (1 + CID_LEN + 4 + 16..=MTU).contains(&n) && packet[0] & 0xc0 == 0x40 {
+        let destination = if (1 + CID_LEN + 4 + 16..=super::mtu::MAX_UDP_PAYLOAD).contains(&n) && packet[0] & 0xc0 == 0x40 {
             self.local_ids
                 .iter()
                 .find_map(|(&seq, cid)| (packet[1..1 + CID_LEN] == *cid).then_some((seq, *cid)))

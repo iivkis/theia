@@ -104,7 +104,7 @@ fn params(
     }
     for (id, value) in [
         (0x01, 30_000),
-        (0x03, MTU as u64),
+        (0x03, super::mtu::MAX_UDP_PAYLOAD as u64),
         (0x04, CREDIT),
         (0x05, CREDIT),
         (0x06, CREDIT),
@@ -1000,7 +1000,7 @@ async fn establish_inner(
         return Err(Error::Scope);
     }
     tokio::time::timeout(DEADLINE, async {
-        let mut buffer = [0; MTU + 1];
+        let mut buffer = [0; super::mtu::MAX_UDP_PAYLOAD + 1];
         loop {
             handshake.collect()?;
             let sent = handshake.flush(&socket, peer).await?;
@@ -1012,7 +1012,7 @@ async fn establish_inner(
                 tokio::task::yield_now().await;
             }
             match tokio::time::timeout(wait, socket.recv_from(&mut buffer)).await {
-                Ok(Ok((n, source))) if source == peer && n <= MTU => {
+                Ok(Ok((n, source))) if source == peer && n <= super::mtu::MAX_UDP_PAYLOAD => {
                     handshake.receive_datagram(&buffer[..n])?
                 }
                 Ok(Ok(_)) | Err(_) => {}
