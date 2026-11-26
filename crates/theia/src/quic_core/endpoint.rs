@@ -66,6 +66,9 @@ impl LabSession {
         let mut session = Self::connect_inner(socket, peer, server, local_cid, remote_cid,
             Protection::Rotating { reader: key_update::Receiver::new(keys.remote, secrets.clone()),
                 writer: key_update::Sender::new(keys.local, secrets) }, server).await?;
+        // Application-space native laboratory defaults to BBR; the
+        // fixed-key codec fixture keeps the CUBIC scheduler for comparison.
+        session.scheduler = Scheduler::with_bbr(Instant::now());
         if server { session.scheduler.enqueue(vec![0x1e]).map_err(Error::Schedule)?; }
         Ok(session)
     }
@@ -270,7 +273,7 @@ impl LabSession {
         let now = Instant::now();
         self.tick(now);
         if self.closed { return Ok(false); }
-        let wait = self.deadline().map_or(wait, |at| wait.min(at.saturating_duration_since(now)));
+        let wait = self.shutdown.deadline().map_or(wait, |at| wait.min(at.saturating_duration_since(now)));
         let result = self.recv_inner(wait).await;
         if result.is_err() { self.abort(); } else { self.tick(Instant::now()); }
         result

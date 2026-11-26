@@ -1,7 +1,7 @@
 //! Development application-space scheduler. Stable frame IDs allow late
 //! ACKs of a lost transmission to cancel queued retransmissions. No
 //! handshake-space timers, multipath, key updates or production admission.
-use super::{ack::Ack, congestion::Window, loss::{self, FrameRef, Ledger, Sent}, recovery::Rtt};
+use super::{ack::Ack, bbr::Bbr, congestion::Window, loss::{self, FrameRef, Ledger, Sent}, recovery::Rtt};
 use std::{collections::{BTreeMap, VecDeque}, time::{Duration, Instant}};
 
 const MAX_FRAMES: usize = 128;
@@ -20,6 +20,7 @@ struct Pending {
 pub struct Scheduler {
     ledger: Ledger,
     window: Window,
+    bbr: Option<Bbr>,
     rtt: Rtt,
     frames: BTreeMap<u64, Pending>,
     queue: VecDeque<u64>,
@@ -33,7 +34,7 @@ pub struct Scheduler {
 impl Default for Scheduler {
     fn default() -> Self {
         Self {
-            ledger: Ledger::default(), window: Window::new(MTU).expect("valid MTU"),
+            ledger: Ledger::default(), window: Window::new(MTU).expect("valid MTU"), bbr: None,
             rtt: Rtt::default(), frames: BTreeMap::new(), queue: VecDeque::new(),
             aliases: BTreeMap::new(), next_id: 0, last_eliciting: None,
             pto_count: 0, next_send: None,
@@ -42,6 +43,10 @@ impl Default for Scheduler {
 }
 
 impl Scheduler {
+    pub fn with_bbr(now: Instant) -> Self {
+        Self { bbr: Some(Bbr::new(MTU, now).expect("valid MTU")), ..Self::default() }
+    }
+
     pub fn can_queue(&self) -> bool { self.can_queue_n(1) }
 
     pub fn can_queue_n(&self, n: usize) -> bool {
@@ -96,6 +101,9 @@ impl Scheduler {
         if bytes == 0 || bytes > MTU as usize { return Err(Error::Limit); }
         if let Some((id, probe)) = frame {
             if !self.frames.contains_key(&id) || self.aliases.len() >= MAX_ALIASES { return Err(Error::Limit); }
+            let before = self.window.in_flight();
+            let app_limited = probe || (self.queue.iter().all(|queued| *queued == id)
+                && before.saturating_add(2 * MTU) <= self.window.cwnd());
             if probe {
                 self.window.reserve_probe(bytes as u64).map_err(|_| Error::Window)?;
             } else {
@@ -106,13 +114,20 @@ impl Scheduler {
                 self.window.retire(bytes as u64).map_err(|_| Error::Window)?;
                 return Err(Error::Ledger);
             }
+            if let Some(bbr) = self.bbr.as_mut() {
+                bbr.sent(number, bytes as u64, now, before, app_limited).map_err(|_| Error::Window)?;
+            }
             self.aliases.insert(number, id);
             self.queue.retain(|queued| *queued != id);
             if let Some(f) = self.frames.get_mut(&id) { f.queued = false; }
             if probe { self.pto_count += 1; }
             self.last_eliciting = Some(now);
-            let spacing = self.rtt.smoothed().mul_f64(bytes as f64 / self.window.cwnd() as f64)
-                .max(Duration::from_micros(100));
+            let spacing = if let Some(bbr) = &self.bbr {
+                bbr.pacing_interval(bytes as u64)
+            } else {
+                self.rtt.smoothed().mul_f64(bytes as f64 / self.window.cwnd() as f64)
+                    .max(Duration::from_micros(1))
+            };
             self.next_send = now.checked_add(spacing);
         } else {
             self.ledger.record(Sent { number, at: now, bytes: bytes as u32,
@@ -141,10 +156,18 @@ impl Scheduler {
     fn apply_loss(&mut self, outcome: loss::Outcome, now: Instant) -> Result<(), Error> {
         let limited = self.window.in_flight().saturating_add(MTU) > self.window.cwnd();
         self.window.retire(outcome.acknowledged_bytes + outcome.lost_bytes).map_err(|_| Error::Window)?;
+        // BBR uses the same authoritative in-flight ledger, but does not
+        // apply CUBIC's multiplicative decrease/growth to its model.
+        if let Some(bbr) = self.bbr.as_mut() {
+            bbr.feedback(&outcome, now, self.window.in_flight()).map_err(|_| Error::Window)?;
+            self.window.set_target(bbr.cwnd()).map_err(|_| Error::Window)?;
+        } else if persistent_loss(&outcome, self.base_pto().saturating_mul(3)) {
+            self.window.persistent_congestion(now);
+        }
         // Apply loss before growth, so an ACK for a packet sent before
         // the new recovery boundary cannot undo the congestion event.
         for p in outcome.lost {
-            if p.in_flight { self.window.loss(p.at, now).map_err(|_| Error::Window)?; }
+            if p.in_flight && self.bbr.is_none() { self.window.loss(p.at, now).map_err(|_| Error::Window)?; }
             for f in p.frames {
                 if let FrameRef::Control(id) = f {
                     if let Some(pending) = self.frames.get_mut(&id) {
@@ -157,7 +180,7 @@ impl Scheduler {
             }
         }
         for p in outcome.acknowledged {
-            if p.in_flight {
+            if p.in_flight && self.bbr.is_none() {
                 self.window.on_ack(p.at, now, u64::from(p.bytes), self.rtt.smoothed(), limited)
                     .map_err(|_| Error::Window)?;
             }
@@ -185,6 +208,25 @@ impl Scheduler {
         } else { None };
         [loss, pto, pace].into_iter().flatten().min()
     }
+}
+
+/// Conservative persistent-congestion evidence: only one contiguous run
+/// of lost ACK-eliciting packets in the same authenticated loss outcome.
+/// Cross-event tracking remains a production recovery requirement.
+fn persistent_loss(outcome: &loss::Outcome, threshold: Duration) -> bool {
+    let mut start: Option<Instant> = None;
+    let mut last: Option<u64> = None;
+    for packet in &outcome.lost {
+        if !packet.in_flight || !packet.ack_eliciting {
+            start = None;
+            last = None;
+            continue;
+        }
+        if last.and_then(|n| n.checked_add(1)) != Some(packet.number) { start = Some(packet.at); }
+        last = Some(packet.number);
+        if start.is_some_and(|at| packet.at.saturating_duration_since(at) >= threshold) { return true; }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -225,6 +267,20 @@ mod tests {
         assert_eq!(s.window.in_flight(), 0);
         assert_eq!(s.acknowledge(&ack(5000), now), Err(Error::Ledger));
     }
+    #[test]
+    fn bbr_scheduler_uses_same_packet_ledger_and_releases_credit() {
+        let now = Instant::now();
+        let mut s = Scheduler::with_bbr(now);
+        s.enqueue(vec![1]).unwrap();
+        let (id, _, probe) = s.candidate(now).unwrap().unwrap();
+        s.record(0, 100, Some((id, probe)), now).unwrap();
+        assert_eq!(s.window.in_flight(), 100);
+        s.acknowledge(&ack(0), now + Duration::from_millis(20)).unwrap();
+        assert_eq!(s.window.in_flight(), 0);
+        assert_eq!(s.pending(), 0);
+        assert_eq!(s.bbr.as_ref().unwrap().bandwidth(), 5000);
+    }
+
     #[test]
     fn cancel_does_not_remove_in_flight_accounting() {
         let now = Instant::now();

@@ -1,7 +1,7 @@
 //! Congestion-control building blocks for the future connection scheduler.
 //! CUBIC window growth, slow start and recovery for the isolated session.
-//! This remains a development controller: ECN, persistent congestion,
-//! HyStart++, full idle handling and BBR are not implemented here.
+//! This remains a development controller: ECN, HyStart++, complete
+//! persistent-congestion evidence and full idle handling remain open.
 use std::time::{Duration, Instant};
 
 const MAX_CWND: u64 = 64 * 1024 * 1024;
@@ -79,6 +79,17 @@ impl Window {
         self.epoch = None;
         self.growth_credit = 0.0;
         Ok(true)
+    }
+
+    /// Collapse the window on verified persistent congestion. Preserve
+    /// accounting for packets that have not yet been acknowledged/lost.
+    pub fn persistent_congestion(&mut self, now: Instant) {
+        self.recovery = Some(now);
+        self.last_max = self.cwnd as f64 / self.mtu as f64;
+        self.cwnd = 2 * self.mtu;
+        self.ssthresh = self.cwnd;
+        self.epoch = None;
+        self.growth_credit = 0.0;
     }
 
     /// Called only for newly acknowledged in-flight bytes. Avoid growth

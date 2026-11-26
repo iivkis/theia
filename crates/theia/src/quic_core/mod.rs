@@ -5,6 +5,7 @@
 pub mod ack;
 pub mod ack_tx;
 pub mod congestion;
+pub mod bbr;
 pub mod datagram;
 pub mod endpoint;
 pub mod flow;
