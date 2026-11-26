@@ -149,10 +149,23 @@ impl DiscoveryPanel {
 
     pub(crate) fn report_actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
         use crate::tui_widgets::ActionItem;
-        if !self.may_review_probe() { return Vec::new(); }
-        vec![ActionItem { key: 'i', label: "Узнать внешний IP" },
-            ActionItem { key: 'r', label: "Посмотреть области поиска" },
-            ActionItem { key: 't', label: "Проверить назначенный IP" }]
+        if !self.may_review_probe() {
+            return Vec::new();
+        }
+        vec![
+            ActionItem {
+                key: 'i',
+                label: "Узнать внешний IP",
+            },
+            ActionItem {
+                key: 'r',
+                label: "Посмотреть области поиска",
+            },
+            ActionItem {
+                key: 't',
+                label: "Проверить назначенный IP",
+            },
+        ]
     }
 
     pub(crate) fn body(&self) -> String {

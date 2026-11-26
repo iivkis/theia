@@ -22,7 +22,13 @@ fn popular_domains_are_seeded_without_a_manual_list_or_live_probe() {
     let plan = build_plan(&ServerSnapshot::default(), &[]);
     assert_eq!(plan.candidates.len(), POPULAR_HTTPS_DOMAINS.len());
     assert!(plan.candidates.len() >= 64);
-    assert_eq!(POPULAR_HTTPS_DOMAINS.iter().collect::<std::collections::HashSet<_>>().len(), POPULAR_HTTPS_DOMAINS.len());
+    assert_eq!(
+        POPULAR_HTTPS_DOMAINS
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        POPULAR_HTTPS_DOMAINS.len()
+    );
     for domain in [
         "google.com",
         "samsung.com",

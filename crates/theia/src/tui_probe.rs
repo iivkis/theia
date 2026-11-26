@@ -331,12 +331,26 @@ impl ProbePanel {
 
     pub(crate) fn report_actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
         use crate::tui_widgets::ActionItem;
-        if !self.is_available() || !matches!(self.state, ProbeState::Select | ProbeState::Complete { .. }) {
+        if !self.is_available()
+            || !matches!(self.state, ProbeState::Select | ProbeState::Complete { .. })
+        {
             return Vec::new();
         }
-        let mut items = vec![ActionItem { key: 't', label: "Предпросмотр проверки выбранного IP" }];
+        let mut items = vec![ActionItem {
+            key: 't',
+            label: "Предпросмотр проверки выбранного IP",
+        }];
         if self.targets.len() > 1 {
-            items.extend([ActionItem { key: 'k', label: "Предыдущий IP" }, ActionItem { key: 'j', label: "Следующий IP" }]);
+            items.extend([
+                ActionItem {
+                    key: 'k',
+                    label: "Предыдущий IP",
+                },
+                ActionItem {
+                    key: 'j',
+                    label: "Следующий IP",
+                },
+            ]);
         }
         items
     }

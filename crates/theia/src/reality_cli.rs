@@ -908,9 +908,11 @@ pub fn run(command: Command) -> Result<String, Error> {
                 return Err(Error::Grant);
             };
             let token = bootstrap::read_credential(Path::new(&token))?;
-            let admission = crate::reality_admission::Secret::load(identity.scope(), Path::new(&admission))
-                .map_err(|_| Error::Credential)?;
-            let invite = Invitation::issued(&identity, &raw, &document, &user, &token, &admission, now)?;
+            let admission =
+                crate::reality_admission::Secret::load(identity.scope(), Path::new(&admission))
+                    .map_err(|_| Error::Credential)?;
+            let invite =
+                Invitation::issued(&identity, &raw, &document, &user, &token, &admission, now)?;
             // Independently supplied offline material must match the actual
             // registered inbound, including its admission secret and signer.
             // Otherwise a syntactically valid key may never authenticate.

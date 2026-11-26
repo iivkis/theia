@@ -212,7 +212,10 @@ use crate::{
 };
 use std::{
     net::{IpAddr, SocketAddr},
-    sync::{Arc, atomic::{AtomicUsize, Ordering}},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 const MAX_DOMAIN_SEEDS: usize = 80;
 const MAX_RANGE_IPS: usize = 32;
@@ -341,8 +344,12 @@ impl WizardInput {
             crate::camouflage_domain_dns::validate_manual_dns_request(
                 name,
                 crate::camouflage_domain_dns::DnsConsent::Approved,
-            ).map_err(|_| Error::Scope)?;
-            if candidates.iter().any(|(prior, _): &(String, Option<IpAddr>)| prior == name) {
+            )
+            .map_err(|_| Error::Scope)?;
+            if candidates
+                .iter()
+                .any(|(prior, _): &(String, Option<IpAddr>)| prior == name)
+            {
                 return Err(Error::Scope);
             }
             candidates.push((name.to_owned(), address));
@@ -351,7 +358,9 @@ impl WizardInput {
         if !fields[4].trim().is_empty() {
             for item in fields[4].split(',').map(str::trim) {
                 if item == "catalog" {
-                    if !automatic { return Err(Error::Scope); }
+                    if !automatic {
+                        return Err(Error::Scope);
+                    }
                     for domain in crate::camouflage_discovery::POPULAR_HTTPS_DOMAINS {
                         add(domain, None)?;
                     }
@@ -426,7 +435,10 @@ impl WizardInput {
         Ok(plan)
     }
 
-    fn search_plan(&self, targets: Vec<reference_health::Target>) -> Result<reference_health::SearchPlan, Error> {
+    fn search_plan(
+        &self,
+        targets: Vec<reference_health::Target>,
+    ) -> Result<reference_health::SearchPlan, Error> {
         reference_health::SearchPlan::new(self.plan_document(targets)).map_err(|_| Error::Health)
     }
 
@@ -435,8 +447,17 @@ impl WizardInput {
     }
 
     async fn resolve(&self, progress: &AtomicUsize) -> Result<ResolvedSearch, Error> {
-        let seeds: Vec<_> = self.candidates.iter().cloned().map(|(name, ip)| SearchSeed::Domain(name, ip))
-            .chain(self.range_targets.iter().cloned().map(|(ip, name)| SearchSeed::Range(ip, name)))
+        let seeds: Vec<_> = self
+            .candidates
+            .iter()
+            .cloned()
+            .map(|(name, ip)| SearchSeed::Domain(name, ip))
+            .chain(
+                self.range_targets
+                    .iter()
+                    .cloned()
+                    .map(|(ip, name)| SearchSeed::Range(ip, name)),
+            )
             .collect();
         let mut references = Vec::new();
         let mut unresolved = Vec::new();
@@ -455,7 +476,8 @@ impl WizardInput {
             for (_, result) in completed {
                 let (name, mut ips, address) = result;
                 ips.sort();
-                let target = ips.into_iter()
+                let target = ips
+                    .into_iter()
                     .map(|ip| reference_health::Target {
                         server_name: name.clone(),
                         address: SocketAddr::new(ip, 443),
@@ -477,7 +499,11 @@ impl WizardInput {
                 }
             }
         }
-        let plan = if references.is_empty() { None } else { Some(self.search_plan(references)?) };
+        let plan = if references.is_empty() {
+            None
+        } else {
+            Some(self.search_plan(references)?)
+        };
         Ok(ResolvedSearch { plan, unresolved })
     }
 }
@@ -485,8 +511,11 @@ impl WizardInput {
 type RangeTargets = Vec<(IpAddr, Option<String>)>;
 
 fn range_targets(raw: &str, own_ips: &[IpAddr]) -> Result<RangeTargets, Error> {
-    if raw.trim().is_empty() { return Ok(Vec::new()); }
-    let native = crate::camouflage_interfaces::collect_assigned_interfaces().map_err(|_| Error::Scope)?;
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let native =
+        crate::camouflage_interfaces::collect_assigned_interfaces().map_err(|_| Error::Scope)?;
     range_targets_for_snapshot(raw, own_ips, &native.server_snapshot())
 }
 
@@ -497,39 +526,64 @@ fn range_targets_for_snapshot(
     own_ips: &[IpAddr],
     snapshot: &crate::camouflage_discovery::ServerSnapshot,
 ) -> Result<RangeTargets, Error> {
-    use crate::camouflage_discovery::{build_plan, CandidateHost, CandidateSource, NetworkPrefix, Warning};
+    use crate::camouflage_discovery::{
+        build_plan, CandidateHost, CandidateSource, NetworkPrefix, Warning,
+    };
     let mut targets: RangeTargets = Vec::new();
-    if raw.split(',').count() > MAX_RANGES { return Err(Error::Scope); }
+    if raw.split(',').count() > MAX_RANGES {
+        return Err(Error::Scope);
+    }
     for item in raw.split(',').map(str::trim) {
         let (name, prefix) = if let Some((name, prefix)) = item.split_once('@') {
             crate::camouflage_domain_dns::validate_manual_dns_request(
-                name, crate::camouflage_domain_dns::DnsConsent::Approved,
-            ).map_err(|_| Error::Scope)?;
+                name,
+                crate::camouflage_domain_dns::DnsConsent::Approved,
+            )
+            .map_err(|_| Error::Scope)?;
             (Some(name.to_owned()), prefix)
         } else {
             (None, item)
         };
         let prefix: NetworkPrefix = prefix.parse().map_err(|_| Error::Scope)?;
         let plan = build_plan(snapshot, &[prefix]);
-        if plan.warnings.iter().any(|warning| matches!(warning,
-            Warning::RangeNotOnServer | Warning::RangeTooBroad | Warning::RangeExceedsAssignedPrefix |
-            Warning::Ipv6EnumerationUnsupported | Warning::CandidateLimitReached)) {
+        if plan.warnings.iter().any(|warning| {
+            matches!(
+                warning,
+                Warning::RangeNotOnServer
+                    | Warning::RangeTooBroad
+                    | Warning::RangeExceedsAssignedPrefix
+                    | Warning::Ipv6EnumerationUnsupported
+                    | Warning::CandidateLimitReached
+            )
+        }) {
             return Err(Error::Scope);
         }
         let mut found = false;
         for candidate in plan.candidates {
-            if candidate.source != CandidateSource::AuthorizedSubnet { continue; }
-            let CandidateHost::Ip(ip) = candidate.host else { continue };
-            if own_ips.contains(&ip) { continue; }
+            if candidate.source != CandidateSource::AuthorizedSubnet {
+                continue;
+            }
+            let CandidateHost::Ip(ip) = candidate.host else {
+                continue;
+            };
+            if own_ips.contains(&ip) {
+                continue;
+            }
             found = true;
             if let Some((_, previous)) = targets.iter().find(|(address, _)| *address == ip) {
-                if previous != &name { return Err(Error::Scope); }
+                if previous != &name {
+                    return Err(Error::Scope);
+                }
                 continue;
             }
             targets.push((ip, name.clone()));
-            if targets.len() > MAX_RANGE_IPS { return Err(Error::Scope); }
+            if targets.len() > MAX_RANGE_IPS {
+                return Err(Error::Scope);
+            }
         }
-        if !found { return Err(Error::Scope); }
+        if !found {
+            return Err(Error::Scope);
+        }
     }
     Ok(targets)
 }
@@ -550,7 +604,9 @@ async fn resolve_seed(seed: SearchSeed) -> (String, Vec<IpAddr>, String) {
     match seed {
         SearchSeed::Domain(name, Some(ip)) => (name, vec![ip], ip.to_string()),
         SearchSeed::Domain(name, None) => {
-            let ips = resolve_manual_domain(&name, DnsConsent::Approved).await.unwrap_or_default();
+            let ips = resolve_manual_domain(&name, DnsConsent::Approved)
+                .await
+                .unwrap_or_default();
             (name, ips, "DNS не подтверждён".into())
         }
         SearchSeed::Range(ip, name) => {
@@ -563,8 +619,12 @@ async fn resolve_seed(seed: SearchSeed) -> (String, Vec<IpAddr>, String) {
             };
             // A reverse name is only a hint. No TLS connection is scheduled
             // unless the same public IP is present in the forward DNS result.
-            let ips = resolve_manual_domain(&name, DnsConsent::Approved).await
-                .ok().filter(|ips| ips.contains(&ip)).map(|_| vec![ip]).unwrap_or_default();
+            let ips = resolve_manual_domain(&name, DnsConsent::Approved)
+                .await
+                .ok()
+                .filter(|ips| ips.contains(&ip))
+                .map(|_| vec![ip])
+                .unwrap_or_default();
             (name, ips, ip.to_string())
         }
     }
@@ -644,16 +704,21 @@ fn rank_checked(
     now: u64,
     mut unresolved: Vec<crate::tui_widgets::ReferenceRow>,
 ) -> Result<(Option<reference_health::State>, RankedReview), Error> {
-    if targets.len() != evidence.len() { return Err(Error::Health); }
+    if targets.len() != evidence.len() {
+        return Err(Error::Health);
+    }
     let mut entries: Vec<_> = targets.into_iter().zip(evidence).collect();
-    let mut rows: Vec<_> = entries.iter().map(|(target, item)| crate::tui_widgets::ReferenceRow {
-        name: target.server_name.clone(),
-        address: target.address.to_string(),
-        score: item.score(),
-        h2: item.eligible(),
-        h3: item.h3(),
-        selected: None,
-    }).collect();
+    let mut rows: Vec<_> = entries
+        .iter()
+        .map(|(target, item)| crate::tui_widgets::ReferenceRow {
+            name: target.server_name.clone(),
+            address: target.address.to_string(),
+            score: item.score(),
+            h2: item.eligible(),
+            h3: item.h3(),
+            selected: None,
+        })
+        .collect();
     let unresolved_count = unresolved.len();
     rows.append(&mut unresolved);
     let mut chosen = Vec::new();
@@ -661,7 +726,9 @@ fn rank_checked(
     if input.automatic {
         entries.sort_by_key(|(_, item)| std::cmp::Reverse(item.score()));
         for (target, item) in entries {
-            if !item.eligible() { continue; }
+            if !item.eligible() {
+                continue;
+            }
             let mut trial = chosen.clone();
             trial.push(target);
             // The persistent contract retains only 3 distinct names and pins.
@@ -669,7 +736,9 @@ fn rank_checked(
                 chosen = trial;
                 observations.push(item);
             }
-            if chosen.len() == 3 { break; }
+            if chosen.len() == 3 {
+                break;
+            }
         }
     } else if unresolved_count == 0 && entries.iter().all(|(_, item)| item.eligible()) {
         (chosen, observations) = entries.into_iter().unzip();
@@ -677,7 +746,10 @@ fn rank_checked(
     let state = if chosen.is_empty() {
         None
     } else {
-        input.plan(chosen).ok().and_then(|plan| reference_health::State::new(plan, observations, now).ok())
+        input
+            .plan(chosen)
+            .ok()
+            .and_then(|plan| reference_health::State::new(plan, observations, now).ok())
     };
     let mut report = format!(
         "Кандидатов: {} · DNS/PTR не подтверждено: {}.\nОценки: 100 = стабильные H2+H3, 80 = стабильный H2, 0 = отказ.\n",
@@ -685,14 +757,24 @@ fn rank_checked(
     );
     if let Some(state) = &state {
         for (index, target) in state.plan().references.iter().enumerate() {
-            if let Some(row) = rows.iter_mut().find(|row| row.name == target.server_name && row.address == target.address.to_string()) {
+            if let Some(row) = rows.iter_mut().find(|row| {
+                row.name == target.server_name && row.address == target.address.to_string()
+            }) {
                 row.selected = Some(index);
             }
         }
     }
-    rows.sort_by_key(|row| (row.selected.unwrap_or(usize::MAX), std::cmp::Reverse(row.score)));
+    rows.sort_by_key(|row| {
+        (
+            row.selected.unwrap_or(usize::MAX),
+            std::cmp::Reverse(row.score),
+        )
+    });
     for row in &rows {
-        report.push_str(&format!("{} {} · H2={} H3={} · {}\n", row.name, row.address, row.h2, row.h3, row.score));
+        report.push_str(&format!(
+            "{} {} · H2={} H3={} · {}\n",
+            row.name, row.address, row.h2, row.h3, row.score
+        ));
     }
     if state.is_some() {
         report.push_str(&format!("\nСервер: {}\nПорт: {}\nПользователи: {}\nСоздать защищённые материалы? Сервер не будет запущен.\ny: создать; n/Esc: назад.",
@@ -709,14 +791,26 @@ fn rank_checked(
 fn merge_rechecked(screen: &mut RankedReview, fresh: RankedReview) {
     for row in &mut screen.rows {
         row.selected = None;
-        if let Some(rechecked) = fresh.rows.iter().find(|fresh| fresh.name == row.name && fresh.address == row.address) {
+        if let Some(rechecked) = fresh
+            .rows
+            .iter()
+            .find(|fresh| fresh.name == row.name && fresh.address == row.address)
+        {
             *row = rechecked.clone();
         }
     }
-    screen.rows.sort_by_key(|row| (row.selected.unwrap_or(usize::MAX), std::cmp::Reverse(row.score)));
+    screen.rows.sort_by_key(|row| {
+        (
+            row.selected.unwrap_or(usize::MAX),
+            std::cmp::Reverse(row.score),
+        )
+    });
     screen.text = format!("Общий поиск: {} кандидатов. Повторно проверены выбранные точные адреса. Остальные оценки предварительные.\n", screen.rows.len());
     for row in &screen.rows {
-        screen.text.push_str(&format!("{} {} · H2={} H3={} · {}\n", row.name, row.address, row.h2, row.h3, row.score));
+        screen.text.push_str(&format!(
+            "{} {} · H2={} H3={} · {}\n",
+            row.name, row.address, row.h2, row.h3, row.score
+        ));
     }
     screen.text.push_str(&fresh.text);
 }
@@ -730,10 +824,20 @@ async fn screen_and_recheck(
 ) -> Result<(Option<reference_health::State>, RankedReview), Error> {
     let plan = resolved.plan.ok_or(Error::Health)?;
     let approved = plan.digest().map_err(|_| Error::Health)?;
-    let evidence = reference_health::check_search(&plan, approved, progress).await.map_err(|_| Error::Health)?;
+    let evidence = reference_health::check_search(&plan, approved, progress)
+        .await
+        .map_err(|_| Error::Health)?;
     let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
-    let (screen_state, mut report) = rank_checked(input, plan.into_targets(), evidence, now, resolved.unresolved)?;
-    let Some(screen_state) = screen_state else { return Ok((None, report)); };
+    let (screen_state, mut report) = rank_checked(
+        input,
+        plan.into_targets(),
+        evidence,
+        now,
+        resolved.unresolved,
+    )?;
+    let Some(screen_state) = screen_state else {
+        return Ok((None, report));
+    };
     // Screening may take minutes. Its earliest observations must not be
     // stamped with the end time of the full search for provisioning.
     let selected = screen_state.plan().references.clone();
@@ -744,7 +848,10 @@ async fn screen_and_recheck(
     let evidence = tokio::time::timeout(
         std::time::Duration::from_secs(55),
         reference_health::check_search(&final_plan, approved, recheck_done),
-    ).await.map_err(|_| Error::Health)?.map_err(|_| Error::Health)?;
+    )
+    .await
+    .map_err(|_| Error::Health)?
+    .map_err(|_| Error::Health)?;
     let (state, fresh) = rank_checked(input, selected, evidence, started, Vec::new())?;
     merge_rechecked(&mut report, fresh);
     let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
@@ -770,7 +877,12 @@ enum WizardStage {
     NoEligible(RankedReview),
     Saving(Receiver<Result<RegistrationPanel, Error>>, PathBuf),
     SavingInitial(Receiver<Result<Editor, Error>>, PathBuf),
-    SaveFailed { root: PathBuf, message: String, retry: bool, inspected: bool },
+    SaveFailed {
+        root: PathBuf,
+        message: String,
+        retry: bool,
+        inspected: bool,
+    },
     Success,
 }
 fn path_observation(path: &Path) -> &'static str {
@@ -782,7 +894,9 @@ fn path_observation(path: &Path) -> &'static str {
 }
 
 fn save_failed(root: PathBuf, error: Option<Error>) -> WizardStage {
-    let retry = error.as_ref().is_some_and(|error| !matches!(error, Error::Indeterminate | Error::Approval));
+    let retry = error
+        .as_ref()
+        .is_some_and(|error| !matches!(error, Error::Indeterminate | Error::Approval));
     let message = if retry {
         "Не удалось сохранить настройки. Проверьте права на папку и свободное место. Повтор возможен только после проверки исходного файла и отсутствия незавершённых материалов."
     } else if matches!(error, Some(Error::Approval)) {
@@ -790,14 +904,31 @@ fn save_failed(root: PathBuf, error: Option<Error>) -> WizardStage {
     } else {
         "Запись не подтверждена. Проверьте файлы, затем откройте конфигурацию заново. Автоматический повтор запрещён."
     };
-    WizardStage::SaveFailed { root, message: message.into(), retry, inspected: false }
+    WizardStage::SaveFailed {
+        root,
+        message: message.into(),
+        retry,
+        inspected: false,
+    }
 }
 
 fn progress_text(label: &str, done: usize, total: usize) -> String {
     let done = done.min(total);
-    let filled = if total == 0 { 0 } else { done.saturating_mul(24) / total };
-    let percent = if total == 0 { 0 } else { done.saturating_mul(100) / total };
-    format!("{label}\n[{}{}] {percent}% · {done} из {total}\nНастройки не изменяются.", "█".repeat(filled), "░".repeat(24 - filled))
+    let filled = if total == 0 {
+        0
+    } else {
+        done.saturating_mul(24) / total
+    };
+    let percent = if total == 0 {
+        0
+    } else {
+        done.saturating_mul(100) / total
+    };
+    format!(
+        "{label}\n[{}{}] {percent}% · {done} из {total}\nНастройки не изменяются.",
+        "█".repeat(filled),
+        "░".repeat(24 - filled)
+    )
 }
 
 struct DomainDraft {
@@ -809,24 +940,45 @@ struct DomainDraft {
 impl DomainDraft {
     fn new(value: &str) -> Self {
         let mut rows: Vec<_> = value.split(',').map(str::to_owned).collect();
-        if rows.is_empty() { rows.push(String::new()); }
-        Self { rows, focus: 0, error: String::new() }
+        if rows.is_empty() {
+            rows.push(String::new());
+        }
+        Self {
+            rows,
+            focus: 0,
+            error: String::new(),
+        }
     }
     fn value(&self) -> String {
-        self.rows.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(",")
+        self.rows
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(",")
     }
     fn paste(&mut self, text: &str) {
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-        if normalized.chars().any(|ch| ch.is_control() && ch != '\n') { return; }
+        if normalized.chars().any(|ch| ch.is_control() && ch != '\n') {
+            return;
+        }
         let mut next = self.rows.clone();
         let mut focus = self.focus;
         for (i, line) in normalized.split([',', '\n']).enumerate() {
-            if i == 0 { next[focus].push_str(line.trim()); }
-            else { focus += 1; next.insert(focus, line.trim().to_owned()); }
+            if i == 0 {
+                next[focus].push_str(line.trim());
+            } else {
+                focus += 1;
+                next.insert(focus, line.trim().to_owned());
+            }
         }
         if next.len() <= 80 && next.join(",").len() <= LIMIT {
-            self.rows = next; self.focus = focus; self.error.clear();
-        } else { self.error = "Слишком длинный список: до 80 строк и 1024 байт.".into(); }
+            self.rows = next;
+            self.focus = focus;
+            self.error.clear();
+        } else {
+            self.error = "Слишком длинный список: до 80 строк и 1024 байт.".into();
+        }
     }
 }
 
@@ -960,9 +1112,16 @@ impl Wizard {
     // A literal endpoint can be copied to the own-address field. Never
     // infer public ownership from a local interface or provider range.
     fn suggest_own_ip(&mut self) {
-        let still_suggested = self.suggested_ip.as_ref().is_some_and(|value| value == &self.fields[3]);
+        let still_suggested = self
+            .suggested_ip
+            .as_ref()
+            .is_some_and(|value| value == &self.fields[3]);
         if self.fields[3].trim().is_empty() || still_suggested {
-            self.suggested_ip = self.fields[2].trim_matches(['[', ']']).parse::<IpAddr>().ok().map(|ip| ip.to_string());
+            self.suggested_ip = self.fields[2]
+                .trim_matches(['[', ']'])
+                .parse::<IpAddr>()
+                .ok()
+                .map(|ip| ip.to_string());
             self.fields[3] = self.suggested_ip.clone().unwrap_or_default();
         }
     }
@@ -981,7 +1140,11 @@ impl Wizard {
             fields[4].clear();
         }
         if self.catalogue {
-            fields[4] = if fields[4].is_empty() { "catalog".into() } else { format!("catalog,{}", fields[4]) };
+            fields[4] = if fields[4].is_empty() {
+                "catalog".into()
+            } else {
+                format!("catalog,{}", fields[4])
+            };
         }
         if !self.ranges_enabled {
             fields[7].clear();
@@ -990,34 +1153,57 @@ impl Wizard {
     }
 
     fn endpoint_is_ip(&self) -> bool {
-        self.fields[2].trim_matches(['[', ']']).parse::<IpAddr>().is_ok()
+        self.fields[2]
+            .trim_matches(['[', ']'])
+            .parse::<IpAddr>()
+            .is_ok()
     }
 
     fn display_value(&self, id: usize) -> String {
         match id {
-            8 => format!("Сайтов в каталоге: {} · рекомендуется", crate::camouflage_discovery::POPULAR_HTTPS_DOMAINS.len()),
+            8 => format!(
+                "Сайтов в каталоге: {} · рекомендуется",
+                crate::camouflage_discovery::POPULAR_HTTPS_DOMAINS.len()
+            ),
             9 => "Дополнительные имена сайтов".into(),
             10 => "Только сети, которые разрешено проверять".into(),
             4 => self.custom_domains(),
-            6 => if self.fields[6] == "auto" { "Автоматически (рекомендуется)".into() } else { "Ручной порядок".into() },
-            5 if self.source.is_some() && self.available_users.is_empty() => "Нет активных пользователей".into(),
-            5 if self.source.is_some() && self.fields[5].is_empty() => "Никто не выбран · открыть список".into(),
+            6 => {
+                if self.fields[6] == "auto" {
+                    "Автоматически (рекомендуется)".into()
+                } else {
+                    "Ручной порядок".into()
+                }
+            }
+            5 if self.source.is_some() && self.available_users.is_empty() => {
+                "Нет активных пользователей".into()
+            }
+            5 if self.source.is_some() && self.fields[5].is_empty() => {
+                "Никто не выбран · открыть список".into()
+            }
             5 if self.source.is_some() => format!("{} · изменить выбор", self.fields[5]),
             _ => self.fields[id].clone(),
         }
     }
 
     fn editable(&self) -> bool {
-        self.focus < self.fields.len() && self.focus != 6
+        self.focus < self.fields.len()
+            && self.focus != 6
             && !(self.focus == 5 && self.source.is_some())
     }
 
     fn edit_value(&self) -> String {
-        if self.focus == 4 { self.custom_domains() } else { self.fields[self.focus].clone() }
+        if self.focus == 4 {
+            self.custom_domains()
+        } else {
+            self.fields[self.focus].clone()
+        }
     }
 
     fn put_value(&mut self, value: String) {
-        if self.focus == 3 { self.suggested_ip = None; }
+        if self.focus == 3 {
+            self.suggested_ip = None;
+        }
         self.fields[self.focus] = value;
         self.error.clear();
     }
@@ -1025,7 +1211,11 @@ impl Wizard {
     fn open_grants(&mut self) {
         if !self.available_users.is_empty() {
             self.grant_picker = Some(GrantPicker {
-                selected: self.available_users.iter().map(|id| self.fields[5].split(',').any(|s| s.trim() == id)).collect(),
+                selected: self
+                    .available_users
+                    .iter()
+                    .map(|id| self.fields[5].split(',').any(|s| s.trim() == id))
+                    .collect(),
                 focus: 0,
             });
         }
@@ -1034,30 +1224,56 @@ impl Wizard {
     fn source_error(&self) -> Option<(usize, &'static str)> {
         let fields = self.effective_fields();
         if self.custom_enabled && self.custom_domains().trim().is_empty() {
-            return Some((4, "Введите хотя бы одно имя сайта или выключите этот источник."));
+            return Some((
+                4,
+                "Введите хотя бы одно имя сайта или выключите этот источник.",
+            ));
         }
         if self.custom_enabled && self.fields[4].split(',').any(|v| v.trim() == "catalog") {
-            return Some((4, "Введите настоящее имя сайта. Готовый каталог включается отдельным переключателем."));
+            return Some((
+                4,
+                "Введите настоящее имя сайта. Готовый каталог включается отдельным переключателем.",
+            ));
         }
         if self.ranges_enabled && fields[7].trim().is_empty() {
-            return Some((7, "Введите разрешённый диапазон или выключите этот источник."));
+            return Some((
+                7,
+                "Введите разрешённый диапазон или выключите этот источник.",
+            ));
         }
         if fields[4].trim().is_empty() && fields[7].trim().is_empty() {
             return Some((8, "Выберите хотя бы один источник: каталог, свои домены или разрешённые IP-диапазоны."));
         }
-        if fields[6] == "manual" && (self.catalogue_enabled() || !fields[7].trim().is_empty() || fields[4].split(',').count() > 3) {
+        if fields[6] == "manual"
+            && (self.catalogue_enabled()
+                || !fields[7].trim().is_empty()
+                || fields[4].split(',').count() > 3)
+        {
             return Some((6, "Ручной порядок: только 1–3 своих домена без каталога и IP-диапазонов. Выберите автоматический подбор."));
         }
-        for item in fields[4].split(',').filter(|s| !s.trim().is_empty() && s.trim() != "catalog") {
+        for item in fields[4]
+            .split(',')
+            .filter(|s| !s.trim().is_empty() && s.trim() != "catalog")
+        {
             let item = item.trim();
-            let (name, pin) = item.split_once('=').map_or((item, None), |(name, pin)| (name, Some(pin)));
-            if crate::camouflage_domain_dns::validate_manual_dns_request(name, crate::camouflage_domain_dns::DnsConsent::Approved).is_err()
-                || pin.is_some_and(|pin| pin.parse::<IpAddr>().is_err()) {
+            let (name, pin) = item
+                .split_once('=')
+                .map_or((item, None), |(name, pin)| (name, Some(pin)));
+            if crate::camouflage_domain_dns::validate_manual_dns_request(
+                name,
+                crate::camouflage_domain_dns::DnsConsent::Approved,
+            )
+            .is_err()
+                || pin.is_some_and(|pin| pin.parse::<IpAddr>().is_err())
+            {
                 return Some((4, "Введите имя сайта без https://, пути и порта. Несколько имён разделяйте запятыми."));
             }
         }
         if !fields[7].trim().is_empty() {
-            let own: Vec<IpAddr> = self.fields[3].split(',').filter_map(|s| s.trim().parse().ok()).collect();
+            let own: Vec<IpAddr> = self.fields[3]
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
             if range_targets(&fields[7], &own).is_err() {
                 return Some((7, "Диапазон не принят. Укажите разрешённую назначенную публичную IPv4-подсеть (до 32 дополнительных IP) или оставьте поле пустым."));
             }
@@ -1098,10 +1314,16 @@ impl Wizard {
         {
             return Some((3, "Введите IP вашего сервера. Если их несколько, разделите запятыми. Не вводите домены или адреса сторонних сайтов."));
         }
-        let own: Vec<IpAddr> = self.fields[3].split(',').filter_map(|v| v.trim().parse().ok()).collect();
+        let own: Vec<IpAddr> = self.fields[3]
+            .split(',')
+            .filter_map(|v| v.trim().parse().ok())
+            .collect();
         if let Ok(ip) = self.fields[2].trim_matches(['[', ']']).parse::<IpAddr>() {
             if !own.contains(&ip) {
-                return Some((3, "Добавьте IP из адреса для клиентов в список собственных IP сервера."));
+                return Some((
+                    3,
+                    "Добавьте IP из адреса для клиентов в список собственных IP сервера.",
+                ));
             }
         }
         if own.len() != own.iter().collect::<std::collections::HashSet<_>>().len() {
@@ -1133,14 +1355,22 @@ impl Wizard {
                 fields.push(3);
             }
             fields.push(5);
-            if self.advanced { fields.push(0); }
+            if self.advanced {
+                fields.push(0);
+            }
             return fields;
         }
         let mut fields = vec![8, 9];
-        if self.custom_enabled { fields.push(4); }
+        if self.custom_enabled {
+            fields.push(4);
+        }
         fields.push(10);
-        if self.ranges_enabled { fields.push(7); }
-        if self.advanced { fields.push(6); }
+        if self.ranges_enabled {
+            fields.push(7);
+        }
+        if self.advanced {
+            fields.push(6);
+        }
         fields
     }
     fn toggle_source(&mut self) {
@@ -1154,7 +1384,9 @@ impl Wizard {
     }
 
     fn move_focus(&mut self, forward: bool) {
-        if self.focus == 2 { self.suggest_own_ip(); }
+        if self.focus == 2 {
+            self.suggest_own_ip();
+        }
         let fields = self.visible_fields();
         let index = fields
             .iter()
@@ -1163,15 +1395,23 @@ impl Wizard {
         self.focus = fields[(index + if forward { 1 } else { fields.len() - 1 }) % fields.len()];
     }
     fn paste(&mut self, text: &str) {
-        if let Some(draft) = self.domain_draft.as_mut() { draft.paste(text); return; }
+        if let Some(draft) = self.domain_draft.as_mut() {
+            draft.paste(text);
+            return;
+        }
         if let Some(panel) = self.registration.as_mut() {
             panel.paste(text);
             return;
         }
-        if self.grant_picker.is_none() && matches!(self.stage, WizardStage::Input) && self.editable() {
+        if self.grant_picker.is_none()
+            && matches!(self.stage, WizardStage::Input)
+            && self.editable()
+        {
             let mut field = self.edit_value();
             let value = text.trim_end_matches(['\r', '\n']);
-            if !value.chars().any(char::is_control) && field.len().saturating_add(value.len()) <= LIMIT {
+            if !value.chars().any(char::is_control)
+                && field.len().saturating_add(value.len()) <= LIMIT
+            {
                 field.push_str(value);
                 self.put_value(field);
             }
@@ -1181,14 +1421,35 @@ impl Wizard {
         if let Some(mut draft) = self.domain_draft.take() {
             match key.code {
                 KeyCode::Esc => return false,
-                KeyCode::F(4) => { self.fields[4] = draft.value(); self.error.clear(); return false; }
+                KeyCode::F(4) => {
+                    self.fields[4] = draft.value();
+                    self.error.clear();
+                    return false;
+                }
                 KeyCode::Up | KeyCode::BackTab => draft.focus = draft.focus.saturating_sub(1),
-                KeyCode::Down | KeyCode::Tab => draft.focus = (draft.focus + 1).min(draft.rows.len() - 1),
-                KeyCode::Enter if draft.rows.len() < 80 && draft.rows.join(",").len() < LIMIT => { draft.focus += 1; draft.rows.insert(draft.focus, String::new()); }
-                KeyCode::Delete if draft.rows.len() > 1 => { draft.rows.remove(draft.focus); draft.focus = draft.focus.min(draft.rows.len() - 1); }
-                KeyCode::Backspace => { draft.rows[draft.focus].pop(); }
-                KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => draft.rows[draft.focus].clear(),
-                KeyCode::Char(ch) if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) && !ch.is_control() => { draft.paste(&ch.to_string()); }
+                KeyCode::Down | KeyCode::Tab => {
+                    draft.focus = (draft.focus + 1).min(draft.rows.len() - 1)
+                }
+                KeyCode::Enter if draft.rows.len() < 80 && draft.rows.join(",").len() < LIMIT => {
+                    draft.focus += 1;
+                    draft.rows.insert(draft.focus, String::new());
+                }
+                KeyCode::Delete if draft.rows.len() > 1 => {
+                    draft.rows.remove(draft.focus);
+                    draft.focus = draft.focus.min(draft.rows.len() - 1);
+                }
+                KeyCode::Backspace => {
+                    draft.rows[draft.focus].pop();
+                }
+                KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
+                    draft.rows[draft.focus].clear()
+                }
+                KeyCode::Char(ch)
+                    if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                        && !ch.is_control() =>
+                {
+                    draft.paste(&ch.to_string());
+                }
                 _ => {}
             }
             self.domain_draft = Some(draft);
@@ -1244,34 +1505,62 @@ impl Wizard {
                         self.suggest_own_ip();
                         if self.fields[3].is_empty() {
                             self.error = "Укажите IP из панели хостинга.".into();
-                        } else { self.error.clear(); }
+                        } else {
+                            self.error.clear();
+                        }
                     }
-                    KeyCode::F(4) if self.sources && self.custom_enabled => { self.focus = 4; self.domain_draft = Some(DomainDraft::new(&self.fields[4])); }
+                    KeyCode::F(4) if self.sources && self.custom_enabled => {
+                        self.focus = 4;
+                        self.domain_draft = Some(DomainDraft::new(&self.fields[4]));
+                    }
                     KeyCode::F(6) if !self.sources && self.focus == 5 => self.open_grants(),
                     KeyCode::Tab | KeyCode::Down => self.move_focus(true),
                     KeyCode::BackTab | KeyCode::Up => self.move_focus(false),
-                    KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right if matches!(self.focus, 8..=10) => self.toggle_source(),
+                    KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
+                        if matches!(self.focus, 8..=10) =>
+                    {
+                        self.toggle_source()
+                    }
                     KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right if self.focus == 6 => {
-                        self.fields[6] = if self.fields[6] == "auto" { "manual".into() } else { "auto".into() };
+                        self.fields[6] = if self.fields[6] == "auto" {
+                            "manual".into()
+                        } else {
+                            "auto".into()
+                        };
                         self.error.clear();
                     }
-                    KeyCode::Char(' ') if !self.sources && self.focus == 5 && self.source.is_some() => self.open_grants(),
+                    KeyCode::Char(' ')
+                        if !self.sources && self.focus == 5 && self.source.is_some() =>
+                    {
+                        self.open_grants()
+                    }
                     KeyCode::Backspace if self.editable() => {
                         let mut value = self.edit_value();
                         value.pop();
                         self.put_value(value);
                     }
-                    KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL && self.editable() => self.put_value(String::new()),
+                    KeyCode::Char('u')
+                        if key.modifiers == KeyModifiers::CONTROL && self.editable() =>
+                    {
+                        self.put_value(String::new())
+                    }
                     KeyCode::Enter => {
                         self.suggest_own_ip();
-                        if !self.sources && self.focus == 5 && self.source.is_some() && !self.available_users.is_empty() && self.fields[5].is_empty() {
+                        if !self.sources
+                            && self.focus == 5
+                            && self.source.is_some()
+                            && !self.available_users.is_empty()
+                            && self.fields[5].is_empty()
+                        {
                             self.open_grants();
                             return false;
                         }
                         if let Some((field, message)) = self.basic_error() {
                             self.sources = false;
                             self.focus = field;
-                            if field == 3 { self.advanced = true; }
+                            if field == 3 {
+                                self.advanced = true;
+                            }
                             self.error = message.into();
                             return false;
                         }
@@ -1283,11 +1572,17 @@ impl Wizard {
                         }
                         if let Some((field, message)) = self.source_error() {
                             self.focus = field;
-                            if field == 6 { self.advanced = true; }
+                            if field == 6 {
+                                self.advanced = true;
+                            }
                             self.error = message.into();
                             return false;
                         }
-                        match WizardInput::parse(self.config.clone(), self.source, &self.effective_fields()) {
+                        match WizardInput::parse(
+                            self.config.clone(),
+                            self.source,
+                            &self.effective_fields(),
+                        ) {
                             Ok(input) => {
                                 self.error.clear();
                                 self.dns_details = false;
@@ -1297,7 +1592,11 @@ impl Wizard {
                             Err(error) => self.error = Self::explain_error(error).into(),
                         }
                     }
-                    KeyCode::Char(ch) if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) && !ch.is_control() && self.editable() => {
+                    KeyCode::Char(ch)
+                        if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                            && !ch.is_control()
+                            && self.editable() =>
+                    {
                         let mut value = self.edit_value();
                         if value.len() + ch.len_utf8() <= LIMIT {
                             value.push(ch);
@@ -1312,12 +1611,17 @@ impl Wizard {
                 self.dns_details = !self.dns_details;
                 WizardStage::DnsConfirm(input)
             }
-            WizardStage::DnsConfirm(input) if self.dns_details && matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('n')) => {
+            WizardStage::DnsConfirm(input)
+                if self.dns_details
+                    && matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('n')) =>
+            {
                 self.dns_details = false;
                 WizardStage::DnsConfirm(input)
             }
             WizardStage::DnsConfirm(input)
-                if !self.dns_details && key.code == KeyCode::Char('y') && key.modifiers.is_empty() =>
+                if !self.dns_details
+                    && key.code == KeyCode::Char('y')
+                    && key.modifiers.is_empty() =>
             {
                 let input = *input;
                 self.total = input.seed_count();
@@ -1348,15 +1652,23 @@ impl Wizard {
                 self.tls_details = !self.tls_details;
                 WizardStage::ProbeConfirm(value)
             }
-            WizardStage::ProbeConfirm(value) if self.tls_details && matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('n')) => {
+            WizardStage::ProbeConfirm(value)
+                if self.tls_details
+                    && matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('n')) =>
+            {
                 self.tls_details = false;
                 WizardStage::ProbeConfirm(value)
             }
             WizardStage::ProbeConfirm(value)
-                if !self.tls_details && key.code == KeyCode::Char('y') && key.modifiers.is_empty() =>
+                if !self.tls_details
+                    && key.code == KeyCode::Char('y')
+                    && key.modifiers.is_empty() =>
             {
                 let (input, resolved) = *value;
-                self.total = resolved.plan.as_ref().map_or(0, |plan| plan.targets().len());
+                self.total = resolved
+                    .plan
+                    .as_ref()
+                    .map_or(0, |plan| plan.targets().len());
                 self.progress = Arc::new(AtomicUsize::new(0));
                 self.recheck_done = Arc::new(AtomicUsize::new(0));
                 self.recheck_total = Arc::new(AtomicUsize::new(0));
@@ -1383,7 +1695,10 @@ impl Wizard {
                 self.result_details = !self.result_details;
                 WizardStage::CreateConfirm(value)
             }
-            WizardStage::CreateConfirm(value) if self.result_details && matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('n')) => {
+            WizardStage::CreateConfirm(value)
+                if self.result_details
+                    && matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('n')) =>
+            {
                 self.result_details = false;
                 WizardStage::CreateConfirm(value)
             }
@@ -1391,27 +1706,35 @@ impl Wizard {
                 self.result_details = !self.result_details;
                 WizardStage::NoEligible(report)
             }
-            WizardStage::NoEligible(report) if self.result_details && matches!(key.code, KeyCode::Esc | KeyCode::Enter) => {
+            WizardStage::NoEligible(report)
+                if self.result_details && matches!(key.code, KeyCode::Esc | KeyCode::Enter) =>
+            {
                 self.result_details = false;
                 WizardStage::NoEligible(report)
             }
             WizardStage::CreateConfirm(value)
-                if !self.result_details && key.code == KeyCode::Char('y') && key.modifiers.is_empty() =>
+                if !self.result_details
+                    && key.code == KeyCode::Char('y')
+                    && key.modifiers.is_empty() =>
             {
                 let (input, state, _) = *value;
                 // Long review/scrolling must not turn stale evidence into a
                 // save. Ask again for the same exact pins, without resuming
                 // the broad discovery or modifying the saved configuration.
                 let fresh = reference_health::unix_now()
-                    .and_then(|now| state.provisioning_ready(now)).is_ok();
+                    .and_then(|now| state.provisioning_ready(now))
+                    .is_ok();
                 if !fresh {
                     match input.search_plan(state.plan().references.clone()) {
                         Ok(plan) => {
                             self.tls_details = false;
-                            self.stage = WizardStage::ProbeConfirm(Box::new((input, ResolvedSearch {
-                                plan: Some(plan),
-                                unresolved: Vec::new(),
-                            })));
+                            self.stage = WizardStage::ProbeConfirm(Box::new((
+                                input,
+                                ResolvedSearch {
+                                    plan: Some(plan),
+                                    unresolved: Vec::new(),
+                                },
+                            )));
                         }
                         Err(_) => {
                             self.error = "Результаты устарели. Повторите проверку.".into();
@@ -1512,7 +1835,12 @@ impl Wizard {
                 let _ = cancel.send(());
                 WizardStage::Input
             }
-            WizardStage::SaveFailed { root, message, retry, inspected } => {
+            WizardStage::SaveFailed {
+                root,
+                message,
+                retry,
+                inspected,
+            } => {
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('n') => return true,
                     KeyCode::F(2) if !inspected => {
@@ -1534,10 +1862,22 @@ impl Wizard {
                             _ => WizardStage::SaveFailed { root, message: "Повтор заблокирован: файл, каталог или параметры изменились. Откройте конфигурацию заново.".into(), retry: false, inspected: false },
                         }
                     }
-                    _ => WizardStage::SaveFailed { root, message, retry, inspected },
+                    _ => WizardStage::SaveFailed {
+                        root,
+                        message,
+                        retry,
+                        inspected,
+                    },
                 }
             }
-            WizardStage::Success if matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('y' | 'n')) => return true,
+            WizardStage::Success
+                if matches!(
+                    key.code,
+                    KeyCode::Enter | KeyCode::Esc | KeyCode::Char('y' | 'n')
+                ) =>
+            {
+                return true
+            }
             other => other,
         };
         false
@@ -1755,14 +2095,27 @@ impl ProvisionPanel {
 
     pub(crate) fn confirmation_choice(&self) -> Option<(char, &'static str)> {
         if let Some(wizard) = &self.wizard {
-            if let Some(panel) = &wizard.registration { return panel.confirmation_choice(); }
-            if wizard.grant_picker.is_some() { return None; }
+            if let Some(panel) = &wizard.registration {
+                return panel.confirmation_choice();
+            }
+            if wizard.grant_picker.is_some() {
+                return None;
+            }
             return match wizard.stage {
                 WizardStage::DnsConfirm(_) if !wizard.dns_details => Some(('y', "Найти адреса")),
-                WizardStage::ProbeConfirm(_) if !wizard.tls_details => Some(('y', "Проверить сайты")),
+                WizardStage::ProbeConfirm(_) if !wizard.tls_details => {
+                    Some(('y', "Проверить сайты"))
+                }
                 WizardStage::CreateConfirm(_) if !wizard.result_details => Some(('y', "Сохранить")),
                 WizardStage::SaveFailed { retry: true, .. } => Some(('y', "Повторить настройку")),
-                WizardStage::Success => Some(('y', if wizard.source.is_none() { "Выпустить ключ доступа" } else { "Открыть пользователей" })),
+                WizardStage::Success => Some((
+                    'y',
+                    if wizard.source.is_none() {
+                        "Выпустить ключ доступа"
+                    } else {
+                        "Открыть пользователей"
+                    },
+                )),
                 _ => None,
             };
         }
@@ -1920,11 +2273,16 @@ impl ProvisionPanel {
     }
 
     pub(crate) fn success_first_user(&self) -> Option<&str> {
-        self.wizard.as_ref().filter(|w| matches!(w.stage, WizardStage::Success) && w.source.is_none()).map(|w| w.fields[5].as_str())
+        self.wizard
+            .as_ref()
+            .filter(|w| matches!(w.stage, WizardStage::Success) && w.source.is_none())
+            .map(|w| w.fields[5].as_str())
     }
 
     pub(crate) fn succeeded(&self) -> bool {
-        self.wizard.as_ref().is_some_and(|w| matches!(w.stage, WizardStage::Success))
+        self.wizard
+            .as_ref()
+            .is_some_and(|w| matches!(w.stage, WizardStage::Success))
     }
 
     pub(crate) fn form(&self) -> Option<crate::tui_widgets::Form> {
@@ -2010,7 +2368,12 @@ impl ProvisionPanel {
                 panel.select_field(id);
                 return;
             }
-            if let Some(draft) = wizard.domain_draft.as_mut() { if id < draft.rows.len() { draft.focus = id; } return; }
+            if let Some(draft) = wizard.domain_draft.as_mut() {
+                if id < draft.rows.len() {
+                    draft.focus = id;
+                }
+                return;
+            }
             if let Some(picker) = wizard.grant_picker.as_mut() {
                 if id < picker.selected.len() {
                     picker.focus = id;
@@ -2021,7 +2384,9 @@ impl ProvisionPanel {
                 && matches!(wizard.stage, WizardStage::Input)
                 && wizard.visible_fields().contains(&id)
             {
-                if wizard.focus == 2 { wizard.suggest_own_ip(); }
+                if wizard.focus == 2 {
+                    wizard.suggest_own_ip();
+                }
                 wizard.focus = id;
             }
         }
@@ -2044,7 +2409,9 @@ impl ProvisionPanel {
                 expanded: wizard.result_details,
             });
         }
-        let WizardStage::CreateConfirm(value) = &wizard.stage else { return None; };
+        let WizardStage::CreateConfirm(value) = &wizard.stage else {
+            return None;
+        };
         let (input, _, review) = value.as_ref();
         let first = input.source.is_none();
         let details = vec![
@@ -2094,7 +2461,14 @@ impl ProvisionPanel {
                 "Enter предпросмотр · Y подтвердить · Esc назад",
             ));
         }
-        if wizard.domain_draft.is_some() { return Some((2, 6, "Редактор списка сайтов", "↑↓ строка · Enter добавить · Delete удалить · F4 готово · Esc отменить")); }
+        if wizard.domain_draft.is_some() {
+            return Some((
+                2,
+                6,
+                "Редактор списка сайтов",
+                "↑↓ строка · Enter добавить · Delete удалить · F4 готово · Esc отменить",
+            ));
+        }
         if wizard.grant_picker.is_some() {
             return Some((
                 1,
@@ -2167,7 +2541,8 @@ mod tests {
 
     #[test]
     fn wizard_catalogue_search_is_not_the_three_reference_persistence_limit() {
-        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("wizard-search").unwrap());
+        let dir =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("wizard-search").unwrap());
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("server.toml");
         let mut wizard = Wizard::first(path.clone()).unwrap();
@@ -2175,24 +2550,43 @@ mod tests {
         wizard.fields[3] = "93.184.216.1".into();
         wizard.fields[5] = "owner".into();
         let input = WizardInput::parse(path.clone(), None, &wizard.fields).unwrap();
-        assert_eq!(input.candidates.len(), crate::camouflage_discovery::POPULAR_HTTPS_DOMAINS.len());
-        let targets: Vec<_> = (2..=7).map(|n| reference_health::Target {
-            server_name: format!("host{n}.example.org"),
-            address: format!("93.184.216.{n}:443").parse().unwrap(),
-        }).collect();
+        assert_eq!(
+            input.candidates.len(),
+            crate::camouflage_discovery::POPULAR_HTTPS_DOMAINS.len()
+        );
+        let targets: Vec<_> = (2..=7)
+            .map(|n| reference_health::Target {
+                server_name: format!("host{n}.example.org"),
+                address: format!("93.184.216.{n}:443").parse().unwrap(),
+            })
+            .collect();
         assert!(input.search_plan(targets.clone()).is_ok());
         assert!(input.plan(targets.clone()).is_err());
-        let mut evidence = vec![reference_health::Evidence { h2_status: Some(200), h3_status: None }; targets.len()];
+        let mut evidence = vec![
+            reference_health::Evidence {
+                h2_status: Some(200),
+                h3_status: None
+            };
+            targets.len()
+        ];
         evidence[4].h3_status = Some(200);
         evidence[5] = reference_health::Evidence::default();
-        let (state, report) = rank_checked(&input, targets.clone(), evidence, 1000, Vec::new()).unwrap();
+        let (state, report) =
+            rank_checked(&input, targets.clone(), evidence, 1000, Vec::new()).unwrap();
         let state = state.unwrap();
         assert_eq!(state.plan().references.len(), 3);
         assert_eq!(state.plan().references[0].server_name, "host6.example.org");
         assert_eq!(report.rows.len(), 6);
         assert_eq!(report.rows[0].score, 100);
         assert_eq!(report.rows[5].score, 0);
-        let (state, report) = rank_checked(&input, targets.clone(), vec![reference_health::Evidence::default(); targets.len()], 1000, Vec::new()).unwrap();
+        let (state, report) = rank_checked(
+            &input,
+            targets.clone(),
+            vec![reference_health::Evidence::default(); targets.len()],
+            1000,
+            Vec::new(),
+        )
+        .unwrap();
         assert!(state.is_none());
         assert_eq!(report.rows.len(), 6);
         assert!(!path.exists());
@@ -2202,12 +2596,20 @@ mod tests {
     #[test]
     fn recheck_never_promotes_an_unobserved_backup() {
         let row = |name: &str, score, selected| crate::tui_widgets::ReferenceRow {
-            name: name.into(), address: format!("{name}:443"), score,
-            h2: score > 0, h3: score == 100, selected,
+            name: name.into(),
+            address: format!("{name}:443"),
+            score,
+            h2: score > 0,
+            h3: score == 100,
+            selected,
         };
         let mut screening = RankedReview {
             text: String::new(),
-            rows: vec![row("first", 100, Some(0)), row("other", 100, None), row("backup", 80, Some(1))],
+            rows: vec![
+                row("first", 100, Some(0)),
+                row("other", 100, None),
+                row("backup", 80, Some(1)),
+            ],
         };
         let fresh = RankedReview {
             text: "fresh".into(),
@@ -2225,20 +2627,41 @@ mod tests {
     fn range_sources_are_bounded_and_require_assigned_scope_before_dns() {
         use crate::camouflage_discovery::{InterfaceAddress, ServerSnapshot};
         let snapshot = ServerSnapshot {
-            interfaces: vec![InterfaceAddress { address: "93.184.216.10".parse().unwrap(), prefix_len: 24 }],
+            interfaces: vec![InterfaceAddress {
+                address: "93.184.216.10".parse().unwrap(),
+                prefix_len: 24,
+            }],
             ..ServerSnapshot::default()
         };
         let own = ["93.184.216.10".parse().unwrap()];
         let targets = range_targets_for_snapshot("93.184.216.8/29", &own, &snapshot).unwrap();
         assert_eq!(targets.len(), 5);
-        assert!(targets.iter().all(|(ip, name)| !own.contains(ip) && name.is_none()));
-        let explicit = range_targets_for_snapshot("reference.example.org@93.184.216.8/29", &own, &snapshot).unwrap();
-        assert!(explicit.iter().all(|(_, name)| name.as_deref() == Some("reference.example.org")));
-        for raw in ["93.184.217.0/29", "93.184.216.0/24", "10.0.0.0/29", "0.0.0.0/0", "93.184.216.8/29,other.example.org@93.184.216.8/29"] {
-            assert!(range_targets_for_snapshot(raw, &own, &snapshot).is_err(), "{raw}");
+        assert!(targets
+            .iter()
+            .all(|(ip, name)| !own.contains(ip) && name.is_none()));
+        let explicit =
+            range_targets_for_snapshot("reference.example.org@93.184.216.8/29", &own, &snapshot)
+                .unwrap();
+        assert!(explicit
+            .iter()
+            .all(|(_, name)| name.as_deref() == Some("reference.example.org")));
+        for raw in [
+            "93.184.217.0/29",
+            "93.184.216.0/24",
+            "10.0.0.0/29",
+            "0.0.0.0/0",
+            "93.184.216.8/29,other.example.org@93.184.216.8/29",
+        ] {
+            assert!(
+                range_targets_for_snapshot(raw, &own, &snapshot).is_err(),
+                "{raw}"
+            );
         }
         let narrow = ServerSnapshot {
-            interfaces: vec![InterfaceAddress { address: own[0], prefix_len: 32 }],
+            interfaces: vec![InterfaceAddress {
+                address: own[0],
+                prefix_len: 32,
+            }],
             ..ServerSnapshot::default()
         };
         assert!(range_targets_for_snapshot("93.184.216.8/29", &own, &narrow).is_err());
@@ -2246,7 +2669,8 @@ mod tests {
 
     #[test]
     fn novice_setup_and_source_choices_do_not_start_network_or_write() {
-        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("wizard-novice").unwrap());
+        let dir =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("wizard-novice").unwrap());
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("server.toml");
         let mut wizard = Wizard::first(path.clone()).unwrap();
@@ -2333,7 +2757,8 @@ mod tests {
         draft.paste(&"x".repeat(LIMIT));
         assert_eq!(draft.value(), before);
         assert!(!draft.error.is_empty());
-        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("wizard-domain-draft").unwrap());
+        let dir = std::env::temp_dir()
+            .join(crate::tui_editor::generated_id("wizard-domain-draft").unwrap());
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("server.toml");
         let mut wizard = Wizard::first(path.clone()).unwrap();
@@ -2357,7 +2782,8 @@ mod tests {
 
     #[test]
     fn save_recovery_does_not_retry_uncertain_or_changed_paths() {
-        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("wizard-recovery").unwrap());
+        let dir =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("wizard-recovery").unwrap());
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("server.toml");
         let mut wizard = Wizard::first(path.clone()).unwrap();
@@ -2369,9 +2795,18 @@ mod tests {
         let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
         wizard.stage = save_failed(root.clone(), None);
         wizard.key(press(KeyCode::Char('y')));
-        assert!(matches!(wizard.stage, WizardStage::SaveFailed { retry: false, .. }));
+        assert!(matches!(
+            wizard.stage,
+            WizardStage::SaveFailed { retry: false, .. }
+        ));
         wizard.key(press(KeyCode::F(2)));
-        assert!(matches!(wizard.stage, WizardStage::SaveFailed { inspected: true, .. }));
+        assert!(matches!(
+            wizard.stage,
+            WizardStage::SaveFailed {
+                inspected: true,
+                ..
+            }
+        ));
         assert!(!path.exists() && !root.exists());
         wizard.stage = save_failed(root.clone(), Some(Error::Storage));
         wizard.key(press(KeyCode::F(2)));
@@ -2381,14 +2816,18 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         wizard.stage = save_failed(root.clone(), Some(Error::Storage));
         wizard.key(press(KeyCode::Char('y')));
-        assert!(matches!(wizard.stage, WizardStage::SaveFailed { retry: false, .. }));
+        assert!(matches!(
+            wizard.stage,
+            WizardStage::SaveFailed { retry: false, .. }
+        ));
         assert!(root.is_dir() && !path.exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn expanded_tls_and_result_views_never_approve_and_progress_is_bounded() {
-        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("wizard-details").unwrap());
+        let dir =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("wizard-details").unwrap());
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("server.toml");
         let mut panel = ProvisionPanel::first(path.clone()).unwrap();
@@ -2397,10 +2836,17 @@ mod tests {
         wizard.suggest_own_ip();
         wizard.fields[5] = "phone".into();
         let input = WizardInput::parse(path.clone(), None, &wizard.effective_fields()).unwrap();
-        let target = Target { server_name: "reference.example.org".into(), address: "93.184.216.2:443".parse().unwrap() };
-        wizard.stage = WizardStage::ProbeConfirm(Box::new((input.clone(), ResolvedSearch {
-            plan: Some(input.search_plan(vec![target.clone()]).unwrap()), unresolved: Vec::new(),
-        })));
+        let target = Target {
+            server_name: "reference.example.org".into(),
+            address: "93.184.216.2:443".parse().unwrap(),
+        };
+        wizard.stage = WizardStage::ProbeConfirm(Box::new((
+            input.clone(),
+            ResolvedSearch {
+                plan: Some(input.search_plan(vec![target.clone()]).unwrap()),
+                unresolved: Vec::new(),
+            },
+        )));
         let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
         panel.key(press(KeyCode::F(2)));
         assert!(panel.confirmation_choice().is_none());
@@ -2409,8 +2855,19 @@ mod tests {
         assert!(panel.confirmation_choice().is_none());
         panel.key(press(KeyCode::Enter));
         assert!(panel.confirmation_choice().is_some());
-        let (state, review) = rank_checked(&input, vec![target], vec![Evidence { h2_status: Some(200), h3_status: None }], reference_health::unix_now().unwrap(), Vec::new()).unwrap();
-        panel.wizard.as_mut().unwrap().stage = WizardStage::CreateConfirm(Box::new((input, state.unwrap(), review)));
+        let (state, review) = rank_checked(
+            &input,
+            vec![target],
+            vec![Evidence {
+                h2_status: Some(200),
+                h3_status: None,
+            }],
+            reference_health::unix_now().unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+        panel.wizard.as_mut().unwrap().stage =
+            WizardStage::CreateConfirm(Box::new((input, state.unwrap(), review)));
         panel.key(press(KeyCode::F(2)));
         assert!(panel.reference_review().unwrap().expanded);
         panel.key(press(KeyCode::Char('y')));
@@ -2590,11 +3047,25 @@ mod tests {
             },
         ];
         let now = reference_health::unix_now().unwrap();
-        let (state, report) = rank_checked(&input, plan.references.clone(), evidence.clone(), now, Vec::new()).unwrap();
+        let (state, report) = rank_checked(
+            &input,
+            plan.references.clone(),
+            evidence.clone(),
+            now,
+            Vec::new(),
+        )
+        .unwrap();
         let state = state.unwrap();
         let mut manual = input.clone();
         manual.automatic = false;
-        let (ordered, _) = rank_checked(&manual, plan.references.clone(), evidence.clone(), now, Vec::new()).unwrap();
+        let (ordered, _) = rank_checked(
+            &manual,
+            plan.references.clone(),
+            evidence.clone(),
+            now,
+            Vec::new(),
+        )
+        .unwrap();
         let ordered = ordered.unwrap();
         assert_eq!(
             ordered.plan().references[0].server_name,
@@ -2605,14 +3076,26 @@ mod tests {
             h2_status: None,
             h3_status: None,
         };
-        assert!(rank_checked(&manual, plan.references.clone(), failed.clone(), now, Vec::new()).unwrap().0.is_none());
-        let (filtered, filtered_review) = rank_checked(&input, plan.references.clone(), failed, now, Vec::new()).unwrap();
+        assert!(rank_checked(
+            &manual,
+            plan.references.clone(),
+            failed.clone(),
+            now,
+            Vec::new()
+        )
+        .unwrap()
+        .0
+        .is_none());
+        let (filtered, filtered_review) =
+            rank_checked(&input, plan.references.clone(), failed, now, Vec::new()).unwrap();
         let filtered = filtered.unwrap();
         assert_eq!(filtered_review.rows.len(), 2);
         assert_eq!(filtered_review.rows[1].selected, None);
         assert_eq!(filtered_review.rows[1].score, 0);
         assert_eq!(filtered.plan().references.len(), 1);
-        assert!(rank_checked(&input, plan.references.clone(), Vec::new(), now, Vec::new()).is_err());
+        assert!(
+            rank_checked(&input, plan.references.clone(), Vec::new(), now, Vec::new()).is_err()
+        );
         let resolved = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

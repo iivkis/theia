@@ -598,8 +598,12 @@ impl RuntimePanel {
 
     pub(crate) fn confirmation_choice(&self) -> Option<(char, &'static str)> {
         match self.phase {
-            Phase::Confirming { .. } | Phase::QuotaConfirming { .. } | Phase::CutoverConfirming { .. } => Some(('y', "Применить")),
-            Phase::RollbackConfirming { .. } | Phase::TlsRollbackConfirming { .. } | Phase::RestartRollbackConfirming { .. } => Some(('y', "Выполнить откат")),
+            Phase::Confirming { .. }
+            | Phase::QuotaConfirming { .. }
+            | Phase::CutoverConfirming { .. } => Some(('y', "Применить")),
+            Phase::RollbackConfirming { .. }
+            | Phase::TlsRollbackConfirming { .. }
+            | Phase::RestartRollbackConfirming { .. } => Some(('y', "Выполнить откат")),
             _ => None,
         }
     }

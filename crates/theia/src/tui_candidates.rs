@@ -215,10 +215,23 @@ impl CandidateReview {
 
     pub(crate) fn report_actions(&self) -> Vec<crate::tui_widgets::ActionItem> {
         use crate::tui_widgets::ActionItem;
-        if self.is_editing() || self.is_confirming() { return Vec::new(); }
-        vec![ActionItem { key: 'a', label: "Указать свой диапазон адресов (без сети)" },
-            ActionItem { key: 'b', label: "Выбрать IP для проверки" },
-            ActionItem { key: 'd', label: "Открыть каталог доменов" }]
+        if self.is_editing() || self.is_confirming() {
+            return Vec::new();
+        }
+        vec![
+            ActionItem {
+                key: 'a',
+                label: "Указать свой диапазон адресов (без сети)",
+            },
+            ActionItem {
+                key: 'b',
+                label: "Выбрать IP для проверки",
+            },
+            ActionItem {
+                key: 'd',
+                label: "Открыть каталог доменов",
+            },
+        ]
     }
 
     pub(crate) fn body(&self) -> String {

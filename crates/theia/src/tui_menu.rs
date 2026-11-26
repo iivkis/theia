@@ -217,7 +217,9 @@ impl Menu {
             KeyCode::PageUp => selected.saturating_sub(5),
             KeyCode::PageDown => (selected + 5).min(count - 1),
             KeyCode::Right => {
-                if self.item.is_none() { self.item = Some(0); }
+                if self.item.is_none() {
+                    self.item = Some(0);
+                }
                 return None;
             }
             KeyCode::Enter => {
@@ -728,7 +730,8 @@ impl FirstInvite {
                 self.error = None;
             } else {
                 self.source = Zeroizing::new(String::new());
-                self.error = Some("Ключ слишком длинный. Вставьте его целиком или запросите новый.");
+                self.error =
+                    Some("Ключ слишком длинный. Вставьте его целиком или запросите новый.");
             }
         } else {
             let field = if self.focus == 0 {
@@ -1099,16 +1102,28 @@ impl ConfigDialog {
         }
     }
     pub(crate) fn confirmation_choice(&self) -> Option<(char, &'static str)> {
-        if self.loading.is_some() || self.browser.is_some() { return None; }
-        if let Some(panel) = &self.first_invite {
-            return (panel.review && panel.browser.is_none() && panel.reading.is_none()).then_some(('y', "Сохранить профиль"));
+        if self.loading.is_some() || self.browser.is_some() {
+            return None;
         }
-        if let Some(panel) = &self.reality { return panel.confirmation_choice(); }
-        if let Some(panel) = &self.enrollment { return panel.confirmation_choice(); }
-        self.setup.as_ref().filter(|s| s.review.is_some()).map(|_| ('y', "Создать настройки"))
+        if let Some(panel) = &self.first_invite {
+            return (panel.review && panel.browser.is_none() && panel.reading.is_none())
+                .then_some(('y', "Сохранить профиль"));
+        }
+        if let Some(panel) = &self.reality {
+            return panel.confirmation_choice();
+        }
+        if let Some(panel) = &self.enrollment {
+            return panel.confirmation_choice();
+        }
+        self.setup
+            .as_ref()
+            .filter(|s| s.review.is_some())
+            .map(|_| ('y', "Создать настройки"))
     }
 
-    pub(crate) fn reality_success_first_user(&self) -> Option<&str> { self.reality.as_ref().and_then(|p| p.success_first_user()) }
+    pub(crate) fn reality_success_first_user(&self) -> Option<&str> {
+        self.reality.as_ref().and_then(|p| p.success_first_user())
+    }
 
     pub(crate) fn reality_succeeded(&self) -> bool {
         self.reality.as_ref().is_some_and(|p| p.succeeded())

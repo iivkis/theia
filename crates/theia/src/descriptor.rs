@@ -278,16 +278,16 @@ pub(crate) fn invitation_parts(document: &str) -> Result<(Descriptor, [u8; 64]),
         return Err(Error::Format);
     }
     let envelope: Envelope = toml::from_str(document).map_err(|_| Error::Format)?;
-    let payload = URL_SAFE_NO_PAD.decode(&envelope.payload).map_err(|_| Error::Format)?;
+    let payload = URL_SAFE_NO_PAD
+        .decode(&envelope.payload)
+        .map_err(|_| Error::Format)?;
     if payload.len() > MAX_PAYLOAD || URL_SAFE_NO_PAD.encode(&payload) != envelope.payload {
         return Err(Error::Format);
     }
     let text = std::str::from_utf8(&payload).map_err(|_| Error::Format)?;
     let descriptor: Descriptor = toml::from_str(text).map_err(|_| Error::Format)?;
     let signature = canonical_base64::<64>(&envelope.signature)?;
-    if descriptor.payload()? != text
-        || invitation_document(&descriptor, signature)? != document
-    {
+    if descriptor.payload()? != text || invitation_document(&descriptor, signature)? != document {
         return Err(Error::Format);
     }
     Ok((descriptor, signature))

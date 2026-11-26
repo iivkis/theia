@@ -137,7 +137,8 @@ impl Plan {
                 || target.address.port() != 443
                 || !public_address(target.address.ip())
                 || !pairs.insert((&target.server_name, target.address))
-                || (!allow_shared_pins && (!names.insert(&target.server_name) || !pins.insert(target.address)))
+                || (!allow_shared_pins
+                    && (!names.insert(&target.server_name) || !pins.insert(target.address)))
             {
                 return Err(Error::Format);
             }
@@ -185,8 +186,12 @@ impl SearchPlan {
         plan.validate_scope(MAX_SEARCH_TARGETS, true)?;
         Ok(Self(plan))
     }
-    pub(crate) fn targets(&self) -> &[Target] { &self.0.references }
-    pub(crate) fn into_targets(self) -> Vec<Target> { self.0.references }
+    pub(crate) fn targets(&self) -> &[Target] {
+        &self.0.references
+    }
+    pub(crate) fn into_targets(self) -> Vec<Target> {
+        self.0.references
+    }
     pub(crate) fn digest(&self) -> Result<[u8; 32], Error> {
         self.0.validate_scope(MAX_SEARCH_TARGETS, true)?;
         let raw = toml::to_string(&self.0).map_err(|_| Error::Format)?;
@@ -520,10 +525,14 @@ pub(crate) async fn check_search(
     approved: [u8; 32],
     progress: &std::sync::atomic::AtomicUsize,
 ) -> Result<Vec<Evidence>, Error> {
-    if search.digest()? != approved { return Err(Error::Approval); }
+    if search.digest()? != approved {
+        return Err(Error::Approval);
+    }
     let mut roots = RootCertStore::empty();
     roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
-    if roots.is_empty() { return Err(Error::NoRoots); }
+    if roots.is_empty() {
+        return Err(Error::NoRoots);
+    }
     let roots = Arc::new(roots);
     let own = own_addresses(&search.0)?;
     let mut context = search.0.clone();
@@ -553,7 +562,9 @@ pub(crate) async fn check_search(
             }
         }
         Ok(results)
-    }).await.map_err(|_| Error::Timeout)?
+    })
+    .await
+    .map_err(|_| Error::Timeout)?
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

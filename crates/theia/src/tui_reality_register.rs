@@ -327,7 +327,9 @@ impl RegistrationPanel {
     pub(crate) fn confirmation_choice(&self) -> Option<(char, &'static str)> {
         matches!(self.stage, Stage::Confirm(_)).then_some(if self.reenroll_id.is_some() {
             ('Y', "Подтвердить новое доверие")
-        } else { ('y', "Сохранить") })
+        } else {
+            ('y', "Сохранить")
+        })
     }
 
     pub(crate) fn key(&mut self, key: KeyEvent) -> bool {
@@ -491,11 +493,15 @@ impl RegistrationPanel {
                     }
                     Ok(Err(SaveError::Refused(Error::Indeterminate)))
                     | Err(TryRecvError::Disconnected) => {
-                        if let Some(root) = &self.staged_save { self.wizard_failure = Some((root.clone(), None, false)); }
+                        if let Some(root) = &self.staged_save {
+                            self.wizard_failure = Some((root.clone(), None, false));
+                        }
                         self.stage = Stage::Done(format!("Запись не подтверждена. Проверьте файл настроек и подготовленный каталог, затем откройте конфигурацию заново. Повтор запрещён до проверки.\nФайл: {}\nКаталог: {:?}\nEsc: закрыть.", self.config.display(), self.staged_save));
                     }
                     Ok(Err(SaveError::SavedReloadFailed)) => {
-                        if let Some(root) = &self.staged_save { self.wizard_failure = Some((root.clone(), None, true)); }
+                        if let Some(root) = &self.staged_save {
+                            self.wizard_failure = Some((root.clone(), None, true));
+                        }
                         self.stage = Stage::Done("TOML сохранён, перечитать редактор не удалось. Откройте заново; runtime не изменён.\nEsc: закрыть.".into());
                     }
                     Ok(Err(SaveError::Refused(error))) => {
