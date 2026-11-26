@@ -10,16 +10,19 @@ use std::net::{IpAddr, SocketAddr};
 const CID_LEN: usize = 8;
 const TAG_LEN: usize = 32;
 const MAX_TTL: u64 = 30;
-const BODY_LEN: usize = 8 + 4 + CID_LEN * 2;
+pub const TOKEN_TTL: u64 = MAX_TTL;
+const MIN_BODY_LEN: usize = 8 + 4 + CID_LEN + 1 + 8 + 1;
+const MAX_BODY_LEN: usize = 8 + 4 + CID_LEN + 1 + 20 + 1 + 20;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error { Random, Invalid, Expired, Context }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Binding {
     pub version: Version,
-    pub original: [u8; CID_LEN],
+    pub original: Vec<u8>,
     pub retry: [u8; CID_LEN],
+    pub client: Vec<u8>,
 }
 
 pub struct Tokens {
@@ -50,31 +53,46 @@ impl Tokens {
     /// The caller supplies seconds from the same clock for issue and verify.
     /// This token validates address and CID binding, not admission. Replay
     /// within TTL requires separate listener CID/session deduplication.
-    pub fn issue(&self, peer: SocketAddr, binding: Binding, now_secs: u64) -> Result<Vec<u8>, Error> {
-        if peer.port() == 0 || binding.original == binding.retry { return Err(Error::Context); }
-        let mut body = Vec::with_capacity(BODY_LEN + TAG_LEN);
+    pub fn issue(&self, peer: SocketAddr, binding: &Binding, now_secs: u64) -> Result<Vec<u8>, Error> {
+        if peer.port() == 0 || !(8..=20).contains(&binding.original.len())
+            || binding.client.len() > 20 || binding.original.as_slice() == binding.retry.as_slice() {
+            return Err(Error::Context);
+        }
+        let mut body = Vec::with_capacity(MAX_BODY_LEN + TAG_LEN);
         body.extend(now_secs.to_be_bytes());
         body.extend(binding.version.wire().to_be_bytes());
-        body.extend(binding.original);
         body.extend(binding.retry);
+        body.push(binding.original.len() as u8);
+        body.extend_from_slice(&binding.original);
+        body.push(binding.client.len() as u8);
+        body.extend_from_slice(&binding.client);
         let tag = hmac::sign(&self.key, &Self::authenticate_input(peer, &body));
         body.extend(tag.as_ref());
         Ok(body)
     }
 
     pub fn verify(&self, token: &[u8], peer: SocketAddr, expected_version: Version,
-                  expected_retry: [u8; CID_LEN], now_secs: u64) -> Result<Binding, Error> {
-        if token.len() != BODY_LEN + TAG_LEN || peer.port() == 0 { return Err(Error::Invalid); }
-        let (body, tag) = token.split_at(BODY_LEN);
+                  expected_retry: [u8; CID_LEN], expected_client: &[u8], now_secs: u64)
+        -> Result<Binding, Error> {
+        if !(MIN_BODY_LEN + TAG_LEN..=MAX_BODY_LEN + TAG_LEN).contains(&token.len())
+            || peer.port() == 0 || expected_client.len() > 20 { return Err(Error::Invalid); }
+        let (body, tag) = token.split_at(token.len() - TAG_LEN);
         hmac::verify(&self.key, &Self::authenticate_input(peer, body), tag).map_err(|_| Error::Invalid)?;
         let issued = u64::from_be_bytes(body[..8].try_into().map_err(|_| Error::Invalid)?);
         if now_secs.checked_sub(issued).is_none_or(|age| age > MAX_TTL) { return Err(Error::Expired); }
         let version = Version::from_wire(u32::from_be_bytes(body[8..12].try_into().map_err(|_| Error::Invalid)?))
             .ok_or(Error::Invalid)?;
-        let original = body[12..20].try_into().map_err(|_| Error::Invalid)?;
-        let retry = body[20..28].try_into().map_err(|_| Error::Invalid)?;
-        if version != expected_version || retry != expected_retry || original == retry { return Err(Error::Context); }
-        Ok(Binding { version, original, retry })
+        let retry: [u8; CID_LEN] = body[12..20].try_into().map_err(|_| Error::Invalid)?;
+        let original_len = usize::from(body[20]);
+        if !(8..=20).contains(&original_len) { return Err(Error::Invalid); }
+        let original_end = 21 + original_len;
+        let original = body.get(21..original_end).ok_or(Error::Invalid)?;
+        let client_len = usize::from(*body.get(original_end).ok_or(Error::Invalid)?);
+        let client = body.get(original_end + 1..).ok_or(Error::Invalid)?;
+        if client_len != client.len() || client_len > 20 { return Err(Error::Invalid); }
+        if version != expected_version || retry != expected_retry || original == retry.as_slice()
+            || client != expected_client { return Err(Error::Context); }
+        Ok(Binding { version, original: original.to_vec(), retry, client: client.to_vec() })
     }
 }
 
@@ -104,7 +122,7 @@ pub fn version_candidates(packet: &[u8], offered: Version, local: &[u8],
     if h.kind != Kind::VersionNegotiation || h.dcid != local || h.scid != original { return Err(Error::Invalid); }
     let start = 7 + local.len() + original.len();
     let versions = packet.get(start..).ok_or(Error::Invalid)?;
-    if versions.len() > 256 { return Err(Error::Invalid); }
+    if versions.is_empty() || versions.len() > 256 || versions.len() % 4 != 0 { return Err(Error::Invalid); }
     let mut result = Vec::new();
     for bytes in versions.chunks_exact(4) {
         let number = u32::from_be_bytes(bytes.try_into().map_err(|_| Error::Invalid)?);
@@ -134,17 +152,18 @@ mod tests {
         let peer = "127.0.0.1:2345".parse().unwrap();
         let other = "127.0.0.1:2346".parse().unwrap();
         for version in [Version::V1, Version::V2] {
-            let b = Binding { version, original: [1; 8], retry: [2; 8] };
-            let token = t.issue(peer, b, 100).unwrap();
-            assert_eq!(t.verify(&token, peer, version, b.retry, 130), Ok(b));
-            assert_eq!(t.verify(&token, peer, version, b.retry, 131), Err(Error::Expired));
-            assert_eq!(t.verify(&token, peer, version, b.retry, 99), Err(Error::Expired));
-            assert_eq!(t.verify(&token, other, version, b.retry, 101), Err(Error::Invalid));
-            assert_eq!(t.verify(&token, peer, version, [3; 8], 101), Err(Error::Context));
+            let b = Binding { version, original: vec![1; 12], retry: [2; 8], client: vec![4; 10] };
+            let token = t.issue(peer, &b, 100).unwrap();
+            assert_eq!(t.verify(&token, peer, version, b.retry, &b.client, 130), Ok(b.clone()));
+            assert_eq!(t.verify(&token, peer, version, b.retry, &b.client, 131), Err(Error::Expired));
+            assert_eq!(t.verify(&token, peer, version, b.retry, &b.client, 99), Err(Error::Expired));
+            assert_eq!(t.verify(&token, other, version, b.retry, &b.client, 101), Err(Error::Invalid));
+            assert_eq!(t.verify(&token, peer, version, [3; 8], &b.client, 101), Err(Error::Context));
+            assert_eq!(t.verify(&token, peer, version, b.retry, &[9; 10], 101), Err(Error::Context));
             let mut altered = token.clone();
             altered[15] ^= 1;
-            assert_eq!(t.verify(&altered, peer, version, b.retry, 101), Err(Error::Invalid));
-            assert_eq!(t.verify(&token[..20], peer, version, b.retry, 101), Err(Error::Invalid));
+            assert_eq!(t.verify(&altered, peer, version, b.retry, &b.client, 101), Err(Error::Invalid));
+            assert_eq!(t.verify(&token[..20], peer, version, b.retry, &b.client, 101), Err(Error::Invalid));
         }
     }
 

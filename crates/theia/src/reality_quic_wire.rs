@@ -181,6 +181,18 @@ pub(crate) fn short_matches(bytes: &[u8], cid: &[u8]) -> bool {
 /// Retry integrity is a public consistency check, not proof of the client's
 /// address or of the reference's TLS identity. Token bytes remain opaque.
 pub(crate) fn retry_valid(bytes: &[u8], original: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    let Some(header) = long(bytes) else { return false; };
+    if header.kind != Kind::Retry { return false; }
+    let split = bytes.len() - 16;
+    retry_integrity_tag(header.version, &bytes[..split], original)
+        .is_some_and(|tag| bool::from(tag.as_slice().ct_eq(&bytes[split..])))
+}
+
+/// Public Retry integrity tag, not authentication. Use only for the
+/// standardized Retry pseudo-packet with the RFC fixed key and nonce.
+pub(crate) fn retry_integrity_tag(version: u32, packet: &[u8], original: &[u8]) -> Option<[u8; 16]> {
+    if original.len() > 20 || packet.len() > MAX_DATAGRAM - 16 { return None; }
     const KEY: [u8; 16] = [
         0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8,
         0x4e,
@@ -188,13 +200,7 @@ pub(crate) fn retry_valid(bytes: &[u8], original: &[u8]) -> bool {
     const NONCE: [u8; 12] = [
         0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
     ];
-    let Some(header) = long(bytes) else {
-        return false;
-    };
-    if original.len() > 20 || header.kind != Kind::Retry {
-        return false;
-    }
-    let (key, nonce) = match header.version {
+    let (key, nonce) = match version {
         V1 => (KEY, NONCE),
         V2 => (
             [
@@ -205,24 +211,19 @@ pub(crate) fn retry_valid(bytes: &[u8], original: &[u8]) -> bool {
                 0xd8, 0x69, 0x69, 0xbc, 0x2d, 0x7c, 0x6d, 0x99, 0x90, 0xef, 0xb0, 0x4a,
             ],
         ),
-        _ => return false,
+        _ => return None,
     };
-    let split = bytes.len() - 16;
-    let mut aad = Vec::with_capacity(1 + original.len() + split);
+    let mut aad = Vec::with_capacity(1 + original.len() + packet.len());
     aad.push(original.len() as u8);
     aad.extend_from_slice(original);
-    aad.extend_from_slice(&bytes[..split]);
-    let Ok(key) = aead::UnboundKey::new(&aead::AES_128_GCM, &key) else {
-        return false;
-    };
-    let mut tag = bytes[split..].to_vec();
-    aead::LessSafeKey::new(key)
-        .open_in_place(
-            aead::Nonce::assume_unique_for_key(nonce),
-            aead::Aad::from(aad),
-            &mut tag,
-        )
-        .is_ok()
+    aad.extend_from_slice(packet);
+    let key = aead::UnboundKey::new(&aead::AES_128_GCM, &key).ok()?;
+    let tag = aead::LessSafeKey::new(key).seal_in_place_separate_tag(
+        aead::Nonce::assume_unique_for_key(nonce),
+        aead::Aad::from(aad),
+        &mut [],
+    ).ok()?;
+    tag.as_ref().try_into().ok()
 }
 
 struct Size(usize);

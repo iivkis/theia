@@ -49,7 +49,10 @@ pub fn split(datagram: &[u8]) -> Result<Vec<Packet<'_>>, Error> {
                 Kind::VersionNegotiation => PacketKind::VersionNegotiation,
                 Kind::ZeroRtt => return Err(Error::Unsupported),
             };
-            if h.dcid.len() != CID_LEN || h.scid.len() > 20 { return Err(Error::Malformed); }
+            if (kind == PacketKind::Initial && !(8..=20).contains(&h.dcid.len()))
+                || (kind != PacketKind::Initial && h.dcid.len() != CID_LEN) || h.scid.len() > 20 {
+                return Err(Error::Malformed);
+            }
             if kind != PacketKind::VersionNegotiation && first & 0x40 == 0 { return Err(Error::Malformed); }
             if kind == PacketKind::Initial && datagram.len() < 1200 { return Err(Error::Malformed); }
             if matches!(kind, PacketKind::Retry | PacketKind::VersionNegotiation) && !out.is_empty() {
@@ -106,14 +109,16 @@ impl Demux {
         self.routes.retain(|_, value| *value != owner);
     }
 
+    pub fn owner(&self, cid: [u8; CID_LEN]) -> Option<u64> { self.routes.get(&cid).copied() }
+
     /// Unknown Initial is only a candidate, never an allocated connection.
     /// The caller applies Retry, admission and resource gates separately.
     pub fn classify(&self, datagram: &[u8]) -> Result<Route, Error> {
         let packets = split(datagram)?;
         let head = packets.first().ok_or(Error::Malformed)?;
-        let cid: [u8; CID_LEN] = head.destination.try_into().map_err(|_| Error::Malformed)?;
-        Ok(if let Some(owner) = self.routes.get(&cid) {
-            Route::Existing(*owner)
+        let owner = <[u8; CID_LEN]>::try_from(head.destination).ok().and_then(|cid| self.owner(cid));
+        Ok(if let Some(owner) = owner {
+            Route::Existing(owner)
         } else if head.kind == PacketKind::Initial {
             Route::NewInitial
         } else {

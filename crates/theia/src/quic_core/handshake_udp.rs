@@ -1,6 +1,6 @@
 //! Loopback-only QUIC v1/v2 handshake experiment over UDP. TLS messages
 //! travel exclusively in protected Initial and Handshake packets. Fixed
-//! pre-arranged CIDs, no Retry/VN, no coalescing, no resumption, no H3.
+//! pre-arranged CIDs, no Retry/VN, no resumption, no H3.
 //! This is not a production listener or Theia admission.
 use super::{
     ack_tx::History, endpoint::LabSession, frames::{self, Frame},
@@ -104,7 +104,7 @@ fn parse_header(packet: &[u8], version: Version, local: &[u8; CID_LEN],
         return None;
     }
     let mut at = 23;
-    if index == 0 && (packet.len() < MTU || varint(packet, &mut at)? != 0) { return None; }
+    if index == 0 && varint(packet, &mut at)? != 0 { return None; }
     let length = usize::try_from(varint(packet, &mut at)?).ok()?;
     if length < 20 || at.checked_add(length)? != packet.len() { return None; }
     Some((index, at))
@@ -159,6 +159,20 @@ impl Handshake {
             epoch.schedule.record(number, packet.len(), frame, now).map_err(Error::Schedule)?;
             if socket.send(&packet).await.map_err(Error::Io)? != packet.len() { return Err(Error::Protocol); }
             if frame.is_none() { epoch.ack.sent(); }
+        }
+        Ok(())
+    }
+
+    fn receive_datagram(&mut self, datagram: &[u8]) -> Result<(), Error> {
+        let Ok(packets) = super::datagram::split(datagram) else { return Ok(()); };
+        for packet in packets {
+            if !matches!(packet.kind, super::datagram::PacketKind::Initial | super::datagram::PacketKind::Handshake) {
+                continue;
+            }
+            self.receive(packet.bytes)?;
+            // A preceding Initial can install Handshake keys needed for
+            // the next packet in the same datagram.
+            self.collect()?;
         }
         Ok(())
     }
@@ -237,7 +251,7 @@ pub async fn establish(socket: UdpSocket, peer: SocketAddr, version: Version,
             handshake.flush(&socket).await?;
             if handshake.done() { break; }
             match tokio::time::timeout(Duration::from_millis(2), socket.recv(&mut buffer)).await {
-                Ok(Ok(n)) if n <= MTU => handshake.receive(&buffer[..n])?,
+                Ok(Ok(n)) if n <= MTU => handshake.receive_datagram(&buffer[..n])?,
                 Ok(Ok(_)) | Err(_) => {}
                 Ok(Err(e)) => return Err(Error::Io(e)),
             }
