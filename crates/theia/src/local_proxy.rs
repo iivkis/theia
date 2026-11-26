@@ -904,9 +904,16 @@ impl AutoClient {
 
 enum ProxyTunnel {
     Direct(TcpStream),
-    Dpi(Box<crate::routing::dpi::Tunnel>),
+    Dpi(Box<DpiRoute>),
     H2(Box<Tunnel>),
     H3(Box<H3Tunnel>),
+}
+
+struct DpiRoute {
+    tunnel: crate::routing::dpi::Tunnel,
+    carrier: Carrier,
+    address: Address,
+    port: u16,
 }
 
 impl Carrier {
@@ -1072,7 +1079,9 @@ async fn routed_open(
                     });
                     if permitted {
                         if let Some(tunnel) = cache.dpi.open(name, port, &ips, snapshot.digest()).await {
-                            return Ok(ProxyTunnel::Dpi(Box::new(tunnel)));
+                            return Ok(ProxyTunnel::Dpi(Box::new(DpiRoute {
+                                tunnel, carrier: carrier.clone(), address, port,
+                            })));
                         }
                     }
                 }
@@ -1207,7 +1216,24 @@ impl ProxyTunnel {
     async fn relay(self, socket: TcpStream) -> Result<(), ClientError> {
         match self {
             Self::Direct(target) => client_state::relay_direct(socket, target).await,
-            Self::Dpi(tunnel) => (*tunnel).relay(socket).await,
+            Self::Dpi(route) => {
+                let DpiRoute { tunnel, carrier, address, port } = *route;
+                match tunnel.relay(socket).await? {
+                    crate::routing::dpi::RelayOutcome::Finished => Ok(()),
+                    crate::routing::dpi::RelayOutcome::Fallback { client, prefix } => {
+                        // The origin received no application bytes. The carrier
+                        // repeats server admission/ACL for the original target.
+                        let tunnel = carrier.open(address, port).await?;
+                        let local = crate::reality_tcp::Prefixed::new(client, prefix.into());
+                        crate::traffic::dpi_fallback_open();
+                        match tunnel {
+                            Self::H2(tunnel) => tunnel.relay(local).await,
+                            Self::H3(tunnel) => tunnel.relay(local).await,
+                            _ => Err(ClientError::Protocol),
+                        }
+                    }
+                }
+            },
             Self::H2(tunnel) => tunnel.relay(socket).await,
             Self::H3(tunnel) => tunnel.relay(socket).await,
         }
@@ -3220,6 +3246,33 @@ mod selector_tests {
                 let _dpi_accepted = dpi_listener.accept().await.unwrap();
                 drop(dpi_tunnel);
                 drop(_dpi_accepted);
+                // Exercise deferred fallback on both carriers without making
+                // any public connections or weakening production IP checks.
+                let fallback = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let fallback_port = fallback.local_addr().unwrap().port();
+                let (origin, mut observer) = paired().await;
+                let (mut app, local) = paired().await;
+                let ProxyClient::Direct(client) = &proxy_client else { panic!("expected own TLS") };
+                let route = ProxyTunnel::Dpi(Box::new(DpiRoute {
+                    tunnel: crate::routing::dpi::Tunnel::fixture(origin,"example.org"),
+                    carrier: client.carrier.clone(), address: Address::V4([127,0,0,1]), port: fallback_port,
+                }));
+                let task = tokio::spawn(route.relay(local));
+                app.write_all(b"not TLS, exact prefix").await.unwrap();
+                app.shutdown().await.unwrap();
+                let (mut destination, _) = fallback.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                destination.read_to_end(&mut bytes).await.unwrap();
+                assert_eq!(bytes,b"not TLS, exact prefix");
+                destination.write_all(b"ok").await.unwrap();
+                destination.shutdown().await.unwrap();
+                let mut reply = Vec::new();
+                app.read_to_end(&mut reply).await.unwrap();
+                assert_eq!(reply,b"ok");
+                task.await.unwrap().unwrap();
+                let mut leaked = Vec::new();
+                observer.read_to_end(&mut leaked).await.unwrap();
+                assert!(leaked.is_empty());
                 assert!(matches!(
                     proxy_client
                         .open(Address::Dns("blocked.invalid".into()), 443)

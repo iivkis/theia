@@ -53,6 +53,12 @@ pub struct Prefixed<T> {
     prefix: bytes::Bytes,
 }
 
+impl<T> Prefixed<T> {
+    pub(crate) fn new(inner: T, prefix: bytes::Bytes) -> Self {
+        Self { inner, prefix }
+    }
+}
+
 impl<T: AsyncRead + Unpin> AsyncRead for Prefixed<T> {
     fn poll_read(
         mut self: Pin<&mut Self>,

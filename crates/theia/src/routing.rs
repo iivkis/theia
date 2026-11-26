@@ -31,7 +31,7 @@ pub enum Action {
     Direct,
     Blocked,
     Allowed,
-    /// Prefer an explicitly authorized local DPI backend; otherwise use the VPS.
+    /// Prefer an explicitly authorized proxy-based DPI strategy; otherwise use the VPS.
     #[serde(rename = "direct_dpi")]
     DirectDpi,
 }
