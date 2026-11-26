@@ -361,6 +361,7 @@ impl Retired {
 }
 
 struct Pending {
+    local: SocketAddr,
     flight: Flight,
     client: Cid,
     version: u32,
@@ -827,11 +828,11 @@ impl PreparedQuic {
                     if !pending.contains_key(&key) {
                         if pending.len() + sessions.len() >= SESSIONS { continue; }
                         let Some(flight) = Flight::new(&h) else { continue; };
-                        pending.insert(key.clone(), Pending { flight, client: h.scid.to_vec(), version:h.version,datagrams: Vec::new(), bytes: 0, deadline: now + FIRST_DEADLINE });
+                        pending.insert(key.clone(), Pending { local, flight, client: h.scid.to_vec(), version:h.version,datagrams: Vec::new(), bytes: 0, deadline: now + FIRST_DEADLINE });
                     }
                     // Do not let an unrelated version/SCID invalidate an
                     // already pending flight or consume its reassembly slot.
-                    if pending.get(&key).is_some_and(|p|p.version!=h.version||p.client.as_slice()!=h.scid){continue;}
+                    if pending.get(&key).is_some_and(|p|p.local!=local||p.version!=h.version||p.client.as_slice()!=h.scid){continue;}
                     let decision = pending.get_mut(&key).and_then(|p| {
                         if now >= p.deadline { None } else { p.add(data.to_vec()) }
                     });
@@ -990,6 +991,7 @@ mod tests {
         initial.resize(1200, 0);
         let h = wire::long(&initial).unwrap();
         let mut pending = Pending {
+            local: peer(443),
             flight: Flight::new(&h).unwrap(),
             client: h.scid.to_vec(),
             version: h.version,

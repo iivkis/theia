@@ -38,6 +38,11 @@ pub(crate) struct OwnTlsConfig {
 }
 
 impl OwnTlsConfig {
+    pub(crate) fn from_native(mut native: rustls::ServerConfig) -> Self {
+        native.send_tls13_tickets = 0;
+        Self { native: Arc::new(native) }
+    }
+
     pub(crate) fn new(
         certificates: Vec<rustls::pki_types::CertificateDer<'static>>,
         key: rustls::pki_types::PrivateKeyDer<'static>,
