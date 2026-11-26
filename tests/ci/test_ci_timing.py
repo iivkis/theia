@@ -60,6 +60,25 @@ class TimingTests(unittest.TestCase):
         with self.assertRaises(timing.EvidenceError):
             timing.summarize(*snapshot(event="push", merged=True))
 
+    def test_sharded_merged_matrix_requires_all_six_added_jobs(self):
+        run, jobs = snapshot(merged=True)
+        for name in sorted(timing.SHARDED_MERGED_JOBS - timing.MERGED_JOBS):
+            entry = deepcopy(jobs["jobs"][0])
+            entry["name"] = name
+            jobs["jobs"].append(entry)
+        jobs["total_count"] = len(jobs["jobs"])
+        result = timing.summarize(run, jobs)
+        self.assertEqual(len(result["jobs"]), 22)
+        self.assertEqual(set(result["jobs"]), timing.SHARDED_MERGED_JOBS)
+        for name in timing.SHARDED_MERGED_JOBS - timing.MERGED_JOBS:
+            broken = deepcopy(jobs)
+            broken["jobs"] = [job for job in broken["jobs"] if job["name"] != name]
+            broken["total_count"] -= 1
+            with self.assertRaises(timing.EvidenceError):
+                timing.summarize(run, broken)
+        with self.assertRaises(timing.EvidenceError):
+            timing.compare(timing.summarize(*snapshot(2, merged=True)), result)
+
     def test_real_sanitized_api_snapshots_match_observed_durations(self):
         path = SOURCE.parents[1] / "tests" / "ci" / "fixtures" / "timing-snapshots.json"
         snapshots = json.loads(path.read_text(encoding="utf-8"))
