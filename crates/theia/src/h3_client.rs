@@ -18,8 +18,8 @@ use tokio::{
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
-type Tx = RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
-type Rx = RequestStream<h3_quinn::RecvStream, Bytes>;
+type Tx = RequestStream<crate::h3_carrier::Tx, Bytes>;
+type Rx = RequestStream<crate::h3_carrier::Rx, Bytes>;
 
 pub struct H3Client {
     remote: SocketAddr,
@@ -28,6 +28,7 @@ pub struct H3Client {
     authorization: HeaderValue,
     roots: RootCertStore,
     identity_quic: Option<quinn::ClientConfig>,
+    native_lab: Option<crate::quic_core::wire::Version>,
     identity_routes: Option<crate::split_http::IdentityRoutes>,
     padding: crate::descriptor::Padding,
     own_routes: Option<crate::split_http::IdentityRoutes>,
@@ -67,6 +68,7 @@ impl H3Client {
             authorization: bearer_header(token)?,
             roots,
             identity_quic: None,
+            native_lab: None,
             identity_routes: None,
             padding: crate::descriptor::Padding::default(),
             own_routes: Some(crate::split_http::IdentityRoutes::new(
@@ -163,6 +165,7 @@ impl H3Client {
             authorization: bearer_header(token)?,
             roots: RootCertStore::empty(),
             identity_quic: Some(quic),
+            native_lab: None,
             identity_routes: Some(routes),
             padding: d.padding.clone(),
             own_routes: None,
@@ -506,6 +509,23 @@ impl H3Client {
 
     /// A full authenticated transport handshake, shared by tunnel opens and
     /// idle-cache rechecks. No HTTP request or bearer is sent here.
+    /// Explicit non-production carrier. Never used by config, Auto or REALITY.
+    /// Certificate pinning cannot be bypassed by selecting this fixture.
+    pub fn with_native_lab(mut self, version: crate::quic_core::wire::Version) -> Result<Self, ClientError> {
+        if !self.remote.ip().is_loopback() || self.identity_quic.is_some() || self.certificate_pin.is_some() { return Err(ClientError::Configuration); }
+        self.native_lab = Some(version);
+        Ok(self)
+    }
+
+    async fn native_connection(&self, version: crate::quic_core::wire::Version) -> Result<crate::quic_core::endpoint::LabSession, ClientError> {
+        if !self.remote.ip().is_loopback() || self.identity_quic.is_some() || self.certificate_pin.is_some() { return Err(ClientError::Configuration); }
+        let tls = crate::transport_policy::Carrier::H3.client_tls(self.roots.clone()).map_err(|_| ClientError::Tls)?;
+        let name = ServerName::try_from(self.name.clone()).map_err(|_| ClientError::Configuration)?;
+        let bind = if self.remote.is_ipv4() { "127.0.0.1:0" } else { "[::1]:0" };
+        let socket = tokio::net::UdpSocket::bind(bind).await.map_err(|_| ClientError::Io)?;
+        timeout(self.connect_timeout, crate::quic_core::handshake_udp::connect(socket, self.remote, version, Arc::new(tls), name)).await.map_err(|_| ClientError::Timeout)?.map_err(|_| ClientError::Tls)
+    }
+
     async fn verified_connection(
         &self,
     ) -> Result<(ObservedEndpoint, quinn::Connection), ClientError> {
@@ -538,6 +558,7 @@ impl H3Client {
     /// Check only the configured peer, PKI, ALPN, optional pin and BBR.
     /// Dropping the endpoint closes this probe; it never opens a tunnel.
     pub(crate) async fn probe(&self) -> Result<(), ClientError> {
+        if let Some(version) = self.native_lab { return self.native_connection(version).await.map(|_| ()); }
         self.verified_connection().await.map(|_| ())
     }
 
@@ -597,6 +618,11 @@ impl H3Client {
     }
 
     async fn connect_verified(&self, operation: u64) -> Result<H3Connection, ClientError> {
+        let (transport, endpoint, binding) = if let Some(version) = self.native_lab {
+            let session = self.native_connection(version).await?;
+            let (native, _key) = crate::quic_core::h3_adapter::NativeConnection::start(session).map_err(|_| ClientError::Tls)?;
+            (crate::h3_carrier::Connection::Native(Box::new(native)), None, None)
+        } else {
         let (endpoint, connection) = self.verified_connection().await?;
         let binding = if self.certificate_pin.is_some() {
             let mut key = zeroize::Zeroizing::new([0u8; 32]);
@@ -617,10 +643,12 @@ impl H3Client {
             "quic_tls_bbr_verified",
             "op" = Value::Count(operation)
         );
+        (crate::h3_carrier::Connection::Quinn(Box::new(h3_quinn::Connection::new(connection))), Some(endpoint), binding)
+        };
         let mut builder = h3::client::builder();
         builder.max_field_section_size(u64::from(crate::transport_policy::MAX_HEADER_LIST_BYTES));
         let (mut driver, sender) = builder
-            .build::<_, _, Bytes>(h3_quinn::Connection::new(connection))
+            .build::<_, _, Bytes>(transport)
             .await
             .map_err(|_| ClientError::Http3)?;
         // h3 closes the connection when the final SendRequest is dropped.
@@ -874,10 +902,10 @@ fn quic_error(error: QuicError) -> ClientError {
 }
 
 struct H3Connection {
-    sender: std::sync::Mutex<h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>>,
+    sender: std::sync::Mutex<h3::client::SendRequest<crate::h3_carrier::Opener, Bytes>>,
     driver: Driver,
     binding: Option<crate::channel_binding::Key>,
-    _endpoint: ObservedEndpoint,
+    _endpoint: Option<ObservedEndpoint>,
 }
 
 struct Driver(JoinHandle<()>);
@@ -975,6 +1003,7 @@ impl H3Tunnel {
         self._lease
             .connection()
             ._endpoint
+            .as_ref().ok_or(ClientError::Configuration)?
             .endpoint
             .rebind(socket)
             .map_err(|_| ClientError::Io)

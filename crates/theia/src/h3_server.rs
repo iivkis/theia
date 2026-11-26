@@ -21,8 +21,8 @@ type Stream<S> = RequestStream<S, Bytes>;
 
 // Both carriers must enter the very same request handlers; the native lab
 // does not get its own less restrictive authorization path.
-trait CarrierStream: quic::BidiStream<Bytes> + Send + 'static {}
-impl<S: quic::BidiStream<Bytes> + Send + 'static> CarrierStream for S {}
+trait CarrierStream: quic::BidiStream<Bytes> + quic::RecvStream<Buf = Bytes> + Send + 'static {}
+impl<S: quic::BidiStream<Bytes> + quic::RecvStream<Buf = Bytes> + Send + 'static> CarrierStream for S {}
 
 struct ConnectionGuard(quinn::Connection);
 
@@ -168,7 +168,7 @@ async fn run_h3<C, F>(transport: C, context: Arc<ServerContext>, mut phase: watc
     binding: Option<Arc<crate::channel_binding::Admission>>, closed: F)
 where C: quic::Connection<Bytes>, C::BidiStream: CarrierStream,
     <C::BidiStream as quic::BidiStream<Bytes>>::SendStream: Send + 'static,
-    <C::BidiStream as quic::BidiStream<Bytes>>::RecvStream: Send + 'static,
+    <C::BidiStream as quic::BidiStream<Bytes>>::RecvStream: quic::RecvStream<Buf = Bytes> + Send + 'static,
     F: std::future::Future<Output = ()>,
 {
     tokio::pin!(closed);
