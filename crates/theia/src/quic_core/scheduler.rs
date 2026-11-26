@@ -127,6 +127,10 @@ impl Scheduler {
             Ok([Frame::Stream { id, .. } | Frame::ResetStream { id, .. }]) if *id == stream))
     }
 
+    pub(crate) fn has_queued(&self) -> bool {
+        self.frames.values().any(|frame| frame.queued)
+    }
+
     pub fn pending(&self) -> usize {
         self.frames.len()
     }

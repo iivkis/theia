@@ -169,6 +169,10 @@ impl ReceiveBuffer {
         self.limit
     }
 
+    pub(crate) fn consumed_offset(&self) -> u64 {
+        self.read_offset
+    }
+
     pub fn highest_offset(&self) -> u64 {
         self.highest
     }

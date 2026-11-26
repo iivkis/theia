@@ -201,6 +201,88 @@ fn parse_header(
     Some((index, at))
 }
 
+/// Client-side Handshake packet-number space retained after TLS completion.
+/// A lost final Handshake ACK must not prevent 1-RTT or HANDSHAKE_DONE.
+/// Only the client retains this state; the server discards it on TLS confirmation.
+pub(crate) struct HandshakeTail {
+    epoch: Epoch,
+    version: Version,
+    local: [u8; CID_LEN],
+    remote: [u8; CID_LEN],
+    consumed: u64,
+    expires: Instant,
+}
+
+pub(crate) enum TailEvent {
+    Ignored,
+    Authenticated,
+    Close,
+}
+
+impl HandshakeTail {
+    pub(crate) fn deadline(&self) -> Instant {
+        self.epoch.schedule.deadline().map_or(self.expires, |at| at.min(self.expires))
+    }
+
+    /// Some indicates a sent Handshake packet; the boolean says whether
+    /// it is ACK-eliciting. Retransmissions allocate new packet numbers.
+    pub(crate) async fn flush(&mut self, socket: &SessionIo, peer: SocketAddr, now: Instant)
+        -> Result<Option<bool>, Error> {
+        if now >= self.expires { return Err(Error::Timeout); }
+        self.epoch.schedule.on_timer(now).map_err(Error::Schedule)?;
+        let (mut payload, frame) = if let Some(ack) = self.epoch.ack.encode() {
+            (ack, None)
+        } else if let Some((id, data, probe)) = self.epoch.schedule.candidate(now).map_err(Error::Schedule)? {
+            (data, Some((id, probe)))
+        } else {
+            return Ok(None);
+        };
+        let header = header(self.version, 1, &self.local, &self.remote, &[], &mut payload, 0)?;
+        let (number, packet) = self.epoch.writer.seal(&header, &payload).map_err(Error::Packet)?;
+        self.epoch.schedule.record(number, packet.len(), frame, now).map_err(Error::Schedule)?;
+        if socket.send_to(&packet, peer).await.map_err(Error::Io)? != packet.len() {
+            return Err(Error::Protocol);
+        }
+        if frame.is_none() { self.epoch.ack.sent(); }
+        Ok(Some(frame.is_some()))
+    }
+
+    pub(crate) fn receive(&mut self, packet: &[u8], now: Instant) -> Result<TailEvent, Error> {
+        if now >= self.expires { return Err(Error::Timeout); }
+        let Some((1, at)) = parse_header(packet, self.version, &self.local, &self.remote, &[]) else {
+            return Ok(TailEvent::Ignored);
+        };
+        let opened = match self.epoch.reader.open(packet, at) {
+            Ok(packet) => packet,
+            Err(packet::Error::Reserved | packet::Error::Limit) => return Err(Error::Protocol),
+            Err(_) => return Ok(TailEvent::Ignored),
+        };
+        let parsed = frames::decode(&opened.payload, Space::Handshake).map_err(|_| Error::Protocol)?;
+        if parsed.iter().any(|frame| matches!(frame, Frame::Close { .. })) {
+            return Ok(TailEvent::Close);
+        }
+        let mut eliciting = false;
+        for frame in parsed {
+            match frame {
+                Frame::Padding => {},
+                Frame::Ping => eliciting = true,
+                Frame::Ack(ack) => self.epoch.schedule.acknowledge(&ack, now).map_err(Error::Schedule)?,
+                Frame::Crypto { offset, data } => {
+                    // TLS is complete. Already consumed CRYPTO may be
+                    // retransmitted, but no new handshake bytes are accepted.
+                    if offset.checked_add(data.len() as u64).is_none_or(|end| end > self.consumed) {
+                        return Err(Error::Protocol);
+                    }
+                    eliciting = true;
+                }
+                _ => return Err(Error::Protocol),
+            }
+        }
+        self.epoch.ack.record(opened.number, eliciting);
+        Ok(TailEvent::Authenticated)
+    }
+}
+
 struct FlightPacket {
     index: usize,
     header: Vec<u8>,
@@ -478,18 +560,16 @@ impl Handshake {
     fn done(&self) -> bool {
         self.driver.tls_complete()
             && self.application.is_some()
-            && self
-                .epochs
-                .iter()
-                .flatten()
-                .all(|epoch| epoch.schedule.pending() == 0 && !epoch.ack.pending())
+            && (self.server || self.epochs.iter().flatten().all(|epoch|
+                !epoch.schedule.has_queued() && !epoch.ack.pending()))
     }
 }
 
 /// Complete TLS via actual UDP Initial/Handshake datagrams, then hand the
 /// unused 1-RTT keys to the existing isolated session. Both peers must be
 /// driven concurrently. Timeout/uncertain I/O drops the socket and keys.
-/// A lost final ACK may time out; full QUIC draining is not implemented.
+/// The client retains Handshake recovery until authenticated HANDSHAKE_DONE.
+/// Server confirmation does not depend on a final Handshake ACK.
 pub async fn establish(
     socket: UdpSocket,
     peer: SocketAddr,
@@ -730,7 +810,20 @@ async fn establish_inner(
     } else {
         peer_idle.min(30_000)
     });
+    let peer_reset_token = peer_params.get(0x02).and_then(|token| token.try_into().ok());
     let binding = handshake.driver.channel_binding().map_err(Error::Driver)?;
+    let tail = if server {
+        None
+    } else {
+        Some(HandshakeTail {
+            epoch: handshake.epochs[1].take().ok_or(Error::Protocol)?,
+            version,
+            local,
+            remote: handshake.remote,
+            consumed: handshake.driver.consumed_handshake(),
+            expires: Instant::now().checked_add(DEADLINE).ok_or(Error::Protocol)?,
+        })
+    };
     let (keys, secrets) = handshake.application.take().ok_or(Error::Protocol)?;
     LabSession::after_handshake(
         socket,
@@ -744,7 +837,8 @@ async fn establish_inner(
             idle_timeout,
             binding,
             peer_limits: limits,
-            peer_reset_token: peer_params.get(0x02).and_then(|token| token.try_into().ok()),
+            peer_reset_token,
+            tail,
         },
     )
     .await
@@ -754,6 +848,60 @@ async fn establish_inner(
 #[cfg(test)]
 mod coalescing_tests {
     use super::*;
+    #[tokio::test]
+    async fn retained_handshake_space_retransmits_without_reusing_packet_numbers() {
+        for version in [Version::V1, Version::V2] {
+            let client = [1; CID_LEN];
+            let server = [2; CID_LEN];
+            // Use independently derived matching fixture keys for this
+            // packet-space test; the real TLS integration tests use TLS keys.
+            let client_keys = initial_keys(version, &server, false).unwrap();
+            let server_keys = initial_keys(version, &server, true).unwrap();
+            let mut reader = Reader::new(server_keys.remote);
+            let mut writer = Writer::new(server_keys.local);
+            let now = Instant::now();
+            let mut tail = HandshakeTail {
+                epoch: Epoch::new(client_keys),
+                version,
+                local: client,
+                remote: server,
+                consumed: 8,
+                expires: now + DEADLINE,
+            };
+            tail.epoch.schedule.enqueue(crypto_frame(0, b"finished").unwrap()).unwrap();
+            let socket = SessionIo::from(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = peer.local_addr().unwrap();
+            let mut buf = [0; MTU];
+            for (pn, at) in [(0, now), (1, now + Duration::from_secs(2))] {
+                assert_eq!(tail.flush(&socket, addr, at).await.unwrap(), Some(true));
+                let (n, _) = tokio::time::timeout(Duration::from_secs(1), peer.recv_from(&mut buf)).await.unwrap().unwrap();
+                let (index, offset) = parse_header(&buf[..n], version, &server, &client, &[]).unwrap();
+                assert_eq!(index, 1);
+                let opened = reader.open(&buf[..n], offset).unwrap();
+                assert_eq!(opened.number, pn);
+                let parsed = frames::decode(&opened.payload, Space::Handshake).unwrap();
+                assert!(matches!(parsed.as_slice(), [Frame::Crypto { offset: 0, data }] if *data == b"finished"));
+                // Deliberately omit the ACK of the first transmission.
+            }
+            let mut ack = vec![2, 1, 0, 0, 0];
+            let h = header(version, 1, &server, &client, &[], &mut ack, 0).unwrap();
+            let (_, ack) = writer.seal(&h, &ack).unwrap();
+            let at = now + Duration::from_secs(2) + Duration::from_millis(1);
+            assert!(matches!(tail.receive(&ack, at), Ok(TailEvent::Authenticated)));
+            assert_eq!(tail.epoch.schedule.pending(), 0);
+            let mut retransmitted = crypto_frame(0, b"finished").unwrap();
+            let h = header(version, 1, &server, &client, &[], &mut retransmitted, 0).unwrap();
+            let (_, retransmitted) = writer.seal(&h, &retransmitted).unwrap();
+            assert!(matches!(tail.receive(&retransmitted, at), Ok(TailEvent::Authenticated)));
+            assert_eq!(tail.flush(&socket, addr, at).await.unwrap(), Some(false));
+            let mut extra = crypto_frame(8, b"x").unwrap();
+            let h = header(version, 1, &server, &client, &[], &mut extra, 0).unwrap();
+            let (_, extra) = writer.seal(&h, &extra).unwrap();
+            assert!(matches!(tail.receive(&extra, at), Err(Error::Protocol)));
+        }
+    }
+
     #[test]
     fn initial_padding_counts_coalesced_handshake_bytes() {
         for version in [Version::V1, Version::V2] {

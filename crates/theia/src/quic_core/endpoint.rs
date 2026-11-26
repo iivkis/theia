@@ -13,6 +13,7 @@ use super::{
     spaces::Space,
 };
 use super::{
+    handshake_udp::{HandshakeTail, TailEvent},
     key_update,
     lifecycle::{Idle, Shutdown, ShutdownPhase},
     path::{ConnectionId, Paths, PeerIds},
@@ -61,6 +62,7 @@ pub(crate) struct Established {
     pub binding: zeroize::Zeroizing<[u8; 32]>,
     pub peer_limits: super::parameters::Limits,
     pub peer_reset_token: Option<[u8; 16]>,
+    pub tail: Option<HandshakeTail>,
 }
 
 pub struct LabSession {
@@ -71,6 +73,7 @@ pub struct LabSession {
     peer_cid_limit: usize,
     peer_ids: PeerIds,
     protection: Option<Protection>,
+    handshake_tail: Option<HandshakeTail>,
     acknowledgments: History,
     send: SendFlow,
     receive: ReceiveFlow,
@@ -128,6 +131,7 @@ impl LabSession {
             binding,
             peer_limits,
             peer_reset_token,
+            tail,
         } = established;
         let mut session = Self::connect_inner(
             socket,
@@ -149,6 +153,7 @@ impl LabSession {
         session.scheduler = Scheduler::with_bbr(Instant::now());
         session.idle = Idle::new(Instant::now(), idle_timeout);
         session.binding = Some(binding);
+        session.handshake_tail = tail;
         if server {
             session
                 .scheduler
@@ -202,6 +207,7 @@ impl LabSession {
             peer_cid_limit: 2,
             peer_ids: PeerIds::with_initial(&remote_cid, None, 2).map_err(|_| Error::Protocol)?,
             protection: Some(protection),
+            handshake_tail: None,
             acknowledgments: History::default(),
             send,
             receive,
@@ -513,6 +519,7 @@ impl LabSession {
         self.closed = true;
         self.shutdown.abort();
         self.protection = None;
+        self.handshake_tail = None;
         self.binding = None;
     }
 
@@ -571,6 +578,7 @@ impl LabSession {
         };
         [
             self.shutdown.deadline(),
+            self.handshake_tail.as_ref().map(HandshakeTail::deadline).filter(|_| self.active()),
             old_keys,
             recovery,
             self.paths.deadline(),
@@ -641,6 +649,12 @@ impl LabSession {
     }
 
     async fn flush_inner(&mut self, now: Instant) -> Result<bool, Error> {
+        if let Some(tail) = self.handshake_tail.as_mut() {
+            if let Some(eliciting) = tail.flush(&self.socket, self.paths.active(), now).await.map_err(|_| Error::Protocol)? {
+                if eliciting { self.idle.sent(now); }
+                return Ok(true);
+            }
+        }
         self.scheduler.on_timer(now).map_err(Error::Schedule)?;
         if self.scheduler.can_send_path() {
             let pto = self.scheduler.base_pto();
@@ -721,10 +735,16 @@ impl LabSession {
 
     fn receive_stateless_reset(&mut self, packet: &[u8], source: SocketAddr, now: Instant) -> Result<bool, Error> {
         if source != self.paths.active() || packet.len() > MTU || !self.peer_ids.matches_reset(packet) { return Ok(false); }
+        self.enter_draining(now)?;
+        Ok(true)
+    }
+
+    fn enter_draining(&mut self, now: Instant) -> Result<(), Error> {
         self.shutdown.peer(now, self.scheduler.base_pto()).map_err(|_| Error::Protocol)?;
         self.protection = None;
+        self.handshake_tail = None;
         self.binding = None;
-        Ok(true)
+        Ok(())
     }
 
     async fn recv_inner(&mut self, wait: Duration, wake: Option<&tokio::sync::Notify>) -> Result<bool, Error> {
@@ -749,22 +769,49 @@ impl LabSession {
         {
             return Ok(false);
         }
-        let destination = if (1 + CID_LEN + 4 + 16..=MTU).contains(&n) && buf[0] & 0xc0 == 0x40 {
-            self.local_ids.iter().find_map(|(&seq, cid)| (buf[1..1+CID_LEN] == *cid).then_some((seq, *cid)))
+        let mut packet = &buf[..n];
+        // A coalesced datagram can carry the last Handshake ACK and the
+        // first HANDSHAKE_DONE/STREAM. Apply each protected space separately.
+        if packet.first().is_some_and(|first| first & 0x80 != 0) {
+            if new_path || n > MTU { return Ok(false); }
+            let Ok(parts) = super::datagram::split(packet) else { return Ok(false); };
+            let mut application = None;
+            for part in parts {
+                match part.kind {
+                    super::datagram::PacketKind::Handshake => {
+                        if let Some(tail) = self.handshake_tail.as_mut() {
+                            let now = Instant::now();
+                            match tail.receive(part.bytes, now).map_err(|_| Error::Protocol)? {
+                                TailEvent::Ignored => {},
+                                TailEvent::Authenticated => self.idle.received(now),
+                                TailEvent::Close => { self.enter_draining(now)?; return Ok(true); }
+                            }
+                        }
+                    }
+                    super::datagram::PacketKind::Application => application = Some(part.bytes),
+                    _ => {},
+                }
+            }
+            let Some(application) = application else { return Ok(false); };
+            packet = application;
+        }
+        let n = packet.len();
+        let destination = if (1 + CID_LEN + 4 + 16..=MTU).contains(&n) && packet[0] & 0xc0 == 0x40 {
+            self.local_ids.iter().find_map(|(&seq, cid)| (packet[1..1+CID_LEN] == *cid).then_some((seq, *cid)))
         } else { None };
         let Some((destination_sequence, destination_cid)) = destination else {
-            return self.receive_stateless_reset(&buf[..n], source, Instant::now());
+            return self.receive_stateless_reset(packet, source, Instant::now());
         };
         let now = Instant::now();
         let old_key_deadline = now
             .checked_add(self.scheduler.base_pto().saturating_mul(3))
             .ok_or(Error::Protocol)?;
         let result = match self.protection.as_mut().ok_or(Error::Closed)? {
-            Protection::Fixed { reader, .. } => reader.open(&buf[..n], 1 + CID_LEN),
+            Protection::Fixed { reader, .. } => reader.open(packet, 1 + CID_LEN),
             Protection::Rotating { reader, writer } => {
                 match reader.open(
                     &destination_cid,
-                    &buf[..n],
+                    packet,
                     now,
                     old_key_deadline,
                     self.confirmed,
@@ -780,7 +827,7 @@ impl LabSession {
         let opened = match result {
             Ok(p) => p,
             Err(packet::Error::Reserved | packet::Error::Limit) => return Err(Error::Protocol),
-            Err(packet::Error::Crypto | packet::Error::Header | packet::Error::TooOld) => return self.receive_stateless_reset(&buf[..n], source, now),
+            Err(packet::Error::Crypto | packet::Error::Header | packet::Error::TooOld) => return self.receive_stateless_reset(packet, source, now),
             Err(_) => return Ok(false),
         };
         if matches!(&self.protection, Some(Protection::Fixed { .. }))
@@ -837,13 +884,9 @@ impl LabSession {
             if *application {
                 self.peer_application_close = Some(*code);
             }
-            self.shutdown
-                .peer(now, self.scheduler.base_pto())
-                .map_err(|_| Error::Protocol)?;
             // Draining is silent. Drop keys now; retain the connection
             // object/route until the shutdown deadline.
-            self.protection = None;
-            self.binding = None;
+            self.enter_draining(now)?;
             return Ok(true);
         }
         if self.shutdown.phase() == ShutdownPhase::Closing {
@@ -892,6 +935,7 @@ impl LabSession {
                         && matches!(&self.protection, Some(Protection::Rotating { .. })) =>
                 {
                     self.confirmed = true;
+                    self.handshake_tail = None;
                 }
                 Frame::Stream {
                     id,
