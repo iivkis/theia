@@ -96,7 +96,7 @@ impl Validator {
         }
         let delta = [counts[0]-self.reported[0], counts[1]-self.reported[1], counts[2]-self.reported[2]];
         if delta[0]+delta[2] < newly_marked[0] || delta[1]+delta[2] < newly_marked[1]
-            || delta.iter().sum::<u64>() < newly_marked.iter().sum::<u64>() {
+            || delta.iter().map(|&n| u128::from(n)).sum::<u128>() < newly_marked.iter().map(|&n| u128::from(n)).sum::<u128>() {
             self.fail();
             return Feedback::Failed;
         }
@@ -128,6 +128,8 @@ mod tests {
 
     #[test]
     fn detects_missing_bleached_and_fabricated_marks() {
+        let mut extreme = Validator::default();
+        assert_eq!(extreme.acknowledge(1, [u64::MAX; 2], Some([0; 3])), Feedback::Failed);
         for counters in [None, Some([0, 0, 0]), Some([0, 1, 0]), Some([2, 0, 0])] {
             let mut v = Validator::default();
             v.sent(Mark::Ect0);
