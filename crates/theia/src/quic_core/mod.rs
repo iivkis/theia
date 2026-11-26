@@ -8,6 +8,7 @@ pub mod bbr;
 pub mod congestion;
 pub mod datagram;
 pub mod endpoint;
+pub mod ecn;
 pub mod flow;
 pub mod frames;
 pub mod h3_adapter;

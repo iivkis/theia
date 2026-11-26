@@ -209,6 +209,9 @@ impl Scheduler {
                 return Err(Error::Limit);
             }
             let before = self.window.in_flight();
+            if before == 0 && self.bbr.is_none() {
+                self.window.application_limited();
+            }
             let app_limited = probe
                 || (self.queue.iter().all(|queued| *queued == id)
                     && before.saturating_add(2 * MTU) <= self.window.cwnd());

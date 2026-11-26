@@ -31,6 +31,7 @@ pub struct Window {
     recovery: Option<Instant>,
     ssthresh: u64,
     last_max: f64,
+    prior_cwnd: f64,
     epoch: Option<(Instant, f64)>,
     growth_credit: f64,
     friendly: f64,
@@ -49,6 +50,7 @@ impl Window {
             recovery: None,
             ssthresh: MAX_CWND,
             last_max: 0.0,
+            prior_cwnd: 0.0,
             epoch: None,
             growth_credit: 0.0,
             friendly: 0.0,
@@ -98,6 +100,7 @@ impl Window {
         }
         self.recovery = Some(now);
         let packets = self.cwnd as f64 / self.mtu as f64;
+        self.prior_cwnd = packets;
         // Fast convergence: when another flow joins, reduce the remembered
         // maximum more aggressively than the actual window reduction.
         self.last_max = if packets < self.last_max {
@@ -117,8 +120,16 @@ impl Window {
     pub fn persistent_congestion(&mut self, now: Instant) {
         self.recovery = Some(now);
         self.last_max = self.cwnd as f64 / self.mtu as f64;
+        self.prior_cwnd = self.last_max;
         self.cwnd = 2 * self.mtu;
         self.ssthresh = self.cwnd;
+        self.epoch = None;
+        self.growth_credit = 0.0;
+    }
+
+    pub(crate) fn application_limited(&mut self) {
+        // Rebase the next epoch rather than accumulating cubic time while
+        // the application is idle or flow-control limited.
         self.epoch = None;
         self.growth_credit = 0.0;
     }
@@ -139,8 +150,7 @@ impl Window {
             return Err(Error::Accounting);
         }
         if !cwnd_limited {
-            self.epoch = None;
-            self.growth_credit = 0.0;
+            self.application_limited();
             return Ok(());
         }
         if self.recovery.is_some_and(|start| sent <= start) {
@@ -164,12 +174,20 @@ impl Window {
             cubic_target(w_max, initial, elapsed.saturating_add(rtt)).ok_or(Error::Accounting)?;
         // TCP-friendly growth is driven by newly acknowledged bytes, not
         // merely wall time (an ACK after an idle period must not grant a burst).
-        self.friendly += (3.0 * (1.0 - BETA) / (1.0 + BETA)) * (bytes as f64 / self.mtu as f64) / self.friendly.max(1.0);
-        let friendly = self.friendly;
-        // Limit ACK-driven growth to a bounded target; use fractional byte
-        // credit rather than rounding every small ACK up to a whole MTU.
-        let target = cubic.max(friendly).min(current * 1.5);
-        let increase = ((target - current).max(0.0) / current) * bytes as f64;
+        // RFC 9438 section 4.3: use the Reno increment after W_est reaches
+        // the pre-congestion window. The denominator is the current cwnd.
+        let alpha = if self.friendly >= self.prior_cwnd { 1.0 } else { 3.0 * (1.0 - BETA) / (1.0 + BETA) };
+        self.friendly += alpha * (bytes as f64 / self.mtu as f64) / current.max(1.0);
+        let cubic_now = cubic_target(w_max, initial, elapsed).ok_or(Error::Accounting)?;
+        // Reno-friendly growth updates the estimate directly rather than
+        // integrating the difference a second time. Otherwise grow toward
+        // the next-RTT cubic target, bounded by the slow-start rate.
+        let increase = if cubic_now < self.friendly {
+            ((self.friendly - current).max(0.0) * self.mtu as f64).min(bytes as f64)
+        } else {
+            let target = cubic.clamp(current, current * 1.5);
+            ((target - current) / current) * bytes as f64
+        };
         self.growth_credit += increase;
         let whole = self.growth_credit.floor() as u64;
         self.growth_credit -= whole as f64;
@@ -216,6 +234,22 @@ mod tests {
         w.set_target(12000).unwrap();
         assert_eq!(w.cwnd(), 12000);
     }
+    #[test]
+    fn reno_friendly_growth_is_ack_driven_and_idle_rebases_epoch() {
+        let now = Instant::now();
+        let rtt = Duration::from_millis(10);
+        let mut w = Window::new(1200).unwrap();
+        w.loss(now, now).unwrap();
+        let initial = w.cwnd();
+        let sent = now + rtt;
+        w.on_ack(sent, sent + rtt, 1200, rtt, true).unwrap();
+        assert!(w.cwnd() > initial);
+        let after = w.cwnd();
+        w.application_limited();
+        w.on_ack(sent, sent + Duration::from_secs(60), 1200, rtt, true).unwrap();
+        assert!(w.cwnd() <= after + 1200);
+    }
+
     #[test]
     fn slow_start_then_cubic_growth_ignores_app_limited_and_old_packets() {
         let start = Instant::now();

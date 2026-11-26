@@ -14,7 +14,10 @@ import subprocess
 
 def parse_samples(output):
     header = "backend,stream_up,sample,bytes,open_us,relay_us"
-    lines = output.splitlines()
+    # Rust's test harness may prefix the first uncaptured line with
+    # the test name and ellipsis. Normalize only that exact prefix.
+    prefix = "test quinn_native_xhttp_comparison_samples ... "
+    lines = [line.removeprefix(prefix) for line in output.splitlines()]
     if lines.count(header) != 1:
         raise ValueError("missing or duplicate comparison header")
     rows = []

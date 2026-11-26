@@ -2,6 +2,7 @@
 //! packets. ACK-only packets do not trigger an ACK on their own.
 use super::{
     ack::Range,
+    ecn::{Counts, Mark},
     wire::{encode_varint, MAX_VARINT},
 };
 use std::collections::BTreeSet;
@@ -13,10 +14,17 @@ pub struct History {
     numbers: BTreeSet<u64>,
     largest: Option<u64>,
     pending: bool,
+    ecn: Counts,
 }
 
 impl History {
     pub fn record(&mut self, number: u64, eliciting: bool) -> bool {
+        self.record_marked(number, eliciting, Mark::NotEct)
+    }
+
+    /// Only call with a verified packet and a codepoint obtained from its
+    /// IP header. Duplicate packet numbers cannot inflate ECN counters.
+    pub fn record_marked(&mut self, number: u64, eliciting: bool, mark: Mark) -> bool {
         if number > MAX_VARINT
             || self
                 .largest
@@ -29,6 +37,7 @@ impl History {
         self.numbers.retain(|n| *n >= floor);
         let fresh = self.numbers.insert(number);
         self.pending |= eliciting;
+        if fresh { self.ecn.record(mark); }
         fresh
     }
 
@@ -56,7 +65,8 @@ impl History {
             });
         }
         let first = ranges.first()?;
-        let mut out = vec![2];
+        let counters = self.ecn.reported();
+        let mut out = vec![if counters.is_some() { 3 } else { 2 }];
         let mut add = |value| {
             let mut scratch = [0; 8];
             out.extend_from_slice(encode_varint(value, &mut scratch).expect("bounded ACK value"));
@@ -68,6 +78,9 @@ impl History {
         for pair in ranges.windows(2) {
             add(pair[0].first - pair[1].last - 2);
             add(pair[1].last - pair[1].first);
+        }
+        if let Some(counters) = counters {
+            for count in counters { add(count); }
         }
         Some(out)
     }
@@ -81,6 +94,24 @@ impl History {
 mod tests {
     use super::*;
     use crate::quic_core::ack::Ack;
+
+    #[test]
+    fn ack_ecn_counts_only_fresh_authenticated_packets() {
+        let mut h = History::default();
+        assert!(h.record_marked(0, true, Mark::Ect0));
+        assert!(!h.record_marked(0, true, Mark::Ce));
+        assert!(h.record_marked(1, false, Mark::Ect1));
+        assert!(h.record_marked(2, true, Mark::Ce));
+        let data = h.encode().unwrap();
+        assert_eq!(data[0], 3);
+        let mut pos = 1;
+        assert_eq!(Ack::decode(&data, &mut pos, true).unwrap().ecn, Some([1, 1, 1]));
+        assert_eq!(pos, data.len());
+        h.sent();
+        assert!(h.record(140, true));
+        assert!(!h.record_marked(0, true, Mark::Ce));
+        assert_eq!(Ack::decode(&h.encode().unwrap(), &mut 1usize, true).unwrap().ecn, Some([1, 1, 1]));
+    }
 
     #[test]
     fn gaps_reorder_and_ack_only() {
