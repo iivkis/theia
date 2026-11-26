@@ -84,8 +84,8 @@ fn params(
     version: Version,
     versions: &VersionPolicy,
     local: &[u8; CID_LEN],
-    original: &[u8; CID_LEN],
-    retry: Option<&[u8; CID_LEN]>,
+    original: &[u8],
+    retry: Option<&[u8]>,
 ) -> Result<Vec<u8>, Error> {
     let mut out = Vec::new();
     parameters::append(&mut out, 0x11, &versions.information(version, server)).map_err(|_| Error::Protocol)?;
@@ -130,14 +130,15 @@ fn header(
     version: Version,
     index: usize,
     local: &[u8; CID_LEN],
-    remote: &[u8; CID_LEN],
+    remote: &[u8],
     token: &[u8],
     payload: &mut Vec<u8>,
     minimum: usize,
 ) -> Result<Vec<u8>, Error> {
     let mut out = vec![header_type(version, index)];
     out.extend_from_slice(&version.wire().to_be_bytes());
-    out.push(CID_LEN as u8);
+    if remote.is_empty() || remote.len() > 20 { return Err(Error::Protocol); }
+    out.push(remote.len() as u8);
     out.extend_from_slice(remote);
     out.push(CID_LEN as u8);
     out.extend_from_slice(local);
@@ -166,7 +167,7 @@ fn parse_header(
     packet: &[u8],
     version: Version,
     local: &[u8; CID_LEN],
-    remote: &[u8; CID_LEN],
+    remote: &[u8],
     expected_token: &[u8],
 ) -> Option<(usize, usize)> {
     let ty = *packet.first()? & 0xf0;
@@ -180,12 +181,12 @@ fn parse_header(
     if packet.get(1..5)? != version.wire().to_be_bytes()
         || *packet.get(5)? != CID_LEN as u8
         || packet.get(6..14)? != local
-        || *packet.get(14)? != CID_LEN as u8
-        || packet.get(15..23)? != remote
+        || usize::from(*packet.get(14)?) != remote.len()
+        || packet.get(15..15 + remote.len())? != remote
     {
         return None;
     }
-    let mut at = 23;
+    let mut at = 15 + remote.len();
     if index == 0 {
         let len = usize::try_from(varint(packet, &mut at)?).ok()?;
         let end = at.checked_add(len)?;
@@ -208,7 +209,7 @@ pub(crate) struct HandshakeTail {
     epoch: Epoch,
     version: Version,
     local: [u8; CID_LEN],
-    remote: [u8; CID_LEN],
+    remote: Vec<u8>,
     consumed: u64,
     expires: Instant,
 }
@@ -301,12 +302,13 @@ struct Handshake {
     server: bool,
     version: Version,
     local: [u8; CID_LEN],
-    remote: [u8; CID_LEN],
-    original: [u8; CID_LEN],
-    retry: Option<[u8; CID_LEN]>,
+    remote: Vec<u8>,
+    original: Vec<u8>,
+    retry: Option<Vec<u8>>,
     token: Vec<u8>,
     peer_progress: bool,
     initial_frames: Vec<Vec<u8>>,
+    early_application: Vec<Vec<u8>>,
     versions: VersionPolicy,
     restarted: bool,
 }
@@ -430,11 +432,9 @@ impl Handshake {
         ) else {
             return Ok(());
         };
-        let Ok(cid) = <[u8; CID_LEN]>::try_from(cid) else {
-            return Ok(());
-        };
+        if cid.is_empty() || cid.len() > 20 { return Ok(()); }
         // Bound the opaque token to leave room for the original CRYPTO chunks.
-        if cid == self.local || token.is_empty() || token.len() > 200 {
+        if cid == self.local.as_slice() || token.is_empty() || token.len() > 200 {
             return Ok(());
         }
         let next = self.epochs[0]
@@ -444,15 +444,15 @@ impl Handshake {
             .next();
         // Keep TLS and CRYPTO offsets; only Initial protection and recovery
         // are reset. The packet number MUST continue across Retry.
-        let keys = initial_keys(self.version, &cid, false)?;
+        let keys = initial_keys(self.version, cid, false)?;
         let mut epoch = Epoch { reader: Reader::new(keys.remote), writer: Writer::with_next(keys.local, next),
             ack: History::default(), schedule: Scheduler::after_retry(next) };
         for frame in self.initial_frames.drain(..) {
             epoch.schedule.enqueue(frame).map_err(Error::Schedule)?;
         }
         self.epochs[0] = Some(epoch);
-        self.remote = cid;
-        self.retry = Some(cid);
+        self.remote = cid.to_vec();
+        self.retry = Some(cid.to_vec());
         self.token = token.to_vec();
         Ok(())
     }
@@ -472,6 +472,14 @@ impl Handshake {
             }
             if packet.kind == super::datagram::PacketKind::Retry {
                 self.apply_retry(packet.bytes)?;
+                continue;
+            }
+            if packet.kind == super::datagram::PacketKind::Application {
+                // Only ciphertext is buffered, with a fixed per-connection
+                // bound. Never apply 1-RTT until TLS and transport parameters pass.
+                if packet.destination == self.local.as_slice() && self.early_application.len() < 16 {
+                    self.early_application.push(packet.bytes.to_vec());
+                }
                 continue;
             }
             if !matches!(
@@ -494,8 +502,16 @@ impl Handshake {
         } else {
             &[][..]
         };
+        // A server chooses its own SCID in its first Initial, including
+        // after Retry. The Initial AEAD uses ODCID/Retry keys, not this SCID.
+        // TLS transport parameters subsequently authenticate the selection.
+        let proposed = if !self.server && !self.peer_progress {
+            crate::reality_quic_wire::long(packet).filter(|h| h.kind == crate::reality_quic_wire::Kind::Initial)
+                .map(|h| h.scid).filter(|cid| !cid.is_empty() && cid.len() <= 20 && *cid != self.local.as_slice())
+        } else { None };
+        let remote = proposed.unwrap_or(self.remote.as_slice());
         let Some((index, at)) =
-            parse_header(packet, self.version, &self.local, &self.remote, token)
+            parse_header(packet, self.version, &self.local, remote, token)
         else {
             return Ok(());
         };
@@ -509,6 +525,7 @@ impl Handshake {
             }
             Err(_) => return Ok(()),
         };
+        if let Some(cid) = proposed { self.remote = cid.to_vec(); }
         self.peer_progress = true;
         self.initial_frames.clear();
         let space = if index == 0 {
@@ -594,8 +611,8 @@ pub async fn establish(
         InitialRoute {
             version,
             local,
-            remote,
-            original,
+            remote: remote.to_vec(),
+            original: original.to_vec(),
             retry: None,
             token: Vec::new(),
             versions: if server { VersionPolicy::both() } else { VersionPolicy::exact(version) },
@@ -639,7 +656,7 @@ pub async fn connect_versions(local: SocketAddr, peer: SocketAddr, versions: Ver
         let cid = super::negotiation::random_cid().map_err(|_| Error::Protocol)?;
         let original = super::negotiation::random_cid().map_err(|_| Error::Protocol)?;
         if cid == original || cid == [0; CID_LEN] || original == [0; CID_LEN] { return Err(Error::Protocol); }
-        let route = InitialRoute { version, local: cid, remote: original, original, retry: None,
+        let route = InitialRoute { version, local: cid, remote: original.to_vec(), original: original.to_vec(), retry: None,
             token: Vec::new(), versions: versions.clone(), restarted };
         match establish_inner(socket.into(), peer, route, Config::Client { tls: tls.clone(), name: name.clone() }).await {
             Ok(session) => return Ok((version, session)),
@@ -654,11 +671,10 @@ pub async fn connect_versions(local: SocketAddr, peer: SocketAddr, versions: Ver
 /// TLS and CID parameters must still authenticate before returning a session.
 pub async fn accept(candidate: Candidate, tls: Arc<ServerConfig>) -> Result<LabSession, Error> {
     let (socket, peer, binding, token, versions) = candidate.into_parts();
-    let original =
-        <[u8; CID_LEN]>::try_from(binding.original.as_slice()).map_err(|_| Error::Protocol)?;
-    let remote =
-        <[u8; CID_LEN]>::try_from(binding.client.as_slice()).map_err(|_| Error::Protocol)?;
-    if remote == binding.retry || remote == [0; CID_LEN] || original == [0; CID_LEN] {
+    let original = binding.original;
+    let remote = binding.client;
+    if !(8..=20).contains(&original.len()) || remote.is_empty() || remote.len() > 20
+        || remote.as_slice() == binding.retry.as_slice() || remote.iter().all(|b| *b == 0) || original.iter().all(|b| *b == 0) {
         return Err(Error::Scope);
     }
     establish_inner(
@@ -669,7 +685,7 @@ pub async fn accept(candidate: Candidate, tls: Arc<ServerConfig>) -> Result<LabS
             local: binding.retry,
             remote,
             original,
-            retry: Some(binding.retry),
+            retry: Some(binding.retry.to_vec()),
             token,
             versions,
             restarted: false,
@@ -698,9 +714,9 @@ fn initial_keys(version: Version, destination: &[u8], server: bool) -> Result<Ke
 struct InitialRoute {
     version: Version,
     local: [u8; CID_LEN],
-    remote: [u8; CID_LEN],
-    original: [u8; CID_LEN],
-    retry: Option<[u8; CID_LEN]>,
+    remote: Vec<u8>,
+    original: Vec<u8>,
+    retry: Option<Vec<u8>>,
     token: Vec<u8>,
     versions: VersionPolicy,
     restarted: bool,
@@ -723,7 +739,7 @@ async fn establish_inner(
         restarted,
     } = route;
     let server = matches!(&config, Config::Server(_));
-    let parameters = params(server, version, &versions, &local, &original, retry.as_ref())?;
+    let parameters = params(server, version, &versions, &local, &original, retry.as_deref())?;
     let connection = match config {
         Config::Client { tls: config, name } => tls::client(config, version, name, parameters),
         Config::Server(config) => {
@@ -734,7 +750,7 @@ async fn establish_inner(
         }
     }
     .map_err(Error::Tls)?;
-    let destination = retry.as_ref().unwrap_or(&original);
+    let destination = retry.as_deref().unwrap_or(&original);
     let keys = initial_keys(version, destination, server)?;
     let mut handshake = Handshake {
         driver: Driver::new(connection),
@@ -750,10 +766,11 @@ async fn establish_inner(
         token,
         peer_progress: false,
         initial_frames: Vec::new(),
+        early_application: Vec::new(),
         versions,
         restarted,
     };
-    if server && retry.is_some() {
+    if server && handshake.retry.is_some() {
         handshake.budget.validate();
     }
     if socket.peer_addr().is_ok() {
@@ -792,11 +809,11 @@ async fn establish_inner(
         .validate(PeerContext {
             server: !server,
             initial_source: &handshake.remote,
-            original_destination: &original,
+            original_destination: &handshake.original,
             retry_source: if server {
                 None
             } else {
-                handshake.retry.as_ref().map(|cid| cid.as_slice())
+                handshake.retry.as_deref()
             },
         })
         .map_err(|_| Error::Protocol)?;
@@ -819,7 +836,7 @@ async fn establish_inner(
             epoch: handshake.epochs[1].take().ok_or(Error::Protocol)?,
             version,
             local,
-            remote: handshake.remote,
+            remote: handshake.remote.clone(),
             consumed: handshake.driver.consumed_handshake(),
             expires: Instant::now().checked_add(DEADLINE).ok_or(Error::Protocol)?,
         })
@@ -830,7 +847,7 @@ async fn establish_inner(
         peer,
         server,
         local,
-        handshake.remote,
+        &handshake.remote,
         super::endpoint::Established {
             keys,
             secrets,
@@ -839,6 +856,7 @@ async fn establish_inner(
             peer_limits: limits,
             peer_reset_token,
             tail,
+            early_application: handshake.early_application,
         },
     )
     .await
@@ -864,7 +882,7 @@ mod coalescing_tests {
                 epoch: Epoch::new(client_keys),
                 version,
                 local: client,
-                remote: server,
+                remote: server.to_vec(),
                 consumed: 8,
                 expires: now + DEADLINE,
             };
@@ -899,6 +917,34 @@ mod coalescing_tests {
             let h = header(version, 1, &server, &client, &[], &mut extra, 0).unwrap();
             let (_, extra) = writer.seal(&h, &extra).unwrap();
             assert!(matches!(tail.receive(&extra, at), Err(Error::Protocol)));
+        }
+    }
+
+    #[test]
+    fn long_headers_accept_independent_peer_cid_lengths() {
+        for version in [Version::V1, Version::V2] {
+            for len in [1, 8, 12, 20] {
+                let local = [1; CID_LEN];
+                let remote = vec![2; len];
+                let mut payload = vec![1];
+                let h = header(version, 1, &local, &remote, &[], &mut payload, 0).unwrap();
+                let mut packet = h.clone();
+                packet.extend_from_slice(&payload);
+                packet.extend([0; 16]);
+                // Receiver local CID remains eight bytes; verify the inverse
+                // direction with the variable peer source CID.
+                let mut inbound = vec![header_type(version, 1)];
+                inbound.extend(version.wire().to_be_bytes());
+                inbound.push(CID_LEN as u8);
+                inbound.extend(local);
+                inbound.push(len as u8);
+                inbound.extend(&remote);
+                inbound.extend_from_slice(&(21u16 | 0x4000).to_be_bytes());
+                inbound.extend([0; 21]);
+                assert_eq!(parse_header(&inbound, version, &local, &remote, &[]), Some((1, 17 + len)));
+                assert!(parse_header(&inbound, version, &local, &[3; 8], &[]).is_none());
+                assert_eq!(packet[5] as usize, len);
+            }
         }
     }
 

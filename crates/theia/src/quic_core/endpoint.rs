@@ -20,7 +20,7 @@ use super::{
 };
 use rustls::quic::{Keys, Secrets};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     io,
     net::SocketAddr,
     time::{Duration, Instant},
@@ -63,6 +63,7 @@ pub(crate) struct Established {
     pub peer_limits: super::parameters::Limits,
     pub peer_reset_token: Option<[u8; 16]>,
     pub tail: Option<HandshakeTail>,
+    pub early_application: Vec<Vec<u8>>,
 }
 
 pub struct LabSession {
@@ -76,6 +77,7 @@ pub struct LabSession {
     peer_ids: PeerIds,
     protection: Option<Protection>,
     handshake_tail: Option<HandshakeTail>,
+    early_application: VecDeque<Vec<u8>>,
     acknowledgments: History,
     send: SendFlow,
     receive: ReceiveFlow,
@@ -106,7 +108,7 @@ impl LabSession {
             peer,
             server,
             local_cid,
-            remote_cid,
+            &remote_cid,
             Protection::Fixed {
                 reader: Reader::new(keys.remote),
                 writer: Writer::new(keys.local),
@@ -123,7 +125,7 @@ impl LabSession {
         peer: SocketAddr,
         server: bool,
         local_cid: [u8; CID_LEN],
-        remote_cid: [u8; CID_LEN],
+        remote_cid: &[u8],
         established: Established,
     ) -> Result<Self, Error> {
         let Established {
@@ -134,6 +136,7 @@ impl LabSession {
             peer_limits,
             peer_reset_token,
             tail,
+            early_application,
         } = established;
         let mut session = Self::connect_inner(
             socket,
@@ -149,7 +152,7 @@ impl LabSession {
         )?;
         // Application-space native laboratory defaults to BBR; the
         // fixed-key codec fixture keeps the CUBIC scheduler for comparison.
-        session.peer_ids = PeerIds::with_initial(&remote_cid, peer_reset_token, 2).map_err(|_| Error::Protocol)?;
+        session.peer_ids = PeerIds::with_initial(remote_cid, peer_reset_token, 2).map_err(|_| Error::Protocol)?;
         session.peer_cid_limit = peer_limits.active_cid_limit.min(8) as usize;
         session.send = SendFlow::from_peer(server, peer_limits, MAX_STREAMS).map_err(Error::Send)?;
         session.scheduler = Scheduler::with_bbr(Instant::now());
@@ -157,6 +160,7 @@ impl LabSession {
         session.idle = Idle::new(Instant::now(), idle_timeout);
         session.binding = Some(binding);
         session.handshake_tail = tail;
+        session.early_application = early_application.into();
         if server {
             session
                 .scheduler
@@ -171,15 +175,15 @@ impl LabSession {
         peer: SocketAddr,
         server: bool,
         local_cid: [u8; CID_LEN],
-        remote_cid: [u8; CID_LEN],
+        remote_cid: &[u8],
         protection: Protection,
         confirmed: bool,
     ) -> Result<Self, Error> {
         let local = socket.local_addr().map_err(Error::Io)?;
         if !super::loopback_pair(local, peer)
-            || local_cid == remote_cid
+            || local_cid.as_slice() == remote_cid
             || local_cid == [0; CID_LEN]
-            || remote_cid == [0; CID_LEN]
+            || remote_cid.is_empty() || remote_cid.len() > 20 || remote_cid.iter().all(|b| *b == 0)
         {
             return Err(Error::Scope);
         }
@@ -210,9 +214,10 @@ impl LabSession {
             peer_cid_limit: 2,
             auto_cids: false,
             cid_retry_at: None,
-            peer_ids: PeerIds::with_initial(&remote_cid, None, 2).map_err(|_| Error::Protocol)?,
+            peer_ids: PeerIds::with_initial(remote_cid, None, 2).map_err(|_| Error::Protocol)?,
             protection: Some(protection),
             handshake_tail: None,
+            early_application: VecDeque::new(),
             acknowledgments: History::default(),
             send,
             receive,
@@ -553,6 +558,7 @@ impl LabSession {
         self.shutdown.abort();
         self.protection = None;
         self.handshake_tail = None;
+        self.early_application.clear();
         self.binding = None;
     }
 
@@ -778,19 +784,26 @@ impl LabSession {
         self.shutdown.peer(now, self.scheduler.base_pto()).map_err(|_| Error::Protocol)?;
         self.protection = None;
         self.handshake_tail = None;
+        self.early_application.clear();
         self.binding = None;
         Ok(())
     }
 
     async fn recv_inner(&mut self, wait: Duration, wake: Option<&tokio::sync::Notify>) -> Result<bool, Error> {
         let mut buf = [0; MTU + 1];
-        let incoming = tokio::time::timeout(wait, self.socket.recv_from(&mut buf));
-        let received = if let Some(wake) = wake {
-            tokio::select! { biased; packet = incoming => packet, _ = wake.notified() => return Ok(false) }
-        } else { incoming.await };
-        let (n, source) = match received {
-            Ok(result) => result.map_err(Error::Io)?,
-            Err(_) => return Ok(false),
+        let (n, source) = if let Some(packet) = self.early_application.pop_front() {
+            if packet.len() > MTU { return Err(Error::Protocol); }
+            buf[..packet.len()].copy_from_slice(&packet);
+            (packet.len(), self.paths.active())
+        } else {
+            let incoming = tokio::time::timeout(wait, self.socket.recv_from(&mut buf));
+            let received = if let Some(wake) = wake {
+                tokio::select! { biased; packet = incoming => packet, _ = wake.notified() => return Ok(false) }
+            } else { incoming.await };
+            match received {
+                Ok(result) => result.map_err(Error::Io)?,
+                Err(_) => return Ok(false),
+            }
         };
         if self.shutdown.phase() == ShutdownPhase::Draining {
             return Ok(false);
