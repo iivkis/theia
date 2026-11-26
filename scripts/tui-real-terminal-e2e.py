@@ -63,13 +63,19 @@ class Terminal:
     def _read(self):
         try:
             if self.win:
-                while self.win.isalive():
+                # Process exit does not mean the ConPTY output pipe is drained.
+                # Read the final restoration sequences and CLI result until EOF.
+                while True:
                     chunk = self.win.read()
                     if chunk:
                         with self.lock:
                             text = chunk if isinstance(chunk, str) else self.decoder.decode(chunk)
                             self.raw += text
                             self.stream.feed(text)
+                    elif not self.win.isalive():
+                        break
+                    else:
+                        time.sleep(0.01)
             else:
                 import select
 
@@ -132,6 +138,10 @@ class Terminal:
                     time.sleep(0.05)
                 if self.alive():
                     raise AssertionError("TUI did not exit after q")
+                # The reader can still have buffered bytes after process exit.
+                self.reader.join(timeout=7.0)
+                assert not self.reader.is_alive(), "PTY output did not drain after exit"
+                assert not self.error, "PTY output read failed after exit"
                 # The guard must leave alt-screen, restore cursor and return.
                 with self.lock:
                     output = self.raw
