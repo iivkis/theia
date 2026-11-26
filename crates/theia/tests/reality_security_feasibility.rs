@@ -167,35 +167,48 @@ fn replacement_v1_invite_rejects_unsupported_mode_and_identity_injection() {
         let wire = URL_SAFE_NO_PAD
             .decode(v1.strip_prefix("theia://v1/").unwrap())
             .unwrap();
-        let text = std::str::from_utf8(&wire).unwrap();
-        for profile in ["smart-reality-v1", "browser-h2-btls-v1", "reality"] {
-            let changed = text.replace(
-                "security_mode = \"own-tls\"",
-                &format!("security_mode = \"{profile}\""),
-            );
-            assert!(changed != text);
-            let encoded = URL_SAFE_NO_PAD.encode(changed.as_bytes());
-            let link = format!("theia://v1/{encoded}");
-            assert!(Invitation::decode(&link).is_err());
+        assert_eq!(wire[0], 1);
+        assert_eq!(wire[1], 0);
+        let rejects = |candidate: &[u8]| {
+            assert_ne!(candidate, wire.as_slice());
+            let encoded = URL_SAFE_NO_PAD.encode(candidate);
+            assert!(Invitation::decode(&format!("theia://v1/{encoded}")).is_err());
+        };
+
+        // The compact header has version, security mode, transport,
+        // XHTTP mode and flags. Unknown discriminants must fail closed.
+        for (index, value) in [(0, 2), (1, 1), (1, 2), (1, 255), (2, 3), (3, 3)] {
+            let mut changed = wire.clone();
+            changed[index] = value;
+            rejects(&changed);
         }
-        for candidate in [
-            text.replace("version = 1", "version = 2"),
-            format!("{text}server_public_key = \"test-only-key\"\n"),
-            format!("{text}security_mode = \"smart-reality-v1\"\n"),
-            format!("{text}trust_generation = 2\n"),
-            format!("{text}retired_keys = []\n"),
-            format!("{text}flow_shaping = \"required\"\n"),
-            format!("{text}insecure_skip_verify = true\n"),
-            format!("{text}tls_profile = \"default\"\n"),
-            format!("{text}[identity]\nrequired = true\n"),
+        for bit in 2..8 {
+            let mut changed = wire.clone();
+            changed[4] |= 1 << bit;
+            rejects(&changed);
+        }
+
+        // An Own-TLS invitation must not accept injected admission material.
+        let mut admission = wire.clone();
+        admission[4] |= 2;
+        let offset = 5 + if invite.has_token() { 32 } else { 0 };
+        admission.splice(offset..offset, [0x42; 32]);
+        rejects(&admission);
+
+        // Trailing identity, trust and anti-DPI fields cannot extend v1.
+        for extra in [
+            b"server_public_key = \"test-only-key\"\n".as_slice(),
+            b"trust_generation = 2\n",
+            b"retired_keys = []\n",
+            b"flow_shaping = \"required\"\n",
+            b"insecure_skip_verify = true\n",
+            b"tls_profile = \"default\"\n",
+            b"[identity]\nrequired = true\n",
+            &[0x42; 32],
         ] {
-            assert!(candidate != text);
-            let encoded = URL_SAFE_NO_PAD.encode(candidate.as_bytes());
-            let link = format!("theia://v1/{encoded}");
-            assert!(
-                Invitation::decode(&link).is_err(),
-                "v1 must reject new trust and anti-DPI fields"
-            );
+            let mut changed = wire.clone();
+            changed.extend_from_slice(extra);
+            rejects(&changed);
         }
     }
 }
