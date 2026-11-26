@@ -112,6 +112,10 @@ pub struct Writer {
 impl Writer {
     pub fn new(keys: DirectionalKeys) -> Self { Self { keys, next: 0 } }
 
+    pub(crate) fn with_next(keys: DirectionalKeys, next: u64) -> Self { Self { keys, next } }
+
+    pub(crate) fn next(&self) -> u64 { self.next }
+
     pub fn seal(&mut self, header: &[u8], payload: &[u8]) -> Result<(u64, Vec<u8>), Error> {
         if header.len() < 5 || header[0] & 3 != 3 { return Err(Error::Header); }
         let reserved = if header[0] & 0x80 != 0 { 0x0c } else { 0x18 };

@@ -48,6 +48,9 @@ pub struct Ledger {
 }
 
 impl Ledger {
+    /// Retry resets recovery, but never the packet-number sequence.
+    pub(crate) fn with_next(next: u64) -> Self { Self { next, ..Self::default() } }
+
     /// This stage requires contiguous attempted packet numbers. If sealing
     /// burns a number before transmission, the future owner must account for
     /// it explicitly instead of treating it as successfully sent.

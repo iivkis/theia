@@ -52,10 +52,13 @@ impl Epoch {
     }
 }
 
-fn params(server: bool, local: &[u8; CID_LEN], original: &[u8; CID_LEN]) -> Result<Vec<u8>, Error> {
+fn params(server: bool, local: &[u8; CID_LEN], original: &[u8; CID_LEN], retry: Option<&[u8; CID_LEN]>) -> Result<Vec<u8>, Error> {
     let mut out = Vec::new();
     parameters::append(&mut out, 0x0f, local).map_err(|_| Error::Protocol)?;
     if server { parameters::append(&mut out, 0x00, original).map_err(|_| Error::Protocol)?; }
+    if server {
+        if let Some(cid) = retry { parameters::append(&mut out, 0x10, cid).map_err(|_| Error::Protocol)?; }
+    }
     for (id, value) in [(0x03, MTU as u64), (0x04, CREDIT), (0x05, CREDIT), (0x06, CREDIT), (0x07, CREDIT), (0x08, STREAMS), (0x09, STREAMS)] {
         let mut scratch = [0; 8];
         let value = encode_varint(value, &mut scratch).ok_or(Error::Protocol)?;
@@ -76,14 +79,18 @@ fn header_type(version: Version, index: usize) -> u8 {
 /// Four-byte packet number and two-byte length, with padding INSIDE
 /// Initial AEAD. Exactly one long-header packet per datagram.
 fn header(version: Version, index: usize, local: &[u8; CID_LEN],
-          remote: &[u8; CID_LEN], payload: &mut Vec<u8>) -> Result<Vec<u8>, Error> {
+          remote: &[u8; CID_LEN], token: &[u8], payload: &mut Vec<u8>) -> Result<Vec<u8>, Error> {
     let mut out = vec![header_type(version, index)];
     out.extend_from_slice(&version.wire().to_be_bytes());
     out.push(CID_LEN as u8);
     out.extend_from_slice(remote);
     out.push(CID_LEN as u8);
     out.extend_from_slice(local);
-    if index == 0 { out.push(0); }
+    if index == 0 {
+        let mut scratch = [0; 8];
+        out.extend_from_slice(encode_varint(token.len() as u64, &mut scratch).ok_or(Error::Protocol)?);
+        out.extend_from_slice(token);
+    }
     let overhead = out.len() + 2 + 4 + 16;
     if payload.is_empty() || overhead + payload.len() > MTU { return Err(Error::Protocol); }
     if index == 0 { payload.resize(MTU - overhead, 0); }
@@ -94,7 +101,7 @@ fn header(version: Version, index: usize, local: &[u8; CID_LEN],
 }
 
 fn parse_header(packet: &[u8], version: Version, local: &[u8; CID_LEN],
-                remote: &[u8; CID_LEN]) -> Option<(usize, usize)> {
+                remote: &[u8; CID_LEN], expected_token: &[u8]) -> Option<(usize, usize)> {
     let ty = *packet.first()? & 0xf0;
     let index = if ty == header_type(version, 0) & 0xf0 { 0 }
         else if ty == header_type(version, 1) & 0xf0 { 1 } else { return None; };
@@ -104,7 +111,12 @@ fn parse_header(packet: &[u8], version: Version, local: &[u8; CID_LEN],
         return None;
     }
     let mut at = 23;
-    if index == 0 && varint(packet, &mut at)? != 0 { return None; }
+    if index == 0 {
+        let len = usize::try_from(varint(packet, &mut at)?).ok()?;
+        let end = at.checked_add(len)?;
+        if packet.get(at..end)? != expected_token { return None; }
+        at = end;
+    }
     let length = usize::try_from(varint(packet, &mut at)?).ok()?;
     if length < 20 || at.checked_add(length)? != packet.len() { return None; }
     Some((index, at))
@@ -119,6 +131,11 @@ struct Handshake {
     version: Version,
     local: [u8; CID_LEN],
     remote: [u8; CID_LEN],
+    original: [u8; CID_LEN],
+    retry: Option<[u8; CID_LEN]>,
+    token: Vec<u8>,
+    peer_progress: bool,
+    initial_frames: Vec<Vec<u8>>,
 }
 
 impl Handshake {
@@ -130,6 +147,9 @@ impl Handshake {
             if index >= 2 && !flight.data.is_empty() { return Err(Error::Protocol); }
             for (i, chunk) in flight.data.chunks(CHUNK).enumerate() {
                 let frame = crypto_frame(flight.offset + (i * CHUNK) as u64, chunk).map_err(|_| Error::Protocol)?;
+                if !self.server && index == 0 && !self.peer_progress && self.retry.is_none() {
+                    self.initial_frames.push(frame.clone());
+                }
                 self.epochs[index].as_mut().ok_or(Error::Protocol)?.schedule.enqueue(frame).map_err(Error::Schedule)?;
             }
             match flight.keys {
@@ -153,7 +173,8 @@ impl Handshake {
             } else if let Some((id, data, probe)) = epoch.schedule.candidate(now).map_err(Error::Schedule)? {
                 (data, Some((id, probe)))
             } else { continue; };
-            let h = header(self.version, index, &self.local, &self.remote, &mut payload)?;
+            let token = if self.server { &[][..] } else { self.token.as_slice() };
+            let h = header(self.version, index, &self.local, &self.remote, token, &mut payload)?;
             let expected = h.len() + payload.len() + 16;
             if self.server && !self.budget.reserve_send(expected as u64) { continue; }
             let (number, packet) = epoch.writer.seal(&h, &payload).map_err(Error::Packet)?;
@@ -168,9 +189,38 @@ impl Handshake {
         Ok(())
     }
 
+    fn apply_retry(&mut self, packet: &[u8]) -> Result<(), Error> {
+        if self.server { return Ok(()); }
+        let Ok((cid, token)) = super::negotiation::retry_token(packet, self.version, &self.local,
+            &self.original, self.retry.is_some(), self.peer_progress) else { return Ok(()); };
+        let Ok(cid) = <[u8; CID_LEN]>::try_from(cid) else { return Ok(()); };
+        // Bound the opaque token to leave room for the original CRYPTO chunks.
+        if cid == self.local || token.is_empty() || token.len() > 200 { return Ok(()); }
+        let next = self.epochs[0].as_ref().ok_or(Error::Protocol)?.writer.next();
+        let keys = initial_keys(self.version, &cid, false)?;
+        let mut epoch = Epoch::new(keys);
+        // Keep TLS and CRYPTO offsets; only Initial protection and recovery
+        // are reset. The packet number MUST continue across Retry.
+        let keys = initial_keys(self.version, &cid, false)?;
+        epoch.writer = Writer::with_next(keys.local, next);
+        epoch.schedule = Scheduler::after_retry(next);
+        for frame in self.initial_frames.drain(..) {
+            epoch.schedule.enqueue(frame).map_err(Error::Schedule)?;
+        }
+        self.epochs[0] = Some(epoch);
+        self.remote = cid;
+        self.retry = Some(cid);
+        self.token = token.to_vec();
+        Ok(())
+    }
+
     fn receive_datagram(&mut self, datagram: &[u8]) -> Result<(), Error> {
         let Ok(packets) = super::datagram::split(datagram) else { return Ok(()); };
         for packet in packets {
+            if packet.kind == super::datagram::PacketKind::Retry {
+                self.apply_retry(packet.bytes)?;
+                continue;
+            }
             if !matches!(packet.kind, super::datagram::PacketKind::Initial | super::datagram::PacketKind::Handshake) {
                 continue;
             }
@@ -183,13 +233,16 @@ impl Handshake {
     }
 
     fn receive(&mut self, packet: &[u8]) -> Result<(), Error> {
-        let Some((index, at)) = parse_header(packet, self.version, &self.local, &self.remote) else { return Ok(()); };
+        let token = if self.server { self.token.as_slice() } else { &[][..] };
+        let Some((index, at)) = parse_header(packet, self.version, &self.local, &self.remote, token) else { return Ok(()); };
         let Some(epoch) = self.epochs[index].as_mut() else { return Ok(()); };
         let opened = match epoch.reader.open(packet, at) {
             Ok(p) => p,
             Err(packet::Error::Reserved | packet::Error::Limit) if index == 1 => return Err(Error::Protocol),
             Err(_) => return Ok(()),
         };
+        self.peer_progress = true;
+        self.initial_frames.clear();
         let space = if index == 0 { Space::Initial } else { Space::Handshake };
         let level = if index == 0 { Level::Initial } else { Level::Handshake };
         let parsed = frames::decode(&opened.payload, space).map_err(|_| Error::Protocol)?;
@@ -238,7 +291,20 @@ pub async fn establish(socket: UdpSocket, peer: SocketAddr, version: Version,
     }
     let server = matches!(&config, Config::Server(_));
     let original = if server { local } else { remote };
-    let parameters = params(server, &local, &original)?;
+    establish_inner(socket, peer, version, local, remote, original, None, Vec::new(), config).await
+}
+
+fn initial_keys(version: Version, destination: &[u8], server: bool) -> Result<Keys, Error> {
+    let suite = TLS13_AES_128_GCM_SHA256.tls13().and_then(|s| s.quic_suite()).ok_or(Error::Protocol)?;
+    let version_tls = match version { Version::V1 => quic::Version::V1, Version::V2 => quic::Version::V2 };
+    Ok(suite.keys(destination, if server { Side::Server } else { Side::Client }, version_tls))
+}
+
+async fn establish_inner(socket: UdpSocket, peer: SocketAddr, version: Version,
+    local: [u8; CID_LEN], remote: [u8; CID_LEN], original: [u8; CID_LEN],
+    retry: Option<[u8; CID_LEN]>, token: Vec<u8>, config: Config) -> Result<LabSession, Error> {
+    let server = matches!(&config, Config::Server(_));
+    let parameters = params(server, &local, &original, retry.as_ref())?;
     let connection = match config {
         Config::Client { tls: config, name } => tls::client(config, version, name, parameters),
         Config::Server(config) => {
@@ -246,11 +312,12 @@ pub async fn establish(socket: UdpSocket, peer: SocketAddr, version: Version,
             tls::server(config, version, parameters)
         }
     }.map_err(Error::Tls)?;
-    let suite = TLS13_AES_128_GCM_SHA256.tls13().and_then(|s| s.quic_suite()).ok_or(Error::Protocol)?;
-    let version_tls = match version { Version::V1 => quic::Version::V1, Version::V2 => quic::Version::V2 };
-    let keys = suite.keys(&original, if server { Side::Server } else { Side::Client }, version_tls);
+    let destination = retry.as_ref().unwrap_or(&original);
+    let keys = initial_keys(version, destination, server)?;
     let mut handshake = Handshake { driver: Driver::new(connection), epochs: [Some(Epoch::new(keys)), None],
-        application: None, budget: PathBudget::default(), server, version, local, remote };
+        application: None, budget: PathBudget::default(), server, version, local, remote,
+        original, retry, token, peer_progress: false, initial_frames: Vec::new() };
+    if server && retry.is_some() { handshake.budget.validate(); }
     if socket.peer_addr().is_ok() { return Err(Error::Scope); }
     tokio::time::timeout(DEADLINE, async {
         let mut buffer = [0; MTU + 1];
@@ -269,14 +336,14 @@ pub async fn establish(socket: UdpSocket, peer: SocketAddr, version: Version,
     if handshake.driver.negotiated_alpn() != Some(b"h3".as_slice()) { return Err(Error::Protocol); }
     let peer_params = Parameters::parse(handshake.driver.peer_parameters().ok_or(Error::Protocol)?)
         .map_err(|_| Error::Protocol)?;
-    let limits = peer_params.validate(PeerContext { server: !server, initial_source: &remote,
-        original_destination: &original, retry_source: None }).map_err(|_| Error::Protocol)?;
+    let limits = peer_params.validate(PeerContext { server: !server, initial_source: &handshake.remote,
+        original_destination: &original, retry_source: if server { None } else { handshake.retry.as_ref().map(|cid| cid.as_slice()) } }).map_err(|_| Error::Protocol)?;
     if limits.max_data != CREDIT || limits.max_streams_uni != STREAMS
         || limits.max_streams_bidi != STREAMS || limits.max_udp_payload != MTU as u64
         || [0x05, 0x06, 0x07].into_iter().any(|id| peer_params.integer(id) != Ok(Some(CREDIT))) {
         return Err(Error::Protocol);
     }
     let (keys, secrets) = handshake.application.take().ok_or(Error::Protocol)?;
-    LabSession::after_handshake(socket, peer, server, local, remote, keys, secrets)
+    LabSession::after_handshake(socket, peer, server, local, handshake.remote, keys, secrets)
         .await.map_err(Error::Endpoint)
 }

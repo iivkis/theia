@@ -43,6 +43,10 @@ impl Default for Scheduler {
 }
 
 impl Scheduler {
+    pub(crate) fn after_retry(next: u64) -> Self {
+        Self { ledger: Ledger::with_next(next), ..Self::default() }
+    }
+
     pub fn with_bbr(now: Instant) -> Self {
         Self { bbr: Some(Bbr::new(MTU, now).expect("valid MTU")), ..Self::default() }
     }
