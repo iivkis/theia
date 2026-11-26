@@ -17,6 +17,7 @@ use std::{
 const MAX_FRAMES: usize = 128;
 const MAX_ALIASES: usize = 4096;
 const MAX_PTO: u32 = 8;
+const MAX_HISTORY: usize = 8192;
 const MTU: u64 = 1200;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,7 +41,17 @@ struct LossUndo {
     cubic: super::congestion::Undo,
     bbr: Option<super::bbr::Undo>,
     pending: BTreeSet<u64>,
+    boundary: u64,
     expires: Instant,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TxState { Pending, Acked, Lost, Neutral }
+
+struct TxHistory {
+    at: Instant,
+    space: u64,
+    state: TxState,
 }
 
 struct PathControl {
@@ -53,6 +64,9 @@ struct PathControl {
     persistent_reported: Option<Instant>,
     next_tx: u64,
     last_tx: Option<u64>,
+    next_space: u64,
+    history: BTreeMap<u64, TxHistory>,
+    application_max_ack_delay: Duration,
     undo: Option<LossUndo>,
 }
 
@@ -68,15 +82,42 @@ impl PathControl {
             persistent_reported: None,
             next_tx: 0,
             last_tx: None,
+            next_space: 1,
+            history: BTreeMap::new(),
+            application_max_ack_delay: Duration::ZERO,
             undo: None,
         }
     }
 
-    fn allocate(&mut self) -> Result<u64, Error> {
+    fn allocate(&mut self, space: u64, now: Instant, eliciting: bool) -> Result<u64, Error> {
         let id = self.next_tx;
         self.next_tx = id.checked_add(1).ok_or(Error::Limit)?;
         self.last_tx = Some(id);
+        if eliciting {
+            self.history.insert(id, TxHistory { at: now, space, state: TxState::Pending });
+            if self.history.len() > MAX_HISTORY { self.history.pop_first(); }
+        }
         Ok(id)
+    }
+
+    fn persistent_end(&self, first: Instant, threshold: Duration) -> Option<Instant> {
+        let mut start = None;
+        let mut end = None;
+        for entry in self.history.values() {
+            if entry.at < first || entry.state != TxState::Lost {
+                start = None;
+                continue;
+            }
+            let begin = *start.get_or_insert(entry.at);
+            if entry.at.saturating_duration_since(begin) >= threshold {
+                end = Some(entry.at);
+            }
+        }
+        end
+    }
+
+    fn state(&mut self, tx: u64, state: TxState) {
+        if let Some(entry) = self.history.get_mut(&tx) { entry.state = state; }
     }
 }
 
@@ -85,6 +126,7 @@ type SharedPath = Arc<Mutex<PathControl>>;
 pub struct Scheduler {
     ledger: Ledger,
     path: SharedPath,
+    space: u64,
     // Wire packet numbers overlap across spaces; BBR and HyStart use a
     // monotone connection-local transmission ID instead.
     active_tx: BTreeMap<u64, u64>,
@@ -107,6 +149,7 @@ impl Default for Scheduler {
         Self {
             ledger: Ledger::default(),
             path: Arc::new(Mutex::new(PathControl::new(None))),
+            space: 0,
             active_tx: BTreeMap::new(),
             lost_tx: BTreeMap::new(),
             ack_delay_exponent: 0,
@@ -134,6 +177,9 @@ impl Scheduler {
     pub(crate) fn fork_space(&self) -> Self {
         let mut scheduler = Self::default();
         scheduler.path = self.path.clone();
+        let mut path = self.path.lock().expect("path lock");
+        scheduler.space = path.next_space;
+        path.next_space = path.next_space.checked_add(1).expect("bounded packet spaces");
         scheduler
     }
 
@@ -160,9 +206,13 @@ impl Scheduler {
         let mut path = self.path.lock().expect("path lock");
         debug_assert_eq!(path.window.in_flight(), self.ledger.bytes_in_flight());
         let next_tx = path.next_tx;
+        let next_space = path.next_space;
+        let app_delay = path.application_max_ack_delay;
         let bbr = path.bbr.as_ref().map(|_| Bbr::new(MTU, now).expect("valid MTU"));
         *path = PathControl::new(bbr);
         path.next_tx = next_tx;
+        path.next_space = next_space;
+        path.application_max_ack_delay = app_delay;
         self.ledger.restart_path();
         self.active_tx.clear();
         self.lost_tx.clear();
@@ -416,7 +466,7 @@ impl Scheduler {
                     .map_err(|_| Error::Window)?;
                 return Err(Error::Ledger);
             }
-            let tx = path.allocate()?;
+            let tx = path.allocate(self.space, now, true)?;
             self.active_tx.insert(number, tx);
             if let Some(bbr) = path.bbr.as_mut() {
                 bbr.sent(tx, bytes as u64, now, before, app_limited)
@@ -496,7 +546,7 @@ impl Scheduler {
                 .map_err(|_| Error::Window)?;
             return Err(Error::Ledger);
         }
-        let tx = path.allocate()?;
+        let tx = path.allocate(self.space, now, eliciting)?;
         self.active_tx.insert(number, tx);
         if let Some(bbr) = path.bbr.as_mut() {
             bbr.sent(tx, bytes as u64, now, before, true)
@@ -517,6 +567,7 @@ impl Scheduler {
     ) {
         self.ack_delay_exponent = exponent.min(20) as u32;
         self.max_ack_delay = Duration::from_millis(max_delay_ms.min((1 << 14) - 1));
+        self.path.lock().expect("path lock").application_max_ack_delay = self.max_ack_delay;
         self.confirmed = confirmed;
     }
 
@@ -631,9 +682,12 @@ impl Scheduler {
             }
         }
         let mut path = self.path.lock().expect("path lock");
-        let pto = path.rtt.pto(self.ack_delay_limit(), 0);
+        let pto = path.rtt.pto(path.application_max_ack_delay, 0);
+        for p in &model.acknowledged { path.state(p.number, TxState::Acked); }
+        for p in &model.late_acknowledged { path.state(p.number, TxState::Acked); }
+        for p in &model.lost { path.state(p.number, if p.frames.contains(&FrameRef::MtuProbe) { TxState::Neutral } else { TxState::Lost }); }
         let persistent = path.first_rtt_at.filter(|_| !outcome.lost.is_empty()).and_then(|first| {
-            self.ledger.persistent_end(first, pto.saturating_mul(3))
+            path.persistent_end(first, pto.saturating_mul(3))
         }).filter(|end| path.persistent_reported.is_none_or(|old| *end > old));
         // Undo is intentionally stricter than a heuristic: only a complete
         // set of late original-PN ACKs proves the loss event spurious.
@@ -644,18 +698,23 @@ impl Scheduler {
         if persistent.is_some() {
             path.undo = None;
         } else if !congestion.is_empty() {
-            // Multiple loss batches might overlap a prior congestion event.
-            // Never undo an older reduction on evidence of a newer batch.
-            if path.undo.take().is_none() {
-                let snapshot = LossUndo {
+            let same_episode = path.undo.as_ref().is_some_and(|undo| {
+                congestion.last().is_some_and(|tx| *tx <= undo.boundary)
+                    && undo.pending.len().saturating_add(congestion.len()) <= MAX_HISTORY
+            });
+            if same_episode {
+                if let Some(undo) = path.undo.as_mut() { undo.pending.extend(congestion); }
+            } else {
+                path.undo = Some(LossUndo {
                     cubic: path.window.checkpoint(),
                     bbr: path.bbr.as_ref().map(Bbr::checkpoint),
                     pending: congestion,
+                    boundary: path.last_tx.unwrap_or(0),
                     expires: now.checked_add(pto.saturating_mul(3).min(Duration::from_secs(30))).ok_or(Error::Limit)?,
-                };
-                path.undo = Some(snapshot);
+                });
             }
-        } else if let Some(undo) = path.undo.as_mut() {
+        }
+        if let Some(undo) = path.undo.as_mut() {
             for packet in &model.late_acknowledged { undo.pending.remove(&packet.number); }
         }
         let in_flight = path.window.in_flight();
@@ -736,6 +795,11 @@ impl Scheduler {
         self.last_eliciting?.checked_add(path.rtt.pto(self.ack_delay_limit(), path.pto_count))
     }
 
+    pub(crate) fn pacing_deadline(&self) -> Option<Instant> {
+        let path = self.path.lock().expect("path lock");
+        (path.window.in_flight().saturating_add(MTU) <= path.window.cwnd()).then_some(path.next_send).flatten()
+    }
+
     pub fn deadline(&self) -> Option<Instant> {
         let (loss, pace) = {
             let path = self.path.lock().expect("path lock");
@@ -755,6 +819,9 @@ impl Drop for Scheduler {
     fn drop(&mut self) {
         let Ok(mut path) = self.path.lock() else { return; };
         if path.undo.as_ref().is_some_and(|undo| self.lost_tx.values().any(|id| undo.pending.contains(id))) { path.undo = None; }
+        // A discarded space can no longer prove delivery of its packets.
+        // Keep a neutral barrier instead of joining loss intervals across it.
+        for entry in path.history.values_mut().filter(|entry| entry.space == self.space) { entry.state = TxState::Neutral; }
         if self.ledger.bytes_in_flight() != 0 { path.pto_count = 0; }
         let _ = path.window.retire(self.ledger.bytes_in_flight());
         if let Some(bbr) = path.bbr.as_mut() {
@@ -776,6 +843,24 @@ mod tests {
             ranges: vec![Range { first: n, last: n }],
             ecn: None,
         }
+    }
+
+    #[test]
+    fn persistent_congestion_is_connection_wide_and_ack_is_a_barrier() {
+        let now = Instant::now();
+        let delta = Duration::from_millis(100);
+        let mut path = PathControl::new(None);
+        let a = path.allocate(0, now, true).unwrap();
+        let b = path.allocate(1, now + delta, true).unwrap();
+        let c = path.allocate(2, now + delta * 3, true).unwrap();
+        path.state(a, TxState::Lost);
+        path.state(b, TxState::Lost);
+        path.state(c, TxState::Lost);
+        assert_eq!(path.persistent_end(now, delta * 3), Some(now + delta * 3));
+        path.state(b, TxState::Acked);
+        assert_eq!(path.persistent_end(now, delta * 3), None);
+        path.state(b, TxState::Neutral);
+        assert_eq!(path.persistent_end(now, delta * 3), None);
     }
 
     #[test]
@@ -882,7 +967,7 @@ mod tests {
         assert_eq!(s.current_mtu(), size);
         s.enqueue(vec![1]).unwrap();
         s.enqueue(vec![1]).unwrap();
-        let later = at + Duration::from_millis(10);
+        let later = s.path.lock().unwrap().next_send.unwrap().max(at + Duration::from_millis(10));
         let (ids, bytes, probe) = s.candidate_batch(later, size - 29).unwrap().unwrap();
         assert_eq!(bytes, [1, 1]);
         assert_eq!(ids.len(), 2);

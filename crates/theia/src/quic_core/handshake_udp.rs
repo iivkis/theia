@@ -548,7 +548,13 @@ impl Handshake {
         self.epochs
             .iter()
             .flatten()
-            .filter_map(|epoch| epoch.schedule.deadline())
+            .filter_map(|epoch| {
+                let deadline = epoch.schedule.deadline();
+                // Client Initial ACK-only packets require padding and can
+                // be deferred by the shared pacing window.
+                let ack_pace = (!self.server && epoch.ack.pending()).then(|| epoch.schedule.pacing_deadline()).flatten();
+                [deadline, ack_pace].into_iter().flatten().min()
+            })
             .filter(|at| *at > now || !self.server || self.budget.can_send(MTU as u64))
             .min()
             .map_or(DEADLINE, |at| {

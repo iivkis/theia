@@ -286,6 +286,7 @@ impl Ledger {
     /// RFC 9002 persistent congestion can span multiple ACK/loss events.
     /// An unresolved or ACKed ack-eliciting packet breaks the run; ignored
     /// ACK-only numbers do not. Bounded history eviction is conservative.
+    #[cfg(test)]
     pub(crate) fn persistent_end(&self, first_rtt: Instant, threshold: Duration) -> Option<Instant> {
         let mut start = None;
         let mut end = None;
