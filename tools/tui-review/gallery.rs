@@ -1,10 +1,14 @@
 // Included inside tui::tests only by the dedicated Linux visual-review workflow.
 fn review_capture(name: &str, model: &Model, ui: &Interaction) {
+    ui.viewport.reset();
+    review_capture_current(name, model, ui);
+}
+
+fn review_capture_current(name: &str, model: &Model, ui: &Interaction) {
     use std::io::Write;
     let root = std::path::PathBuf::from(std::env::var_os("THEIA_REVIEW_CELLS").unwrap());
     let (width, height) = (120u16, 40u16);
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-    ui.viewport.reset();
     terminal.draw(|f| draw(f, model, Some(ui))).unwrap();
     let mut out = std::io::BufWriter::new(std::fs::File::create(root.join(format!("{name}.cells"))).unwrap());
     writeln!(out, "{width}\t{height}").unwrap();
@@ -30,7 +34,7 @@ fn visual_review_gallery() {
     // the real renderer and offline test-only state fixtures.
     {
         let path = root.join("wizard-review-only.toml");
-        let model = Model::new(Some(Role::Server));
+        let mut model = Model::new(Some(Role::Server));
         for (name, panel) in ProvisionPanel::review_wizard_stages(path.clone()) {
             let mut ui = Interaction::new(None);
             ui.reality_provision = Some(panel);
@@ -44,9 +48,18 @@ fn visual_review_gallery() {
                 let screen = rendered_interaction(120, 40, &model, &ui);
                 assert!(screen.contains("Конфигурация к сохранению"));
             }
-            if name == "state-reality-step6-success" {
+            if name == "state-reality-step5-long-report" {
+                assert!(ui.viewport.max.get() > 0);
+                let last = ui.reality_provision.as_ref().unwrap().reference_review().unwrap().rows.last().unwrap().name.clone();
+                for _ in 0..10 {
+                    if ui.viewport.offset.get() == ui.viewport.max.get() { break; }
+                    ui.update(&mut model, press(KeyCode::PageDown));
+                    let _ = rendered_interaction(120, 40, &model, &ui);
+                }
+                assert_eq!(ui.viewport.offset.get(), ui.viewport.max.get());
                 let screen = rendered_interaction(120, 40, &model, &ui);
-                assert!(screen.contains("Подключение REALITY создано"));
+                assert!(screen.contains("TLS / H2 / H3") && screen.contains(&last));
+                review_capture_current("state-reality-step5-long-report-scrolled", &model, &ui);
             }
             assert!(!path.exists());
         }
@@ -55,6 +68,21 @@ fn visual_review_gallery() {
         let mut ui = Interaction::new(Some(editor));
         ui.reality_provision = Some(panel);
         review_capture("state-reality-step1-grant-picker", &model, &ui);
+
+        let saved = root.join("wizard-saved-fixture.toml");
+        let (panel, editor) = ProvisionPanel::review_saved_wizard(saved.clone());
+        let before = std::fs::read(&saved).unwrap();
+        let mut ui = Interaction::new(Some(editor));
+        ui.reality_provision = Some(panel);
+        review_capture("state-reality-step6-success", &model, &ui);
+        let screen = rendered_interaction(120, 40, &model, &ui);
+        assert!(screen.contains("Подключение REALITY создано") && screen.contains("Выпустить ключ доступа"));
+        ui.update(&mut model, press(KeyCode::Right));
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(matches!(&ui.issuance, Some(IssueFlow::Input(id)) if id == "phone"));
+        assert!(!ui.editor.as_ref().unwrap().dirty() && !ui.server_process.running());
+        assert_eq!(std::fs::read(&saved).unwrap(), before);
+        review_capture("state-reality-step6-key-handoff", &model, &ui);
     }
     // Real first-run import through the production state machine, using a synthetic invitation.
     first_key_import_fixture(&root.join("first-own-tls"), review_capture);

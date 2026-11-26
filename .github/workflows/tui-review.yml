@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # Exact source snapshot for this review, not a moving branch.
-          ref: c338da46ed998bb5de77fd5d4a90e4b2bef54da3
+          ref: dce73bf1fd7f78f285b4e6150edb826639b257b6
           path: source
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -104,6 +104,8 @@ jobs:
             save_recovery_does_not_retry_uncertain_or_changed_paths \
             reference_review_keeps_rejected_rows_and_long_values_visible \
             first_server_wizard_publishes_only_after_review_and_never_overwrites \
+            multiline_domain_draft_preserves_cancel_and_bounds \
+            reality_success_handoff_opens_key_draft_without_issuing_or_starting \
             visual_review_gallery
           do
             echo "::group::$test"
@@ -153,7 +155,7 @@ jobs:
           from pathlib import Path
           src = Path(os.environ["RUNNER_TEMP"]) / "tui-gallery"
           manifest = json.loads((src / "manifest.json").read_text())
-          assert manifest["source_sha"] == "c338da46ed998bb5de77fd5d4a90e4b2bef54da3"
+          assert manifest["source_sha"] == "dce73bf1fd7f78f285b4e6150edb826639b257b6"
           assert (manifest["platform"], manifest["columns"], manifest["rows"]) == ("linux",120,40)
           expected = {"manifest.json", "README.md"}
           for entry in manifest["screens"]:
@@ -167,6 +169,7 @@ jobs:
               assert hashlib.sha256(data).hexdigest() == entry["sha256"]
           required_wizard = set(["server-first-reality-dns-expanded.png","state-reality-step4-tls-consent.png","state-reality-step4-tls-progress.png","state-reality-step4-tls-recheck.png","state-reality-step5-ranked-review.png","state-reality-step5-no-eligible.png","state-reality-step6-saving.png","state-reality-step6-save-error.png","state-reality-step6-save-uncertain.png"])
           required_wizard.update(["state-reality-step4-tls-expanded.png","state-reality-step3-dns-progress.png","state-reality-step5-ranked-expanded.png","state-reality-step5-long-report.png","state-reality-step5-no-eligible-expanded.png","state-reality-step6-save-inspection.png","state-reality-step6-success.png","state-reality-step2-extra-sources.png","state-reality-step1-grant-picker.png"])
+          required_wizard.update(["state-reality-step2-domain-editor.png","state-reality-step5-long-report-scrolled.png","state-reality-step6-key-handoff.png"])
           assert required_wizard <= expected, f"missing REALITY wizard screenshots: {required_wizard - expected}"
           assert len(expected) >= 52
           assert {p.name for p in src.iterdir()} == expected

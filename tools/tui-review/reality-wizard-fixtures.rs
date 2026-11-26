@@ -141,10 +141,10 @@ impl ProvisionPanel {
         screens.push(("state-reality-step6-save-inspection", panel));
 
         let (mut panel, _) = setup();
-        // Presentation-only fixture: the real create/poll transition is tested separately.
-        panel.wizard.as_mut().unwrap().stage = WizardStage::Success;
-        assert!(panel.succeeded());
-        screens.push(("state-reality-step6-success", panel));
+        panel.key(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE));
+        assert!(panel.wizard.as_ref().unwrap().domain_draft.is_some());
+        panel.paste("\nextra.example.org\nexample.net");
+        screens.push(("state-reality-step2-domain-editor", panel));
 
         let (mut panel, _) = setup();
         let wizard = panel.wizard.as_mut().unwrap();
@@ -156,6 +156,38 @@ impl ProvisionPanel {
         screens.push(("state-reality-step2-extra-sources", panel));
         assert!(!path.exists());
         screens
+    }
+
+    // Exercise the actual offline create/poll path in the isolated temporary
+    // directory. Observations are synthetic; no site is contacted.
+    pub(crate) fn review_saved_wizard(path: PathBuf) -> (Self, Editor) {
+        let mut panel = Self::first(path.clone()).unwrap();
+        let wizard = panel.wizard.as_mut().unwrap();
+        wizard.fields[2] = "93.184.216.1".into();
+        wizard.suggest_own_ip();
+        wizard.fields[5] = "phone".into();
+        wizard.sources = true;
+        wizard.catalogue = false;
+        wizard.custom_enabled = true;
+        wizard.fields[4] = "reference.example.org".into();
+        let input = WizardInput::parse(path, None, &wizard.effective_fields()).unwrap();
+        let (state, report) = rank_checked(
+            &input,
+            vec![reference_health::Target { server_name: "reference.example.org".into(), address: "93.184.216.2:443".parse().unwrap() }],
+            vec![reference_health::Evidence { h2_status: Some(200), h3_status: None }],
+            reference_health::unix_now().unwrap(),
+            Vec::new(),
+        ).unwrap();
+        wizard.stage = WizardStage::CreateConfirm(Box::new((input, state.unwrap(), report)));
+        panel.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let editor = loop {
+            if let Some(editor) = panel.poll() { break editor; }
+            assert!(std::time::Instant::now() < deadline, "{}", panel.body());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(panel.succeeded() && editor.selected_reality());
+        (panel, editor)
     }
 
     pub(crate) fn review_grant_picker(editor: &Editor) -> Self {

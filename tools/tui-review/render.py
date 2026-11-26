@@ -83,6 +83,7 @@ def main():
     required.update({"client-first-key-input", "client-first-key-trust", "client-first-key-save-review", "client-first-key-saved", "client-first-key-connect"})
     required.update(["server-first-reality-dns-expanded","state-reality-step4-tls-consent","state-reality-step4-tls-progress","state-reality-step4-tls-recheck","state-reality-step5-ranked-review","state-reality-step5-no-eligible","state-reality-step6-saving","state-reality-step6-save-error","state-reality-step6-save-uncertain"])
     required.update(["state-reality-step4-tls-expanded","state-reality-step3-dns-progress","state-reality-step5-ranked-expanded","state-reality-step5-long-report","state-reality-step5-no-eligible-expanded","state-reality-step6-save-inspection","state-reality-step6-success","state-reality-step2-extra-sources","state-reality-step1-grant-picker"])
+    required.update(["state-reality-step2-domain-editor","state-reality-step5-long-report-scrolled","state-reality-step6-key-handoff"])
     missing = required - {e["scenario"] for e in entries}
     assert not missing, f"missing required screens: {sorted(missing)}"
     hashes = {e["scenario"]: e["sha256"] for e in entries}
