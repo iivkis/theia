@@ -115,4 +115,39 @@ mod tests {
         assert!(client(Arc::new(cc), Version::V1, ServerName::try_from("localhost").unwrap(), vec![]).is_err());
         assert!(server(Arc::new(sc), Version::V2, vec![]).is_err());
     }
+    #[test]
+    fn crypto_driver_reassembles_and_separates_tls_levels() {
+        use crate::quic_core::handshake::{Driver, Level};
+        for v in [Version::V1, Version::V2] {
+            let (cc, sc) = configs();
+            let mut c = Driver::new(client(Arc::new(cc), v, ServerName::try_from("localhost").unwrap(), vec![1, 1, 1]).unwrap());
+            let mut s = Driver::new(server(Arc::new(sc), v, vec![1, 1, 2]).unwrap());
+            let first = c.poll_output().unwrap().unwrap();
+            assert_eq!(first.level, Level::Initial);
+            let split = first.data.len() / 2;
+            s.receive(first.level, split as u64, &first.data[split..]).unwrap();
+            assert!(s.poll_output().unwrap().is_none());
+            s.receive(first.level, 0, &first.data[..split]).unwrap();
+            // Synchronize each side's key transitions before passing the
+            // next level's data, as a real packet engine must do.
+            for _ in 0..16 {
+                while let Some(f) = s.poll_output().unwrap() {
+                    if !f.data.is_empty() { c.receive(f.level, f.offset, &f.data).unwrap(); }
+                    if f.keys.is_some() {
+                        while let Some(reply) = c.poll_output().unwrap() {
+                            if !reply.data.is_empty() { s.receive(reply.level, reply.offset, &reply.data).unwrap(); }
+                        }
+                    }
+                }
+                while let Some(f) = c.poll_output().unwrap() {
+                    if !f.data.is_empty() { s.receive(f.level, f.offset, &f.data).unwrap(); }
+                }
+                if c.tls_complete() && s.tls_complete() { break; }
+            }
+            assert!(c.tls_complete() && s.tls_complete());
+            assert_eq!(c.negotiated_alpn(), Some(b"h3".as_slice()));
+            assert_eq!(c.peer_parameters(), Some([1, 1, 2].as_slice()));
+        }
+    }
+
 }

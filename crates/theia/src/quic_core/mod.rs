@@ -4,6 +4,7 @@
 
 pub mod ack;
 pub mod flow;
+pub mod handshake;
 pub mod initial;
 pub mod lifecycle;
 pub mod loss;
