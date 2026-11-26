@@ -5,6 +5,8 @@
 pub mod ack;
 pub mod flow;
 pub mod initial;
+pub mod lifecycle;
+pub mod loss;
 pub mod packet;
 pub mod parameters;
 pub mod recovery;
