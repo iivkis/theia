@@ -295,23 +295,44 @@ fn visual_review_gallery() {
             assert!(!new_path.exists());
         }
 
-        let labels = if role == Role::Server {
-            ["overview", "connections", "users", "invitations", "traffic", "settings", "diagnostics"]
+        let labels: &[(&str, &str)] = if role == Role::Server {
+            &[("overview", "Обзор"), ("connections", "Подключения"),
+              ("users", "Пользователи и ключи"), ("management", "Управление"),
+              ("traffic", "Статистика"), ("settings", "Настройки"), ("diagnostics", "Диагностика")]
         } else {
-            ["overview", "profiles", "import", "proxy", "traffic", "settings", "diagnostics"]
+            &[("overview", "Обзор"), ("profiles", "Профили"),
+              ("import", "Импорт ключа"), ("proxy", "Подключение"),
+              ("traffic", "Статистика"), ("settings", "Настройки")]
         };
-        for (page, label) in labels.iter().enumerate() {
+        assert_eq!(labels.len(), pages(role).len());
+        let mut action_keys = std::collections::HashSet::new();
+        for (page, (label, title)) in labels.iter().enumerate() {
+            assert_eq!(pages(role)[page], *title);
+            for item in page_actions(role, page, None) {
+                assert!(action_keys.insert(item.key), "duplicate visible action {}", item.key);
+            }
             let mut ui = Interaction::new(Some(Editor::load(role, path).unwrap()));
             ui.select_workspace_page(role, page);
-            ui.workspace_focus = if role == Role::Server && matches!(page, 2 | 3) {
-                WorkspaceFocus::Users
-            } else { WorkspaceFocus::Fields };
+            ui.workspace_focus = ui.workspace_content_focus(role);
             review_capture(&format!("{prefix}-page-{label}"), &model, &ui);
         }
         let mut ui = Interaction::new(Some(Editor::load(role, path).unwrap()));
+        ui.select_workspace_page(role, 0);
+        ui.workspace_focus = WorkspaceFocus::Actions;
+        let before = std::fs::read(path).unwrap();
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert_eq!(ui.workspace_page, 3);
+        assert_eq!(ui.workspace_focus, WorkspaceFocus::Actions);
+        assert!(ui.workspace_visible());
+        assert!(!ui.owned_running(role));
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        review_capture(&format!("{prefix}-overview-next-step"), &model, &ui);
+
+        // F2 now focuses the actual sections, not an independent catalog.
         ui.update(&mut model, press(KeyCode::F(2)));
-        assert!(ui.menu.is_some());
-        review_capture(&format!("{prefix}-command-menu"), &model, &ui);
+        assert!(ui.menu.is_none());
+        assert_eq!(ui.workspace_focus, WorkspaceFocus::Navigation);
+        review_capture(&format!("{prefix}-sections-focus"), &model, &ui);
 
         // Capture the actual monitor, not merely the navigation page.
         let mut ui = Interaction::new(Some(Editor::load(role, path).unwrap()));
@@ -350,34 +371,77 @@ fn visual_review_gallery() {
         assert_eq!(ui.workspace_page, 0);
         ui.update(&mut model, press(KeyCode::Right));
         assert_eq!(ui.workspace_focus, WorkspaceFocus::Actions);
-        // Show a different focused row than the default overview screenshot.
-        // Moving focus must not open a workflow or change saved configuration.
+        // The overview has one navigation action. Move through it, then
+        // capture focus in the canonical operation section.
         let before = std::fs::read(path).unwrap();
-        ui.update(&mut model, press(KeyCode::Down));
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert_eq!(ui.workspace_page, 3);
         assert_eq!(ui.workspace_focus, WorkspaceFocus::Actions);
+        assert!(ui.workspace_visible());
+        assert!(!ui.owned_running(role));
         assert_eq!(std::fs::read(path).unwrap(), before);
-        review_capture(&format!("{prefix}-focus-actions"), &model, &ui);
 
-        // Only passive/input paths; no live operation confirmation.
-        let keys: &[(char, &str)] = if role == Role::Server {
-            &[('N',"new-connection"),('G',"grant-picker"),('u',"new-user"),('b',"recover-user"),
-              ('t',"rotate-token"),('x',"disable-user"),('D',"delete-connection"),('U',"delete-user"),
-              ('Q',"limits"),('E',"certificate"),('W',"reality-wizard"),('s',"server-process"),
-              ('v',"runtime-status"),('p',"network-diagnostics"),('V',"reality-status-unavailable")]
+        // Open ordinary actions through their canonical visible section,
+        // not through a separate command catalog or direct letter shortcuts.
+        let actions: &[(usize, char, &str)] = if role == Role::Server {
+            &[(1,'N',"new-connection"),(2,'G',"grant-picker"),(2,'u',"new-user"),
+              (2,'t',"rotate-token"),(2,'x',"disable-user"),(2,'U',"delete-user"),
+              (5,'Q',"limits"),(1,'E',"certificate"),(3,'s',"server-process"),
+              (3,'v',"runtime-status"),(6,'p',"network-diagnostics"),
+              (3,'a',"apply-rights"),(3,'R',"restart-preflight")]
         } else {
-            &[('N',"new-profile"),('i',"invitation-import"),('I',"reality-import"),('E',"trust-material"),
-              ('A',"active-profile"),('D',"delete-profile"),('V',"connection-status")]
+            &[(1,'N',"new-profile"),(2,'i',"invitation-import"),
+              (1,'E',"trust-material"),(3,'V',"connection-status")]
         };
-        for (key, label) in keys {
+        for (page, key, label) in actions {
             let mut ui = Interaction::new(Some(Editor::load(role, path).unwrap()));
-            if role == Role::Server && *key == 's' {
-                ui.update(&mut model, press(KeyCode::F(5)));
-                assert!(ui.show_server_process, "server process capture must open the actual panel");
-            } else {
-                ui.update(&mut model, press(KeyCode::Char(*key)));
+            let before = std::fs::read(path).unwrap();
+            ui.select_workspace_page(role, *page);
+            ui.workspace_focus = WorkspaceFocus::Actions;
+            let items = page_actions(role, *page, ui.editor.as_ref());
+            ui.workspace_action = items.iter().position(|a| a.key == *key)
+                .unwrap_or_else(|| panic!("missing canonical action {key} in page {page}"));
+            ui.update(&mut model, press(KeyCode::Enter));
+            assert!(!ui.workspace_visible(), "action {key} did not open its workflow");
+            assert!(!ui.owned_running(role));
+            assert_eq!(std::fs::read(path).unwrap(), before);
+            if *key == 'i' {
+                assert!(matches!(ui.importing, Some(ImportFlow::Input(_))));
+                assert!(ui.reality_enrollment.is_none());
             }
-            // An unavailable action deliberately records the actual error, not a mock success.
+            if role == Role::Server && *key == 's' {
+                assert!(ui.show_server_process);
+            }
             review_capture(&format!("{prefix}-action-{label}"), &model, &ui);
+            if role == Role::Server && *key == 'N' {
+                ui.update(&mut model, press(KeyCode::Char('2')));
+                assert!(ui.reality_provision.is_some());
+                review_capture("server-action-reality-wizard", &model, &ui);
+            }
+        }
+        // Keep guarded shortcut-only failure cases explicitly marked as such.
+        if role == Role::Server {
+            for (key, label) in [('D',"delete-connection"),('V',"reality-status-unavailable")] {
+                let mut ui = Interaction::new(Some(Editor::load(role, path).unwrap()));
+                ui.update(&mut model, press(KeyCode::Char(key)));
+                assert!(!ui.owned_running(role));
+                review_capture(&format!("{prefix}-action-{label}"), &model, &ui);
+            }
+        }
+        if role == Role::Client {
+            let path = root.join("multiple-profiles.toml");
+            for (page, key, label) in [(1,'D',"delete-profile"),(3,'A',"active-profile")] {
+                let mut ui = Interaction::new(Some(Editor::load(role, &path).unwrap()));
+                ui.editor.as_mut().unwrap().workspace_select(1);
+                ui.select_workspace_page(role, page);
+                ui.workspace_focus = WorkspaceFocus::Actions;
+                let items = page_actions(role, page, ui.editor.as_ref());
+                ui.workspace_action = items.iter().position(|a| a.key == key).unwrap();
+                ui.update(&mut model, press(KeyCode::Enter));
+                assert!(ui.records.is_some());
+                assert!(!ui.owned_running(role));
+                review_capture(&format!("{prefix}-action-{label}"), &model, &ui);
+            }
         }
 
         let mut ui = Interaction::new(Some(Editor::load(role, path).unwrap()));
@@ -485,6 +549,20 @@ fn visual_review_gallery() {
         review_capture(&format!("state-issuance-{label}-offer"), &model, &ui);
         ui.issuance = Some(IssueFlow::ConfirmReveal);
         review_capture(&format!("state-issuance-{label}-reveal-confirm"), &model, &ui);
+    }
+    {
+        let mut ui = Interaction::new(Some(Editor::load(Role::Server, &disabled_server).unwrap()));
+        let mut model = Model::new(Some(Role::Server));
+        ui.select_workspace_page(Role::Server, 2);
+        ui.workspace_focus = WorkspaceFocus::Actions;
+        let items = page_actions(Role::Server, 2, ui.editor.as_ref());
+        assert!(!items.iter().any(|a| matches!(a.key, 't' | 'x')));
+        ui.workspace_action = items.iter().position(|a| a.key == 'b').unwrap();
+        review_capture("server-page-users-disabled", &model, &ui);
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(matches!(&ui.issuance, Some(IssueFlow::Input(id)) if id == "device-a"));
+        assert!(!ui.owned_running(Role::Server));
+        review_capture("server-action-recover-user", &model, &ui);
     }
     assert_eq!(std::fs::read_to_string(&disabled_server).unwrap(), disabled_fixture);
     let mut ui = Interaction::new(Some(Editor::load(Role::Server, &server).unwrap()));
