@@ -19,7 +19,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Keep the Linux ABI baseline explicit: Ubuntu 22.04 ships glibc 2.35.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             executable: theia
             artifact: theia-linux-x64
@@ -56,13 +57,41 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-build-v1-${{ matrix.target }}
+          key: release-build-v2-${{ matrix.os }}-${{ matrix.target }}
           cache-workspace-crates: false
           cache-bin: false
       - name: Compile optimized native binary
         run: |
           cargo build --locked --release --bin theia --target $env:RELEASE_TARGET
           if ($LASTEXITCODE -ne 0) { throw 'Release compilation failed' }
+      - name: Verify Linux ABI and older distribution startup
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe="target/$RELEASE_TARGET/release/$RELEASE_EXE"
+          readelf --version-info --wide "$exe" > "$RUNNER_TEMP/theia-symbol-versions.txt"
+          python3 - "$RUNNER_TEMP/theia-symbol-versions.txt" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+          text = Path(sys.argv[1]).read_text()
+          versions = set(re.findall(r'\bGLIBC_(\d+(?:\.\d+)+)\b', text))
+          if not versions:
+              raise SystemExit("Expected GNU libc version requirements in Linux binary")
+          maximum = max(versions, key=lambda v: tuple(map(int, v.split("."))))
+          if tuple(map(int, maximum.split("."))) > (2, 35):
+              raise SystemExit(f"Linux ABI regression: GLIBC_{maximum} exceeds 2.35")
+          print(f"Maximum required glibc symbol version: {maximum}")
+          with open(__import__("os").environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(f"Maximum required GLIBC symbol version: {maximum}\n")
+          PY
+          for image in ubuntu:22.04 debian:12-slim; do
+            docker run --rm --network none \
+              --mount "type=bind,src=$(realpath "$exe"),dst=/theia,readonly" \
+              "$image" /theia --version
+            printf 'Linux startup smoke test passed: %s\n' "$image" >> "$GITHUB_STEP_SUMMARY"
+          done
       - name: Verify and stage standalone executable
         run: |
           $ErrorActionPreference = 'Stop'
@@ -164,6 +193,7 @@ jobs:
             "Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             '' \
             'Assets: native Linux x64 and Windows x64 executables, plus SHA256SUMS.' \
+            'Linux: glibc ABI ceiling 2.35; startup checked on Ubuntu 22.04 and Debian 12.' \
             'On Linux, run chmod +x theia-linux-x64 after downloading if needed.' \
             'Dev configuration and key formats may change without backward compatibility.' \
             > "$notes"
