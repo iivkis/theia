@@ -1,6 +1,6 @@
 # Theia TUI visual review
 
-Source: c1969af760283d16c6de239aa00088864ff123f2
+Source: c338da46ed998bb5de77fd5d4a90e4b2bef54da3
 
 Linux · 120×40 · actual production renderer cells. State fixtures and unavailable actions are not runtime success.
 
@@ -446,9 +446,25 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![state-issuance-rotate-reveal-confirm](state-issuance-rotate-reveal-confirm.png)
 
+## state-reality-step1-grant-picker
+
+![state-reality-step1-grant-picker](state-reality-step1-grant-picker.png)
+
+## state-reality-step2-extra-sources
+
+![state-reality-step2-extra-sources](state-reality-step2-extra-sources.png)
+
+## state-reality-step3-dns-progress
+
+![state-reality-step3-dns-progress](state-reality-step3-dns-progress.png)
+
 ## state-reality-step4-tls-consent
 
 ![state-reality-step4-tls-consent](state-reality-step4-tls-consent.png)
+
+## state-reality-step4-tls-expanded
+
+![state-reality-step4-tls-expanded](state-reality-step4-tls-expanded.png)
 
 ## state-reality-step4-tls-progress
 
@@ -458,9 +474,21 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![state-reality-step4-tls-recheck](state-reality-step4-tls-recheck.png)
 
+## state-reality-step5-long-report
+
+![state-reality-step5-long-report](state-reality-step5-long-report.png)
+
+## state-reality-step5-no-eligible-expanded
+
+![state-reality-step5-no-eligible-expanded](state-reality-step5-no-eligible-expanded.png)
+
 ## state-reality-step5-no-eligible
 
 ![state-reality-step5-no-eligible](state-reality-step5-no-eligible.png)
+
+## state-reality-step5-ranked-expanded
+
+![state-reality-step5-ranked-expanded](state-reality-step5-ranked-expanded.png)
 
 ## state-reality-step5-ranked-review
 
@@ -470,6 +498,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![state-reality-step6-save-error](state-reality-step6-save-error.png)
 
+## state-reality-step6-save-inspection
+
+![state-reality-step6-save-inspection](state-reality-step6-save-inspection.png)
+
 ## state-reality-step6-save-uncertain
 
 ![state-reality-step6-save-uncertain](state-reality-step6-save-uncertain.png)
@@ -477,3 +509,7 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## state-reality-step6-saving
 
 ![state-reality-step6-saving](state-reality-step6-saving.png)
+
+## state-reality-step6-success
+
+![state-reality-step6-success](state-reality-step6-success.png)
