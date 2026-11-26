@@ -7,6 +7,10 @@ pub(crate) mod flow;
 pub mod packet;
 #[cfg(target_os = "linux")]
 pub(crate) mod linux_ingress;
+#[cfg(any(target_os = "windows", test))]
+mod wfp_context;
+#[cfg(target_os = "windows")]
+pub(crate) mod wfp_ingress;
 #[cfg(target_os = "linux")]
 pub mod nfqueue;
 pub mod geodata;

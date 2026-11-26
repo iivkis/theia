@@ -1846,9 +1846,12 @@ async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result
 /// table and H2/H3 carrier as explicit proxy ingress. It does NOT install
 /// system rules, assert capture readiness, or provide an egress exemption.
 /// A production backend must own those operations before calling it.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub struct NativeIngress {
     client: ProxyClient,
+    stopped: tokio::sync::watch::Sender<bool>,
+    verdict_gate: Mutex<()>,
+    #[cfg(target_os = "linux")]
     raw: Mutex<std::collections::HashMap<crate::routing::packet::FlowKey, RawLease>>,
     _owner: NativeOwner,
 }
@@ -1861,26 +1864,26 @@ struct RawLease {
     denied: bool,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 static NATIVE_OWNER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 struct NativeOwner;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 impl NativeOwner {
     fn acquire() -> Result<Self, ClientError> {
         NATIVE_OWNER.compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire)
             .map(|_| Self).map_err(|_| ClientError::Configuration)
     }
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 impl Drop for NativeOwner {
     fn drop(&mut self) {
         NATIVE_OWNER.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 impl NativeIngress {
     /// Preflight only; the caller owns an isolated network namespace/rule
     /// transaction. No new CLI or second system interception mode.
@@ -1889,13 +1892,53 @@ impl NativeIngress {
         let raw = zeroize::Zeroizing::new(config::editor_bytes(path).map_err(|_| ClientError::Configuration)?);
         let Config::Client(document) = config::parse(std::str::from_utf8(&raw).map_err(|_| ClientError::Configuration)?)
             .map_err(|_| ClientError::Configuration)? else { return Err(ClientError::Configuration); };
+        use sha2::{Digest, Sha256};
+        let digest: [u8; 32] = Sha256::digest(raw.as_slice()).into();
         let client = prepare_client(&document, path).await?;
-        Ok(Self { client, raw: Mutex::new(std::collections::HashMap::new()), _owner: owner })
+        saved_client_bytes(path, digest)?;
+        let (stopped, _) = tokio::sync::watch::channel(false);
+        Ok(Self {
+            client,
+            stopped,
+            verdict_gate: Mutex::new(()),
+            #[cfg(target_os = "linux")]
+            raw: Mutex::new(std::collections::HashMap::new()),
+            _owner: owner,
+        })
+    }
+
+    /// Cancels all native relay operations, retires the policy lease and
+    /// leaves the externally owned OS capture rules untouched. The platform
+    /// owner must perform its own authenticated CAS restoration on explicit Stop.
+    pub fn shutdown(&self) {
+        let _gate = self.verdict_gate.lock();
+        self.client.routing_cache().dpi.retire();
+        self.stopped.send_replace(true);
+        #[cfg(target_os = "linux")]
+        if let Ok(mut raw) = self.raw.lock() {
+            raw.clear();
+        }
+    }
+
+    async fn stopped(&self) {
+        let mut stop = self.stopped.subscribe();
+        if !*stop.borrow() {
+            let _ = stop.wait_for(|stopped| *stopped).await;
+        }
+    }
+
+    fn ensure_running(&self) -> Result<(), ClientError> {
+        if *self.stopped.borrow() {
+            Err(ClientError::Open(ErrorCode::PolicyDenied))
+        } else {
+            Ok(())
+        }
     }
 
     /// Deliver only a conclusive early Pass to NFQUEUE. Unknown domain/app,
     /// Modify, Redirect and all errors fail closed on raw packet ingress.
     /// No raw TCP connection is moved to the carrier after its SYN.
+    #[cfg(target_os = "linux")]
     pub async fn verdict(&self, packet: crate::routing::nfqueue::Packet<'_>) -> std::io::Result<crate::routing::PacketAction> {
         use crate::routing::PacketAction;
         let action = if packet.local_output() {
@@ -1906,17 +1949,30 @@ impl NativeIngress {
         } else {
             PacketAction::Drop
         };
+        let gate = self.verdict_gate.lock();
+        let action = if gate.is_ok() && self.ensure_running().is_ok() { action } else { PacketAction::Drop };
         packet.finish(action)
     }
 
+    #[cfg(target_os = "linux")]
     async fn raw_verdict(&self, meta: crate::routing::packet::PacketMeta) -> crate::routing::PacketAction {
         use crate::routing::{Evidence, PacketAction, packet::Transport};
-        let Ok(snapshot) = self.client.routing_policy().await else { return PacketAction::Drop; };
+        if self.ensure_running().is_err() { return PacketAction::Drop; }
+        let snapshot = match timeout(Duration::from_millis(250), self.client.routing_policy()).await {
+            Ok(Ok(snapshot)) => snapshot,
+            _ => {
+                if let Ok(mut raw) = self.raw.lock() {
+                    if let Some(entry) = raw.get_mut(&meta.flow) { entry.denied = true; entry.last = Instant::now(); }
+                }
+                return PacketAction::Drop;
+            }
+        };
         let cache = self.client.routing_cache();
         let digest = snapshot.digest();
         let matched = meta.classify(snapshot.policy(), Evidence::Unknown, Evidence::Unknown)
             .ok().and_then(|c| c.action()).map(Action::packet_action);
         let Ok(mut raw) = self.raw.lock() else { return PacketAction::Drop; };
+        if self.ensure_running().is_err() { return PacketAction::Drop; }
         let now = Instant::now();
         raw.retain(|_, entry| now.duration_since(entry.last) < Duration::from_secs(60));
         let current = matched == Some(PacketAction::Pass) && cache.dpi.check_policy(digest).is_ok();
@@ -1940,11 +1996,33 @@ impl NativeIngress {
     /// target from conntrack. Native domain/application are Unknown.
     /// Only carrier Redirect (or legal pre-payload Modify fallback) is
     /// supported here: local Pass must use a separate proven egress path.
+    #[cfg(target_os = "linux")]
     pub async fn relay_linux_tcp(&self, stream: TcpStream) -> Result<(), ClientError> {
         let key = crate::routing::linux_ingress::original_tcp(&stream).map_err(|_| ClientError::Open(ErrorCode::PolicyDenied))?;
-        let (carrier, flow, address) = self.redirect(key).await?;
-        let tunnel = carrier.open(address, key.destination.port()).await?;
-        tunnel.relay_guarded(stream, Some(&flow)).await
+        self.relay_terminated_tcp(key, stream).await
+    }
+
+    /// WFP companion driver must supply the original target in a context
+    /// bound to the current private driver/service session. This entry
+    /// point does not install callouts or trust a client-supplied header.
+    #[cfg(target_os = "windows")]
+    pub async fn relay_windows_tcp(&self, stream: TcpStream, session_token: &[u8; 32]) -> Result<(), ClientError> {
+        let key = crate::routing::wfp_ingress::original_tcp(&stream, session_token)
+            .map_err(|_| ClientError::Open(ErrorCode::PolicyDenied))?;
+        self.relay_terminated_tcp(key, stream).await
+    }
+
+    async fn relay_terminated_tcp(&self, key: crate::routing::packet::FlowKey, stream: TcpStream) -> Result<(), ClientError> {
+        if key.transport != crate::routing::packet::Transport::Tcp { return Err(ClientError::Protocol); }
+        tokio::select! {
+            biased;
+            () = self.stopped() => Err(ClientError::Open(ErrorCode::PolicyDenied)),
+            result = async {
+                let (carrier, flow, address) = self.redirect(key).await?;
+                let tunnel = carrier.open(address, key.destination.port()).await?;
+                tunnel.relay_guarded(stream, Some(&flow)).await
+            } => result,
+        }
     }
 
     /// Common UDP handoff for a trusted platform adapter with a terminated
@@ -1959,13 +2037,20 @@ impl NativeIngress {
         if key.transport != crate::routing::packet::Transport::Udp {
             return Err(ClientError::Protocol);
         }
-        let (carrier, flow, address) = self.redirect(key).await?;
-        let tunnel = carrier.open_udp(address, key.destination.port()).await?;
-        tunnel.relay_guarded(upload, download, Some(&flow)).await
+        tokio::select! {
+            biased;
+            () = self.stopped() => Err(ClientError::Open(ErrorCode::PolicyDenied)),
+            result = async {
+                let (carrier, flow, address) = self.redirect(key).await?;
+                let tunnel = carrier.open_udp(address, key.destination.port()).await?;
+                tunnel.relay_guarded(upload, download, Some(&flow)).await
+            } => result,
+        }
     }
 
     async fn redirect(&self, key: crate::routing::packet::FlowKey) -> Result<(Carrier, crate::routing::flow::FlowLease, Address), ClientError> {
         use crate::routing::{Evidence, PacketAction};
+        self.ensure_running()?;
         let denied = || ClientError::Open(ErrorCode::PolicyDenied);
         if key.destination.port() == 0 || key.source.port() == 0
             || key.destination.ip().is_loopback() || key.destination.ip().is_unspecified()
@@ -1984,6 +2069,7 @@ impl NativeIngress {
         if !matches!(configured, PacketAction::Redirect | PacketAction::Modify) {
             return Err(denied());
         }
+        self.ensure_running()?;
         let flow = cache.flows.begin_native(cache.dpi.clone(), key, snapshot.digest(), configured)?;
         let address = match key.destination.ip() {
             IpAddr::V4(ip) => Address::V4(ip.octets()),
@@ -1991,6 +2077,11 @@ impl NativeIngress {
         };
         Ok((carrier, flow, address))
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl Drop for NativeIngress {
+    fn drop(&mut self) { self.shutdown(); }
 }
 
 /// Shared startup preflight: never changes the OS proxy or claims an

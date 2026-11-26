@@ -88,10 +88,15 @@ impl FlowTable {
     pub(crate) fn begin_native(
         self: &Arc<Self>,
         engine: Arc<Engine>,
-        key: FlowKey,
+        mut key: FlowKey,
         digest: [u8; 32],
         configured: PacketAction,
     ) -> Result<FlowLease, ClientError> {
+        // Single native owner in one isolated namespace/compartment. A
+        // missing interface on an accepted socket must not create another
+        // owner for the exact same transport tuple. Scoped IPv6 is rejected
+        // at native ingress, so this is deliberately conservative.
+        key.interface = 0;
         use super::packet::Transport;
         let protocol = match key.transport {
             Transport::Tcp => Protocol::Tcp,
@@ -261,7 +266,7 @@ mod tests {
             interface: 1,
         };
         let flow = table.begin_native(engine.clone(), key, [1; 32], PacketAction::Redirect).unwrap();
-        assert!(table.begin_native(engine.clone(), key, [1; 32], PacketAction::Pass).is_err());
+        assert!(table.begin_native(engine.clone(), FlowKey { interface: 99, ..key }, [1; 32], PacketAction::Pass).is_err());
         assert!(begin(&table, &engine, PacketAction::Pass).is_err());
         flow.commit(PacketAction::Redirect).unwrap();
         assert!(flow.commit(PacketAction::Pass).is_err());
