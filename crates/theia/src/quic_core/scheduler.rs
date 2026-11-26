@@ -139,7 +139,10 @@ impl Scheduler {
     }
 
     fn apply_loss(&mut self, outcome: loss::Outcome, now: Instant) -> Result<(), Error> {
+        let limited = self.window.in_flight().saturating_add(MTU) > self.window.cwnd();
         self.window.retire(outcome.acknowledged_bytes + outcome.lost_bytes).map_err(|_| Error::Window)?;
+        // Apply loss before growth, so an ACK for a packet sent before
+        // the new recovery boundary cannot undo the congestion event.
         for p in outcome.lost {
             if p.in_flight { self.window.loss(p.at, now).map_err(|_| Error::Window)?; }
             for f in p.frames {
@@ -151,6 +154,12 @@ impl Scheduler {
                         }
                     }
                 }
+            }
+        }
+        for p in outcome.acknowledged {
+            if p.in_flight {
+                self.window.on_ack(p.at, now, u64::from(p.bytes), self.rtt.smoothed(), limited)
+                    .map_err(|_| Error::Window)?;
             }
         }
         Ok(())
