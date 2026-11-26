@@ -101,7 +101,7 @@ pub struct Bbr {
     probe_up_rounds: u8,
     probe_up_acked: u64,
     probe_rtt_cap: Option<u64>,
-    loss_round_delivered: Option<u64>,
+    loss_round_delivered: u64,
     loss_events_in_round: u32,
     total_lost: u64,
     probe_id: u64,
@@ -161,7 +161,7 @@ impl Bbr {
             probe_up_rounds: 0,
             probe_up_acked: 0,
             probe_rtt_cap: None,
-            loss_round_delivered: None,
+            loss_round_delivered: 0,
             loss_events_in_round: 0,
             total_lost: 0,
             probe_id: 0,
@@ -201,7 +201,7 @@ impl Bbr {
         self.loss_ceiling = restore(self.loss_ceiling, old.loss_ceiling);
         self.inflight_longterm = restore(self.inflight_longterm, old.inflight_longterm);
         self.recovery_until = old.recovery_until;
-        self.loss_round_delivered = None;
+        self.loss_round_delivered = self.delivered;
         self.loss_events_in_round = 0;
         self.prev_probe_too_high = false;
         self.prior_cwnd = self.prior_cwnd.max(old.prior_cwnd);
@@ -509,21 +509,20 @@ impl Bbr {
         self.inflight_latest = self.inflight_latest.max(delivered_sample);
         // Packet-timed rounds used by startup and loss rounds are distinct.
         // Start a loss round at the delivery boundary of its first loss.
-        let loss_round_start = self.loss_round_delivered.zip(sample_prior_delivered)
-            .is_some_and(|(boundary, prior)| prior >= boundary);
+        let loss_round_start = sample_prior_delivered.is_some_and(|prior| prior >= self.loss_round_delivered);
         if loss_round_start {
             if self.loss_events_in_round != 0 && !self.is_probing() {
                 let old = self.loss_ceiling.unwrap_or(self.cwnd);
                 self.loss_ceiling = Some((old.saturating_mul(7) / 10).max(self.inflight_latest).clamp(floor, MAX_CWND));
                 self.bound_bandwidth();
             }
-            self.loss_round_delivered = None;
+            self.loss_round_delivered = self.delivered;
             self.loss_events_in_round = 0;
             self.bw_latest = measured_rate;
             self.inflight_latest = delivered_sample;
         }
         if new_loss_events != 0 {
-            self.loss_round_delivered.get_or_insert(self.delivered);
+            if self.loss_events_in_round == 0 { self.loss_round_delivered = self.delivered; }
             self.loss_events_in_round = self.loss_events_in_round.saturating_add(new_loss_events);
         }
         if let Some(flight) = probe_flight {
@@ -576,7 +575,9 @@ impl Bbr {
             self.enter_probe_bw(now);
         } else if self.mode == Mode::ProbeBw {
             if self.phase == ProbePhase::Up {
-                self.probe_up_acked = self.probe_up_acked.saturating_add(outcome.acknowledged_bytes);
+                if sample.is_some_and(|s| !s.app_limited && s.tx_in_flight.saturating_add(self.mtu) >= self.cwnd) {
+                    self.probe_up_acked = self.probe_up_acked.saturating_add(outcome.acknowledged_bytes);
+                }
                 if round_start {
                     if let Some(measured) = nonlimited_rate {
                         if self.probe_full_bw == 0 || u128::from(measured) * 4 >= u128::from(self.probe_full_bw) * 5 {
@@ -655,7 +656,7 @@ impl Bbr {
         Ok(())
     }
 
-    fn probe_rtt_cwnd(&self) -> u64 { self.probe_rtt_cap.unwrap_or_else(|| (self.bdp() / 2).clamp(4 * self.mtu, MAX_CWND)) }
+    fn probe_rtt_cwnd(&self) -> u64 { self.probe_rtt_cap.unwrap_or_else(|| self.bdp() / 2).clamp(4 * self.mtu, MAX_CWND) }
 
     fn longterm_limit(&self) -> u64 {
         let bound = self.inflight_longterm.unwrap_or(MAX_CWND);
@@ -728,7 +729,7 @@ impl Bbr {
         if phase == ProbePhase::Refill {
             self.bandwidth_cap = None;
             self.loss_ceiling = None;
-            self.loss_round_delivered = None;
+            self.loss_round_delivered = self.delivered;
             self.loss_events_in_round = 0;
             self.probe_id = self.probe_id.saturating_add(1);
             self.check_probe_loss = true;
@@ -758,7 +759,7 @@ impl Bbr {
         let headroom = self.inflight_longterm.map_or(MAX_CWND, |v| (v * 85 / 100).max(4 * self.mtu));
         match self.phase {
             ProbePhase::Down if in_flight <= self.bdp() && in_flight <= headroom => self.set_phase(ProbePhase::Cruise, now),
-            ProbePhase::Cruise if new_round && !lost && ((self.stopped_risky_probe || elapsed >= self.probe_wait) || self.round.saturating_sub(self.phase_round) >= (self.bdp() / self.mtu).clamp(2, 63)) => self.set_phase(ProbePhase::Refill, now),
+            ProbePhase::Cruise if new_round && !lost && (self.stopped_risky_probe || elapsed >= self.probe_wait || self.round.saturating_sub(self.phase_round) >= (self.bdp() / self.mtu).clamp(2, 63)) => self.set_phase(ProbePhase::Refill, now),
             ProbePhase::Refill if lost => self.set_phase(ProbePhase::Down, now),
             ProbePhase::Refill if new_round => self.set_phase(ProbePhase::Up, now),
             ProbePhase::Up if self.prev_probe_too_high && self.inflight_longterm.is_some_and(|limit| in_flight >= limit) => {
@@ -766,7 +767,7 @@ impl Bbr {
                 self.prev_probe_too_high = false;
                 self.set_phase(ProbePhase::Down, now);
             }
-            ProbePhase::Up if !self.check_probe_loss && lost || self.probe_plateau >= 3 || (new_round && elapsed >= self.rtt() && in_flight >= self.bdp().saturating_mul(5) / 4) => {
+            ProbePhase::Up if (!self.check_probe_loss && lost) || self.probe_plateau >= 3 || (new_round && elapsed >= self.rtt() && in_flight >= self.bdp().saturating_mul(5) / 4) => {
                 self.set_phase(ProbePhase::Down, now);
             }
             _ => {}

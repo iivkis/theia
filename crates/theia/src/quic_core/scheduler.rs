@@ -146,10 +146,16 @@ pub struct Scheduler {
 
 impl Default for Scheduler {
     fn default() -> Self {
+        Self::new(Arc::new(Mutex::new(PathControl::new(None))), 0)
+    }
+}
+
+impl Scheduler {
+    fn new(path: SharedPath, space: u64) -> Self {
         Self {
             ledger: Ledger::default(),
-            path: Arc::new(Mutex::new(PathControl::new(None))),
-            space: 0,
+            path,
+            space,
             active_tx: BTreeMap::new(),
             lost_tx: BTreeMap::new(),
             ack_delay_exponent: 0,
@@ -165,22 +171,16 @@ impl Default for Scheduler {
             ecn: super::ecn::PathEcn::default(),
         }
     }
-}
 
-impl Scheduler {
     pub fn with_bbr(now: Instant) -> Self {
-        let mut scheduler = Self::default();
-        scheduler.path = Arc::new(Mutex::new(PathControl::new(Some(Bbr::new(MTU, now).expect("valid MTU")))));
-        scheduler
+        Self::new(Arc::new(Mutex::new(PathControl::new(Some(Bbr::new(MTU, now).expect("valid MTU"))))), 0)
     }
 
     pub(crate) fn fork_space(&self) -> Self {
-        let mut scheduler = Self::default();
-        scheduler.path = self.path.clone();
         let mut path = self.path.lock().expect("path lock");
-        scheduler.space = path.next_space;
+        let space = path.next_space;
         path.next_space = path.next_space.checked_add(1).expect("bounded packet spaces");
-        scheduler
+        Self::new(self.path.clone(), space)
     }
 
     pub(crate) fn after_retry(mut self, next: u64, now: Instant) -> Self {
@@ -355,6 +355,7 @@ impl Scheduler {
 
     pub(crate) fn reset_mtu(&mut self, now: Instant) {
         self.ecn.disable();
+        self.path.lock().expect("path lock").undo = None;
         let before = self.mtu.current();
         self.mtu.reset_path(now);
         self.apply_mtu(before);
@@ -787,7 +788,7 @@ impl Scheduler {
         self.path.lock().expect("path lock").rtt.pto(self.ack_delay_limit(), 0)
     }
 
-    fn pto_deadline(&self) -> Option<Instant> {
+    pub(crate) fn pto_deadline(&self) -> Option<Instant> {
         if !self.ledger.has_eliciting_flight() {
             return None;
         }
@@ -822,7 +823,7 @@ impl Drop for Scheduler {
         // A discarded space can no longer prove delivery of its packets.
         // Keep a neutral barrier instead of joining loss intervals across it.
         for entry in path.history.values_mut().filter(|entry| entry.space == self.space) { entry.state = TxState::Neutral; }
-        if self.ledger.bytes_in_flight() != 0 { path.pto_count = 0; }
+        path.pto_count = 0;
         let _ = path.window.retire(self.ledger.bytes_in_flight());
         if let Some(bbr) = path.bbr.as_mut() {
             for id in self.active_tx.values().chain(self.lost_tx.values()) {
@@ -887,6 +888,37 @@ mod tests {
             s.acknowledge(&ack(0), at).unwrap();
             assert_eq!(s.path.lock().unwrap().window.cwnd(), restored);
         }
+    }
+
+    #[test]
+    fn one_loss_episode_can_span_spaces_but_new_ce_invalidates_undo() {
+        let start = Instant::now();
+        let delta = Duration::from_millis(100);
+        let mut initial = Scheduler::default();
+        let mut handshake = initial.fork_space();
+        for n in 0..4 {
+            initial.enqueue(vec![1]).unwrap();
+            initial.record(n, 1200, Some((n, false)), start).unwrap();
+            handshake.enqueue(vec![1]).unwrap();
+            handshake.record(n, 1200, Some((n, false)), start).unwrap();
+        }
+        let at = start + delta;
+        initial.acknowledge(&ack(3), at).unwrap();
+        handshake.acknowledge(&ack(3), at).unwrap();
+        assert_eq!(initial.path.lock().unwrap().undo.as_ref().unwrap().pending.len(), 2);
+        initial.acknowledge(&ack(0), at).unwrap();
+        assert_eq!(initial.path.lock().unwrap().undo.as_ref().unwrap().pending.len(), 1);
+        // CE is validated by the per-space ECN validator before the shared
+        // controller sees it. Exercise that same invalidation boundary.
+        {
+            let mut path = initial.path.lock().unwrap();
+            path.undo = None;
+            path.window.ecn(at, at + delta).unwrap();
+        }
+        let before = initial.path.lock().unwrap().window.cwnd();
+        handshake.acknowledge(&ack(0), at).unwrap();
+        assert_eq!(initial.path.lock().unwrap().window.cwnd(), before);
+        assert!(initial.path.lock().unwrap().undo.is_none());
     }
 
     #[test]

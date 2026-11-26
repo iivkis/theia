@@ -434,7 +434,9 @@ impl Handshake {
         }
         let ordinary: u64 = packets.iter().filter(|p| p.padded_ack || p.frame.is_some_and(|(_, probe)| !probe)).map(|p| p.size() as u64).sum();
         let probes: u64 = packets.iter().filter(|p| p.frame.is_some_and(|(_, probe)| probe)).map(|p| p.size() as u64).sum();
-        if packets.iter().filter(|p| p.frame.is_some_and(|(_, probe)| probe)).count() > 1 || !self.application_schedule.permits_flight(ordinary, probes, now) {
+        let stale_probe = packets.iter().any(|p| p.frame.is_some_and(|(_, probe)| probe)
+            && self.epochs[p.index].as_ref().is_none_or(|epoch| epoch.schedule.pto_deadline().is_none_or(|at| now < at)));
+        if stale_probe || packets.iter().filter(|p| p.frame.is_some_and(|(_, probe)| probe)).count() > 1 || !self.application_schedule.permits_flight(ordinary, probes, now) {
             return Ok(false);
         }
         if self.server && !self.budget.reserve_send(total as u64) {
@@ -529,6 +531,12 @@ impl Handshake {
                 payload,
                 frame,
             });
+        }
+        if packets.iter().filter(|p| p.frame.is_some_and(|(_, probe)| probe)).count() > 1 {
+            let first = packets.iter().filter(|p| p.frame.is_some_and(|(_, probe)| probe))
+                .min_by_key(|p| self.epochs[p.index].as_ref().and_then(|epoch| epoch.schedule.pto_deadline()))
+                .map(|p| p.index).ok_or(Error::Protocol)?;
+            packets.retain(|p| !p.frame.is_some_and(|(_, probe)| probe) || p.index == first);
         }
         if packets.len() == 2 && packets.iter().map(FlightPacket::size).sum::<usize>() <= MTU {
             let initial_size = MTU - packets[1].size();
