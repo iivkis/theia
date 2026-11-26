@@ -4455,7 +4455,8 @@ fn workspace_columns(area: Rect) -> Option<[Rect; 3]> {
         Constraint::Min(1),
     ])
     .split(area);
-    let left = Layout::vertical([Constraint::Length(9), Constraint::Min(1)]).split(cols[0]);
+    let navigation_height = (pages(Role::Server).len().max(pages(Role::Client).len()) as u16) + 2;
+    let left = Layout::vertical([Constraint::Length(navigation_height), Constraint::Min(1)]).split(cols[0]);
     Some([left[0], left[1], cols[2]])
 }
 
