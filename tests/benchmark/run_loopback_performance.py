@@ -127,6 +127,8 @@ class TCPFixture(socketserver.ThreadingTCPServer):
         self.counter = counter
         self.stopping = threading.Event()
         self.slots = threading.BoundedSemaphore(MAX_PEERS)
+        self.accept_lock = threading.Lock()
+        self.accepted = 0
         self.thread = threading.Thread(target=self.serve_forever, kwargs={"poll_interval": 0.05})
         self.thread.start()
 
@@ -134,7 +136,13 @@ class TCPFixture(socketserver.ThreadingTCPServer):
     def port(self):
         return self.server_address[1]
 
+    def accepted_count(self):
+        with self.accept_lock:
+            return self.accepted
+
     def process_request(self, request, address):
+        with self.accept_lock:
+            self.accepted += 1
         if not self.slots.acquire(blocking=False):
             if self.counter:
                 self.counter.fail()
@@ -415,7 +423,10 @@ def trial(binary, cert, key, transport, workload, condition):
             sampler = threading.Thread(target=sample)
             sampler.start()
             before = counter.snapshot()
-            require(before["carrier_bytes"] == 0, "unexpected traffic before trial")
+            # Authenticated routing synchronization is legitimate startup traffic.
+            # Charge it to total wire overhead, but forbid target connections
+            # before the workload and separately prove its encrypted byte delta.
+            require(origin.accepted_count() == 0, "unexpected target dial before trial")
             start = time.perf_counter()
             barrier = threading.Barrier(streams)
             with concurrent.futures.ThreadPoolExecutor(max_workers=streams) as executor:
@@ -431,12 +442,14 @@ def trial(binary, cert, key, transport, workload, condition):
             require(not sampler.is_alive() and not sample_errors, "resource sampling failed")
             require(all(p.poll() is None for p in children), "fixture process exited during trial")
             application = 2 * streams * count * size
-            require(after["carrier_bytes"] >= application, "missing encrypted carrier evidence")
+            require(after["carrier_bytes"] - before["carrier_bytes"] >= application,
+                    "missing encrypted carrier evidence during workload")
+            require(origin.accepted_count() == streams, "unexpected number of target connections")
             require(cpu >= 0 and peak[0] > 0, "invalid process resource evidence")
             if condition == "udp-loss":
-                require(after["dropped_datagrams"] > 0, "loss condition not exercised")
+                require(after["dropped_datagrams"] > before["dropped_datagrams"], "loss condition not exercised during workload")
             if condition == "relay-delay":
-                require(after["delayed_units"] > 0, "delay condition not exercised")
+                require(after["delayed_units"] > before["delayed_units"], "delay condition not exercised during workload")
             result = dict(application_bytes=application, duration_s=duration,
                           cpu_s=cpu, sampled_peak_rss_bytes=peak[0],
                           latency_ms=[v for r in results for v in r["latency_ms"]],
