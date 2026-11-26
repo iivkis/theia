@@ -2319,6 +2319,36 @@ async fn udp_association(
 }
 
 #[cfg(test)]
+async fn udp_prewrite_fallback_fixture(client: &ProxyClient) {
+    use crate::udp_relay::{self, Tunnel, QUEUE};
+    use tokio::sync::mpsc;
+    let local_origin = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let verified = crate::routing::dpi::VerifiedUdp::disabled_fixture(
+        udp_relay::connect(local_origin.local_addr().unwrap()).await.unwrap(),
+    );
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = target.local_addr().unwrap().port();
+    let ProxyClient::Direct(client) = client else { panic!("own TLS fixture"); };
+    let carrier = client.carrier.clone();
+    let fallback = Box::pin(async move { carrier.open_udp(Address::V4([127, 0, 0, 1]), port).await });
+    let (up, rx) = mpsc::channel(QUEUE);
+    let (down, mut responses) = mpsc::channel(QUEUE);
+    up.send(b"first".to_vec()).await.unwrap();
+    up.send(Vec::new()).await.unwrap();
+    let task = tokio::spawn(Tunnel::VerifiedQuic(Box::new(verified), fallback).relay(rx, down));
+    let mut buf = [0; 32];
+    for data in [b"first".as_slice(), b"".as_slice()] {
+        let (n, source) = timeout(Duration::from_secs(3), target.recv_from(&mut buf)).await.unwrap().unwrap();
+        assert_eq!(&buf[..n], data);
+        target.send_to(data, source).await.unwrap();
+        assert_eq!(timeout(Duration::from_secs(3), responses.recv()).await.unwrap().unwrap(), data);
+    }
+    assert!(timeout(Duration::from_millis(50), local_origin.recv_from(&mut buf)).await.is_err());
+    drop(up);
+    task.await.unwrap().unwrap();
+}
+
+#[cfg(test)]
 async fn udp_socks_fixture(client: &ProxyClient) {
     use crate::udp_relay::{encode_socks, parse_socks};
     let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -3748,6 +3778,7 @@ mod selector_tests {
                         Err(ClientError::Open(ErrorCode::PolicyDenied))
                     ));
                 }
+                udp_prewrite_fallback_fixture(&proxy_client).await;
                 udp_socks_fixture(&proxy_client).await;
                 let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let port = target.local_addr().unwrap().port();

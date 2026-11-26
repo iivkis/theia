@@ -52,6 +52,16 @@ impl VerifiedUdp {
     pub(crate) fn failed(&self) {
         self.engine.remember_udp(self.key.clone(), false);
     }
+
+    #[cfg(test)]
+    pub(crate) fn disabled_fixture(socket: tokio::net::UdpSocket) -> Self {
+        let address = socket.peer_addr().unwrap();
+        Self {
+            socket,
+            engine: Arc::new(Engine::default()),
+            key: Key { name: "example.org".into(), address, policy: [1; 32], network: network_scope::Scope::fixture(address, 0) },
+        }
+    }
 }
 
 impl Default for Engine {
@@ -275,11 +285,20 @@ impl Tunnel {
         })
         .await;
         let response = match response {
-            Ok(Ok(response)) => response,
+            Ok(Ok(tcp::ServerFlight::Hello(response))) => response,
+            Ok(Ok(tcp::ServerFlight::Alert(alert))) => {
+                self.engine.cache.failed(&self.key, self.strategy);
+                crate::traffic::dpi_first_failure();
+                crate::traffic::dpi_tls_alert();
+                // Forward the genuine alert; do not retry or manufacture a
+                // replacement response on a different connection.
+                timeout(FIRST_FLIGHT, client.write_all(&alert)).await
+                    .map_err(|_| ClientError::Timeout)?.map_err(|_| ClientError::Io)?;
+                return Err(ClientError::Tls);
+            }
             Ok(Err(error)) => {
                 self.engine.cache.failed(&self.key, self.strategy);
                 crate::traffic::dpi_first_failure();
-                if matches!(error, ClientError::Tls) { crate::traffic::dpi_tls_alert(); }
                 return Err(error);
             }
             Err(_) => {
@@ -337,7 +356,11 @@ mod tests {
             .open("example.org", 443, &["8.8.8.8".parse().unwrap()], [1; 32])
             .await
             .is_none());
+        assert!(engine.open_quic_udp("example.org", 443, &["8.8.8.8".parse().unwrap()], [1; 32]).await.is_none());
         engine.set_enabled(true);
+        assert!(engine.open_quic_udp("localhost", 443, &["127.0.0.1".parse().unwrap()], [1; 32]).await.is_none());
+        assert!(engine.open_quic_udp("example.org", 53, &["8.8.8.8".parse().unwrap()], [1; 32]).await.is_none());
+        assert!(engine.open_quic_udp("example.org", 443, &[], [1; 32]).await.is_none());
         assert!(engine
             .open("localhost", 443, &["127.0.0.1".parse().unwrap()], [1; 32])
             .await
@@ -353,7 +376,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_tls_peer_accepts_both_native_record_strategies_and_rejects_wrong_name() {
+    async fn real_tls_peer_accepts_native_record_strategies_and_rejects_wrong_name() {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let certificate = cert.cert.der().clone();
         let mut roots = rustls::RootCertStore::empty();

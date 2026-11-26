@@ -66,13 +66,18 @@ pub(super) async fn read_record(socket: &mut TcpStream) -> Result<Vec<u8>, Clien
 
 /// Observe a complete bounded server handshake instead of counting a record
 /// containing only its message type as a successful first response.
-pub(super) async fn read_server_hello(socket: &mut TcpStream) -> Result<Vec<u8>, ClientError> {
+pub(super) enum ServerFlight {
+    Hello(Vec<u8>),
+    Alert(Vec<u8>),
+}
+
+pub(super) async fn read_server_hello(socket: &mut TcpStream) -> Result<ServerFlight, ClientError> {
     let mut raw = Vec::new();
     let mut handshake = Vec::new();
     for _ in 0..16 {
         let record = read_record(socket).await?;
-        if record[0] == 21 {
-            return Err(ClientError::Tls);
+        if record[0] == 21 && raw.is_empty() && record[1] == 3 && (1..=3).contains(&record[2]) && record.len() == 7 {
+            return Ok(ServerFlight::Alert(record));
         }
         if record[0] != 22 || record[1] != 3 || !(1..=3).contains(&record[2]) {
             return Err(ClientError::Protocol);
@@ -91,7 +96,7 @@ pub(super) async fn read_server_hello(socket: &mut TcpStream) -> Result<Vec<u8>,
                 return Err(ClientError::Protocol);
             }
             if handshake.len() >= total {
-                return if tls::server_hello(&handshake[..total]) { Ok(raw) } else { Err(ClientError::Protocol) };
+                return if tls::server_hello(&handshake[..total]) { Ok(ServerFlight::Hello(raw)) } else { Err(ClientError::Protocol) };
             }
         }
     }
@@ -148,9 +153,10 @@ mod tests {
             wire.extend(part);
         }
         server.write_all(&wire).await.unwrap();
-        assert_eq!(read_server_hello(&mut client).await.unwrap(), wire);
-        server.write_all(&[21, 3, 3, 0, 2, 2, 40]).await.unwrap();
-        assert!(matches!(read_server_hello(&mut client).await, Err(ClientError::Tls)));
+        assert!(matches!(read_server_hello(&mut client).await.unwrap(), ServerFlight::Hello(response) if response == wire));
+        let alert = [21, 3, 3, 0, 2, 2, 40];
+        server.write_all(&alert).await.unwrap();
+        assert!(matches!(read_server_hello(&mut client).await.unwrap(), ServerFlight::Alert(response) if response == alert));
     }
 
     #[tokio::test]

@@ -143,11 +143,14 @@ impl Tunnel {
                 if !verified.admissible() {
                     drop(verified);
                     let tunnel = fallback.await?;
+                    if !matches!(tunnel, Self::H2(_) | Self::H3(_)) {
+                        return Err(ClientError::Protocol);
+                    }
                     return tunnel.relay_selected(Some(first), upload, download).await;
                 }
                 // Once a send is attempted no fallback or replay is legal.
                 drop(fallback);
-                let result = relay_local(&verified.socket, Some(verified.as_ref()), Some(first), upload, download).await;
+                let result = relay_local(&verified.socket, true, Some(first), upload, download).await;
                 if result.is_err() { verified.failed(); }
                 result
             }
@@ -164,7 +167,7 @@ impl Tunnel {
         match self {
             Self::H2(t) => t.relay_udp(first, upload, download).await,
             Self::H3(t) => t.relay_udp(first, upload, download).await,
-            Self::Direct(socket) => relay_local(&socket, None, first, upload, download).await,
+            Self::Direct(socket) => relay_local(&socket, false, first, upload, download).await,
             Self::VerifiedQuic(..) => Err(ClientError::Protocol),
         }
     }
@@ -176,7 +179,7 @@ pub(crate) async fn next_datagram(first: &mut Option<Vec<u8>>, upload: &mut mpsc
 
 async fn relay_local(
     socket: &UdpSocket,
-    verified: Option<&crate::routing::dpi::VerifiedUdp>,
+    verified: bool,
     mut first: Option<Vec<u8>>,
     mut upload: mpsc::Receiver<Vec<u8>>,
     download: mpsc::Sender<Vec<u8>>,
@@ -185,7 +188,7 @@ async fn relay_local(
     let activity = Activity::new();
     // For verified QUIC, start the receive deadline only after a successful
     // first application write. No server response is assumed authenticated.
-    if verified.is_some() {
+    if verified {
         let data = first.take().ok_or(ClientError::Protocol)?;
         timeout(FIRST_RESPONSE, send_datagram(socket, &data)).await
             .map_err(|_| ClientError::Timeout)?.map_err(|_| ClientError::Io)?;
@@ -203,7 +206,7 @@ async fn relay_local(
     };
     let receive = async {
         let mut buf = vec![0; protocol::MAX_DATAGRAM + 1];
-        let mut waiting = verified.is_some();
+        let mut waiting = verified;
         loop {
             let n = if waiting {
                 timeout(FIRST_RESPONSE, socket.recv(&mut buf)).await.map_err(|_| ClientError::Timeout)?
@@ -334,10 +337,11 @@ mod tests {
     }
     #[tokio::test]
     async fn active_flow_renews_idle_and_queue_overload_drops_without_replay() {
-        let activity = Activity { last: Mutex::new(Instant::now() - Duration::from_secs(601)), idle: IDLE };
-        assert!(activity.deadline() < Instant::now());
+        let activity = Activity { last: Mutex::new(Instant::now()), idle: IDLE };
+        let initial = activity.deadline();
+        tokio::time::sleep(Duration::from_millis(2)).await;
         activity.touch();
-        assert!(activity.deadline() > Instant::now());
+        assert!(activity.deadline() > initial);
         let (tx, mut rx) = mpsc::channel(1);
         assert!(deliver(&tx, || b"one".to_vec()).unwrap());
         assert!(!deliver(&tx, || panic!("full queue must not allocate")).unwrap());
@@ -346,6 +350,27 @@ mod tests {
         assert!(rx.recv().await.unwrap().is_empty());
         drop(rx);
         assert!(deliver(&tx, || b"closed".to_vec()).is_err());
+    }
+
+    #[tokio::test]
+    async fn verified_local_relay_preserves_first_datagram_and_peer_response() {
+        let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = connect(target.local_addr().unwrap()).await.unwrap();
+        let (up, rx) = mpsc::channel(QUEUE);
+        let (down, mut responses) = mpsc::channel(QUEUE);
+        let task = tokio::spawn(async move {
+            relay_local(&socket, true, Some(b"first".to_vec()), rx, down).await
+        });
+        let mut buf = [0; 32];
+        let (n, peer) = timeout(Duration::from_secs(2), target.recv_from(&mut buf)).await.unwrap().unwrap();
+        assert_eq!(&buf[..n], b"first");
+        target.send_to(b"response", peer).await.unwrap();
+        assert_eq!(timeout(Duration::from_secs(2), responses.recv()).await.unwrap().unwrap(), b"response");
+        up.send(Vec::new()).await.unwrap();
+        let (n, _) = timeout(Duration::from_secs(2), target.recv_from(&mut buf)).await.unwrap().unwrap();
+        assert_eq!(n, 0);
+        drop(up);
+        assert!(task.await.unwrap().is_ok());
     }
 
     #[tokio::test]

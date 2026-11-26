@@ -125,7 +125,11 @@ mod tests {
         let addr = endpoint.local_addr().unwrap();
         let serving = tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
-                let _ = incoming.await;
+                if let Ok(connection) = incoming.await {
+                    // Keep the fixture alive until the independently
+                    // authenticated client closes; avoid handshake-close races.
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), connection.closed()).await;
+                }
             }
         });
         let deadline = std::time::Duration::from_secs(5);
