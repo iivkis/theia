@@ -8,8 +8,8 @@ use ring::{aead, hkdf};
 pub(crate) type Cid = Vec<u8>;
 pub(crate) const MAX_DATAGRAM: usize = 65527;
 pub(crate) const MIN_INITIAL: usize = 1200;
-pub(crate) const V1: u32 = 1;
-pub(crate) const V2: u32 = 0x6b3343cf;
+pub(crate) use crate::quic_core::wire::{V1, V2};
+use crate::quic_core::wire::{decode_number, varint};
 const MAX_CRYPTO: usize = crate::reality_admission::MAX_HELLO;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,15 +36,6 @@ fn take<'a>(bytes: &'a [u8], pos: &mut usize, n: usize) -> Option<&'a [u8]> {
     let end = pos.checked_add(n)?;
     let value = bytes.get(*pos..end)?;
     *pos = end;
-    Some(value)
-}
-fn varint(bytes: &[u8], pos: &mut usize) -> Option<u64> {
-    let first = *take(bytes, pos, 1)?.first()?;
-    let n = 1usize << (first >> 6);
-    let mut value = u64::from(first & 63);
-    for &b in take(bytes, pos, n - 1)? {
-        value = (value << 8) | u64::from(b);
-    }
     Some(value)
 }
 fn cid<'a>(bytes: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
@@ -327,19 +318,6 @@ impl InitialKeys {
         Some((pn, plain.to_vec()))
     }
 }
-fn decode_number(truncated: u64, len: usize, largest: Option<u64>) -> Option<u64> {
-    let expected = largest.map_or(0, |n| n + 1);
-    let window = 1u64 << (len * 8);
-    let half = window / 2;
-    let mut candidate = (expected & !(window - 1)) | truncated;
-    if candidate + half <= expected && candidate < (1u64 << 62) - window {
-        candidate += window;
-    } else if candidate > expected + half && candidate >= window {
-        candidate -= window;
-    }
-    (candidate < (1u64 << 62)).then_some(candidate)
-}
-
 pub(crate) enum Inspection {
     Pending,
     Hello(Vec<u8>),
