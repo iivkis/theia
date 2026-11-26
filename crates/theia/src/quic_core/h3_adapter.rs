@@ -124,6 +124,8 @@ struct State {
     error: Option<CE>,
     close: Option<u64>,
     cursor: Option<u64>,
+    #[cfg(test)]
+    rebind: Option<(tokio::net::UdpSocket, oneshot::Sender<Result<(), NativeError>>)>,
 }
 
 fn wake(slot: &mut Option<Waker>, wakes: &mut Vec<Waker>) {
@@ -143,6 +145,10 @@ impl State {
             return;
         }
         self.error = Some(error.clone());
+        #[cfg(test)]
+        if let Some((_, reply)) = self.rebind.take() {
+            let _ = reply.send(Err(NativeError::Scope));
+        }
         for request in self.open.drain(..) {
             let _ = request.result.send(Err(error.clone()));
         }
@@ -334,6 +340,18 @@ fn fail(weak: &Weak<Bridge>, error: CE) {
 async fn drive(mut session: LabSession, weak: Weak<Bridge>, ready: Arc<Notify>) {
     let mut burst = 0;
     loop {
+        #[cfg(test)]
+        {
+            // The test command runs on the sole session owner, never while
+            // the frontend state mutex is held across asynchronous UDP I/O.
+            let request = weak.upgrade().and_then(|shared| {
+                shared.lock().expect("bridge mutex").rebind.take()
+            });
+            if let Some((socket, reply)) = request {
+                let result = session.rebind(socket, Instant::now()).await;
+                let _ = reply.send(result);
+            }
+        }
         let mut wakes = Vec::new();
         let phase = session.shutdown_phase();
         let result = if let Some(shared) = weak.upgrade() {
@@ -435,6 +453,11 @@ impl NativeConnection {
         ))
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_opener(&self) -> Opener {
+        self.opener.clone()
+    }
+
     pub(crate) fn closed_signal(&self) -> watch::Receiver<()> {
         self.closed.clone()
     }
@@ -503,6 +526,21 @@ impl Drop for Opener {
 }
 
 impl Opener {
+    #[cfg(test)]
+    pub(crate) async fn rebind_for_test(&self, socket: std::net::UdpSocket) -> Result<(), NativeError> {
+        let socket = tokio::net::UdpSocket::from_std(socket).map_err(NativeError::Io)?;
+        let (reply, result) = oneshot::channel();
+        {
+            let mut state = self.shared.lock().expect("bridge mutex");
+            if state.error.is_some() || state.close.is_some() || state.rebind.is_some() {
+                return Err(NativeError::Scope);
+            }
+            state.rebind = Some((socket, reply));
+        }
+        self.shared.ready.notify_one();
+        result.await.map_err(|_| NativeError::Scope)?
+    }
+
     fn new(shared: Shared) -> Self {
         Self {
             shared,

@@ -3,7 +3,7 @@ use crate::{
     client::{bearer_header, error_kind, ClientError},
     diagnostics::{self, Value},
     protocol::{self, Address, Decoder, Direction, Frame, Role, Session},
-    quic_transport::{ObservedEndpoint, QuicError},
+    quic_core::{dial, h3_adapter, handshake_udp, negotiation::VersionPolicy, wire::Version},
 };
 use bytes::{Buf, Bytes};
 use h3::{client::RequestStream, quic};
@@ -27,7 +27,7 @@ pub struct H3Client {
     uri: Uri,
     authorization: HeaderValue,
     roots: RootCertStore,
-    identity_quic: Option<quinn::ClientConfig>,
+    identity_quic: Option<Arc<rustls::ClientConfig>>,
     native_lab: Option<crate::quic_core::wire::Version>,
     native_pins: Option<(SocketAddr, crate::quic_core::scope::NetworkScope)>,
     identity_routes: Option<crate::split_http::IdentityRoutes>,
@@ -97,7 +97,7 @@ impl H3Client {
         {
             return Err(ClientError::Configuration);
         }
-        let quic = crate::identity_tls::quic_client(&d.scope, value.signer())
+        let quic = crate::identity_tls::client_tls(&d.scope, value.signer(), crate::identity_tls::Branch::H3)
             .map_err(|_| ClientError::Tls)?;
         Self::identity_carrier(remote, "localhost", token, value, quic)
     }
@@ -120,7 +120,7 @@ impl H3Client {
             .get(usize::from(d.active_reference))
             .ok_or(ClientError::Configuration)?
             .server_name;
-        let quic = crate::identity_tls::admitted_quic_client(value, secret)
+        let quic = crate::identity_tls::admitted_client_tls(value, crate::identity_tls::Branch::H3, secret)
             .map_err(|_| ClientError::Tls)?;
         Self::identity_carrier(remote, name, token, value, quic)
     }
@@ -140,7 +140,7 @@ impl H3Client {
             .get(usize::from(d.active_reference))
             .ok_or(ClientError::Configuration)?
             .server_name;
-        let quic = crate::identity_tls::admitted_quic_client(value, secret)
+        let quic = crate::identity_tls::admitted_client_tls(value, crate::identity_tls::Branch::H3, secret)
             .map_err(|_| ClientError::Tls)?;
         Self::identity_carrier(remote, name, token, value, quic)
     }
@@ -150,7 +150,7 @@ impl H3Client {
         name: &str,
         token: &str,
         value: &crate::descriptor::Verified,
-        quic: quinn::ClientConfig,
+        quic: rustls::ClientConfig,
     ) -> Result<Self, ClientError> {
         let d = value.descriptor();
         let routes = crate::split_http::IdentityRoutes::new(&d.path_prefix)?;
@@ -166,7 +166,7 @@ impl H3Client {
             uri,
             authorization: bearer_header(token)?,
             roots: RootCertStore::empty(),
-            identity_quic: Some(quic),
+            identity_quic: Some(Arc::new(quic)),
             native_lab: None,
             native_pins: None,
             identity_routes: Some(routes),
@@ -553,118 +553,62 @@ impl H3Client {
         Ok(self)
     }
 
-    // Keep the large laboratory handshake future out of production client
-    // futures, especially on the Windows executable's small main stack.
+    // Box the handshake future to keep native QUIC state off the executable's
+    // small Windows main stack. All paths verify the actual TLS handshake,
+    // ALPN, transport parameters and optional DER pin before opening H3.
     fn native_connection(
         &self,
-        version: crate::quic_core::wire::Version,
     ) -> impl std::future::Future<Output = Result<crate::quic_core::endpoint::LabSession, ClientError>>
            + Send
            + '_ {
         Box::pin(async move {
-            if (self.native_pins.is_none() && !self.remote.ip().is_loopback())
-                || self.identity_quic.is_some()
-                || self.certificate_pin.is_some()
-            {
-                return Err(ClientError::Configuration);
-            }
-            let tls = crate::transport_policy::Carrier::H3
-                .client_tls(self.roots.clone())
-                .map_err(|_| ClientError::Tls)?;
-            let name =
-                ServerName::try_from(self.name.clone()).map_err(|_| ClientError::Configuration)?;
-            if let Some((local, scope)) = self.native_pins {
-                return timeout(
-                    self.connect_timeout,
-                    crate::quic_core::handshake_udp::connect_versions_scoped(
-                        local,
-                        self.remote,
-                        crate::quic_core::negotiation::VersionPolicy::exact(version),
-                        Arc::new(tls),
-                        name,
-                        scope,
-                    ),
-                )
-                .await
-                .map_err(|_| ClientError::Timeout)?
-                .map(|(_, session)| session)
-                .map_err(|_| ClientError::Tls);
-            }
-            let bind = if self.remote.is_ipv4() {
-                "127.0.0.1:0"
-            } else {
-                "[::1]:0"
+            let tls = match &self.identity_quic {
+                Some(config) => config.clone(),
+                None => Arc::new(crate::transport_policy::Carrier::H3
+                    .client_tls(self.roots.clone()).map_err(|_| ClientError::Tls)?),
             };
-            let socket = tokio::net::UdpSocket::bind(bind)
-                .await
-                .map_err(|_| ClientError::Io)?;
-            timeout(
-                self.connect_timeout,
-                crate::quic_core::handshake_udp::connect(
-                    socket,
-                    self.remote,
-                    version,
-                    Arc::new(tls),
-                    name,
-                ),
-            )
-            .await
-            .map_err(|_| ClientError::Timeout)?
-            .map_err(|_| ClientError::Tls)
+            let name = ServerName::try_from(self.name.clone()).map_err(|_| ClientError::Configuration)?;
+            let session = if let Some(version) = self.native_lab {
+                // Keep explicit test scopes; never broaden a caller's pinned
+                // addresses or bypass an identity/pin using the lab selectors.
+                if self.identity_quic.is_some() || self.certificate_pin.is_some() {
+                    return Err(ClientError::Configuration);
+                }
+                timeout(self.connect_timeout, async {
+                    let (_, mut session) = match self.native_pins {
+                        Some((local, scope)) => handshake_udp::connect_versions_scoped(
+                            local, self.remote, VersionPolicy::exact(version), tls, name, scope,
+                        ).await,
+                        None => handshake_udp::connect_versions(
+                            SocketAddr::new(self.remote.ip(), 0), self.remote, VersionPolicy::exact(version), tls, name,
+                        ).await,
+                    }.map_err(|_| ClientError::Tls)?;
+                    dial::confirm(&mut session).await.map_err(dial_error)?;
+                    Ok::<_, ClientError>(session)
+                }).await.map_err(|_| ClientError::Timeout)??
+            } else {
+                // Keep v1 for the still-compatible REALITY server. A version
+                // restart for plain TLS must authenticate version_information.
+                let policy = if self.identity_quic.is_some() {
+                    VersionPolicy::exact(Version::V1)
+                } else {
+                    VersionPolicy::both()
+                };
+                dial::connect(self.remote, name, tls, None, policy, self.connect_timeout)
+                    .await.map_err(dial_error)?.1
+            };
+            if let Some(pin) = self.certificate_pin {
+                pin.verify(session.peer_leaf().ok_or(ClientError::Tls)?)?;
+            }
+            Ok(session)
         })
     }
 
-    async fn verified_connection(
-        &self,
-    ) -> Result<(ObservedEndpoint, quinn::Connection), ClientError> {
-        let bind = if self.remote.is_ipv4() {
-            SocketAddr::from(([0, 0, 0, 0], 0))
-        } else {
-            SocketAddr::from(([0u16; 8], 0))
-        };
-        let endpoint = match &self.identity_quic {
-            Some(config) => ObservedEndpoint::with_config(bind, config.clone()),
-            None => ObservedEndpoint::new(bind, self.roots.clone()),
-        }
-        .map_err(quic_error)?;
-        // No credential/request data until verified full handshake and BBR.
-        let connection = endpoint
-            .connect(self.remote, &self.name, self.connect_timeout)
-            .await
-            .map_err(quic_error)?;
-        if let Some(pin) = self.certificate_pin {
-            let chain = connection
-                .peer_identity()
-                .ok_or(ClientError::Tls)?
-                .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
-                .map_err(|_| ClientError::Tls)?;
-            pin.verify(chain.first().ok_or(ClientError::Tls)?.as_ref())?;
-        }
-        Ok((endpoint, connection))
-    }
-
-    /// Check only the configured peer, PKI, ALPN, optional pin and BBR.
-    /// Dropping the endpoint closes this probe; it never opens a tunnel.
+    /// Check only the configured peer, PKI/identity, ALPN and optional pin.
+    /// No HTTP stream, credential or application byte is sent by this probe.
     pub(crate) async fn probe(&self) -> Result<(), ClientError> {
-        if let Some(version) = self.native_lab {
-            return timeout(self.connect_timeout, async {
-                let mut session = self.native_connection(version).await?;
-                crate::camouflage_h3_probe::finish_native_handshake(&mut session)
-                    .await
-                    .map_err(|_| ClientError::Tls)?;
-                session
-                    .close(0x100, std::time::Instant::now())
-                    .map_err(|_| ClientError::Tls)?;
-                session
-                    .flush(std::time::Instant::now())
-                    .await
-                    .map_err(|_| ClientError::Tls)?;
-                Ok(())
-            })
-            .await
-            .map_err(|_| ClientError::Timeout)?;
-        }
-        self.verified_connection().await.map(|_| ())
+        let session = self.native_connection().await?;
+        dial::close_probe(session).await.map_err(dial_error)
     }
 
     async fn open_selected(&self, open: Frame, operation: u64) -> Result<H3Tunnel, ClientError> {
@@ -723,44 +667,18 @@ impl H3Client {
     }
 
     async fn connect_verified(&self, operation: u64) -> Result<H3Connection, ClientError> {
-        let (transport, endpoint, binding) = if let Some(version) = self.native_lab {
-            let session = self.native_connection(version).await?;
-            let (native, _key) = crate::quic_core::h3_adapter::NativeConnection::start(session)
-                .map_err(|_| ClientError::Tls)?;
-            (
-                crate::h3_carrier::Connection::Native(Box::new(native)),
-                None,
-                None,
-            )
-        } else {
-            let (endpoint, connection) = self.verified_connection().await?;
-            let binding = if self.certificate_pin.is_some() {
-                let mut key = zeroize::Zeroizing::new([0u8; 32]);
-                connection
-                    .export_keying_material(
-                        &mut key[..],
-                        crate::channel_binding::LABEL,
-                        crate::channel_binding::H3,
-                    )
-                    .map_err(|_| ClientError::Tls)?;
-                Some(key)
-            } else {
-                None
-            };
-            crate::diag!(
-                Trace,
-                "client.h3",
-                "quic_tls_bbr_verified",
-                "op" = Value::Count(operation)
-            );
-            (
-                crate::h3_carrier::Connection::Quinn(Box::new(h3_quinn::Connection::new(
-                    connection,
-                ))),
-                Some(endpoint),
-                binding,
-            )
-        };
+        let session = self.native_connection().await?;
+        let (transport, key) = h3_adapter::NativeConnection::start(session)
+            .map_err(|_| ClientError::Tls)?;
+        let binding = self.certificate_pin.map(|_| key);
+        #[cfg(test)]
+        let test_opener = transport.test_opener();
+        crate::diag!(
+            Trace,
+            "client.h3",
+            "quic_tls_bbr_verified",
+            "op" = Value::Count(operation)
+        );
         let mut builder = h3::client::builder();
         builder.max_field_section_size(u64::from(crate::transport_policy::MAX_HEADER_LIST_BYTES));
         let (mut driver, sender) = builder
@@ -778,7 +696,8 @@ impl H3Client {
             sender: std::sync::Mutex::new(sender),
             driver,
             binding,
-            _endpoint: endpoint,
+            #[cfg(test)]
+            test_opener,
         })
     }
 
@@ -1005,15 +924,14 @@ impl H3Client {
     }
 }
 
-fn quic_error(error: QuicError) -> ClientError {
+fn dial_error(error: dial::Error) -> ClientError {
     match error {
-        QuicError::Configuration => ClientError::Configuration,
-        QuicError::Bind => ClientError::Io,
-        QuicError::Timeout => ClientError::Timeout,
-        QuicError::Unreachable => ClientError::QuicUnreachable,
-        QuicError::EndpointNetworkRefused => ClientError::QuicEndpointNetworkRefused,
-        QuicError::Handshake | QuicError::Alpn => ClientError::Tls,
-        QuicError::CongestionController => ClientError::Http3,
+        dial::Error::Configuration => ClientError::Configuration,
+        dial::Error::Bind => ClientError::Io,
+        dial::Error::Timeout => ClientError::Timeout,
+        dial::Error::Unreachable => ClientError::QuicUnreachable,
+        dial::Error::EndpointNetworkRefused => ClientError::QuicEndpointNetworkRefused,
+        dial::Error::Handshake => ClientError::Tls,
     }
 }
 
@@ -1021,7 +939,8 @@ struct H3Connection {
     sender: std::sync::Mutex<h3::client::SendRequest<crate::h3_carrier::Opener, Bytes>>,
     driver: Driver,
     binding: Option<crate::channel_binding::Key>,
-    _endpoint: Option<ObservedEndpoint>,
+    #[cfg(test)]
+    test_opener: h3_adapter::Opener,
 }
 
 struct Driver(JoinHandle<()>);
@@ -1115,14 +1034,8 @@ impl H3Tunnel {
         self.stream_up
     }
     #[cfg(test)]
-    pub(crate) fn rebind_for_test(&self, socket: std::net::UdpSocket) -> Result<(), ClientError> {
-        self._lease
-            .connection()
-            ._endpoint
-            .as_ref()
-            .ok_or(ClientError::Configuration)?
-            .endpoint
-            .rebind(socket)
+    pub(crate) async fn rebind_for_test(&self, socket: std::net::UdpSocket) -> Result<(), ClientError> {
+        self._lease.connection().test_opener.rebind_for_test(socket).await
             .map_err(|_| ClientError::Io)
     }
 
@@ -1352,7 +1265,7 @@ mod probe_tests {
         let incoming = server.accept().await.unwrap();
         // A credential-free probe may close immediately after the verified
         // client handshake, before the server confirms its final flight.
-        if let Ok(connection) = incoming.await {
+        if let Ok(Ok(connection)) = timeout(Duration::from_secs(3), incoming).await {
             assert!(!matches!(
                 timeout(Duration::from_millis(250), connection.accept_bi()).await,
                 Ok(Ok(_))

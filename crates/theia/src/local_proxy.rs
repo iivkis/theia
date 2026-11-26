@@ -3057,7 +3057,7 @@ mod selector_tests {
                     let (mut local, remote) = tokio::io::duplex(4096);
                     let rebind = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
                     rebind.set_nonblocking(true).unwrap();
-                    tunnel.rebind_for_test(rebind).unwrap();
+                    tunnel.rebind_for_test(rebind).await.unwrap();
                     let task = tokio::spawn(tunnel.relay(remote));
                     local.write_all(b"move").await.unwrap();
                     let mut bytes = [0; 4];

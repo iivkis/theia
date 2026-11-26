@@ -1194,10 +1194,8 @@ async fn establish_inner(
             handshake.collect()?;
             let sent = match handshake.flush(&socket, peer).await {
                 Ok(sent) => {
-                    if sent {
-                        if let Some(observation) = observation {
-                            observation.sent();
-                        }
+                    if let Some(observation) = observation.filter(|_| sent) {
+                        observation.sent();
                     }
                     sent
                 }
@@ -1275,6 +1273,7 @@ async fn establish_inner(
         .get(0x02)
         .and_then(|token| token.try_into().ok());
     let binding = handshake.driver.channel_binding().map_err(Error::Driver)?;
+    let peer_leaf = handshake.driver.peer_leaf();
     let tail = if server {
         None
     } else {
@@ -1303,6 +1302,7 @@ async fn establish_inner(
             secrets,
             idle_timeout,
             binding,
+            peer_leaf,
             peer_limits: limits,
             peer_reset_token,
             peer_disable_migration: peer_params.get(0x0c).is_some(),
