@@ -8419,14 +8419,14 @@ mod tests {
         let model = Model::new(Some(Role::Server));
         ui.workspace_page = 1;
         let before = rendered_interaction(120, 40, &model, &ui);
-        assert!(before.contains("Что это значит"));
+        assert!(before.contains("Создать подключение"));
         for kind in [IssueKind::NewUser, IssueKind::Rotation, IssueKind::Reenable] {
             ui.issue_kind = kind;
             ui.issuance = Some(IssueFlow::Offer);
             let screen = rendered_interaction(120, 40, &model, &ui);
             assert!(screen.contains("Показать ссылку один раз"));
             assert!(screen.contains("Сохранить приглашение в файл"));
-            assert!(!screen.contains("Что это значит"));
+            assert!(!screen.contains("Создать подключение"));
             assert!(!screen.contains("edge.example.org"));
             assert!(!screen.contains("доступ пользователю."));
             assert!(!screen.contains("theia://"));
