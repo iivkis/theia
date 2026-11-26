@@ -440,19 +440,20 @@ class SpecContractTests(unittest.TestCase):
         self.assertRegex(proxy, r"Self::H3\(client\)\s*=>\s*client\s*\.open\(address,\s*port\)")
         self.assertIn("Err(ClientError::QuicUnreachable)", proxy)
         server = read("crates/theia/src/server.rs")
-        self.assertIn("crate::h3_server::serve(endpoint, context)", server)
+        self.assertIn("tasks.spawn(endpoint.serve(context))", server)
         self.assertIn("tasks.spawn(serve(listener, acceptor, context.clone()))", server)
         self.assertIn("h3_server_and_client_binaries_curl_both_local_proxies",
                       read("crates/theia/tests/client_h2.rs"))
 
     def test_m32_auto_selector_is_fail_closed(self):
         proxy = read("crates/theia/src/local_proxy.rs")
-        quic = read("crates/theia/src/quic_transport.rs")
+        quic = read("crates/theia/src/quic_core/dial.rs")
         self.assertIn("Err(ClientError::QuicUnreachable)", proxy)
-        self.assertIn("self.observation.sent.load", quic)
-        self.assertIn("self.observation.received.load", quic)
-        self.assertIn("handshake_timeout_error", quic)
-        self.assertIn("only_destination_send_network_errors_are_definitive", quic)
+        self.assertIn("self.sent.load", quic)
+        self.assertIn("self.received.load", quic)
+        self.assertIn("observation.failure(true)", quic)
+        self.assertIn("fallback_requires_observed_send_or_exact_send_error_and_no_response", quic)
+        self.assertIn("malformed_response_disables_silence_classification", quic)
         self.assertIn("QuicEndpointNetworkRefused", proxy)
         self.assertIn("AUTO_QUIC_ATTEMPTS", proxy)
         self.assertIn("negative_cache_expires_and_zero_ttl_disables_it", proxy)
@@ -460,7 +461,7 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("idle_profile_rechecks_quic_without_opening_an_application_tunnel", proxy)
         self.assertIn("result = &mut maintenance => return result", proxy)
         self.assertIn("self.attempt_h3(generation, || self.h3.probe()).await", proxy)
-        self.assertIn("self.verified_connection().await.map(|_| ())", read("crates/theia/src/h3_client.rs"))
+        self.assertIn("dial::close_probe(session)", read("crates/theia/src/h3_client.rs"))
         self.assertIn("route_change_rejects_stale_results_and_unknown_route_disables_cache", proxy)
         self.assertIn("crate::network_scope::observe(self.h3.remote())", proxy)
         tests = read("crates/theia/tests/client_h2.rs")
@@ -510,7 +511,19 @@ class SpecContractTests(unittest.TestCase):
         server = read("crates/theia/src/server.rs")
         self.assertIn("crate::tcp_bbr::bind", server)
         self.assertIn("crate::tcp_bbr::select(&socket)", server)
-        self.assertIn("BbrConfig::default()", read("crates/theia/src/quic_transport.rs"))
+        self.assertIn("Congestion::Bbr => Scheduler::with_bbr", read("crates/theia/src/quic_core/handshake_udp.rs"))
+        self.assertIn("BbrConfig::default()", read("crates/theia/tests/support/quinn_reference.rs"))
+
+    def test_native_quic_has_no_normal_quinn_dependency(self):
+        manifest = toml("crates/theia/Cargo.toml")
+        for dependency in ("quinn", "quinn-proto", "h3-quinn"):
+            self.assertNotIn(dependency, manifest["dependencies"])
+        self.assertIn("cargo tree --locked -p theia -e normal,build", read(".github/workflows/ci.yml"))
+        self.assertIn("Candidate::admitted", read("crates/theia/src/reality_quic.rs"))
+        self.assertIn("receive_to", read("crates/theia/src/quic_core/listener.rs"))
+        self.assertIn("send_from", read("crates/theia/src/quic_core/listener.rs"))
+        self.assertNotIn("quinn::", read("crates/theia/src/h3_server.rs"))
+        self.assertNotIn("quinn::", read("crates/theia/src/reality_live.rs"))
 
     def test_offline_signed_descriptor_has_fail_closed_acceptance_contract(self):
         source = read("crates/theia/src/descriptor.rs")

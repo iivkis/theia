@@ -438,3 +438,59 @@ async fn run(
         }
     }
 }
+
+#[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
+mod wildcard_tests {
+    use super::*;
+    use crate::quic_core::{dial, handshake_udp, wire::Version};
+    use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
+
+    #[tokio::test]
+    async fn native_wildcard_handshake_pins_received_destination_and_replies_from_it() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let der = cert.cert.der().clone();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(der.clone()).unwrap();
+        let client_tls = Arc::new(crate::transport_policy::Carrier::H3.client_tls(roots).unwrap());
+        let mut server_tls = crate::transport_policy::Carrier::H3.server_tls(
+            vec![der], PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into()).unwrap();
+        server_tls.send_tls13_tickets = 0;
+        let server_tls = Arc::new(server_tls);
+        for (bind, target) in [
+            #[cfg(target_os = "linux")]
+            ("0.0.0.0:0", "127.0.0.2:0"),
+            #[cfg(target_os = "windows")]
+            ("0.0.0.0:0", "127.0.0.1:0"),
+            ("[::]:0", "[::1]:0"),
+        ] {
+            let socket = UdpSocket::bind(bind).await.unwrap();
+            let local = socket.local_addr().unwrap();
+            let mut peer: SocketAddr = target.parse().unwrap();
+            peer.set_port(local.port());
+            let mut listener = Listener::with_scope(socket, 4, VersionPolicy::both(),
+                NetworkScope::listener(local.ip()).unwrap()).unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let server = async {
+                    let candidate = listener.accept().await.unwrap();
+                    assert_eq!(candidate.io.local_addr().unwrap(), peer);
+                    let mut session = handshake_udp::accept(candidate, server_tls.clone()).await.unwrap();
+                    while session.shutdown_phase() == super::super::lifecycle::ShutdownPhase::Open {
+                        session.flush(Instant::now()).await.unwrap();
+                        session.recv(Duration::from_millis(10)).await.unwrap();
+                    }
+                };
+                let client = async {
+                    let (_, session) = dial::connect(peer, ServerName::try_from("localhost").unwrap(),
+                        client_tls.clone(), None, VersionPolicy::exact(Version::V1), Duration::from_secs(5)).await.unwrap();
+                    assert!(session.handshake_confirmed());
+                    dial::close_probe(session).await.unwrap();
+                };
+                // The verified client may close while the server is draining.
+                tokio::select! {
+                    _ = server => panic!("server closed before client verified"),
+                    _ = client => {}
+                }
+            }).await.unwrap();
+        }
+    }
+}

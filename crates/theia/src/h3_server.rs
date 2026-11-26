@@ -23,8 +23,7 @@ const MAX_HANDLERS: usize = crate::transport_policy::MAX_BIDI_STREAMS as usize;
 
 type Stream<S> = RequestStream<S, Bytes>;
 
-// Both carriers must enter the very same request handlers; the native lab
-// does not get its own less restrictive authorization path.
+// Every native connection enters the same authenticated request handlers.
 trait CarrierStream: quic::BidiStream<Bytes> + quic::RecvStream<Buf = Bytes> + Send + 'static {}
 impl<S: quic::BidiStream<Bytes> + quic::RecvStream<Buf = Bytes> + Send + 'static> CarrierStream
     for S

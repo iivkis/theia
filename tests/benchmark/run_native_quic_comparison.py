@@ -1,4 +1,4 @@
-"""Run and verify the paired native/Quinn loopback diagnostic at exact HEAD.
+"""Run and verify the native version and default-runtime loopback diagnostic at exact HEAD.
 
 The raw sample matrix is not a release benchmark: no cross-host, RSS,
 CPU isolation, loss shaping or approved performance thresholds.
@@ -16,14 +16,14 @@ def parse_samples(output):
     header = "backend,stream_up,sample,bytes,open_us,relay_us"
     # Rust's test harness may prefix the first uncaptured line with
     # the test name and ellipsis. Normalize only that exact prefix.
-    prefix = "test quinn_native_xhttp_comparison_samples ... "
+    prefix = "test native_xhttp_version_comparison_samples ... "
     lines = [line.removeprefix(prefix) for line in output.splitlines()]
     if lines.count(header) != 1:
         raise ValueError("missing or duplicate comparison header")
     rows = []
     observed = set()
     for line in lines[lines.index(header) + 1:]:
-        if not line.startswith(("quinn,", "native-v1,", "native-v2,")):
+        if not line.startswith(("native-default,", "native-v1,", "native-v2,")):
             continue
         backend, split, sample, size, opened, relay = next(csv.reader([line]))
         sample, size, opened, relay = map(int, (sample, size, opened, relay))
@@ -34,7 +34,7 @@ def parse_samples(output):
         rows.append(dict(backend=backend, stream_up=split == "true", sample=sample,
                          bytes=size, open_us=opened, relay_us=relay))
     expected = {(backend, split, sample)
-                for backend in ("quinn", "native-v1", "native-v2")
+                for backend in ("native-default", "native-v1", "native-v2")
                 for split in ("false", "true") for sample in range(5)}
     if observed != expected:
         raise ValueError("incomplete comparison matrix")
@@ -53,13 +53,13 @@ def main():
     cmd = ["cargo", "test", "--workspace", "--locked"]
     if args.release:
         cmd.append("--release")
-    cmd += ["--test", "h3_server", "quinn_native_xhttp_comparison_samples",
+    cmd += ["--test", "h3_server", "native_xhttp_version_comparison_samples",
             "--", "--ignored", "--exact", "--nocapture"]
     output = subprocess.run(cmd, check=True, text=True, stdout=subprocess.PIPE,
                             timeout=1200).stdout
     rows = parse_samples(output)
     summary = []
-    for backend in ("quinn", "native-v1", "native-v2"):
+    for backend in ("native-default", "native-v1", "native-v2"):
         for split in (False, True):
             group = [row for row in rows if row["backend"] == backend and row["stream_up"] == split]
             summary.append(dict(backend=backend, stream_up=split, count=len(group),

@@ -185,6 +185,14 @@ jobs:
           cache-workspace-crates: false
           cache-bin: false
           save-if: false
+      - name: Verify native product graph has no Quinn packages
+        shell: bash
+        run: |
+          cargo tree --locked -p theia -e normal,build --all-features --prefix none > normal-dependencies.txt
+          if grep -E '^(quinn|quinn-proto|quinn-udp|h3-quinn) v' normal-dependencies.txt; then
+            echo "::error::Quinn leaked into product dependencies"
+            exit 1
+          fi
       - name: Build genuine Linux server for Windows cross-OS F-14 E2E
         if: runner.os == 'Linux'
         run: cargo build --workspace --locked --bin theia
