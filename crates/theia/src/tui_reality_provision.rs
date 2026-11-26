@@ -1470,7 +1470,7 @@ impl Wizard {
                         let material = path_observation(&root);
                         WizardStage::SaveFailed { root, message: format!("{message}\nФайл конфигурации: {config}\nКаталог материалов: {material}"), retry, inspected: true }
                     }
-                    KeyCode::Char('y') if retry && !inspected => {
+                    KeyCode::Char('y') if retry && key.modifiers.is_empty() => {
                         // Reconstruct the exact approved scope using the existing
                         // source/path guard. No save, DNS or TLS is triggered.
                         match WizardInput::parse(self.config.clone(), self.source, &self.effective_fields()) {
@@ -1642,7 +1642,7 @@ impl Wizard {
                 }
             },
             WizardStage::Saving(_, _) | WizardStage::SavingInitial(_, _) => "Сохраняем защищённые файлы и настройки…\nДождитесь подтверждения. Работающий сервер не изменяется.".into(),
-            WizardStage::SaveFailed { root, message, retry, inspected } => format!("{}\n\nФайл: {}\nКаталог: {}\nСервер не запущен этой операцией.\n{}", message, self.config.display(), root.display(), if *inspected { "Esc: закрыть и открыть конфигурацию заново." } else if *retry { "F2: проверить наличие файлов. Повторить настройку — вернуться к источникам без записи." } else { "F2: проверить наличие файлов. Повтор недоступен." }),
+            WizardStage::SaveFailed { root, message, retry, inspected } => format!("{}\n\nФайл: {}\nКаталог: {}\nСервер не запущен этой операцией.\n{}", message, self.config.display(), root.display(), if *retry && *inspected { "Повторить настройку — вернуться к источникам после проверки, без записи." } else if *inspected { "Откройте конфигурацию заново. Повтор недоступен." } else if *retry { "F2: проверить наличие файлов. Повторить настройку — вернуться к источникам без записи." } else { "F2: проверить наличие файлов. Повтор недоступен." }),
             WizardStage::Success => "Подключение REALITY создано.\nНастройки сохранены и успешно открыты. Сервер не запущен этой операцией.\n\nЧто дальше:\n1. На странице пользователей выпустите ключ доступа.\n2. На обзоре сервера отдельно запустите сервер.\n3. Импортируйте ключ в клиент Theia.".into(),
         }
     }
@@ -1703,7 +1703,7 @@ impl ProvisionPanel {
                 WizardStage::DnsConfirm(_) if !wizard.dns_details => Some(('y', "Найти адреса")),
                 WizardStage::ProbeConfirm(_) if !wizard.tls_details => Some(('y', "Проверить сайты")),
                 WizardStage::CreateConfirm(_) if !wizard.result_details => Some(('y', "Сохранить")),
-                WizardStage::SaveFailed { retry: true, inspected: false, .. } => Some(('y', "Повторить настройку")),
+                WizardStage::SaveFailed { retry: true, .. } => Some(('y', "Повторить настройку")),
                 _ => None,
             };
         }
@@ -2270,6 +2270,7 @@ mod tests {
         assert!(matches!(wizard.stage, WizardStage::SaveFailed { inspected: true, .. }));
         assert!(!path.exists() && !root.exists());
         wizard.stage = save_failed(root.clone(), Some(Error::Storage));
+        wizard.key(press(KeyCode::F(2)));
         wizard.key(press(KeyCode::Char('y')));
         assert!(matches!(wizard.stage, WizardStage::Input));
         assert!(wizard.sources && !path.exists() && !root.exists());

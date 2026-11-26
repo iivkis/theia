@@ -481,7 +481,7 @@ impl ReferenceReview {
         let selected = self.rows.iter().filter(|row| row.selected.is_some()).count();
         append_wrapped(&mut lines, &format!("Всего: {} · Подходит: {eligible} · Выбрано: {selected}", self.rows.len()), width, Style::default().fg(TEXT));
         append_wrapped(&mut lines, &self.note, width, Style::default().fg(WARNING));
-        append_wrapped(&mut lines, "100: H2 и H3 подтверждены · 80: только H2 · 0: H2 не подтверждён. ? — неизвестно. Оценка не измеряет скорость.", width, Style::default().fg(MUTED));
+        append_wrapped(&mut lines, "100: H2 и H3 подтверждены · 80: только H2 подтверждён · 0: H2 не подтверждён. ? — неизвестно. Оценка не измеряет скорость.", width, Style::default().fg(MUTED));
         if selected > 0 {
             lines.push(Line::raw(""));
             lines.push(Line::styled("Выбранные сайты", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
@@ -535,7 +535,7 @@ impl ReferenceReview {
                 Some(0) => "Основной".into(),
                 Some(index) => format!("Резерв {index}"),
                 None if row.h2 => "Подходит".into(),
-                None if row.address.parse::<std::net::SocketAddr>().is_err() => "Нет DNS".into(),
+                None if row.address.parse::<std::net::SocketAddr>().is_err() => "Нет адреса".into(),
                 None => "Нет H2".into(),
             };
             let color = if row.selected == Some(0) {

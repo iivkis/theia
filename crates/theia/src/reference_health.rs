@@ -195,7 +195,6 @@ impl SearchPlan {
         hash.update(raw.as_bytes());
         Ok(hash.finalize().into())
     }
-    pub(crate) fn preview(&self) -> String { self.0.preview_targets() }
 }
 
 fn normalize(ip: IpAddr) -> IpAddr {
