@@ -221,7 +221,9 @@ def drive(binary, config, scenario, expected):
                 tty.wait("Сначала Ctrl+S", since=since)
                 revision(binary, expected)
                 tty.send("q")
-                tty.wait("Не сохранено: подтвердите переход")
+                tty.wait("Сохранить изменения перед выходом?")
+                tty.wait("Не сохранять и продолжить")
+                revision(binary, expected)
                 tty.send("d")  # discard and exit, never save/apply
                 tty.close()
                 return
@@ -434,6 +436,12 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
     def read_config(path):
         return tomllib.loads(path.read_text(encoding="utf-8"))
 
+    def active_profile_label(profile_id):
+        for index, profile in enumerate(read_config(client)["client"]["profiles"], 1):
+            if profile["id"] == profile_id:
+                return f"Активный профиль: №{index} · {profile['server']}"
+        raise AssertionError("Expected saved profile is missing: " + profile_id)
+
     def finish(tty):
         tty.send("\x1b")
         time.sleep(0.15)
@@ -533,21 +541,21 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         tty.send("A")
         tty.wait("Активный профиль в TOML:")
         tty.send("y")
-        tty.wait("Активный профиль: public")
+        tty.wait(active_profile_label("public"))
         assert read_config(client)["client"]["active_profile"] == "public"
         assert client_revision(1)
         tty.send("V")
-        tty.wait("Headless runtime: revision=1")
+        tty.wait("Фоновый клиент: работает (версия 1)")
         tty.send("h")
-        tty.wait("Headless Apply: revision=1")
+        tty.wait("Применение настроек фонового клиента (версия 1)")
         assert client_revision(1)
         tty.send("n")
-        tty.wait("Настройки внешнего клиента")
+        tty.wait("Фоновый клиент: работает (версия 1)")
         assert client_revision(1)
         tty.send("h")
-        tty.wait("Headless Apply: revision=1")
+        tty.wait("Применение настроек фонового клиента (версия 1)")
         tty.send("y")
-        tty.wait("Headless Apply подтверждён")
+        tty.wait("Настройки фонового клиента применены (версия 2)")
         assert client_revision(2)
         test_tunnels(http_port, socks_port, echo_port)
         tty.send("\x1b")
@@ -588,20 +596,20 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         tty.send("A")
         tty.wait("Активный профиль в TOML:")
         tty.send("y")
-        tty.wait("Активный профиль: reality-profile")
+        tty.wait(active_profile_label("reality-profile"))
         assert read_config(client)["client"]["active_profile"] == "reality-profile"
         tty.send("V")
-        tty.wait("Запустить подключение")
+        tty.wait("Запустить локальный прокси")
         tty.send("s")
-        tty.wait("Запустить сохранённый активный профиль")
+        tty.wait("Запустить локальный прокси для выбранного сервера?")
         tty.send("y")
-        tty.wait("Loopback listeners работают")
+        tty.wait("Локальный прокси работает. Это не подтверждает связь с сервером.")
         test_tunnels(http_port, socks_port, echo_port)
-        tty.wait("last_open=H")
+        tty.wait("последнее подтверждённое соединение: H")
         tty.send("x")
-        tty.wait("Остановить локальный runtime?")
+        tty.wait("Остановить локальный прокси?")
         tty.send("y")
-        tty.wait("Локальный runtime остановлен")
+        tty.wait("Локальный прокси остановлен")
         finish(tty)
         tty = None
     finally:
