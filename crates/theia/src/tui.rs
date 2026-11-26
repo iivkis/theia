@@ -8986,7 +8986,7 @@ mod tests {
         assert!(!ui.discovery.as_ref().unwrap().is_consent_pending());
         let passive = rendered_interaction(120, 40, &model, &ui);
         assert!(passive.contains("Пассивный"));
-        assert!(passive.contains("14"));
+        assert!(passive.contains(&crate::camouflage_discovery::POPULAR_HTTPS_DOMAINS.len().to_string()));
         assert!(passive.contains("api64.ipify.org"));
         assert!(!passive.contains("ЗАПРОС ВЫПОЛНЕН"));
 

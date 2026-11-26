@@ -233,7 +233,7 @@ mod tests {
         let body = p.body();
         assert!(matches!(p.phase, Phase::Passive));
         assert!(body.contains("Пассивный"));
-        assert!(body.contains("14"));
+        assert!(body.contains(&POPULAR_HTTPS_DOMAINS.len().to_string()));
         assert!(body.contains(DEFAULT_EGRESS_SERVICE_URL));
         assert!(body.contains("Запрос пока НЕ отправлялся."));
         assert!(!p.is_consent_pending());

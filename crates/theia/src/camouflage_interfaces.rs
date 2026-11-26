@@ -192,3 +192,52 @@ pub fn collect_assigned_interfaces() -> io::Result<NativeInterfaces> {
         "native interface prefix collector currently supports Linux only",
     ))
 }
+
+
+// DNS-only reverse lookup of a previously authorized exact IPv4 address.
+// PTR is neither certificate evidence nor permission to dial.
+#[cfg(target_os = "linux")]
+pub(crate) async fn reverse_reference_name(address: IpAddr) -> Option<String> {
+    use std::ffi::CStr;
+    let IpAddr::V4(ip) = address else { return None };
+    if !crate::camouflage_discovery::plausible_public_address(address) {
+        return None;
+    }
+    let task = tokio::task::spawn_blocking(move || {
+        let socket = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: 0,
+            sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes(ip.octets()) },
+            sin_zero: [0; 8],
+        };
+        let mut host = [0 as libc::c_char; 1025];
+        // SAFETY: initialized IPv4 address and writable bounded host buffer;
+        // NI_NAMEREQD rejects numeric fallback. No service output.
+        let status = unsafe {
+            libc::getnameinfo(
+                (&socket as *const libc::sockaddr_in).cast(),
+                std::mem::size_of_val(&socket) as libc::socklen_t,
+                host.as_mut_ptr(),
+                host.len() as libc::socklen_t,
+                std::ptr::null_mut(),
+                0,
+                libc::NI_NAMEREQD,
+            )
+        };
+        if status != 0 { return None; }
+        // SAFETY: successful lookup writes a NUL-terminated name.
+        let name = unsafe { CStr::from_ptr(host.as_ptr()) }.to_str().ok()?
+            .trim_end_matches('.').to_ascii_lowercase();
+        crate::camouflage_domain_dns::validate_manual_dns_request(
+            &name, crate::camouflage_domain_dns::DnsConsent::Approved
+        ).ok()?;
+        Some(name)
+    });
+    tokio::time::timeout(crate::camouflage_domain_dns::DNS_DEADLINE, task)
+        .await.ok()?.ok()?
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) async fn reverse_reference_name(_address: IpAddr) -> Option<String> {
+    None
+}

@@ -581,8 +581,8 @@ impl DomainPanel {
     }
 
     pub(crate) fn body(&self) -> String {
-        let mut out = String::from(
-            "F-18: домены из 14 seed-каталога; DNS и TLS только с двумя согласиями\n\n",
+        let mut out = format!(
+            "F-18: каталог из {} доменов; DNS и TLS только с двумя согласиями\n\n", POPULAR_HTTPS_DOMAINS.len(),
         );
         if self.is_manual_input() {
             out.push_str(&format!(
@@ -793,7 +793,7 @@ mod tests {
         assert_eq!(panel.domain(), Some("samsung.com"));
         panel.previous();
         assert_eq!(panel.domain(), Some("google.com"));
-        assert!(panel.body().contains("14"));
+        assert!(panel.body().contains(&POPULAR_HTTPS_DOMAINS.len().to_string()));
         assert!(panel.body().contains("DNS ещё НЕ выполнялся"));
         assert!(!panel.body().contains("H2+H3: ОБА"));
     }
