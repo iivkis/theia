@@ -46,6 +46,7 @@ fn native_tls(roots: RootCertStore) -> Arc<ClientConfig> {
 
 async fn echo<C>(connection: C, limit: usize)
 where C: quic::Connection<Bytes> + 'static,
+    C::BidiStream: quic::BidiStream<Bytes>,
 {
     let mut server = h3::server::builder().build::<_, Bytes>(connection).await.unwrap();
     let resolver = server.accept().await.unwrap().unwrap();
@@ -70,12 +71,11 @@ where C: quic::Connection<Bytes> + 'static,
 
 async fn exchange<C>(connection: C, payload: &[u8]) -> (u128, u128)
 where C: quic::Connection<Bytes> + 'static,
+    C::BidiStream: quic::BidiStream<Bytes>,
 {
     let start = Instant::now();
     let (mut driver, mut sender) = h3::client::new(connection).await.unwrap();
-    let driver = tokio::spawn(async move {
-        let _ = poll_fn(|cx| driver.poll_close(cx)).await;
-    });
+    let request = async {
     let mut stream = sender.send_request(http::Request::builder()
         .method("POST").uri("https://benchmark.invalid/transport-benchmark").body(()).unwrap()).await.unwrap();
     let opened = start.elapsed().as_micros().max(1);
@@ -94,11 +94,14 @@ where C: quic::Connection<Bytes> + 'static,
     }
     assert_eq!(offset, payload.len());
     let relay = start.elapsed().as_micros().max(1);
-    drop(stream);
-    drop(sender);
-    driver.abort();
-    let _ = driver.await;
     (opened, relay)
+    };
+    tokio::pin!(request);
+    tokio::select! {
+        biased;
+        result = &mut request => result,
+        error = poll_fn(|cx| driver.poll_close(cx)) => panic!("H3 driver closed during benchmark: {error:?}"),
+    }
 }
 
 async fn server(backend: &str, bind: SocketAddr, peer: IpAddr, count: usize, size: usize) {

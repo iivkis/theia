@@ -216,7 +216,7 @@ impl Parameters<'_> {
                 .map(|n| n.unwrap_or(default))
                 .map_err(|_| SemanticError::Encoding)
         };
-        let max_udp_payload = get(0x03, 65527)?;
+        let max_udp_payload = get(0x03, 65527)?.min(65527);
         let max_data = get(0x04, 0)?;
         let max_streams_bidi = get(0x08, 0)?;
         let max_streams_uni = get(0x09, 0)?;
@@ -227,7 +227,7 @@ impl Parameters<'_> {
         let initial_bidi_local = get(0x05, 0)?;
         let initial_bidi_remote = get(0x06, 0)?;
         let initial_uni = get(0x07, 0)?;
-        if !(1200..=65527).contains(&max_udp_payload)
+        if max_udp_payload < 1200
             || max_streams_bidi > (1u64 << 60)
             || max_streams_uni > (1u64 << 60)
             || ack_delay_exponent > 20

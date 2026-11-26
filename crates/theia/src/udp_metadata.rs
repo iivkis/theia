@@ -258,7 +258,7 @@ mod windows {
         } else {
             (IPPROTO_IPV6, IPV6_MTU_DISCOVER, IPV6_RECVECN)
         };
-        let df = set_verified(socket, level, mtu, IP_PMTUDISC_DO as i32);
+        let df = set_verified(socket, level, mtu, IP_PMTUDISC_DO);
         let mut recvmsg: LPFN_WSARECVMSG = None;
         let mut written = 0u32;
         // SAFETY: query this socket's provider for the documented function
@@ -387,7 +387,7 @@ mod windows {
             ptr::write_unaligned(p.add(HEAD).cast::<i32>(), 2);
         }
         let mut buffer = WSABUF { len: data.len() as u32, buf: data.as_ptr().cast_mut() };
-        let mut msg = WSAMSG {
+        let msg = WSAMSG {
             name: addr.0.as_mut_ptr().cast::<SOCKADDR>(), namelen: len,
             lpBuffers: &mut buffer, dwBufferCount: 1,
             Control: WSABUF { len: (HEAD + align(size_of::<i32>())) as u32, buf: control.as_mut_ptr().cast() },
@@ -396,7 +396,7 @@ mod windows {
         let mut n = 0;
         // SAFETY: synchronous nonblocking send, all buffers live throughout;
         // Winsock reads the payload. No pending overlapped operation.
-        if unsafe { WSASendMsg(raw(socket), &mut msg, 0, &mut n, ptr::null_mut(), None) } != 0 {
+        if unsafe { WSASendMsg(raw(socket), &msg, 0, &mut n, ptr::null_mut(), None) } != 0 {
             return Err(last_error());
         }
         Ok(n as usize)
