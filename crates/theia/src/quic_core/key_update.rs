@@ -107,6 +107,8 @@ impl Receiver {
 
     pub fn generation(&self) -> u64 { self.generation }
 
+    pub fn retirement_deadline(&self) -> Option<Instant> { self.previous.as_ref().map(|p| p.expires) }
+
     pub fn expire(&mut self, now: Instant) {
         if self.previous.as_ref().is_some_and(|p| now >= p.expires) {
             self.previous = None;

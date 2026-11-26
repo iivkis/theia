@@ -273,6 +273,17 @@ mod tests {
             pump(&mut s, &mut c).await;
             assert_eq!(c.read(stream, &mut out).unwrap(), 8);
             assert_eq!(&out[..8], b"response");
+            use crate::quic_core::lifecycle::ShutdownPhase;
+            c.close(42, Instant::now()).unwrap();
+            assert!(c.open_uni().is_err());
+            pump(&mut c, &mut s).await;
+            assert_eq!(c.shutdown_phase(), ShutdownPhase::Closing);
+            assert_eq!(s.shutdown_phase(), ShutdownPhase::Draining);
+            assert!(s.open_bidi().is_err());
+            assert!(!s.flush(Instant::now()).await.unwrap());
+            let deadline = s.deadline().unwrap();
+            assert!(!s.flush(deadline).await.unwrap());
+            assert_eq!(s.shutdown_phase(), ShutdownPhase::Closed);
         }
     }
 

@@ -5,7 +5,7 @@
 use super::{ack_tx::History, flow::ReceiveFlow, frames::{self, Frame}, packet::{self, Reader, Writer},
     scheduler::Scheduler, send_flow::SendFlow, spaces::Space};
 use rustls::quic::{Keys, Secrets};
-use super::key_update;
+use super::{key_update, lifecycle::{Shutdown, ShutdownPhase}};
 use std::{io, net::SocketAddr, time::{Duration, Instant}};
 use tokio::net::UdpSocket;
 
@@ -35,12 +35,13 @@ pub struct LabSession {
     socket: UdpSocket,
     local_cid: [u8; CID_LEN],
     remote_cid: [u8; CID_LEN],
-    protection: Protection,
+    protection: Option<Protection>,
     acknowledgments: History,
     send: SendFlow,
     receive: ReceiveFlow,
     scheduler: Scheduler,
     closed: bool,
+    shutdown: Shutdown,
     server: bool,
     confirmed: bool,
 }
@@ -82,50 +83,50 @@ impl LabSession {
         let mut receive = ReceiveFlow::new(server, MAX_STREAMS, MAX_STREAMS, FLOW_LIMIT,
             FLOW_LIMIT as usize, FLOW_LIMIT).map_err(Error::Receive)?;
         receive.enable_local_bidi(MAX_STREAMS).map_err(Error::Receive)?;
-        Ok(Self { socket, local_cid, remote_cid, protection, acknowledgments: History::default(),
+        Ok(Self { socket, local_cid, remote_cid, protection: Some(protection), acknowledgments: History::default(),
             send, receive,
-            scheduler: Scheduler::default(), closed: false, server, confirmed })
+            scheduler: Scheduler::default(), closed: false, shutdown: Shutdown::default(), server, confirmed })
     }
 
     pub fn handshake_confirmed(&self) -> bool { self.confirmed }
 
     pub fn update_keys(&mut self) -> Result<(), Error> {
-        if self.closed { return Err(Error::Closed); }
-        match &mut self.protection {
+        if !self.active() { return Err(Error::Closed); }
+        match self.protection.as_mut().ok_or(Error::Closed)? {
             Protection::Rotating { writer, .. } => writer.update(self.confirmed).map_err(Error::Packet),
             Protection::Fixed { .. } => Err(Error::Protocol),
         }
     }
 
     pub fn open_uni(&mut self) -> Result<u64, Error> {
-        if self.closed { return Err(Error::Closed); }
+        if !self.active() { return Err(Error::Closed); }
         self.send.open().map_err(Error::Send)
     }
 
     pub fn open_bidi(&mut self) -> Result<u64, Error> {
-        if self.closed { return Err(Error::Closed); }
+        if !self.active() { return Err(Error::Closed); }
         let id = self.send.open_bidi().map_err(Error::Send)?;
         if let Err(e) = self.receive.register_local_bidi(id) {
-            self.closed = true;
+            self.abort();
             return Err(Error::Receive(e));
         }
         Ok(id)
     }
 
     pub fn queue(&mut self, id: u64, bytes: &[u8], fin: bool) -> Result<(), Error> {
-        if self.closed { return Err(Error::Closed); }
+        if !self.active() { return Err(Error::Closed); }
         if !self.scheduler.can_queue() { return Err(Error::Schedule(super::scheduler::Error::Limit)); }
         let frame = self.send.encode(id, bytes, fin).map_err(Error::Send)?;
         self.scheduler.enqueue(frame).map_err(Error::Schedule)
     }
 
     pub fn reset_stream(&mut self, id: u64, code: u64) -> Result<(), Error> {
-        if self.closed { return Err(Error::Closed); }
+        if !self.active() { return Err(Error::Closed); }
         if !self.scheduler.can_queue() { return Err(Error::Schedule(super::scheduler::Error::Limit)); }
         if let Some(frame) = self.send.reset(id, code).map_err(Error::Send)? {
             self.scheduler.cancel_stream(id);
             if let Err(e) = self.scheduler.enqueue(frame) {
-                self.closed = true;
+                self.abort();
                 return Err(Error::Schedule(e));
             }
         }
@@ -133,7 +134,7 @@ impl LabSession {
     }
 
     pub fn stop_sending(&mut self, id: u64, code: u64) -> Result<(), Error> {
-        if self.closed { return Err(Error::Closed); }
+        if !self.active() { return Err(Error::Closed); }
         self.receive.check_stop(id).map_err(Error::Receive)?;
         let mut frame = vec![5];
         for value in [id, code] {
@@ -143,17 +144,17 @@ impl LabSession {
         self.scheduler.enqueue(frame).map_err(Error::Schedule)
     }
 
-    pub fn pending(&self) -> usize { self.scheduler.pending() }
+    pub fn pending(&self) -> usize { if self.active() { self.scheduler.pending() } else { 0 } }
 
     pub fn read(&mut self, id: u64, bytes: &mut [u8]) -> Result<usize, Error> {
-        if self.closed { return Err(Error::Closed); }
+        if !self.active() { return Err(Error::Closed); }
         self.receive.read(id, bytes).map_err(Error::Receive)
     }
 
     /// Explicit window replenishment for streaming fixtures. Reserving queue
     /// capacity first prevents granting credit without its reliable update.
     pub fn read_replenish(&mut self, id: u64, bytes: &mut [u8]) -> Result<usize, Error> {
-        if self.closed { return Err(Error::Closed); }
+        if !self.active() { return Err(Error::Closed); }
         if !self.scheduler.can_queue_n(2) { return Err(Error::Schedule(super::scheduler::Error::Limit)); }
         let (n, connection, stream) = self.receive.read_replenish(id, bytes).map_err(Error::Receive)?;
         if n != 0 {
@@ -164,7 +165,7 @@ impl LabSession {
                     frame.extend_from_slice(super::wire::encode_varint(value, &mut scratch).ok_or(Error::Protocol)?);
                 }
                 if let Err(e) = self.scheduler.enqueue(frame) {
-                    self.closed = true;
+                    self.abort();
                     return Err(Error::Schedule(e));
                 }
             }
@@ -172,17 +173,77 @@ impl LabSession {
         Ok(n)
     }
 
-    pub fn finished(&self, id: u64) -> bool { !self.closed && self.receive.finished(id) }
+    pub fn finished(&self, id: u64) -> bool { self.active() && self.receive.finished(id) }
 
-    pub fn deadline(&self) -> Option<Instant> { self.scheduler.deadline() }
+    fn active(&self) -> bool { !self.closed && self.shutdown.is_open() }
+
+    fn abort(&mut self) {
+        self.closed = true;
+        self.shutdown.abort();
+        self.protection = None;
+    }
+
+    /// No new streams, data or key changes after local closing begins.
+    pub fn close(&mut self, code: u64, now: Instant) -> Result<(), Error> {
+        if !self.active() { return Err(Error::Closed); }
+        self.shutdown.local(now, self.scheduler.base_pto(), code).map_err(|_| Error::Protocol)
+    }
+
+    pub fn shutdown_phase(&self) -> ShutdownPhase { self.shutdown.phase() }
+
+    fn tick(&mut self, now: Instant) {
+        if self.shutdown.expire(now) {
+            self.abort();
+        } else if let Some(Protection::Rotating { reader, .. }) = &mut self.protection {
+            reader.expire(now);
+        }
+    }
+
+    pub fn deadline(&self) -> Option<Instant> {
+        let old_keys = match &self.protection {
+            Some(Protection::Rotating { reader, .. }) => reader.retirement_deadline(),
+            _ => None,
+        };
+        let recovery = if self.active() { self.scheduler.deadline() } else { None };
+        [self.shutdown.deadline(), old_keys, recovery].into_iter().flatten().min()
+    }
 
     /// Send at most one datagram per call, ACKs first. The caller owns the
     /// drive loop and timer. Any uncertain send outcome is terminal.
     pub async fn flush(&mut self, now: Instant) -> Result<bool, Error> {
         if self.closed { return Err(Error::Closed); }
-        let result = self.flush_inner(now).await;
-        if result.is_err() { self.closed = true; }
+        self.tick(now);
+        if self.closed || self.shutdown.phase() == ShutdownPhase::Draining { return Ok(false); }
+        let result = if self.shutdown.phase() == ShutdownPhase::Closing {
+            self.flush_close(now).await
+        } else {
+            self.flush_inner(now).await
+        };
+        if result.is_err() { self.abort(); }
         result
+    }
+
+    async fn flush_close(&mut self, now: Instant) -> Result<bool, Error> {
+        let Some(code) = self.shutdown.take_close(now, self.scheduler.base_pto()) else { return Ok(false); };
+        let mut payload = vec![0x1d];
+        let mut scratch = [0; 8];
+        payload.extend_from_slice(super::wire::encode_varint(code, &mut scratch).ok_or(Error::Protocol)?);
+        payload.push(0); // empty reason
+        // CONNECTION_CLOSE is not ACK-eliciting. Once closing, no normal
+        // recovery or application frames are driven, but PN never resets.
+        let (_, packet) = self.seal(&payload)?;
+        if self.socket.send(&packet).await.map_err(Error::Io)? != packet.len() { return Err(Error::Protocol); }
+        Ok(true)
+    }
+
+    fn seal(&mut self, payload: &[u8]) -> Result<(u64, Vec<u8>), Error> {
+        let mut header = vec![0x43];
+        header.extend_from_slice(&self.remote_cid);
+        header.extend_from_slice(&[0; 4]);
+        match self.protection.as_mut().ok_or(Error::Closed)? {
+            Protection::Fixed { writer, .. } => writer.seal(&header, payload),
+            Protection::Rotating { writer, .. } => writer.seal(&self.remote_cid, payload),
+        }.map_err(Error::Packet)
     }
 
     async fn flush_inner(&mut self, now: Instant) -> Result<bool, Error> {
@@ -193,13 +254,7 @@ impl LabSession {
         } else if let Some((id, frame, probe)) = self.scheduler.candidate(now).map_err(Error::Schedule)? {
             (frame, Some((id, probe)))
         } else { return Ok(false); };
-        let mut header = vec![0x43];
-        header.extend_from_slice(&self.remote_cid);
-        header.extend_from_slice(&[0; 4]);
-        let (number, packet) = match &mut self.protection {
-            Protection::Fixed { writer, .. } => writer.seal(&header, &payload),
-            Protection::Rotating { writer, .. } => writer.seal(&self.remote_cid, &payload),
-        }.map_err(Error::Packet)?;
+        let (number, packet) = self.seal(&payload)?;
         self.scheduler.record(number, packet.len(), frame, now).map_err(Error::Schedule)?;
         if self.socket.send(&packet).await.map_err(Error::Io)? != packet.len() {
             return Err(Error::Protocol);
@@ -212,8 +267,12 @@ impl LabSession {
     /// dropped; authenticated protocol errors terminate this lab session.
     pub async fn recv(&mut self, wait: Duration) -> Result<bool, Error> {
         if self.closed { return Err(Error::Closed); }
+        let now = Instant::now();
+        self.tick(now);
+        if self.closed { return Ok(false); }
+        let wait = self.deadline().map_or(wait, |at| wait.min(at.saturating_duration_since(now)));
         let result = self.recv_inner(wait).await;
-        if result.is_err() { self.closed = true; }
+        if result.is_err() { self.abort(); } else { self.tick(Instant::now()); }
         result
     }
 
@@ -223,11 +282,12 @@ impl LabSession {
             Ok(result) => result.map_err(Error::Io)?,
             Err(_) => return Ok(false),
         };
+        if self.shutdown.phase() == ShutdownPhase::Draining { return Ok(false); }
         if n > MTU || n < 1 + CID_LEN + 4 + 16 || buf[0] & 0xc0 != 0x40
             || buf[1..1 + CID_LEN] != self.local_cid { return Ok(false); }
         let now = Instant::now();
         let old_key_deadline = now.checked_add(self.scheduler.base_pto().saturating_mul(3)).ok_or(Error::Protocol)?;
-        let result = match &mut self.protection {
+        let result = match self.protection.as_mut().ok_or(Error::Closed)? {
             Protection::Fixed { reader, .. } => reader.open(&buf[..n], 1 + CID_LEN),
             Protection::Rotating { reader, writer } => {
                 match reader.open(&self.local_cid, &buf[..n], now, old_key_deadline, self.confirmed) {
@@ -244,8 +304,19 @@ impl LabSession {
             Err(packet::Error::Reserved | packet::Error::Limit) => return Err(Error::Protocol),
             Err(_) => return Ok(false),
         };
-        if matches!(&self.protection, Protection::Fixed { .. }) && opened.header[0] & 0x04 != 0 { return Err(Error::Protocol); }
+        if matches!(&self.protection, Some(Protection::Fixed { .. })) && opened.header[0] & 0x04 != 0 { return Err(Error::Protocol); }
         let parsed = frames::decode(&opened.payload, Space::Application).map_err(|_| Error::Protocol)?;
+        if parsed.iter().any(|frame| matches!(frame, Frame::Close { .. })) {
+            self.shutdown.peer(now, self.scheduler.base_pto()).map_err(|_| Error::Protocol)?;
+            // Draining is silent. Drop keys now; retain the connection
+            // object/route until the shutdown deadline.
+            self.protection = None;
+            return Ok(true);
+        }
+        if self.shutdown.phase() == ShutdownPhase::Closing {
+            self.shutdown.authenticated_packet(now);
+            return Ok(true);
+        }
         let eliciting = parsed.iter().any(|f| !matches!(f, Frame::Ack(_) | Frame::Padding | Frame::Close { .. }));
         let now = Instant::now();
         for frame in parsed {
@@ -253,11 +324,11 @@ impl LabSession {
                 Frame::Padding | Frame::Ping => {}
                 Frame::Ack(ack) => {
                     self.scheduler.acknowledge(&ack, now).map_err(Error::Schedule)?;
-                    if let Protection::Rotating { writer, .. } = &mut self.protection {
+                    if let Some(Protection::Rotating { writer, .. }) = &mut self.protection {
                         if let Some(range) = ack.ranges.first() { writer.acknowledged(range.last); }
                     }
                 }
-                Frame::HandshakeDone if !self.server && matches!(&self.protection, Protection::Rotating { .. }) => {
+                Frame::HandshakeDone if !self.server && matches!(&self.protection, Some(Protection::Rotating { .. })) => {
                     self.confirmed = true;
                 }
                 Frame::Stream { id, offset, data, fin } => {
@@ -277,7 +348,6 @@ impl LabSession {
                 Frame::MaxStreamData { id, limit } => self.send.max_stream_data(id, limit).map_err(Error::Send)?,
                 Frame::MaxStreams { bidi: false, limit } => self.send.max_streams(limit.min(MAX_STREAMS)).map_err(Error::Send)?,
                 Frame::MaxStreams { bidi: true, limit } => self.send.max_bidi(limit.min(MAX_STREAMS)).map_err(Error::Send)?,
-                Frame::Close { .. } => { self.closed = true; return Ok(true); }
                 _ => return Err(Error::Protocol),
             }
         }

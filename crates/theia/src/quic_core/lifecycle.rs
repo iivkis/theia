@@ -68,9 +68,116 @@ impl Lifecycle {
     }
 }
 
+/// Connection shutdown timer for a connection whose application packet
+/// keys are installed. Retain the route for at least three base PTOs.
+/// Peer close enters silent draining and cannot extend the original timer.
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ShutdownPhase { #[default] Open, Closing, Draining, Closed }
+
+#[derive(Default)]
+pub struct Shutdown {
+    phase: ShutdownPhase,
+    deadline: Option<Instant>,
+    next_send: Option<Instant>,
+    pending: bool,
+    code: u64,
+}
+
+impl Shutdown {
+    pub fn phase(&self) -> ShutdownPhase { self.phase }
+    pub fn deadline(&self) -> Option<Instant> { self.deadline }
+    pub fn is_open(&self) -> bool { self.phase == ShutdownPhase::Open }
+
+    fn duration(pto: Duration) -> Duration {
+        pto.max(Duration::from_millis(1)).saturating_mul(3)
+    }
+
+    pub fn local(&mut self, now: Instant, pto: Duration, code: u64) -> Result<(), Error> {
+        if code > super::wire::MAX_VARINT { return Err(Error::Validation); }
+        if self.phase != ShutdownPhase::Open { return Err(Error::State); }
+        self.deadline = Some(now.checked_add(Self::duration(pto)).ok_or(Error::State)?);
+        self.phase = ShutdownPhase::Closing;
+        self.pending = true;
+        self.code = code;
+        Ok(())
+    }
+
+    pub fn peer(&mut self, now: Instant, pto: Duration) -> Result<(), Error> {
+        match self.phase {
+            ShutdownPhase::Open => {
+                self.deadline = Some(now.checked_add(Self::duration(pto)).ok_or(Error::State)?);
+            }
+            ShutdownPhase::Closing => {}
+            ShutdownPhase::Draining | ShutdownPhase::Closed => return Ok(()),
+        }
+        self.phase = ShutdownPhase::Draining;
+        self.pending = false;
+        self.next_send = None;
+        Ok(())
+    }
+
+    /// The caller has successfully authenticated a packet, not just parsed
+    /// its CID. Limit retransmission of CONNECTION_CLOSE to one per PTO.
+    pub fn authenticated_packet(&mut self, now: Instant) {
+        if self.phase == ShutdownPhase::Closing
+            && self.deadline.is_some_and(|end| now < end)
+            && self.next_send.is_none_or(|next| now >= next) {
+            self.pending = true;
+        }
+    }
+
+    pub fn take_close(&mut self, now: Instant, pto: Duration) -> Option<u64> {
+        if self.expire(now) || self.phase != ShutdownPhase::Closing || !self.pending {
+            return None;
+        }
+        self.pending = false;
+        self.next_send = now.checked_add(pto.max(Duration::from_millis(1)));
+        Some(self.code)
+    }
+
+    pub fn expire(&mut self, now: Instant) -> bool {
+        if self.deadline.is_some_and(|end| now >= end) { self.abort(); }
+        self.phase == ShutdownPhase::Closed
+    }
+
+    pub fn abort(&mut self) {
+        self.phase = ShutdownPhase::Closed;
+        self.deadline = None;
+        self.next_send = None;
+        self.pending = false;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_draining_and_rate_limited_retransmission() {
+        let start = Instant::now();
+        let pto = Duration::from_millis(100);
+        let mut state = Shutdown::default();
+        assert_eq!(state.phase(), ShutdownPhase::Open);
+        state.local(start, pto, 42).unwrap();
+        assert_eq!(state.deadline(), Some(start + pto * 3));
+        assert_eq!(state.take_close(start, pto), Some(42));
+        state.authenticated_packet(start + Duration::from_millis(99));
+        assert_eq!(state.take_close(start + Duration::from_millis(99), pto), None);
+        state.authenticated_packet(start + pto);
+        assert_eq!(state.take_close(start + pto, pto), Some(42));
+        assert_eq!(state.local(start + pto, pto, 7), Err(Error::State));
+        state.peer(start + pto * 2, pto).unwrap();
+        assert_eq!(state.phase(), ShutdownPhase::Draining);
+        state.authenticated_packet(start + pto * 2);
+        assert_eq!(state.take_close(start + pto * 2, pto), None);
+        assert!(!state.expire(start + pto * 2));
+        assert!(state.expire(start + pto * 3));
+        assert_eq!(state.phase(), ShutdownPhase::Closed);
+        state.peer(start + pto * 4, pto).unwrap();
+        assert_eq!(state.phase(), ShutdownPhase::Closed);
+    }
 
     #[test]
     fn transport_readiness_does_not_grant_admission() {

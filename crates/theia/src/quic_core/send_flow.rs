@@ -151,7 +151,7 @@ mod tests {
         assert_eq!(f.open(), Err(Error::Limit));
         assert_eq!(f.encode(id, b"abcd", false), Err(Error::Limit));
         let bytes = f.encode(id, b"ab", false).unwrap();
-        assert_eq!(decode(&bytes, Space::Application).unwrap(), [Frame::Stream { id, offset: 0, data: b"ab", fin: false, reset: false }]);
+        assert_eq!(decode(&bytes, Space::Application).unwrap(), [Frame::Stream { id, offset: 0, data: b"ab", fin: false }]);
         f.max_stream_data(id, 4).unwrap();
         f.max_stream_data(id, 1).unwrap();
         f.encode(id, b"cd", true).unwrap();

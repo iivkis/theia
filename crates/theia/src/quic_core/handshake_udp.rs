@@ -143,6 +143,7 @@ impl Handshake {
     }
 
     async fn flush(&mut self, socket: &UdpSocket) -> Result<(), Error> {
+        let mut discard_initial = false;
         for (index, epoch) in self.epochs.iter_mut().enumerate() {
             let Some(epoch) = epoch else { continue; };
             let now = Instant::now();
@@ -159,7 +160,11 @@ impl Handshake {
             epoch.schedule.record(number, packet.len(), frame, now).map_err(Error::Schedule)?;
             if socket.send(&packet).await.map_err(Error::Io)? != packet.len() { return Err(Error::Protocol); }
             if frame.is_none() { epoch.ack.sent(); }
+            // Client discards Initial only after actually sending a
+            // protected Handshake packet (RFC 9001 section 4.9.1).
+            if !self.server && index == 1 { discard_initial = true; }
         }
+        if discard_initial { self.epochs[0] = None; }
         Ok(())
     }
 
@@ -208,6 +213,9 @@ impl Handshake {
             }
         }
         epoch.ack.record(opened.number, eliciting);
+        // Server discards Initial on its first authenticated Handshake
+        // packet, not on public Initial decryption.
+        if self.server && index == 1 { self.epochs[0] = None; }
         Ok(())
     }
 
