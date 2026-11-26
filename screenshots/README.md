@@ -1,6 +1,6 @@
 # Theia TUI visual review
 
-Source: 9f3821dcf70b7a5e8a6b46e1dd4e69ebb3f2ac70
+Source: b91cd4d5ab1af44a8a8e12804182dd315af7e396
 
 Linux · 120×40 · actual production renderer cells. State fixtures and unavailable actions are not runtime success.
 
@@ -98,6 +98,14 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![client-overview-next-step](client-overview-next-step.png)
 
+## client-page-advanced
+
+![client-page-advanced](client-page-advanced.png)
+
+## client-page-import-masked
+
+![client-page-import-masked](client-page-import-masked.png)
+
 ## client-page-import
 
 ![client-page-import](client-page-import.png)
@@ -113,6 +121,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## client-page-proxy
 
 ![client-page-proxy](client-page-proxy.png)
+
+## client-page-routing
+
+![client-page-routing](client-page-routing.png)
 
 ## client-page-settings
 
@@ -154,6 +166,18 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![client-reality-local-proxy-start-selected](client-reality-local-proxy-start-selected.png)
 
+## client-routing-expired
+
+![client-routing-expired](client-routing-expired.png)
+
+## client-routing-fresh
+
+![client-routing-fresh](client-routing-fresh.png)
+
+## client-routing-unconfirmed
+
+![client-routing-unconfirmed](client-routing-unconfirmed.png)
+
 ## client-sections-focus
 
 ![client-sections-focus](client-sections-focus.png)
@@ -193,6 +217,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## server-action-delete-connection
 
 ![server-action-delete-connection](server-action-delete-connection.png)
+
+## server-action-delete-user-confirm
+
+![server-action-delete-user-confirm](server-action-delete-user-confirm.png)
 
 ## server-action-delete-user
 
@@ -302,6 +330,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![server-overview-next-step](server-overview-next-step.png)
 
+## server-page-advanced
+
+![server-page-advanced](server-page-advanced.png)
+
 ## server-page-connections
 
 ![server-page-connections](server-page-connections.png)
@@ -318,6 +350,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![server-page-overview](server-page-overview.png)
 
+## server-page-routing
+
+![server-page-routing](server-page-routing.png)
+
 ## server-page-settings
 
 ![server-page-settings](server-page-settings.png)
@@ -329,6 +365,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## server-page-users-disabled
 
 ![server-page-users-disabled](server-page-users-disabled.png)
+
+## server-page-users-ungranted
+
+![server-page-users-ungranted](server-page-users-ungranted.png)
 
 ## server-page-users
 
@@ -349,6 +389,14 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## server-reference-cidr-input
 
 ![server-reference-cidr-input](server-reference-cidr-input.png)
+
+## server-routing-edit
+
+![server-routing-edit](server-routing-edit.png)
+
+## server-routing-rules
+
+![server-routing-rules](server-routing-rules.png)
 
 ## server-sections-focus
 
