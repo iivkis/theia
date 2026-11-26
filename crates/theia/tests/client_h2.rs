@@ -495,15 +495,27 @@ async fn launch_client_with_profile_expected(
     if !expect_ready {
         timeout(Duration::from_secs(10), async {
             loop {
-                assert!(TcpStream::connect(http).await.is_err(), "denied client exposed HTTP listener");
-                assert!(TcpStream::connect(socks).await.is_err(), "denied client exposed SOCKS listener");
+                assert!(
+                    TcpStream::connect(http).await.is_err(),
+                    "denied client exposed HTTP listener"
+                );
+                assert!(
+                    TcpStream::connect(socks).await.is_err(),
+                    "denied client exposed SOCKS listener"
+                );
                 if let Some(status) = child.0.try_wait().unwrap() {
-                    assert_eq!(status.code(), Some(2), "expected controlled startup refusal");
+                    assert_eq!(
+                        status.code(),
+                        Some(2),
+                        "expected controlled startup refusal"
+                    );
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        }).await.expect("failed authenticated preflight must exit without binding");
+        })
+        .await
+        .expect("failed authenticated preflight must exit without binding");
         return (dir, child, http, socks);
     }
     #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -549,7 +561,12 @@ async fn launch_client_with_profile(
     label: &str,
     transport: theia::config::Transport,
     security_mode: theia::security_profile::SecurityMode,
-) -> (TestDirectory, ChildProcess, std::net::SocketAddr, std::net::SocketAddr) {
+) -> (
+    TestDirectory,
+    ChildProcess,
+    std::net::SocketAddr,
+    std::net::SocketAddr,
+) {
     launch_client_with_profile_expected(endpoint, pem, label, transport, security_mode, true).await
 }
 
@@ -1264,7 +1281,8 @@ async fn auto_wrong_h3_certificate_never_retries_working_h2() {
             theia::config::Transport::Auto,
             theia::security_profile::SecurityMode::Plain,
             false,
-        ).await;
+        )
+        .await;
         quic.await.unwrap();
         assert!(timeout(Duration::from_millis(250), target.accept())
             .await
@@ -1342,7 +1360,8 @@ async fn auto_denied_h3_bearer_never_retries_working_h2() {
             theia::config::Transport::Auto,
             theia::security_profile::SecurityMode::Plain,
             false,
-        ).await;
+        )
+        .await;
         assert!(timeout(Duration::from_millis(250), target.accept())
             .await
             .is_err());

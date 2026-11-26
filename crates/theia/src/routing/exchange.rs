@@ -263,26 +263,74 @@ mod tests {
     #[tokio::test]
     async fn dns_preflight_is_digest_bound_and_applies_private_acl() {
         use crate::routing::{Action, Rule};
-        let (snapshot, wire) = snapshot::Snapshot::build("scope", 2, &[Rule {
-            name: "ip rule".into(), action: Action::Direct, domains: vec![], ips: vec!["127.0.0.0/8".into()],
-        }], &[], &[]).unwrap();
-        let published = Published { snapshot, wire: wire.into() };
+        let (snapshot, wire) = snapshot::Snapshot::build(
+            "scope",
+            2,
+            &[Rule {
+                name: "ip rule".into(),
+                action: Action::Direct,
+                domains: vec![],
+                ips: vec!["127.0.0.0/8".into()],
+            }],
+            &[],
+            &[],
+        )
+        .unwrap();
+        let published = Published {
+            snapshot,
+            wire: wire.into(),
+        };
         let mut request = http::Request::new(());
         let deadline = Duration::from_secs(2);
-        assert_eq!(response_data(&published, request.headers(), true, deadline).await.unwrap(), published.wire);
-        request.headers_mut().insert(DOMAIN_HEADER, "localhost".parse().unwrap());
-        assert_eq!(response_data(&published, request.headers(), true, deadline).await.unwrap_err(), http::StatusCode::BAD_REQUEST);
-        request_domain(&mut request, "localhost", [0;32]).unwrap();
-        assert_eq!(response_data(&published, request.headers(), true, deadline).await.unwrap_err(), http::StatusCode::CONFLICT);
+        assert_eq!(
+            response_data(&published, request.headers(), true, deadline)
+                .await
+                .unwrap(),
+            published.wire
+        );
+        request
+            .headers_mut()
+            .insert(DOMAIN_HEADER, "localhost".parse().unwrap());
+        assert_eq!(
+            response_data(&published, request.headers(), true, deadline)
+                .await
+                .unwrap_err(),
+            http::StatusCode::BAD_REQUEST
+        );
+        request_domain(&mut request, "localhost", [0; 32]).unwrap();
+        assert_eq!(
+            response_data(&published, request.headers(), true, deadline)
+                .await
+                .unwrap_err(),
+            http::StatusCode::CONFLICT
+        );
         request_domain(&mut request, "localhost", published.snapshot.digest()).unwrap();
-        assert_eq!(response_data(&published, request.headers(), false, deadline).await.unwrap_err(), http::StatusCode::FORBIDDEN);
-        let ips = decode_ips(&response_data(&published, request.headers(), true, deadline).await.unwrap()).unwrap();
+        assert_eq!(
+            response_data(&published, request.headers(), false, deadline)
+                .await
+                .unwrap_err(),
+            http::StatusCode::FORBIDDEN
+        );
+        let ips = decode_ips(
+            &response_data(&published, request.headers(), true, deadline)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert!(!ips.is_empty() && ips.iter().all(IpAddr::is_loopback));
-        assert!(request_domain(&mut request, "bad..name", [0;32]).is_err());
+        assert!(request_domain(&mut request, "bad..name", [0; 32]).is_err());
         let (snapshot, wire) = snapshot::Snapshot::build("scope", 3, &[], &[], &[]).unwrap();
-        let empty = Published { snapshot, wire: wire.into() };
+        let empty = Published {
+            snapshot,
+            wire: wire.into(),
+        };
         request_domain(&mut request, "localhost", empty.snapshot.digest()).unwrap();
-        assert_eq!(response_data(&empty, request.headers(), true, deadline).await.unwrap_err(), http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_data(&empty, request.headers(), true, deadline)
+                .await
+                .unwrap_err(),
+            http::StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]

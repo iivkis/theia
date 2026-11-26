@@ -325,7 +325,8 @@ mod tests {
 
     #[tokio::test]
     async fn durable_floor_is_scope_bound_and_fails_closed_after_deletion() {
-        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("routing-floor").unwrap());
+        let dir =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("routing-floor").unwrap());
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("floor.toml");
         let cache = Cache::new("scope".into(), Some(path.clone()));
@@ -335,7 +336,10 @@ mod tests {
         cache.get(|| async { Ok(bytes.clone()) }).await.unwrap();
         assert_eq!(cache.observation(), (2, 1));
         assert!(cache.report().contains("актуальны"));
-        cache.get(|| async { panic!("fresh floor must not fetch") }).await.unwrap();
+        cache
+            .get(|| async { panic!("fresh floor must not fetch") })
+            .await
+            .unwrap();
         let restarted = Cache::new("scope".into(), Some(path.clone()));
         let (_, old) = Snapshot::build("scope", 1, &[], &[], &[]).unwrap();
         assert!(restarted.get(|| async { Ok(old) }).await.is_err());
@@ -345,7 +349,15 @@ mod tests {
         let advanced = Cache::new("scope".into(), Some(path.clone()));
         let (_, next) = Snapshot::build("scope", 3, &[], &[], &[]).unwrap();
         advanced.get(|| async { Ok(next.clone()) }).await.unwrap();
-        assert_eq!(cache.get(|| async { Ok(next) }).await.unwrap().manifest().revision, 3);
+        assert_eq!(
+            cache
+                .get(|| async { Ok(next) })
+                .await
+                .unwrap()
+                .manifest()
+                .revision,
+            3
+        );
         cache.state.lock().await.expires = None;
         assert_eq!(cache.observation(), (3, 2));
         assert!(cache.report().contains("просрочена"));
@@ -358,9 +370,26 @@ mod tests {
 
     #[tokio::test]
     async fn direct_dial_rejects_invalid_ports_and_unusable_addresses() {
-        assert!(dial_direct(Address::V4([127,0,0,1]), 0, None).await.is_err());
-        assert!(dial_direct(Address::Dns("unused.invalid".into()), 1, Some(vec!["0.0.0.0".parse().unwrap(), "224.0.0.1".parse().unwrap()])).await.is_err());
-        assert!(dial_direct(Address::V4([127,0,0,1]), 1, Some(vec!["127.0.0.1".parse().unwrap();65])).await.is_err());
+        assert!(dial_direct(Address::V4([127, 0, 0, 1]), 0, None)
+            .await
+            .is_err());
+        assert!(dial_direct(
+            Address::Dns("unused.invalid".into()),
+            1,
+            Some(vec![
+                "0.0.0.0".parse().unwrap(),
+                "224.0.0.1".parse().unwrap()
+            ])
+        )
+        .await
+        .is_err());
+        assert!(dial_direct(
+            Address::V4([127, 0, 0, 1]),
+            1,
+            Some(vec!["127.0.0.1".parse().unwrap(); 65])
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]
