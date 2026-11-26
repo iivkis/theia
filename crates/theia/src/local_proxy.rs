@@ -798,11 +798,11 @@ impl AutoClient {
         }
     }
 
-    async fn fetch_routing(&self) -> Result<Vec<u8>, ClientError> {
+    async fn fetch_routing(&self, known: Option<[u8; 32]>) -> Result<Vec<u8>, ClientError> {
         let (generation, cached) = self.prepare().await?;
         if !cached {
             if let Some(value) = self
-                .attempt_h3(generation, || self.h3.fetch_routing())
+                .attempt_h3(generation, || self.h3.fetch_routing(known))
                 .await?
             {
                 return Ok(value);
@@ -811,7 +811,7 @@ impl AutoClient {
         if !self.same_scope(generation)? {
             return Err(ClientError::QuicUnreachable);
         }
-        self.h2.fetch_routing().await
+        self.h2.fetch_routing(known).await
     }
 
     async fn resolve_routing(
@@ -916,11 +916,11 @@ impl Carrier {
             Self::Auto(c) => c.h2.own_routing_scope(),
         }
     }
-    async fn fetch_routing(&self) -> Result<Vec<u8>, ClientError> {
+    async fn fetch_routing(&self, known: Option<[u8; 32]>) -> Result<Vec<u8>, ClientError> {
         match self {
-            Self::H2(c) => Box::pin(c.fetch_routing()).await,
-            Self::H3(c) => Box::pin(c.fetch_routing()).await,
-            Self::Auto(c) => Box::pin(c.fetch_routing()).await,
+            Self::H2(c) => Box::pin(c.fetch_routing(known)).await,
+            Self::H3(c) => Box::pin(c.fetch_routing(known)).await,
+            Self::Auto(c) => Box::pin(c.fetch_routing(known)).await,
         }
     }
     async fn resolve_routing(
@@ -1011,7 +1011,7 @@ async fn routed_open(
     address: Address,
     port: u16,
 ) -> Result<ProxyTunnel, ClientError> {
-    let snapshot = cache.get(|| carrier.fetch_routing()).await?;
+    let snapshot = cache.get(|known| carrier.fetch_routing(known)).await?;
     let policy = snapshot.policy();
     let denied = || ClientError::Open(ErrorCode::PolicyDenied);
     let mut pinned = None;
@@ -1110,10 +1110,10 @@ impl ProxyClient {
     }
     async fn routing_policy(&self) -> Result<Arc<Snapshot>, ClientError> {
         match self {
-            Self::Direct(c) => c.routing.get(|| c.carrier.fetch_routing()).await,
+            Self::Direct(c) => c.routing.get(|known| c.carrier.fetch_routing(known)).await,
             Self::Reality(c) => {
                 let generation = c.generation().await?;
-                c.routing.get(|| generation.carrier.fetch_routing()).await
+                c.routing.get(|known| generation.carrier.fetch_routing(known)).await
             }
         }
     }

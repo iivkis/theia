@@ -148,7 +148,7 @@ impl Cache {
 
     pub(crate) async fn get<F, Fut>(&self, fetch: F) -> Result<Arc<Snapshot>, ClientError>
     where
-        F: FnOnce() -> Fut,
+        F: FnOnce(Option<[u8; 32]>) -> Fut,
         Fut: Future<Output = Result<Vec<u8>, ClientError>>,
     {
         let mut state = self.state.lock().await;
@@ -172,14 +172,23 @@ impl Cache {
         }
         state.expires = None;
         state.retry = Some(now + RETRY);
-        let wire = fetch().await?;
-        let scope = self.scope.clone();
-        let snapshot = tokio::task::spawn_blocking(move || Snapshot::decode(&wire, &scope))
-            .await
-            .map_err(|_| ClientError::Protocol)?
-            .map_err(|_| ClientError::Protocol)?;
+        let previous = state.snapshot.as_ref();
+        let wire = fetch(previous.map(|s| s.digest())).await?;
+        let snapshot = if let Some(previous) = previous.filter(|s| {
+            wire.as_slice() == super::exchange::unchanged_receipt(s.digest()).as_slice()
+        }) {
+            previous.clone()
+        } else {
+            let scope = self.scope.clone();
+            Arc::new(
+                tokio::task::spawn_blocking(move || Snapshot::decode(&wire, &scope))
+                    .await
+                    .map_err(|_| ClientError::Protocol)?
+                    .map_err(|_| ClientError::Protocol)?,
+            )
+        };
+        // The durable floor is checked even for an unchanged receipt.
         self.persist(&snapshot, state.snapshot.as_deref())?;
-        let snapshot = Arc::new(snapshot);
         state.snapshot = Some(snapshot.clone());
         state.expires = Some(Instant::now() + TTL);
         state.retry = None;
@@ -308,19 +317,46 @@ mod tests {
     async fn cache_rejects_rollback_and_equivocation() {
         let cache = Cache::new("scope".into(), None);
         let (_, bytes) = Snapshot::build("scope", 2, &[], &[], &[]).unwrap();
-        let accepted = cache.get(|| async { Ok(bytes) }).await.unwrap();
+        let accepted = cache.get(|_| async { Ok(bytes) }).await.unwrap();
         assert_eq!(accepted.manifest().revision, 2);
         assert!(cache
-            .get(|| async { panic!("fresh cache must not fetch") })
+            .get(|_| async { panic!("fresh cache must not fetch") })
             .await
             .is_ok());
         cache.state.lock().await.expires = None;
         let (_, bytes) = Snapshot::build("scope", 1, &[], &[], &[]).unwrap();
-        assert!(cache.get(|| async { Ok(bytes) }).await.is_err());
+        assert!(cache.get(|_| async { Ok(bytes) }).await.is_err());
         assert!(cache
-            .get(|| async { panic!("retry throttled") })
+            .get(|_| async { panic!("retry throttled") })
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn conditional_refresh_reuses_only_the_exact_verified_snapshot() {
+        let cache = Cache::new("scope".into(), None);
+        let (snapshot, wire) = Snapshot::build("scope", 2, &[], &[], &[]).unwrap();
+        let digest = snapshot.digest();
+        let old = cache.get(|known| async move {
+            assert!(known.is_none());
+            Ok(wire)
+        }).await.unwrap();
+        cache.state.lock().await.expires = None;
+        let fresh = cache.get(|known| async move {
+            assert_eq!(known, Some(digest));
+            Ok(super::super::exchange::unchanged_receipt(digest).to_vec())
+        }).await.unwrap();
+        assert!(Arc::ptr_eq(&old, &fresh));
+        assert_eq!(cache.observation(), (2, 1));
+        cache.state.lock().await.expires = None;
+        assert!(cache.get(|_| async {
+            Ok(super::super::exchange::unchanged_receipt([0; 32]).to_vec())
+        }).await.is_err());
+        assert_eq!(cache.observation(), (2, 2));
+        let empty = Cache::new("scope".into(), None);
+        assert!(empty.get(|_| async {
+            Ok(super::super::exchange::unchanged_receipt(digest).to_vec())
+        }).await.is_err());
     }
 
     #[tokio::test]
@@ -333,25 +369,25 @@ mod tests {
         assert_eq!(cache.observation(), (0, 0));
         assert!(cache.report().contains("не подтверждены"));
         let (_, bytes) = Snapshot::build("scope", 2, &[], &[], &[]).unwrap();
-        cache.get(|| async { Ok(bytes.clone()) }).await.unwrap();
+        cache.get(|_| async { Ok(bytes.clone()) }).await.unwrap();
         assert_eq!(cache.observation(), (2, 1));
         assert!(cache.report().contains("актуальны"));
         cache
-            .get(|| async { panic!("fresh floor must not fetch") })
+            .get(|_| async { panic!("fresh floor must not fetch") })
             .await
             .unwrap();
         let restarted = Cache::new("scope".into(), Some(path.clone()));
         let (_, old) = Snapshot::build("scope", 1, &[], &[], &[]).unwrap();
-        assert!(restarted.get(|| async { Ok(old) }).await.is_err());
+        assert!(restarted.get(|_| async { Ok(old) }).await.is_err());
         let other = Cache::new("other".into(), Some(path.clone()));
         let (_, wrong) = Snapshot::build("other", 3, &[], &[], &[]).unwrap();
-        assert!(other.get(|| async { Ok(wrong) }).await.is_err());
+        assert!(other.get(|_| async { Ok(wrong) }).await.is_err());
         let advanced = Cache::new("scope".into(), Some(path.clone()));
         let (_, next) = Snapshot::build("scope", 3, &[], &[], &[]).unwrap();
-        advanced.get(|| async { Ok(next.clone()) }).await.unwrap();
+        advanced.get(|_| async { Ok(next.clone()) }).await.unwrap();
         assert_eq!(
             cache
-                .get(|| async { Ok(next) })
+                .get(|_| async { Ok(next) })
                 .await
                 .unwrap()
                 .manifest()
@@ -363,7 +399,7 @@ mod tests {
         assert!(cache.report().contains("просрочена"));
         std::fs::remove_file(&path).unwrap();
         let (_, newer) = Snapshot::build("scope", 4, &[], &[], &[]).unwrap();
-        assert!(cache.get(|| async { Ok(newer) }).await.is_err());
+        assert!(cache.get(|_| async { Ok(newer) }).await.is_err());
         assert!(!path.exists());
         std::fs::remove_dir_all(dir).unwrap();
     }

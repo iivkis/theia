@@ -778,6 +778,14 @@ impl RoutingPanel {
             crate::routing::Action::Allowed => "allowed",
         }
     }
+    fn action_label(value: &str) -> &str {
+        match value {
+            "direct" => "Напрямую",
+            "blocked" => "Блокировать",
+            "allowed" => "Через сервер",
+            _ => value,
+        }
+    }
     fn edit(&mut self, index: Option<usize>) {
         let values = index
             .and_then(|i| self.settings.rules.get(i))
@@ -924,7 +932,7 @@ impl RoutingPanel {
                         "blocked" => crate::routing::Action::Blocked,
                         "allowed" => crate::routing::Action::Allowed,
                         _ => {
-                            self.message = "Действие: direct, blocked или allowed.".into();
+                            self.message = "Выберите действие стрелками влево или вправо.".into();
                             return true;
                         }
                     };
@@ -998,20 +1006,21 @@ impl RoutingPanel {
         let mut body = String::new();
         if let Some((_, fields, focus)) = &self.fields {
             for (i, (label, value)) in
-                ["Имя", "Действие", "Домены / geosite:", "IP / CIDR / geoip:"]
+                ["Имя", "Действие", "Домены / GeoSite", "IP / CIDR / GeoIP"]
                     .iter()
                     .zip(fields)
                     .enumerate()
             {
+                let value = if i == 1 { Self::action_label(value) } else { value.as_str() };
                 body.push_str(&format!(
                     "{} {label}: {value}\n",
                     if i == *focus { "›" } else { " " }
                 ));
             }
-            body.push_str("\n↑↓ / Tab: поле · ←→: действие · Ctrl+U: очистить\nEnter: принять · Esc: отменить");
+            body.push_str("\nПримеры: domain:example.org, geosite:google\nIP: 192.0.2.0/24, geoip:private · несколько значений через запятую\n\n↑↓ / Tab: поле · ←→: действие · Ctrl+U: очистить\nEnter: принять правило · Esc: отменить");
         } else {
             body.push_str(&format!(
-                "GeoData: {}\nПервое совпадение; иначе allowed.\n",
+                "GeoData: {}\nПравила проверяются сверху вниз. Без совпадения — через сервер.\n",
                 self.settings
                     .datasets
                     .as_ref()
@@ -1024,7 +1033,7 @@ impl RoutingPanel {
                     if i == self.selected { "›" } else { " " },
                     i + 1,
                     rule.name,
-                    Self::action_name(rule.action)
+                    Self::action_label(Self::action_name(rule.action))
                 ));
             }
             if self.settings.rules.is_empty() {
@@ -1089,7 +1098,7 @@ impl RoutingObservation {
                 })) if config_sha256 == self.digest => {
                     let status = match routing_state {
                         1 => format!("Правила актуальны · ревизия {routing_revision}"),
-                        2 => format!("Правила просрочены · ревизия {routing_revision}; новые соединения ждут проверки"),
+                        2 => format!("Внимание: правила просрочены · ревизия {routing_revision}\nНовые соединения заблокированы до успешной проверки"),
                         3 => "Синхронизация выполняется".into(),
                         _ => "Правила ещё не подтверждены".into(),
                     };
@@ -6715,7 +6724,7 @@ fn page_layout_for(
     } else if role == Role::Client && page == 2 {
         7
     } else if role == Role::Client && page == 6 {
-        14
+        if area.width >= 76 { 10 } else { 14 }
     } else if page == 5 {
         8
     } else if role == Role::Server && page == 3 {
@@ -7161,7 +7170,7 @@ fn draw_page(
                     ui.and_then(|u| u.routing_observation.as_ref()).filter(|o| o.digest == editor.saved_sha256()).map_or_else(|| "Проверяем состояние клиента…".into(), RoutingObservation::body)
                 }
             }
-            (Role::Server,7) => editor.routing_settings().map_or_else(|| "Правил нет. По умолчанию: allowed (через сервер).".into(), |s| format!("Ревизия: {} · правил: {}\nGeoData: {}\nСохраните TOML, затем примените через Управление.", s.revision, s.rules.len(), s.datasets.as_ref().map_or("не выбраны", |m| m.release.as_str()))),
+            (Role::Server,7) => editor.routing_settings().map_or_else(|| "Правил нет. По умолчанию весь трафик Theia идёт через сервер.".into(), |s| format!("Ревизия: {} · правил: {}\nGeoData: {}\nСохраните TOML, затем примените через Управление.", s.revision, s.rules.len(), s.datasets.as_ref().map_or("не выбраны", |m| m.release.as_str()))),
             (_,5) => format!("Файл: {}\n{}\nСохранение не меняет работающий процесс.", editor.saved_path().display(), editor.settings_summary()),
             _ => "Проверьте состояние подключения.\nСетевые проверки требуют согласия.".into(),
         };

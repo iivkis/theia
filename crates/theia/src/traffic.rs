@@ -105,13 +105,12 @@ pub(crate) fn routing_summary_from(totals: [u64; 7]) -> String {
     let [direct_up, direct_down, proxy_up, proxy_down, blocked, direct_active, proxy_active] =
         totals;
     format!(
-        "Маршрутизация: через VPS ↑ {} ↓ {} · напрямую ↑ {} ↓ {} · блокировок {}",
+        "Через VPS: ↑ {} ↓ {} · активно {proxy_active}\nНапрямую: ↑ {} ↓ {} · активно {direct_active}\nЗаблокировано: {blocked}",
         bytes(proxy_up),
         bytes(proxy_down),
         bytes(direct_up),
         bytes(direct_down),
-        blocked
-    ) + &format!("\nАктивные соединения: напрямую {direct_active}, через VPS {proxy_active}")
+    )
 }
 
 fn counters(role: Role, h3: bool) -> &'static Counters {

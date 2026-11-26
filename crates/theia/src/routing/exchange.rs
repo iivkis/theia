@@ -14,6 +14,30 @@ use std::{
 pub(crate) const DOMAIN_HEADER: &str = "theia-routing-domain";
 pub(crate) const DIGEST_HEADER: &str = "theia-routing-digest";
 pub(crate) const DNS_LIMIT: usize = 1 + 64 * 17;
+// Exact-digest receipt for an authenticated conditional refresh.
+const UNCHANGED_MAGIC: &[u8; 8] = b"THEIANC1";
+
+pub(crate) fn unchanged_receipt(digest: [u8; 32]) -> [u8; 40] {
+    let mut receipt = [0; 40];
+    receipt[..8].copy_from_slice(UNCHANGED_MAGIC);
+    receipt[8..].copy_from_slice(&digest);
+    receipt
+}
+
+fn digest_text(digest: [u8; 32]) -> String {
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub(crate) fn request_digest(
+    request: &mut http::Request<()>,
+    digest: [u8; 32],
+) -> Result<(), ClientError> {
+    request.headers_mut().insert(
+        DIGEST_HEADER,
+        http::HeaderValue::from_str(&digest_text(digest)).map_err(|_| ClientError::Protocol)?,
+    );
+    Ok(())
+}
 pub(crate) const TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
 pub(crate) struct Published {
     pub(crate) snapshot: snapshot::Snapshot,
@@ -105,15 +129,7 @@ pub(crate) fn request_domain(
     let mut name = http::HeaderValue::from_str(&host).map_err(|_| ClientError::Protocol)?;
     name.set_sensitive(true);
     request.headers_mut().insert(DOMAIN_HEADER, name);
-    let text = digest
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-    request.headers_mut().insert(
-        DIGEST_HEADER,
-        http::HeaderValue::from_str(&text).map_err(|_| ClientError::Protocol)?,
-    );
-    Ok(())
+    request_digest(request, digest)
 }
 
 /// This read-only DNS preflight is bound to the exact published policy.
@@ -128,7 +144,22 @@ pub(crate) async fn response_data(
     use http::StatusCode;
     let domain_count = headers.get_all(DOMAIN_HEADER).iter().count();
     let digest_count = headers.get_all(DIGEST_HEADER).iter().count();
-    if domain_count == 0 && digest_count == 0 {
+    if domain_count == 0 {
+        if digest_count == 0 {
+            return Ok(publication.wire.clone());
+        }
+        let digest = headers
+            .get(DIGEST_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| {
+                digest_count == 1
+                    && v.len() == 64
+                    && v.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+            .ok_or(StatusCode::BAD_REQUEST)?;
+        if digest == digest_text(publication.snapshot.digest()) {
+            return Ok(Arc::from(unchanged_receipt(publication.snapshot.digest()).as_slice()));
+        }
         return Ok(publication.wire.clone());
     }
     if domain_count != 1 || digest_count != 1 {
@@ -139,12 +170,7 @@ pub(crate) async fn response_data(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| super::domain_name(v).ok())
         .ok_or(StatusCode::BAD_REQUEST)?;
-    let expected = publication
-        .snapshot
-        .digest()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
+    let expected = digest_text(publication.snapshot.digest());
     if headers.get(DIGEST_HEADER).and_then(|v| v.to_str().ok()) != Some(expected.as_str()) {
         return Err(StatusCode::CONFLICT);
     }
@@ -329,6 +355,34 @@ mod tests {
             response_data(&empty, request.headers(), true, deadline)
                 .await
                 .unwrap_err(),
+            http::StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_snapshot_is_exact_and_rejects_ambiguous_headers() {
+        let (snapshot, wire) = snapshot::Snapshot::build("scope", 2, &[], &[], &[]).unwrap();
+        let publication = Published { snapshot, wire: wire.into() };
+        let mut request = http::Request::new(());
+        let deadline = Duration::from_secs(1);
+        request_digest(&mut request, publication.snapshot.digest()).unwrap();
+        let receipt = response_data(&publication, request.headers(), false, deadline)
+            .await
+            .unwrap();
+        assert_eq!(&*receipt, &unchanged_receipt(publication.snapshot.digest()));
+        request_digest(&mut request, [0; 32]).unwrap();
+        assert_eq!(
+            response_data(&publication, request.headers(), false, deadline).await.unwrap(),
+            publication.wire
+        );
+        request.headers_mut().append(DIGEST_HEADER, "invalid".parse().unwrap());
+        assert_eq!(
+            response_data(&publication, request.headers(), false, deadline).await.unwrap_err(),
+            http::StatusCode::BAD_REQUEST
+        );
+        request.headers_mut().insert(DIGEST_HEADER, "invalid".parse().unwrap());
+        assert_eq!(
+            response_data(&publication, request.headers(), false, deadline).await.unwrap_err(),
             http::StatusCode::BAD_REQUEST
         );
     }
