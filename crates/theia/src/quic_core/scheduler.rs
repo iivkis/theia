@@ -113,6 +113,7 @@ impl Scheduler {
             self.aliases.retain(|_, value| *value != id);
         }
         self.queue.retain(|id| self.frames.contains_key(id));
+        if self.frames.is_empty() { self.last_eliciting = None; }
         if outcome.acknowledged.iter().any(|p| p.ack_eliciting) {
             self.pto_count = 0;
         }

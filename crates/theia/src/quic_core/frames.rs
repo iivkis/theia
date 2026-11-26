@@ -19,6 +19,10 @@ pub enum Frame<'a> {
     MaxStreamData { id: u64, limit: u64 },
     MaxStreams { bidi: bool, limit: u64 },
     Close { application: bool, code: u64, trigger: Option<u64>, reason: &'a [u8] },
+    NewConnectionId { sequence: u64, retire_prior_to: u64, cid: &'a [u8], reset_token: [u8; 16] },
+    RetireConnectionId(u64),
+    PathChallenge([u8; 8]),
+    PathResponse([u8; 8]),
     HandshakeDone,
 }
 
@@ -83,6 +87,19 @@ pub fn decode(bytes: &[u8], space: Space) -> Result<Vec<Frame<'_>>, Error> {
                 if limit > 1 << 60 { return Err(Error::Limit); }
                 Frame::MaxStreams { bidi: ty == 0x12, limit }
             }
+            0x18 => {
+                let sequence = number(bytes, &mut at)?;
+                let retire_prior_to = number(bytes, &mut at)?;
+                if retire_prior_to > sequence { return Err(Error::Invalid); }
+                let len = u64::from(*take(bytes, &mut at, 1)?.first().ok_or(Error::Truncated)?);
+                if !(1..=20).contains(&len) { return Err(Error::Invalid); }
+                let cid = take(bytes, &mut at, len)?;
+                let reset_token = take(bytes, &mut at, 16)?.try_into().map_err(|_| Error::Truncated)?;
+                Frame::NewConnectionId { sequence, retire_prior_to, cid, reset_token }
+            }
+            0x19 => Frame::RetireConnectionId(number(bytes, &mut at)?),
+            0x1a => Frame::PathChallenge(take(bytes, &mut at, 8)?.try_into().map_err(|_| Error::Truncated)?),
+            0x1b => Frame::PathResponse(take(bytes, &mut at, 8)?.try_into().map_err(|_| Error::Truncated)?),
             0x1c | 0x1d => {
                 let code = number(bytes, &mut at)?;
                 let trigger = if ty == 0x1c { Some(number(bytes, &mut at)?) } else { None };
@@ -127,4 +144,21 @@ mod tests {
         assert_eq!(decode(&[0x1f], Space::Application), Err(Error::Unsupported));
         assert_eq!(decode(&vec![1; MAX_FRAMES + 1], Space::Application), Err(Error::Limit));
     }
+    #[test]
+    fn cid_and_path_frames() {
+        let mut bytes = vec![0x18, 2, 1, 1, 9];
+        bytes.extend([4; 16]);
+        bytes.extend([0x19, 0, 0x1a]);
+        bytes.extend([5; 8]);
+        bytes.push(0x1b);
+        bytes.extend([6; 8]);
+        assert_eq!(decode(&bytes, Space::Application).unwrap(), [
+            Frame::NewConnectionId { sequence: 2, retire_prior_to: 1, cid: &[9], reset_token: [4; 16] },
+            Frame::RetireConnectionId(0), Frame::PathChallenge([5; 8]), Frame::PathResponse([6; 8]),
+        ]);
+        assert_eq!(decode(&[0x18, 0, 1, 1], Space::Application), Err(Error::Invalid));
+        assert_eq!(decode(&[0x1a, 0], Space::Application), Err(Error::Truncated));
+        assert_eq!(decode(&[0x1b], Space::Handshake), Err(Error::WrongSpace));
+    }
+
 }
