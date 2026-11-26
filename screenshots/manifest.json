@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "source_sha": "8ea9f17a47d147ace551dee09f5c7f1f68be653b",
+  "source_sha": "abd7ffe3206cce3ff4d474c4130a272ea5b71fde",
   "platform": "linux",
   "columns": 120,
   "rows": 40,
@@ -324,7 +324,7 @@
     {
       "scenario": "server-action-network-diagnostics",
       "file": "server-action-network-diagnostics.png",
-      "sha256": "f6ca6b9efc374150ec5df7704fa2e7484ac1e125f897af96c90df1012dd25a39",
+      "sha256": "6676c439be874424934ead46f1165f7e1a40ad03585a13121e74be5aba4af54e",
       "state_fixture": false
     },
     {
@@ -348,7 +348,7 @@
     {
       "scenario": "server-action-reality-wizard",
       "file": "server-action-reality-wizard.png",
-      "sha256": "040a6cd42ce32fbdfbf0614862a0e15fe6a39562b926a945fc9e38d90b623f69",
+      "sha256": "0fbccf49edd73e29ee3d951638338b40b8962d07d6ea94356866345cbb4cd11a",
       "state_fixture": false
     },
     {
@@ -384,25 +384,25 @@
     {
       "scenario": "server-discovery-actions",
       "file": "server-discovery-actions.png",
-      "sha256": "4ff8ba4e3b3b41bedeac4c8121e110f08ce9ccd18102e5798f718de651125690",
+      "sha256": "5e378c33735618b5ce700ce7d716418cf528459c4d9fb018f2256e934a2c1489",
       "state_fixture": false
     },
     {
       "scenario": "server-discovery-consent",
       "file": "server-discovery-consent.png",
-      "sha256": "2100394320e7e6bd83b4856bf82d154074e5694d1e8d05840c0d016de2024af1",
+      "sha256": "e3c8cf140b3f02cd1d2e11fcec42471cb53db8a719410f4003b4fef68314bc67",
       "state_fixture": false
     },
     {
       "scenario": "server-domain-catalog",
       "file": "server-domain-catalog.png",
-      "sha256": "45276eb6c39bf8e21bd07d5220e5070ac8a06bc9e53b8a7e6d8eccffab296a94",
+      "sha256": "a967e461a418ce41bd4b07bd300222a92ce36783adf7b9c7c109b82e39c5df1b",
       "state_fixture": false
     },
     {
       "scenario": "server-domain-dns-confirm",
       "file": "server-domain-dns-confirm.png",
-      "sha256": "89971389c3843f1730357e76c6c166035a10124e772222fdab1568f1a20ae8ce",
+      "sha256": "17774988cfe9d0176e3c225cea63af02a99497f35fd7789edccd3e17ada8935f",
       "state_fixture": false
     },
     {
@@ -412,9 +412,21 @@
       "state_fixture": false
     },
     {
+      "scenario": "server-first-reality-dns-consent",
+      "file": "server-first-reality-dns-consent.png",
+      "sha256": "f8b61d845bdf3a7086c6d5048769b90434f43b99e32fa1287b33e4f8d63327d4",
+      "state_fixture": false
+    },
+    {
+      "scenario": "server-first-reality-sources",
+      "file": "server-first-reality-sources.png",
+      "sha256": "afd24fabe1b07c1438669caab49389cfb3c7f6fcc2305ec1b885823b033fbda4",
+      "state_fixture": false
+    },
+    {
       "scenario": "server-first-run-reality",
       "file": "server-first-run-reality.png",
-      "sha256": "fa8ab31c76721ae1ced60596de1d57ccbc70392bd3b3eecfe4d20b5d1379acdc",
+      "sha256": "e2d3b2860d74bed8038e54f7b367a36302175deffc0db5fb2ca60f2132476775",
       "state_fixture": false
     },
     {
@@ -486,25 +498,25 @@
     {
       "scenario": "server-reality-status-summary",
       "file": "server-reality-status-summary.png",
-      "sha256": "4ba835a2c78cde0f39af47d5d211b5de15c4947ca59b16f62bdcd23f6ae334bb",
+      "sha256": "8e8e6117bf44a9ef208c73e7d1117cf10421f4f769f37680fcabc06ab34ca745",
       "state_fixture": false
     },
     {
       "scenario": "server-reality-status-technical",
       "file": "server-reality-status-technical.png",
-      "sha256": "204d8d3a0bfd0172fe688c4100166b7fb7670efe8c380231678af6b7e47bd54c",
+      "sha256": "7baf7565322faaf8b2d90baade8cdda42ec1bde40d36069aa1fbe43bf8dc4c79",
       "state_fixture": false
     },
     {
       "scenario": "server-reference-candidate-groups",
       "file": "server-reference-candidate-groups.png",
-      "sha256": "5e7bb6ec353e18bd51bd03186a789e7a98c34e387eb305f45a469bbfb8887bd8",
+      "sha256": "46c2048f4fff43423ca0dd688c29f61f08c415557223af5ba553824fe0c7987a",
       "state_fixture": false
     },
     {
       "scenario": "server-reference-cidr-input",
       "file": "server-reference-cidr-input.png",
-      "sha256": "818c7bee9289870c5bbbe764fb506fd6045adcd41bac53167523b389e1a75a17",
+      "sha256": "d76cca22fdcbb7d23ddc0301511284f93d3b253db82816c52ae6341e1dacc41e",
       "state_fixture": false
     },
     {
