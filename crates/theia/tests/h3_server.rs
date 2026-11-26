@@ -759,7 +759,7 @@ async fn pinned_native_h3_ipv4_ipv6_pool_auth_and_drain() {
 async fn pinned_native_h3_non_loopback_interface() {
     let ip: std::net::IpAddr = std::env::var("THEIA_QUIC_TEST_LOCAL").unwrap().parse().unwrap();
     assert!(!ip.is_loopback());
-    timeout(Duration::from_secs(60), exercise_pinned_native_endpoint(ip, true)).await.unwrap();
+    timeout(Duration::from_secs(60), exercise_pinned_native_endpoint(ip, false)).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
