@@ -530,7 +530,7 @@ impl H3Client {
     fn native_connection(
         &self,
         version: crate::quic_core::wire::Version,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<crate::quic_core::endpoint::LabSession, ClientError>> + Send + '_>> {
+    ) -> impl std::future::Future<Output = Result<crate::quic_core::endpoint::LabSession, ClientError>> + Send + '_ {
         Box::pin(async move {
         if !self.remote.ip().is_loopback()
             || self.identity_quic.is_some()
