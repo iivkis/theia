@@ -70,12 +70,15 @@ struct Epoch {
 }
 
 impl Epoch {
-    fn new(keys: Keys) -> Self {
+    #[cfg(test)]
+    fn new(keys: Keys) -> Self { Self::with_schedule(keys, Scheduler::default()) }
+
+    fn with_schedule(keys: Keys, schedule: Scheduler) -> Self {
         Self {
             reader: Reader::new(keys.remote),
             writer: Writer::new(keys.local),
             ack: History::default(),
-            schedule: Scheduler::default(),
+            schedule,
         }
     }
 }
@@ -352,6 +355,7 @@ impl FlightPacket {
 struct Handshake {
     driver: Driver,
     epochs: [Option<Epoch>; 2],
+    application_schedule: Scheduler,
     application: Option<(Keys, Secrets)>,
     budget: PathBudget,
     server: bool,
@@ -392,7 +396,7 @@ impl Handshake {
             }
             match flight.keys {
                 Some(KeyChange::Handshake { keys }) if self.epochs[1].is_none() => {
-                    self.epochs[1] = Some(Epoch::new(keys))
+                    self.epochs[1] = Some(Epoch::with_schedule(keys, self.application_schedule.fork_space()))
                 }
                 Some(KeyChange::OneRtt { keys, next }) if self.application.is_none() => {
                     self.application = Some((keys, next))
@@ -416,6 +420,11 @@ impl Handshake {
         let total: usize = packets.iter().map(FlightPacket::size).sum();
         if total > MTU || total == 0 {
             return Err(Error::Protocol);
+        }
+        let ordinary: u64 = packets.iter().filter(|p| p.frame.is_some_and(|(_, probe)| !probe)).map(|p| p.size() as u64).sum();
+        let probes: u64 = packets.iter().filter(|p| p.frame.is_some_and(|(_, probe)| probe)).map(|p| p.size() as u64).sum();
+        if !self.application_schedule.permits_flight(ordinary, probes, now) {
+            return Ok(false);
         }
         if self.server && !self.budget.reserve_send(total as u64) {
             return Ok(false);
@@ -567,11 +576,12 @@ impl Handshake {
         // Keep TLS and CRYPTO offsets; only Initial protection and recovery
         // are reset. The packet number MUST continue across Retry.
         let keys = initial_keys(self.version, cid, false)?;
+        let old = self.epochs[0].take().ok_or(Error::Protocol)?;
         let mut epoch = Epoch {
             reader: Reader::new(keys.remote),
             writer: Writer::with_next(keys.local, next),
             ack: History::default(),
-            schedule: Scheduler::after_retry(next),
+            schedule: old.schedule.after_retry(next, Instant::now()),
         };
         // A larger opaque Retry token consumes Initial payload space.
         // Re-fragment the original CRYPTO without changing TLS offsets.
@@ -975,9 +985,12 @@ async fn establish_inner(
     .map_err(Error::Tls)?;
     let destination = retry.as_deref().unwrap_or(&original);
     let keys = initial_keys(version, destination, server)?;
+    let initial = Scheduler::with_bbr(Instant::now());
+    let application_schedule = initial.fork_space();
     let mut handshake = Handshake {
         driver: Driver::new(connection),
-        epochs: [Some(Epoch::new(keys)), None],
+        epochs: [Some(Epoch::with_schedule(keys, initial)), None],
+        application_schedule,
         application: None,
         budget: PathBudget::default(),
         server,
@@ -1073,6 +1086,8 @@ async fn establish_inner(
                 .ok_or(Error::Protocol)?,
         })
     };
+    // Key discard releases the Initial and (server) Handshake flight.
+    handshake.epochs = [None, None];
     let (keys, secrets) = handshake.application.take().ok_or(Error::Protocol)?;
     LabSession::after_handshake(
         socket,
@@ -1089,6 +1104,7 @@ async fn establish_inner(
             peer_reset_token,
             peer_disable_migration: peer_params.get(0x0c).is_some(),
             tail,
+            scheduler: handshake.application_schedule,
             early_application: handshake.early_application,
         },
     )

@@ -64,6 +64,7 @@ pub(crate) struct Established {
     pub peer_reset_token: Option<[u8; 16]>,
     pub peer_disable_migration: bool,
     pub tail: Option<HandshakeTail>,
+    pub scheduler: Scheduler,
     pub early_application: Vec<Vec<u8>>,
 }
 
@@ -139,6 +140,7 @@ impl LabSession {
             peer_reset_token,
             peer_disable_migration,
             tail,
+            scheduler,
             early_application,
         } = established;
         let mut session = Self::connect_inner(
@@ -153,8 +155,8 @@ impl LabSession {
             },
             server,
         )?;
-        // Application-space native laboratory defaults to BBR; the
-        // fixed-key codec fixture keeps the CUBIC scheduler for comparison.
+        // Preserve the actual path controller and RTT learned during TLS.
+        // Fixed-key fixtures still use the isolated CUBIC scheduler.
         session.peer_ids =
             PeerIds::with_initial(remote_cid, peer_reset_token, 2).map_err(|_| Error::Protocol)?;
         session.peer_cid_limit = peer_limits.active_cid_limit.min(8) as usize;
@@ -162,7 +164,7 @@ impl LabSession {
         session.send =
             SendFlow::from_peer(server, peer_limits, MAX_STREAMS).map_err(Error::Send)?;
         session.receive.enable_autotune().map_err(Error::Receive)?;
-        session.scheduler = Scheduler::with_bbr(Instant::now());
+        session.scheduler = scheduler;
         let options = session.socket.options();
         if options.df { session.scheduler.enable_mtu(peer_limits.max_udp_payload, Instant::now()); }
         session.scheduler.enable_ecn(options.ecn);

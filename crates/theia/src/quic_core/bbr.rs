@@ -159,6 +159,11 @@ impl Bbr {
         })
     }
 
+    pub(crate) fn discard(&mut self, tx: u64) {
+        self.samples.remove(&tx);
+        self.lost_samples.remove(&tx);
+    }
+
     pub fn mode(&self) -> Mode {
         self.mode
     }

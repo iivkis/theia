@@ -1,6 +1,5 @@
-//! Development application-space scheduler. Stable frame IDs allow late
-//! ACKs of a lost transmission to cancel queued retransmissions. No
-//! handshake-space timers, multipath, key updates or production admission.
+//! Per-PN-space loss/retransmission ledgers sharing one physical-path
+//! congestion controller, RTT estimator, pacing clock and PTO backoff.
 use super::{
     ack::Ack,
     bbr::Bbr,
@@ -11,6 +10,7 @@ use super::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -34,11 +34,52 @@ struct Pending {
     queued: bool,
 }
 
-pub struct Scheduler {
-    ledger: Ledger,
+// A single owner drives the connection. The lock protects synchronous
+// state transitions only; it is never held across I/O or an await.
+struct PathControl {
     window: Window,
     bbr: Option<Bbr>,
     rtt: Rtt,
+    pto_count: u32,
+    next_send: Option<Instant>,
+    first_rtt_at: Option<Instant>,
+    persistent_reported: Option<Instant>,
+    next_tx: u64,
+    last_tx: Option<u64>,
+}
+
+impl PathControl {
+    fn new(bbr: Option<Bbr>) -> Self {
+        Self {
+            window: Window::new(MTU).expect("valid MTU"),
+            bbr,
+            rtt: Rtt::default(),
+            pto_count: 0,
+            next_send: None,
+            first_rtt_at: None,
+            persistent_reported: None,
+            next_tx: 0,
+            last_tx: None,
+        }
+    }
+
+    fn allocate(&mut self) -> Result<u64, Error> {
+        let id = self.next_tx;
+        self.next_tx = id.checked_add(1).ok_or(Error::Limit)?;
+        self.last_tx = Some(id);
+        Ok(id)
+    }
+}
+
+type SharedPath = Arc<Mutex<PathControl>>;
+
+pub struct Scheduler {
+    ledger: Ledger,
+    path: SharedPath,
+    // Wire packet numbers overlap across spaces; BBR and HyStart use a
+    // monotone connection-local transmission ID instead.
+    active_tx: BTreeMap<u64, u64>,
+    lost_tx: BTreeMap<u64, u64>,
     ack_delay_exponent: u32,
     max_ack_delay: Duration,
     confirmed: bool,
@@ -47,23 +88,18 @@ pub struct Scheduler {
     aliases: BTreeMap<u64, Vec<u64>>,
     next_id: u64,
     last_eliciting: Option<Instant>,
-    pto_count: u32,
-    next_send: Option<Instant>,
     cwnd_limited: BTreeSet<u64>,
-    first_rtt_at: Option<Instant>,
-    persistent_reported: Option<Instant>,
     mtu: Discovery,
     ecn: super::ecn::PathEcn,
-    last_sent_number: Option<u64>,
 }
 
 impl Default for Scheduler {
     fn default() -> Self {
         Self {
             ledger: Ledger::default(),
-            window: Window::new(MTU).expect("valid MTU"),
-            bbr: None,
-            rtt: Rtt::default(),
+            path: Arc::new(Mutex::new(PathControl::new(None))),
+            active_tx: BTreeMap::new(),
+            lost_tx: BTreeMap::new(),
             ack_delay_exponent: 0,
             max_ack_delay: Duration::ZERO,
             confirmed: false,
@@ -72,47 +108,57 @@ impl Default for Scheduler {
             aliases: BTreeMap::new(),
             next_id: 0,
             last_eliciting: None,
-            pto_count: 0,
-            next_send: None,
             cwnd_limited: BTreeSet::new(),
-            first_rtt_at: None,
-            persistent_reported: None,
             mtu: Discovery::default(),
             ecn: super::ecn::PathEcn::default(),
-            last_sent_number: None,
         }
     }
 }
 
 impl Scheduler {
-    pub(crate) fn after_retry(next: u64) -> Self {
-        Self {
-            ledger: Ledger::with_next(next),
-            ..Self::default()
-        }
-    }
-
     pub fn with_bbr(now: Instant) -> Self {
-        Self {
-            bbr: Some(Bbr::new(MTU, now).expect("valid MTU")),
-            ..Self::default()
-        }
+        let mut scheduler = Self::default();
+        scheduler.path = Arc::new(Mutex::new(PathControl::new(Some(Bbr::new(MTU, now).expect("valid MTU")))));
+        scheduler
     }
 
-    /// Cross-IP migration resets RTT, congestion and pacing. Reliable
-    /// frames are queued again; retained aliases still recognize a late
-    /// ACK from the old path without adding old-path RTT or delivery samples.
+    pub(crate) fn fork_space(&self) -> Self {
+        let mut scheduler = Self::default();
+        scheduler.path = self.path.clone();
+        scheduler
+    }
+
+    pub(crate) fn after_retry(mut self, next: u64, now: Instant) -> Self {
+        // Retry is possible only before Handshake keys. Reset path model,
+        // retain the shared handle and never restart the wire PN sequence.
+        self.restart_path(now);
+        let mut next_space = self.fork_space();
+        next_space.ledger = Ledger::with_next(next);
+        next_space
+    }
+
+    /// Check actual coalesced flight bytes before allocating any wire PN.
+    /// PTO is an explicitly bounded exception, not ordinary send credit.
+    pub(crate) fn permits_flight(&self, ordinary: u64, probe: u64, now: Instant) -> bool {
+        let path = self.path.lock().expect("path lock");
+        probe <= MTU && (ordinary == 0 || (path.next_send.is_none_or(|at| now >= at)
+            && path.window.in_flight().saturating_add(ordinary) <= path.window.cwnd()))
+    }
+
+    /// Cross-IP migration occurs only after Handshake discard. Reset model
+    /// and flight but never the wire PN or the connection-local TX sequence.
     pub(crate) fn restart_path(&mut self, now: Instant) {
+        let mut path = self.path.lock().expect("path lock");
+        debug_assert_eq!(path.window.in_flight(), self.ledger.bytes_in_flight());
+        let next_tx = path.next_tx;
+        let bbr = path.bbr.as_ref().map(|_| Bbr::new(MTU, now).expect("valid MTU"));
+        *path = PathControl::new(bbr);
+        path.next_tx = next_tx;
         self.ledger.restart_path();
+        self.active_tx.clear();
+        self.lost_tx.clear();
         self.mtu.reset_path(now);
         self.ecn.disable();
-        self.window = Window::new(MTU).expect("valid MTU");
-        if self.bbr.is_some() {
-            self.bbr = Some(Bbr::new(MTU, now).expect("valid MTU"));
-        }
-        self.rtt = Rtt::default();
-        self.first_rtt_at = None;
-        self.persistent_reported = None;
         self.queue.clear();
         for (&id, frame) in &mut self.frames {
             frame.queued = true;
@@ -120,9 +166,6 @@ impl Scheduler {
         }
         self.cwnd_limited.clear();
         self.last_eliciting = None;
-        self.pto_count = 0;
-        self.next_send = None;
-        self.last_sent_number = None;
     }
 
     pub fn can_queue(&self) -> bool {
@@ -196,7 +239,7 @@ impl Scheduler {
         self.queue.retain(|id| self.frames.contains_key(id));
         let probe_due = self.pto_deadline().is_some_and(|at| now >= at);
         if probe_due {
-            if self.pto_count >= MAX_PTO {
+            if self.path.lock().expect("path lock").pto_count >= MAX_PTO {
                 return Err(Error::Timeout);
             }
             if self.aliases.len() >= MAX_ALIASES {
@@ -211,9 +254,7 @@ impl Scheduler {
                 return Ok(Some((id, f.bytes.clone(), true)));
             }
         }
-        if self.next_send.is_some_and(|at| now < at)
-            || self.window.in_flight().saturating_add(self.mtu.current() as u64) > self.window.cwnd()
-        {
+        if !self.permits_flight(self.mtu.current() as u64, 0, now) {
             return Ok(None);
         }
         if self.aliases.len() >= MAX_ALIASES {
@@ -272,7 +313,7 @@ impl Scheduler {
 
     fn mtu_deadline(&self) -> Option<Instant> {
         let size = self.mtu.candidate()?;
-        (self.confirmed && self.window.can_reserve_size(size as u64)).then_some(())?;
+        (self.confirmed && self.path.lock().expect("path lock").window.can_reserve_size(size as u64)).then_some(())?;
         self.mtu.deadline()
     }
 
@@ -283,11 +324,12 @@ impl Scheduler {
     fn apply_mtu(&mut self, before: usize) {
         let mtu = self.mtu.current();
         if before != mtu {
-            self.window.set_mtu(mtu as u64);
-            if let Some(bbr) = self.bbr.as_mut() {
+            let mut path = self.path.lock().expect("path lock");
+            path.window.set_mtu(mtu as u64);
+            if let Some(bbr) = path.bbr.as_mut() {
                 bbr.set_mtu(mtu as u64);
-                // BBR's minimum may be larger than CUBIC's minimum.
-                self.window.set_target(bbr.cwnd()).expect("bounded BBR window");
+                let target = bbr.cwnd();
+                path.window.set_target(target).expect("bounded BBR window");
             }
         }
     }
@@ -334,19 +376,20 @@ impl Scheduler {
             if ids.iter().any(|id| !self.frames.contains_key(id)) || self.aliases.len() >= MAX_ALIASES {
                 return Err(Error::Limit);
             }
-            let before = self.window.in_flight();
-            if before == 0 && self.bbr.is_none() {
-                self.window.resume(now);
+            let mut path = self.path.lock().expect("path lock");
+            let before = path.window.in_flight();
+            if before == 0 && path.bbr.is_none() {
+                path.window.resume(now);
             }
             let app_limited = probe
                 || (self.queue.iter().all(|queued| ids.contains(queued))
-                    && before.saturating_add(2 * self.mtu.current() as u64) <= self.window.cwnd());
+                    && before.saturating_add(2 * self.mtu.current() as u64) <= path.window.cwnd());
             if probe {
-                self.window
+                path.window
                     .reserve_probe(bytes as u64)
                     .map_err(|_| Error::Window)?;
             } else {
-                self.window
+                path.window
                     .reserve(bytes as u64)
                     .map_err(|_| Error::Window)?;
             }
@@ -358,16 +401,18 @@ impl Scheduler {
                 in_flight: true,
                 frames: ids.iter().map(|&id| FrameRef::Control(id)).collect(),
             }) {
-                self.window
+                path.window
                     .retire(bytes as u64)
                     .map_err(|_| Error::Window)?;
                 return Err(Error::Ledger);
             }
-            if let Some(bbr) = self.bbr.as_mut() {
-                bbr.sent(number, bytes as u64, now, before, app_limited)
+            let tx = path.allocate()?;
+            self.active_tx.insert(number, tx);
+            if let Some(bbr) = path.bbr.as_mut() {
+                bbr.sent(tx, bytes as u64, now, before, app_limited)
                     .map_err(|_| Error::Window)?;
             }
-            if !app_limited && self.bbr.is_none() {
+            if !app_limited && path.bbr.is_none() {
                 self.cwnd_limited.insert(number);
             }
             self.aliases.insert(number, ids.to_vec());
@@ -376,16 +421,15 @@ impl Scheduler {
                 if let Some(f) = self.frames.get_mut(id) { f.queued = false; }
             }
             if probe {
-                self.pto_count += 1;
+                path.pto_count += 1;
             }
             self.last_eliciting = Some(now);
-            self.last_sent_number = Some(number);
-            let spacing = if let Some(bbr) = &self.bbr {
+            let spacing = if let Some(bbr) = &path.bbr {
                 bbr.pacing_interval(bytes as u64)
             } else {
-                self.window.pacing_interval(bytes as u64, self.rtt.smoothed())
+                path.window.pacing_interval(bytes as u64, path.rtt.smoothed())
             };
-            self.next_send = now.checked_add(spacing);
+            path.next_send = now.checked_add(spacing);
         } else {
             self.ledger
                 .record(Sent {
@@ -405,7 +449,8 @@ impl Scheduler {
     /// No generic STREAM retransmission is created for PATH_* frames.
     /// The path owner decides whether and where a later probe may be sent.
     pub fn can_send_path(&self) -> bool {
-        self.window.in_flight().saturating_add(MTU) <= self.window.cwnd()
+        let path = self.path.lock().expect("path lock");
+        path.window.in_flight().saturating_add(MTU) <= path.window.cwnd()
     }
 
     pub fn record_path(&mut self, number: u64, bytes: usize, now: Instant) -> Result<(), Error> {
@@ -416,8 +461,9 @@ impl Scheduler {
     }
 
     fn record_unreliable(&mut self, number: u64, bytes: usize, now: Instant, discovery: bool) -> Result<(), Error> {
-        let before = self.window.in_flight();
-        self.window.reserve_discovery(bytes as u64).map_err(|_| Error::Window)?;
+        let mut path = self.path.lock().expect("path lock");
+        let before = path.window.in_flight();
+        path.window.reserve_discovery(bytes as u64).map_err(|_| Error::Window)?;
         if self
             .ledger
             .record(Sent {
@@ -430,17 +476,18 @@ impl Scheduler {
             })
             .is_err()
         {
-            self.window
+            path.window
                 .retire(bytes as u64)
                 .map_err(|_| Error::Window)?;
             return Err(Error::Ledger);
         }
-        if let Some(bbr) = self.bbr.as_mut() {
-            bbr.sent(number, bytes as u64, now, before, true)
+        let tx = path.allocate()?;
+        self.active_tx.insert(number, tx);
+        if let Some(bbr) = path.bbr.as_mut() {
+            bbr.sent(tx, bytes as u64, now, before, true)
                 .map_err(|_| Error::Window)?;
         }
         self.last_eliciting = Some(now);
-        self.last_sent_number = Some(number);
         Ok(())
     }
 
@@ -472,15 +519,16 @@ impl Scheduler {
         let delay = Duration::from_micros(ack.delay.saturating_mul(1u64 << self.ack_delay_exponent));
         let limit = self.ack_delay_limit();
         let confirmed = self.confirmed;
-        let rtt = &mut self.rtt;
-        let first = &mut self.first_rtt_at;
-        let outcome = self.ledger.acknowledge_with_delay(ack, now, |sample| {
-            if let Some(sample) = sample {
-                first.get_or_insert(now);
-                rtt.update(sample, delay, limit, confirmed);
-            }
-            rtt.loss_delay()
-        }).map_err(|_| Error::Ledger)?;
+        let outcome = {
+            let mut path = self.path.lock().expect("path lock");
+            self.ledger.acknowledge_with_delay(ack, now, |sample| {
+                if let Some(sample) = sample {
+                    path.first_rtt_at.get_or_insert(now);
+                    path.rtt.update(sample, delay, limit, confirmed);
+                }
+                path.rtt.loss_delay()
+            }).map_err(|_| Error::Ledger)?
+        };
         // Retain aliases for declared-lost packets until any copy is ACKed.
         let completed: BTreeSet<u64> = self.aliases.iter()
             .filter(|(n, _)| ack.acknowledges(**n))
@@ -494,64 +542,93 @@ impl Scheduler {
         if self.frames.is_empty() && self.ledger.bytes_in_flight() == 0 {
             self.last_eliciting = None;
         }
-        if outcome.newly_acked_eliciting {
-            self.pto_count = 0;
-        }
-        if self.bbr.is_none() && outcome.lost_bytes == 0 {
-            if let (Some(sample), Some(last), Some(range)) = (outcome.rtt_sample, self.last_sent_number, ack.ranges.first()) {
-                if outcome.acknowledged.iter().any(|p| self.cwnd_limited.contains(&p.number)) {
-                    self.window.rtt_sample(range.last, last.max(range.last), sample);
+        {
+            let mut path = self.path.lock().expect("path lock");
+            if outcome.newly_acked_eliciting {
+                path.pto_count = 0;
+            }
+            if path.bbr.is_none() && outcome.lost_bytes == 0 {
+                if let (Some(sample), Some(last)) = (outcome.rtt_sample, path.last_tx) {
+                    if let Some(tx) = outcome.acknowledged.iter()
+                        .filter(|p| self.cwnd_limited.contains(&p.number))
+                        .filter_map(|p| self.active_tx.get(&p.number).copied()).max() {
+                        path.window.rtt_sample(tx, last, sample);
+                    }
                 }
             }
         }
         let new_delivery = outcome.newly_acked_eliciting;
         self.apply_loss(outcome, now)?;
+        let mut path = self.path.lock().expect("path lock");
         if let Some(at) = self.ecn.acknowledge(ack) {
-            if let Some(bbr) = self.bbr.as_mut() {
+            if let Some(bbr) = path.bbr.as_mut() {
                 bbr.ecn_congestion(now);
-                self.window.set_target(bbr.cwnd()).map_err(|_| Error::Window)?;
+                let target = bbr.cwnd();
+                path.window.set_target(target).map_err(|_| Error::Window)?;
             } else {
-                self.window.ecn(at, now).map_err(|_| Error::Window)?;
+                path.window.ecn(at, now).map_err(|_| Error::Window)?;
             }
-        } else if new_delivery && self.bbr.is_none() {
-            self.window.clean_ecn_ack(now, self.rtt.smoothed());
+        } else if new_delivery && path.bbr.is_none() {
+            let rtt = path.rtt.smoothed();
+            path.window.clean_ecn_ack(now, rtt);
         }
         Ok(())
     }
 
     fn apply_loss(&mut self, outcome: loss::Outcome, now: Instant) -> Result<(), Error> {
-        self.window
+        self.path.lock().expect("path lock").window
             .retire(outcome.acknowledged_bytes + outcome.lost_bytes)
             .map_err(|_| Error::Window)?;
         let before = self.mtu.current();
         self.mtu.feedback(&outcome, now);
         self.apply_mtu(before);
-        // BBR uses the same authoritative in-flight ledger, but does not
-        // apply CUBIC's multiplicative decrease/growth to its model.
-        let persistent = self.first_rtt_at.filter(|_| !outcome.lost.is_empty()).and_then(|first| {
-            self.ledger.persistent_end(first, self.base_pto().saturating_mul(3))
-        }).filter(|end| self.persistent_reported.is_none_or(|old| *end > old));
-        if let Some(bbr) = self.bbr.as_mut() {
-            bbr.feedback(&outcome, now, self.window.in_flight())
-                .map_err(|_| Error::Window)?;
-            if persistent.is_some() {
-                bbr.persistent_congestion(now);
+        // Keep wire aliases/MTU feedback in their own number space. Only
+        // controller feedback uses connection-local transmission IDs.
+        let mut model = loss::Outcome {
+            acknowledged_bytes: outcome.acknowledged_bytes,
+            lost_bytes: outcome.lost_bytes,
+            rtt_sample: outcome.rtt_sample,
+            newly_acked_eliciting: outcome.newly_acked_eliciting,
+            ..loss::Outcome::default()
+        };
+        for packet in &outcome.acknowledged {
+            let mut p = packet.clone();
+            p.number = self.active_tx.remove(&packet.number).ok_or(Error::Ledger)?;
+            model.acknowledged.push(p);
+        }
+        for packet in &outcome.lost {
+            let mut p = packet.clone();
+            p.number = self.active_tx.remove(&packet.number).ok_or(Error::Ledger)?;
+            self.lost_tx.insert(packet.number, p.number);
+            if self.lost_tx.len() > MAX_ALIASES { self.lost_tx.pop_first(); }
+            model.lost.push(p);
+        }
+        for packet in &outcome.late_acknowledged {
+            if let Some(tx) = self.lost_tx.remove(&packet.number) {
+                let mut p = packet.clone();
+                p.number = tx;
+                model.late_acknowledged.push(p);
             }
-            self.window
-                .set_target(bbr.cwnd())
-                .map_err(|_| Error::Window)?;
+        }
+        let mut path = self.path.lock().expect("path lock");
+        let pto = path.rtt.pto(self.ack_delay_limit(), 0);
+        let persistent = path.first_rtt_at.filter(|_| !outcome.lost.is_empty()).and_then(|first| {
+            self.ledger.persistent_end(first, pto.saturating_mul(3))
+        }).filter(|end| path.persistent_reported.is_none_or(|old| *end > old));
+        let in_flight = path.window.in_flight();
+        if let Some(bbr) = path.bbr.as_mut() {
+            bbr.feedback(&model, now, in_flight).map_err(|_| Error::Window)?;
+            if persistent.is_some() { bbr.persistent_congestion(now); }
+            let target = bbr.cwnd();
+            path.window.set_target(target).map_err(|_| Error::Window)?;
         } else if persistent.is_some() {
-            self.window.persistent_congestion(now);
+            path.window.persistent_congestion(now);
         }
-        if persistent.is_some() {
-            self.persistent_reported = persistent;
-        }
-        // Apply loss before growth, so an ACK for a packet sent before
-        // the new recovery boundary cannot undo the congestion event.
+        if persistent.is_some() { path.persistent_reported = persistent; }
         for p in outcome.lost {
             self.cwnd_limited.remove(&p.number);
-            if p.in_flight && self.bbr.is_none() && !p.frames.contains(&FrameRef::MtuProbe) {
-                self.window.loss(p.at, now).map_err(|_| Error::Window)?;
+            if p.in_flight && path.bbr.is_none() && persistent.is_none() && !p.frames.contains(&FrameRef::MtuProbe) {
+                path.window.loss(p.at, now).map_err(|_| Error::Window)?;
             }
             for f in p.frames {
                 if let FrameRef::Control(id) = f {
@@ -564,16 +641,16 @@ impl Scheduler {
                 }
             }
         }
+        let smoothed = path.rtt.smoothed();
         for p in outcome.acknowledged {
             let limited = self.cwnd_limited.remove(&p.number);
-            if p.in_flight && self.bbr.is_none() && persistent.is_none() {
-                self.window
-                    .on_ack(p.at, now, u64::from(p.bytes), self.rtt.smoothed(), limited)
+            if p.in_flight && path.bbr.is_none() && persistent.is_none() {
+                path.window.on_ack(p.at, now, u64::from(p.bytes), smoothed, limited)
                     .map_err(|_| Error::Window)?;
             }
         }
-        if self.window.in_flight() == 0 && self.bbr.is_none() {
-            self.window.mark_idle(now);
+        if path.window.in_flight() == 0 && path.bbr.is_none() {
+            path.window.mark_idle(now);
         }
         Ok(())
     }
@@ -581,40 +658,55 @@ impl Scheduler {
     pub fn on_timer(&mut self, now: Instant) -> Result<(), Error> {
         let pto = self.base_pto();
         self.ecn.tick(now, pto);
+        let delay = self.path.lock().expect("path lock").rtt.loss_delay();
         let result = self
             .ledger
-            .on_loss_timer(now, self.rtt.loss_delay())
+            .on_loss_timer(now, delay)
             .map_err(|_| Error::Ledger)?;
         self.apply_loss(result, now)
     }
 
     pub(crate) fn measured_rtt(&self) -> Option<Duration> {
-        self.rtt.minimum().map(|_| self.rtt.smoothed())
+        let path = self.path.lock().expect("path lock");
+        path.rtt.minimum().map(|_| path.rtt.smoothed())
     }
 
     pub fn base_pto(&self) -> Duration {
-        self.rtt.pto(self.ack_delay_limit(), 0)
+        self.path.lock().expect("path lock").rtt.pto(self.ack_delay_limit(), 0)
     }
 
     fn pto_deadline(&self) -> Option<Instant> {
         if self.ledger.bytes_in_flight() == 0 {
             return None;
         }
-        self.last_eliciting?
-            .checked_add(self.rtt.pto(self.ack_delay_limit(), self.pto_count))
+        let path = self.path.lock().expect("path lock");
+        self.last_eliciting?.checked_add(path.rtt.pto(self.ack_delay_limit(), path.pto_count))
     }
 
     pub fn deadline(&self) -> Option<Instant> {
-        let loss = self.ledger.loss_deadline(self.rtt.loss_delay());
-        let pto = self.pto_deadline();
-        let pace = if !self.queue.is_empty()
-            && self.window.in_flight().saturating_add(self.mtu.current() as u64) <= self.window.cwnd()
-        {
-            self.next_send
-        } else {
-            None
+        let (loss, pace) = {
+            let path = self.path.lock().expect("path lock");
+            let loss = self.ledger.loss_deadline(path.rtt.loss_delay());
+            let pace = if !self.queue.is_empty() && path.window.in_flight().saturating_add(self.mtu.current() as u64) <= path.window.cwnd() {
+                path.next_send
+            } else { None };
+            (loss, pace)
         };
-        [loss, pto, pace, self.mtu_deadline()].into_iter().flatten().min()
+        [loss, self.pto_deadline(), pace, self.mtu_deadline()].into_iter().flatten().min()
+    }
+}
+
+// Key discard releases only the abandoned space. It is not congestion,
+// delivery, or an RTT sample. Other spaces retain their model and flight.
+impl Drop for Scheduler {
+    fn drop(&mut self) {
+        let Ok(mut path) = self.path.lock() else { return; };
+        let _ = path.window.retire(self.ledger.bytes_in_flight());
+        if let Some(bbr) = path.bbr.as_mut() {
+            for id in self.active_tx.values().chain(self.lost_tx.values()) {
+                bbr.discard(*id);
+            }
+        }
     }
 }
 
@@ -632,6 +724,34 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_spaces_share_window_rtt_pacing_and_discard() {
+        let now = Instant::now();
+        for bbr in [false, true] {
+            let mut initial = if bbr { Scheduler::with_bbr(now) } else { Scheduler::default() };
+            let mut handshake = initial.fork_space();
+            let mut application = initial.fork_space();
+            initial.enqueue(vec![1]).unwrap();
+            handshake.enqueue(vec![1]).unwrap();
+            application.enqueue(vec![1]).unwrap();
+            initial.record(0, 1200, Some((0, false)), now).unwrap();
+            assert!(handshake.candidate(now).unwrap().is_none());
+            let later = now + Duration::from_secs(1);
+            handshake.record(0, 1000, Some((0, false)), later).unwrap();
+            assert_eq!(application.path.lock().unwrap().window.in_flight(), 2200);
+            assert_ne!(initial.active_tx[&0], handshake.active_tx[&0]);
+            initial.acknowledge(&ack(0), later).unwrap();
+            assert_eq!(application.path.lock().unwrap().rtt.minimum(), Some(Duration::from_secs(1)));
+            assert_eq!(application.path.lock().unwrap().window.in_flight(), 1000);
+            application.record(0, 500, Some((0, false)), later).unwrap();
+            drop(handshake);
+            assert_eq!(application.path.lock().unwrap().window.in_flight(), 500);
+            application.acknowledge(&ack(0), later + Duration::from_millis(10)).unwrap();
+            assert_eq!(application.path.lock().unwrap().window.in_flight(), 0);
+            assert_eq!(application.path.lock().unwrap().rtt.minimum(), Some(Duration::from_millis(10)));
+        }
+    }
+
+    #[test]
     fn negotiated_ack_delay_applies_only_after_confirmation() {
         let now = Instant::now();
         let mut s = Scheduler::default();
@@ -640,7 +760,7 @@ mod tests {
         assert_eq!(s.base_pto(), initial_pto);
         s.confirm_handshake();
         assert_eq!(s.base_pto(), initial_pto + Duration::from_millis(25));
-        s.rtt.update(
+        s.path.lock().unwrap().rtt.update(
             Duration::from_millis(100),
             Duration::ZERO,
             Duration::ZERO,
@@ -651,7 +771,7 @@ mod tests {
         let mut a = ack(0);
         a.delay = 2500; // 20ms at exponent 3
         s.acknowledge(&a, now + Duration::from_millis(150)).unwrap();
-        assert_eq!(s.rtt.smoothed(), Duration::from_micros(103750));
+        assert_eq!(s.path.lock().unwrap().rtt.smoothed(), Duration::from_micros(103750));
     }
 
     #[test]
@@ -704,7 +824,7 @@ mod tests {
         s.record_batch(2, 729, &one, false, at).unwrap();
         s.acknowledge(&ack(1), at).unwrap();
         assert_eq!(s.pending(), 0);
-        assert_eq!(s.window.in_flight(), 729);
+        assert_eq!(s.path.lock().unwrap().window.in_flight(), 729);
     }
 
     #[test]
@@ -727,7 +847,7 @@ mod tests {
         assert_eq!(s.pending(), 0);
         assert!(s.candidate(later).unwrap().is_none());
         s.acknowledge(&ack(1), later).unwrap();
-        assert_eq!(s.window.in_flight(), 0);
+        assert_eq!(s.path.lock().unwrap().window.in_flight(), 0);
     }
 
     #[test]
@@ -744,18 +864,18 @@ mod tests {
             s.record(0, 100, Some((id, false)), now).unwrap();
             let next = now + Duration::from_millis(50);
             s.restart_path(next);
-            assert_eq!(s.window.in_flight(), 0);
-            assert!(s.rtt.minimum().is_none());
+            assert_eq!(s.path.lock().unwrap().window.in_flight(), 0);
+            assert!(s.path.lock().unwrap().rtt.minimum().is_none());
             assert_eq!(s.candidate(next).unwrap().unwrap().0, id);
             s.record(1, 100, Some((id, false)), next).unwrap();
             s.acknowledge(&ack(0), next).unwrap();
             assert_eq!(s.pending(), 0);
-            assert!(s.rtt.minimum().is_none());
-            assert_eq!(s.window.in_flight(), 100);
+            assert!(s.path.lock().unwrap().rtt.minimum().is_none());
+            assert_eq!(s.path.lock().unwrap().window.in_flight(), 100);
             s.acknowledge(&ack(1), next + Duration::from_millis(5))
                 .unwrap();
-            assert_eq!(s.window.in_flight(), 0);
-            assert_eq!(s.rtt.minimum(), Some(Duration::from_millis(5)));
+            assert_eq!(s.path.lock().unwrap().window.in_flight(), 0);
+            assert_eq!(s.path.lock().unwrap().rtt.minimum(), Some(Duration::from_millis(5)));
         }
     }
 
@@ -766,7 +886,7 @@ mod tests {
         for number in 0..5000 {
             s.record(number, 30, None, now).unwrap();
         }
-        assert_eq!(s.window.in_flight(), 0);
+        assert_eq!(s.path.lock().unwrap().window.in_flight(), 0);
         assert_eq!(s.acknowledge(&ack(5000), now), Err(Error::Ledger));
     }
     #[test]
@@ -776,12 +896,12 @@ mod tests {
         s.enqueue(vec![1]).unwrap();
         let (id, _, probe) = s.candidate(now).unwrap().unwrap();
         s.record(0, 100, Some((id, probe)), now).unwrap();
-        assert_eq!(s.window.in_flight(), 100);
+        assert_eq!(s.path.lock().unwrap().window.in_flight(), 100);
         s.acknowledge(&ack(0), now + Duration::from_millis(20))
             .unwrap();
-        assert_eq!(s.window.in_flight(), 0);
+        assert_eq!(s.path.lock().unwrap().window.in_flight(), 0);
         assert_eq!(s.pending(), 0);
-        assert_eq!(s.bbr.as_ref().unwrap().bandwidth(), 5000);
+        assert_eq!(s.path.lock().unwrap().bbr.as_ref().unwrap().bandwidth(), 5000);
     }
 
     #[test]
@@ -790,11 +910,11 @@ mod tests {
         let mut s = Scheduler::with_bbr(now);
         assert!(s.can_send_path());
         s.record_path(0, 1200, now).unwrap();
-        assert_eq!(s.window.in_flight(), 1200);
+        assert_eq!(s.path.lock().unwrap().window.in_flight(), 1200);
         assert_eq!(s.pending(), 0);
         s.acknowledge(&ack(0), now + Duration::from_millis(10))
             .unwrap();
-        assert_eq!(s.window.in_flight(), 0);
+        assert_eq!(s.path.lock().unwrap().window.in_flight(), 0);
     }
 
     #[test]
@@ -809,7 +929,7 @@ mod tests {
         s.record(1, 32, Some((id, probe)), at).unwrap();
         s.acknowledge(&ack(1), at + Duration::from_millis(10))
             .unwrap();
-        assert_eq!(s.window.in_flight(), 0);
+        assert_eq!(s.path.lock().unwrap().window.in_flight(), 0);
         assert_eq!(s.pending(), 0);
     }
 
@@ -823,9 +943,9 @@ mod tests {
         s.record(0, 100, Some((id, false)), now).unwrap();
         s.cancel_stream(2);
         assert_eq!(s.pending(), 1);
-        assert_eq!(s.window.in_flight(), 100);
+        assert_eq!(s.path.lock().unwrap().window.in_flight(), 100);
         s.acknowledge(&ack(0), now).unwrap();
-        assert_eq!(s.window.in_flight(), 0);
+        assert_eq!(s.path.lock().unwrap().window.in_flight(), 0);
         assert_eq!(s.pending(), 1);
     }
 }
