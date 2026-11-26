@@ -327,8 +327,8 @@ impl H2Client {
     }
 
     /// Authenticated binary policy snapshot for this exact inbound path.
-    pub(crate) async fn fetch_routing(&self) -> Result<Vec<u8>, ClientError> {
-        self.routing_resource(None).await
+    pub(crate) async fn fetch_routing(&self, known: Option<[u8; 32]>) -> Result<Vec<u8>, ClientError> {
+        self.routing_resource(None, known).await
     }
 
     pub(crate) async fn resolve_routing(
@@ -336,7 +336,7 @@ impl H2Client {
         name: &str,
         digest: [u8; 32],
     ) -> Result<Vec<std::net::IpAddr>, ClientError> {
-        let bytes = self.routing_resource(Some((name, digest))).await?;
+        let bytes = self.routing_resource(Some((name, digest)), None).await?;
         crate::routing::exchange::decode_ips(&bytes)
     }
 
@@ -351,6 +351,7 @@ impl H2Client {
     async fn routing_resource(
         &self,
         domain: Option<(&str, [u8; 32])>,
+        known: Option<[u8; 32]>,
     ) -> Result<Vec<u8>, ClientError> {
         let routes = self
             .identity_routes
@@ -410,6 +411,8 @@ impl H2Client {
                 .map_err(|_| ClientError::Configuration)?;
             if let Some((name, digest)) = domain {
                 crate::routing::exchange::request_domain(&mut request, name, digest)?;
+            } else if let Some(digest) = known {
+                crate::routing::exchange::request_digest(&mut request, digest)?;
             }
             let request = crate::channel_binding::attach(
                 connection.binding.as_ref(),
