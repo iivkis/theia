@@ -1108,6 +1108,8 @@ impl ConfigDialog {
         self.setup.as_ref().filter(|s| s.review.is_some()).map(|_| ('y', "Создать настройки"))
     }
 
+    pub(crate) fn reality_success_first_user(&self) -> Option<&str> { self.reality.as_ref().and_then(|p| p.success_first_user()) }
+
     pub(crate) fn reality_succeeded(&self) -> bool {
         self.reality.as_ref().is_some_and(|p| p.succeeded())
     }

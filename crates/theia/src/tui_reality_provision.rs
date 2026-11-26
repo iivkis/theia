@@ -797,7 +797,37 @@ fn progress_text(label: &str, done: usize, total: usize) -> String {
     let done = done.min(total);
     let filled = if total == 0 { 0 } else { done.saturating_mul(24) / total };
     let percent = if total == 0 { 0 } else { done.saturating_mul(100) / total };
-    format!("{label}\n[{}{}] {percent}% · {done} из {total}\nНастройки не изменяются.", "━".repeat(filled), "─".repeat(24 - filled))
+    format!("{label}\n[{}{}] {percent}% · {done} из {total}\nНастройки не изменяются.", "█".repeat(filled), "░".repeat(24 - filled))
+}
+
+struct DomainDraft {
+    rows: Vec<String>,
+    focus: usize,
+    error: String,
+}
+
+impl DomainDraft {
+    fn new(value: &str) -> Self {
+        let mut rows: Vec<_> = value.split(',').map(str::to_owned).collect();
+        if rows.is_empty() { rows.push(String::new()); }
+        Self { rows, focus: 0, error: String::new() }
+    }
+    fn value(&self) -> String {
+        self.rows.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(",")
+    }
+    fn paste(&mut self, text: &str) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        if normalized.chars().any(|ch| ch.is_control() && ch != '\n') { return; }
+        let mut next = self.rows.clone();
+        let mut focus = self.focus;
+        for (i, line) in normalized.split([',', '\n']).enumerate() {
+            if i == 0 { next[focus].push_str(line.trim()); }
+            else { focus += 1; next.insert(focus, line.trim().to_owned()); }
+        }
+        if next.len() <= 80 && next.join(",").len() <= LIMIT {
+            self.rows = next; self.focus = focus; self.error.clear();
+        } else { self.error = "Слишком длинный список: до 80 строк и 1024 байт.".into(); }
+    }
 }
 
 struct GrantPicker {
@@ -824,6 +854,7 @@ struct Wizard {
     users: String,
     available_users: Vec<String>,
     grant_picker: Option<GrantPicker>,
+    domain_draft: Option<DomainDraft>,
     progress: Arc<AtomicUsize>,
     total: usize,
     stage: WizardStage,
@@ -873,6 +904,7 @@ impl Wizard {
                 .filter_map(|(id, disabled, _)| (!disabled).then_some(id))
                 .collect(),
             grant_picker: None,
+            domain_draft: None,
             progress: Arc::new(AtomicUsize::new(0)),
             total: 0,
             stage: WizardStage::Input,
@@ -917,6 +949,7 @@ impl Wizard {
                 .into(),
             available_users: Vec::new(),
             grant_picker: None,
+            domain_draft: None,
             progress: Arc::new(AtomicUsize::new(0)),
             total: 0,
             stage: WizardStage::Input,
@@ -962,7 +995,7 @@ impl Wizard {
 
     fn display_value(&self, id: usize) -> String {
         match id {
-            8 => format!("Каталог: {} доменов · рекомендуется", crate::camouflage_discovery::POPULAR_HTTPS_DOMAINS.len()),
+            8 => format!("Сайтов в каталоге: {} · рекомендуется", crate::camouflage_discovery::POPULAR_HTTPS_DOMAINS.len()),
             9 => "Дополнительные имена сайтов".into(),
             10 => "Только сети, которые разрешено проверять".into(),
             4 => self.custom_domains(),
@@ -1130,6 +1163,7 @@ impl Wizard {
         self.focus = fields[(index + if forward { 1 } else { fields.len() - 1 }) % fields.len()];
     }
     fn paste(&mut self, text: &str) {
+        if let Some(draft) = self.domain_draft.as_mut() { draft.paste(text); return; }
         if let Some(panel) = self.registration.as_mut() {
             panel.paste(text);
             return;
@@ -1144,6 +1178,22 @@ impl Wizard {
         }
     }
     fn key(&mut self, key: KeyEvent) -> bool {
+        if let Some(mut draft) = self.domain_draft.take() {
+            match key.code {
+                KeyCode::Esc => return false,
+                KeyCode::F(4) => { self.fields[4] = draft.value(); self.error.clear(); return false; }
+                KeyCode::Up | KeyCode::BackTab => draft.focus = draft.focus.saturating_sub(1),
+                KeyCode::Down | KeyCode::Tab => draft.focus = (draft.focus + 1).min(draft.rows.len() - 1),
+                KeyCode::Enter if draft.rows.len() < 80 && draft.rows.join(",").len() < LIMIT => { draft.focus += 1; draft.rows.insert(draft.focus, String::new()); }
+                KeyCode::Delete if draft.rows.len() > 1 => { draft.rows.remove(draft.focus); draft.focus = draft.focus.min(draft.rows.len() - 1); }
+                KeyCode::Backspace => { draft.rows[draft.focus].pop(); }
+                KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => draft.rows[draft.focus].clear(),
+                KeyCode::Char(ch) if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) && !ch.is_control() => { draft.paste(&ch.to_string()); }
+                _ => {}
+            }
+            self.domain_draft = Some(draft);
+            return false;
+        }
         if let Some(panel) = self.registration.as_mut() {
             return panel.key(key);
         }
@@ -1196,6 +1246,7 @@ impl Wizard {
                             self.error = "Укажите IP из панели хостинга.".into();
                         } else { self.error.clear(); }
                     }
+                    KeyCode::F(4) if self.sources && self.focus == 4 && self.custom_enabled => { self.domain_draft = Some(DomainDraft::new(&self.fields[4])); }
                     KeyCode::F(6) if !self.sources && self.focus == 5 => self.open_grants(),
                     KeyCode::Tab | KeyCode::Down => self.move_focus(true),
                     KeyCode::BackTab | KeyCode::Up => self.move_focus(false),
@@ -1486,7 +1537,7 @@ impl Wizard {
                     _ => WizardStage::SaveFailed { root, message, retry, inspected },
                 }
             }
-            WizardStage::Success if matches!(key.code, KeyCode::Enter | KeyCode::Esc) => return true,
+            WizardStage::Success if matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('y' | 'n')) => return true,
             other => other,
         };
         false
@@ -1608,7 +1659,7 @@ impl Wizard {
                 }
                 body
             }
-            WizardStage::Resolving(_, _) => progress_text("Поиск сетевых адресов", self.progress.load(Ordering::Relaxed), self.total),
+            WizardStage::Resolving(_, _) => progress_text("Фаза 1/3: поиск сетевых адресов", self.progress.load(Ordering::Relaxed), self.total),
             WizardStage::ProbeConfirm(value) => {
                 let targets = value.1.plan.as_ref().map(|p| p.targets()).unwrap_or_default();
                 let mut text = format!("Theia проверит защищённые соединения с выбранными сайтами.\n\nАдресов для проверки: {} · не удалось найти адрес: {}\nТолько перечисленные IP и имена, порт 443, TLS 1.3, HTTP/2 и HTTP/3.\nСверка DNS сервера и сайтов; по две проверки HTTPS HEAD без перенаправлений, ключей и тела запроса.\nНастройки не записываются. Лучшие сайты будут перепроверены.", targets.len(), value.1.unresolved.len());
@@ -1626,11 +1677,11 @@ impl Wizard {
                 let done = self.progress.load(Ordering::Relaxed);
                 let total = self.recheck_total.load(Ordering::Relaxed);
                 if total > 0 {
-                    progress_text("Повторная проверка выбранных сайтов", self.recheck_done.load(Ordering::Relaxed), total)
+                    format!("✓ Адреса найдены · ✓ Первичная проверка завершена\n{}", progress_text("Фаза 3/3: повторная проверка выбранных сайтов", self.recheck_done.load(Ordering::Relaxed), total))
                 } else if done >= self.total {
                     "Подбираем лучшие сайты для повторной проверки.\nНастройки не изменяются.".into()
                 } else {
-                    progress_text("Проверка защищённых соединений", done, self.total)
+                    format!("✓ Адреса найдены\n{}", progress_text("Фаза 2/3: проверка защищённых соединений", done, self.total))
                 }
             },
             WizardStage::NoEligible(report) => report.text.clone(),
@@ -1641,9 +1692,16 @@ impl Wizard {
                     value.2.text.clone()
                 }
             },
-            WizardStage::Saving(_, _) | WizardStage::SavingInitial(_, _) => "Сохраняем защищённые файлы и настройки…\nДождитесь подтверждения. Работающий сервер не изменяется.".into(),
-            WizardStage::SaveFailed { root, message, retry, inspected } => format!("{}\n\nФайл: {}\nКаталог: {}\nСервер не запущен этой операцией.\n{}", message, self.config.display(), root.display(), if *retry && *inspected { "Повторить настройку — вернуться к источникам после проверки, без записи." } else if *inspected { "Откройте конфигурацию заново. Повтор недоступен." } else if *retry { "F2: проверить наличие файлов. Повторить настройку — вернуться к источникам без записи." } else { "F2: проверить наличие файлов. Повтор недоступен." }),
-            WizardStage::Success => "Подключение REALITY создано.\nНастройки сохранены и успешно открыты. Сервер не запущен этой операцией.\n\nЧто дальше:\n1. На странице пользователей выпустите ключ доступа.\n2. На обзоре сервера отдельно запустите сервер.\n3. Импортируйте ключ в клиент Theia.".into(),
+            WizardStage::Saving(_, _) | WizardStage::SavingInitial(_, _) => { let phase = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() / 180 % 4) as usize; format!("{} Сохраняем защищённые файлы и настройки…\nРаботающий сервер не изменяется. Дождитесь подтверждения.", ["⠋", "⠙", "⠹", "⠸"][phase]) },
+            WizardStage::SaveFailed { root, message, retry, inspected } => {
+                let mut body = format!("{}\n{}\n\nСервер не запущен этой операцией.", if *retry { "Ошибка сохранения" } else { "ВНИМАНИЕ: запись не подтверждена или требуется повторное открытие" }, message);
+                if *inspected { body.push_str(&format!("\n\nФайл: {}\nКаталог: {}\nПроверено только наличие, не целостность.", self.config.display(), root.display())); }
+                else { body.push_str("\nF2: Проверить наличие файлов и показать пути."); }
+                if *retry { body.push_str("\nПовторить настройку — вернуться к источникам без записи."); }
+                else { body.push_str("\nПовтор недоступен. Откройте конфигурацию заново."); }
+                body
+            },
+            WizardStage::Success => format!("✓ Подключение REALITY создано.\n\nАдрес: {} · Порт: {}\nПользователи: {}\nНастройки: сохранены и открыты.\nСервер: не запущен этой операцией.\n\n{}", self.fields[2], self.fields[1], self.fields[5], if self.source.is_none() { "Первый пользователь отключён до выпуска ключа.\nОткройте выпуск ключа, затем отдельно запустите сервер и импортируйте ключ в клиент." } else { "Действующие ключи не изменены. Откройте пользователей для управления доступом." }),
         }
     }
 }
@@ -1704,6 +1762,7 @@ impl ProvisionPanel {
                 WizardStage::ProbeConfirm(_) if !wizard.tls_details => Some(('y', "Проверить сайты")),
                 WizardStage::CreateConfirm(_) if !wizard.result_details => Some(('y', "Сохранить")),
                 WizardStage::SaveFailed { retry: true, .. } => Some(('y', "Повторить настройку")),
+                WizardStage::Success => Some(('y', if wizard.source.is_none() { "Выпустить ключ доступа" } else { "Открыть пользователей" })),
                 _ => None,
             };
         }
@@ -1860,6 +1919,10 @@ impl ProvisionPanel {
         None
     }
 
+    pub(crate) fn success_first_user(&self) -> Option<&str> {
+        self.wizard.as_ref().filter(|w| matches!(w.stage, WizardStage::Success) && w.source.is_none()).map(|w| w.fields[5].as_str())
+    }
+
     pub(crate) fn succeeded(&self) -> bool {
         self.wizard.as_ref().is_some_and(|w| matches!(w.stage, WizardStage::Success))
     }
@@ -1872,6 +1935,12 @@ impl ProvisionPanel {
         }
         if !matches!(wizard.stage, WizardStage::Input) {
             return None;
+        }
+        if let Some(draft) = &wizard.domain_draft {
+            return Some(Form {
+                fields: draft.rows.iter().enumerate().map(|(id, value)| Field { id, label: "Сайт", value: value.clone(), hint: "Один сайт на строку. Можно вставить список. Enter — добавить строку, Delete — удалить, F4 — принять черновик." }).collect(),
+                selected: draft.focus, lead: format!("Строк: {} из 80 · Вставьте имена сайтов, по одному на строку", draft.rows.len()), error: draft.error.clone(),
+            });
         }
         if let Some(picker) = &wizard.grant_picker {
             let count = picker.selected.iter().filter(|chosen| **chosen).count();
@@ -1905,7 +1974,7 @@ impl ProvisionPanel {
             ("Порт подключения", "Обычно 443. Порт должен быть доступен на сервере."),
             ("Адрес сервера для клиентов", "Пример: vpn.example.org · IP или домен из панели хостинга, без https:// и порта."),
             ("Все IP вашего сервера", "Пример: 203.0.113.10 · Укажите реальные IP сервера, включая публичные/NAT. Несколько через запятую."),
-            ("Свои сайты", "Пример: example.org,example.net · Имена через запятую; допустимо имя=IP."),
+            ("Свои сайты", "Пример: example.org · F4 открыть многострочный редактор. Можно вставить список имён через запятую; допустимо имя=IP."),
             (if first { "Имя первого пользователя" } else { "› Пользователи с доступом" },
              if first { "Пример: user · Придумайте имя. После создания выдайте личный ключ через «Восстановить доступ»." } else { "Пробел или F6 — открыть список. Если никто не выбран, Enter откроет его. Доступ не выдаётся автоматически." }),
             ("› Порядок выбора", "Пробел — изменить. Автоматический подбор рекомендуется."),
@@ -1929,7 +1998,7 @@ impl ProvisionPanel {
             lead: if wizard.sources {
                 "Для обычной настройки достаточно готового каталога. Дополнительные источники — по желанию.".into()
             } else {
-                "Введите адрес из панели хостинга. Дополнительные IP, включая NAT, укажите в расширенных настройках.".into()
+                "Введите адрес из панели хостинга. Все дополнительные IP сервера укажите в расширенных настройках.".into()
             },
             error: wizard.error.clone(),
         })
@@ -1941,6 +2010,7 @@ impl ProvisionPanel {
                 panel.select_field(id);
                 return;
             }
+            if let Some(draft) = wizard.domain_draft.as_mut() { if id < draft.rows.len() { draft.focus = id; } return; }
             if let Some(picker) = wizard.grant_picker.as_mut() {
                 if id < picker.selected.len() {
                     picker.focus = id;
@@ -1983,7 +2053,7 @@ impl ProvisionPanel {
             (
                 "Пользователи",
                 if first {
-                    format!("{} (отключён до выпуска токена)", input.grants.join(", "))
+                    format!("{} (отключён до выпуска ключа)", input.grants.join(", "))
                 } else {
                     input.grants.join(", ")
                 },
@@ -2024,6 +2094,7 @@ impl ProvisionPanel {
                 "Enter предпросмотр · Y подтвердить · Esc назад",
             ));
         }
+        if wizard.domain_draft.is_some() { return Some((2, 6, "Редактор списка сайтов", "↑↓ строка · Enter добавить · Delete удалить · F4 готово · Esc отменить")); }
         if wizard.grant_picker.is_some() {
             return Some((
                 1,
@@ -2033,14 +2104,14 @@ impl ProvisionPanel {
             ));
         }
         Some(match &wizard.stage {
-            WizardStage::Input if wizard.sources => (2, 6, "Источники поиска", "↑↓ поле · Пробел выбрать · Enter продолжить · F2 расширенные · Esc назад"),
+            WizardStage::Input if wizard.sources => (2, 6, "Источники поиска", "↑↓ поле · Пробел выбрать · Enter продолжить · F4 список сайтов · F2 расширенные · Esc назад"),
             WizardStage::Input => (1, 6, "Настройка сервера", "↑↓ поле · Enter продолжить · F2 расширенные · Esc назад"),
-            WizardStage::DnsConfirm(_) if wizard.dns_details => (3, 6, "Полный список целей", "Shift+PgUp/PgDn прокрутка · F2 / Enter / Esc свернуть"),
+            WizardStage::DnsConfirm(_) if wizard.dns_details => (3, 6, "Полный список целей", "PgUp/PgDn прокрутка · F2 / Enter / Esc свернуть"),
             WizardStage::DnsConfirm(_) => {
                 (3, 6, "Поиск адресов сайтов", "F2 список целей · Y найти адреса · N / Esc назад")
             }
             WizardStage::Resolving(_, _) => (3, 6, "Получение адресов", "Esc отменить"),
-            WizardStage::ProbeConfirm(_) if wizard.tls_details => (4, 6, "Точные адреса проверки", "Shift+PgUp/PgDn прокрутка · F2 / Enter / Esc свернуть"),
+            WizardStage::ProbeConfirm(_) if wizard.tls_details => (4, 6, "Точные адреса проверки", "PgUp/PgDn прокрутка · F2 / Enter / Esc свернуть"),
             WizardStage::ProbeConfirm(_) => (
                 4,
                 6,
@@ -2048,7 +2119,7 @@ impl ProvisionPanel {
                 "Y проверить перечисленные адреса · N / Esc назад",
             ),
             WizardStage::Checking(_, _) => (4, 6, "Проверка сайтов", "Esc отменить"),
-            WizardStage::NoEligible(_) | WizardStage::CreateConfirm(_) if wizard.result_details => (5, 6, "Полный отчёт", "Shift+PgUp/PgDn прокрутка · F2 / Enter / Esc свернуть"),
+            WizardStage::NoEligible(_) | WizardStage::CreateConfirm(_) if wizard.result_details => (5, 6, "Полный отчёт", "PgUp/PgDn прокрутка · F2 / Enter / Esc свернуть"),
             WizardStage::NoEligible(_) => (5, 6, "Нет подходящих сайтов", "F2 отчёт · Enter / Esc изменить источники"),
             WizardStage::CreateConfirm(value) => (
                 5,
@@ -2065,7 +2136,7 @@ impl ProvisionPanel {
             }
             WizardStage::SaveFailed { inspected: true, .. } => (6, 6, "Результат проверки файлов", "Esc закрыть"),
             WizardStage::SaveFailed { .. } => (6, 6, "Сохранение не подтверждено", "F2 проверить файлы · Esc закрыть"),
-            WizardStage::Success => (6, 6, "REALITY создан", "Enter к обзору · Esc закрыть"),
+            WizardStage::Success => (6, 6, "REALITY создан", "Enter продолжить · Esc к обзору"),
         })
     }
 
@@ -2249,6 +2320,19 @@ mod tests {
         assert!(wizard.sources);
         assert!(!path.exists());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn multiline_domain_draft_preserves_cancel_and_bounds() {
+        let mut draft = DomainDraft::new("example.org");
+        draft.focus = 0;
+        draft.paste(",example.net\r\nexample.com");
+        assert_eq!(draft.value(), "example.org,example.net,example.com");
+        assert_eq!(draft.rows.len(), 3);
+        let before = draft.value();
+        draft.paste(&"x".repeat(LIMIT));
+        assert_eq!(draft.value(), before);
+        assert!(!draft.error.is_empty());
     }
 
     #[test]

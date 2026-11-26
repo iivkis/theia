@@ -1887,9 +1887,24 @@ impl Interaction {
         }
     }
 
+    fn after_reality_success(&mut self, first_user: Option<String>) {
+        self.workspace_page = 2;
+        self.workspace_focus = WorkspaceFocus::Users;
+        self.workspace_action = 0;
+        if let Some(editor) = self.editor.as_mut() {
+            if editor.role() == Role::Server && !editor.dirty() && !editor.write_uncertain() {
+                if let Some(id) = first_user.filter(|id| eligible_users(editor, true).contains(id)) {
+                    editor.error = None;
+                    self.issue_kind = IssueKind::Reenable;
+                    self.issuance = Some(IssueFlow::Input(id));
+                }
+            }
+        }
+    }
+
     fn update(&mut self, model: &mut Model, mut key: KeyEvent) -> bool {
         if key.kind == KeyEventKind::Press
-            && key.modifiers == KeyModifiers::SHIFT
+            && (key.modifiers == KeyModifiers::SHIFT || (key.modifiers.is_empty() && (self.reality_provision.as_ref().and_then(|p| p.guide()).or_else(|| self.config_dialog.as_ref().and_then(|d| d.guide())).is_some_and(|g| matches!(g.2, "Полный отчёт" | "Полный список целей" | "Точные адреса проверки")))))
             && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
             && self.menu.is_none()
             && (!self.workspace_visible() || model.screen == Screen::Help)
@@ -1965,8 +1980,11 @@ impl Interaction {
             return false;
         }
         if let Some(dialog) = self.config_dialog.as_mut() {
+            let next = dialog.reality_succeeded() && key.code == KeyCode::Char('y') && key.modifiers.is_empty();
+            let first_user = dialog.reality_success_first_user().map(str::to_owned);
             if dialog.key(key) {
                 self.config_dialog = None;
+                if next { self.after_reality_success(first_user); }
             }
             return false;
         }
@@ -2057,8 +2075,11 @@ impl Interaction {
             return false;
         }
         if let Some(panel) = self.reality_provision.as_mut() {
+            let next = panel.succeeded() && key.code == KeyCode::Char('y') && key.modifiers.is_empty();
+            let first_user = panel.success_first_user().map(str::to_owned);
             if panel.key(key) {
                 self.reality_provision = None;
+                if next { self.after_reality_success(first_user); }
             }
             return false;
         }
@@ -4046,6 +4067,13 @@ fn visual_rows(body: &str, width: usize) -> (Vec<Line<'_>>, Option<usize>) {
     let mut rows = Vec::new();
     let mut focus = None;
     for line in body.split('\n') {
+        if let Some((bar, suffix)) = line.strip_prefix('[').and_then(|s| s.split_once(']')) {
+            if !bar.is_empty() && bar.chars().all(|ch| matches!(ch, '█' | '░')) && Span::raw(line).width() <= width {
+                let filled = bar.chars().filter(|&ch| ch == '█').count();
+                rows.push(Line::from(vec![Span::styled("█".repeat(filled), Style::default().fg(ACCENT)), Span::styled("░".repeat(bar.chars().count() - filled), Style::default().fg(MUTED)), Span::styled(suffix, Style::default().fg(TEXT).add_modifier(Modifier::BOLD))]));
+                continue;
+            }
+        }
         let selected = line.starts_with("> ") || line.starts_with("› ");
         let style = if selected {
             focus.get_or_insert(rows.len());
@@ -4058,6 +4086,8 @@ fn visual_rows(body: &str, width: usize) -> (Vec<Line<'_>>, Option<usize>) {
             || line.starts_with("Отказ:")
         {
             Style::default().fg(ERROR).add_modifier(Modifier::BOLD)
+        } else if line.starts_with("✓ ") {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
         } else if line.starts_with("ШАГ ")
             || line.starts_with("ПРЕДЛОЖЕННЫЙ ")
             || line.starts_with("ПУТЬ К TOML")
@@ -4359,7 +4389,12 @@ fn draw_guided(
         } else {
             String::new()
         };
-        let mut visible: Vec<_> = lines.into_iter().skip(offset).take(page).collect();
+        let sticky = if review.as_ref().is_some_and(|r| r.expanded) && offset > 0 && page > 1 {
+            lines[..offset].iter().rev().find(|line| line.spans.iter().any(|span| span.content.starts_with("Сайт ") && span.content.contains("TLS / H2 / H3"))).cloned()
+                .filter(|_| lines.get(offset).is_some_and(|line| line.spans.len() >= 3))
+        } else { None };
+        let mut visible: Vec<_> = lines.into_iter().skip(offset).take(page.saturating_sub(usize::from(sticky.is_some()))).collect();
+        if let Some(header) = sticky { visible.insert(0, header); }
         if !status.is_empty() {
             visible.push(Line::styled(status, Style::default().fg(MUTED)));
         }

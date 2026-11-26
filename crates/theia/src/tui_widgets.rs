@@ -366,14 +366,16 @@ impl Form {
             }
             if picker && g.stride >= 2 {
                 let style = label_style.bg(if selected { FOCUS } else { SURFACE });
+                let grant = matches!(field.label, "[x] Доступ выбран" | "[ ] Нет доступа");
+                let primary = if grant { format!("{marker}{} {}", if field.label.starts_with("[x]") { "[x]" } else { "[ ]" }, field.value) } else { label };
                 frame.render_widget(
-                    Paragraph::new(label).style(style),
+                    Paragraph::new(primary).style(style),
                     Rect::new(rect.x, rect.y, rect.width, 1),
                 );
                 frame.render_widget(
                     Paragraph::new(format!(
                         "  {}",
-                        fit_value(value, rect.width.saturating_sub(2), false)
+                        fit_value(if grant { if field.label.starts_with("[x]") { "Доступ выбран" } else { "Не выбран" } } else { value }, rect.width.saturating_sub(2), false)
                     ))
                     .style(value_style),
                     Rect::new(rect.x, rect.y + 1, rect.width, 1),
@@ -391,8 +393,10 @@ impl Form {
                     rect.width.saturating_sub(4),
                     1,
                 );
-                let shown = fit_value(value, input.width.saturating_sub(3), selected);
-                let content = if selected && !picker {
+                let placeholder;
+                let value = if field.value.is_empty() { placeholder = format!("Пример: {value}"); placeholder.as_str() } else { value };
+                let shown = fit_value(value, input.width.saturating_sub(3), selected && !field.value.is_empty());
+                let content = if selected && !picker && !field.value.is_empty() {
                     format!(" {shown} ▏")
                 } else {
                     format!(" {shown}")
@@ -480,16 +484,21 @@ impl ReferenceReview {
         let eligible = self.rows.iter().filter(|row| row.h2).count();
         let selected = self.rows.iter().filter(|row| row.selected.is_some()).count();
         append_wrapped(&mut lines, &format!("Всего: {} · Подходит: {eligible} · Выбрано: {selected}", self.rows.len()), width, Style::default().fg(TEXT));
-        append_wrapped(&mut lines, &self.note, width, Style::default().fg(WARNING));
-        append_wrapped(&mut lines, "100: H2 и H3 подтверждены · 80: только H2 подтверждён · 0: H2 не подтверждён. ? — неизвестно. Оценка не измеряет скорость.", width, Style::default().fg(MUTED));
+        for note in self.note.lines() {
+            append_wrapped(&mut lines, note, width, Style::default().fg(if eligible == 0 || note.starts_with("Внимание") { WARNING } else { TEXT }));
+        }
+        append_wrapped(&mut lines, "100: H2 и H3 подтверждены · 80: только H2 подтверждён · 0: H2 не подтверждён. ? — не подтверждено. Оценка не измеряет скорость.", width, Style::default().fg(MUTED));
         if selected > 0 {
             lines.push(Line::raw(""));
             lines.push(Line::styled("Выбранные сайты", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
             Self::append_rows(&mut lines, width, self.rows.iter().filter(|row| row.selected.is_some()));
         }
         if !self.expanded {
+            for (label, value) in self.details.iter().filter(|(label, _)| matches!(*label, "Адрес сервера" | "Пользователи")) {
+                append_wrapped(&mut lines, &format!("{label}: {value}"), width, Style::default().fg(TEXT));
+            }
             lines.push(Line::raw(""));
-            append_wrapped(&mut lines, "F2: Все кандидаты и параметры конфигурации", width, Style::default().fg(ACCENT));
+            append_wrapped(&mut lines, if self.details.is_empty() { "F2: Все кандидаты" } else { "F2: Все кандидаты и параметры конфигурации" }, width, Style::default().fg(ACCENT));
             return lines;
         }
         lines.push(Line::raw(""));
@@ -536,26 +545,25 @@ impl ReferenceReview {
                 Some(index) => format!("Резерв {index}"),
                 None if row.h2 => "Подходит".into(),
                 None if row.address.parse::<std::net::SocketAddr>().is_err() => "Нет адреса".into(),
-                None => "Нет H2".into(),
+                None => "H2 не подтверждён".into(),
             };
             let color = if row.selected == Some(0) {
                 ACCENT
             } else if row.selected.is_some() {
-                WARNING
+                ACCENT
             } else if row.h2 {
                 MUTED
             } else {
                 ERROR
             };
-            let has_pin = row.address.parse::<std::net::SocketAddr>().is_ok();
             let transports = format!(
                 "{} TLS {} H2 {} H3",
                 if row.h2 || row.h3 { "✓" } else { "?" },
-                if row.h2 { "✓" } else if has_pin { "×" } else { "?" },
-                if row.h3 { "✓" } else if has_pin { "×" } else { "?" }
+                if row.h2 { "✓" } else { "?" },
+                if row.h3 { "✓" } else { "?" }
             );
             // Long names and IPv6 addresses must remain visible, not elided.
-            if wide && Span::raw(row.name.as_str()).width() <= 28 && row.address.len() <= 23 {
+            if wide && Span::raw(row.name.as_str()).width() <= 28 && row.address.len() <= 23 && 76 + Span::raw(format!("{status} · {}", row.score)).width() <= usize::from(width) {
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("{:<30} {:<25} ", row.name, row.address),
@@ -956,7 +964,7 @@ mod tests {
                 "example.org",
                 "Основной",
                 "Резерв 1",
-                "Нет H2",
+                "H2 не подтверждён",
                 "100",
                 "80",
                 "Сервер не запускается.",
