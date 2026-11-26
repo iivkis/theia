@@ -88,6 +88,21 @@ static UDP_QUIC: AtomicU64 = AtomicU64::new(0);
 static UDP_STUN: AtomicU64 = AtomicU64::new(0);
 static UDP_STUN_RESPONSE: AtomicU64 = AtomicU64::new(0);
 static UDP_DPI_FALLBACK: AtomicU64 = AtomicU64::new(0);
+static DPI_CACHE_HIT: AtomicU64 = AtomicU64::new(0);
+static DPI_PROBE_OK: AtomicU64 = AtomicU64::new(0);
+static DPI_PROBE_FAILED: AtomicU64 = AtomicU64::new(0);
+static DPI_TLS_ALERT: AtomicU64 = AtomicU64::new(0);
+static DPI_TIMEOUT: AtomicU64 = AtomicU64::new(0);
+static UDP_VERIFIED_LOCAL: AtomicU64 = AtomicU64::new(0);
+static UDP_QUEUE_DROP: AtomicU64 = AtomicU64::new(0);
+static UDP_STUN_FALLBACK: AtomicU64 = AtomicU64::new(0);
+pub(crate) fn dpi_cache_hit() { DPI_CACHE_HIT.fetch_add(1, Ordering::Relaxed); }
+pub(crate) fn dpi_probe(good: bool) { (if good { &DPI_PROBE_OK } else { &DPI_PROBE_FAILED }).fetch_add(1, Ordering::Relaxed); }
+pub(crate) fn dpi_tls_alert() { DPI_TLS_ALERT.fetch_add(1, Ordering::Relaxed); }
+pub(crate) fn dpi_timeout() { DPI_TIMEOUT.fetch_add(1, Ordering::Relaxed); }
+pub(crate) fn udp_verified_local() { UDP_VERIFIED_LOCAL.fetch_add(1, Ordering::Relaxed); }
+pub(crate) fn udp_queue_drop() { UDP_QUEUE_DROP.fetch_add(1, Ordering::Relaxed); }
+pub(crate) fn udp_stun_fallback() { UDP_STUN_FALLBACK.fetch_add(1, Ordering::Relaxed); }
 pub(crate) fn enter_udp(role: Role, h3: bool, direct: bool) -> Relay<'static> {
     if direct {
         return UDP_DIRECT.enter();
@@ -116,10 +131,11 @@ pub(crate) fn udp_dpi_fallback() {
 #[test]
 fn udp_routing_summary_reports_independent_counters() {
     let report =
-        routing_summary_from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        routing_summary_from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]);
     assert!(report.contains("UDP VPS:"));
     assert!(report.contains("QUIC Initial 7 · STUN 8 · совпавший ответ 9"));
-    assert!(report.contains("UDP Anti-DPI: только VPS, открыто 10"));
+    assert!(report.contains("QUIC локально 16 · резерв VPS 10"));
+    assert!(report.contains("STUN через VPS 18 · потери очереди 17"));
 }
 
 pub(crate) fn enter_direct() -> Relay<'static> {
@@ -137,7 +153,7 @@ pub(crate) fn dpi_fallback_open() {
 pub(crate) fn dpi_first_failure() {
     DPI_FIRST_FAILURE.fetch_add(1, Ordering::Relaxed);
 }
-pub(crate) fn routing_totals() -> [u64; 20] {
+pub(crate) fn routing_totals() -> [u64; 28] {
     let direct = CLIENT_DIRECT.snapshot();
     let proxied = snapshot(Role::Client);
     let udp = UDP_DIRECT.snapshot();
@@ -164,6 +180,14 @@ pub(crate) fn routing_totals() -> [u64; 20] {
         UDP_STUN.load(Ordering::Relaxed),
         UDP_STUN_RESPONSE.load(Ordering::Relaxed),
         UDP_DPI_FALLBACK.load(Ordering::Relaxed),
+        DPI_CACHE_HIT.load(Ordering::Relaxed),
+        DPI_PROBE_OK.load(Ordering::Relaxed),
+        DPI_PROBE_FAILED.load(Ordering::Relaxed),
+        DPI_TLS_ALERT.load(Ordering::Relaxed),
+        DPI_TIMEOUT.load(Ordering::Relaxed),
+        UDP_VERIFIED_LOCAL.load(Ordering::Relaxed),
+        UDP_QUEUE_DROP.load(Ordering::Relaxed),
+        UDP_STUN_FALLBACK.load(Ordering::Relaxed),
     ]
 }
 
@@ -171,11 +195,11 @@ pub(crate) fn routing_summary() -> String {
     routing_summary_from(routing_totals())
 }
 
-pub(crate) fn routing_summary_from(totals: [u64; 20]) -> String {
-    let [direct_up, direct_down, proxy_up, proxy_down, blocked, direct_active, proxy_active, dpi_first_response, dpi_fallback_open, dpi_first_failure, udp_direct_up, udp_direct_down, udp_proxy_up, udp_proxy_down, udp_direct_active, udp_proxy_active, quic, stun, stun_response, udp_fallback] =
+pub(crate) fn routing_summary_from(totals: [u64; 28]) -> String {
+    let [direct_up, direct_down, proxy_up, proxy_down, blocked, direct_active, proxy_active, dpi_first_response, dpi_fallback_open, dpi_first_failure, udp_direct_up, udp_direct_down, udp_proxy_up, udp_proxy_down, udp_direct_active, udp_proxy_active, quic, stun, stun_response, udp_fallback, cache_hits, probes_ok, probes_failed, tls_alerts, timeouts, udp_verified, udp_drops, stun_fallback] =
         totals;
     format!(
-        "Через VPS: ↑ {} ↓ {} · активно {proxy_active}\nНапрямую: ↑ {} ↓ {} · активно {direct_active}\nЗаблокировано: {blocked}\nAnti-DPI: первый ответ TLS {dpi_first_response} · резерв VPS {dpi_fallback_open}\nОшибки первого обмена: {dpi_first_failure}\nUDP VPS: ↑ {} ↓ {} · активно {udp_proxy_active}\nUDP напрямую: ↑ {} ↓ {} · активно {udp_direct_active}\nUDP: QUIC Initial {quic} · STUN {stun} · совпавший ответ {stun_response}\nUDP Anti-DPI: только VPS, открыто {udp_fallback}",
+        "Через VPS: ↑ {} ↓ {} · активно {proxy_active}\nНапрямую: ↑ {} ↓ {} · активно {direct_active}\nЗаблокировано: {blocked}\nAnti-DPI: ServerHello {dpi_first_response} · резерв VPS {dpi_fallback_open}\nОшибки первого обмена {dpi_first_failure} · TLS alert {tls_alerts} · тайм-аут {timeouts}\nПроверки TLS/QUIC: успешно {probes_ok} · отказ {probes_failed} · кеш {cache_hits}\nUDP VPS: ↑ {} ↓ {} · активно {udp_proxy_active}\nUDP напрямую: ↑ {} ↓ {} · активно {udp_direct_active}\nUDP: QUIC Initial {quic} · STUN {stun} · совпавший ответ {stun_response}\nUDP: QUIC локально {udp_verified} · резерв VPS {udp_fallback}\nSTUN через VPS {stun_fallback} · потери очереди {udp_drops}",
         bytes(proxy_up),
         bytes(proxy_down),
         bytes(direct_up),

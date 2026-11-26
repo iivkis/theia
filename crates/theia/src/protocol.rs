@@ -91,7 +91,7 @@ pub enum Frame {
     Padding(Vec<u8>),
 }
 
-fn valid_dns(host: &str) -> bool {
+pub(crate) fn valid_dns(host: &str) -> bool {
     host.len() <= 253
         && !host.is_empty()
         && host.is_ascii()

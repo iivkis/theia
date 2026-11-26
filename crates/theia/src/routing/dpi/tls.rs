@@ -25,7 +25,11 @@ fn word(data: &mut &[u8]) -> Option<usize> {
     )))
 }
 
-pub(super) fn hello_name(mut data: &[u8]) -> Option<String> {
+pub(super) fn hello_name(data: &[u8]) -> Option<String> {
+    hello_metadata(data).map(|(name, _)| name)
+}
+
+pub(super) fn hello_metadata(mut data: &[u8]) -> Option<(String, bool)> {
     if byte(&mut data)? != 1 {
         return None;
     }
@@ -54,6 +58,7 @@ pub(super) fn hello_name(mut data: &[u8]) -> Option<String> {
     }
     let mut seen = HashSet::new();
     let mut name = None;
+    let mut h3 = false;
     while !data.is_empty() {
         let kind = word(&mut data)?;
         let len = word(&mut data)?;
@@ -76,10 +81,18 @@ pub(super) fn hello_name(mut data: &[u8]) -> Option<String> {
                 }
                 name = Some(super::super::domain_name(raw).ok()?);
             }
+            16 => {
+                if word(&mut value)? != value.len() || value.is_empty() { return None; }
+                while !value.is_empty() {
+                    let n = byte(&mut value)?;
+                    if n == 0 { return None; }
+                    h3 |= take(&mut value, n)? == b"h3";
+                }
+            }
             _ => {}
         }
     }
-    name
+    Some((name?, h3))
 }
 
 pub(super) enum Flight {

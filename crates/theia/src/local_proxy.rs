@@ -227,7 +227,7 @@ enum Carrier {
 struct DirectClient {
     carrier: Carrier,
     routing: Cache,
-    last_open: std::sync::atomic::AtomicU8,
+    last_open: Arc<std::sync::atomic::AtomicU8>,
 }
 impl DirectClient {
     fn fallback(&self) -> bool {
@@ -251,7 +251,7 @@ struct RealityGeneration {
     value: crate::descriptor::Verified,
     carrier: Carrier,
     credential_digest: [u8; 32],
-    last_open: std::sync::atomic::AtomicU8,
+    last_open: Arc<std::sync::atomic::AtomicU8>,
     last_refresh: std::sync::atomic::AtomicU8,
 }
 pub(crate) struct RealityClient {
@@ -335,7 +335,7 @@ impl RealityClient {
             value,
             carrier,
             credential_digest,
-            last_open: std::sync::atomic::AtomicU8::new(0),
+            last_open: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             last_refresh: std::sync::atomic::AtomicU8::new(0),
         })
     }
@@ -381,8 +381,9 @@ impl RealityClient {
     }
     async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
         let generation = self.generation().await?;
-        let result = routed_open(&generation.carrier, &self.routing, address, port).await;
-        if let Ok(tunnel) = &result {
+        let mut result = routed_open(&generation.carrier, &self.routing, address, port).await;
+        if let Ok(tunnel) = &mut result {
+            if let ProxyTunnel::Dpi(route) = tunnel { route.observed = Some(generation.last_open.clone()); }
             if tunnel.open_code() != 0 {
                 generation
                     .last_open
@@ -935,6 +936,7 @@ enum ProxyTunnel {
 
 struct DpiRoute {
     tunnel: crate::routing::dpi::Tunnel,
+    observed: Option<Arc<std::sync::atomic::AtomicU8>>,
     carrier: Carrier,
     address: Address,
     port: u16,
@@ -1144,6 +1146,7 @@ async fn routed_open(
                         {
                             return Ok(ProxyTunnel::Dpi(Box::new(DpiRoute {
                                 tunnel,
+                                observed: None,
                                 carrier: carrier.clone(),
                                 address,
                                 port,
@@ -1169,8 +1172,9 @@ async fn routed_udp(
     cache: &Cache,
     address: Address,
     port: u16,
+    candidate: &crate::routing::dpi::udp::Candidate,
 ) -> Result<crate::udp_relay::Tunnel, ClientError> {
-    let (_, action, pinned) = route_decision(carrier, cache, &address).await?;
+    let (snapshot, action, pinned) = route_decision(carrier, cache, &address).await?;
     match action {
         Action::Blocked => {
             crate::traffic::blocked();
@@ -1181,8 +1185,31 @@ async fn routed_udp(
             .map(crate::udp_relay::Tunnel::Direct),
         Action::Allowed => carrier.open_udp(address, port).await,
         Action::DirectDpi => {
+            use crate::routing::dpi::udp::Candidate;
+            // STUN transaction correlation is not authentication. Unknown,
+            // incomplete, v2 and unsupported traffic stay on the VPS.
+            if cache.dpi.enabled() && port == 443 {
+                if let (Address::Dns(name), Candidate::QuicH3(sni)) = (&address, candidate) {
+                    if crate::routing::domain_name(name).as_deref() == Ok(sni.as_str()) {
+                        let ips = match pinned {
+                            Some(ips) => ips,
+                            None => match carrier.resolve_routing(name, snapshot.digest()).await {
+                                Ok(ips) => ips,
+                                Err(ClientError::Rejected(502 | 504)) => Vec::new(),
+                                Err(error) => return Err(error),
+                            },
+                        };
+                        if !ips.is_empty() && ips.iter().all(|ip| snapshot.policy().matching_action(Some(name), Some(*ip)) == Ok(Some(Action::DirectDpi))) {
+                            if let Some(tunnel) = cache.dpi.open_quic_udp(name, port, &ips, snapshot.digest()).await {
+                                return Ok(tunnel);
+                            }
+                        }
+                    }
+                }
+            }
             let tunnel = carrier.open_udp(address, port).await?;
             crate::traffic::udp_dpi_fallback();
+            if matches!(candidate, Candidate::Stun) { crate::traffic::udp_stun_fallback(); }
             Ok(tunnel)
         }
     }
@@ -1200,7 +1227,7 @@ impl ProxyClient {
         Self::Direct(Arc::new(DirectClient {
             carrier,
             routing,
-            last_open: std::sync::atomic::AtomicU8::new(0),
+            last_open: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         }))
     }
 
@@ -1255,12 +1282,13 @@ impl ProxyClient {
         &self,
         address: Address,
         port: u16,
+        candidate: &crate::routing::dpi::udp::Candidate,
     ) -> Result<crate::udp_relay::Tunnel, ClientError> {
         match self {
-            Self::Direct(c) => routed_udp(&c.carrier, &c.routing, address, port).await,
+            Self::Direct(c) => routed_udp(&c.carrier, &c.routing, address, port, candidate).await,
             Self::Reality(c) => {
                 let generation = c.generation().await?;
-                routed_udp(&generation.carrier, &c.routing, address, port).await
+                routed_udp(&generation.carrier, &c.routing, address, port, candidate).await
             }
         }
     }
@@ -1275,7 +1303,8 @@ impl ProxyClient {
     async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
         match self {
             Self::Direct(client) => {
-                let tunnel = routed_open(&client.carrier, &client.routing, address, port).await?;
+                let mut tunnel = routed_open(&client.carrier, &client.routing, address, port).await?;
+                if let ProxyTunnel::Dpi(route) = &mut tunnel { route.observed = Some(client.last_open.clone()); }
                 if tunnel.open_code() != 0 {
                     client
                         .last_open
@@ -1327,6 +1356,7 @@ impl ProxyTunnel {
             Self::Dpi(route) => {
                 let DpiRoute {
                     tunnel,
+                    observed,
                     carrier,
                     address,
                     port,
@@ -1337,6 +1367,9 @@ impl ProxyTunnel {
                         // The origin received no application bytes. The carrier
                         // repeats server admission/ACL for the original target.
                         let tunnel = carrier.open(address, port).await?;
+                        if let Some(observed) = observed {
+                            observed.store(tunnel.open_code(), std::sync::atomic::Ordering::Relaxed);
+                        }
                         let local = crate::reality_tcp::Prefixed::new(client, prefix.into());
                         crate::traffic::dpi_fallback_open();
                         match tunnel {
@@ -1401,7 +1434,7 @@ impl ClientRuntime {
             stage: tokio::sync::Mutex::new(()),
         })
     }
-    pub(crate) async fn status(&self) -> (u64, [u8; 32], u64, u8, u8, bool, (u64, u8), [u64; 20]) {
+    pub(crate) async fn status(&self) -> (u64, [u8; 32], u64, u8, u8, bool, (u64, u8), [u64; 28]) {
         let view = self.slot.borrow().clone();
         let (desc, observed, fallback) = match &view.client {
             ProxyClient::Reality(r) => {
@@ -2239,22 +2272,28 @@ async fn udp_association(
                 if let Some((tx,observer))=flows.get(&key) {
                     // Full queue drops the datagram, never replays it.
                     if !tx.is_closed() {
-                        if tx.try_send(data.to_vec()).is_ok(){observer.lock().unwrap_or_else(|e|e.into_inner()).outgoing(data);}
+                        match tx.try_reserve() {
+                            Ok(permit) => {
+                                observer.lock().unwrap_or_else(|e|e.into_inner()).outgoing(data);
+                                permit.send(data.to_vec());
+                            }
+                            Err(_) => crate::traffic::udp_queue_drop(),
+                        }
                         continue;
                     }
                 }
                 flows.retain(|_,(tx,_)|!tx.is_closed());
-                if tasks.len()>=MAX_FLOWS { continue; }
+                if tasks.len()>=MAX_FLOWS { crate::traffic::udp_queue_drop(); continue; }
                 let (tx,rx)=mpsc::channel(QUEUE);
                 let _=tx.try_send(data.to_vec());
                 let observer=Arc::new(std::sync::Mutex::new(crate::routing::dpi::udp::Observer::default()));
-                observer.lock().unwrap_or_else(|e|e.into_inner()).outgoing(data);
+                let candidate=observer.lock().unwrap_or_else(|e|e.into_inner()).outgoing(data);
                 flows.insert(key.clone(),(tx,observer.clone()));
                 let socket=socket.clone();
                 let proxy=(*client).clone();
                 tasks.spawn(async move {
                     let (address,port)=key;
-                    let tunnel=proxy.open_udp(address.clone(),port).await?;
+                    let tunnel=proxy.open_udp(address.clone(),port,&candidate).await?;
                     let (down_tx,mut down_rx)=mpsc::channel(QUEUE);
                     let relay=tunnel.relay(rx,down_tx);
                     let deliver=async {
@@ -2283,7 +2322,7 @@ async fn udp_socks_fixture(client: &ProxyClient) {
     let client = (*client).clone();
     assert!(matches!(
         client
-            .open_udp(Address::Dns("blocked.invalid".into()), 443)
+            .open_udp(Address::Dns("blocked.invalid".into()), 443, &crate::routing::dpi::udp::Candidate::Other)
             .await,
         Err(ClientError::Open(ErrorCode::PolicyDenied))
     ));
@@ -3658,6 +3697,7 @@ mod selector_tests {
                 };
                 let route = ProxyTunnel::Dpi(Box::new(DpiRoute {
                     tunnel: crate::routing::dpi::Tunnel::fixture(origin, "example.org"),
+                    observed: Some(client.last_open.clone()),
                     carrier: client.carrier.clone(),
                     address: Address::V4([127, 0, 0, 1]),
                     port: fallback_port,

@@ -39,6 +39,15 @@ impl Stun {
             && self.transaction == response.transaction
     }
 }
+/// Classification is not peer authentication. Only a complete first QUIC
+/// v1 ClientHello offering h3 may request independent authenticated evidence.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Candidate {
+    QuicH3(String),
+    Stun,
+    Other,
+}
+
 #[derive(Default)]
 pub(crate) struct Observer {
     quic: quic::Observer,
@@ -46,24 +55,28 @@ pub(crate) struct Observer {
     request: Option<Stun>,
 }
 impl Observer {
-    pub(crate) fn outgoing(&mut self, data: &[u8]) {
+    pub(crate) fn outgoing(&mut self, data: &[u8]) -> Candidate {
         if self.done {
-            return;
+            return Candidate::Other;
         }
         if let Some(message) = stun(data) {
             self.request = Some(message);
             self.done = true;
             crate::traffic::udp_stun_flow();
-        } else {
-            match self.quic.observe(data) {
-                quic::Result::Pending => {}
-                quic::Result::Hello => {
-                    self.done = true;
-                    crate::traffic::udp_quic_flow();
-                }
-                quic::Result::Unsupported => self.done = true,
-            }
+            return Candidate::Stun;
         }
+        match self.quic.observe(data) {
+            quic::Result::Pending => {}
+            quic::Result::Hello { name, version, h3 } => {
+                self.done = true;
+                crate::traffic::udp_quic_flow();
+                if version == crate::reality_quic_wire::V1 && h3 {
+                    return Candidate::QuicH3(name);
+                }
+            }
+            quic::Result::Unsupported => self.done = true,
+        }
+        Candidate::Other
     }
     pub(crate) fn incoming(&mut self, data: &[u8]) {
         if self.request.is_some_and(|request| {
@@ -74,6 +87,27 @@ impl Observer {
         }
     }
 }
+/// Probe independently with an ordinary, strictly verified QUIC connection.
+/// The application flight is never sent by this probe. A successful probe
+/// demonstrates reachability for this name/IP/ALPN, not evasion or app identity.
+pub(super) async fn probe_quic(
+    name: &str,
+    address: std::net::SocketAddr,
+    config: std::sync::Arc<rustls::ClientConfig>,
+) -> Option<()> {
+    let mut tls = (*config).clone();
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).ok()?;
+    let mut config = quinn::ClientConfig::new(std::sync::Arc::new(crypto));
+    config.transport_config(crate::quic_transport::transport_config());
+    let bind = if address.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let mut endpoint = quinn::Endpoint::client(bind.parse().ok()?).ok()?;
+    endpoint.set_default_client_config(config);
+    let connection = crate::quic_transport::connect(&endpoint, address, name).await.ok()?;
+    connection.close(quinn::VarInt::from_u32(0), b"");
+    Some(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,7 +131,7 @@ mod tests {
             assert!(stun(&req[..n]).is_none());
         }
         let mut observer = Observer::default();
-        observer.outgoing(&req);
+        assert_eq!(observer.outgoing(&req), Candidate::Stun);
         res[19] ^= 1;
         observer.incoming(&res);
         assert!(observer.request.is_none());

@@ -7197,7 +7197,7 @@ fn draw_page(
                 } else {
                     ui.and_then(|u| u.routing_observation.as_ref()).filter(|o| o.digest == editor.saved_sha256()).map_or_else(|| "Проверяем состояние клиента…".into(), RoutingObservation::body)
                 };
-                format!("Anti-DPI в сохранённом файле: {}\n{observation}", if editor.direct_dpi_allowed() { "разрешён; TCP/TLS, экспериментально" } else { "выключен (резерв VPS)" })
+                format!("Anti-DPI в сохранённом файле: {}\n{observation}", if editor.direct_dpi_allowed() { "разрешён; TLS/QUIC, экспериментально" } else { "выключен (резерв VPS)" })
             }
             (Role::Server,7) => editor.routing_settings().map_or_else(|| "Правил нет. По умолчанию весь трафик Theia идёт через сервер.".into(), |s| format!("Ревизия: {} · правил: {}\nGeoData: {}\nСохраните TOML, затем примените через Управление.", s.revision, s.rules.len(), s.datasets.as_ref().map_or("не выбраны", |m| m.release.as_str()))),
             (_,5) => format!("Файл: {}\n{}\nСохранение не меняет работающий процесс.", editor.saved_path().display(), editor.settings_summary()),
@@ -9019,7 +9019,7 @@ mod tests {
             routing_revision: 5,
             routing_state: 1,
             routing_totals: [
-                10, 20, 30, 40, 2, 1, 1, 3, 4, 5, 10, 20, 30, 40, 1, 2, 3, 4, 5, 6,
+                10, 20, 30, 40, 2, 1, 1, 3, 4, 5, 10, 20, 30, 40, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
             ],
         }))
         .unwrap();

@@ -941,9 +941,10 @@ impl H3Tunnel {
                 match frame {
                     Frame::Datagram(data) => {
                         let size = data.len();
-                        download.send(data).await.map_err(|_| ClientError::Io)?;
-                        traffic.download(size);
-                        activity.touch();
+                        if crate::udp_relay::deliver(&download, &data)? {
+                            traffic.download(size);
+                            activity.touch();
+                        }
                     }
                     Frame::Padding(_) => tokio::task::yield_now().await,
                     Frame::Fin => return Ok::<(), ClientError>(()),

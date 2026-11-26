@@ -27,6 +27,7 @@ const FIRST_FLIGHT: Duration = Duration::from_secs(5);
 pub(crate) struct Engine {
     enabled: AtomicBool,
     cache: strategy::Cache,
+    udp_cache: std::sync::Mutex<std::collections::VecDeque<(Key, bool, std::time::Instant)>>,
     probes: Semaphore,
     // Bounded lock stripes coalesce simultaneous probes without an unbounded map.
     probe_slots: [tokio::sync::Mutex<()>; 32],
@@ -37,6 +38,7 @@ impl Default for Engine {
         Self {
             enabled: AtomicBool::new(false),
             cache: strategy::Cache::default(),
+            udp_cache: std::sync::Mutex::new(std::collections::VecDeque::new()),
             probes: Semaphore::new(4),
             probe_slots: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
         }
@@ -57,6 +59,66 @@ impl Engine {
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         (name, address, policy).hash(&mut hash);
         (hash.finish() as usize) % self.probe_slots.len()
+    }
+
+    fn cached_udp(&self, key: &Key) -> Option<bool> {
+        let mut cache = self.udp_cache.lock().ok()?;
+        cache.retain(|(_, _, expiry)| *expiry > std::time::Instant::now());
+        cache.iter().find(|(k, _, _)| k == key).map(|(_, good, _)| *good)
+    }
+
+    fn remember_udp(&self, key: Key, good: bool) {
+        if network_scope::observe(key.address) != Some(key.network) { return; }
+        if let Ok(mut cache) = self.udp_cache.lock() {
+            cache.retain(|(k, _, expiry)| k != &key && *expiry > std::time::Instant::now());
+            if cache.len() >= 128 { cache.pop_front(); }
+            cache.push_back((key, good, std::time::Instant::now() + Duration::from_secs(if good { 60 } else { 20 })));
+        }
+    }
+
+    /// Local reachability strategy; not a ciphertext transformation. Fail
+    /// closed to the authenticated VPS before the first application datagram.
+    pub(crate) async fn open_quic_udp(
+        self: &Arc<Self>,
+        name: &str,
+        port: u16,
+        ips: &[IpAddr],
+        policy: [u8; 32],
+    ) -> Option<crate::udp_relay::Tunnel> {
+        if !self.enabled() || port != 443 || ips.is_empty() || ips.len() > 64
+            || !ips.iter().all(|ip| crate::server::allowed_destination(*ip, false)) {
+            return None;
+        }
+        let name = super::domain_name(name).ok()?;
+        timeout(OPEN_BUDGET, async {
+            for ip in ips.iter().take(2) {
+                let address = SocketAddr::new(*ip, port);
+                let Some(network) = network_scope::observe(address) else { continue; };
+                let key = Key { name: name.clone(), address, policy, network };
+                let slot = self.probe_slot(&name, address, policy);
+                let guard = self.probe_slots[slot].lock().await;
+                let good = if let Some(good) = self.cached_udp(&key) {
+                    crate::traffic::dpi_cache_hit();
+                    good
+                } else {
+                    let _permit = self.probes.try_acquire().ok()?;
+                    let config = tokio::task::spawn_blocking(tls::native_config).await.ok()??;
+                    let good = timeout(ATTEMPT, udp::probe_quic(&name, address, config)).await.ok().flatten().is_some();
+                    crate::traffic::dpi_probe(good);
+                    self.remember_udp(key.clone(), good);
+                    good
+                };
+                drop(guard);
+                if !good || !self.enabled() || network_scope::observe(address) != Some(network) { continue; }
+                if let Ok(socket) = crate::udp_relay::connect(address).await {
+                    if self.enabled() && network_scope::observe(address) == Some(network) {
+                        return Some(crate::udp_relay::Tunnel::VerifiedQuic(socket, self.clone(), address, network));
+                    }
+                }
+                self.remember_udp(key, false);
+            }
+            None
+        }).await.ok().flatten()
     }
 
     pub(crate) async fn open(
@@ -87,7 +149,7 @@ impl Engine {
                 let slot = self.probe_slot(&key.name, address, policy);
                 let guard = self.probe_slots[slot].lock().await;
                 let strategy = match self.cache.cached(&key) {
-                    Some(Verdict::Verified(strategy)) => strategy,
+                    Some(Verdict::Verified(strategy)) => { crate::traffic::dpi_cache_hit(); strategy },
                     Some(Verdict::Unavailable) => continue,
                     previous => {
                         let _permit = self.probes.try_acquire().ok()?;
@@ -95,12 +157,10 @@ impl Engine {
                         let mut verified = None;
                         for strategy in Strategy::ALL {
                             if matches!(previous, Some(Verdict::Avoid { strategy: failed, .. }) if failed == strategy) { continue; }
-                            if timeout(ATTEMPT, tls::probe(&name, address, strategy, config.clone()))
-                                .await
-                                .ok()
-                                .flatten()
-                                .is_some()
-                            {
+                            let good = timeout(ATTEMPT, tls::probe(&name, address, strategy, config.clone()))
+                                .await.ok().flatten().is_some();
+                            crate::traffic::dpi_probe(good);
+                            if good {
                                 verified = Some(strategy);
                                 break;
                             }
@@ -192,11 +252,13 @@ impl Tunnel {
             Ok(Err(error)) => {
                 self.engine.cache.failed(&self.key, self.strategy);
                 crate::traffic::dpi_first_failure();
+                if matches!(error, ClientError::Tls) { crate::traffic::dpi_tls_alert(); }
                 return Err(error);
             }
             Err(_) => {
                 self.engine.cache.failed(&self.key, self.strategy);
                 crate::traffic::dpi_first_failure();
+                crate::traffic::dpi_timeout();
                 return Err(ClientError::Timeout);
             }
         };
