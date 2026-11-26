@@ -44,6 +44,13 @@ impl Window {
         Ok(())
     }
 
+    /// At most one MTU per PTO probe; caller enforces timer and probe count.
+    pub fn reserve_probe(&mut self, bytes: u64) -> Result<(), Error> {
+        if bytes == 0 || bytes > self.mtu { return Err(Error::Limit); }
+        self.in_flight = self.in_flight.checked_add(bytes).ok_or(Error::Limit)?;
+        Ok(())
+    }
+
     pub fn retire(&mut self, bytes: u64) -> Result<(), Error> {
         self.in_flight = self.in_flight.checked_sub(bytes).ok_or(Error::Accounting)?;
         Ok(())

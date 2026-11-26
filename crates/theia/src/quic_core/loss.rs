@@ -54,7 +54,7 @@ impl Ledger {
     pub fn record(&mut self, packet: Sent) -> Result<(), Error> {
         if packet.number != self.next || packet.number > MAX_VARINT { return Err(Error::Sequence); }
         if packet.bytes == 0 || packet.bytes > 65527
-            || packet.frames.len() > MAX_FRAMES || self.sent.len() == MAX_OUTSTANDING
+            || packet.frames.len() > MAX_FRAMES || (packet.in_flight && self.sent.len() == MAX_OUTSTANDING)
             || (!packet.in_flight && packet.ack_eliciting) { return Err(Error::Limit); }
         if self.last_send.is_some_and(|last| packet.at < last) { return Err(Error::Clock); }
         if packet.in_flight {
@@ -62,7 +62,9 @@ impl Ledger {
         }
         self.next += 1;
         self.last_send = Some(packet.at);
-        self.sent.push_back(packet);
+        // ACK-only packets still consume packet numbers, but do not need
+        // retention in the loss ledger.
+        if packet.in_flight { self.sent.push_back(packet); }
         Ok(())
     }
 
