@@ -674,6 +674,10 @@ impl ServerContext {
         self.authorize(auth).map_err(AuthFailure::status)
     }
 
+    pub(crate) fn allows_native_lab(&self) -> bool {
+        self.security_mode.is_plain() && self.identity_routes.is_none()
+    }
+
     pub(crate) fn requires_channel_binding(&self) -> bool {
         !self.security_mode.is_plain() && self.identity_routes.is_none()
     }

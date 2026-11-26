@@ -598,7 +598,7 @@ async fn native_fixture(private: bool) -> (SocketAddr, JoinHandle<()>, RootCertS
     tls.alpn_protocols = vec![b"h3".to_vec()];
     tls.send_tls13_tickets = 0;
     let tls = Arc::new(tls);
-    let mut listener = Listener::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(), 8).unwrap();
+    let mut listener = Listener::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(), 64).unwrap();
     let remote = listener.local_addr().unwrap();
     let context = context(private);
     let mut roots = RootCertStore::empty();

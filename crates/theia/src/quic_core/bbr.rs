@@ -65,6 +65,9 @@ pub struct Bbr {
     probe_done: Option<(Instant, u64)>,
     probe_min: Option<Duration>,
     recovery_until: Option<u64>,
+    loss_ceiling: Option<u64>,
+    round_acked: u64,
+    round_lost: u64,
 }
 
 impl Bbr {
@@ -96,6 +99,9 @@ impl Bbr {
             probe_done: None,
             probe_min: None,
             recovery_until: None,
+            loss_ceiling: None,
+            round_acked: 0,
+            round_lost: 0,
         })
     }
 
@@ -276,6 +282,25 @@ impl Bbr {
                 }
             }
         }
+        // A bounded loss signal complements the delivery-rate estimate. It is
+        // deliberately conservative and does not claim the full v3 model.
+        self.round_acked = self.round_acked.saturating_add(outcome.acknowledged_bytes);
+        self.round_lost = self.round_lost.saturating_add(outcome.lost_bytes);
+        let floor = 4 * self.mtu;
+        let observed = self.round_acked.saturating_add(self.round_lost);
+        if observed >= 4 * self.mtu && u128::from(self.round_lost) * 50 > u128::from(observed) {
+            let bound = (self.cwnd.saturating_mul(7) / 10).max(floor);
+            self.loss_ceiling = Some(self.loss_ceiling.map_or(bound, |old| old.min(bound)));
+            if self.mode == Mode::Startup { self.full_pipe = true; self.mode = Mode::Drain; }
+            self.round_acked = 0;
+            self.round_lost = 0;
+        } else if round_start {
+            if self.round_lost == 0 {
+                if let Some(old) = self.loss_ceiling { self.loss_ceiling = Some(old.saturating_add(self.mtu).min(MAX_CWND)); }
+            }
+            self.round_acked = 0;
+            self.round_lost = 0;
+        }
         let expired = now.saturating_duration_since(self.min_stamp) >= MIN_RTT_TTL;
         if let Some(rtt) = outcome.rtt_sample.map(|r| r.max(Duration::from_micros(1))) {
             if self.min_rtt.is_none_or(|old| rtt <= old) {
@@ -345,7 +370,7 @@ impl Bbr {
             self.recovery_until = self.last_sent;
             self.cwnd = self.cwnd.saturating_sub(outcome.lost_bytes).max(floor);
         }
-        let target = self.bdp().saturating_mul(2).clamp(floor, MAX_CWND);
+        let target = self.bdp().saturating_mul(2).clamp(floor, MAX_CWND).min(self.loss_ceiling.unwrap_or(MAX_CWND));
         self.cwnd = if self.mode == Mode::ProbeRtt {
             floor
         } else if self.full_pipe {

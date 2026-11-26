@@ -155,10 +155,11 @@ pub(crate) async fn run_connection(
 /// sessions cannot enter the shared admission/relay handlers.
 pub async fn run_native_lab(session: crate::quic_core::endpoint::LabSession, context: Arc<ServerContext>) -> Result<(), ServerError> {
     let peer = session.peer_addr().ip();
-    if !peer.is_loopback() { return Err(ServerError::Io); }
+    // REALITY dispatch and pinned-identity admission are not yet integrated.
+    if !peer.is_loopback() || !context.allows_native_lab() { return Err(ServerError::Io); }
     let _slot = context.connection_slot().ok_or(ServerError::Io)?;
-    let (transport, key) = crate::quic_core::h3_adapter::NativeConnection::start(session).map_err(|_| ServerError::Io)?;
-    let binding = context.requires_channel_binding().then(|| Arc::new(crate::channel_binding::Admission::new(key)));
+    let (transport, _key) = crate::quic_core::h3_adapter::NativeConnection::start(session).map_err(|_| ServerError::Io)?;
+    let binding = None;
     let (_owner, phase) = watch::channel(GenerationPhase::Active);
     run_h3(transport, context, phase, peer, binding, std::future::pending::<()>()).await;
     Ok(())
