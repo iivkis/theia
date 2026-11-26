@@ -9,12 +9,25 @@ not a substitute for mandatory native CI or a real physical-node test.
 cargo test -p theia --locked --release --test routing_real_dat -- --ignored --nocapture
 ```
 
-The test downloads a single current XTLS release using the production loader,
+The test downloads a single current XTLS release using the production loader
+(GeoSite Standard `geosite.dat` and GeoIP Lite `geoip-lite.dat`),
 verifies both published hashes and selected categories, reloads the pinned
 files, checks IPv4/IPv6 and domain decisions, then builds and decodes three
 snapshots and rejects corruption. It prints exact release, hashes, byte sizes,
 download+activation wall time, and local build/decode timings. These are not
 network RTT or throughput. Save raw output, git SHA, OS, CPU and test date.
+
+The compact pair is the only default source. It lacks worldwide IP
+geolocation and expanded domain lists; XTLS Lite aliases cn/ru/ir have
+regional whitelist semantics, not full-edition country geolocation.
+Use explicit in-cn/in-ru/in-ir for the regional meaning and review old
+rules before selecting compact data. An unavailable category rejects
+the candidate; no automatic fallback or category substitution.
+Old full/expanded files and active.toml are retained but are not used
+as compact data. Existing pinned configurations must be reviewed and
+re-selected through the guarded routing draft, save and Apply. A new
+compact pointer is active-standard-lite.toml; a matching upstream
+release tag alone never authorizes reuse of the old edition.
 
 ## External routing evidence
 

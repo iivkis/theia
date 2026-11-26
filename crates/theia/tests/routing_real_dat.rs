@@ -46,8 +46,11 @@ async fn real_xtls_pair_and_snapshot_cost() {
     let pair = store.refresh(&rules).await.expect("real XTLS pair, verified by production loader");
     let refresh_ms = start.elapsed().as_millis();
     let manifest = pair.manifest();
+    assert!(pair.geosite().len() <= 32 * 1024 * 1024);
+    assert!(pair.geoip().len() <= 32 * 1024 * 1024);
+    assert!(directory.join("active-standard-lite.toml").is_file());
     println!(
-        "release={} raw_geosite_bytes={} raw_geoip_bytes={} refresh_ms={} geosite_sha256={:02x?} geoip_sha256={:02x?}",
+        "edition=standard-lite release={} raw_geosite_bytes={} raw_geoip_bytes={} refresh_ms={} geosite_sha256={:02x?} geoip_sha256={:02x?}",
         manifest.release, pair.geosite().len(), pair.geoip().len(), refresh_ms,
         manifest.geosite_sha256, manifest.geoip_sha256,
     );

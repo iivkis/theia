@@ -15,9 +15,9 @@ use std::{
 };
 
 pub const GEOSITE_URL: &str =
-    "https://github.com/XTLS/Xray-rules-dat/releases/latest/download/geosite-expand.dat";
+    "https://github.com/XTLS/Xray-rules-dat/releases/latest/download/geosite.dat";
 pub const GEOIP_URL: &str =
-    "https://github.com/XTLS/Xray-rules-dat/releases/latest/download/geoip-full.dat";
+    "https://github.com/XTLS/Xray-rules-dat/releases/latest/download/geoip-lite.dat";
 const MAX_DAT: usize = 256 * 1024 * 1024;
 const MAX_RULES: usize = 1024;
 const MAX_SELECTORS: usize = 8192;
@@ -325,7 +325,20 @@ fn entry_code(bytes: &[u8]) -> Result<String, RoutingError> {
     while let Some((field, value)) = wire.next()? {
         if field == 1 {
             match value {
-                Field::Bytes(value) if code.is_none() => code = Some(category(utf8(value)?)?),
+                Field::Bytes(value) if code.is_none() => {
+                    let name = utf8(value)?;
+                    // Upstream may publish category keys outside Theia's
+                    // selector grammar (for example attribute-qualified keys).
+                    // Validate their structure, but never interpret them as
+                    // user selectors or compile their unused domain records.
+                    if name.is_empty()
+                        || name.len() > 256
+                        || !name.bytes().all(|b| b.is_ascii_graphic())
+                    {
+                        return Err(RoutingError::InvalidCategory);
+                    }
+                    code = Some(name.to_ascii_uppercase());
+                }
                 _ => return Err(RoutingError::InvalidDat),
             }
         }
@@ -767,6 +780,32 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn unrelated_upstream_category_keys_do_not_break_selected_rules() {
+        let mut data = site("GOOGLE@CN", 2, "other.example");
+        data.extend(site("GOOGLE", 2, "google.com"));
+        let rules = [rule(Action::Direct, &["geosite:google"], &[])];
+        let policy = Policy::compile(&rules, &data, &[]).unwrap();
+        assert_eq!(
+            policy.matching_action(Some("google.com"), None).unwrap(),
+            Some(Action::Direct)
+        );
+        assert_eq!(
+            policy.matching_action(Some("other.example"), None).unwrap(),
+            None
+        );
+        assert!(matches!(
+            Policy::compile(&[rule(Action::Direct, &["geosite:google@cn"], &[])], &data, &[]),
+            Err(RoutingError::InvalidCategory)
+        ));
+        assert!(matches!(
+            Policy::compile(&rules, &site("BAD KEY", 2, "example.com"), &[]),
+            Err(RoutingError::InvalidCategory)
+        ));
+        let (_, wire) = snapshot::Snapshot::build("scope", 2, &rules, &data, &[]).unwrap();
+        assert!(snapshot::Snapshot::decode(&wire, "scope").is_ok());
     }
 
     #[test]

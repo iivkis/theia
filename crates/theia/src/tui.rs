@@ -827,7 +827,7 @@ impl RoutingPanel {
                 self.settings.geodata_directory = Some(directory);
                 self.settings.datasets = Some(manifest);
                 self.download = None;
-                self.message = "Базы проверены. Подтвердите черновик клавишей s.".into();
+                self.message = "Компактные базы проверены. Проверьте правила, затем подтвердите черновик клавишей s.".into();
             }
             Ok(Err(error)) => {
                 self.download = None;
@@ -1017,10 +1017,10 @@ impl RoutingPanel {
                     if i == *focus { "›" } else { " " }
                 ));
             }
-            body.push_str("\nПримеры: domain:example.org, geosite:google\nIP: 192.0.2.0/24, geoip:private · несколько значений через запятую\n\n↑↓ / Tab: поле · ←→: действие · Ctrl+U: очистить\nEnter: принять правило · Esc: отменить");
+            body.push_str("\nПримеры: domain:example.org, geosite:google\nIP: 192.0.2.0/24, geoip:private · через запятую\nGeoIP Lite: in-ru, in-cn, in-ir — региональные наборы, не геолокация\n\n↑↓ / Tab: поле · ←→: действие · Ctrl+U: очистить\nEnter: принять правило · Esc: отменить");
         } else {
             body.push_str(&format!(
-                "GeoData: {}\nПравила проверяются сверху вниз. Без совпадения — через сервер.\n",
+                "GeoData: {} (GeoSite Standard + GeoIP Lite)\nПравила проверяются сверху вниз. Без совпадения — через сервер.\n",
                 self.settings
                     .datasets
                     .as_ref()

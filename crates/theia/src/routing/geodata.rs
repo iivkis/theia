@@ -1,7 +1,7 @@
 //! Verified, content-addressed XTLS datasets. The active pointer is a
 //! cooperating CAS publication; a failed refresh never replaces the old pair.
 //! Call from a supervised runtime or an explicitly confirmed operator action.
-use super::{Policy, RoutingError, Rule, MAX_DAT};
+use super::{Policy, RoutingError, Rule};
 use flate2::read::MultiGzDecoder;
 use http::{header, StatusCode, Uri};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -17,11 +17,14 @@ use std::{
 
 const REPO: &str = "/XTLS/Xray-rules-dat/releases";
 const LATEST: &str = "https://github.com/XTLS/Xray-rules-dat/releases/latest";
-const SITE: &str = "geosite-expand.dat";
-const IP: &str = "geoip-full.dat";
+const SITE: &str = "geosite.dat";
+const IP: &str = "geoip-lite.dat";
 const MAX_CHECKSUM: usize = 1024;
 const MAX_REDIRECTS: usize = 4;
-const MAX_COMPRESSED: usize = 128 * 1024 * 1024;
+// Bounds are deliberately above the current compact upstream assets;
+// oversized future releases fail closed rather than loading full editions.
+const MAX_COMPRESSED: usize = 16 * 1024 * 1024;
+const MAX_DATASET: usize = 32 * 1024 * 1024;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(86400);
@@ -72,7 +75,7 @@ impl Pair {
         if !valid_tag(&manifest.release) || geosite.is_empty() || geoip.is_empty() {
             return Err(Error::Format);
         }
-        if geosite.len() > MAX_DAT || geoip.len() > MAX_DAT {
+        if geosite.len() > MAX_DATASET || geoip.len() > MAX_DATASET {
             return Err(Error::Limit);
         }
         if hash(&geosite) != manifest.geosite_sha256 || hash(&geoip) != manifest.geoip_sha256 {
@@ -362,10 +365,10 @@ async fn asset(
 fn decompress(compressed: &[u8], expected: [u8; 32]) -> Result<Vec<u8>, Error> {
     let mut result = Vec::new();
     MultiGzDecoder::new(compressed)
-        .take((MAX_DAT + 1) as u64)
+        .take((MAX_DATASET + 1) as u64)
         .read_to_end(&mut result)
         .map_err(|_| Error::Format)?;
-    if result.len() > MAX_DAT {
+    if result.len() > MAX_DATASET {
         return Err(Error::Limit);
     }
     if result.is_empty() || hash(&result) != expected {
@@ -395,7 +398,7 @@ async fn dataset(
 }
 
 /// A cache directory must be owned by the operator and have trusted parents.
-/// Only a small active.toml is replaced; old content-addressed files are
+/// Only a small edition-specific active manifest is replaced; old files are
 /// deliberately retained, so a reader of the old manifest remains valid.
 pub struct Store {
     directory: PathBuf,
@@ -410,7 +413,9 @@ impl Store {
         Ok(Self { directory })
     }
     fn active(&self) -> PathBuf {
-        self.directory.join("active.toml")
+        // Different upstream editions have different semantics even at the
+        // same release tag. Never reuse the previous full/expanded pointer.
+        self.directory.join("active-standard-lite.toml")
     }
     fn data_path(&self, name: &str, digest: &[u8; 32]) -> PathBuf {
         self.directory.join(format!("{}-{name}", hex(digest)))
@@ -430,14 +435,14 @@ impl Store {
                 .map_err(|_| Error::Format)?;
         let site = crate::bounded_input::read(
             &self.data_path(SITE, &manifest.geosite_sha256),
-            MAX_DAT as u64,
+            MAX_DATASET as u64,
             true,
             true,
         )
         .map_err(|_| Error::Io)?;
         let ip = crate::bounded_input::read(
             &self.data_path(IP, &manifest.geoip_sha256),
-            MAX_DAT as u64,
+            MAX_DATASET as u64,
             true,
             true,
         )
@@ -457,7 +462,7 @@ impl Store {
     fn write_blob(&self, name: &str, bytes: &[u8], digest: [u8; 32]) -> Result<(), Error> {
         let path = self.data_path(name, &digest);
         let check = || -> Result<(), Error> {
-            let existing = crate::bounded_input::read(&path, MAX_DAT as u64, true, true)
+            let existing = crate::bounded_input::read(&path, MAX_DATASET as u64, true, true)
                 .map_err(|_| Error::Io)?;
             if hash(&existing) != digest {
                 return Err(Error::Integrity);
@@ -602,6 +607,12 @@ mod tests {
         )
         .is_ok());
         assert!(asset_uri("../latest", SITE).is_err());
+        assert_eq!(SITE, "geosite.dat");
+        assert_eq!(IP, "geoip-lite.dat");
+        assert!(super::super::GEOSITE_URL.ends_with("/geosite.dat"));
+        assert!(super::super::GEOIP_URL.ends_with("/geoip-lite.dat"));
+        assert!(asset_uri("20261126014317", SITE).unwrap().path().ends_with("/geosite.dat"));
+        assert!(asset_uri("20261126014317", IP).unwrap().path().ends_with("/geoip-lite.dat"));
         let digest = hash(b"test");
         let sum = format!("{}  {SITE}\n", hex(&digest));
         assert_eq!(checksum(sum.as_bytes(), SITE).unwrap(), digest);
@@ -713,6 +724,35 @@ mod tests {
             .prepare_geodata(&current, &path, next.manifest().clone())
             .unwrap()
             .is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn compact_cache_never_reuses_old_full_edition() {
+        let mut random = [0; 16];
+        SystemRandom::new().fill(&mut random).unwrap();
+        let dir = std::env::temp_dir().join(format!("theia-geodata-edition-{}", hex(&random)));
+        fs::create_dir(&dir).unwrap();
+        let store = Store::new(dir.clone()).unwrap();
+        let site = dat(b'X');
+        let ip = ip();
+        let old = Manifest {
+            release: "20261126014317".into(),
+            geosite_sha256: hash(&site),
+            geoip_sha256: hash(&ip),
+        };
+        let previous = toml::to_string(&old).unwrap();
+        fs::write(dir.join("active.toml"), &previous).unwrap();
+        fs::write(store.data_path("geosite-expand.dat", &old.geosite_sha256), &site).unwrap();
+        fs::write(store.data_path("geoip-full.dat", &old.geoip_sha256), &ip).unwrap();
+        assert!(store.load(&[]).unwrap().is_none());
+        assert!(store.load_pinned(&old, &[]).is_err());
+        let pair = Pair::verified(old.clone(), site, ip, &[]).unwrap();
+        store.publish(&pair, None).unwrap();
+        assert_eq!(store.load(&[]).unwrap().unwrap().manifest(), &old);
+        assert_eq!(fs::read_to_string(dir.join("active.toml")).unwrap(), previous);
+        assert!(store.data_path("geosite-expand.dat", &old.geosite_sha256).exists());
+        assert!(store.data_path("geoip-full.dat", &old.geoip_sha256).exists());
         fs::remove_dir_all(dir).unwrap();
     }
 
