@@ -24,10 +24,12 @@ fn exercise(bytes: &[u8], ingress: &mut Ingress, tick: u64) {
         }
     }
     if let Ok(parts) = datagram::split(bytes) {
-        assert_eq!(
-            parts.iter().map(|p| p.bytes.len()).sum::<usize>(),
-            bytes.len()
-        );
+        let consumed = parts.iter().map(|p| p.bytes.len()).sum::<usize>();
+        assert!(consumed <= bytes.len());
+        assert!(bytes[consumed..].iter().all(|&b| b == 0));
+        if consumed < bytes.len() {
+            assert_eq!(parts[0].kind, datagram::PacketKind::Initial);
+        }
         assert!(parts.iter().all(|p| p.destination == parts[0].destination));
     }
     if let Ok(params) = Parameters::parse(bytes) {
