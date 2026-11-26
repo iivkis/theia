@@ -1,4 +1,4 @@
-//! Passive UDP classification. No integrity-field or encrypted-payload mutation.
+//! UDP classification and independent reachability probes. No application-payload mutation.
 use super::quic;
 use std::{collections::VecDeque, time::{Duration, Instant}};
 const STUN_LIMIT: usize = 16;
@@ -43,12 +43,116 @@ impl Stun {
             && self.transaction == response.transaction
     }
 }
-/// Classification is not peer authentication. Only a complete bounded initial
-/// QUIC v1 flight offering h3 may request independent authenticated evidence.
+/// A deliberately narrow STUN Binding subset. TURN, ICE credentials and
+/// unknown attributes are never admitted by the local Binding strategy.
+pub(crate) fn plain_binding(data: &[u8]) -> Option<Stun> {
+    let message = stun(data)?;
+    if message.method != 1 || message.class != 0 || data.len() > 512 { return None; }
+    let mut rest = &data[20..];
+    let mut software = false;
+    while !rest.is_empty() {
+        let kind = u16::from_be_bytes(rest[..2].try_into().ok()?);
+        let len = usize::from(u16::from_be_bytes(rest[2..4].try_into().ok()?));
+        let end = 4 + ((len + 3) & !3);
+        match kind {
+            0x8022 if !software && len <= 128 => software = true,
+            0x8028 if len == 4 && end == rest.len() && fingerprint(data) => {},
+            _ => return None,
+        }
+        rest = &rest[end..];
+    }
+    Some(message)
+}
+
+fn fingerprint(data: &[u8]) -> bool {
+    let Some(end) = data.len().checked_sub(8) else { return false; };
+    if data[end..end + 4] != [0x80, 0x28, 0, 4] { return false; }
+    let mut crc = flate2::Crc::new();
+    crc.update(&data[..end]);
+    (crc.sum() ^ 0x5354554e).to_be_bytes() == data[end + 4..]
+}
+
+fn binding_success(data: &[u8]) -> Option<Stun> {
+    let message = stun(data)?;
+    if message.method != 1 || message.class != 2 || data.len() > 512 { return None; }
+    let mut rest = &data[20..];
+    let mut mapped = false;
+    while !rest.is_empty() {
+        let kind = u16::from_be_bytes(rest[..2].try_into().ok()?);
+        let len = usize::from(u16::from_be_bytes(rest[2..4].try_into().ok()?));
+        let end = 4 + ((len + 3) & !3);
+        let value = &rest[4..4+len];
+        match kind {
+            0x0020 if !mapped && matches!(value, [0, 1, ..] if len == 8)
+                || kind == 0x0020 && !mapped && matches!(value, [0, 2, ..] if len == 20) => {
+                if u16::from_be_bytes(value[2..4].try_into().ok()?) ^ 0x2112 == 0 { return None; }
+                mapped = true;
+            }
+            0x8028 if len == 4 && end == rest.len() && fingerprint(data) => {},
+            // Unknown comprehension-required attributes or integrity fields
+            // cannot be validated by this deliberately credential-free mode.
+            0x0000..=0x7fff => return None,
+            0x8028 => return None,
+            _ => {},
+        }
+        rest = &rest[end..];
+    }
+    mapped.then_some(message)
+}
+
+/// One independent CSPRNG Binding request to the connected peer. This is
+/// reachability evidence only; no STUN MESSAGE-INTEGRITY key is available.
+pub(super) async fn probe_stun(socket: &tokio::net::UdpSocket) -> Option<()> {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut request = [0u8; 20];
+    request[1] = 1;
+    request[4..8].copy_from_slice(&COOKIE);
+    SystemRandom::new().fill(&mut request[8..]).ok()?;
+    let expected = plain_binding(&request)?;
+    crate::udp_relay::send_datagram(socket, &request).await.ok()?;
+    let mut response = [0; 513];
+    // The caller imposes the absolute time budget. Also bound invalid input.
+    for _ in 0..8 {
+        let n = socket.recv(&mut response).await.ok()?;
+        if binding_success(&response[..n]).is_some_and(|actual| expected.matches_response(actual)) {
+            return Some(());
+        }
+    }
+    None
+}
+
+/// Correlate only application requests actually admitted to the local
+/// Binding relay, independent of the passive SOCKS observer and probe.
+#[derive(Default)]
+pub(crate) struct BindingTransactions(VecDeque<(Stun, Instant)>);
+impl BindingTransactions {
+    pub(crate) fn admit(&mut self, data: &[u8]) -> bool {
+        let Some(message) = plain_binding(data) else { return false; };
+        let now = Instant::now();
+        self.0.retain(|(_, expires)| *expires > now);
+        if self.0.iter().any(|(old, _)| *old == message) { return true; }
+        if self.0.len() >= STUN_LIMIT { return false; }
+        self.0.push_back((message, now + STUN_TTL));
+        true
+    }
+
+    pub(crate) fn accept(&mut self, data: &[u8]) -> bool {
+        let now = Instant::now();
+        self.0.retain(|(_, expires)| *expires > now);
+        let Some(response) = binding_success(data) else { return false; };
+        let Some(index) = self.0.iter().position(|(request, _)| request.matches_response(response)) else { return false; };
+        self.0.remove(index);
+        true
+    }
+}
+
+/// Classification is not peer authentication. QUIC versions remain distinct.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Candidate {
     Pending,
     QuicH3(String),
+    QuicV2H3(String),
+    StunBinding,
     Stun,
     Other,
 }
@@ -86,7 +190,7 @@ impl Observer {
             self.stun_flow = true;
             self.done = true;
             crate::traffic::udp_stun_flow();
-            return Candidate::Stun;
+            return if plain_binding(data).is_some() { Candidate::StunBinding } else { Candidate::Stun };
         }
         let deadline = *self.classification_deadline.get_or_insert_with(
             || tokio::time::Instant::now() + CLASSIFY_BUDGET,
@@ -105,10 +209,10 @@ impl Observer {
             quic::Result::Hello { name, version, h3 } => {
                 self.done = true;
                 crate::traffic::udp_quic_flow();
-                if version == crate::reality_quic_wire::V1 && h3 {
-                    Candidate::QuicH3(name)
-                } else {
-                    Candidate::Other
+                match (version, h3) {
+                    (crate::reality_quic_wire::V1, true) => Candidate::QuicH3(name),
+                    (crate::reality_quic_wire::V2, true) => Candidate::QuicV2H3(name),
+                    _ => Candidate::Other,
                 }
             }
             quic::Result::Unsupported => {
@@ -248,7 +352,7 @@ mod tests {
         let hello = h3_hello();
         for version in [crate::reality_quic_wire::V1, crate::reality_quic_wire::V2] {
             let packet = crate::reality_quic_wire::test_initial(version, &hello);
-            let expected = if version == crate::reality_quic_wire::V1 { Candidate::QuicH3("example.org".into()) } else { Candidate::Other };
+            let expected = if version == crate::reality_quic_wire::V1 { Candidate::QuicH3("example.org".into()) } else { Candidate::QuicV2H3("example.org".into()) };
             assert_eq!(Observer::default().outgoing(&packet), expected);
         }
         let plain = super::super::tls::fixture("example.org");
@@ -266,7 +370,7 @@ mod tests {
             bytes
         };
         for id in 0..=STUN_LIMIT as u8 {
-            assert_eq!(observer.outgoing(&request(id)), Candidate::Stun);
+            assert_eq!(observer.outgoing(&request(id)), if id == 0 { Candidate::StunBinding } else { Candidate::Stun });
         }
         assert_eq!(observer.requests.len(), STUN_LIMIT);
         observer.outgoing(&request(1));
@@ -279,6 +383,58 @@ mod tests {
         observer.requests.iter_mut().for_each(|(_, expiry)| *expiry = Instant::now());
         observer.incoming(&response);
         assert!(observer.requests.is_empty());
+    }
+
+    pub(crate) fn binding_response(request: &[u8]) -> Vec<u8> {
+        let mut response = request[..20].to_vec();
+        response[0] = 1;
+        response[2..4].copy_from_slice(&12u16.to_be_bytes());
+        response.extend([0, 0x20, 0, 8, 0, 1, 0x21, 0x13, 1, 2, 3, 4]);
+        response
+    }
+
+    #[test]
+    fn binding_admission_rejects_credentials_and_unmatched_responses() {
+        let mut request = vec![0, 1, 0, 0];
+        request.extend(COOKIE);
+        request.extend([7; 12]);
+        let mut credential = request.clone();
+        credential[3] = 8;
+        credential.extend([0, 6, 0, 1, b'x', 0, 0, 0]);
+        assert_eq!(Observer::default().outgoing(&credential), Candidate::Stun);
+        assert!(plain_binding(&credential).is_none());
+        let mut tracker = BindingTransactions::default();
+        assert!(tracker.admit(&request));
+        let response = binding_response(&request);
+        let mut wrong = response.clone();
+        wrong[19] ^= 1;
+        assert!(!tracker.accept(&wrong));
+        assert!(tracker.accept(&response));
+        assert!(!tracker.accept(&response));
+        assert!(!tracker.admit(&credential));
+        assert!(plain_binding(&[]).is_none());
+    }
+
+    #[tokio::test]
+    async fn active_binding_probe_ignores_wrong_transaction_and_malformed_mapping() {
+        let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = crate::udp_relay::connect(target.local_addr().unwrap()).await.unwrap();
+        let server = async {
+            let mut buf = [0; 512];
+            let (n, peer) = target.recv_from(&mut buf).await.unwrap();
+            let response = binding_response(&buf[..n]);
+            let mut wrong = response.clone();
+            wrong[19] ^= 1;
+            target.send_to(&wrong, peer).await.unwrap();
+            wrong = response.clone();
+            wrong[25] = 3;
+            target.send_to(&wrong, peer).await.unwrap();
+            target.send_to(&response, peer).await.unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(probe_stun(&socket), server)
+        }).await.unwrap();
+        assert!(result.is_some());
     }
 
     #[test]
@@ -301,7 +457,7 @@ mod tests {
             assert!(stun(&req[..n]).is_none());
         }
         let mut observer = Observer::default();
-        assert_eq!(observer.outgoing(&req), Candidate::Stun);
+        assert_eq!(observer.outgoing(&req), Candidate::StunBinding);
         res[19] ^= 1;
         observer.incoming(&res);
         assert!(observer.requests.is_empty());

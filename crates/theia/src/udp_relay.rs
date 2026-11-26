@@ -138,7 +138,7 @@ impl LocalRelayError {
 
 pub(crate) enum Tunnel {
     Direct(UdpSocket),
-    VerifiedQuic(Box<crate::routing::dpi::VerifiedUdp>, Fallback),
+    VerifiedLocal(Box<crate::routing::dpi::VerifiedUdp>, Fallback),
     H2(Box<crate::client::Tunnel>),
     H3(Box<crate::h3_client::H3Tunnel>),
 }
@@ -147,7 +147,7 @@ impl Tunnel {
         let (transport, up) = match self {
             Self::H2(tunnel) => (2, tunnel.opened_stream_up()),
             Self::H3(tunnel) => (3, tunnel.opened_stream_up()),
-            Self::Direct(_) | Self::VerifiedQuic(..) => return,
+            Self::Direct(_) | Self::VerifiedLocal(..) => return,
         };
         observed.store((transport << 2) | if up { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
     }
@@ -158,9 +158,10 @@ impl Tunnel {
         download: mpsc::Sender<Vec<u8>>,
     ) -> Result<(), ClientError> {
         match self {
-            Self::VerifiedQuic(verified, fallback) => {
+            Self::VerifiedLocal(verified, fallback) => {
                 let Some(first) = upload.recv().await else { return Ok(()); };
-                if !verified.admissible()? {
+                let stun = verified.strategy == crate::routing::dpi::UdpStrategy::StunBinding;
+                if !verified.admissible()? || (stun && crate::routing::dpi::udp::plain_binding(&first).is_none()) {
                     let authorization = verified.fallback_policy();
                     drop(verified);
                     authorization.check()?;
@@ -174,7 +175,11 @@ impl Tunnel {
                 // Once a send is attempted no fallback or replay is legal.
                 drop(fallback);
                 verified.check_policy()?;
-                let result = relay_local(&verified.socket, Some(FIRST_RESPONSE), Some(first), upload, download).await;
+                let result = if stun {
+                    relay_stun(&verified.socket, first, upload, download).await
+                } else {
+                    relay_local(&verified.socket, Some(FIRST_RESPONSE), Some(first), upload, download).await
+                };
                 if matches!(&result, Err(LocalRelayError::Peer(_))) {
                     verified.failed();
                     crate::traffic::udp_peer_failure();
@@ -195,7 +200,7 @@ impl Tunnel {
             Self::H2(t) => t.relay_udp(first, upload, download).await,
             Self::H3(t) => t.relay_udp(first, upload, download).await,
             Self::Direct(socket) => relay_local(&socket, None, first, upload, download).await.map_err(LocalRelayError::into_client),
-            Self::VerifiedQuic(..) => Err(ClientError::Protocol),
+            Self::VerifiedLocal(..) => Err(ClientError::Protocol),
         }
     }
 }
@@ -245,6 +250,61 @@ async fn relay_local(
             if waiting.take().is_some() {
                 crate::traffic::udp_peer_reply();
             }
+            if deliver(&download, || buf[..n].to_vec()).map_err(LocalRelayError::Application)? {
+                traffic.download(n);
+                activity.touch();
+            }
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), LocalRelayError>(())
+    };
+    tokio::select! { result=send=>result, result=receive=>result, ()=activity.expire()=>Ok(()) }
+}
+
+/// The locally admitted STUN subset stays Binding-only for the entire flow.
+/// No credentials or unrelated UDP may leak by reusing the same target tuple.
+async fn relay_stun(
+    socket: &UdpSocket,
+    first: Vec<u8>,
+    mut upload: mpsc::Receiver<Vec<u8>>,
+    download: mpsc::Sender<Vec<u8>>,
+) -> Result<(), LocalRelayError> {
+    use crate::routing::dpi::udp::BindingTransactions;
+    let traffic = crate::traffic::enter_udp(crate::Role::Client, false, true);
+    let activity = Activity::new();
+    let requests = Mutex::new(BindingTransactions::default());
+    if !requests.lock().unwrap_or_else(|e| e.into_inner()).admit(&first) {
+        return Err(LocalRelayError::Application(ClientError::Protocol));
+    }
+    timeout(FIRST_RESPONSE, send_datagram(socket, &first)).await
+        .map_err(|_| LocalRelayError::Peer(ClientError::Timeout))?
+        .map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
+    traffic.upload(first.len());
+    activity.touch();
+    crate::traffic::udp_stun_local();
+    let send = async {
+        while let Some(data) = upload.recv().await {
+            if !requests.lock().unwrap_or_else(|e| e.into_inner()).admit(&data) {
+                // No switch or replay once the local flow was used.
+                return Err(LocalRelayError::Application(ClientError::Protocol));
+            }
+            send_datagram(socket, &data).await.map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
+            traffic.upload(data.len());
+            activity.touch();
+        }
+        Ok::<(), LocalRelayError>(())
+    };
+    let receive = async {
+        let mut buf = [0u8; 513];
+        let mut waiting = Some(Instant::now() + FIRST_RESPONSE);
+        loop {
+            let n = match waiting {
+                Some(deadline) => timeout_at(deadline, socket.recv(&mut buf)).await
+                    .map_err(|_| LocalRelayError::Peer(ClientError::Timeout))?,
+                None => socket.recv(&mut buf).await,
+            }.map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
+            if !requests.lock().unwrap_or_else(|e| e.into_inner()).accept(&buf[..n]) { continue; }
+            if waiting.take().is_some() { crate::traffic::udp_peer_reply(); }
             if deliver(&download, || buf[..n].to_vec()).map_err(LocalRelayError::Application)? {
                 traffic.download(n);
                 activity.touch();

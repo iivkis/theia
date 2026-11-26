@@ -31,6 +31,7 @@ pub(crate) fn stale_policy() -> ClientError {
 /// Consent is local configuration, not a command in the server snapshot.
 pub(crate) struct Engine {
     enabled: AtomicBool,
+    stun_enabled: AtomicBool,
     policy: std::sync::Mutex<Option<super::client_state::LocalPolicy>>,
     cache: strategy::Cache,
     udp_cache: std::sync::Mutex<std::collections::VecDeque<UdpEvidence>>,
@@ -45,8 +46,12 @@ struct UdpEvidence {
     expiry: std::time::Instant,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UdpStrategy { QuicV1, StunBinding }
+
 pub(crate) struct VerifiedUdp {
     pub(crate) socket: tokio::net::UdpSocket,
+    pub(crate) strategy: UdpStrategy,
     engine: Arc<Engine>,
     key: Key,
 }
@@ -62,6 +67,7 @@ impl VerifiedUdp {
     pub(crate) fn admissible(&self) -> Result<bool, ClientError> {
         self.check_policy()?;
         Ok(self.engine.enabled()
+            && (self.strategy != UdpStrategy::StunBinding || self.engine.stun_enabled())
             && network_scope::observe(self.key.address) == Some(self.key.network)
             && self.socket.local_addr().is_ok_and(|local| self.key.network.matches_local(local))
             && self.engine.cached_udp(&self.key) == Some(true))
@@ -77,16 +83,24 @@ impl VerifiedUdp {
         engine.authorize_policy(Some(super::client_state::LocalPolicy::fixture([1; 32])));
         Self {
             socket,
+            strategy: UdpStrategy::QuicV1,
             engine,
             key: Key { name: "example.org".into(), address, policy: [1; 32], network: network_scope::Scope::fixture(address, 0) },
         }
     }
 }
 
+async fn scoped_udp(address: SocketAddr, scope: network_scope::Scope) -> Option<tokio::net::UdpSocket> {
+    let socket = tokio::net::UdpSocket::bind(scope.bind_address()).await.ok()?;
+    socket.connect(address).await.ok()?;
+    (socket.peer_addr().ok()? == address && scope.matches_local(socket.local_addr().ok()?)).then_some(socket)
+}
+
 impl Default for Engine {
     fn default() -> Self {
         Self {
             enabled: AtomicBool::new(false),
+            stun_enabled: AtomicBool::new(false),
             policy: std::sync::Mutex::new(None),
             cache: strategy::Cache::default(),
             udp_cache: std::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -99,6 +113,14 @@ impl Default for Engine {
 impl Engine {
     pub(crate) fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_stun_enabled(&self, enabled: bool) {
+        self.stun_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub(crate) fn stun_enabled(&self) -> bool {
+        self.enabled() && self.stun_enabled.load(Ordering::Relaxed)
     }
 
     pub(super) fn authorize_policy(&self, lease: Option<super::client_state::LocalPolicy>) {
@@ -177,10 +199,52 @@ impl Engine {
                 if let Ok(socket) = crate::udp_relay::connect(address).await {
                     if self.enabled() && self.policy_current(policy) && network_scope::observe(address) == Some(network)
                         && socket.local_addr().is_ok_and(|local| network.matches_local(local)) {
-                        return Some(VerifiedUdp { socket, engine: self.clone(), key });
+                        return Some(VerifiedUdp { socket, strategy: UdpStrategy::QuicV1, engine: self.clone(), key });
                     }
                 }
                 self.remember_udp(key, false);
+            }
+            None
+        }).await.ok().flatten()
+    }
+
+    /// Opt-in, credential-free STUN Binding reachability. The probe uses a
+    /// separate socket; no probe response can enter the application relay.
+    /// No positive result is reused to skip probing another flow.
+    pub(crate) async fn open_stun_udp(
+        self: &Arc<Self>, name: &str, port: u16, ips: &[IpAddr], policy: [u8; 32],
+    ) -> Option<VerifiedUdp> {
+        if !self.stun_enabled() || !self.policy_current(policy) || port != 3478
+            || ips.is_empty() || ips.len() > 64
+            || !ips.iter().all(|ip| crate::server::allowed_destination(*ip, false)) { return None; }
+        let name = super::domain_name(name).ok()?;
+        timeout(OPEN_BUDGET, async {
+            for ip in ips.iter().take(2) {
+                let address = SocketAddr::new(*ip, port);
+                let Some(network) = network_scope::observe(address) else { continue; };
+                let key = Key { name: name.clone(), address, policy, network };
+                let _guard = self.probe_slots[self.probe_slot(&name, address, policy)].lock().await;
+                if !self.stun_enabled() || !self.policy_current(policy)
+                    || network_scope::observe(address) != Some(network) { continue; }
+                if self.cached_udp(&key) == Some(false) { continue; }
+                let _permit = self.probes.try_acquire().ok()?;
+                let good = timeout(ATTEMPT, async {
+                    let socket = scoped_udp(address, network).await?;
+                    if !self.stun_enabled() || !self.policy_current(policy)
+                        || network_scope::observe(address) != Some(network) { return None; }
+                    udp::probe_stun(&socket).await
+                }).await.ok().flatten().is_some();
+                if !self.stun_enabled() || !self.policy_current(policy)
+                    || network_scope::observe(address) != Some(network) { continue; }
+                crate::traffic::udp_stun_probe(good);
+                self.remember_udp(key.clone(), good);
+                if !good { continue; }
+                if let Some(socket) = scoped_udp(address, network).await {
+                    if self.stun_enabled() && self.policy_current(policy)
+                        && network_scope::observe(address) == Some(network) {
+                        return Some(VerifiedUdp { socket, strategy: UdpStrategy::StunBinding, engine: self.clone(), key });
+                    }
+                }
             }
             None
         }).await.ok().flatten()

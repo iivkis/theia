@@ -722,6 +722,7 @@ fn validate_profile(profile: Profile) -> Result<Profile, InviteError> {
                 socks5_listen: "127.0.0.1:7891".into(),
                 system_proxy: SystemProxy::Off,
                 direct_dpi: None,
+                direct_dpi_stun: None,
             },
         },
         management: Management {

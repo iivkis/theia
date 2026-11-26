@@ -1190,11 +1190,17 @@ async fn routed_udp(
         Action::Allowed => carrier.open_udp(address, port).await,
         Action::DirectDpi => {
             use crate::routing::dpi::udp::Candidate;
-            // STUN transaction correlation is not authentication. Unknown,
-            // incomplete, v2 and unsupported traffic stay on the VPS.
-            if cache.dpi.enabled() && port == 443 {
-                if let (Address::Dns(name), Candidate::QuicH3(sni)) = (&address, candidate) {
-                    if crate::routing::domain_name(name).as_deref() == Ok(sni.as_str()) {
+            // The locked Quinn backend cannot authenticate QUIC v2.
+            // Never treat a v1 handshake as evidence for v2.
+            let stun = matches!(candidate, Candidate::StunBinding);
+            let local_candidate = match (&address, candidate) {
+                (Address::Dns(name), Candidate::QuicH3(sni)) if port == 443 && cache.dpi.enabled() =>
+                    crate::routing::domain_name(name).as_deref() == Ok(sni.as_str()),
+                (Address::Dns(_), Candidate::StunBinding) if port == 3478 && cache.dpi.stun_enabled() => true,
+                _ => false,
+            };
+            if local_candidate {
+                if let Address::Dns(name) = &address {
                         let ips = match pinned {
                             Some(ips) => ips,
                             None => match carrier.resolve_routing(name, snapshot.digest()).await {
@@ -1204,7 +1210,12 @@ async fn routed_udp(
                             },
                         };
                         if !ips.is_empty() && ips.iter().all(|ip| snapshot.policy().matching_action(Some(name), Some(*ip)) == Ok(Some(Action::DirectDpi))) {
-                            if let Some(verified) = cache.dpi.open_quic_udp(name, port, &ips, snapshot.digest()).await {
+                            let verified = if stun {
+                                cache.dpi.open_stun_udp(name, port, &ips, snapshot.digest()).await
+                            } else {
+                                cache.dpi.open_quic_udp(name, port, &ips, snapshot.digest()).await
+                            };
+                            if let Some(verified) = verified {
                                 let carrier = carrier.clone();
                                 let target = address.clone();
                                 let observed = observed.clone();
@@ -1212,12 +1223,12 @@ async fn routed_udp(
                                     let tunnel = carrier.open_udp(target, port).await?;
                                     tunnel.record_transport(&observed);
                                     crate::traffic::udp_dpi_fallback();
+                                    if stun { crate::traffic::udp_stun_fallback(); }
                                     Ok(tunnel)
                                 });
-                                return Ok(crate::udp_relay::Tunnel::VerifiedQuic(Box::new(verified), fallback));
+                                return Ok(crate::udp_relay::Tunnel::VerifiedLocal(Box::new(verified), fallback));
                             }
                         }
-                    }
                 }
             }
             if !cache.dpi.policy_current(snapshot.digest()) {
@@ -1226,7 +1237,8 @@ async fn routed_udp(
             let tunnel = carrier.open_udp(address, port).await?;
             cache.dpi.check_policy(snapshot.digest())?;
             crate::traffic::udp_dpi_fallback();
-            if matches!(candidate, Candidate::Stun) { crate::traffic::udp_stun_fallback(); }
+            if matches!(candidate, Candidate::Stun | Candidate::StunBinding) { crate::traffic::udp_stun_fallback(); }
+            if matches!(candidate, Candidate::QuicV2H3(_)) { crate::traffic::udp_quic_v2_fallback(); }
             Ok(tunnel)
         }
     }
@@ -1460,7 +1472,7 @@ impl ClientRuntime {
             stage: tokio::sync::Mutex::new(()),
         })
     }
-    pub(crate) async fn status(&self) -> (u64, [u8; 32], u64, u8, u8, bool, (u64, u8), [u64; 33]) {
+    pub(crate) async fn status(&self) -> (u64, [u8; 32], u64, u8, u8, bool, (u64, u8), [u64; 37]) {
         let view = self.slot.borrow().clone();
         let (desc, observed, fallback) = match &view.client {
             ProxyClient::Reality(r) => {
@@ -1556,6 +1568,7 @@ impl ClientRuntime {
             .routing_cache()
             .dpi
             .set_enabled(candidate.client.proxy.direct_dpi.unwrap_or(false));
+        client.routing_cache().dpi.set_stun_enabled(candidate.client.proxy.direct_dpi_stun.unwrap_or(false));
         Box::pin(client.routing_policy()).await?;
         saved_client_bytes(&self.path, digest)?;
         Ok((candidate, client))
@@ -1707,6 +1720,7 @@ async fn prepare_proxy(
         .routing_cache()
         .dpi
         .set_enabled(document.client.proxy.direct_dpi.unwrap_or(false));
+    client.routing_cache().dpi.set_stun_enabled(document.client.proxy.direct_dpi_stun.unwrap_or(false));
     client.routing_policy().await?;
     crate::diag!(Info, "client.proxy", "transport_preflight_passed");
     // All startup validation and both binds must succeed before accepting.
@@ -2399,7 +2413,7 @@ async fn udp_revoked_fallback_fixture(client: &ProxyClient) {
     up.send(b"must not escape".to_vec()).await.unwrap();
     let result = timeout(
         Duration::from_secs(5),
-        Tunnel::VerifiedQuic(Box::new(verified), fallback).relay(rx, down),
+        Tunnel::VerifiedLocal(Box::new(verified), fallback).relay(rx, down),
     ).await.unwrap();
     assert!(matches!(result, Err(ClientError::Open(ErrorCode::PolicyDenied))));
     let mut buf = [0; 32];
@@ -2424,7 +2438,7 @@ async fn udp_prewrite_fallback_fixture(client: &ProxyClient) {
     let (down, mut responses) = mpsc::channel(QUEUE);
     up.send(b"first".to_vec()).await.unwrap();
     up.send(Vec::new()).await.unwrap();
-    let task = tokio::spawn(Tunnel::VerifiedQuic(Box::new(verified), fallback).relay(rx, down));
+    let task = tokio::spawn(Tunnel::VerifiedLocal(Box::new(verified), fallback).relay(rx, down));
     let mut buf = [0; 32];
     for data in [b"first".as_slice(), b"".as_slice()] {
         let (n, source) = timeout(Duration::from_secs(3), target.recv_from(&mut buf)).await.unwrap().unwrap();

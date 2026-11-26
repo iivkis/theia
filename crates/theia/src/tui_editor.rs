@@ -336,6 +336,7 @@ impl Editor {
                     socks5_listen: "127.0.0.1:7891".into(),
                     system_proxy: config::SystemProxy::Off,
                     direct_dpi: None,
+                direct_dpi_stun: None,
                 },
             },
         });
@@ -1313,6 +1314,10 @@ impl Editor {
         matches!(&self.original, Config::Client(doc) if doc.client.proxy.direct_dpi == Some(true))
     }
 
+    pub(crate) fn direct_dpi_stun_allowed(&self) -> bool {
+        matches!(&self.original, Config::Client(doc) if doc.client.proxy.direct_dpi == Some(true) && doc.client.proxy.direct_dpi_stun == Some(true))
+    }
+
     pub(crate) fn review_direct_dpi_permission(&self) -> Result<RecordReview, &'static str> {
         self.require_clean_records()?;
         if self.write_uncertain {
@@ -1324,6 +1329,7 @@ impl Editor {
             return Err("Требуется клиентская конфигурация.");
         };
         doc.client.proxy.direct_dpi = Some(enable);
+        doc.client.proxy.direct_dpi_stun = Some(enable);
         candidate
             .validate()
             .map_err(|_| "Настройки клиента не прошли проверку.")?;
@@ -1338,7 +1344,7 @@ impl Editor {
                 "Отключить Anti-DPI"
             },
             body: if enable {
-                "Разрешить локальный Anti-DPI для этого файла клиента?\n\nДля правил direct_dpi возможен прямой выход и независимая TLS/QUIC-проверка назначения: сайт увидит IP вашего устройства. DNS запрашивается через Theia. Остальные правила не меняются.\nСохранение не запускает режим; перезапустите клиент.\n\ny: разрешить · n/Esc: отменить".into()
+                "Разрешить локальный Anti-DPI для этого файла клиента?\n\nДля правил direct_dpi возможен прямой выход и независимая TLS/QUIC-проверка назначения, а также экспериментальный STUN Binding без учётных данных (сервер STUN увидит IP; ответ не удостоверяет его личность). Сайт увидит IP вашего устройства. DNS запрашивается через Theia. Остальные правила не меняются.\nСохранение не запускает режим; перезапустите клиент.\n\ny: разрешить · n/Esc: отменить".into()
             } else {
                 "Отключить локальный Anti-DPI?\nПравила direct_dpi будут использовать VPS после перезапуска клиента. Текущие соединения не изменятся.\n\ny: отключить · n/Esc: отменить".into()
             },

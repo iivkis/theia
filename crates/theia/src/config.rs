@@ -211,6 +211,9 @@ pub struct LocalProxy {
     /// Local consent for experimental native direct DPI and direct egress IP.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direct_dpi: Option<bool>,
+    /// Separate opt-in for unauthenticated, credential-free STUN reachability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_dpi_stun: Option<bool>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
