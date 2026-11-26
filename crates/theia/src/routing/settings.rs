@@ -1,6 +1,6 @@
 //! Typed server routing configuration. Data updates are candidates until
 //! their exact digests and a new monotonic revision are selected in TOML.
-use super::{geodata, snapshot, Policy, RoutingError, Rule};
+use super::{geodata, snapshot, RoutingError, Rule};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -40,7 +40,6 @@ impl Settings {
         if self.revision < 2 {
             return Err(Error::Invalid);
         }
-        Policy::validate_rules(&self.rules)?;
         let (_, site_codes, ip_codes) = super::compile_selectors(&self.rules)?;
         let requires_data = !site_codes.is_empty() || !ip_codes.is_empty();
         match (&self.geodata_directory, &self.datasets) {

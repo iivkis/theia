@@ -377,9 +377,14 @@ impl Store {
         let roots = tokio::task::spawn_blocking(roots).await.map_err(|_| Error::Io)??;
         let tag = latest(&roots).await?;
         if let Some(bytes) = previous.as_deref() {
-            let cached = self.load_bytes(bytes, rules)?;
-            if cached.manifest.release == tag { return Ok(cached); }
-            if cached.manifest.release > tag { return Err(Error::Conflict); }
+            let manifest: Manifest = toml::from_str(std::str::from_utf8(bytes).map_err(|_| Error::Format)?)
+                .map_err(|_| Error::Format)?;
+            if !valid_tag(&manifest.release) || manifest.release > tag { return Err(Error::Conflict); }
+            if manifest.release == tag {
+                return self.load_bytes(bytes, rules);
+            }
+            // A new release may contain categories missing in the old one.
+            // Validate only the new pair before changing the active pointer.
         }
         let (site, site_hash) = dataset(&tag, SITE, &roots).await?;
         let (ip, ip_hash) = dataset(&tag, IP, &roots).await?;

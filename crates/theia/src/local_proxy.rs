@@ -1037,8 +1037,7 @@ impl ProxyClient {
                 };
                 format!("Локальный прокси работает. Это не подтверждает связь с сервером.\nРежим передачи: {} · последнее подтверждённое соединение: {opened}; XHTTP: {}\nВременный переход с H3: {}", if policy == "auto" { "автоматически" } else { policy }, xhttp_observation(d.last_xhttp()), if d.fallback() { "активен: временная сетевая недоступность QUIC" } else { "не активен" })
             }
-        }
-        ;
+        };
         format!("{report}\n{}\n{}", self.routing_cache().report(), crate::traffic::routing_summary())
     }
 
@@ -1836,12 +1835,11 @@ async fn handle(
     );
     match client.open(address, port).await {
         Ok(tunnel) => {
-            crate::diag!(
-                Debug,
-                "client.proxy",
-                if tunnel.open_code() == 0 { "direct_open_ok" } else { "remote_open_ok" },
-                "session" = Value::Count(session_id)
-            );
+            if tunnel.open_code() == 0 {
+                crate::diag!(Debug, "client.proxy", "direct_open_ok", "session" = Value::Count(session_id));
+            } else {
+                crate::diag!(Debug, "client.proxy", "remote_open_ok", "session" = Value::Count(session_id));
+            }
             // A direct socket is already connected; proxied routes verified OPEN_OK.
             if is_http {
                 timeout(REPLY_TIMEOUT, socket.write_all(HTTP_OK))
@@ -3016,7 +3014,15 @@ mod selector_tests {
             disabled: false,
         };
         let policy = ServerPolicy {
-            routing: None,
+            routing: Some(crate::routing::Settings {
+                revision: 2,
+                geodata_directory: None,
+                datasets: None,
+                rules: vec![
+                    crate::routing::Rule { name: "local direct".into(), action: Action::Direct, domains: vec!["full:localhost".into()], ips: vec![] },
+                    crate::routing::Rule { name: "blocked".into(), action: Action::Blocked, domains: vec!["full:blocked.invalid".into()], ips: vec![] },
+                ],
+            }),
             allow_private_ips: true,
             max_connections_per_user: 8,
             max_connections_total: 8,
@@ -3060,6 +3066,17 @@ mod selector_tests {
                 profile.transport = transport;
                 profile.server = remote.to_string();
                 let proxy_client = load_client(&profile).await.unwrap();
+                let policy = proxy_client.routing_policy().await.unwrap();
+                assert_eq!(policy.manifest().revision, 2);
+                assert!(matches!(proxy_client.open(Address::Dns("blocked.invalid".into()), 443).await, Err(ClientError::Open(ErrorCode::PolicyDenied))));
+                let direct_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let direct_port = direct_listener.local_addr().unwrap().port();
+                let tunnel = proxy_client.open(Address::Dns("localhost".into()), direct_port).await.unwrap();
+                assert!(matches!(tunnel, ProxyTunnel::Direct(_)));
+                let _accepted = direct_listener.accept().await.unwrap();
+                if let ProxyClient::Direct(client) = &proxy_client {
+                    assert!(matches!(client.carrier.open(Address::Dns("localhost".into()), direct_port).await, Err(ClientError::Open(ErrorCode::PolicyDenied))));
+                }
                 let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let port = target.local_addr().unwrap().port();
                 let echo = tokio::spawn(async move {
