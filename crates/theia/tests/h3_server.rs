@@ -608,7 +608,7 @@ async fn native_fixture(private: bool) -> (SocketAddr, JoinHandle<()>, RootCertS
         64,
     )
     .unwrap();
-    let remote = listener.local_addr().unwrap();
+    let remote = listener.local_addr();
     let context = context(private);
     let mut roots = RootCertStore::empty();
     roots.add(der).unwrap();
