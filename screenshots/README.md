@@ -1,6 +1,6 @@
 # Theia TUI visual review
 
-Source: c338da46ed998bb5de77fd5d4a90e4b2bef54da3
+Source: dce73bf1fd7f78f285b4e6150edb826639b257b6
 
 Linux · 120×40 · actual production renderer cells. State fixtures and unavailable actions are not runtime success.
 
@@ -450,6 +450,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![state-reality-step1-grant-picker](state-reality-step1-grant-picker.png)
 
+## state-reality-step2-domain-editor
+
+![state-reality-step2-domain-editor](state-reality-step2-domain-editor.png)
+
 ## state-reality-step2-extra-sources
 
 ![state-reality-step2-extra-sources](state-reality-step2-extra-sources.png)
@@ -474,6 +478,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![state-reality-step4-tls-recheck](state-reality-step4-tls-recheck.png)
 
+## state-reality-step5-long-report-scrolled
+
+![state-reality-step5-long-report-scrolled](state-reality-step5-long-report-scrolled.png)
+
 ## state-reality-step5-long-report
 
 ![state-reality-step5-long-report](state-reality-step5-long-report.png)
@@ -493,6 +501,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## state-reality-step5-ranked-review
 
 ![state-reality-step5-ranked-review](state-reality-step5-ranked-review.png)
+
+## state-reality-step6-key-handoff
+
+![state-reality-step6-key-handoff](state-reality-step6-key-handoff.png)
 
 ## state-reality-step6-save-error
 
