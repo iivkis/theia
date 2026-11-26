@@ -453,8 +453,8 @@ impl ReferenceReview {
         if wide {
             lines.push(Line::styled(
                 format!(
-                    "{:<30} {:<25} {:<13} {}",
-                    "Референс", "Адрес", "H2 / H3", "Результат"
+                    "{:<30} {:<25} {:<18} {}",
+                    "Референс", "Адрес", "TLS / H2 / H3", "Результат"
                 ),
                 Style::default().fg(MUTED),
             ));
@@ -476,7 +476,8 @@ impl ReferenceReview {
                 ERROR
             };
             let transports = format!(
-                "{} H2  {} H3",
+                "{} TLS {} H2 {} H3",
+                if row.h2 || row.h3 { "✓" } else { "?" },
                 if row.h2 { "✓" } else { "×" },
                 if row.h3 { "✓" } else { "×" }
             );
@@ -487,7 +488,7 @@ impl ReferenceReview {
                         format!("{:<30} {:<25} ", row.name, row.address),
                         Style::default().fg(TEXT),
                     ),
-                    Span::styled(format!("{transports:<13} "), Style::default().fg(MUTED)),
+                    Span::styled(format!("{transports:<18} "), Style::default().fg(MUTED)),
                     Span::styled(
                         format!("{status} · {}", row.score),
                         Style::default().fg(color).add_modifier(Modifier::BOLD),

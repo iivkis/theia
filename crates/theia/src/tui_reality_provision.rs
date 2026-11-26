@@ -703,6 +703,55 @@ fn rank_checked(
     Ok((state, RankedReview { text: report, rows }))
 }
 
+/// Replace provisional measurements only for the exact pins rechecked in the
+/// final small batch. Other candidates are screening observations, never
+/// silently promoted after that batch.
+fn merge_rechecked(screen: &mut RankedReview, fresh: RankedReview) {
+    for row in &mut screen.rows {
+        row.selected = None;
+        if let Some(rechecked) = fresh.rows.iter().find(|fresh| fresh.name == row.name && fresh.address == row.address) {
+            *row = rechecked.clone();
+        }
+    }
+    screen.rows.sort_by_key(|row| (row.selected.unwrap_or(usize::MAX), std::cmp::Reverse(row.score)));
+    screen.text = format!("Общий поиск: {} кандидатов. Повторно проверены выбранные точные адреса. Остальные оценки предварительные.\n", screen.rows.len());
+    for row in &screen.rows {
+        screen.text.push_str(&format!("{} {} · H2={} H3={} · {}\n", row.name, row.address, row.h2, row.h3, row.score));
+    }
+    screen.text.push_str(&fresh.text);
+}
+
+async fn screen_and_recheck(
+    input: &WizardInput,
+    resolved: ResolvedSearch,
+    progress: &AtomicUsize,
+) -> Result<(Option<reference_health::State>, RankedReview), Error> {
+    let plan = resolved.plan.ok_or(Error::Health)?;
+    let approved = plan.digest().map_err(|_| Error::Health)?;
+    let evidence = reference_health::check_search(&plan, approved, progress).await.map_err(|_| Error::Health)?;
+    let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
+    let (screen_state, mut report) = rank_checked(input, plan.into_targets(), evidence, now, resolved.unresolved)?;
+    let Some(screen_state) = screen_state else { return Ok((None, report)); };
+    // Screening may take minutes. Its earliest observations must not be
+    // stamped with the end time of the full search for provisioning.
+    let selected = screen_state.plan().references.clone();
+    let final_plan = input.search_plan(selected.clone())?;
+    let approved = final_plan.digest().map_err(|_| Error::Health)?;
+    let started = reference_health::unix_now().map_err(|_| Error::Clock)?;
+    let recheck_progress = AtomicUsize::new(0);
+    let evidence = tokio::time::timeout(
+        std::time::Duration::from_secs(55),
+        reference_health::check_search(&final_plan, approved, &recheck_progress),
+    ).await.map_err(|_| Error::Health)?.map_err(|_| Error::Health)?;
+    let (state, fresh) = rank_checked(input, selected, evidence, started, Vec::new())?;
+    merge_rechecked(&mut report, fresh);
+    let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
+    if let Some(state) = &state {
+        state.provisioning_ready(now).map_err(|_| Error::Health)?;
+    }
+    Ok((state, report))
+}
+
 enum WizardStage {
     Input,
     DnsConfirm(Box<WizardInput>),
@@ -1015,16 +1064,12 @@ impl Wizard {
                 let (cancel, cancelled) = tokio::sync::oneshot::channel();
                 let _worker = std::thread::spawn(move || {
                     let result = input.check_source().and_then(|()| {
-                        let plan = resolved.plan.ok_or(Error::Health)?;
-                        let approved = plan.digest().map_err(|_| Error::Health)?;
                         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| Error::Storage)?;
-                        let evidence = rt.block_on(async { tokio::select! {
+                        let (state, report) = rt.block_on(async { tokio::select! {
                             biased;
                             _ = cancelled => Err(Error::Health),
-                            value = reference_health::check_search(&plan, approved, &progress) => value.map_err(|_| Error::Health),
+                            value = screen_and_recheck(&input, resolved, &progress) => value,
                         } })?;
-                        let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
-                        let (state, report) = rank_checked(&input, plan.into_targets(), evidence, now, resolved.unresolved)?;
                         Ok((input, state, report))
                     });
                     let _ = tx.send(result);
@@ -1035,6 +1080,26 @@ impl Wizard {
                 if key.code == KeyCode::Char('y') && key.modifiers.is_empty() =>
             {
                 let (input, state, _) = *value;
+                // Long review/scrolling must not turn stale evidence into a
+                // save. Ask again for the same exact pins, without resuming
+                // the broad discovery or modifying the saved configuration.
+                let fresh = reference_health::unix_now()
+                    .and_then(|now| state.provisioning_ready(now)).is_ok();
+                if !fresh {
+                    match input.search_plan(state.plan().references.clone()) {
+                        Ok(plan) => {
+                            self.stage = WizardStage::ProbeConfirm(Box::new((input, ResolvedSearch {
+                                plan: Some(plan),
+                                unresolved: Vec::new(),
+                            })));
+                        }
+                        Err(_) => {
+                            self.error = "Результаты устарели. Повторите проверку.".into();
+                            self.stage = WizardStage::Input;
+                        }
+                    }
+                    return false;
+                }
                 let root = input
                     .health
                     .parent()
@@ -1223,9 +1288,16 @@ impl Wizard {
             WizardStage::Resolving(_, _) => format!("Получение DNS/PTR: {} / {}.\nEsc: отменить, без TLS и записи.", self.progress.load(Ordering::Relaxed), self.total),
             WizardStage::ProbeConfirm(value) => {
                 let search = value.1.plan.as_ref().map_or_else(String::new, |plan| plan.preview());
-                format!("Проверить {} согласованных IP:443 и SNI (public PKI, TLS 1.3, H2/H3 HEAD).\nDNS/PTR исключено: {}. Никаких иных адресов, портов, bearer или записи.\nDNS будет повторно сверён, включая endpoint.\ny: проверить; n/Esc: отменить.\n\n{}", value.1.plan.as_ref().map_or(0, |plan| plan.targets().len()), value.1.unresolved.len(), search)
+                format!("Проверить {} согласованных IP:443 и SNI (public PKI, TLS 1.3, H2/H3 HEAD).\nDNS/PTR исключено: {}. Никаких иных адресов, портов, bearer или записи.\nDNS будет повторно сверён, включая endpoint.\nЛучшие кандидаты будут повторно проверены до сохранения.\ny: проверить; n/Esc: отменить.\n\n{}", value.1.plan.as_ref().map_or(0, |plan| plan.targets().len()), value.1.unresolved.len(), search)
             }
-            WizardStage::Checking(_, _) => format!("Проверка TLS / QUIC: {} / {}.\nEsc: отменить без записи.", self.progress.load(Ordering::Relaxed), self.total),
+            WizardStage::Checking(_, _) => {
+                let done = self.progress.load(Ordering::Relaxed);
+                if done >= self.total {
+                    "Повторная проверка выбранных референсов.\nEsc: отменить без записи.".into()
+                } else {
+                    format!("Проверка TLS / QUIC: {done} / {}.\nEsc: отменить без записи.", self.total)
+                }
+            },
             WizardStage::NoEligible(report) => report.text.clone(),
             WizardStage::CreateConfirm(value) => {
                 if value.0.source.is_none() {
@@ -1573,6 +1645,7 @@ impl ProvisionPanel {
         } else {
             "Создание защищённых материалов. TOML сохраняется после отдельного подтверждения; сервер не запускается.".to_owned()
         };
+        note.push_str("\nВыбранные адреса перепроверены; прочие оценки предварительные. Если результаты устареют, потребуется повторная проверка выбранных адресов.");
         if input
             .endpoint
             .parse::<SocketAddr>()
@@ -1701,6 +1774,28 @@ mod tests {
         assert_eq!(report.rows.len(), 6);
         assert!(!path.exists());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recheck_never_promotes_an_unobserved_backup() {
+        let row = |name: &str, score, selected| crate::tui_widgets::ReferenceRow {
+            name: name.into(), address: format!("{name}:443"), score,
+            h2: score > 0, h3: score == 100, selected,
+        };
+        let mut screening = RankedReview {
+            text: String::new(),
+            rows: vec![row("first", 100, Some(0)), row("other", 100, None), row("backup", 80, Some(1))],
+        };
+        let fresh = RankedReview {
+            text: "fresh".into(),
+            rows: vec![row("backup", 80, Some(0)), row("first", 0, None)],
+        };
+        merge_rechecked(&mut screening, fresh);
+        assert_eq!(screening.rows[0].name, "backup");
+        assert_eq!(screening.rows[0].selected, Some(0));
+        assert_eq!(screening.rows[1].name, "other");
+        assert_eq!(screening.rows[1].selected, None);
+        assert_eq!(screening.rows[2].score, 0);
     }
 
     #[test]
