@@ -427,7 +427,7 @@ class SpecContractTests(unittest.TestCase):
             self.assertIn(f"Case::{case}", tests)
         for adapter in ("server", "h3_server"):
             source = read(f"crates/theia/src/{adapter}.rs")
-            relay = source.split("async fn relay_request(", 1)[1].split("\nasync fn ", 1)[0]
+            relay = source.split("async fn relay_request", 1)[1].split("\nasync fn ", 1)[0]
             self.assertNotIn("SESSION_TIMEOUT", relay)
             self.assertNotIn("Duration::from_secs(300)", relay)
         self.assertIn("h2_request_trailers_after_fin_reset_the_stream",
