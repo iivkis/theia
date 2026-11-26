@@ -313,6 +313,7 @@ impl LabSession {
         if !self.active() {
             return Err(Error::Closed);
         }
+        if !self.receive.can_open_local_bidi() { return Err(Error::Send(super::send_flow::Error::Limit)); }
         let id = self.send.open_bidi().map_err(Error::Send)?;
         if let Err(e) = self.receive.register_local_bidi(id) {
             self.abort();
@@ -361,6 +362,31 @@ impl LabSession {
                 super::wire::encode_varint(value, &mut scratch).ok_or(Error::Protocol)?,
             );
         }
+        self.scheduler.enqueue(frame).map_err(Error::Schedule)
+    }
+
+    pub(crate) fn lifetime_exhausted(&self, bidi: bool) -> bool { self.send.lifetime_exhausted(bidi) }
+
+    /// A peer stream earns a new stream ID only after both relevant halves
+    /// terminate and reliable STREAM/RESET frames are acknowledged.
+    pub(crate) fn retire_stream(&mut self, id: u64, tx: bool, rx: bool) -> Result<bool, Error> {
+        if tx && (!self.send.terminal(id) || self.scheduler.stream_pending(id)) { return Ok(false); }
+        if !rx { return Ok(true); }
+        if !self.scheduler.can_queue_n(2) { return Ok(false); }
+        let Some((grant, data)) = self.receive.retire(id) else { return Ok(false); };
+        if let Some(limit) = grant {
+            let bidi = id & 2 == 0;
+            if bidi { self.send.grant_peer_bidi(limit); }
+            self.queue_credit(if bidi { 0x12 } else { 0x13 }, limit)?;
+        }
+        if let Some(limit) = data { self.queue_credit(0x10, limit)?; }
+        Ok(true)
+    }
+
+    fn queue_credit(&mut self, ty: u8, limit: u64) -> Result<(), Error> {
+        let mut frame = vec![ty];
+        let mut scratch = [0; 8];
+        frame.extend_from_slice(super::wire::encode_varint(limit, &mut scratch).ok_or(Error::Protocol)?);
         self.scheduler.enqueue(frame).map_err(Error::Schedule)
     }
 
@@ -815,11 +841,11 @@ impl LabSession {
                 }
                 Frame::MaxStreams { bidi: false, limit } => self
                     .send
-                    .max_streams(limit.min(MAX_STREAMS))
+                    .max_streams(limit)
                     .map_err(Error::Send)?,
                 Frame::MaxStreams { bidi: true, limit } => self
                     .send
-                    .max_bidi(limit.min(MAX_STREAMS))
+                    .max_bidi(limit)
                     .map_err(Error::Send)?,
                 _ => return Err(Error::Protocol),
             }

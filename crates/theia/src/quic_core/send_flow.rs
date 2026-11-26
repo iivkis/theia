@@ -122,6 +122,18 @@ impl SendFlow {
         Ok(())
     }
 
+    pub(crate) fn grant_peer_bidi(&mut self, value: u64) {
+        self.peer_bidi = self.peer_bidi.max(value.min(MAX_STREAMS));
+    }
+
+    pub(crate) fn terminal(&self, id: u64) -> bool {
+        self.streams.get(&id).is_some_and(|stream| stream.fin)
+    }
+
+    pub(crate) fn lifetime_exhausted(&self, bidi: bool) -> bool {
+        (if bidi { self.next_bidi } else { self.next_uni }) >= MAX_STREAMS
+    }
+
     pub fn max_bidi(&mut self, value: u64) -> Result<(), Error> {
         if value > (1 << 60) {
             return Err(Error::Limit);

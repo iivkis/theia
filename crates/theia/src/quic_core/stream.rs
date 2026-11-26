@@ -120,6 +120,16 @@ impl ReceiveBuffer {
         Ok(())
     }
 
+    /// Terminal metadata remains available to validate late duplicates, but
+    /// the reassembly allocation and unread reset credit can be released.
+    pub(crate) fn release_terminal(&mut self) -> Option<u64> {
+        if !self.finished() && self.reset_code.is_none() { return None; }
+        let released = self.highest.saturating_sub(self.read_offset);
+        self.read_offset = self.highest;
+        self.bytes = VecDeque::new();
+        Some(released)
+    }
+
     pub fn reset_code(&self) -> Option<u64> {
         self.reset_code
     }

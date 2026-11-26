@@ -103,6 +103,12 @@ impl Scheduler {
         Ok(())
     }
 
+    pub(crate) fn stream_pending(&self, stream: u64) -> bool {
+        use super::{frames::{decode, Frame}, spaces::Space};
+        self.frames.values().any(|pending| matches!(decode(&pending.bytes, Space::Application).as_deref(),
+            Ok([Frame::Stream { id, .. } | Frame::ResetStream { id, .. }]) if *id == stream))
+    }
+
     pub fn pending(&self) -> usize {
         self.frames.len()
     }

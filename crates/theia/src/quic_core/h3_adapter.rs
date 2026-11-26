@@ -83,6 +83,9 @@ struct StreamState {
     stop: Option<u64>,
     stop_sent: bool,
     recv_reset: Option<u64>,
+    send_dropped: bool,
+    recv_dropped: bool,
+    retired: bool,
     send_waker: Option<Waker>,
     recv_waker: Option<Waker>,
 }
@@ -168,7 +171,9 @@ fn progress(
     wakes: &mut Vec<Waker>,
 ) -> Result<(), NativeError> {
     state.discover(session, wakes);
-    while let Some(request) = state.open.pop_front() {
+    // Visit each queued open once: a blocked bidi must not starve uni.
+    for _ in 0..state.open.len() {
+        let Some(request) = state.open.pop_front() else { break; };
         if request.result.is_closed() {
             continue;
         }
@@ -181,14 +186,19 @@ fn progress(
                 let mut stream = StreamState::new(true, request.bidi);
                 if request.result.send(Ok(id)).is_err() {
                     stream.reset = Some(CANCEL);
+                    stream.send_dropped = true;
                     if request.bidi {
                         stream.stop = Some(CANCEL);
+                        stream.recv_dropped = true;
                     }
                 }
                 state.streams.insert(id, stream);
             }
+            Err(NativeError::Send(send_flow::Error::Limit)) if !session.lifetime_exhausted(request.bidi) => {
+                state.open.push_back(request);
+            }
             Err(_) => {
-                // Fixed lifetime cap, no false promise of dynamic MAX_STREAMS.
+                // The lifetime metadata cap remains a deliberate laboratory bound.
                 let _ = request
                     .result
                     .send(Err(CE::InternalError("native stream limit".into())));
@@ -196,6 +206,7 @@ fn progress(
         }
     }
     for (&id, s) in &mut state.streams {
+        if s.retired { continue; }
         if s.tx && !s.reset_sent {
             if let Some(code) = session.send_reset_code(id) {
                 if s.reset.is_none() {
@@ -273,6 +284,11 @@ fn progress(
                     Err(e) => return Err(e),
                 }
             }
+        }
+        if (!s.tx || s.send_dropped) && (!s.rx || s.recv_dropped) && session.retire_stream(id, s.tx, s.rx)? {
+            s.retired = true;
+            s.outgoing = None;
+            s.incoming = None;
         }
     }
     Ok(())
@@ -545,6 +561,8 @@ impl SendSide {
 impl Drop for SendSide {
     fn drop(&mut self) {
         self.cancel(CANCEL);
+        if let Some(s) = self.shared.lock().expect("bridge mutex").streams.get_mut(&self.id) { s.send_dropped = true; }
+        self.shared.ready.notify_one();
     }
 }
 
@@ -645,6 +663,8 @@ impl RecvSide {
 impl Drop for RecvSide {
     fn drop(&mut self) {
         self.stop(CANCEL);
+        if let Some(s) = self.shared.lock().expect("bridge mutex").streams.get_mut(&self.id) { s.recv_dropped = true; }
+        self.shared.ready.notify_one();
     }
 }
 impl quic::RecvStream for RecvSide {

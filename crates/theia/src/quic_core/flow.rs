@@ -4,7 +4,7 @@ use super::{
     stream::{ReceiveBuffer, ReceiveError, MAX_WINDOW},
     wire::MAX_VARINT,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_STREAMS: u64 = 64;
 const MAX_TOTAL_WINDOW: usize = 8 * 1024 * 1024;
@@ -26,6 +26,7 @@ pub struct ReceiveFlow {
     max_data: u64,
     used: u64,
     streams: BTreeMap<u64, ReceiveBuffer>,
+    retired: BTreeSet<u64>,
 }
 
 impl ReceiveFlow {
@@ -58,6 +59,7 @@ impl ReceiveFlow {
             max_data,
             used: 0,
             streams: BTreeMap::new(),
+            retired: BTreeSet::new(),
         })
     }
 
@@ -77,15 +79,20 @@ impl ReceiveFlow {
         Ok(())
     }
 
+    pub(crate) fn can_open_local_bidi(&self) -> bool {
+        self.streams.keys().filter(|id| **id & 1 != self.peer_bit && !self.retired.contains(id)).count() < self.max_local_bidi as usize
+    }
+
     pub fn register_local_bidi(&mut self, id: u64) -> Result<(), Error> {
         if id > MAX_VARINT
             || id & 2 != 0
             || id & 1 == self.peer_bit
-            || id / 4 >= self.max_local_bidi
+            || id / 4 >= MAX_STREAMS
         {
             return Err(Error::StreamId);
         }
         if !self.streams.contains_key(&id) {
+            if !self.can_open_local_bidi() { return Err(Error::Limit); }
             let buffer =
                 ReceiveBuffer::new(self.window, self.stream_limit).map_err(Error::Receive)?;
             self.streams.insert(id, buffer);
@@ -125,7 +132,7 @@ impl ReceiveFlow {
         self.streams
             .keys()
             .copied()
-            .filter(|id| id & 1 == self.peer_bit)
+            .filter(|id| id & 1 == self.peer_bit && !self.retired.contains(id))
             .collect()
     }
 
@@ -231,6 +238,21 @@ impl ReceiveFlow {
         Ok((n, self.max_data, limit))
     }
 
+    /// Return cumulative peer stream credit and connection credit only once,
+    /// after the application has released a terminal receive direction.
+    /// Lifetime IDs remain capped at 64 per direction; no ID is reused.
+    pub(crate) fn retire(&mut self, id: u64) -> Option<(Option<u64>, Option<u64>)> {
+        if self.retired.contains(&id) { return None; }
+        let released = self.streams.get_mut(&id)?.release_terminal()?;
+        self.retired.insert(id);
+        self.max_data = self.max_data.saturating_add(released).min(MAX_VARINT);
+        let grant = if id & 1 == self.peer_bit {
+            let limit = if id & 2 == 0 { &mut self.max_bidi } else { &mut self.max_uni };
+            if *limit < MAX_STREAMS { *limit += 1; Some(*limit) } else { None }
+        } else { None };
+        Some((grant, (released != 0).then_some(self.max_data)))
+    }
+
     pub fn finished(&self, id: u64) -> bool {
         self.streams.get(&id).is_some_and(ReceiveBuffer::finished)
     }
@@ -264,6 +286,21 @@ mod tests {
         assert_eq!(f.used(), 9);
         assert_eq!(f.extend_connection_limit(8), Err(Error::Limit));
         assert!(ReceiveFlow::new(false, 64, 1, 16, 16, 8).is_err());
+    }
+    #[test]
+    fn retirement_grants_credit_once_and_preserves_final_size() {
+        let mut f = ReceiveFlow::new(true, 1, 1, 16, 16, 16).unwrap();
+        f.insert(2, 0, b"abc", true).unwrap();
+        assert_eq!(f.retire(2), None);
+        assert_eq!(f.read(2, &mut [0; 3]), Ok(3));
+        assert_eq!(f.retire(2), Some((Some(2), None)));
+        assert_eq!(f.retire(2), None);
+        assert!(f.insert(2, 3, b"x", false).is_err());
+        f.reset(6, 8, 7).unwrap();
+        assert_eq!(f.retire(6), Some((Some(3), Some(24))));
+        assert_eq!(f.retire(6), None);
+        assert!(f.peer_streams().is_empty());
+        f.insert(10, 0, b"x", true).unwrap();
     }
     #[test]
     fn reset_charges_final_size_once_and_discards_buffer() {
