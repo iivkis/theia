@@ -725,6 +725,8 @@ async fn screen_and_recheck(
     input: &WizardInput,
     resolved: ResolvedSearch,
     progress: &AtomicUsize,
+    recheck_done: &AtomicUsize,
+    recheck_total: &AtomicUsize,
 ) -> Result<(Option<reference_health::State>, RankedReview), Error> {
     let plan = resolved.plan.ok_or(Error::Health)?;
     let approved = plan.digest().map_err(|_| Error::Health)?;
@@ -738,10 +740,10 @@ async fn screen_and_recheck(
     let final_plan = input.search_plan(selected.clone())?;
     let approved = final_plan.digest().map_err(|_| Error::Health)?;
     let started = reference_health::unix_now().map_err(|_| Error::Clock)?;
-    let recheck_progress = AtomicUsize::new(0);
+    recheck_total.store(selected.len(), Ordering::Relaxed);
     let evidence = tokio::time::timeout(
         std::time::Duration::from_secs(55),
-        reference_health::check_search(&final_plan, approved, &recheck_progress),
+        reference_health::check_search(&final_plan, approved, recheck_done),
     ).await.map_err(|_| Error::Health)?.map_err(|_| Error::Health)?;
     let (state, fresh) = rank_checked(input, selected, evidence, started, Vec::new())?;
     merge_rechecked(&mut report, fresh);
@@ -768,8 +770,34 @@ enum WizardStage {
     NoEligible(RankedReview),
     Saving(Receiver<Result<RegistrationPanel, Error>>, PathBuf),
     SavingInitial(Receiver<Result<Editor, Error>>, PathBuf),
-    Done(String),
+    SaveFailed { root: PathBuf, message: String, retry: bool, inspected: bool },
+    Success,
 }
+fn path_observation(path: &Path) -> &'static str {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => "существует; содержимое не проверено",
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "не найден",
+        Err(_) => "не удалось проверить",
+    }
+}
+
+fn save_failed(root: PathBuf, error: Option<Error>) -> WizardStage {
+    let retry = error.as_ref().is_some_and(|error| !matches!(error, Error::Indeterminate | Error::Approval));
+    let message = if retry {
+        "Не удалось сохранить настройки. Проверьте права на папку и свободное место. Повтор возможен только после проверки исходного файла и отсутствия незавершённых материалов."
+    } else {
+        "Запись не подтверждена или исходный файл изменился. Проверьте файлы, затем откройте конфигурацию заново. Автоматический повтор запрещён."
+    };
+    WizardStage::SaveFailed { root, message: message.into(), retry, inspected: false }
+}
+
+fn progress_text(label: &str, done: usize, total: usize) -> String {
+    let done = done.min(total);
+    let filled = if total == 0 { 0 } else { done.saturating_mul(24) / total };
+    let percent = if total == 0 { 0 } else { done.saturating_mul(100) / total };
+    format!("{label}\n[{}{}] {percent}% · {done} из {total}\nНастройки не изменяются.", "━".repeat(filled), "─".repeat(24 - filled))
+}
+
 struct GrantPicker {
     selected: Vec<bool>,
     focus: usize,
@@ -786,6 +814,10 @@ struct Wizard {
     custom_enabled: bool,
     ranges_enabled: bool,
     dns_details: bool,
+    tls_details: bool,
+    result_details: bool,
+    recheck_done: Arc<AtomicUsize>,
+    recheck_total: Arc<AtomicUsize>,
     suggested_ip: Option<String>,
     users: String,
     available_users: Vec<String>,
@@ -825,6 +857,10 @@ impl Wizard {
             custom_enabled: false,
             ranges_enabled: false,
             dns_details: false,
+            tls_details: false,
+            result_details: false,
+            recheck_done: Arc::new(AtomicUsize::new(0)),
+            recheck_total: Arc::new(AtomicUsize::new(0)),
             suggested_ip: None,
             users: editor
                 .record_user_catalog(crate::tui_editor::RecordAction::NewInbound)
@@ -870,6 +906,10 @@ impl Wizard {
             custom_enabled: false,
             ranges_enabled: false,
             dns_details: false,
+            tls_details: false,
+            result_details: false,
+            recheck_done: Arc::new(AtomicUsize::new(0)),
+            recheck_total: Arc::new(AtomicUsize::new(0)),
             suggested_ip: None,
             users: "Введите ID первого пользователя. Он будет отключён до явного выпуска токена."
                 .into(),
@@ -1251,12 +1291,24 @@ impl Wizard {
                 });
                 WizardStage::Resolving(rx, cancel)
             }
+            WizardStage::ProbeConfirm(value) if key.code == KeyCode::F(2) => {
+                self.tls_details = !self.tls_details;
+                WizardStage::ProbeConfirm(value)
+            }
+            WizardStage::ProbeConfirm(value) if self.tls_details && matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('n')) => {
+                self.tls_details = false;
+                WizardStage::ProbeConfirm(value)
+            }
             WizardStage::ProbeConfirm(value)
-                if key.code == KeyCode::Char('y') && key.modifiers.is_empty() =>
+                if !self.tls_details && key.code == KeyCode::Char('y') && key.modifiers.is_empty() =>
             {
                 let (input, resolved) = *value;
                 self.total = resolved.plan.as_ref().map_or(0, |plan| plan.targets().len());
                 self.progress = Arc::new(AtomicUsize::new(0));
+                self.recheck_done = Arc::new(AtomicUsize::new(0));
+                self.recheck_total = Arc::new(AtomicUsize::new(0));
+                let recheck_done = Arc::clone(&self.recheck_done);
+                let recheck_total = Arc::clone(&self.recheck_total);
                 let progress = Arc::clone(&self.progress);
                 let (tx, rx) = mpsc::channel();
                 let (cancel, cancelled) = tokio::sync::oneshot::channel();
@@ -1266,7 +1318,7 @@ impl Wizard {
                         let (state, report) = rt.block_on(async { tokio::select! {
                             biased;
                             _ = cancelled => Err(Error::Health),
-                            value = screen_and_recheck(&input, resolved, &progress) => value,
+                            value = screen_and_recheck(&input, resolved, &progress, &recheck_done, &recheck_total) => value,
                         } })?;
                         Ok((input, state, report))
                     });
@@ -1274,8 +1326,24 @@ impl Wizard {
                 });
                 WizardStage::Checking(rx, cancel)
             }
+            WizardStage::CreateConfirm(value) if key.code == KeyCode::F(2) => {
+                self.result_details = !self.result_details;
+                WizardStage::CreateConfirm(value)
+            }
+            WizardStage::CreateConfirm(value) if self.result_details && matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('n')) => {
+                self.result_details = false;
+                WizardStage::CreateConfirm(value)
+            }
+            WizardStage::NoEligible(report) if key.code == KeyCode::F(2) => {
+                self.result_details = !self.result_details;
+                WizardStage::NoEligible(report)
+            }
+            WizardStage::NoEligible(report) if self.result_details && matches!(key.code, KeyCode::Esc | KeyCode::Enter) => {
+                self.result_details = false;
+                WizardStage::NoEligible(report)
+            }
             WizardStage::CreateConfirm(value)
-                if key.code == KeyCode::Char('y') && key.modifiers.is_empty() =>
+                if !self.result_details && key.code == KeyCode::Char('y') && key.modifiers.is_empty() =>
             {
                 let (input, state, _) = *value;
                 // Long review/scrolling must not turn stale evidence into a
@@ -1286,6 +1354,7 @@ impl Wizard {
                 if !fresh {
                     match input.search_plan(state.plan().references.clone()) {
                         Ok(plan) => {
+                            self.tls_details = false;
                             self.stage = WizardStage::ProbeConfirm(Box::new((input, ResolvedSearch {
                                 plan: Some(plan),
                                 unresolved: Vec::new(),
@@ -1390,19 +1459,50 @@ impl Wizard {
                 let _ = cancel.send(());
                 WizardStage::Input
             }
-            WizardStage::Done(_) if key.code == KeyCode::Esc => return true,
+            WizardStage::SaveFailed { root, message, retry, inspected } => {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('n') => return true,
+                    KeyCode::F(2) if !inspected => {
+                        // Inspection never writes, deletes or changes the saved config.
+                        let config = path_observation(&self.config);
+                        let material = path_observation(&root);
+                        WizardStage::SaveFailed { root, message: format!("{message}\nФайл конфигурации: {config}\nКаталог материалов: {material}"), retry, inspected: true }
+                    }
+                    KeyCode::Char('y') if retry && !inspected => {
+                        // Reconstruct the exact approved scope using the existing
+                        // source/path guard. No save, DNS or TLS is triggered.
+                        match WizardInput::parse(self.config.clone(), self.source, &self.effective_fields()) {
+                            Ok(input) if input.health.parent() == Some(root.as_path()) => {
+                                self.error.clear();
+                                self.sources = true;
+                                self.focus = 8;
+                                WizardStage::Input
+                            }
+                            _ => WizardStage::SaveFailed { root, message: "Повтор заблокирован: файл, каталог или параметры изменились. Откройте конфигурацию заново.".into(), retry: false, inspected: false },
+                        }
+                    }
+                    _ => WizardStage::SaveFailed { root, message, retry, inspected },
+                }
+            }
+            WizardStage::Success if matches!(key.code, KeyCode::Enter | KeyCode::Esc) => return true,
             other => other,
         };
         false
     }
     fn poll(&mut self) -> Option<Editor> {
         if let Some(panel) = self.registration.as_mut() {
-            return panel.poll();
+            if let Some(editor) = panel.poll() {
+                self.registration = None;
+                self.stage = WizardStage::Success;
+                return Some(editor);
+            }
+            return None;
         }
         let result = match &self.stage {
             WizardStage::Resolving(rx, _) => match rx.try_recv() {
                 Ok(value) => value.map(|(input, resolved)| {
                     if resolved.plan.is_some() {
+                        self.tls_details = false;
                         WizardStage::ProbeConfirm(Box::new((input, resolved)))
                     } else {
                         WizardStage::NoEligible(RankedReview {
@@ -1414,23 +1514,23 @@ impl Wizard {
                 Err(TryRecvError::Empty) => return None, Err(TryRecvError::Disconnected) => Err(Error::Health),
             },
             WizardStage::Checking(rx, _) => match rx.try_recv() {
-                Ok(value) => value.map(|(input, state, report)| match state {
+                Ok(value) => value.map(|(input, state, report)| { self.result_details = false; match state {
                     Some(state) => WizardStage::CreateConfirm(Box::new((input, state, report))),
                     None => WizardStage::NoEligible(report),
-                }),
+                } }),
                 Err(TryRecvError::Empty) => return None, Err(TryRecvError::Disconnected) => Err(Error::Health),
             },
             WizardStage::SavingInitial(rx, root) => match rx.try_recv() {
-                Ok(Ok(editor)) => return Some(editor),
-                Ok(Err(error)) => Ok(WizardStage::Done(format!("Не удалось сохранить первый TOML: {error}. При неопределённой записи проверьте {root:?}. Сервер не запущен."))),
+                Ok(Ok(editor)) => { self.stage = WizardStage::Success; return Some(editor); }
+                Ok(Err(error)) => Ok(save_failed(root.clone(), Some(error))),
                 Err(TryRecvError::Empty) => return None,
-                Err(TryRecvError::Disconnected) => Ok(WizardStage::Done(format!("Запись не подтверждена. Проверьте TOML и {root:?}; не повторяйте вслепую."))),
+                Err(TryRecvError::Disconnected) => Ok(save_failed(root.clone(), None)),
             },
             WizardStage::Saving(rx, root) => match rx.try_recv() {
                 Ok(Ok(panel)) => { self.registration = Some(panel); return None; }
-                Ok(Err(error)) => Ok(WizardStage::Done(format!("ОТКАЗ: {error}. При неопределённой записи проверьте каталог {root:?}; для целых материалов доступна регистрация M. Runtime не изменён. Esc: закрыть."))),
+                Ok(Err(error)) => Ok(save_failed(root.clone(), Some(error))),
                 Err(TryRecvError::Empty) => return None,
-                Err(TryRecvError::Disconnected) => Ok(WizardStage::Done(format!("Неопределённая запись материалов в {root:?}. Не повторяйте вслепую. Esc: закрыть."))),
+                Err(TryRecvError::Disconnected) => Ok(save_failed(root.clone(), None)),
             },
             _ => return None,
         };
@@ -1497,17 +1597,29 @@ impl Wizard {
                 }
                 body
             }
-            WizardStage::Resolving(_, _) => format!("Поиск адресов сайтов: {} из {}.\nEsc — отменить; настройки не изменятся.", self.progress.load(Ordering::Relaxed), self.total),
+            WizardStage::Resolving(_, _) => progress_text("Поиск сетевых адресов", self.progress.load(Ordering::Relaxed), self.total),
             WizardStage::ProbeConfirm(value) => {
-                let search = value.1.plan.as_ref().map_or_else(String::new, |plan| plan.preview());
-                format!("Проверить защищённое соединение с {} перечисленными адресами на порту 443.\nНе удалось подтвердить адрес или имя: {}. Ключи доступа не отправляются, настройки не записываются.\nDNS, имена и сертификаты проверяются. Лучшие результаты будут перепроверены.\ny: проверить; n/Esc: отменить.\n\n{}", value.1.plan.as_ref().map_or(0, |plan| plan.targets().len()), value.1.unresolved.len(), search)
+                let targets = value.1.plan.as_ref().map(|p| p.targets()).unwrap_or_default();
+                let mut text = format!("Theia проверит защищённые соединения с выбранными сайтами.\n\nАдресов для проверки: {} · не удалось найти адрес: {}\nТолько перечисленные IP и имена, порт 443, TLS 1.3, HTTP/2 и HTTP/3.\nПовторная сверка DNS, по две проверки без перенаправлений, ключей и тела запроса.\nНастройки не записываются. Лучшие сайты будут перепроверены.", targets.len(), value.1.unresolved.len());
+                if self.tls_details {
+                    text.push_str("\n\nТочные цели проверки\n");
+                    for target in targets {
+                        text.push_str(&format!("{} · {}\n", target.server_name, target.address));
+                    }
+                } else {
+                    text.push_str("\n\nF2: Показать полный список адресов.");
+                }
+                text
             }
             WizardStage::Checking(_, _) => {
                 let done = self.progress.load(Ordering::Relaxed);
-                if done >= self.total {
-                    "Повторная проверка выбранных референсов.\nEsc: отменить без записи.".into()
+                let total = self.recheck_total.load(Ordering::Relaxed);
+                if total > 0 {
+                    progress_text("Повторная проверка выбранных сайтов", self.recheck_done.load(Ordering::Relaxed), total)
+                } else if done >= self.total {
+                    "Подбираем лучшие сайты для повторной проверки.\nНастройки не изменяются.".into()
                 } else {
-                    format!("Проверка защищённых соединений: {done} из {}.\nEsc — отменить; настройки не изменятся.", self.total)
+                    progress_text("Проверка защищённых соединений", done, self.total)
                 }
             },
             WizardStage::NoEligible(report) => report.text.clone(),
@@ -1518,8 +1630,9 @@ impl Wizard {
                     value.2.text.clone()
                 }
             },
-            WizardStage::Saving(_, _) | WizardStage::SavingInitial(_, _) => "Создание локальных материалов; не закрывайте экран. Runtime не меняется.".into(),
-            WizardStage::Done(message) => message.clone(),
+            WizardStage::Saving(_, _) | WizardStage::SavingInitial(_, _) => "Сохраняем защищённые файлы и настройки…\nДождитесь подтверждения. Работающий сервер не изменяется.".into(),
+            WizardStage::SaveFailed { root, message, retry, inspected } => format!("{}\n\nФайл: {}\nКаталог: {}\nСервер не запущен этой операцией.\n{}", message, self.config.display(), root.display(), if *inspected { "Esc: закрыть и открыть конфигурацию заново." } else if *retry { "F2: проверить наличие файлов. Повторить настройку — вернуться к источникам без записи." } else { "F2: проверить наличие файлов. Повтор недоступен." }),
+            WizardStage::Success => "Подключение REALITY создано.\nНастройки сохранены и успешно открыты. Сервер не запущен этой операцией.\n\nЧто дальше:\n1. На странице пользователей выпустите ключ доступа.\n2. На обзоре сервера отдельно запустите сервер.\n3. Импортируйте ключ в клиент Theia.\n\nEnter или Esc — перейти к обзору.".into(),
         }
     }
 }
@@ -1577,8 +1690,9 @@ impl ProvisionPanel {
             if wizard.grant_picker.is_some() { return None; }
             return match wizard.stage {
                 WizardStage::DnsConfirm(_) if !wizard.dns_details => Some(('y', "Найти адреса")),
-                WizardStage::ProbeConfirm(_) => Some(('y', "Проверить сайты")),
-                WizardStage::CreateConfirm(_) => Some(('y', "Сохранить")),
+                WizardStage::ProbeConfirm(_) if !wizard.tls_details => Some(('y', "Проверить сайты")),
+                WizardStage::CreateConfirm(_) if !wizard.result_details => Some(('y', "Сохранить")),
+                WizardStage::SaveFailed { retry: true, inspected: false, .. } => Some(('y', "Повторить настройку")),
                 _ => None,
             };
         }
@@ -1735,6 +1849,10 @@ impl ProvisionPanel {
         None
     }
 
+    pub(crate) fn succeeded(&self) -> bool {
+        self.wizard.as_ref().is_some_and(|w| matches!(w.stage, WizardStage::Success))
+    }
+
     pub(crate) fn form(&self) -> Option<crate::tui_widgets::Form> {
         use crate::tui_widgets::{Field, Form};
         let wizard = self.wizard.as_ref()?;
@@ -1837,7 +1955,8 @@ impl ProvisionPanel {
             return Some(crate::tui_widgets::ReferenceReview {
                 rows: report.rows.clone(),
                 details: Vec::new(),
-                note: "Подходящих сайтов не найдено. Ничего не сохранено. Enter или Esc — вернуться к источникам и повторить.".into(),
+                note: "Подходящих сайтов не найдено. Ничего не сохранено. Проверьте доступ к DNS/HTTPS, затем измените источники. Не отключайте проверку сертификатов. F2 — полный отчёт.".into(),
+                expanded: wizard.result_details,
             });
         }
         let WizardStage::CreateConfirm(value) = &wizard.stage else { return None; };
@@ -1845,7 +1964,7 @@ impl ProvisionPanel {
         let first = input.source.is_none();
         let details = vec![
             ("Адрес сервера", input.endpoint.clone()),
-            ("TCP/UDP bind", input.listen.to_string()),
+            ("Адрес прослушивания", input.listen.to_string()),
             (
                 "Пользователи",
                 if first {
@@ -1854,14 +1973,14 @@ impl ProvisionPanel {
                     input.grants.join(", ")
                 },
             ),
-            ("TOML", input.config.display().to_string()),
+            ("Файл настроек", input.config.display().to_string()),
         ];
         let mut note = if first {
-            "Будут созданы защищённые файлы и конфигурация. Сервер не запускается. Затем на обзоре сервера выпустите ключ первого пользователя и запустите сервер.".to_owned()
+            "Сохранение создаст защищённые файлы и настройки, но не запустит сервер.".to_owned()
         } else {
-            "Создание защищённых материалов. TOML сохраняется после отдельного подтверждения; сервер не запускается.".to_owned()
+            "Сначала создаются защищённые файлы. Запись настроек подтверждается отдельно; сервер не запускается.".to_owned()
         };
-        note.push_str("\nВыбранные сайты перепроверены. Остальные оценки предварительные. Если результаты устареют, мастер предложит повторную проверку.");
+        note.push_str("\nВыбранные сайты перепроверены. Остальные оценки предварительные. F2 — все результаты и параметры.");
         if input
             .endpoint
             .parse::<SocketAddr>()
@@ -1876,6 +1995,7 @@ impl ProvisionPanel {
             rows: review.rows.clone(),
             details,
             note,
+            expanded: wizard.result_details,
         })
     }
 
@@ -1905,6 +2025,7 @@ impl ProvisionPanel {
                 (3, 6, "Поиск адресов сайтов", "F2 список целей · Y найти адреса · N / Esc назад")
             }
             WizardStage::Resolving(_, _) => (3, 6, "Получение адресов", "Esc отменить"),
+            WizardStage::ProbeConfirm(_) if wizard.tls_details => (4, 6, "Точные адреса проверки", "Shift+PgUp/PgDn прокрутка · F2 / Enter / Esc свернуть"),
             WizardStage::ProbeConfirm(_) => (
                 4,
                 6,
@@ -1912,7 +2033,8 @@ impl ProvisionPanel {
                 "Y проверить перечисленные адреса · N / Esc назад",
             ),
             WizardStage::Checking(_, _) => (4, 6, "Проверка сайтов", "Esc отменить"),
-            WizardStage::NoEligible(_) => (5, 6, "Нет подходящих сайтов", "Enter / Esc изменить источники"),
+            WizardStage::NoEligible(_) | WizardStage::CreateConfirm(_) if wizard.result_details => (5, 6, "Полный отчёт", "Shift+PgUp/PgDn прокрутка · F2 / Enter / Esc свернуть"),
+            WizardStage::NoEligible(_) => (5, 6, "Нет подходящих сайтов", "F2 отчёт · Enter / Esc изменить источники"),
             WizardStage::CreateConfirm(value) => (
                 5,
                 6,
@@ -1924,9 +2046,10 @@ impl ProvisionPanel {
                 },
             ),
             WizardStage::Saving(_, _) | WizardStage::SavingInitial(_, _) => {
-                (6, 6, "Сохранение", "Идёт запись; сервер не запускается")
+                (6, 6, "Сохранение", "")
             }
-            WizardStage::Done(_) => (6, 6, "Результат записи", "Esc закрыть"),
+            WizardStage::SaveFailed { .. } => (6, 6, "Сохранение не подтверждено", "F2 проверить файлы · Esc закрыть"),
+            WizardStage::Success => (6, 6, "REALITY создан", "Enter к обзору · Esc закрыть"),
         })
     }
 

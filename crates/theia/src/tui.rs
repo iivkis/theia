@@ -1290,8 +1290,9 @@ impl Interaction {
                 } else if dialog.import_after_load() {
                     self.importing = Some(ImportFlow::Input(Zeroizing::new(String::new())));
                 }
+                let keep_success = dialog.reality_succeeded();
                 self.editor = Some(editor);
-                self.config_dialog = None;
+                if !keep_success { self.config_dialog = None; }
                 self.menu = None;
                 self.workspace_page = if self
                     .editor
@@ -4372,7 +4373,7 @@ fn draw_guided(
             v.confirm_rect.set(Some(Rect::new(body_area.x, y, body_area.width.min(72), 2)));
         }
     }
-    if parts[2].height > 0 && !viewport.is_some_and(|v| v.confirmation.get()) {
+    if parts[2].height > 0 && !keys.is_empty() && !viewport.is_some_and(|v| v.confirmation.get()) {
         frame.render_widget(
             Paragraph::new(vec![
                 Line::styled("Следующее действие", Style::default().fg(MUTED)),

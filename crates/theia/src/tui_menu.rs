@@ -1108,6 +1108,10 @@ impl ConfigDialog {
         self.setup.as_ref().filter(|s| s.review.is_some()).map(|_| ('y', "Создать настройки"))
     }
 
+    pub(crate) fn reality_succeeded(&self) -> bool {
+        self.reality.as_ref().is_some_and(|p| p.succeeded())
+    }
+
     pub(crate) fn key(&mut self, key: KeyEvent) -> bool {
         if self.loading.is_some() {
             return false;
@@ -1154,8 +1158,10 @@ impl ConfigDialog {
             return false;
         }
         if let Some(panel) = self.reality.as_mut() {
+            let succeeded = panel.succeeded();
             if panel.key(key) {
                 self.reality = None;
+                return succeeded;
             }
             return false;
         }

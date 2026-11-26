@@ -488,7 +488,7 @@ impl RegistrationPanel {
                     }
                     Ok(Err(SaveError::Refused(error))) => {
                         if self.staged_save.is_some() {
-                            self.stage = Stage::Done(format!("ОТКАЗ: {error}. Подготовленные материалы удалены; откройте новый мастер. Esc: закрыть."));
+                            self.stage = Stage::Done("Не удалось записать настройки. Подготовленные материалы удалены. Откройте сохранённую конфигурацию и новый мастер. Esc: закрыть.".into());
                         } else {
                             self.error = Some(format!("ОТКАЗ: {error}"));
                             self.stage = Stage::Input;

@@ -467,6 +467,7 @@ pub(crate) struct ReferenceReview {
     pub rows: Vec<ReferenceRow>,
     pub details: Vec<(&'static str, String)>,
     pub note: String,
+    pub expanded: bool,
 }
 
 impl ReferenceReview {
@@ -480,11 +481,16 @@ impl ReferenceReview {
         let selected = self.rows.iter().filter(|row| row.selected.is_some()).count();
         append_wrapped(&mut lines, &format!("Всего: {} · Подходит: {eligible} · Выбрано: {selected}", self.rows.len()), width, Style::default().fg(TEXT));
         append_wrapped(&mut lines, &self.note, width, Style::default().fg(WARNING));
-        append_wrapped(&mut lines, "H2 — подтверждённый основной транспорт; H3 — дополнительный. ? — нет подтверждения.", width, Style::default().fg(MUTED));
+        append_wrapped(&mut lines, "100: H2 и H3 подтверждены · 80: только H2 · 0: H2 не подтверждён. ? — неизвестно. Оценка не измеряет скорость.", width, Style::default().fg(MUTED));
         if selected > 0 {
             lines.push(Line::raw(""));
             lines.push(Line::styled("Выбранные сайты", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
             Self::append_rows(&mut lines, width, self.rows.iter().filter(|row| row.selected.is_some()));
+        }
+        if !self.expanded {
+            lines.push(Line::raw(""));
+            append_wrapped(&mut lines, "F2: Все кандидаты и параметры конфигурации", width, Style::default().fg(ACCENT));
+            return lines;
         }
         lines.push(Line::raw(""));
         if !self.details.is_empty() {
@@ -519,7 +525,7 @@ impl ReferenceReview {
             lines.push(Line::styled(
                 format!(
                     "{:<30} {:<25} {:<18} {}",
-                    "Референс", "Адрес", "TLS / H2 / H3", "Результат"
+                    "Сайт", "Адрес", "TLS / H2 / H3", "Результат"
                 ),
                 Style::default().fg(MUTED),
             ));
@@ -529,7 +535,8 @@ impl ReferenceReview {
                 Some(0) => "Основной".into(),
                 Some(index) => format!("Резерв {index}"),
                 None if row.h2 => "Подходит".into(),
-                None => "Исключён".into(),
+                None if row.address.parse::<std::net::SocketAddr>().is_err() => "Нет DNS".into(),
+                None => "Нет H2".into(),
             };
             let color = if row.selected == Some(0) {
                 ACCENT
@@ -935,6 +942,7 @@ mod tests {
             ],
             details: vec![("TOML", "a".repeat(150))],
             note: "Сервер не запускается.".into(),
+        expanded: true,
         };
         for width in [32, 80, 120] {
             let lines = review.lines(width);
