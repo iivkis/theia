@@ -161,8 +161,9 @@ impl Tunnel {
             Self::VerifiedQuic(verified, fallback) => {
                 let Some(first) = upload.recv().await else { return Ok(()); };
                 if !verified.admissible()? {
-                    drop(verified);
                     let tunnel = fallback.await?;
+                    verified.check_policy()?;
+                    drop(verified);
                     if !matches!(tunnel, Self::H2(_) | Self::H3(_)) {
                         return Err(ClientError::Protocol);
                     }
@@ -170,6 +171,7 @@ impl Tunnel {
                 }
                 // Once a send is attempted no fallback or replay is legal.
                 drop(fallback);
+                verified.check_policy()?;
                 let result = relay_local(&verified.socket, Some(FIRST_RESPONSE), Some(first), upload, download).await;
                 if matches!(&result, Err(LocalRelayError::Peer(_))) {
                     verified.failed();

@@ -51,10 +51,12 @@ pub(crate) struct VerifiedUdp {
     key: Key,
 }
 impl VerifiedUdp {
+    pub(crate) fn check_policy(&self) -> Result<(), ClientError> {
+        self.engine.check_policy(self.key.policy)
+    }
+
     pub(crate) fn admissible(&self) -> Result<bool, ClientError> {
-        if !self.engine.policy_current(self.key.policy) {
-            return Err(stale_policy());
-        }
+        self.check_policy()?;
         Ok(self.engine.enabled()
             && network_scope::observe(self.key.address) == Some(self.key.network)
             && self.socket.local_addr().is_ok_and(|local| self.key.network.matches_local(local))
@@ -101,6 +103,10 @@ impl Engine {
 
     pub(crate) fn policy_current(&self, digest: [u8; 32]) -> bool {
         self.policy.lock().ok().is_some_and(|policy| policy.as_ref().is_some_and(|lease| lease.valid(digest)))
+    }
+
+    pub(crate) fn check_policy(&self, digest: [u8; 32]) -> Result<(), ClientError> {
+        if self.policy_current(digest) { Ok(()) } else { Err(stale_policy()) }
     }
 
     pub(crate) fn enabled(&self) -> bool {
@@ -273,7 +279,21 @@ pub(crate) enum RelayOutcome {
     Fallback { client: TcpStream, prefix: Vec<u8> },
 }
 
+pub(crate) struct FallbackPolicy {
+    engine: Arc<Engine>,
+    digest: [u8; 32],
+}
+impl FallbackPolicy {
+    pub(crate) fn check(&self) -> Result<(), ClientError> {
+        self.engine.check_policy(self.digest)
+    }
+}
+
 impl Tunnel {
+    pub(crate) fn fallback_policy(&self) -> FallbackPolicy {
+        FallbackPolicy { engine: self.engine.clone(), digest: self.key.policy }
+    }
+
     pub(crate) async fn relay(
         mut self,
         mut client: TcpStream,
@@ -305,6 +325,7 @@ impl Tunnel {
         {
             return Ok(RelayOutcome::Fallback { client, prefix });
         }
+        self.engine.check_policy(self.key.policy)?;
         // From the first attempted write onward, even a partial write or
         // timeout is terminal for this stream. Never replay it over the VPS.
         let started = std::time::Instant::now();
@@ -355,12 +376,12 @@ impl Tunnel {
         .await;
         // A ServerHello alone is insufficient evidence of usable application
         // traffic. Do not penalize a clean early application disconnect.
-        if exchanged {
-            self.engine.cache.observe(&self.key, self.strategy, true, hello_elapsed);
-        } else if peer_failure {
+        if peer_failure {
             self.engine.cache.failed(&self.key, self.strategy);
+            crate::traffic::dpi_post_hello_failure();
+        } else if exchanged && result.is_ok() {
+            self.engine.cache.observe(&self.key, self.strategy, true, hello_elapsed);
         }
-        if peer_failure { crate::traffic::dpi_post_hello_failure(); }
         result?;
         Ok(RelayOutcome::Finished)
     }
@@ -392,6 +413,19 @@ pub(crate) fn test_hello() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn deferred_fallback_cannot_reuse_revoked_policy() {
+        let engine = Arc::new(Engine::default());
+        let digest = [1; 32];
+        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(digest)));
+        let authorization = FallbackPolicy { engine: engine.clone(), digest };
+        assert!(authorization.check().is_ok());
+        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture([2; 32])));
+        assert!(authorization.check().is_err());
+        engine.authorize_policy(None);
+        assert!(authorization.check().is_err());
+    }
+
     #[tokio::test]
     async fn disabled_or_private_targets_never_probe() {
         let engine = Arc::new(Engine::default());

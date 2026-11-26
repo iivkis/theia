@@ -1160,6 +1160,7 @@ async fn routed_open(
             // Failed local probe/dial or unsupported traffic uses the same
             // authenticated VPS carrier. No silent unprotected direct route.
             let tunnel = carrier.open(address, port).await?;
+            cache.dpi.check_policy(snapshot.digest())?;
             crate::traffic::dpi_fallback_open();
             Ok(tunnel)
         }
@@ -1223,6 +1224,7 @@ async fn routed_udp(
                 return Err(crate::routing::dpi::stale_policy());
             }
             let tunnel = carrier.open_udp(address, port).await?;
+            cache.dpi.check_policy(snapshot.digest())?;
             crate::traffic::udp_dpi_fallback();
             if matches!(candidate, Candidate::Stun) { crate::traffic::udp_stun_fallback(); }
             Ok(tunnel)
@@ -1382,12 +1384,15 @@ impl ProxyTunnel {
                     address,
                     port,
                 } = *route;
+                let authorization = tunnel.fallback_policy();
                 match tunnel.relay(socket).await? {
                     crate::routing::dpi::RelayOutcome::Finished => Ok(()),
                     crate::routing::dpi::RelayOutcome::Fallback { client, prefix } => {
                         // The origin received no application bytes. The carrier
                         // repeats server admission/ACL for the original target.
+                        authorization.check()?;
                         let tunnel = carrier.open(address, port).await?;
+                        authorization.check()?;
                         if let Some(observed) = observed {
                             observed.store(tunnel.open_code(), std::sync::atomic::Ordering::Relaxed);
                         }
@@ -2327,7 +2332,11 @@ async fn udp_association(
                 let (tx,rx)=mpsc::channel(QUEUE);
                 let _=tx.try_send(data.to_vec());
                 let observer=Arc::new(std::sync::Mutex::new(udp::Observer::default()));
-                let candidate=observer.lock().unwrap_or_else(|e|e.into_inner()).outgoing(data);
+                let (candidate, deadline) = {
+                    let mut observer = observer.lock().unwrap_or_else(|e| e.into_inner());
+                    let candidate = observer.outgoing(data);
+                    (candidate, observer.classification_deadline())
+                };
                 let (classification,classified)=tokio::sync::watch::channel(candidate);
                 let finished=Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let completion=Completion(finished.clone());
@@ -2337,7 +2346,7 @@ async fn udp_association(
                 tasks.spawn(async move {
                     let _completion=completion;
                     let (address,port)=key;
-                    let candidate=udp::await_candidate(classified).await;
+                    let candidate=udp::await_candidate(classified, deadline).await;
                     let tunnel=proxy.open_udp(address.clone(),port,&candidate).await?;
                     let (down_tx,mut down_rx)=mpsc::channel(QUEUE);
                     let relay=tunnel.relay(rx,down_tx);

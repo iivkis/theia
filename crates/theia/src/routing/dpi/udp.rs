@@ -58,6 +58,7 @@ pub(crate) struct Observer {
     quic: quic::Observer,
     done: bool,
     stun_flow: bool,
+    classification_deadline: Option<tokio::time::Instant>,
     requests: VecDeque<(Stun, Instant)>,
 }
 impl Observer {
@@ -68,6 +69,10 @@ impl Observer {
         if self.requests.len() >= STUN_LIMIT { self.requests.pop_front(); }
         self.requests.push_back((message, now + STUN_TTL));
     }
+    pub(crate) fn classification_deadline(&self) -> tokio::time::Instant {
+        self.classification_deadline.unwrap_or_else(tokio::time::Instant::now)
+    }
+
     pub(crate) fn outgoing(&mut self, data: &[u8]) -> Candidate {
         if self.stun_flow {
             if let Some(message) = stun(data) { self.request(message); }
@@ -83,7 +88,19 @@ impl Observer {
             crate::traffic::udp_stun_flow();
             return Candidate::Stun;
         }
-        match self.quic.observe(data) {
+        let deadline = *self.classification_deadline.get_or_insert_with(
+            || tokio::time::Instant::now() + CLASSIFY_BUDGET,
+        );
+        if tokio::time::Instant::now() >= deadline {
+            self.done = true;
+            return Candidate::Other;
+        }
+        let result = self.quic.observe(data);
+        if tokio::time::Instant::now() >= deadline {
+            self.done = true;
+            return Candidate::Other;
+        }
+        match result {
             quic::Result::Pending => Candidate::Pending,
             quic::Result::Hello { name, version, h3 } => {
                 self.done = true;
@@ -114,10 +131,17 @@ impl Observer {
 
 /// Only a pending initial flight waits; other UDP does not incur this delay.
 /// The flow task never consumes queued application datagrams during detection.
-pub(crate) async fn await_candidate(mut classification: tokio::sync::watch::Receiver<Candidate>) -> Candidate {
+pub(crate) async fn await_candidate(
+    mut classification: tokio::sync::watch::Receiver<Candidate>,
+    deadline: tokio::time::Instant,
+) -> Candidate {
     let initial = classification.borrow_and_update().clone();
+    // A complete candidate published within the observer's deadline remains
+    // valid even if the worker is scheduled late. Pending input gets no
+    // fresh classification budget when the worker starts.
     if initial != Candidate::Pending { return initial; }
-    let ready = tokio::time::timeout(CLASSIFY_BUDGET, classification.wait_for(|value| *value != Candidate::Pending)).await;
+    if tokio::time::Instant::now() >= deadline { return Candidate::Other; }
+    let ready = tokio::time::timeout_at(deadline, classification.wait_for(|value| *value != Candidate::Pending)).await;
     match ready {
         Ok(Ok(value)) => value.clone(),
         _ => Candidate::Other,
@@ -203,9 +227,20 @@ mod tests {
         let complete = observer.outgoing(&packets[1]);
         assert_eq!(complete, Candidate::QuicH3("example.org".into()));
         tx.send(complete.clone()).unwrap();
-        assert_eq!(await_candidate(rx).await, complete);
+        assert_eq!(await_candidate(rx, observer.classification_deadline()).await, complete);
         let (_tx, rx) = tokio::sync::watch::channel(Candidate::Pending);
-        assert_eq!(await_candidate(rx).await, Candidate::Other);
+        assert_eq!(await_candidate(rx, tokio::time::Instant::now()).await, Candidate::Other);
+    }
+
+    #[tokio::test]
+    async fn late_initial_fragment_cannot_authorize_local_candidate() {
+        let hello = h3_hello();
+        let packets = crate::reality_quic_wire::test_initial_parts(crate::reality_quic_wire::V1, &hello);
+        let mut observer = Observer::default();
+        assert_eq!(observer.outgoing(&packets[0]), Candidate::Pending);
+        observer.classification_deadline = Some(tokio::time::Instant::now());
+        assert_eq!(observer.outgoing(&packets[1]), Candidate::Other);
+        assert_eq!(observer.outgoing(&packets[1]), Candidate::Other);
     }
 
     #[test]
