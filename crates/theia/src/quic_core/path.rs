@@ -196,9 +196,10 @@ impl Paths {
         if !c.budget.can_send(bytes) {
             return None;
         }
-        let at = c
-            .last_challenge?
-            .checked_add(interval.max(Duration::from_millis(1)))?;
+        let at = match c.last_challenge {
+            Some(sent) => sent.checked_add(interval.max(Duration::from_millis(1)))?,
+            None => c.expires.checked_sub(CHALLENGE_TTL)?,
+        };
         (at < c.expires).then_some(at)
     }
 

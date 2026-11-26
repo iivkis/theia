@@ -605,6 +605,12 @@ impl LabSession {
     /// Read at most one datagram. Malformed unauthenticated packets are
     /// dropped; authenticated protocol errors terminate this lab session.
     pub async fn recv(&mut self, wait: Duration) -> Result<bool, Error> {
+        self.recv_with_wake(wait, None).await
+    }
+
+    /// Wake only while waiting for UDP, never cancel an authenticated packet
+    /// handler after it has consumed a datagram or reserved a packet number.
+    pub(crate) async fn recv_with_wake(&mut self, wait: Duration, wake: Option<&tokio::sync::Notify>) -> Result<bool, Error> {
         if self.closed {
             return Err(Error::Closed);
         }
@@ -622,7 +628,7 @@ impl LabSession {
             .into_iter()
             .flatten()
             .fold(wait, |wait, at| wait.min(at.saturating_duration_since(now)));
-        let result = self.recv_inner(wait).await;
+        let result = self.recv_inner(wait, wake).await;
         if result.is_err() {
             self.abort();
         } else {
@@ -631,9 +637,13 @@ impl LabSession {
         result
     }
 
-    async fn recv_inner(&mut self, wait: Duration) -> Result<bool, Error> {
+    async fn recv_inner(&mut self, wait: Duration, wake: Option<&tokio::sync::Notify>) -> Result<bool, Error> {
         let mut buf = [0; MTU + 1];
-        let (n, source) = match tokio::time::timeout(wait, self.socket.recv_from(&mut buf)).await {
+        let incoming = tokio::time::timeout(wait, self.socket.recv_from(&mut buf));
+        let received = if let Some(wake) = wake {
+            tokio::select! { biased; packet = incoming => packet, _ = wake.notified() => return Ok(false) }
+        } else { incoming.await };
+        let (n, source) = match received {
             Ok(result) => result.map_err(Error::Io)?,
             Err(_) => return Ok(false),
         };
