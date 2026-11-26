@@ -395,6 +395,23 @@ mod tests {
     }
 
     #[test]
+    fn slow_path_validation_uses_pto_and_counts_small_responses() {
+        let active = "127.0.0.1:1000".parse().unwrap();
+        let next = "127.0.0.1:1001".parse().unwrap();
+        let now = Instant::now();
+        let pto = Duration::from_secs(3);
+        let mut paths = Paths::new_validated(active);
+        let challenge = paths.begin_with_timeout(next, 100, now, pto * 3).unwrap();
+        assert!(!paths.reserve_challenge(next, 1200, now, pto));
+        assert!(paths.reserve_candidate_send(next, 38, now));
+        assert!(!paths.response(next, challenge, now));
+        paths.begin_with_timeout(next, 1200, now + pto, pto * 3).unwrap();
+        assert!(paths.reserve_challenge(next, 1200, now + pto, pto));
+        assert!(paths.response(next, challenge, now + pto * 2));
+        assert_eq!(paths.active(), next);
+    }
+
+    #[test]
     fn lost_challenge_retries_until_amplification_budget_exhausted() {
         let active = "127.0.0.1:1000".parse().unwrap();
         let next = "127.0.0.1:1001".parse().unwrap();

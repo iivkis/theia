@@ -1,7 +1,7 @@
 //! Isolated development UDP session for exercising application-space
-//! packet protection, STREAM, ACK and retransmission. Loopback only,
-//! bounded CID rotation and candidate-path validation; not an external
-//! QUIC endpoint, interoperable H3 backend or an admitted Theia user tunnel.
+//! packet protection, STREAM, ACK and retransmission. Raw key fixtures stay
+//! loopback-only; TLS sessions support explicitly pinned network trials.
+//! This is not a generally selectable production QUIC endpoint.
 use super::listener::SessionIo;
 use super::{
     ack_tx::History,
@@ -346,8 +346,8 @@ impl LabSession {
         self.scheduler.enqueue(frame).map_err(Error::Schedule)
     }
 
-    /// Controlled rebinding: a different loopback IP requires a fresh peer
-    /// CID and recovery reset. This does not enable public addresses.
+    /// Controlled rebinding: a different authorized IP requires a fresh peer
+    /// CID and recovery reset. The original socket scope cannot be expanded.
     /// Existing streams and cryptographic packet numbers remain intact.
     pub async fn rebind(&mut self, socket: UdpSocket, now: Instant) -> Result<(), Error> {
         if self.server || self.peer_disable_migration || !self.confirmed || !self.active() {

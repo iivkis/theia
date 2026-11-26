@@ -420,8 +420,6 @@ impl NativeConnection {
             drive(session, weak, ready).await;
             drop(done);
         });
-        // Construct the opener before moving the last frontend reference into the worker.
-
         Ok((
             Self {
                 opener: Opener::new(shared),

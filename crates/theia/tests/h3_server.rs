@@ -587,8 +587,7 @@ async fn h3_rejects_unnegotiated_padding_before_target_dial() {
     .unwrap();
 }
 
-async fn native_fixture(private: bool) -> (SocketAddr, JoinHandle<()>, RootCertStore) {
-    use theia::quic_core::{handshake_udp, listener::Listener};
+fn native_tls_fixture() -> (Arc<rustls::ServerConfig>, RootCertStore) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let der = cert.cert.der().clone();
     let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
@@ -602,7 +601,14 @@ async fn native_fixture(private: bool) -> (SocketAddr, JoinHandle<()>, RootCertS
     .unwrap();
     tls.alpn_protocols = vec![b"h3".to_vec()];
     tls.send_tls13_tickets = 0;
-    let tls = Arc::new(tls);
+    let mut roots = RootCertStore::empty();
+    roots.add(der).unwrap();
+    (Arc::new(tls), roots)
+}
+
+async fn native_fixture(private: bool) -> (SocketAddr, JoinHandle<()>, RootCertStore) {
+    use theia::quic_core::{handshake_udp, listener::Listener};
+    let (tls, roots) = native_tls_fixture();
     let mut listener = Listener::new(
         tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
         64,
@@ -610,8 +616,6 @@ async fn native_fixture(private: bool) -> (SocketAddr, JoinHandle<()>, RootCertS
     .unwrap();
     let remote = listener.local_addr();
     let context = context(private);
-    let mut roots = RootCertStore::empty();
-    roots.add(der).unwrap();
     let task = tokio::spawn(async move {
         let mut tasks = tokio::task::JoinSet::new();
         loop {
@@ -700,6 +704,57 @@ async fn native_xhttp_loopback_preserves_grants_and_both_stream_modes() {
     })
     .await
     .unwrap();
+}
+
+async fn exercise_pinned_native_endpoint(ip: std::net::IpAddr) {
+    use theia::quic_core::{scope::NetworkScope, wire::Version};
+    let (tls, roots) = native_tls_fixture();
+    let local = SocketAddr::new(ip, 0);
+    let socket = tokio::net::UdpSocket::bind(local).await.unwrap();
+    let remote = socket.local_addr().unwrap();
+    let scope = NetworkScope::pinned([ip; 2], [ip; 2]).unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(h3_server::serve_native_pinned(socket, scope, tls, context(true), async move {
+        let _ = stopped.await;
+    }));
+    for version in [Version::V1, Version::V2] {
+        let client = H3Client::new(remote, "localhost", &token(), roots.clone())
+            .unwrap().with_native_pinned(version, local, scope).unwrap()
+            .with_connection_pool().with_auto_stream_up(Duration::from_secs(60)).unwrap();
+        let data: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+        // Repeated opens exercise the same common connection pool and
+        // per-request authorization rather than a new fixture-only relay.
+        exact_relay_sample(&client, &data).await;
+        exact_relay_sample(&client, b"second pooled request").await;
+    }
+    let wrong = URL_SAFE_NO_PAD.encode([0x44; 32]);
+    let client = H3Client::new(remote, "localhost", &wrong, roots)
+        .unwrap().with_native_pinned(Version::V2, local, scope).unwrap();
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    assert!(matches!(client.open(Address::V4([127, 0, 0, 1]), target.local_addr().unwrap().port()).await,
+        Err(ClientError::Unauthorized)));
+    assert!(timeout(Duration::from_millis(250), target.accept()).await.is_err());
+    drop(client);
+    stop.send(()).unwrap();
+    timeout(Duration::from_secs(25), server).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pinned_native_h3_ipv4_ipv6_pool_auth_and_drain() {
+    timeout(Duration::from_secs(90), async {
+        exercise_pinned_native_endpoint("127.0.0.1".parse().unwrap()).await;
+        exercise_pinned_native_endpoint("::1".parse().unwrap()).await;
+    }).await.unwrap();
+}
+
+/// Explicitly opt in using a locally assigned, non-loopback interface.
+/// This is a same-host smoke test, not a physical-network acceptance result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an explicitly provisioned network interface"]
+async fn pinned_native_h3_non_loopback_interface() {
+    let ip: std::net::IpAddr = std::env::var("THEIA_QUIC_TEST_LOCAL").unwrap().parse().unwrap();
+    assert!(!ip.is_loopback());
+    timeout(Duration::from_secs(60), exercise_pinned_native_endpoint(ip)).await.unwrap();
 }
 
 /// Manual matched loopback workload: raw samples, no performance claim.

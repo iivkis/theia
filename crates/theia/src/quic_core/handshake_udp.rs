@@ -1016,6 +1016,7 @@ async fn establish_inner(
                     handshake.receive_datagram(&buffer[..n])?
                 }
                 Ok(Ok(_)) | Err(_) => {}
+                Ok(Err(e)) if super::mtu::message_too_large(&e) => {}
                 Ok(Err(e)) => return Err(Error::Io(e)),
             }
         }

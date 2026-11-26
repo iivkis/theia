@@ -136,8 +136,8 @@ mod mutation_tests {
     }
 }
 
-/// The experimental native transport must never become an externally reachable
-/// carrier before independent admission and interoperability acceptance.
+/// Raw key fixtures retain loopback-only scope. Controlled non-loopback
+/// TLS trials require a separate explicit pinned NetworkScope.
 pub(crate) fn loopback_pair(local: std::net::SocketAddr, peer: std::net::SocketAddr) -> bool {
     local.ip().is_loopback() && peer.ip().is_loopback() && peer.port() != 0 && local != peer
 }

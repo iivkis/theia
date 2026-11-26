@@ -633,6 +633,33 @@ mod tests {
     }
 
     #[test]
+    fn retransmission_after_mtu_reduction_keeps_individual_frame_aliases() {
+        let now = Instant::now();
+        let mut s = Scheduler::default();
+        s.enqueue(vec![1; 700]).unwrap();
+        s.enqueue(vec![1; 590]).unwrap();
+        let (ids, _, _) = s.candidate_batch(now, 1400).unwrap().unwrap();
+        assert_eq!(ids.len(), 2);
+        // Model the initial batched transmission on a discovered path.
+        s.confirm_handshake();
+        s.enable_mtu(1452, now);
+        let at = s.mtu_deadline().unwrap();
+        let probe = s.mtu_probe(at).unwrap();
+        s.record_mtu_probe(0, probe, at).unwrap();
+        s.acknowledge(&ack(0), at + Duration::from_millis(10)).unwrap();
+        let at = at + Duration::from_millis(10);
+        s.record_batch(1, 1319, &ids, false, at).unwrap();
+        s.restart_path(at);
+        let (one, bytes, _) = s.candidate_batch(at, 1171).unwrap().unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(bytes.len(), 700);
+        s.record_batch(2, 729, &one, false, at).unwrap();
+        s.acknowledge(&ack(1), at).unwrap();
+        assert_eq!(s.pending(), 0);
+        assert_eq!(s.window.in_flight(), 729);
+    }
+
+    #[test]
     fn pto_retransmission_and_late_ack_cancel() {
         let now = Instant::now();
         let mut s = Scheduler::default();
