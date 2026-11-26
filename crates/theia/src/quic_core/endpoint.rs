@@ -1,7 +1,7 @@
 //! Isolated development UDP session for exercising application-space
 //! packet protection, STREAM, ACK and retransmission. Loopback only,
-//! pre-established TLS keys, fixed CID, bounded same-IP rebinding; NOT a QUIC handshake
-//! endpoint, interoperable H3 backend or an admitted Theia user tunnel.
+//! bounded CID rotation and candidate-path validation; not an external
+//! QUIC endpoint, interoperable H3 backend or an admitted Theia user tunnel.
 use super::listener::SessionIo;
 use super::{
     ack_tx::History,
@@ -288,6 +288,7 @@ impl LabSession {
         let cross_ip = next.ip() != previous.ip();
         let rotate = self.peer_ids.has_spare();
         if !next.ip().is_loopback()
+            || next.is_ipv4() != self.paths.active().is_ipv4()
             || (cross_ip && !rotate)
             || (rotate && !self.scheduler.can_queue())
             || next == previous
@@ -779,7 +780,7 @@ impl LabSession {
         let opened = match result {
             Ok(p) => p,
             Err(packet::Error::Reserved | packet::Error::Limit) => return Err(Error::Protocol),
-            Err(packet::Error::Crypto | packet::Error::Header) => return self.receive_stateless_reset(&buf[..n], source, now),
+            Err(packet::Error::Crypto | packet::Error::Header | packet::Error::TooOld) => return self.receive_stateless_reset(&buf[..n], source, now),
             Err(_) => return Ok(false),
         };
         if matches!(&self.protection, Some(Protection::Fixed { .. }))
@@ -863,12 +864,12 @@ impl LabSession {
                         self.send_path(source, &response, now).await?;
                     }
                 }
-                Frame::NewConnectionId { sequence, retire_prior_to, cid, reset_token } if self.confirmed => {
+                Frame::NewConnectionId { sequence, retire_prior_to, cid, reset_token } => {
                     let retired = self.peer_ids.insert(ConnectionId { sequence, cid: cid.to_vec(), reset_token }, retire_prior_to).map_err(|_| Error::Protocol)?;
                     if !self.scheduler.can_queue_n(retired.len()) { return Err(Error::Protocol); }
                     for sequence in retired { self.queue_retire_cid(sequence)?; }
                 }
-                Frame::RetireConnectionId(sequence) if self.confirmed => {
+                Frame::RetireConnectionId(sequence) => {
                     if sequence >= self.next_local_sequence || sequence == destination_sequence { return Err(Error::Protocol); }
                     if let Some(cid) = self.local_ids.get(&sequence).copied() {
                         if self.local_ids.len() <= 1 { return Err(Error::Protocol); }

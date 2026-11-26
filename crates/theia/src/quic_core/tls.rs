@@ -470,6 +470,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn routed_cid_rotation_migration_and_stateless_reset_v1_v2() {
+        use crate::quic_core::{endpoint::LabSession, handshake_udp, lifecycle::ShutdownPhase, listener::Listener};
+        use std::time::{Duration, Instant};
+        use tokio::net::UdpSocket;
+
+        async fn pump(from: &mut LabSession, to: &mut LabSession) {
+            for _ in 0..100 {
+                if from.flush(Instant::now()).await.unwrap() {
+                    for _ in 0..8 {
+                        if to.recv(Duration::from_millis(100)).await.unwrap() { return; }
+                    }
+                    panic!("expected authenticated packet");
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            panic!("no scheduled packet");
+        }
+
+        for version in [Version::V1, Version::V2] {
+            let (cc, mut sc) = configs();
+            sc.send_tls13_tickets = 0;
+            let mut listener = Listener::new(UdpSocket::bind("127.0.0.1:0").await.unwrap(), 8).unwrap();
+            let addr = listener.local_addr();
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let old = socket.local_addr().unwrap();
+            let (c, s) = tokio::join!(
+                handshake_udp::connect(socket, addr, version, Arc::new(cc), ServerName::try_from("localhost").unwrap()),
+                async { handshake_udp::accept(listener.accept().await.unwrap(), Arc::new(sc)).await },
+            );
+            let (mut c, mut s) = (c.unwrap(), s.unwrap());
+            pump(&mut s, &mut c).await; // HANDSHAKE_DONE
+            pump(&mut c, &mut s).await;
+            assert_eq!(s.advertise_connection_id().await.unwrap(), 1);
+            pump(&mut s, &mut c).await;
+            pump(&mut c, &mut s).await;
+            let stream = c.open_bidi().unwrap();
+            c.queue(stream, b"before", false).unwrap();
+            pump(&mut c, &mut s).await;
+            let mut out = [0; 16];
+            assert_eq!(s.read(stream, &mut out).unwrap(), 6);
+            assert_eq!(&out[..6], b"before");
+            pump(&mut s, &mut c).await;
+
+            // Linux's 127/8 permits an actual change of source IP in this
+            // closed fixture. Windows covers the same CID rotation with a
+            // new UDP port without assuming another loopback IP is assigned.
+            let bind = if cfg!(target_os = "linux") { "127.0.0.2:0" } else { "127.0.0.1:0" };
+            let moved = UdpSocket::bind(bind).await.unwrap();
+            let next = moved.local_addr().unwrap();
+            c.rebind(moved, Instant::now()).await.unwrap();
+            let wait = Duration::from_secs(1);
+            assert!(!s.recv(wait).await.unwrap());
+            assert_eq!(s.peer_addr(), old);
+            assert!(c.recv(wait).await.unwrap());
+            assert!(s.recv(wait).await.unwrap());
+            assert_eq!(s.peer_addr(), next);
+            pump(&mut s, &mut c).await;
+            pump(&mut c, &mut s).await; // ACK the challenge
+            pump(&mut c, &mut s).await; // retire sequence zero
+            pump(&mut s, &mut c).await;
+            // Retirement released the active-ID slot, not the Retry replay tombstone.
+            assert_eq!(s.advertise_connection_id().await.unwrap(), 2);
+            pump(&mut s, &mut c).await;
+            pump(&mut c, &mut s).await;
+            c.queue(stream, b"after", false).unwrap();
+            pump(&mut c, &mut s).await;
+            assert_eq!(s.read(stream, &mut out).unwrap(), 5);
+            assert_eq!(&out[..5], b"after");
+            pump(&mut s, &mut c).await;
+            s.queue(stream, b"reply", true).unwrap();
+            pump(&mut s, &mut c).await;
+            assert_eq!(c.read(stream, &mut out).unwrap(), 5);
+            assert_eq!(&out[..5], b"reply");
+            pump(&mut c, &mut s).await;
+
+            // Simulate loss of the server connection object while the
+            // endpoint still owns its reset key and bounded CID tombstones.
+            drop(s);
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            c.queue(stream, b"gone", true).unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while c.shutdown_phase() != ShutdownPhase::Draining {
+                    c.flush(Instant::now()).await.unwrap();
+                    c.recv(Duration::from_millis(20)).await.unwrap();
+                }
+            }).await.unwrap();
+            assert!(!c.flush(Instant::now()).await.unwrap());
+            assert!(c.open_bidi().is_err());
+        }
+    }
+
+    #[tokio::test]
     async fn version_negotiation_restarts_with_fresh_connection_and_authenticated_choice() {
         use crate::quic_core::{handshake_udp, listener::Listener, negotiation::VersionPolicy};
         use tokio::net::UdpSocket;

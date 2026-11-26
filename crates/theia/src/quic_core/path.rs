@@ -29,11 +29,16 @@ pub struct ConnectionId {
     pub reset_token: [u8; 16],
 }
 
+struct InitialId {
+    cid: Vec<u8>,
+    reset_token: Option<[u8; 16]>,
+}
+
 pub struct PeerIds {
     entries: BTreeMap<u64, ConnectionId>,
     floor: u64,
     limit: usize,
-    initial: Option<(Vec<u8>, Option<[u8; 16]>)>,
+    initial: Option<InitialId>,
 }
 
 impl PeerIds {
@@ -54,12 +59,12 @@ impl PeerIds {
     pub(crate) fn with_initial(cid: &[u8], token: Option<[u8; 16]>, limit: usize) -> Result<Self, Error> {
         if cid.is_empty() || cid.len() > 20 { return Err(Error::Invalid); }
         let mut ids = Self::new(limit)?;
-        ids.initial = Some((cid.to_vec(), token));
+        ids.initial = Some(InitialId { cid: cid.to_vec(), reset_token: token });
         Ok(ids)
     }
 
     pub(crate) fn current(&self) -> Option<&[u8]> {
-        if let Some((cid, _)) = &self.initial { return Some(cid); }
+        if let Some(initial) = &self.initial { return Some(&initial.cid); }
         self.entries.first_key_value().map(|(_, id)| id.cid.as_slice())
     }
 
@@ -84,10 +89,11 @@ impl PeerIds {
     pub(crate) fn matches_reset(&self, packet: &[u8]) -> bool {
         if packet.len() < 21 || packet[0] & 0x80 != 0 { return false; }
         let tail = &packet[packet.len()-16..];
-        let mut matched = subtle::Choice::from(0);
-        if let Some((_, Some(token))) = &self.initial { matched |= token.as_slice().ct_eq(tail); }
-        for id in self.entries.values() { matched |= id.reset_token.as_slice().ct_eq(tail); }
-        bool::from(matched)
+        // Do not match tokens belonging to spare, never-used or retired CIDs.
+        let token = if let Some(initial) = &self.initial { initial.reset_token.as_ref() } else {
+            self.entries.first_key_value().map(|(_, id)| &id.reset_token)
+        };
+        token.is_some_and(|token| bool::from(token.as_slice().ct_eq(tail)))
     }
 
     /// Accept one authenticated NEW_CONNECTION_ID. Return sequences that
@@ -101,15 +107,16 @@ impl PeerIds {
         {
             return Err(Error::Invalid);
         }
-        if let Some((initial, token)) = &mut self.initial {
+        if let Some(initial) = &mut self.initial {
             if id.sequence == 0 {
-                if *initial != id.cid || token.is_some_and(|old| old != id.reset_token) {
+                if initial.cid != id.cid || initial.reset_token.is_some_and(|old| old != id.reset_token)
+                    || self.entries.values().any(|old| old.reset_token == id.reset_token) {
                     return Err(Error::Conflict);
                 }
-                *token = Some(id.reset_token);
+                initial.reset_token = Some(id.reset_token);
                 return Ok(Vec::new());
             }
-            if *initial == id.cid || token.is_some_and(|old| old == id.reset_token) {
+            if initial.cid == id.cid || initial.reset_token.is_some_and(|old| old == id.reset_token) {
                 return Err(Error::Conflict);
             }
         }
@@ -335,6 +342,9 @@ mod tests {
         assert!(ids.matches_reset(&reset));
         assert!(!ids.matches_reset(&reset[1..]));
         ids.insert(cid(1), 0).unwrap();
+        reset[5..].fill(1);
+        assert!(!ids.matches_reset(&reset)); // unused spare
+        reset[5..].fill(9);
         assert_eq!(ids.insert(cid(2), 0), Err(Error::Limit));
         assert_eq!(ids.rotate(), Some(0));
         assert_eq!(ids.current(), Some([1; 8].as_slice()));

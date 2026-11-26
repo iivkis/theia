@@ -18,7 +18,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 
 type Cid = [u8; 8];
 type IssuedCid = (Cid, [u8; 16]);
-enum RouteCommand {
+pub(crate) enum RouteCommand {
     Issue { owner: u64, reply: oneshot::Sender<io::Result<IssuedCid>> },
     Retire { owner: u64, cid: Cid, reply: oneshot::Sender<io::Result<()>> },
 }
@@ -215,15 +215,26 @@ async fn run(
                 }
             }
             received = socket.recv_from(&mut buffer) => {
-                let (n, peer) = received?;
+                let (n, peer) = match received {
+                    Ok(value) => value,
+                    // Windows can surface ICMP Port Unreachable on an
+                    // unconnected UDP socket. It is not a listener failure.
+                    Err(e) if matches!(e.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused) => continue,
+                    Err(e) => return Err(e),
+                };
                 if !peer.ip().is_loopback() || n > MTU { continue; }
                 let bytes = &buffer[..n];
                 let now = clock.elapsed().as_secs();
                 match ingress.process(peer, bytes, now).map_err(|_| io::ErrorKind::InvalidData)? {
                     Action::Drop => {}
                     Action::Reply(reply) => {
-                        if reply.len() <= n && socket.send_to(&reply, peer).await? != reply.len() {
-                            return Err(io::Error::from(io::ErrorKind::WriteZero));
+                        if reply.len() <= n {
+                            match socket.send_to(&reply, peer).await {
+                                Ok(written) if written == reply.len() => {},
+                                Ok(_) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+                                Err(e) if matches!(e.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused | io::ErrorKind::NetworkUnreachable | io::ErrorKind::HostUnreachable) => {},
+                                Err(e) => return Err(e),
+                            }
                         }
                     }
                     Action::Existing(owner) => {
