@@ -3,6 +3,7 @@
 pub(crate) mod client_state;
 pub(crate) mod dpi;
 pub(crate) mod exchange;
+pub(crate) mod flow;
 pub mod geodata;
 mod settings;
 pub mod snapshot;

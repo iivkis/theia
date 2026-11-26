@@ -533,9 +533,15 @@ impl Tunnel {
         }
     }
 
-    pub(crate) async fn relay(
+    #[cfg(test)]
+    pub(crate) async fn relay(self, client: TcpStream) -> Result<RelayOutcome, ClientError> {
+        self.relay_guarded(client, None).await
+    }
+
+    pub(crate) async fn relay_guarded(
         mut self,
         mut client: TcpStream,
+        flow: Option<&super::flow::FlowLease>,
     ) -> Result<RelayOutcome, ClientError> {
         let mut prefix = Vec::new();
         let ready = match timeout(FIRST_FLIGHT, tcp::read_hello(&mut client, &mut prefix)).await {
@@ -568,6 +574,9 @@ impl Tunnel {
             return Ok(RelayOutcome::Fallback { client, prefix });
         }
         self.engine.check_policy(self.key.policy)?;
+        if let Some(flow) = flow {
+            flow.commit(super::PacketAction::Modify)?;
+        }
         // From the first attempted write onward, even a partial write or
         // timeout is terminal for this stream. Never replay it over the VPS.
         let started = std::time::Instant::now();

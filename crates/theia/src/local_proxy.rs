@@ -379,11 +379,11 @@ impl RealityClient {
         self.changed.notify_one();
         Ok(next)
     }
-    async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
+    async fn open(&self, address: Address, port: u16) -> Result<RoutedTcp, ClientError> {
         let generation = self.generation().await?;
         let mut result = routed_open(&generation.carrier, &self.routing, address, port).await;
         if let Ok(tunnel) = &mut result {
-            if let ProxyTunnel::Dpi(route) = tunnel {
+            if let ProxyTunnel::Dpi(route) = &mut tunnel.tunnel {
                 route.observed = Some(generation.last_open.clone());
             }
             if tunnel.open_code() != 0 {
@@ -936,6 +936,30 @@ enum ProxyTunnel {
     H3(Box<H3Tunnel>),
 }
 
+struct RoutedTcp {
+    tunnel: ProxyTunnel,
+    flow: crate::routing::flow::FlowLease,
+}
+impl RoutedTcp {
+    fn open_code(&self) -> u8 { self.tunnel.open_code() }
+    async fn relay(self, socket: TcpStream) -> Result<(), ClientError> {
+        self.tunnel.relay_guarded(socket, Some(&self.flow)).await
+    }
+}
+
+struct RoutedUdp {
+    tunnel: crate::udp_relay::Tunnel,
+    flow: crate::routing::flow::FlowLease,
+}
+impl RoutedUdp {
+    fn record_transport(&self, observed: &std::sync::atomic::AtomicU8) {
+        self.tunnel.record_transport(observed);
+    }
+    async fn relay(self, upload: tokio::sync::mpsc::Receiver<Vec<u8>>, download: tokio::sync::mpsc::Sender<Vec<u8>>) -> Result<(), ClientError> {
+        self.tunnel.relay_guarded(upload, download, Some(&self.flow)).await
+    }
+}
+
 struct DpiRoute {
     tunnel: crate::routing::dpi::Tunnel,
     observed: Option<Arc<std::sync::atomic::AtomicU8>>,
@@ -1116,8 +1140,26 @@ async fn routed_open(
     cache: &Cache,
     address: Address,
     port: u16,
-) -> Result<ProxyTunnel, ClientError> {
+) -> Result<RoutedTcp, ClientError> {
     let (snapshot, action, pinned) = route_decision(carrier, cache, &address).await?;
+    if action.packet_action() == crate::routing::PacketAction::Drop {
+        crate::traffic::blocked();
+        return Err(ClientError::Open(ErrorCode::PolicyDenied));
+    }
+    let flow = cache.flows.begin(cache.dpi.clone(), crate::routing::flow::Protocol::Tcp, address.clone(), port, snapshot.digest(), action.packet_action())?;
+    let tunnel = routed_open_selected(carrier, cache, address, port, snapshot, action, pinned).await?;
+    Ok(RoutedTcp { tunnel, flow })
+}
+
+async fn routed_open_selected(
+    carrier: &Carrier,
+    cache: &Cache,
+    address: Address,
+    port: u16,
+    snapshot: Arc<Snapshot>,
+    action: Action,
+    pinned: Option<Vec<IpAddr>>,
+) -> Result<ProxyTunnel, ClientError> {
     let policy = snapshot.policy();
     let denied = || ClientError::Open(ErrorCode::PolicyDenied);
     match action.packet_action() {
@@ -1194,8 +1236,29 @@ async fn routed_udp(
     port: u16,
     candidate: &crate::routing::dpi::udp::Candidate,
     observed: &Arc<std::sync::atomic::AtomicU8>,
-) -> Result<crate::udp_relay::Tunnel, ClientError> {
+) -> Result<RoutedUdp, ClientError> {
     let (snapshot, action, pinned) = route_decision(carrier, cache, &address).await?;
+    if action.packet_action() == crate::routing::PacketAction::Drop {
+        crate::traffic::blocked();
+        return Err(ClientError::Open(ErrorCode::PolicyDenied));
+    }
+    let flow = cache.flows.begin(cache.dpi.clone(), crate::routing::flow::Protocol::Udp, address.clone(), port, snapshot.digest(), action.packet_action())?;
+    let tunnel = routed_udp_selected(carrier, cache, address, port, candidate, observed, snapshot, action, pinned).await?;
+    Ok(RoutedUdp { tunnel, flow })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn routed_udp_selected(
+    carrier: &Carrier,
+    cache: &Cache,
+    address: Address,
+    port: u16,
+    candidate: &crate::routing::dpi::udp::Candidate,
+    observed: &Arc<std::sync::atomic::AtomicU8>,
+    snapshot: Arc<Snapshot>,
+    action: Action,
+    pinned: Option<Vec<IpAddr>>,
+) -> Result<crate::udp_relay::Tunnel, ClientError> {
     match action.packet_action() {
         crate::routing::PacketAction::Drop => {
             crate::traffic::blocked();
@@ -1364,7 +1427,7 @@ impl ProxyClient {
         address: Address,
         port: u16,
         candidate: &crate::routing::dpi::udp::Candidate,
-    ) -> Result<crate::udp_relay::Tunnel, ClientError> {
+    ) -> Result<RoutedUdp, ClientError> {
         match self {
             Self::Direct(c) => {
                 let tunnel = routed_udp(
@@ -1403,12 +1466,12 @@ impl ProxyClient {
         }
     }
 
-    async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
+    async fn open(&self, address: Address, port: u16) -> Result<RoutedTcp, ClientError> {
         match self {
             Self::Direct(client) => {
                 let mut tunnel =
                     routed_open(&client.carrier, &client.routing, address, port).await?;
-                if let ProxyTunnel::Dpi(route) = &mut tunnel {
+                if let ProxyTunnel::Dpi(route) = &mut tunnel.tunnel {
                     route.observed = Some(client.last_open.clone());
                 }
                 if tunnel.open_code() != 0 {
@@ -1456,9 +1519,15 @@ impl ProxyTunnel {
         (transport << 2) | if up { 2 } else { 1 }
     }
 
+    #[cfg(test)]
     async fn relay(self, socket: TcpStream) -> Result<(), ClientError> {
+        self.relay_guarded(socket, None).await
+    }
+
+    async fn relay_guarded(self, socket: TcpStream, flow: Option<&crate::routing::flow::FlowLease>) -> Result<(), ClientError> {
+        use crate::routing::{flow::GuardedIo, PacketAction};
         match self {
-            Self::Direct(target) => client_state::relay_direct(socket, target).await,
+            Self::Direct(target) => client_state::relay_direct(GuardedIo::new(socket, flow, PacketAction::Pass), target).await,
             Self::Dpi(route) => {
                 let DpiRoute {
                     tunnel,
@@ -1468,7 +1537,7 @@ impl ProxyTunnel {
                     port,
                 } = *route;
                 let authorization = tunnel.fallback_policy();
-                match tunnel.relay(socket).await? {
+                match tunnel.relay_guarded(socket, flow).await? {
                     crate::routing::dpi::RelayOutcome::Finished => Ok(()),
                     crate::routing::dpi::RelayOutcome::Fallback { client, prefix } => {
                         // The origin received no application bytes. The carrier
@@ -1483,15 +1552,15 @@ impl ProxyTunnel {
                         let local = crate::reality_tcp::Prefixed::new(client, prefix.into());
                         crate::traffic::dpi_fallback_open();
                         match tunnel {
-                            Self::H2(tunnel) => tunnel.relay(local).await,
-                            Self::H3(tunnel) => tunnel.relay(local).await,
+                            Self::H2(tunnel) => tunnel.relay(GuardedIo::new(local, flow, PacketAction::Redirect)).await,
+                            Self::H3(tunnel) => tunnel.relay(GuardedIo::new(local, flow, PacketAction::Redirect)).await,
                             _ => Err(ClientError::Protocol),
                         }
                     }
                 }
             }
-            Self::H2(tunnel) => tunnel.relay(socket).await,
-            Self::H3(tunnel) => tunnel.relay(socket).await,
+            Self::H2(tunnel) => tunnel.relay(GuardedIo::new(socket, flow, PacketAction::Redirect)).await,
+            Self::H3(tunnel) => tunnel.relay(GuardedIo::new(socket, flow, PacketAction::Redirect)).await,
         }
     }
 }
@@ -3939,7 +4008,7 @@ mod selector_tests {
                     .await
                     .unwrap();
                 assert!(matches!(
-                    dpi_tunnel,
+                    dpi_tunnel.tunnel,
                     ProxyTunnel::H2(_) | ProxyTunnel::H3(_)
                 ));
                 let _dpi_accepted = dpi_listener.accept().await.unwrap();
@@ -3989,7 +4058,7 @@ mod selector_tests {
                     .open(Address::Dns("localhost".into()), direct_port)
                     .await
                     .unwrap();
-                assert!(matches!(tunnel, ProxyTunnel::Direct(_)));
+                assert!(matches!(tunnel.tunnel, ProxyTunnel::Direct(_)));
                 let _accepted = direct_listener.accept().await.unwrap();
                 if let ProxyClient::Direct(client) = &proxy_client {
                     assert!(matches!(

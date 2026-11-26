@@ -158,11 +158,22 @@ impl Tunnel {
         );
     }
 
+    #[cfg(test)]
     pub(crate) async fn relay(
+        self,
+        upload: mpsc::Receiver<Vec<u8>>,
+        download: mpsc::Sender<Vec<u8>>,
+    ) -> Result<(), ClientError> {
+        self.relay_guarded(upload, download, None).await
+    }
+
+    pub(crate) async fn relay_guarded(
         self,
         mut upload: mpsc::Receiver<Vec<u8>>,
         download: mpsc::Sender<Vec<u8>>,
+        flow: Option<&crate::routing::flow::FlowLease>,
     ) -> Result<(), ClientError> {
+        use crate::routing::PacketAction;
         match self {
             Self::VerifiedLocal(verified, fallback) => {
                 let Some(first) = upload.recv().await else {
@@ -172,7 +183,12 @@ impl Tunnel {
                     crate::routing::dpi::UdpStrategy::StunBinding(strategy) => Some(strategy),
                     crate::routing::dpi::UdpStrategy::QuicV1 => None,
                 };
+                let unmodified = flow.is_some() && stun.is_none_or(|strategy| {
+                    crate::routing::dpi::udp::prepare_binding(&first, strategy)
+                        .is_none_or(|bytes| bytes == first)
+                });
                 if !verified.admissible()?
+                    || unmodified
                     || stun.is_some_and(|strategy| {
                         crate::routing::dpi::udp::prepare_binding(&first, strategy).is_none()
                     })
@@ -185,11 +201,17 @@ impl Tunnel {
                     if !matches!(tunnel, Self::H2(_) | Self::H3(_)) {
                         return Err(ClientError::Protocol);
                     }
+                    if let Some(flow) = flow {
+                        flow.commit(PacketAction::Redirect)?;
+                    }
                     return tunnel.relay_selected(Some(first), upload, download).await;
                 }
                 // Once a send is attempted no fallback or replay is legal.
                 drop(fallback);
                 verified.check_policy()?;
+                if let Some(flow) = flow {
+                    flow.commit(PacketAction::Modify)?;
+                }
                 let result = if let Some(strategy) = stun {
                     relay_stun(&verified.socket, strategy, first, upload, download).await
                 } else {
@@ -208,7 +230,16 @@ impl Tunnel {
                 }
                 result.map_err(LocalRelayError::into_client)
             }
-            other => other.relay_selected(None, upload, download).await,
+            other => {
+                if let Some(flow) = flow {
+                    let Some(first) = upload.recv().await else { return Ok(()); };
+                    let action = if matches!(&other, Self::Direct(_)) { PacketAction::Pass } else { PacketAction::Redirect };
+                    flow.commit(action)?;
+                    other.relay_selected(Some(first), upload, download).await
+                } else {
+                    other.relay_selected(None, upload, download).await
+                }
+            }
         }
     }
 

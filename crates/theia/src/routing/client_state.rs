@@ -115,6 +115,7 @@ pub(crate) struct Cache {
     checkpoint: Option<PathBuf>,
     state: tokio::sync::Mutex<State>,
     pub(crate) dpi: Arc<super::dpi::Engine>,
+    pub(crate) flows: Arc<super::flow::FlowTable>,
 }
 
 fn floor_bytes(path: &Path) -> Result<Option<Vec<u8>>, ClientError> {
@@ -142,6 +143,7 @@ impl Cache {
             scope,
             checkpoint,
             dpi: Arc::new(super::dpi::Engine::default()),
+            flows: super::flow::FlowTable::shared(),
             state: tokio::sync::Mutex::new(State {
                 snapshot: None,
                 expires: None,
@@ -393,12 +395,12 @@ async fn copy_direction(
     }
 }
 
-pub(crate) async fn relay_direct(client: TcpStream, target: TcpStream) -> Result<(), ClientError> {
+pub(crate) async fn relay_direct(client: impl AsyncRead + AsyncWrite + Unpin, target: TcpStream) -> Result<(), ClientError> {
     relay_direct_after_first(client, target, 0, 0).await.0
 }
 
 pub(crate) async fn relay_direct_after_first(
-    client: TcpStream,
+    client: impl AsyncRead + AsyncWrite + Unpin,
     target: TcpStream,
     upload: usize,
     download: usize,
@@ -409,7 +411,7 @@ pub(crate) async fn relay_direct_after_first(
     let activity = crate::relay_liveness::Activity::new();
     let evidence = (upload != 0 && download != 0)
         .then(|| ExchangeEvidence(std::sync::atomic::AtomicU8::new(0)));
-    let (cr, cw) = client.into_split();
+    let (cr, cw) = tokio::io::split(client);
     let (tr, tw) = target.into_split();
     let result = activity
         .run(
