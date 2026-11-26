@@ -210,15 +210,23 @@ use crate::{
     tui_reality_register::RegistrationPanel,
     Role,
 };
-use std::net::{IpAddr, SocketAddr};
-const WIZARD_LABELS: [&str; 7] = [
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, atomic::{AtomicUsize, Ordering}},
+};
+const MAX_DOMAIN_SEEDS: usize = 80;
+const MAX_RANGE_IPS: usize = 32;
+const MAX_RANGES: usize = 4;
+const DNS_PARALLELISM: usize = 6;
+const WIZARD_LABELS: [&str; 8] = [
     "ID inbound",
     "TCP/UDP bind",
     "Публичный endpoint host (без порта)",
     "Собственные IP через запятую",
-    "Домены (до 3) или domain=IP",
+    "Домены: catalog или domain=IP",
     "Grants (ID через запятую)",
     "Выбор: auto / manual",
+    "Разрешённые CIDR (необязательно)",
 ];
 
 #[derive(Clone)]
@@ -230,6 +238,8 @@ struct WizardInput {
     endpoint: String,
     own_ips: Vec<IpAddr>,
     candidates: Vec<(String, Option<IpAddr>)>,
+    range_spec: String,
+    range_targets: Vec<(IpAddr, Option<String>)>,
     grants: Vec<String>,
     automatic: bool,
     health: PathBuf,
@@ -237,6 +247,9 @@ struct WizardInput {
 }
 impl WizardInput {
     fn check_source(&self) -> Result<(), Error> {
+        if range_targets(&self.range_spec, &self.own_ips)? != self.range_targets {
+            return Err(Error::Scope);
+        }
         use sha2::{Digest, Sha256};
         if self.source.is_none() {
             if self.grants.len() != 1 || !config::valid_id(&self.grants[0]) {
@@ -295,7 +308,7 @@ impl WizardInput {
     fn parse(
         config: PathBuf,
         source: Option<[u8; 32]>,
-        fields: &[String; 7],
+        fields: &[String; 8],
     ) -> Result<Self, Error> {
         if !config::valid_id(&fields[0]) {
             return Err(Error::Scope);
@@ -318,24 +331,47 @@ impl WizardInput {
         if own_ips.is_empty() || own_ips.len() > 64 {
             return Err(Error::Scope);
         }
+        let automatic = match fields[6].as_str() {
+            "auto" => true,
+            "manual" => false,
+            _ => return Err(Error::Format),
+        };
         let mut candidates = Vec::new();
-        for item in fields[4].split(',').map(str::trim) {
-            let (name, address) = if let Some((name, ip)) = item.split_once('=') {
-                (name, Some(ip.parse::<IpAddr>().map_err(|_| Error::Scope)?))
-            } else {
-                (item, None)
-            };
+        let mut add = |name: &str, address: Option<IpAddr>| -> Result<(), Error> {
             crate::camouflage_domain_dns::validate_manual_dns_request(
                 name,
                 crate::camouflage_domain_dns::DnsConsent::Approved,
-            )
-            .map_err(|_| Error::Scope)?;
-            if candidates.iter().any(|(prior, _)| prior == name) {
+            ).map_err(|_| Error::Scope)?;
+            if candidates.iter().any(|(prior, _): &(String, Option<IpAddr>)| prior == name) {
                 return Err(Error::Scope);
             }
             candidates.push((name.to_owned(), address));
+            Ok(())
+        };
+        if !fields[4].trim().is_empty() {
+            for item in fields[4].split(',').map(str::trim) {
+                if item == "catalog" {
+                    if !automatic { return Err(Error::Scope); }
+                    for domain in crate::camouflage_discovery::POPULAR_HTTPS_DOMAINS {
+                        add(domain, None)?;
+                    }
+                    continue;
+                }
+                let (name, address) = if let Some((name, ip)) = item.split_once('=') {
+                    (name, Some(ip.parse::<IpAddr>().map_err(|_| Error::Scope)?))
+                } else {
+                    (item, None)
+                };
+                add(name, address)?;
+            }
         }
-        if candidates.is_empty() || candidates.len() > 3 {
+        let range_spec = fields[7].trim().to_owned();
+        let range_targets = range_targets(&range_spec, &own_ips)?;
+        if candidates.len() > MAX_DOMAIN_SEEDS
+            || candidates.len() + range_targets.len() > reference_health::MAX_SEARCH_TARGETS
+            || (candidates.is_empty() && range_targets.is_empty())
+            || (!automatic && (candidates.len() > 3 || !range_targets.is_empty()))
+        {
             return Err(Error::Scope);
         }
         let grants: Vec<String> = fields[5].split(',').map(|v| v.trim().to_owned()).collect();
@@ -349,11 +385,6 @@ impl WizardInput {
         {
             return Err(Error::Grant);
         }
-        let automatic = match fields[6].as_str() {
-            "auto" => true,
-            "manual" => false,
-            _ => return Err(Error::Format),
-        };
         let parent = config.parent().ok_or(Error::Storage)?;
         let root = parent.join(format!(".theia-{}-material", fields[0]));
         let health = root.join("health.toml");
@@ -366,6 +397,8 @@ impl WizardInput {
             endpoint,
             own_ips,
             candidates,
+            range_spec,
+            range_targets,
             grants,
             automatic,
             health,
@@ -374,55 +407,166 @@ impl WizardInput {
         input.check_source()?;
         Ok(input)
     }
-    fn plan(
-        &self,
-        references: Vec<reference_health::Target>,
-    ) -> Result<reference_health::Plan, Error> {
-        let plan = reference_health::Plan {
+    fn plan_document(&self, references: Vec<reference_health::Target>) -> reference_health::Plan {
+        reference_health::Plan {
             schema_version: 1,
             inbound: self.id.clone(),
             endpoint: self.endpoint.clone(),
             own_ips: self.own_ips.clone(),
             references,
-        };
+        }
+    }
+
+    fn plan(
+        &self,
+        references: Vec<reference_health::Target>,
+    ) -> Result<reference_health::Plan, Error> {
+        let plan = self.plan_document(references);
         plan.digest().map_err(|_| Error::Health)?;
         Ok(plan)
     }
-    async fn resolve(&self) -> Result<reference_health::Plan, Error> {
+
+    fn search_plan(&self, targets: Vec<reference_health::Target>) -> Result<reference_health::SearchPlan, Error> {
+        reference_health::SearchPlan::new(self.plan_document(targets)).map_err(|_| Error::Health)
+    }
+
+    fn seed_count(&self) -> usize {
+        self.candidates.len() + self.range_targets.len()
+    }
+
+    async fn resolve(&self, progress: &AtomicUsize) -> Result<ResolvedSearch, Error> {
+        let seeds: Vec<_> = self.candidates.iter().cloned().map(|(name, ip)| SearchSeed::Domain(name, ip))
+            .chain(self.range_targets.iter().cloned().map(|(ip, name)| SearchSeed::Range(ip, name)))
+            .collect();
         let mut references = Vec::new();
-        for (name, pinned) in &self.candidates {
-            let mut addresses = match pinned {
-                Some(ip) => vec![*ip],
-                None => match crate::camouflage_domain_dns::resolve_manual_domain(
-                    name,
-                    crate::camouflage_domain_dns::DnsConsent::Approved,
-                )
-                .await
-                {
-                    Ok(ips) => ips,
-                    Err(_) if self.automatic => continue,
-                    Err(_) => return Err(Error::Health),
-                },
-            };
-            addresses.sort();
-            let target = addresses
-                .into_iter()
-                .map(|ip| reference_health::Target {
-                    server_name: name.clone(),
-                    address: SocketAddr::new(ip, 443),
-                })
-                .find(|target| {
-                    let mut candidate = references.clone();
-                    candidate.push(target.clone());
-                    self.plan(candidate).is_ok()
-                });
-            match target {
-                Some(target) => references.push(target),
-                None if self.automatic => {}
-                None => return Err(Error::Health),
+        let mut unresolved = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for group in seeds.chunks(DNS_PARALLELISM) {
+            let mut tasks = tokio::task::JoinSet::new();
+            for (index, seed) in group.iter().cloned().enumerate() {
+                tasks.spawn(async move { (index, resolve_seed(seed).await) });
+            }
+            let mut completed = Vec::new();
+            while let Some(result) = tasks.join_next().await {
+                completed.push(result.map_err(|_| Error::Health)?);
+                progress.fetch_add(1, Ordering::Relaxed);
+            }
+            completed.sort_by_key(|(index, _)| *index);
+            for (_, result) in completed {
+                let (name, mut ips, address) = result;
+                ips.sort();
+                let target = ips.into_iter()
+                    .map(|ip| reference_health::Target {
+                        server_name: name.clone(),
+                        address: SocketAddr::new(ip, 443),
+                    })
+                    .find(|target| self.search_plan(vec![target.clone()]).is_ok());
+                if let Some(target) = target {
+                    if seen.insert((target.server_name.clone(), target.address)) {
+                        references.push(target);
+                    }
+                } else {
+                    unresolved.push(crate::tui_widgets::ReferenceRow {
+                        name,
+                        address,
+                        score: 0,
+                        h2: false,
+                        h3: false,
+                        selected: None,
+                    });
+                }
             }
         }
-        self.plan(references)
+        let plan = if references.is_empty() { None } else { Some(self.search_plan(references)?) };
+        Ok(ResolvedSearch { plan, unresolved })
+    }
+}
+
+type RangeTargets = Vec<(IpAddr, Option<String>)>;
+
+fn range_targets(raw: &str, own_ips: &[IpAddr]) -> Result<RangeTargets, Error> {
+    if raw.trim().is_empty() { return Ok(Vec::new()); }
+    let native = crate::camouflage_interfaces::collect_assigned_interfaces().map_err(|_| Error::Scope)?;
+    range_targets_for_snapshot(raw, own_ips, &native.server_snapshot())
+}
+
+// Offline expansion reuses the existing assigned-interface scope gate.
+// No implied permission from provider prefix, public egress or DNS answers.
+fn range_targets_for_snapshot(
+    raw: &str,
+    own_ips: &[IpAddr],
+    snapshot: &crate::camouflage_discovery::ServerSnapshot,
+) -> Result<RangeTargets, Error> {
+    use crate::camouflage_discovery::{build_plan, CandidateHost, CandidateSource, NetworkPrefix, Warning};
+    let mut targets: RangeTargets = Vec::new();
+    if raw.split(',').count() > MAX_RANGES { return Err(Error::Scope); }
+    for item in raw.split(',').map(str::trim) {
+        let (name, prefix) = if let Some((name, prefix)) = item.split_once('@') {
+            crate::camouflage_domain_dns::validate_manual_dns_request(
+                name, crate::camouflage_domain_dns::DnsConsent::Approved,
+            ).map_err(|_| Error::Scope)?;
+            (Some(name.to_owned()), prefix)
+        } else {
+            (None, item)
+        };
+        let prefix: NetworkPrefix = prefix.parse().map_err(|_| Error::Scope)?;
+        let plan = build_plan(snapshot, &[prefix]);
+        if plan.warnings.iter().any(|warning| matches!(warning,
+            Warning::RangeNotOnServer | Warning::RangeTooBroad | Warning::RangeExceedsAssignedPrefix |
+            Warning::Ipv6EnumerationUnsupported | Warning::CandidateLimitReached)) {
+            return Err(Error::Scope);
+        }
+        let mut found = false;
+        for candidate in plan.candidates {
+            if candidate.source != CandidateSource::AuthorizedSubnet { continue; }
+            let CandidateHost::Ip(ip) = candidate.host else { continue };
+            if own_ips.contains(&ip) { continue; }
+            found = true;
+            if let Some((_, previous)) = targets.iter().find(|(address, _)| *address == ip) {
+                if previous != &name { return Err(Error::Scope); }
+                continue;
+            }
+            targets.push((ip, name.clone()));
+            if targets.len() > MAX_RANGE_IPS { return Err(Error::Scope); }
+        }
+        if !found { return Err(Error::Scope); }
+    }
+    Ok(targets)
+}
+
+#[derive(Clone)]
+enum SearchSeed {
+    Domain(String, Option<IpAddr>),
+    Range(IpAddr, Option<String>),
+}
+
+struct ResolvedSearch {
+    plan: Option<reference_health::SearchPlan>,
+    unresolved: Vec<crate::tui_widgets::ReferenceRow>,
+}
+
+async fn resolve_seed(seed: SearchSeed) -> (String, Vec<IpAddr>, String) {
+    use crate::camouflage_domain_dns::{resolve_manual_domain, DnsConsent};
+    match seed {
+        SearchSeed::Domain(name, Some(ip)) => (name, vec![ip], ip.to_string()),
+        SearchSeed::Domain(name, None) => {
+            let ips = resolve_manual_domain(&name, DnsConsent::Approved).await.unwrap_or_default();
+            (name, ips, "DNS не подтверждён".into())
+        }
+        SearchSeed::Range(ip, name) => {
+            let name = match name {
+                Some(name) => Some(name),
+                None => crate::camouflage_interfaces::reverse_reference_name(ip).await,
+            };
+            let Some(name) = name else {
+                return ("PTR/SNI не найден".into(), Vec::new(), ip.to_string());
+            };
+            // A reverse name is only a hint. No TLS connection is scheduled
+            // unless the same public IP is present in the forward DNS result.
+            let ips = resolve_manual_domain(&name, DnsConsent::Approved).await
+                .ok().filter(|ips| ips.contains(&ip)).map(|_| vec![ip]).unwrap_or_default();
+            (name, ips, ip.to_string())
+        }
     }
 }
 /// Publish a first-run configuration only after an explicit reviewed save.
@@ -495,72 +639,67 @@ struct RankedReview {
 
 fn rank_checked(
     input: &WizardInput,
-    plan: reference_health::Plan,
+    targets: Vec<reference_health::Target>,
     evidence: Vec<reference_health::Evidence>,
     now: u64,
-) -> Result<(reference_health::State, RankedReview), Error> {
-    if plan.references.len() != evidence.len() {
-        return Err(Error::Health);
-    }
-    let mut entries: Vec<_> = plan.references.into_iter().zip(evidence).collect();
-    let mut report =
-        String::from("Оценки: 100 = стабильные H2+H3, 80 = стабильный H2, 0 = отказ.\n");
-    let mut rows: Vec<_> = entries
-        .iter()
-        .map(|(target, item)| crate::tui_widgets::ReferenceRow {
-            name: target.server_name.clone(),
-            address: target.address.to_string(),
-            score: item.score(),
-            h2: item.eligible(),
-            h3: item.h3(),
-            selected: None,
-        })
-        .collect();
-    for (target, item) in &entries {
-        report.push_str(&format!(
-            "{} {}: {}\n",
-            target.server_name,
-            target.address,
-            item.score()
-        ));
-    }
+    mut unresolved: Vec<crate::tui_widgets::ReferenceRow>,
+) -> Result<(Option<reference_health::State>, RankedReview), Error> {
+    if targets.len() != evidence.len() { return Err(Error::Health); }
+    let mut entries: Vec<_> = targets.into_iter().zip(evidence).collect();
+    let mut rows: Vec<_> = entries.iter().map(|(target, item)| crate::tui_widgets::ReferenceRow {
+        name: target.server_name.clone(),
+        address: target.address.to_string(),
+        score: item.score(),
+        h2: item.eligible(),
+        h3: item.h3(),
+        selected: None,
+    }).collect();
+    let unresolved_count = unresolved.len();
+    rows.append(&mut unresolved);
+    let mut chosen = Vec::new();
+    let mut observations = Vec::new();
     if input.automatic {
-        entries.retain(|(_, item)| item.eligible());
         entries.sort_by_key(|(_, item)| std::cmp::Reverse(item.score()));
-    }
-    // Manual mode preserves the exact operator order and refuses any
-    // failed reference. Auto may only remove/reorder approved pins.
-    let (targets, observed): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
-    let plan = input.plan(targets)?;
-    let state = reference_health::State::new(plan, observed, now).map_err(|_| Error::Health)?;
-    report.push_str("\nПРЕДЛОЖЕННЫЙ НАБОР\n");
-    for (index, target) in state.plan().references.iter().enumerate() {
-        if let Some(row) = rows
-            .iter_mut()
-            .find(|row| row.name == target.server_name && row.address == target.address.to_string())
-        {
-            row.selected = Some(index);
+        for (target, item) in entries {
+            if !item.eligible() { continue; }
+            let mut trial = chosen.clone();
+            trial.push(target);
+            // The persistent contract retains only 3 distinct names and pins.
+            if input.plan(trial.clone()).is_ok() {
+                chosen = trial;
+                observations.push(item);
+            }
+            if chosen.len() == 3 { break; }
         }
-        let role = if index == 0 {
-            "Основной".to_owned()
-        } else {
-            format!("Резерв {index}")
-        };
-        report.push_str(&format!(
-            "{role}: {}  ({})\n",
-            target.server_name, target.address
-        ));
+    } else if unresolved_count == 0 && entries.iter().all(|(_, item)| item.eligible()) {
+        (chosen, observations) = entries.into_iter().unzip();
     }
-    report.push_str(&format!(
-        "\nСервер: {}\nПорт: {}\nПользователи: {}\n",
-        input.endpoint,
-        input.listen.port(),
-        input.grants.join(", ")
-    ));
-    report.push_str(
-        "\nСоздать защищённые материалы? Сервер не будет запущен.\ny: создать; n/Esc: назад.",
+    let state = if chosen.is_empty() {
+        None
+    } else {
+        input.plan(chosen).ok().and_then(|plan| reference_health::State::new(plan, observations, now).ok())
+    };
+    let mut report = format!(
+        "Кандидатов: {} · DNS/PTR не подтверждено: {}.\nОценки: 100 = стабильные H2+H3, 80 = стабильный H2, 0 = отказ.\n",
+        rows.len(), unresolved_count,
     );
-    rows.sort_by_key(|row| row.selected.unwrap_or(usize::MAX));
+    if let Some(state) = &state {
+        for (index, target) in state.plan().references.iter().enumerate() {
+            if let Some(row) = rows.iter_mut().find(|row| row.name == target.server_name && row.address == target.address.to_string()) {
+                row.selected = Some(index);
+            }
+        }
+    }
+    rows.sort_by_key(|row| (row.selected.unwrap_or(usize::MAX), std::cmp::Reverse(row.score)));
+    for row in &rows {
+        report.push_str(&format!("{} {} · H2={} H3={} · {}\n", row.name, row.address, row.h2, row.h3, row.score));
+    }
+    if state.is_some() {
+        report.push_str(&format!("\nСервер: {}\nПорт: {}\nПользователи: {}\nСоздать защищённые материалы? Сервер не будет запущен.\ny: создать; n/Esc: назад.",
+            input.endpoint, input.listen.port(), input.grants.join(", ")));
+    } else {
+        report.push_str("\nНет допустимого набора референсов. Ничего не сохранено. Esc: изменить источники и повторить.");
+    }
     Ok((state, RankedReview { text: report, rows }))
 }
 
@@ -568,15 +707,16 @@ enum WizardStage {
     Input,
     DnsConfirm(Box<WizardInput>),
     Resolving(
-        Receiver<Result<(WizardInput, reference_health::Plan), Error>>,
+        Receiver<Result<(WizardInput, ResolvedSearch), Error>>,
         tokio::sync::oneshot::Sender<()>,
     ),
-    ProbeConfirm(Box<(WizardInput, reference_health::Plan)>),
+    ProbeConfirm(Box<(WizardInput, ResolvedSearch)>),
     Checking(
-        Receiver<Result<(WizardInput, reference_health::State, RankedReview), Error>>,
+        Receiver<Result<(WizardInput, Option<reference_health::State>, RankedReview), Error>>,
         tokio::sync::oneshot::Sender<()>,
     ),
     CreateConfirm(Box<(WizardInput, reference_health::State, RankedReview)>),
+    NoEligible(RankedReview),
     Saving(Receiver<Result<RegistrationPanel, Error>>, PathBuf),
     SavingInitial(Receiver<Result<Editor, Error>>, PathBuf),
     Done(String),
@@ -589,12 +729,14 @@ struct GrantPicker {
 struct Wizard {
     config: PathBuf,
     source: Option<[u8; 32]>,
-    fields: [String; 7],
+    fields: [String; 8],
     focus: usize,
     advanced: bool,
     users: String,
     available_users: Vec<String>,
     grant_picker: Option<GrantPicker>,
+    progress: Arc<AtomicUsize>,
+    total: usize,
     stage: WizardStage,
     error: String,
     registration: Option<RegistrationPanel>,
@@ -616,9 +758,10 @@ impl Wizard {
                 "443".into(),
                 String::new(),
                 String::new(),
-                crate::camouflage_discovery::POPULAR_HTTPS_DOMAINS[..3].join(","),
+                "catalog".into(),
                 String::new(),
                 "auto".into(),
+                String::new(),
             ],
             focus: 1,
             advanced: false,
@@ -631,6 +774,8 @@ impl Wizard {
                 .filter_map(|(id, disabled, _)| (!disabled).then_some(id))
                 .collect(),
             grant_picker: None,
+            progress: Arc::new(AtomicUsize::new(0)),
+            total: 0,
             stage: WizardStage::Input,
             error: String::new(),
             registration: None,
@@ -652,9 +797,10 @@ impl Wizard {
                 "443".into(),
                 String::new(),
                 String::new(),
-                crate::camouflage_discovery::POPULAR_HTTPS_DOMAINS[..3].join(","),
+                "catalog".into(),
                 String::new(),
                 "auto".into(),
+                String::new(),
             ],
             focus: 1,
             advanced: false,
@@ -662,6 +808,8 @@ impl Wizard {
                 .into(),
             available_users: Vec::new(),
             grant_picker: None,
+            progress: Arc::new(AtomicUsize::new(0)),
+            total: 0,
             stage: WizardStage::Input,
             error: String::new(),
             registration: None,
@@ -704,9 +852,9 @@ impl Wizard {
 
     fn visible_fields(&self) -> &[usize] {
         if self.advanced {
-            &[0, 1, 2, 3, 4, 5, 6]
+            &[0, 1, 2, 3, 4, 5, 6, 7]
         } else {
-            &[1, 2, 3, 5]
+            &[1, 2, 3, 5, 4, 7]
         }
     }
     fn move_focus(&mut self, forward: bool) {
@@ -832,6 +980,9 @@ impl Wizard {
                 if key.code == KeyCode::Char('y') && key.modifiers.is_empty() =>
             {
                 let input = *input;
+                self.total = input.seed_count();
+                self.progress = Arc::new(AtomicUsize::new(0));
+                let progress = Arc::clone(&self.progress);
                 let (tx, rx) = mpsc::channel();
                 let (cancel, cancelled) = tokio::sync::oneshot::channel();
                 let _worker = std::thread::spawn(move || {
@@ -844,7 +995,7 @@ impl Wizard {
                             tokio::select! {
                                 biased;
                                 _ = cancelled => Err(Error::Health),
-                                result = input.resolve() => result,
+                                result = input.resolve(&progress) => result,
                             }
                         })?;
                         Ok((input, plan))
@@ -856,20 +1007,24 @@ impl Wizard {
             WizardStage::ProbeConfirm(value)
                 if key.code == KeyCode::Char('y') && key.modifiers.is_empty() =>
             {
-                let (input, plan) = *value;
+                let (input, resolved) = *value;
+                self.total = resolved.plan.as_ref().map_or(0, |plan| plan.targets().len());
+                self.progress = Arc::new(AtomicUsize::new(0));
+                let progress = Arc::clone(&self.progress);
                 let (tx, rx) = mpsc::channel();
                 let (cancel, cancelled) = tokio::sync::oneshot::channel();
                 let _worker = std::thread::spawn(move || {
                     let result = input.check_source().and_then(|()| {
+                        let plan = resolved.plan.ok_or(Error::Health)?;
                         let approved = plan.digest().map_err(|_| Error::Health)?;
                         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| Error::Storage)?;
                         let evidence = rt.block_on(async { tokio::select! {
                             biased;
                             _ = cancelled => Err(Error::Health),
-                            value = reference_health::check(&plan, approved) => value.map_err(|_| Error::Health),
+                            value = reference_health::check_search(&plan, approved, &progress) => value.map_err(|_| Error::Health),
                         } })?;
                         let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
-                        let (state, report) = rank_checked(&input, plan, evidence, now)?;
+                        let (state, report) = rank_checked(&input, plan.into_targets(), evidence, now, resolved.unresolved)?;
                         Ok((input, state, report))
                     });
                     let _ = tx.send(result);
@@ -958,6 +1113,7 @@ impl Wizard {
             WizardStage::DnsConfirm(_)
             | WizardStage::ProbeConfirm(_)
             | WizardStage::CreateConfirm(_)
+            | WizardStage::NoEligible(_)
                 if matches!(key.code, KeyCode::Esc | KeyCode::Char('n')) =>
             {
                 WizardStage::Input
@@ -981,11 +1137,23 @@ impl Wizard {
         }
         let result = match &self.stage {
             WizardStage::Resolving(rx, _) => match rx.try_recv() {
-                Ok(value) => value.map(|v| WizardStage::ProbeConfirm(Box::new(v))),
+                Ok(value) => value.map(|(input, resolved)| {
+                    if resolved.plan.is_some() {
+                        WizardStage::ProbeConfirm(Box::new((input, resolved)))
+                    } else {
+                        WizardStage::NoEligible(RankedReview {
+                            text: "DNS/PTR не подтвердил ни одного кандидата. TLS не выполнялся. Esc: назад.".into(),
+                            rows: resolved.unresolved,
+                        })
+                    }
+                }),
                 Err(TryRecvError::Empty) => return None, Err(TryRecvError::Disconnected) => Err(Error::Health),
             },
             WizardStage::Checking(rx, _) => match rx.try_recv() {
-                Ok(value) => value.map(|v| WizardStage::CreateConfirm(Box::new(v))),
+                Ok(value) => value.map(|(input, state, report)| match state {
+                    Some(state) => WizardStage::CreateConfirm(Box::new((input, state, report))),
+                    None => WizardStage::NoEligible(report),
+                }),
                 Err(TryRecvError::Empty) => return None, Err(TryRecvError::Disconnected) => Err(Error::Health),
             },
             WizardStage::SavingInitial(rx, root) => match rx.try_recv() {
@@ -1039,13 +1207,26 @@ impl Wizard {
                 out.push_str("\nEnter: проверить и подобрать; ↑↓ / Tab: поле; Ctrl+U: очистить; Esc: отменить.\n");
                 out.push_str(&self.error); out
             }
-            WizardStage::DnsConfirm(input) => format!("DNS: только перечисленные домены без заданного IP.\n{}\nНет TLS/QUIC соединений. y: DNS; n/Esc: отменить.", input.candidates.iter().map(|(name, ip)| format!("{name}: {}", ip.map_or("DNS".into(), |ip| ip.to_string()))).collect::<Vec<_>>().join("\n")),
-            WizardStage::Resolving(_, _) => "Ограниченный DNS. Esc: отменить ожидание, без TLS/записи.".into(),
+            WizardStage::DnsConfirm(input) => {
+                let mut body = format!("Поиск: {} доменов, {} IP из разрешённых CIDR.\nDNS и обратный DNS; без TLS и записи. Только адреса с подтверждённым SNI попадут в следующий этап.\nCIDR: подтверждайте только адреса, на проверку которых у вас есть разрешение.\ny: разрешить DNS; n/Esc: отменить.\n\nДОМЕНЫ\n", input.candidates.len(), input.range_targets.len());
+                for (name, ip) in &input.candidates {
+                    body.push_str(&format!("{name}: {}\n", ip.map_or("DNS".into(), |ip| ip.to_string())));
+                }
+                if !input.range_targets.is_empty() {
+                    body.push_str("\nРАЗРЕШЁННЫЕ IP\n");
+                    for (ip, name) in &input.range_targets {
+                        body.push_str(&format!("{ip}: {}\n", name.as_deref().unwrap_or("PTR → DNS")));
+                    }
+                }
+                body
+            }
+            WizardStage::Resolving(_, _) => format!("Получение DNS/PTR: {} / {}.\nEsc: отменить, без TLS и записи.", self.progress.load(Ordering::Relaxed), self.total),
             WizardStage::ProbeConfirm(value) => {
-                let skipped = value.0.candidates.iter().filter(|(name, _)| !value.1.references.iter().any(|t| &t.server_name == name)).map(|(name, _)| name.as_str()).collect::<Vec<_>>();
-                format!("Проверить только эти IP:443 и SNI (public PKI, H2/H3 HEAD):\n{}\nИсключены DNS/недопустимые/повторные IP: {}\nDNS будет повторно сверён, включая endpoint; запрещено подключение к собственным IP.\ny: проверить; n/Esc: отменить.", value.1.preview().unwrap_or_else(|_| "Неверный план".into()), skipped.join(", "))
-            },
-            WizardStage::Checking(_, _) => "Проверка согласованных IP; Esc: отменить без записи.".into(),
+                let search = value.1.plan.as_ref().map_or_else(String::new, |plan| plan.preview());
+                format!("Проверить {} согласованных IP:443 и SNI (public PKI, TLS 1.3, H2/H3 HEAD).\nDNS/PTR исключено: {}. Никаких иных адресов, портов, bearer или записи.\nDNS будет повторно сверён, включая endpoint.\ny: проверить; n/Esc: отменить.\n\n{}", value.1.plan.as_ref().map_or(0, |plan| plan.targets().len()), value.1.unresolved.len(), search)
+            }
+            WizardStage::Checking(_, _) => format!("Проверка TLS / QUIC: {} / {}.\nEsc: отменить без записи.", self.progress.load(Ordering::Relaxed), self.total),
+            WizardStage::NoEligible(report) => report.text.clone(),
             WizardStage::CreateConfirm(value) => {
                 if value.0.source.is_none() {
                     format!("{}\nПервый TOML: {}\nПервый пользователь: {} (отключён).\ny: создать материалы и сохранить новый TOML; n/Esc: назад.", value.2.text, value.0.config.display(), value.0.grants.join(", "))
@@ -1311,10 +1492,11 @@ impl ProvisionPanel {
             ("Порт TCP/UDP", "Оставьте 443, если не знаете, зачем менять. Порт должен быть доступен на сервере."),
             ("Адрес сервера для клиентов", "Введите IP или домен VPS из панели хостинга, без https:// и порта. Не адрес стороннего сайта."),
             ("IP-адреса вашего сервера", "IP указаны в панели хостинга. F3 — перенести IP из поля выше. Если IP несколько, перечислите их через запятую."),
-            ("Домены референсов", "До трёх доменов или домен=IP, через запятую."),
+            ("Поиск по доменам", "catalog — весь каталог; свои домены или домен=IP через запятую. Можно очистить для поиска только по CIDR."),
             (if first { "Имя первого пользователя" } else { "Пользователи с доступом (F6)" },
              if first { "Придумайте имя, например phone. После создания выдайте личный ключ через «Восстановить доступ» на обзоре." } else { "Нажмите F6 и отметьте нужных пользователей. Никому не выдаётся доступ автоматически." }),
-            ("Режим подбора", "auto — по результатам проверок; manual — в заданном порядке."),
+            ("Режим подбора", "auto — лучшие 3; manual — до трёх явных доменов в заданном порядке."),
+            ("Разрешённые CIDR", "Необязательно: CIDR или SNI@CIDR, до 32 IP в назначенной подсети. PTR и прямой DNS обязательны; только с разрешением."),
         ];
         Some(Form {
             fields: wizard
@@ -1363,9 +1545,14 @@ impl ProvisionPanel {
         if wizard.registration.is_some() {
             return None;
         }
-        let WizardStage::CreateConfirm(value) = &wizard.stage else {
-            return None;
-        };
+        if let WizardStage::NoEligible(report) = &wizard.stage {
+            return Some(crate::tui_widgets::ReferenceReview {
+                rows: report.rows.clone(),
+                details: Vec::new(),
+                note: "Нет допустимого набора. Ничего не сохранено. Esc: вернуться к источникам.".into(),
+            });
+        }
+        let WizardStage::CreateConfirm(value) = &wizard.stage else { return None; };
         let (input, _, review) = value.as_ref();
         let first = input.source.is_none();
         let details = vec![
@@ -1439,6 +1626,7 @@ impl ProvisionPanel {
                 "Y проверить перечисленные адреса · N / Esc назад",
             ),
             WizardStage::Checking(_, _) => (3, 5, "Проверка TLS / QUIC", "Esc отменить"),
+            WizardStage::NoEligible(_) => (4, 5, "Нет подходящих референсов", "Esc изменить источники"),
             WizardStage::CreateConfirm(value) => (
                 4,
                 5,
@@ -1480,6 +1668,63 @@ impl ProvisionPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wizard_catalogue_search_is_not_the_three_reference_persistence_limit() {
+        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("wizard-search").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("server.toml");
+        let mut wizard = Wizard::first(path.clone()).unwrap();
+        wizard.fields[2] = "edge.example.org".into();
+        wizard.fields[3] = "93.184.216.1".into();
+        wizard.fields[5] = "owner".into();
+        let input = WizardInput::parse(path.clone(), None, &wizard.fields).unwrap();
+        assert_eq!(input.candidates.len(), crate::camouflage_discovery::POPULAR_HTTPS_DOMAINS.len());
+        let targets: Vec<_> = (2..=7).map(|n| reference_health::Target {
+            server_name: format!("host{n}.example.org"),
+            address: format!("93.184.216.{n}:443").parse().unwrap(),
+        }).collect();
+        assert!(input.search_plan(targets.clone()).is_ok());
+        assert!(input.plan(targets.clone()).is_err());
+        let mut evidence = vec![reference_health::Evidence { h2_status: Some(200), h3_status: None }; targets.len()];
+        evidence[4].h3_status = Some(200);
+        evidence[5] = reference_health::Evidence::default();
+        let (state, report) = rank_checked(&input, targets.clone(), evidence, 1000, Vec::new()).unwrap();
+        let state = state.unwrap();
+        assert_eq!(state.plan().references.len(), 3);
+        assert_eq!(state.plan().references[0].server_name, "host6.example.org");
+        assert_eq!(report.rows.len(), 6);
+        assert_eq!(report.rows[0].score, 100);
+        assert_eq!(report.rows[5].score, 0);
+        let (state, report) = rank_checked(&input, targets.clone(), vec![reference_health::Evidence::default(); targets.len()], 1000, Vec::new()).unwrap();
+        assert!(state.is_none());
+        assert_eq!(report.rows.len(), 6);
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn range_sources_are_bounded_and_require_assigned_scope_before_dns() {
+        use crate::camouflage_discovery::{InterfaceAddress, ServerSnapshot};
+        let snapshot = ServerSnapshot {
+            interfaces: vec![InterfaceAddress { address: "93.184.216.10".parse().unwrap(), prefix_len: 24 }],
+            ..ServerSnapshot::default()
+        };
+        let own = ["93.184.216.10".parse().unwrap()];
+        let targets = range_targets_for_snapshot("93.184.216.8/29", &own, &snapshot).unwrap();
+        assert_eq!(targets.len(), 5);
+        assert!(targets.iter().all(|(ip, name)| !own.contains(ip) && name.is_none()));
+        let explicit = range_targets_for_snapshot("reference.example.org@93.184.216.8/29", &own, &snapshot).unwrap();
+        assert!(explicit.iter().all(|(_, name)| name.as_deref() == Some("reference.example.org")));
+        for raw in ["93.184.217.0/29", "93.184.216.0/24", "10.0.0.0/29", "0.0.0.0/0", "93.184.216.8/29,other.example.org@93.184.216.8/29"] {
+            assert!(range_targets_for_snapshot(raw, &own, &snapshot).is_err(), "{raw}");
+        }
+        let narrow = ServerSnapshot {
+            interfaces: vec![InterfaceAddress { address: own[0], prefix_len: 32 }],
+            ..ServerSnapshot::default()
+        };
+        assert!(range_targets_for_snapshot("93.184.216.8/29", &own, &narrow).is_err());
+    }
 
     #[test]
     fn novice_errors_focus_the_missing_field_without_creating_files() {
@@ -1548,14 +1793,16 @@ mod tests {
         let now = reference_health::unix_now().unwrap();
         let (state, report) = rank_checked(
             &input,
-            plan,
+            plan.references,
             vec![Evidence {
                 h2_status: Some(200),
                 h3_status: None,
             }],
             now,
+            Vec::new(),
         )
         .unwrap();
+        let state = state.unwrap();
         let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
         wizard.stage =
             WizardStage::CreateConfirm(Box::new((input.clone(), state.clone(), report.clone())));
@@ -1640,10 +1887,12 @@ mod tests {
             },
         ];
         let now = reference_health::unix_now().unwrap();
-        let (state, report) = rank_checked(&input, plan.clone(), evidence.clone(), now).unwrap();
+        let (state, report) = rank_checked(&input, plan.references.clone(), evidence.clone(), now, Vec::new()).unwrap();
+        let state = state.unwrap();
         let mut manual = input.clone();
         manual.automatic = false;
-        let (ordered, _) = rank_checked(&manual, plan.clone(), evidence.clone(), now).unwrap();
+        let (ordered, _) = rank_checked(&manual, plan.references.clone(), evidence.clone(), now, Vec::new()).unwrap();
+        let ordered = ordered.unwrap();
         assert_eq!(
             ordered.plan().references[0].server_name,
             "first.example.org"
@@ -1653,20 +1902,21 @@ mod tests {
             h2_status: None,
             h3_status: None,
         };
-        assert!(rank_checked(&manual, plan.clone(), failed.clone(), now).is_err());
-        let (filtered, filtered_review) = rank_checked(&input, plan.clone(), failed, now).unwrap();
+        assert!(rank_checked(&manual, plan.references.clone(), failed.clone(), now, Vec::new()).unwrap().0.is_none());
+        let (filtered, filtered_review) = rank_checked(&input, plan.references.clone(), failed, now, Vec::new()).unwrap();
+        let filtered = filtered.unwrap();
         assert_eq!(filtered_review.rows.len(), 2);
         assert_eq!(filtered_review.rows[1].selected, None);
         assert_eq!(filtered_review.rows[1].score, 0);
         assert_eq!(filtered.plan().references.len(), 1);
-        assert!(rank_checked(&input, plan.clone(), Vec::new(), now).is_err());
+        assert!(rank_checked(&input, plan.references.clone(), Vec::new(), now, Vec::new()).is_err());
         let resolved = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
-            .block_on(input.resolve())
+            .block_on(input.resolve(&AtomicUsize::new(0)))
             .unwrap();
-        assert_eq!(resolved.digest().unwrap(), plan.digest().unwrap());
+        assert!(resolved.plan.unwrap().targets() == plan.references.as_slice());
         assert_eq!(state.plan().references[0].server_name, "second.example.org");
         assert!(report.text.contains("100") && report.text.contains("80"));
         assert_eq!(report.rows[0].selected, Some(0));

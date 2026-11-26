@@ -463,12 +463,15 @@ impl ReferenceReview {
             let status = match row.selected {
                 Some(0) => "Основной".into(),
                 Some(index) => format!("Резерв {index}"),
+                None if row.h2 => "Подходит".into(),
                 None => "Исключён".into(),
             };
             let color = if row.selected == Some(0) {
                 ACCENT
             } else if row.selected.is_some() {
                 WARNING
+            } else if row.h2 {
+                MUTED
             } else {
                 ERROR
             };
@@ -512,10 +515,12 @@ impl ReferenceReview {
             }
         }
         lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            "Конфигурация к сохранению",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ));
+        if !self.details.is_empty() {
+            lines.push(Line::styled(
+                "Конфигурация к сохранению",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ));
+        }
         for (label, value) in &self.details {
             if wide && Span::raw(value.as_str()).width() + 24 <= usize::from(width) {
                 lines.push(Line::from(vec![
