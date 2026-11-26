@@ -326,6 +326,13 @@ impl ExchangeEvidence {
     }
 }
 
+struct DirectRelayError {
+    error: ClientError,
+    peer: bool,
+}
+impl DirectRelayError {
+    fn io(peer: bool) -> Self { Self { error: ClientError::Io, peer } }
+}
 async fn copy_direction(
     mut input: impl AsyncRead + Unpin,
     mut output: impl AsyncWrite + Unpin,
@@ -333,19 +340,19 @@ async fn copy_direction(
     meter: &crate::traffic::Relay<'_>,
     upload: bool,
     evidence: Option<&ExchangeEvidence>,
-) -> Result<(), ClientError> {
+) -> Result<(), DirectRelayError> {
     let mut bytes = [0u8; 16 * 1024];
     loop {
-        let count = input.read(&mut bytes).await.map_err(|_| ClientError::Io)?;
+        let count = input.read(&mut bytes).await.map_err(|_| DirectRelayError::io(!upload))?;
         if count == 0 {
-            output.shutdown().await.map_err(|_| ClientError::Io)?;
+            output.shutdown().await.map_err(|_| DirectRelayError::io(upload))?;
             activity.half_closed();
             return Ok(());
         }
         output
             .write_all(&bytes[..count])
             .await
-            .map_err(|_| ClientError::Io)?;
+            .map_err(|_| DirectRelayError::io(upload))?;
         activity.data(count);
         if let Some(evidence) = evidence { evidence.wrote(upload); }
         if upload {
@@ -365,7 +372,7 @@ pub(crate) async fn relay_direct_after_first(
     target: TcpStream,
     upload: usize,
     download: usize,
-) -> (Result<(), ClientError>, bool) {
+) -> (Result<(), ClientError>, bool, bool) {
     let meter = crate::traffic::enter_direct();
     meter.upload(upload);
     meter.download(download);
@@ -377,11 +384,12 @@ pub(crate) async fn relay_direct_after_first(
         .run(
             copy_direction(cr, tw, &activity, &meter, true, evidence.as_ref()),
             copy_direction(tr, cw, &activity, &meter, false, evidence.as_ref()),
-            ClientError::Timeout,
+            DirectRelayError { error: ClientError::Timeout, peer: false },
         )
         .await;
     let exchanged = evidence.is_some_and(|value| value.0.load(std::sync::atomic::Ordering::Relaxed) == 3);
-    (result, exchanged)
+    let peer_failure = result.as_ref().is_err_and(|error| error.peer);
+    (result.map_err(|error| error.error), exchanged, peer_failure)
 }
 
 #[cfg(test)]

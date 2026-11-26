@@ -125,6 +125,17 @@ pub(crate) async fn direct(
 type Fallback = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Tunnel, ClientError>> + Send>>;
 const FIRST_RESPONSE: Duration = Duration::from_secs(5);
 
+#[derive(Debug)]
+enum LocalRelayError {
+    Peer(ClientError),
+    Application(ClientError),
+}
+impl LocalRelayError {
+    fn into_client(self) -> ClientError {
+        match self { Self::Peer(error) | Self::Application(error) => error }
+    }
+}
+
 pub(crate) enum Tunnel {
     Direct(UdpSocket),
     VerifiedQuic(Box<crate::routing::dpi::VerifiedUdp>, Fallback),
@@ -132,6 +143,15 @@ pub(crate) enum Tunnel {
     H3(Box<crate::h3_client::H3Tunnel>),
 }
 impl Tunnel {
+    pub(crate) fn record_transport(&self, observed: &std::sync::atomic::AtomicU8) {
+        let (transport, up) = match self {
+            Self::H2(tunnel) => (2, tunnel.opened_stream_up()),
+            Self::H3(tunnel) => (3, tunnel.opened_stream_up()),
+            Self::Direct(_) | Self::VerifiedQuic(..) => return,
+        };
+        observed.store((transport << 2) | if up { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) async fn relay(
         self,
         mut upload: mpsc::Receiver<Vec<u8>>,
@@ -150,9 +170,12 @@ impl Tunnel {
                 }
                 // Once a send is attempted no fallback or replay is legal.
                 drop(fallback);
-                let result = relay_local(&verified.socket, true, Some(first), upload, download).await;
-                if result.is_err() { verified.failed(); }
-                result
+                let result = relay_local(&verified.socket, Some(FIRST_RESPONSE), Some(first), upload, download).await;
+                if matches!(&result, Err(LocalRelayError::Peer(_))) {
+                    verified.failed();
+                    crate::traffic::udp_peer_failure();
+                }
+                result.map_err(LocalRelayError::into_client)
             }
             other => other.relay_selected(None, upload, download).await,
         }
@@ -167,7 +190,7 @@ impl Tunnel {
         match self {
             Self::H2(t) => t.relay_udp(first, upload, download).await,
             Self::H3(t) => t.relay_udp(first, upload, download).await,
-            Self::Direct(socket) => relay_local(&socket, false, first, upload, download).await,
+            Self::Direct(socket) => relay_local(&socket, None, first, upload, download).await.map_err(LocalRelayError::into_client),
             Self::VerifiedQuic(..) => Err(ClientError::Protocol),
         }
     }
@@ -179,51 +202,52 @@ pub(crate) async fn next_datagram(first: &mut Option<Vec<u8>>, upload: &mut mpsc
 
 async fn relay_local(
     socket: &UdpSocket,
-    verified: bool,
+    verification_deadline: Option<Duration>,
     mut first: Option<Vec<u8>>,
     mut upload: mpsc::Receiver<Vec<u8>>,
     download: mpsc::Sender<Vec<u8>>,
-) -> Result<(), ClientError> {
+) -> Result<(), LocalRelayError> {
     let traffic = crate::traffic::enter_udp(crate::Role::Client, false, true);
     let activity = Activity::new();
     // For verified QUIC, start the receive deadline only after a successful
     // first application write. No server response is assumed authenticated.
-    if verified {
-        let data = first.take().ok_or(ClientError::Protocol)?;
-        timeout(FIRST_RESPONSE, send_datagram(socket, &data)).await
-            .map_err(|_| ClientError::Timeout)?.map_err(|_| ClientError::Io)?;
+    if let Some(deadline) = verification_deadline {
+        let data = first.take().ok_or(LocalRelayError::Application(ClientError::Protocol))?;
+        timeout(deadline, send_datagram(socket, &data)).await
+            .map_err(|_| LocalRelayError::Peer(ClientError::Timeout))?
+            .map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
         traffic.upload(data.len());
         crate::traffic::udp_verified_local();
         activity.touch();
     }
     let send = async {
         while let Some(data) = next_datagram(&mut first, &mut upload).await {
-            send_datagram(socket, &data).await.map_err(|_| ClientError::Io)?;
+            send_datagram(socket, &data).await.map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
             traffic.upload(data.len());
             activity.touch();
         }
-        Ok::<(), ClientError>(())
+        Ok::<(), LocalRelayError>(())
     };
     let receive = async {
         let mut buf = vec![0; protocol::MAX_DATAGRAM + 1];
-        let mut waiting = verified.then(|| Instant::now() + FIRST_RESPONSE);
+        let mut waiting = verification_deadline.map(|duration| Instant::now() + duration);
         loop {
             let n = if let Some(deadline) = waiting {
-                timeout_at(deadline, socket.recv(&mut buf)).await.map_err(|_| ClientError::Timeout)?
+                timeout_at(deadline, socket.recv(&mut buf)).await.map_err(|_| LocalRelayError::Peer(ClientError::Timeout))?
             } else {
                 socket.recv(&mut buf).await
-            }.map_err(|_| ClientError::Io)?;
+            }.map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
             if n > protocol::MAX_DATAGRAM { continue; }
             if waiting.take().is_some() {
                 crate::traffic::udp_peer_reply();
             }
-            if deliver(&download, || buf[..n].to_vec())? {
+            if deliver(&download, || buf[..n].to_vec()).map_err(LocalRelayError::Application)? {
                 traffic.download(n);
                 activity.touch();
             }
         }
         #[allow(unreachable_code)]
-        Ok::<(), ClientError>(())
+        Ok::<(), LocalRelayError>(())
     };
     tokio::select! { result=send=>result, result=receive=>result, ()=activity.expire()=>Ok(()) }
 }
@@ -358,7 +382,7 @@ mod tests {
         let (up, rx) = mpsc::channel(QUEUE);
         let (down, mut responses) = mpsc::channel(QUEUE);
         let task = tokio::spawn(async move {
-            relay_local(&socket, true, Some(b"first".to_vec()), rx, down).await
+            relay_local(&socket, Some(FIRST_RESPONSE), Some(b"first".to_vec()), rx, down).await
         });
         let mut buf = [0; 32];
         let (n, peer) = timeout(Duration::from_secs(2), target.recv_from(&mut buf)).await.unwrap().unwrap();
@@ -370,6 +394,22 @@ mod tests {
         assert_eq!(n, 0);
         drop(up);
         assert!(task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn verified_first_response_timeout_does_not_repeat_datagram() {
+        let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = connect(target.local_addr().unwrap()).await.unwrap();
+        let (_up, rx) = mpsc::channel(QUEUE);
+        let (down, _responses) = mpsc::channel(QUEUE);
+        let task = tokio::spawn(async move {
+            relay_local(&socket, Some(Duration::from_millis(50)), Some(b"first".to_vec()), rx, down).await
+        });
+        let mut buf = [0; 32];
+        let (n, _) = timeout(Duration::from_secs(2), target.recv_from(&mut buf)).await.unwrap().unwrap();
+        assert_eq!(&buf[..n], b"first");
+        assert!(matches!(task.await.unwrap(), Err(LocalRelayError::Peer(ClientError::Timeout))));
+        assert!(timeout(Duration::from_millis(30), target.recv_from(&mut buf)).await.is_err());
     }
 
     #[tokio::test]

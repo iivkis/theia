@@ -117,7 +117,8 @@ impl Observer {
 pub(crate) async fn await_candidate(mut classification: tokio::sync::watch::Receiver<Candidate>) -> Candidate {
     let initial = classification.borrow_and_update().clone();
     if initial != Candidate::Pending { return initial; }
-    match tokio::time::timeout(CLASSIFY_BUDGET, classification.wait_for(|value| *value != Candidate::Pending)).await {
+    let ready = tokio::time::timeout(CLASSIFY_BUDGET, classification.wait_for(|value| *value != Candidate::Pending)).await;
+    match ready {
         Ok(Ok(value)) => value.clone(),
         _ => Candidate::Other,
     }

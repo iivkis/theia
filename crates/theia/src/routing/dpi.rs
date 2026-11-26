@@ -22,6 +22,11 @@ const ATTEMPT: Duration = Duration::from_secs(2);
 const OPEN_BUDGET: Duration = Duration::from_secs(6);
 const FIRST_FLIGHT: Duration = Duration::from_secs(5);
 
+pub(crate) fn stale_policy() -> ClientError {
+    crate::traffic::dpi_policy_stale();
+    ClientError::Open(crate::protocol::ErrorCode::PolicyDenied)
+}
+
 /// Profile-local, bounded strategy evidence. No state on disk or in logs.
 /// Consent is local configuration, not a command in the server snapshot.
 pub(crate) struct Engine {
@@ -48,7 +53,7 @@ pub(crate) struct VerifiedUdp {
 impl VerifiedUdp {
     pub(crate) fn admissible(&self) -> Result<bool, ClientError> {
         if !self.engine.policy_current(self.key.policy) {
-            return Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied));
+            return Err(stale_policy());
         }
         Ok(self.engine.enabled()
             && network_scope::observe(self.key.address) == Some(self.key.network)
@@ -281,7 +286,7 @@ impl Tunnel {
         };
         // A superseded/expired policy is not permission for VPS fallback.
         if !self.engine.policy_current(self.key.policy) {
-            return Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied));
+            return Err(stale_policy());
         }
         let transformed = if ready {
             tls::transform(&prefix, &self.key.name, self.strategy)
@@ -341,7 +346,7 @@ impl Tunnel {
             .map_err(|_| ClientError::Io)?;
         let hello_elapsed = started.elapsed();
         crate::traffic::dpi_first_response();
-        let (result, exchanged) = super::client_state::relay_direct_after_first(
+        let (result, exchanged, peer_failure) = super::client_state::relay_direct_after_first(
             client,
             self.target,
             prefix.len(),
@@ -352,10 +357,10 @@ impl Tunnel {
         // traffic. Do not penalize a clean early application disconnect.
         if exchanged {
             self.engine.cache.observe(&self.key, self.strategy, true, hello_elapsed);
-        } else if result.is_err() {
+        } else if peer_failure {
             self.engine.cache.failed(&self.key, self.strategy);
-            crate::traffic::dpi_first_failure();
         }
+        if peer_failure { crate::traffic::dpi_post_hello_failure(); }
         result?;
         Ok(RelayOutcome::Finished)
     }

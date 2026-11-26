@@ -1156,7 +1156,7 @@ async fn routed_open(
                 }
             }
             // A changed local policy does not authorize an older fallback.
-            if !cache.dpi.policy_current(snapshot.digest()) { return Err(denied()); }
+            if !cache.dpi.policy_current(snapshot.digest()) { return Err(crate::routing::dpi::stale_policy()); }
             // Failed local probe/dial or unsupported traffic uses the same
             // authenticated VPS carrier. No silent unprotected direct route.
             let tunnel = carrier.open(address, port).await?;
@@ -1175,6 +1175,7 @@ async fn routed_udp(
     address: Address,
     port: u16,
     candidate: &crate::routing::dpi::udp::Candidate,
+    observed: &Arc<std::sync::atomic::AtomicU8>,
 ) -> Result<crate::udp_relay::Tunnel, ClientError> {
     let (snapshot, action, pinned) = route_decision(carrier, cache, &address).await?;
     match action {
@@ -1205,8 +1206,10 @@ async fn routed_udp(
                             if let Some(verified) = cache.dpi.open_quic_udp(name, port, &ips, snapshot.digest()).await {
                                 let carrier = carrier.clone();
                                 let target = address.clone();
+                                let observed = observed.clone();
                                 let fallback = Box::pin(async move {
                                     let tunnel = carrier.open_udp(target, port).await?;
+                                    tunnel.record_transport(&observed);
                                     crate::traffic::udp_dpi_fallback();
                                     Ok(tunnel)
                                 });
@@ -1217,7 +1220,7 @@ async fn routed_udp(
                 }
             }
             if !cache.dpi.policy_current(snapshot.digest()) {
-                return Err(ClientError::Open(ErrorCode::PolicyDenied));
+                return Err(crate::routing::dpi::stale_policy());
             }
             let tunnel = carrier.open_udp(address, port).await?;
             crate::traffic::udp_dpi_fallback();
@@ -1297,10 +1300,16 @@ impl ProxyClient {
         candidate: &crate::routing::dpi::udp::Candidate,
     ) -> Result<crate::udp_relay::Tunnel, ClientError> {
         match self {
-            Self::Direct(c) => routed_udp(&c.carrier, &c.routing, address, port, candidate).await,
+            Self::Direct(c) => {
+                let tunnel = routed_udp(&c.carrier, &c.routing, address, port, candidate, &c.last_open).await?;
+                tunnel.record_transport(&c.last_open);
+                Ok(tunnel)
+            }
             Self::Reality(c) => {
                 let generation = c.generation().await?;
-                routed_udp(&generation.carrier, &c.routing, address, port, candidate).await
+                let tunnel = routed_udp(&generation.carrier, &c.routing, address, port, candidate, &generation.last_open).await?;
+                tunnel.record_transport(&generation.last_open);
+                Ok(tunnel)
             }
         }
     }
@@ -1446,7 +1455,7 @@ impl ClientRuntime {
             stage: tokio::sync::Mutex::new(()),
         })
     }
-    pub(crate) async fn status(&self) -> (u64, [u8; 32], u64, u8, u8, bool, (u64, u8), [u64; 30]) {
+    pub(crate) async fn status(&self) -> (u64, [u8; 32], u64, u8, u8, bool, (u64, u8), [u64; 33]) {
         let view = self.slot.borrow().clone();
         let (desc, observed, fallback) = match &view.client {
             ProxyClient::Reality(r) => {
@@ -2269,6 +2278,11 @@ async fn udp_association(
         tx: mpsc::Sender<Vec<u8>>,
         observer: Observer,
         classification: tokio::sync::watch::Sender<Candidate>,
+        finished: Arc<std::sync::atomic::AtomicBool>,
+    }
+    struct Completion(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Completion {
+        fn drop(&mut self) { self.0.store(true, std::sync::atomic::Ordering::Release); }
     }
     let mut flows = std::collections::HashMap::<(Address, u16), Flow>::new();
     let mut tasks = tokio::task::JoinSet::new();
@@ -2279,13 +2293,14 @@ async fn udp_association(
             result=control.read(&mut control_byte)=>{
                 return match result { Ok(0)=>Ok(()), Ok(_)=>Err(ClientError::Protocol), Err(_)=>Err(ClientError::Io) };
             }
-            _=tasks.join_next(), if !tasks.is_empty()=>{ flows.retain(|_,flow|!flow.tx.is_closed()); }
+            _=tasks.join_next(), if !tasks.is_empty()=>{ flows.retain(|_,flow|!flow.finished.load(std::sync::atomic::Ordering::Acquire)); }
             result=socket.recv_from(&mut buf)=>{
                 let (n,source)=result.map_err(|_|ClientError::Io)?;
                 if source.ip()!=peer.ip() || pinned.is_some_and(|old|old!=source) { continue; }
                 let Some((address,port,data))=udp_relay::parse_socks(&buf[..n]) else { continue; };
                 if pinned.is_none() { pinned=Some(source); }
                 let key=(address,port);
+                flows.retain(|_,flow|!flow.finished.load(std::sync::atomic::Ordering::Acquire));
                 if let Some(flow)=flows.get(&key) {
                     // Full queue drops the datagram, never replays it.
                     if !flow.tx.is_closed() {
@@ -2302,20 +2317,25 @@ async fn udp_association(
                             }
                             Err(_) => crate::traffic::udp_queue_drop(),
                         }
-                        continue;
+                    } else {
+                        // The previous flow still owns the downstream queue.
+                        crate::traffic::udp_queue_drop();
                     }
+                    continue;
                 }
-                flows.retain(|_,flow|!flow.tx.is_closed());
                 if tasks.len()>=MAX_FLOWS { crate::traffic::udp_queue_drop(); continue; }
                 let (tx,rx)=mpsc::channel(QUEUE);
                 let _=tx.try_send(data.to_vec());
                 let observer=Arc::new(std::sync::Mutex::new(udp::Observer::default()));
                 let candidate=observer.lock().unwrap_or_else(|e|e.into_inner()).outgoing(data);
                 let (classification,classified)=tokio::sync::watch::channel(candidate);
-                flows.insert(key.clone(),Flow { tx, observer: observer.clone(), classification });
+                let finished=Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let completion=Completion(finished.clone());
+                flows.insert(key.clone(),Flow { tx, observer: observer.clone(), classification, finished });
                 let socket=socket.clone();
                 let proxy=(*client).clone();
                 tasks.spawn(async move {
+                    let _completion=completion;
                     let (address,port)=key;
                     let candidate=udp::await_candidate(classified).await;
                     let tunnel=proxy.open_udp(address.clone(),port,&candidate).await?;
