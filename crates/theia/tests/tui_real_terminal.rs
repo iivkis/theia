@@ -407,13 +407,36 @@ async fn compiled_dual_mode_tui_invitation_import_apply_and_rollback() {
         .unwrap()
         .ip();
     let reserve = |ip| {
-        (0..16)
-            .find_map(|_| {
-                let tcp = TcpListener::bind(std::net::SocketAddr::new(ip, 0)).ok()?;
-                let udp = UdpSocket::bind(tcp.local_addr().ok()?).ok()?;
-                Some((tcp, udp))
-            })
-            .unwrap()
+        // TCP and UDP have distinct ephemeral/excluded port ranges on
+        // Windows. Keep unsuccessful reservations alive during the search
+        // so an allocator cannot repeatedly return the same unusable port.
+        let mut tcp_rejected = Vec::new();
+        let mut udp_rejected = Vec::new();
+        let mut last_error = None;
+        let addr = std::net::SocketAddr::new(ip, 0);
+        for _ in 0..128 {
+            match UdpSocket::bind(addr) {
+                Ok(udp) => match TcpListener::bind(udp.local_addr().unwrap()) {
+                    Ok(tcp) => return (tcp, udp),
+                    Err(error) => {
+                        last_error = Some(error);
+                        udp_rejected.push(udp);
+                    }
+                },
+                Err(error) => last_error = Some(error),
+            }
+            match TcpListener::bind(addr) {
+                Ok(tcp) => match UdpSocket::bind(tcp.local_addr().unwrap()) {
+                    Ok(udp) => return (tcp, udp),
+                    Err(error) => {
+                        last_error = Some(error);
+                        tcp_rejected.push(tcp);
+                    }
+                },
+                Err(error) => last_error = Some(error),
+            }
+        }
+        panic!("cannot reserve a shared TCP/UDP port on {ip}: {last_error:?}");
     };
     let own = reserve(localhost);
     let smart = reserve(std::net::Ipv4Addr::LOCALHOST.into());
