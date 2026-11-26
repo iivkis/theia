@@ -444,7 +444,7 @@ impl ServerContext {
         &self,
         request: &Request<T>,
         peer: IpAddr,
-    ) -> Result<(SessionPermit, Arc<[u8]>), StatusCode> {
+    ) -> Result<(SessionPermit, Arc<crate::routing::exchange::Published>), StatusCode> {
         if !self.is_routing_request(request) || request.uri().query().is_some()
             || request.headers().contains_key(crate::split_http::PAIR_HEADER)
         {
@@ -457,7 +457,18 @@ impl ServerContext {
         let permit = self.authorize(request.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()))
             .map_err(AuthFailure::status)?;
         let publication = self.routing.as_ref().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        Ok((permit, publication.wire.clone()))
+        Ok((permit, publication.clone()))
+    }
+
+    pub(crate) async fn routing_response(
+        &self,
+        publication: &crate::routing::exchange::Published,
+        headers: &http::HeaderMap,
+    ) -> Result<Arc<[u8]>, StatusCode> {
+        crate::routing::exchange::response_data(
+            publication, headers, self.policy.allow_private_ips,
+            Duration::from_millis(u64::from(self.policy.connect_timeout_ms)),
+        ).await
     }
 
     pub(crate) fn is_descriptor_request<T>(&self, request: &Request<T>) -> bool {
@@ -1252,7 +1263,7 @@ async fn handle_routing(
     peer: IpAddr,
     binding: Option<&crate::channel_binding::Admission>,
 ) -> Result<(), ServerError> {
-    let (_permit, signed) = match context.authorize_routing(&request, peer) {
+    let (_permit, publication) = match context.authorize_routing(&request, peer) {
         Ok(value) => value,
         Err(status) => return reject(&mut respond, status).await,
     };
@@ -1270,6 +1281,10 @@ async fn handle_routing(
     if !empty {
         return reject(&mut respond, StatusCode::BAD_REQUEST).await;
     }
+    let signed = match context.routing_response(&publication, request.headers()).await {
+        Ok(bytes) => bytes,
+        Err(status) => return reject(&mut respond, status).await,
+    };
     let response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")

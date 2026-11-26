@@ -280,7 +280,7 @@ async fn handle_routing(
     peer: IpAddr,
     binding: Option<&crate::channel_binding::Admission>,
 ) {
-    let (_permit, signed) = match context.authorize_routing(&request, peer) {
+    let (_permit, publication) = match context.authorize_routing(&request, peer) {
         Ok(value) => value,
         Err(status) => {
             reject_split(&mut stream, status).await;
@@ -301,6 +301,10 @@ async fn handle_routing(
         reject_split(&mut stream, StatusCode::BAD_REQUEST).await;
         return;
     }
+    let signed = match context.routing_response(&publication, request.headers()).await {
+        Ok(bytes) => bytes,
+        Err(status) => { reject_split(&mut stream, status).await; return; }
+    };
     let Ok(response) = Response::builder()
         .status(StatusCode::OK)
         .header(http::header::CONTENT_TYPE, "application/octet-stream")

@@ -251,6 +251,19 @@ impl H3Client {
 
     /// Authenticated binary policy snapshot for this exact inbound path.
     pub(crate) async fn fetch_routing(&self) -> Result<Vec<u8>, ClientError> {
+        self.routing_resource(None).await
+    }
+
+    pub(crate) async fn resolve_routing(&self, name: &str, digest: [u8; 32]) -> Result<Vec<std::net::IpAddr>, ClientError> {
+        let bytes = self.routing_resource(Some((name, digest))).await?;
+        crate::routing::exchange::decode_ips(&bytes)
+    }
+
+    pub(crate) fn own_routing_scope(&self) -> Option<&str> {
+        self.own_routes.as_ref()?.routing.strip_prefix("/v1/")?.strip_suffix("/routing")
+    }
+
+    async fn routing_resource(&self, domain: Option<(&str, [u8; 32])>) -> Result<Vec<u8>, ClientError> {
         let routes = self
             .identity_routes
             .as_ref().or(self.own_routes.as_ref())
@@ -269,12 +282,16 @@ impl H3Client {
                 .map_err(|_| ClientError::Configuration)?,
             );
             let uri = Uri::from_parts(parts).map_err(|_| ClientError::Configuration)?;
-            let request = Request::get(uri)
+            let mut request = Request::get(uri)
                 .header(header::AUTHORIZATION, self.authorization.clone())
                 .body(())
                 .map_err(|_| ClientError::Configuration)?;
+            if let Some((name, digest)) = domain {
+                crate::routing::exchange::request_domain(&mut request, name, digest)?;
+            }
+            let request = crate::channel_binding::attach(connection.binding.as_ref(), self.padding.request(request)?)?;
             let mut stream = sender
-                .send_request(self.padding.request(request)?)
+                .send_request(request)
                 .await
                 .map_err(|_| ClientError::Http3)?;
             stream.finish().await.map_err(|_| ClientError::Http3)?;
@@ -284,6 +301,7 @@ impl H3Client {
                 .map_err(|_| ClientError::Http3)?;
             crate::split_http::check_status(response.status())?;
             let expected = crate::routing::exchange::validate_headers(response.headers())?;
+            if domain.is_some() && expected > crate::routing::exchange::DNS_LIMIT { return Err(ClientError::Protocol); }
             let mut bytes = Vec::new();
             while let Some(mut chunk) = stream.recv_data().await.map_err(|_| ClientError::Http3)? {
                 if chunk.remaining() > expected.saturating_sub(bytes.len()) {
