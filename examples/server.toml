@@ -37,7 +37,7 @@ connect_timeout_ms = 10000
 # revision = 2
 # [[server.policy.routing.rules]]
 # name = "DPI fallback example"
-# action = "direct_dpi"
+# action = "direct_via_client_anti_dpi"
 # domains = ["example.org"]
 # ips = []
 

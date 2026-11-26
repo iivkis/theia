@@ -783,20 +783,15 @@ impl RoutingPanel {
         }
     }
     fn action_name(action: crate::routing::Action) -> &'static str {
-        match action {
-            crate::routing::Action::Direct => "direct",
-            crate::routing::Action::DirectDpi => "direct_dpi",
-            crate::routing::Action::Blocked => "blocked",
-            crate::routing::Action::Allowed => "allowed",
-        }
+        action.name()
     }
     fn action_label(value: &str) -> &str {
-        match value {
-            "direct" => "Напрямую",
-            "direct_dpi" => "Anti-DPI / резерв VPS",
-            "blocked" => "Блокировать",
-            "allowed" => "Через сервер",
-            _ => value,
+        match crate::routing::Action::from_name(value) {
+            Some(crate::routing::Action::Direct) => "Напрямую",
+            Some(crate::routing::Action::DirectDpi) => "Anti-DPI / резерв VPS",
+            Some(crate::routing::Action::Blocked) => "Блокировать",
+            Some(crate::routing::Action::Allowed) => "Через сервер",
+            None => value,
         }
     }
     fn edit(&mut self, index: Option<usize>) {
@@ -813,7 +808,7 @@ impl RoutingPanel {
             .unwrap_or_else(|| {
                 [
                     String::new(),
-                    "allowed".into(),
+                    crate::routing::Action::Allowed.name().into(),
                     String::new(),
                     String::new(),
                 ]
@@ -918,7 +913,7 @@ impl RoutingPanel {
                     fields[*focus].clear()
                 }
                 KeyCode::Left | KeyCode::Right if *focus == 1 => {
-                    let options = ["allowed", "direct", "blocked", "direct_dpi"];
+                    let options = crate::routing::Action::ALL.map(crate::routing::Action::name);
                     let index = options.iter().position(|a| *a == fields[1]).unwrap_or(0);
                     let next = if key.code == KeyCode::Right {
                         (index + 1) % options.len()
@@ -940,15 +935,9 @@ impl RoutingPanel {
                     fields[*focus].push(c)
                 }
                 KeyCode::Enter => {
-                    let action = match fields[1].trim() {
-                        "direct" => crate::routing::Action::Direct,
-                        "direct_dpi" => crate::routing::Action::DirectDpi,
-                        "blocked" => crate::routing::Action::Blocked,
-                        "allowed" => crate::routing::Action::Allowed,
-                        _ => {
-                            self.message = "Выберите действие стрелками влево или вправо.".into();
-                            return true;
-                        }
+                    let Some(action) = crate::routing::Action::from_name(fields[1].trim()) else {
+                        self.message = "Выберите действие стрелками влево или вправо.".into();
+                        return true;
                     };
                     let split = |s: &str| {
                         s.split(|c: char| c == ',' || c.is_whitespace())
@@ -9070,7 +9059,7 @@ mod tests {
         let (_, fields, _) = panel.fields.as_mut().unwrap();
         *fields = [
             "local".into(),
-            "direct".into(),
+            "direct_via_client".into(),
             "full:localhost".into(),
             String::new(),
         ];
@@ -9084,7 +9073,7 @@ mod tests {
         let (_, fields, _) = panel.fields.as_mut().unwrap();
         *fields = [
             "DPI".into(),
-            "direct_dpi".into(),
+            "direct_via_client_anti_dpi".into(),
             "example.org".into(),
             String::new(),
         ];

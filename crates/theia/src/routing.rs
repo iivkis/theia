@@ -26,13 +26,14 @@ const MAX_ENTRIES: usize = 2_000_000;
 const MAX_REGEXES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 pub enum Action {
+    #[serde(rename = "direct_via_client")]
     Direct,
+    #[serde(rename = "blackhole")]
     Blocked,
+    #[serde(rename = "proxy_via_server")]
     Allowed,
-    /// Prefer an explicitly authorized proxy-based DPI strategy; otherwise use the VPS.
-    #[serde(rename = "direct_dpi")]
+    #[serde(rename = "direct_via_client_anti_dpi")]
     DirectDpi,
 }
 
@@ -72,6 +73,22 @@ impl Classification {
 }
 
 impl Action {
+    /// Canonical v1 routing names shared by config, snapshots and UI.
+    pub const ALL: [Self; 4] = [Self::Allowed, Self::Direct, Self::Blocked, Self::DirectDpi];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Direct => "direct_via_client",
+            Self::Blocked => "blackhole",
+            Self::Allowed => "proxy_via_server",
+            Self::DirectDpi => "direct_via_client_anti_dpi",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|action| action.name() == name)
+    }
+
     pub fn packet_action(self) -> PacketAction {
         match self {
             Self::Direct => PacketAction::Pass,
@@ -773,6 +790,21 @@ mod tests {
         assert_eq!(Action::DirectDpi.packet_action(), PacketAction::Modify);
         assert_eq!(Action::Allowed.packet_action(), PacketAction::Redirect);
         assert_eq!(Action::Blocked.packet_action(), PacketAction::Drop);
+    }
+
+    #[test]
+    fn canonical_action_names_reject_legacy_in_v1() {
+        for action in Action::ALL {
+            let rule = rule(action, &["example.org"], &[]);
+            let wire = toml::to_string(&rule).unwrap();
+            assert!(wire.contains(action.name()));
+            assert_eq!(Action::from_name(action.name()), Some(action));
+            assert_eq!(toml::from_str::<Rule>(&wire).unwrap(), rule);
+            for old in ["direct", "allowed", "blocked", "direct_dpi"] {
+                assert!(Action::from_name(old).is_none());
+                assert!(toml::from_str::<Rule>(&wire.replace(action.name(), old)).is_err());
+            }
+        }
     }
 
     #[test]
