@@ -1,5 +1,7 @@
 //! Shared route matching primitives for server and client.
 //! No DNS, transport, file I/O or implicit bypass occurs in this module.
+pub mod snapshot;
+
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -129,14 +131,82 @@ impl DomainPattern {
     }
 }
 
+#[derive(Debug, Default)]
+struct DomainCategory {
+    full: HashSet<String>,
+    suffix: HashSet<String>,
+    other: Vec<DomainPattern>,
+}
+impl DomainCategory {
+    fn insert(&mut self, pattern: DomainPattern) {
+        match pattern {
+            DomainPattern::Full(name) => { self.full.insert(name); }
+            DomainPattern::Suffix(name) => { self.suffix.insert(name); }
+            other => self.other.push(other),
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.full.is_empty() && self.suffix.is_empty() && self.other.is_empty()
+    }
+    fn matches(&self, host: &str) -> bool {
+        self.full.contains(host)
+            || self.suffix.contains(host)
+            || host.match_indices('.').any(|(index, _)| self.suffix.contains(&host[index + 1..]))
+            || self.other.iter().any(|p| p.matches(host))
+    }
+}
+
 #[derive(Debug)]
 struct IpCategory {
-    cidrs: Vec<Cidr>,
+    v4: Vec<(u128, u128)>,
+    v6: Vec<(u128, u128)>,
     reverse: bool,
 }
+
+fn merge_ranges(mut ranges: Vec<(u128, u128)>) -> Vec<(u128, u128)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(u128, u128)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1.saturating_add(1) {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    merged
+}
+fn range_contains(ranges: &[(u128, u128)], ip: u128) -> bool {
+    let position = ranges.partition_point(|(start, _)| *start <= ip);
+    position > 0 && ip <= ranges[position - 1].1
+}
 impl IpCategory {
+    fn new(cidrs: Vec<Cidr>, reverse: bool) -> Self {
+        let mut v4 = Vec::new();
+        let mut v6 = Vec::new();
+        for cidr in cidrs {
+            match cidr.address {
+                IpAddr::V4(ip) => {
+                    let mask = if cidr.prefix == 0 { 0 } else { u32::MAX << (32 - cidr.prefix) };
+                    let start = u32::from(ip) & mask;
+                    v4.push((u128::from(start), u128::from(start | !mask)));
+                }
+                IpAddr::V6(ip) => {
+                    let mask = if cidr.prefix == 0 { 0 } else { u128::MAX << (128 - cidr.prefix) };
+                    let start = u128::from(ip) & mask;
+                    v6.push((start, start | !mask));
+                }
+            }
+        }
+        Self { v4: merge_ranges(v4), v6: merge_ranges(v6), reverse }
+    }
     fn matches(&self, ip: IpAddr) -> bool {
-        self.cidrs.iter().any(|cidr| cidr.matches(ip)) != self.reverse
+        let contained = match ip {
+            IpAddr::V4(ip) => range_contains(&self.v4, u128::from(u32::from(ip))),
+            IpAddr::V6(ip) => range_contains(&self.v6, u128::from(ip)),
+        };
+        contained != self.reverse
     }
 }
 
@@ -292,7 +362,7 @@ struct CompiledRule {
 #[derive(Debug)]
 pub struct Policy {
     rules: Vec<CompiledRule>,
-    sites: HashMap<String, Vec<DomainPattern>>,
+    sites: HashMap<String, DomainCategory>,
     ips: HashMap<String, IpCategory>,
 }
 
@@ -350,14 +420,14 @@ impl Policy {
             let Field::Bytes(bytes) = value else { return Err(RoutingError::InvalidDat); };
             let code = entry_code(bytes)?;
             if !site_codes.contains(&code) { continue; }
-            let mut entries = Vec::new();
+            let mut entries = DomainCategory::default();
             let mut entry = Wire(bytes);
             while let Some((field, value)) = entry.next()? {
                 if field != 2 { continue; }
                 let Field::Bytes(bytes) = value else { return Err(RoutingError::InvalidDat); };
                 count += 1;
                 if count > MAX_ENTRIES { return Err(RoutingError::Limit); }
-                entries.push(dat_domain(bytes, &mut regex_count)?);
+                entries.insert(dat_domain(bytes, &mut regex_count)?);
             }
             if entries.is_empty() || sites.insert(code, entries).is_some() {
                 return Err(RoutingError::InvalidDat);
@@ -385,7 +455,7 @@ impl Policy {
                     _ => {}
                 }
             }
-            if cidrs.is_empty() || ips.insert(code, IpCategory { cidrs, reverse: reverse.unwrap_or(false) }).is_some() {
+            if cidrs.is_empty() || ips.insert(code, IpCategory::new(cidrs, reverse.unwrap_or(false))).is_some() {
                 return Err(RoutingError::InvalidDat);
             }
         }
@@ -409,7 +479,7 @@ impl Policy {
             let domain_match = domain.as_ref().is_some_and(|host| {
                 rule.domains.iter().any(|selector| match selector {
                     DomainSelector::Literal(pattern) => pattern.matches(host),
-                    DomainSelector::Category(code) => self.sites[code].iter().any(|p| p.matches(host)),
+                    DomainSelector::Category(code) => self.sites[code].matches(host),
                 })
             });
             let ip_match = ip.is_some_and(|ip| rule.ips.iter().any(|selector| match selector {
