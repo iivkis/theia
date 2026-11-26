@@ -2,6 +2,7 @@
 //! No DNS, transport, file I/O or implicit bypass occurs in this module.
 pub mod snapshot;
 pub mod geodata;
+pub(crate) mod exchange;
 mod settings;
 pub use settings::Settings;
 
@@ -486,6 +487,21 @@ impl Policy {
     /// An absent result is not an authorization: the transport still needs ACL.
     /// A DNS name may be evaluated without resolving it; a caller can supply
     /// an independently pinned IP in a second evaluation.
+    /// A DNS name is not enough to choose a route if an earlier rule can
+    /// match a resolved IP. Never assume that an unknown IP is a non-match.
+    pub fn domain_decision(&self, domain: &str) -> Result<Option<Action>, RoutingError> {
+        let host = domain_name(domain)?;
+        for rule in &self.rules {
+            let matched = rule.domains.iter().any(|selector| match selector {
+                DomainSelector::Literal(pattern) => pattern.matches(&host),
+                DomainSelector::Category(code) => self.sites[code].matches(&host),
+            });
+            if matched { return Ok(Some(rule.action)); }
+            if !rule.ips.is_empty() { return Ok(None); }
+        }
+        Ok(Some(Action::Allowed))
+    }
+
     pub fn matching_action(&self, domain: Option<&str>, ip: Option<IpAddr>) -> Result<Option<Action>, RoutingError> {
         let domain = domain.map(domain_name).transpose()?;
         let ip = ip.map(|ip| match ip {

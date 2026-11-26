@@ -33,6 +33,7 @@ pub(crate) struct IdentityRoutes {
     download: String,
     pub(crate) descriptor: String,
     pub(crate) successor: String,
+    pub(crate) routing: String,
 }
 
 impl IdentityRoutes {
@@ -46,6 +47,7 @@ impl IdentityRoutes {
             download: format!("{prefix}/stream-up/download"),
             descriptor: format!("{prefix}/descriptor"),
             successor: format!("{prefix}/successor"),
+            routing: format!("{prefix}/routing"),
         })
     }
 

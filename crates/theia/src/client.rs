@@ -326,6 +326,60 @@ impl H2Client {
         .map_err(|_| ClientError::Timeout)?
     }
 
+    /// Authenticated binary policy snapshot for this exact inbound path.
+    pub(crate) async fn fetch_routing(&self) -> Result<Vec<u8>, ClientError> {
+        let routes = self
+            .identity_routes
+            .as_ref().or(self.own_routes.as_ref())
+            .ok_or(ClientError::Configuration)?;
+        timeout(crate::routing::exchange::TRANSFER_TIMEOUT, async {
+            let connection = self.connect_verified(diagnostics::next_id()).await?;
+            let sender = connection
+                .sender
+                .lock()
+                .map_err(|_| ClientError::Http2)?
+                .clone();
+            let mut sender = sender.ready().await.map_err(|_| ClientError::Http2)?;
+            let mut parts = self.uri.clone().into_parts();
+            parts.path_and_query = Some(
+                (&routes.routing)
+                .parse()
+                .map_err(|_| ClientError::Configuration)?,
+            );
+            let uri = http::Uri::from_parts(parts).map_err(|_| ClientError::Configuration)?;
+            let request = Request::get(uri)
+                .header(header::AUTHORIZATION, self.authorization.clone())
+                .body(())
+                .map_err(|_| ClientError::Configuration)?;
+            let (response, _) = sender
+                .send_request(self.padding.request(request)?, true)
+                .map_err(|_| ClientError::Http2)?;
+            let response = response.await.map_err(|_| ClientError::Http2)?;
+            crate::split_http::check_status(response.status())?;
+            let expected = crate::routing::exchange::validate_headers(response.headers())?;
+            let mut body = response.into_body();
+            let mut bytes = Vec::new();
+            while let Some(chunk) = body.data().await {
+                let chunk = chunk.map_err(|_| ClientError::Http2)?;
+                crate::routing::exchange::append(&mut bytes, &chunk, expected)?;
+                body.flow_control()
+                    .release_capacity(chunk.len())
+                    .map_err(|_| ClientError::Http2)?;
+            }
+            if body
+                .trailers()
+                .await
+                .map_err(|_| ClientError::Http2)?
+                .is_some()
+            {
+                return Err(ClientError::Protocol);
+            }
+            crate::routing::exchange::finish(bytes, expected)
+        })
+        .await
+        .map_err(|_| ClientError::Timeout)?
+    }
+
     /// Experimental API only: build a separately verified BoringSSL connector
     /// with one explicit CA PEM. Not selected by TOML, H3 or the default CLI;
     /// never treat this as a named Chrome/browser fingerprint.

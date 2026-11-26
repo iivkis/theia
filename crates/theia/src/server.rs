@@ -141,6 +141,7 @@ pub struct ServerContext {
     identity_gate: Option<Arc<RwLock<bool>>>,
     authorization: Arc<AuthCell>,
     policy: ServerPolicy,
+    routing: Result<Arc<crate::routing::exchange::Published>, ServerError>,
     global_streams: Arc<Semaphore>,
     user_streams: Arc<HashMap<String, Arc<Semaphore>>>,
     connection_slots: Arc<Semaphore>,
@@ -224,6 +225,7 @@ impl ServerContext {
             identity_gate: None,
             authorization,
             policy: policy.clone(),
+            routing: crate::routing::exchange::Published::prepare(inbound, policy).map(Arc::new).map_err(|_| ServerError::Config),
             global_streams,
             user_streams,
             connection_slots,
@@ -282,6 +284,8 @@ impl ServerContext {
         }
         let paths = crate::split_http::IdentityRoutes::new(&d.path_prefix)
             .map_err(|_| ServerError::Config)?;
+        self.routing = crate::routing::exchange::Published::for_scope(&inbound.id, &self.policy).map(Arc::new).map_err(|_| ServerError::Config);
+        self.routing.as_ref().map_err(|_| ServerError::Config)?;
         self.padding = d.padding.clone();
         self.identity_routes = Some(RwLock::new(IdentityRoutePolicy {
             paths,
@@ -335,6 +339,7 @@ impl ServerContext {
             identity_gate: Some(gate),
             authorization: self.authorization.clone(),
             policy: self.policy.clone(),
+            routing: self.routing.clone(),
             global_streams: self.global_streams.clone(),
             user_streams: self.user_streams.clone(),
             connection_slots: self.connection_slots.clone(),
@@ -426,6 +431,35 @@ impl ServerContext {
         }
     }
 
+    /// Routing data is private to authenticated grants, including own-TLS.
+    pub(crate) fn is_routing_request<T>(&self, request: &Request<T>) -> bool {
+        if request.method() != Method::GET { return false; }
+        match &self.identity_routes {
+            Some(routes) => routes.read().is_ok_and(|r| r.current() && request.uri().path() == r.paths.routing),
+            None => self.own_routes.as_ref().is_some_and(|r| request.uri().path() == r.routing),
+        }
+    }
+
+    pub(crate) fn authorize_routing<T>(
+        &self,
+        request: &Request<T>,
+        peer: IpAddr,
+    ) -> Result<(SessionPermit, Arc<[u8]>), StatusCode> {
+        if !self.is_routing_request(request) || request.uri().query().is_some()
+            || request.headers().contains_key(crate::split_http::PAIR_HEADER)
+        {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        if !self.peer_budget.admit(peer, Instant::now()) { return Err(StatusCode::TOO_MANY_REQUESTS); }
+        if request.headers().get_all(header::AUTHORIZATION).iter().count() != 1 {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        let permit = self.authorize(request.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()))
+            .map_err(AuthFailure::status)?;
+        let publication = self.routing.as_ref().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        Ok((permit, publication.wire.clone()))
+    }
+
     pub(crate) fn is_descriptor_request<T>(&self, request: &Request<T>) -> bool {
         self.identity_routes.as_ref().is_some_and(|routes| {
             routes.read().is_ok_and(|routes| {
@@ -506,7 +540,8 @@ impl ServerContext {
         address: &Address,
         port: u16,
     ) -> Result<TcpStream, ErrorCode> {
-        connect_target(address, port, &self.policy).await
+        let routing = self.routing.as_ref().map_err(|_| ErrorCode::PolicyDenied)?;
+        connect_target(address, port, &self.policy, routing.snapshot.policy()).await
     }
 
     /// Identical admission, route, content type, credential and user quota
@@ -784,7 +819,14 @@ async fn connect_target(
     address: &Address,
     port: u16,
     policy: &ServerPolicy,
+    routing: &crate::routing::Policy,
 ) -> Result<TcpStream, ErrorCode> {
+    let domain = match address { Address::Dns(name) => Some(name.as_str()), _ => None };
+    if let Some(name) = domain {
+        if matches!(routing.domain_decision(name).map_err(|_| ErrorCode::PolicyDenied)?, Some(crate::routing::Action::Direct | crate::routing::Action::Blocked)) {
+            return Err(ErrorCode::PolicyDenied);
+        }
+    }
     let duration = Duration::from_millis(u64::from(policy.connect_timeout_ms));
     let deadline = tokio::time::Instant::now() + duration;
     timeout(duration, async {
@@ -798,9 +840,16 @@ async fn connect_target(
                 .collect(),
         };
         let permitted = permitted_candidates(candidates, policy.allow_private_ips)?;
+        let mut routed = Vec::new();
+        for candidate in permitted {
+            if routing.matching_action(domain, Some(candidate.ip())).map_err(|_| ErrorCode::PolicyDenied)?.unwrap_or(crate::routing::Action::Allowed) == crate::routing::Action::Allowed {
+                routed.push(candidate);
+            }
+        }
+        if routed.is_empty() { return Err(ErrorCode::PolicyDenied); }
         // Pin each ACL-checked SocketAddr. Share the remaining deadline
         // between candidates so an unresponsive IPv6 route cannot starve IPv4.
-        dial_candidates(&permitted, deadline, TcpStream::connect).await
+        dial_candidates(&routed, deadline, TcpStream::connect).await
     })
     .await
     .map_err(|_| ErrorCode::DialTimeout)?
@@ -1092,7 +1141,9 @@ pub(crate) async fn serve_h2_socket<S>(
         let pair = pair.clone();
         let binding = binding.clone();
         handlers.spawn(async move {
-            let result = if context.is_descriptor_request(&request) {
+            let result = if context.is_routing_request(&request) {
+                handle_routing(request, respond, &context, peer.ip(), binding.as_deref()).await
+            } else if context.is_descriptor_request(&request) {
                 handle_descriptor(request, respond, &context, peer.ip()).await
             } else if context.accepts_split(&request) {
                 handle_split_request(
@@ -1193,6 +1244,70 @@ async fn handle_descriptor(
     .await
     .map_err(|_| ServerError::Io)?
 }
+
+async fn handle_routing(
+    mut request: Request<h2::RecvStream>,
+    mut respond: h2::server::SendResponse<Bytes>,
+    context: &ServerContext,
+    peer: IpAddr,
+    binding: Option<&crate::channel_binding::Admission>,
+) -> Result<(), ServerError> {
+    let (_permit, signed) = match context.authorize_routing(&request, peer) {
+        Ok(value) => value,
+        Err(status) => return reject(&mut respond, status).await,
+    };
+    if !crate::channel_binding::admit(binding, &[&request]) { return reject(&mut respond, StatusCode::UNAUTHORIZED).await; }
+    let empty = timeout(HANDSHAKE_TIMEOUT, async {
+        request.body_mut().data().await.is_none()
+            && request
+                .body_mut()
+                .trailers()
+                .await
+                .is_ok_and(|value| value.is_none())
+    })
+    .await
+    .unwrap_or(false);
+    if !empty {
+        return reject(&mut respond, StatusCode::BAD_REQUEST).await;
+    }
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, signed.len().to_string())
+        .body(())
+        .map_err(|_| ServerError::Http2)?;
+    let mut output = respond
+        .send_response(context.pad_response(response)?, false)
+        .map_err(|_| ServerError::Http2)?;
+    timeout(crate::routing::exchange::TRANSFER_TIMEOUT, async {
+        output.reserve_capacity(signed.len().min(64 * 1024));
+        let mut remaining: &[u8] = &signed;
+        while !remaining.is_empty() {
+            let credit = std::future::poll_fn(|cx| output.poll_capacity(cx))
+                .await
+                .ok_or(ServerError::Io)?
+                .map_err(|_| ServerError::Io)?;
+            if credit == 0 {
+                continue;
+            }
+            let count = credit.min(remaining.len()).min(64 * 1024);
+            output
+                .send_data(
+                    Bytes::copy_from_slice(&remaining[..count]),
+                    count == remaining.len(),
+                )
+                .map_err(|_| ServerError::Io)?;
+            remaining = &remaining[count..];
+            if !remaining.is_empty() {
+                output.reserve_capacity(remaining.len().min(64 * 1024));
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| ServerError::Io)?
+}
+
 
 async fn handle_request(
     request: Request<h2::RecvStream>,
@@ -2066,6 +2181,7 @@ async fn prepare_selected_listeners_inner(
                 limits.connections.clone(),
                 limits.peer_budget.clone(),
             );
+            context.routing.as_ref().map_err(|_| ServerError::Config)?;
             context.live_quota = Some(limits.ledger.clone());
             #[cfg(test)]
             let carrier = if let Some(start) = guard_start {
@@ -2139,6 +2255,7 @@ async fn prepare_selected_listeners_inner(
             limits.connections.clone(),
             limits.peer_budget.clone(),
         );
+        context.routing.as_ref().map_err(|_| ServerError::Config)?;
         context.live_quota = Some(limits.ledger.clone());
         context.apply_own_tls_policy();
         listeners.push(ReadyListener::Plain(
@@ -3469,6 +3586,7 @@ async fn run_reality_document_inner(
             connections.clone(),
             peers.clone(),
         );
+        context.routing.as_ref().map_err(|_| ServerError::Config)?;
         context.live_quota = Some(ledger.clone());
         context.apply_own_tls_policy();
         if inbound.security_mode == crate::security_profile::SecurityMode::SmartReality {
@@ -3720,6 +3838,7 @@ async fn run_document_with_config(
             connections.clone(),
             peer_budget.clone(),
         );
+        context.routing.as_ref().map_err(|_| ServerError::Config)?;
         context.apply_own_tls_policy();
         prepared.push((listener, acceptor, endpoint, Arc::new(context)));
     }

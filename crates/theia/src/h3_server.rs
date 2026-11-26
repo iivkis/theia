@@ -205,7 +205,9 @@ pub(crate) async fn run_connection(
                 crate::diag!(Warn, "server.h3", "request_headers_failed_or_timeout");
                 return;
             };
-            if context.is_descriptor_request(&request) {
+            if context.is_routing_request(&request) {
+                handle_routing(request, stream, &context, peer, binding.as_deref()).await;
+            } else if context.is_descriptor_request(&request) {
                 handle_descriptor(request, stream, &context, peer).await;
             } else if context.accepts_split(&request) {
                 handle_split_request(request, stream, &context, peer, &pair, binding.as_deref())
@@ -270,6 +272,62 @@ async fn handle_descriptor(
         stream.stop_sending(Code::H3_REQUEST_CANCELLED);
     }
 }
+
+async fn handle_routing(
+    request: Request<()>,
+    mut stream: Stream,
+    context: &ServerContext,
+    peer: IpAddr,
+    binding: Option<&crate::channel_binding::Admission>,
+) {
+    let (_permit, signed) = match context.authorize_routing(&request, peer) {
+        Ok(value) => value,
+        Err(status) => {
+            reject_split(&mut stream, status).await;
+            return;
+        }
+    };
+    if !crate::channel_binding::admit(binding, &[&request]) { reject_split(&mut stream, StatusCode::UNAUTHORIZED).await; return; }
+    let empty = timeout(HANDSHAKE_TIMEOUT, async {
+        stream.recv_data().await.is_ok_and(|data| data.is_none())
+            && stream
+                .recv_trailers()
+                .await
+                .is_ok_and(|trailers| trailers.is_none())
+    })
+    .await
+    .unwrap_or(false);
+    if !empty {
+        reject_split(&mut stream, StatusCode::BAD_REQUEST).await;
+        return;
+    }
+    let Ok(response) = Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "application/octet-stream")
+        .header(http::header::CONTENT_LENGTH, signed.len().to_string())
+        .body(())
+    else {
+        return;
+    };
+    if !matches!(
+        timeout(crate::routing::exchange::TRANSFER_TIMEOUT, async {
+            stream
+                .send_response(context.pad_response(response)?)
+                .await
+                .map_err(|_| ServerError::Io)?;
+            for chunk in signed.chunks(64 * 1024) {
+                stream.send_data(Bytes::copy_from_slice(chunk)).await.map_err(|_| ServerError::Io)?;
+            }
+            stream.finish().await.map_err(|_| ServerError::Io)
+        })
+        .await,
+        Ok(Ok(()))
+    ) {
+        stream.stop_stream(Code::H3_REQUEST_CANCELLED);
+        stream.stop_sending(Code::H3_REQUEST_CANCELLED);
+    }
+}
+
 
 async fn handle_request(
     request: Request<()>,
