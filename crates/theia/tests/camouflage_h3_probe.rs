@@ -1,5 +1,9 @@
 //! Native Linux/Windows CI: strict, explicitly approved QUIC/H3 TLS observations.
 //! Real local UDP/QUIC handshakes, never public targets or DNS.
+#[path = "support/quinn_reference.rs"]
+mod quinn_reference;
+
+use quinn_reference as quic_transport;
 use rcgen::generate_simple_self_signed;
 use rustls::{pki_types::PrivatePkcs8KeyDer, RootCertStore};
 use std::{net::SocketAddr, time::Duration};
@@ -7,7 +11,6 @@ use theia::{
     camouflage_discovery::Observation,
     camouflage_h3_probe::{probe_quic_h3, H3ProbeError},
     camouflage_probe::{ProbeApproval, ProbeRequest},
-    quic_transport,
 };
 use tokio::time::timeout;
 
