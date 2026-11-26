@@ -4374,26 +4374,31 @@ fn draw_guided(
             parts[1].width.saturating_sub(4),
             parts[1].height,
         );
-        let page = usize::from(body_area.height.saturating_sub(1)).max(1);
+        let raw_page = usize::from(body_area.height.saturating_sub(1)).max(1);
         let count = lines.len();
+        // Reserve space for a repeated heading when the remaining-candidate table
+        // is longer than the viewport. The final row must remain reachable.
+        let table_header = if review.as_ref().is_some_and(|r| r.expanded) && count > raw_page && raw_page > 1 {
+            lines.iter().position(|line| line.spans.iter().any(|span| span.content == "Остальные проверенные сайты"))
+                .and_then(|start| lines.get(start + 1).filter(|line| line.spans.iter().any(|span| span.content.starts_with("Сайт ") && span.content.contains("TLS / H2 / H3"))).map(|_| start + 1))
+        } else { None };
+        let page = raw_page - usize::from(table_header.is_some());
         let offset = viewport.map_or(0, |v| v.position(&caption, count, page, None));
         let status = if count > page {
             format!(
-                "{}–{}/{} · Shift+PgUp/PgDn или колесо",
+                "{}–{}/{} · {} или колесо",
                 offset + 1,
                 (offset + page).min(count),
-                count
+                count,
+                if matches!(heading, "Полный отчёт" | "Полный список целей" | "Точные адреса проверки") { "PgUp/PgDn" } else { "Shift+PgUp/PgDn" }
             )
         } else if parts[0].height == 0 {
             caption.clone()
         } else {
             String::new()
         };
-        let sticky = if review.as_ref().is_some_and(|r| r.expanded) && offset > 0 && page > 1 {
-            lines[..offset].iter().rev().find(|line| line.spans.iter().any(|span| span.content.starts_with("Сайт ") && span.content.contains("TLS / H2 / H3"))).cloned()
-                .filter(|_| lines.get(offset).is_some_and(|line| line.spans.len() >= 3))
-        } else { None };
-        let mut visible: Vec<_> = lines.into_iter().skip(offset).take(page.saturating_sub(usize::from(sticky.is_some()))).collect();
+        let sticky = table_header.filter(|&index| index < offset).map(|index| lines[index].clone());
+        let mut visible: Vec<_> = lines.into_iter().skip(offset).take(page).collect();
         if let Some(header) = sticky { visible.insert(0, header); }
         if !status.is_empty() {
             visible.push(Line::styled(status, Style::default().fg(MUTED)));
@@ -7356,6 +7361,26 @@ mod tests {
         ui.update(&mut model, press(KeyCode::Esc));
         assert!(!ui.editor.as_ref().unwrap().dirty());
         assert!(!ui.server_process.running());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reality_success_handoff_opens_key_draft_without_issuing_or_starting() {
+        let path = std::env::temp_dir().join(crate::tui_editor::generated_id("reality-success-handoff").unwrap());
+        let original = server_issuance_fixture().replace("disabled = false", "disabled = true");
+        assert_ne!(original, server_issuance_fixture());
+        std::fs::write(&path, &original).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Server, &path).unwrap()));
+        ui.after_reality_success(Some("device-a".into()));
+        assert!(matches!(&ui.issuance, Some(IssueFlow::Input(id)) if id == "device-a"));
+        assert_eq!(ui.workspace_page, 2);
+        assert!(!ui.editor.as_ref().unwrap().dirty());
+        assert!(!ui.server_process.running());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        ui.issuance = None;
+        ui.after_reality_success(None);
+        assert!(ui.issuance.is_none());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         std::fs::remove_file(path).unwrap();
     }

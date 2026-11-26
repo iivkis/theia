@@ -394,7 +394,7 @@ impl Form {
                     1,
                 );
                 let placeholder;
-                let value = if field.value.is_empty() { placeholder = format!("Пример: {value}"); placeholder.as_str() } else { value };
+                let value = if field.value.is_empty() && field.hint.starts_with("Пример: ") { placeholder = format!("Пример: {value}"); placeholder.as_str() } else { value };
                 let shown = fit_value(value, input.width.saturating_sub(3), selected && !field.value.is_empty());
                 let content = if selected && !picker && !field.value.is_empty() {
                     format!(" {shown} ▏")
@@ -721,7 +721,7 @@ pub(crate) fn confirmation_bar(frame: &mut Frame<'_>, area: Rect, heading: &str,
         Rect::new(area.x, area.y, area.width, 1));
     if area.height < 2 { return; }
     let half = area.width / 2;
-    for (i, (label, x, width)) in [("Отменить", area.x, half), (confirm, area.x + half, area.width - half)].into_iter().enumerate() {
+    for (i, (label, x, width)) in [(if matches!(confirm, "Выпустить ключ доступа" | "Открыть пользователей") { "К обзору" } else { "Отменить" }, area.x, half), (confirm, area.x + half, area.width - half)].into_iter().enumerate() {
         let active = (i == 1) == selected;
         let shown = fit_value(label, width.saturating_sub(2), false);
         frame.render_widget(Paragraph::new(format!("{} {shown}", if active { "›" } else { " " }))

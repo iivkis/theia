@@ -1246,7 +1246,7 @@ impl Wizard {
                             self.error = "Укажите IP из панели хостинга.".into();
                         } else { self.error.clear(); }
                     }
-                    KeyCode::F(4) if self.sources && self.focus == 4 && self.custom_enabled => { self.domain_draft = Some(DomainDraft::new(&self.fields[4])); }
+                    KeyCode::F(4) if self.sources && self.custom_enabled => { self.focus = 4; self.domain_draft = Some(DomainDraft::new(&self.fields[4])); }
                     KeyCode::F(6) if !self.sources && self.focus == 5 => self.open_grants(),
                     KeyCode::Tab | KeyCode::Down => self.move_focus(true),
                     KeyCode::BackTab | KeyCode::Up => self.move_focus(false),
@@ -2333,6 +2333,26 @@ mod tests {
         draft.paste(&"x".repeat(LIMIT));
         assert_eq!(draft.value(), before);
         assert!(!draft.error.is_empty());
+        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("wizard-domain-draft").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("server.toml");
+        let mut wizard = Wizard::first(path.clone()).unwrap();
+        wizard.sources = true;
+        wizard.custom_enabled = true;
+        wizard.fields[4] = "example.org".into();
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        wizard.key(press(KeyCode::F(4)));
+        wizard.key(press(KeyCode::Enter));
+        wizard.paste("example.net");
+        wizard.key(press(KeyCode::Esc));
+        assert_eq!(wizard.fields[4], "example.org");
+        wizard.key(press(KeyCode::F(4)));
+        wizard.key(press(KeyCode::Enter));
+        wizard.paste("example.net");
+        wizard.key(press(KeyCode::F(4)));
+        assert_eq!(wizard.fields[4], "example.org,example.net");
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
