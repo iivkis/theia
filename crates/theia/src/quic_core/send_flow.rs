@@ -13,6 +13,7 @@ struct Stream {
     offset: u64,
     limit: u64,
     fin: bool,
+    reset: bool,
 }
 
 pub struct SendFlow {
@@ -40,7 +41,7 @@ impl SendFlow {
         let n = self.next_uni;
         if n >= self.max_streams { return Err(Error::Limit); }
         let id = n * 4 + 2 + self.local_bit;
-        self.streams.insert(id, Stream { offset: 0, limit: self.initial_limit, fin: false });
+        self.streams.insert(id, Stream { offset: 0, limit: self.initial_limit, fin: false, reset: false });
         self.next_uni += 1;
         Ok(id)
     }
@@ -58,7 +59,7 @@ impl SendFlow {
     pub fn open_bidi(&mut self) -> Result<u64, Error> {
         if self.next_bidi >= self.max_bidi { return Err(Error::Limit); }
         let id = self.next_bidi * 4 + self.local_bit;
-        self.streams.insert(id, Stream { offset: 0, limit: self.initial_limit, fin: false });
+        self.streams.insert(id, Stream { offset: 0, limit: self.initial_limit, fin: false, reset: false });
         self.next_bidi += 1;
         Ok(id)
     }
@@ -68,7 +69,7 @@ impl SendFlow {
         if id > MAX_VARINT || id & 2 != 0 || id & 1 == self.local_bit || id / 4 >= self.peer_bidi {
             return Err(Error::Stream);
         }
-        self.streams.entry(id).or_insert(Stream { offset: 0, limit: self.initial_limit, fin: false });
+        self.streams.entry(id).or_insert(Stream { offset: 0, limit: self.initial_limit, fin: false, reset: false });
         Ok(())
     }
 
@@ -95,6 +96,23 @@ impl SendFlow {
         let stream = self.streams.get_mut(&id).ok_or(Error::Stream)?;
         stream.limit = stream.limit.max(value);
         Ok(())
+    }
+
+    /// STOP_SENDING or a local reset terminates the send direction. The
+    /// final offset includes all bytes already committed to send credit.
+    /// The caller cancels queued STREAM frames and reliably sends RESET.
+    pub fn reset(&mut self, id: u64, code: u64) -> Result<Option<Vec<u8>>, Error> {
+        let stream = self.streams.get_mut(&id).ok_or(Error::Stream)?;
+        if code > MAX_VARINT { return Err(Error::Limit); }
+        if stream.reset { return Ok(None); }
+        let mut frame = vec![4];
+        for value in [id, code, stream.offset] {
+            let mut scratch = [0; 8];
+            frame.extend_from_slice(encode_varint(value, &mut scratch).ok_or(Error::Limit)?);
+        }
+        stream.reset = true;
+        stream.fin = true;
+        Ok(Some(frame))
     }
 
     /// Encode one STREAM frame and commit newly sent byte offsets. The caller
@@ -133,7 +151,7 @@ mod tests {
         assert_eq!(f.open(), Err(Error::Limit));
         assert_eq!(f.encode(id, b"abcd", false), Err(Error::Limit));
         let bytes = f.encode(id, b"ab", false).unwrap();
-        assert_eq!(decode(&bytes, Space::Application).unwrap(), [Frame::Stream { id, offset: 0, data: b"ab", fin: false }]);
+        assert_eq!(decode(&bytes, Space::Application).unwrap(), [Frame::Stream { id, offset: 0, data: b"ab", fin: false, reset: false }]);
         f.max_stream_data(id, 4).unwrap();
         f.max_stream_data(id, 1).unwrap();
         f.encode(id, b"cd", true).unwrap();
@@ -144,4 +162,16 @@ mod tests {
         f.max_data(5).unwrap();
         f.encode(second, b"x", true).unwrap();
     }
+    #[test]
+    fn reset_serializes_committed_offset_and_is_idempotent() {
+        let mut f = SendFlow::new(false, 1, 8, 8).unwrap();
+        let id = f.open().unwrap();
+        f.encode(id, b"abc", false).unwrap();
+        let frame = f.reset(id, 17).unwrap().unwrap();
+        assert_eq!(decode(&frame, Space::Application).unwrap(),
+            [Frame::ResetStream { id, code: 17, final_size: 3 }]);
+        assert_eq!(f.reset(id, 17), Ok(None));
+        assert_eq!(f.encode(id, b"x", false), Err(Error::Finished));
+    }
+
 }

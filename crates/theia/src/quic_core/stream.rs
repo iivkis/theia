@@ -10,6 +10,7 @@ pub enum ReceiveError {
     Limit,
     FinalSize,
     Conflict,
+    Reset(u64),
 }
 
 pub struct ReceiveBuffer {
@@ -18,6 +19,7 @@ pub struct ReceiveBuffer {
     read_offset: u64,
     highest: u64,
     final_size: Option<u64>,
+    reset_code: Option<u64>,
     bytes: VecDeque<Option<u8>>,
 }
 
@@ -32,6 +34,7 @@ impl ReceiveBuffer {
             read_offset: 0,
             highest: 0,
             final_size: None,
+            reset_code: None,
             bytes: VecDeque::new(),
         })
     }
@@ -57,6 +60,7 @@ impl ReceiveBuffer {
         {
             return Err(ReceiveError::FinalSize);
         }
+        if self.reset_code.is_some() { return Ok(()); }
         if end.saturating_sub(self.read_offset) > self.window as u64 {
             return Err(ReceiveError::Limit);
         }
@@ -87,6 +91,24 @@ impl ReceiveBuffer {
         Ok(())
     }
 
+    /// RESET_STREAM fixes final size even if bytes are missing. Credit is
+    /// checked by the owner before this mutation; do not allocate gaps.
+    pub fn reset(&mut self, final_size: u64, code: u64) -> Result<(), ReceiveError> {
+        if final_size > self.limit || code > MAX_VARINT { return Err(ReceiveError::Limit); }
+        if final_size < self.highest || self.final_size.is_some_and(|size| size != final_size) {
+            return Err(ReceiveError::FinalSize);
+        }
+        // Already fully consumed FIN wins; late RESET cannot revoke it.
+        if self.finished() { return Ok(()); }
+        self.final_size = Some(final_size);
+        self.highest = final_size;
+        self.reset_code.get_or_insert(code);
+        self.bytes.clear();
+        Ok(())
+    }
+
+    pub fn reset_code(&self) -> Option<u64> { self.reset_code }
+
     pub fn read(&mut self, output: &mut [u8]) -> usize {
         let mut written = 0;
         for slot in output {
@@ -102,7 +124,7 @@ impl ReceiveBuffer {
     }
 
     pub fn finished(&self) -> bool {
-        self.final_size == Some(self.read_offset)
+        self.reset_code.is_none() && self.final_size == Some(self.read_offset)
     }
 
     pub fn limit(&self) -> u64 { self.limit }

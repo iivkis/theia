@@ -84,6 +84,30 @@ impl LabSession {
         self.scheduler.enqueue(frame).map_err(Error::Schedule)
     }
 
+    pub fn reset_stream(&mut self, id: u64, code: u64) -> Result<(), Error> {
+        if self.closed { return Err(Error::Closed); }
+        if !self.scheduler.can_queue() { return Err(Error::Schedule(super::scheduler::Error::Limit)); }
+        if let Some(frame) = self.send.reset(id, code).map_err(Error::Send)? {
+            self.scheduler.cancel_stream(id);
+            if let Err(e) = self.scheduler.enqueue(frame) {
+                self.closed = true;
+                return Err(Error::Schedule(e));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn stop_sending(&mut self, id: u64, code: u64) -> Result<(), Error> {
+        if self.closed { return Err(Error::Closed); }
+        self.receive.check_stop(id).map_err(Error::Receive)?;
+        let mut frame = vec![5];
+        for value in [id, code] {
+            let mut scratch = [0; 8];
+            frame.extend_from_slice(super::wire::encode_varint(value, &mut scratch).ok_or(Error::Protocol)?);
+        }
+        self.scheduler.enqueue(frame).map_err(Error::Schedule)
+    }
+
     pub fn pending(&self) -> usize { self.scheduler.pending() }
 
     pub fn read(&mut self, id: u64, bytes: &mut [u8]) -> Result<usize, Error> {
@@ -183,9 +207,16 @@ impl LabSession {
                         self.send.register_peer_bidi(id).map_err(Error::Send)?;
                     }
                 }
+                Frame::ResetStream { id, code, final_size } => {
+                    self.receive.reset(id, final_size, code).map_err(Error::Receive)?;
+                    if id & 2 == 0 && id & 1 != u64::from(self.server) {
+                        self.send.register_peer_bidi(id).map_err(Error::Send)?;
+                    }
+                }
+                Frame::StopSending { id, code } => self.reset_stream(id, code)?,
                 Frame::MaxData(n) => self.send.max_data(n).map_err(Error::Send)?,
                 Frame::MaxStreamData { id, limit } => self.send.max_stream_data(id, limit).map_err(Error::Send)?,
-                Frame::MaxStreams { bidi: false, limit } => self.send.max_streams(limit).map_err(Error::Send)?,
+                Frame::MaxStreams { bidi: false, limit } => self.send.max_streams(limit.min(MAX_STREAMS)).map_err(Error::Send)?,
                 Frame::MaxStreams { bidi: true, limit } => self.send.max_bidi(limit.min(MAX_STREAMS)).map_err(Error::Send)?,
                 Frame::Close { .. } => { self.closed = true; return Ok(true); }
                 _ => return Err(Error::Protocol),

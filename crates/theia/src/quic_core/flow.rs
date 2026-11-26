@@ -89,8 +89,28 @@ impl ReceiveFlow {
         Ok(())
     }
 
+    pub fn reset(&mut self, id: u64, final_size: u64, code: u64) -> Result<(), Error> {
+        self.check_id(id)?;
+        let old = self.streams.get(&id).map_or(0, ReceiveBuffer::highest_offset);
+        let used = self.used.checked_add(final_size.saturating_sub(old)).ok_or(Error::Limit)?;
+        if used > self.max_data { return Err(Error::Limit); }
+        if let Some(stream) = self.streams.get_mut(&id) {
+            stream.reset(final_size, code).map_err(Error::Receive)?;
+        } else {
+            let mut stream = ReceiveBuffer::new(self.window, self.stream_limit).map_err(Error::Receive)?;
+            stream.reset(final_size, code).map_err(Error::Receive)?;
+            self.streams.insert(id, stream);
+        }
+        self.used = used;
+        Ok(())
+    }
+
+    pub fn check_stop(&self, id: u64) -> Result<(), Error> { self.check_id(id) }
+
     pub fn read(&mut self, id: u64, output: &mut [u8]) -> Result<usize, Error> {
-        Ok(self.streams.get_mut(&id).ok_or(Error::StreamId)?.read(output))
+        let stream = self.streams.get_mut(&id).ok_or(Error::StreamId)?;
+        if let Some(code) = stream.reset_code() { return Err(Error::Receive(ReceiveError::Reset(code))); }
+        Ok(stream.read(output))
     }
 
     /// Read and replenish only the consumed absolute credit. The caller must
@@ -98,6 +118,7 @@ impl ReceiveFlow {
     /// to the peer. Neither duplicate nor out-of-order bytes grant credit.
     pub fn read_replenish(&mut self, id: u64, output: &mut [u8]) -> Result<(usize, u64, u64), Error> {
         let stream = self.streams.get_mut(&id).ok_or(Error::StreamId)?;
+        if let Some(code) = stream.reset_code() { return Err(Error::Receive(ReceiveError::Reset(code))); }
         let n = stream.read(output);
         let limit = stream.limit().saturating_add(n as u64).min(MAX_VARINT);
         stream.extend_limit(limit).map_err(Error::Receive)?;
@@ -139,4 +160,23 @@ mod tests {
         assert_eq!(f.extend_connection_limit(8), Err(Error::Limit));
         assert!(ReceiveFlow::new(false, 64, 1, 16, 16, 8).is_err());
     }
+    #[test]
+    fn reset_charges_final_size_once_and_discards_buffer() {
+        let mut f = ReceiveFlow::new(true, 1, 1, 16, 8, 12).unwrap();
+        f.insert(0, 0, b"abc", false).unwrap();
+        assert_eq!(f.reset(0, 2, 7), Err(Error::Receive(ReceiveError::FinalSize)));
+        assert_eq!(f.reset(0, 13, 7), Err(Error::Limit));
+        assert_eq!(f.used(), 3);
+        f.reset(0, 10, 7).unwrap();
+        assert_eq!(f.used(), 10);
+        f.reset(0, 10, 8).unwrap();
+        f.insert(0, 9, b"x", true).unwrap();
+        assert_eq!(f.used(), 10);
+        assert_eq!(f.read(0, &mut [0; 4]), Err(Error::Receive(ReceiveError::Reset(7))));
+        assert!(!f.finished(0));
+        assert_eq!(f.insert(0, 10, b"x", false), Err(Error::Receive(ReceiveError::FinalSize)));
+        assert_eq!(f.reset(2, 3, 0), Err(Error::Limit));
+        assert_eq!(f.used(), 10);
+    }
+
 }

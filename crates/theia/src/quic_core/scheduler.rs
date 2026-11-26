@@ -59,6 +59,19 @@ impl Scheduler {
 
     pub fn pending(&self) -> usize { self.frames.len() }
 
+    /// Cancel only STREAM data for the reset direction. Keep sent-packet
+    /// accounting until ACK/loss so bytes-in-flight never disappear early.
+    pub fn cancel_stream(&mut self, stream: u64) {
+        use super::{frames::{decode, Frame}, spaces::Space};
+        self.frames.retain(|_, pending| {
+            !matches!(decode(&pending.bytes, Space::Application).as_deref(),
+                Ok([Frame::Stream { id, .. }]) if *id == stream)
+        });
+        self.aliases.retain(|_, id| self.frames.contains_key(id));
+        self.queue.retain(|id| self.frames.contains_key(id));
+        if self.frames.is_empty() { self.last_eliciting = None; }
+    }
+
     /// One frame per packet. PTO may send a single probe over the current
     /// congestion window; ordinary sends remain paced and window-limited.
     pub fn candidate(&mut self, now: Instant) -> Result<Option<(u64, Vec<u8>, bool)>, Error> {
@@ -201,4 +214,20 @@ mod tests {
         assert_eq!(s.window.in_flight(), 0);
         assert_eq!(s.acknowledge(&ack(5000), now), Err(Error::Ledger));
     }
+    #[test]
+    fn cancel_does_not_remove_in_flight_accounting() {
+        let now = Instant::now();
+        let mut s = Scheduler::default();
+        s.enqueue(vec![0x0a, 2, 1, 42]).unwrap();
+        s.enqueue(vec![0x0a, 6, 1, 42]).unwrap();
+        let (id, _, _) = s.candidate(now).unwrap().unwrap();
+        s.record(0, 100, Some((id, false)), now).unwrap();
+        s.cancel_stream(2);
+        assert_eq!(s.pending(), 1);
+        assert_eq!(s.window.in_flight(), 100);
+        s.acknowledge(&ack(0), now).unwrap();
+        assert_eq!(s.window.in_flight(), 0);
+        assert_eq!(s.pending(), 1);
+    }
+
 }
