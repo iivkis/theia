@@ -354,10 +354,45 @@ async fn run_client(
             .spawn()
             .unwrap(),
     );
+    if !successful {
+        // Mandatory authenticated routing preflight now rejects wrong CA or
+        // bearer before either listener is exposed.
+        timeout(Duration::from_secs(15), async {
+            loop {
+                assert!(TcpStream::connect(http).await.is_err());
+                assert!(TcpStream::connect(socks).await.is_err());
+                if let Some(status) = process.0.try_wait().unwrap() {
+                    assert!(!status.success());
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        }).await.expect("invalid client must fail closed before binding");
+        return;
+    }
     await_client(http, &mut process).await;
     await_client(socks, &mut process).await;
     http_connect(http, origin, successful).await;
     socks5_connect(socks, origin, successful).await;
+    // The identical domain rule selects the native Windows listener rather
+    // than the Linux VM origin. The distinctive reply proves the local dial.
+    let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = target.local_addr().unwrap().port();
+    let listener = tokio::spawn(async move {
+        let (mut stream, _) = target.accept().await.unwrap();
+        stream.write_all(b"native-client-origin").await.unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    let mut direct = TcpStream::connect(http).await.unwrap();
+    direct.write_all(format!("CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n").as_bytes()).await.unwrap();
+    assert_eq!(response_head(&mut direct).await, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+    let mut result = Vec::new();
+    direct.read_to_end(&mut result).await.unwrap();
+    assert_eq!(result, b"native-client-origin");
+    listener.await.unwrap();
+    let mut blocked = TcpStream::connect(http).await.unwrap();
+    blocked.write_all(format!("CONNECT blocked.invalid:{port} HTTP/1.1\r\nHost: blocked.invalid:{port}\r\n\r\n").as_bytes()).await.unwrap();
+    assert!(!response_head(&mut blocked).await.starts_with(b"HTTP/1.1 200"));
     assert!(process.0.try_wait().unwrap().is_none());
 }
 

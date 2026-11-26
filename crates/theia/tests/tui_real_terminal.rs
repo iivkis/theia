@@ -188,6 +188,7 @@ async fn compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas() {
                 disabled: false,
             }],
             policy: ServerPolicy {
+                routing: None,
                 allow_private_ips: true,
                 max_connections_per_user: 5,
                 max_connections_total: 12,
@@ -654,6 +655,7 @@ async fn compiled_client_proxy_conpty_lifecycle() {
                 disabled: false,
             }],
             policy: ServerPolicy {
+                routing: None,
                 allow_private_ips: true,
                 max_connections_per_user: 5,
                 max_connections_total: 12,

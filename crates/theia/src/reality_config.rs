@@ -183,6 +183,7 @@ pub(crate) fn first_server_candidate(r: &ServerRequest, now: u64) -> Result<Conf
                 disabled: true,
             }],
             policy: config::ServerPolicy {
+                routing: None,
                 allow_private_ips: false,
                 max_connections_per_user: 64,
                 max_connections_total: 1024,

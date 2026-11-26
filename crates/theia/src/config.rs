@@ -133,6 +133,8 @@ pub struct ServerPolicy {
     pub max_connections_per_user: u32,
     pub max_connections_total: u32,
     pub connect_timeout_ms: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<crate::routing::Settings>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -546,6 +548,9 @@ impl ServerDocument {
             tcp_listeners.push(tcp);
         }
         let p = &self.server.policy;
+        if let Some(routing) = &p.routing {
+            routing.validate().map_err(|_| ConfigError::new("server.policy.routing", "invalid routing settings"))?;
+        }
         ensure(
             p.max_connections_per_user > 0,
             "server.policy.max_connections_per_user",

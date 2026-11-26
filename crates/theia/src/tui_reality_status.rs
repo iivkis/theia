@@ -194,7 +194,7 @@ impl StatusPanel {
                             .ok()
                         });
                     let live=match response{
-                        Some(StatusReply::ClientRunning{revision,config_sha256,descriptor_revision,transport,xhttp,fallback}) if config_sha256 == digest && selected_active =>
+                        Some(StatusReply::ClientRunning{revision,config_sha256,descriptor_revision,transport,xhttp,fallback,..}) if config_sha256 == digest && selected_active =>
                             format!("Фоновый клиент: работает с этими настройками (версия {revision}).\nВерсия описания сервера: {descriptor_revision}\nПоследнее подтверждённое соединение: {}; XHTTP: {}\nВременный переход с H3: {}",
                                 match transport{2=>"H2",3=>"H3",_=>"пока нет"}, crate::local_proxy::xhttp_observation(xhttp), if fallback {"да, H3 временно недоступен"} else {"нет"}),
                         Some(StatusReply::ClientRunning{revision,..})=>format!("Фоновый клиент: работает (версия {revision}), но использование выбранного профиля не подтверждено."),
@@ -871,6 +871,15 @@ impl StatusPanel {
             }
         }
     }
+    pub(crate) fn routing_observation(&self, digest: [u8; 32]) -> Option<String> {
+        if self.digest != digest || !self.client_active { return None; }
+        let run = self.client_run.as_ref()?;
+        run.stop.as_ref()?;
+        let report = run.report.lock().ok()?;
+        let start = report.find("Правила маршрутизации:")?;
+        Some(report[start..].to_owned())
+    }
+
     pub(crate) fn body(&self) -> String {
         if self.show_details {
             if let Some(details) = &self.details {

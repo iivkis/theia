@@ -249,6 +249,81 @@ impl H3Client {
         .map_err(|_| ClientError::Timeout)?
     }
 
+    /// Authenticated binary policy snapshot for this exact inbound path.
+    pub(crate) async fn fetch_routing(&self) -> Result<Vec<u8>, ClientError> {
+        self.routing_resource(None).await
+    }
+
+    pub(crate) async fn resolve_routing(&self, name: &str, digest: [u8; 32]) -> Result<Vec<std::net::IpAddr>, ClientError> {
+        let bytes = self.routing_resource(Some((name, digest))).await?;
+        crate::routing::exchange::decode_ips(&bytes)
+    }
+
+    pub(crate) fn own_routing_scope(&self) -> Option<&str> {
+        self.own_routes.as_ref()?.routing.strip_prefix("/v1/")?.strip_suffix("/routing")
+    }
+
+    async fn routing_resource(&self, domain: Option<(&str, [u8; 32])>) -> Result<Vec<u8>, ClientError> {
+        let routes = self
+            .identity_routes
+            .as_ref().or(self.own_routes.as_ref())
+            .ok_or(ClientError::Configuration)?;
+        timeout(crate::routing::exchange::TRANSFER_TIMEOUT, async {
+            let connection = self.connect_verified(diagnostics::next_id()).await?;
+            let mut sender = connection
+                .sender
+                .lock()
+                .map_err(|_| ClientError::Http3)?
+                .clone();
+            let mut parts = self.uri.clone().into_parts();
+            parts.path_and_query = Some(
+                (&routes.routing)
+                .parse()
+                .map_err(|_| ClientError::Configuration)?,
+            );
+            let uri = Uri::from_parts(parts).map_err(|_| ClientError::Configuration)?;
+            let mut request = Request::get(uri)
+                .header(header::AUTHORIZATION, self.authorization.clone())
+                .body(())
+                .map_err(|_| ClientError::Configuration)?;
+            if let Some((name, digest)) = domain {
+                crate::routing::exchange::request_domain(&mut request, name, digest)?;
+            }
+            let request = crate::channel_binding::attach(connection.binding.as_ref(), self.padding.request(request)?)?;
+            let mut stream = sender
+                .send_request(request)
+                .await
+                .map_err(|_| ClientError::Http3)?;
+            stream.finish().await.map_err(|_| ClientError::Http3)?;
+            let response = stream
+                .recv_response()
+                .await
+                .map_err(|_| ClientError::Http3)?;
+            crate::split_http::check_status(response.status())?;
+            let expected = crate::routing::exchange::validate_headers(response.headers())?;
+            if domain.is_some() && expected > crate::routing::exchange::DNS_LIMIT { return Err(ClientError::Protocol); }
+            let mut bytes = Vec::new();
+            while let Some(mut chunk) = stream.recv_data().await.map_err(|_| ClientError::Http3)? {
+                if chunk.remaining() > expected.saturating_sub(bytes.len()) {
+                    return Err(ClientError::Protocol);
+                }
+                let chunk = chunk.copy_to_bytes(chunk.remaining());
+                crate::routing::exchange::append(&mut bytes, &chunk, expected)?;
+            }
+            if stream
+                .recv_trailers()
+                .await
+                .map_err(|_| ClientError::Http3)?
+                .is_some()
+            {
+                return Err(ClientError::Protocol);
+            }
+            crate::routing::exchange::finish(bytes, expected)
+        })
+        .await
+        .map_err(|_| ClientError::Timeout)?
+    }
+
     /// Reuse verified own-TLS connections within this immutable profile.
     pub(crate) fn set_profile_budget(&mut self, budget: std::sync::Arc<tokio::sync::Semaphore>) {
         self.pool.set_profile_budget(budget);

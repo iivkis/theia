@@ -1,0 +1,238 @@
+//! Profile-scoped routing freshness and durable rollback floor.
+//! A stale/unavailable policy never permits direct or proxy traffic.
+use super::snapshot::{Checkpoint, Snapshot};
+use crate::{client::ClientError, config::Profile, protocol::{Address, ErrorCode}};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    future::Future, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::{Path, PathBuf}, sync::Arc, time::{Duration, Instant},
+};
+use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt}, net::TcpStream};
+
+const TTL: Duration = Duration::from_secs(60);
+const RETRY: Duration = Duration::from_secs(3);
+const DIAL: Duration = Duration::from_secs(15);
+
+pub(crate) fn checkpoint_path(config: Option<&Path>, profile: &Profile, trust: [u8; 32]) -> Result<Option<PathBuf>, ClientError> {
+    let Some(config) = config else { return Ok(None); };
+    let config = std::fs::canonicalize(config).map_err(|_| ClientError::Configuration)?;
+    let parent = config.parent().ok_or(ClientError::Configuration)?;
+    let mut hash = Sha256::new();
+    for value in [
+        config.file_name().ok_or(ClientError::Configuration)?.as_encoded_bytes(),
+        profile.id.as_bytes(), profile.server.as_bytes(), profile.server_name.as_bytes(),
+        profile.path_prefix.as_deref().unwrap_or("").as_bytes(),
+        if profile.reality_profile.is_some() { b"reality".as_slice() } else { b"own-tls".as_slice() },
+        trust.as_slice(),
+    ] {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value);
+    }
+    let digest = hash.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>();
+    Ok(Some(parent.join(format!(".routing-{digest}.toml"))))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Floor {
+    scope: String,
+    checkpoint: Checkpoint,
+}
+
+struct State {
+    snapshot: Option<Arc<Snapshot>>,
+    expires: Option<Instant>,
+    retry: Option<Instant>,
+}
+pub(crate) struct Cache {
+    scope: String,
+    checkpoint: Option<PathBuf>,
+    state: tokio::sync::Mutex<State>,
+}
+
+fn floor_bytes(path: &Path) -> Result<Option<Vec<u8>>, ClientError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => crate::bounded_input::read(path, 4096, true, true).map(|b| Some(b.to_vec())).map_err(|_| ClientError::Configuration),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(ClientError::Configuration),
+    }
+}
+fn read_floor(bytes: &[u8], scope: &str) -> Result<Floor, ClientError> {
+    let value: Floor = toml::from_str(std::str::from_utf8(bytes).map_err(|_| ClientError::Configuration)?)
+        .map_err(|_| ClientError::Configuration)?;
+    if value.scope != scope || value.checkpoint.revision == 0 { return Err(ClientError::Configuration); }
+    Ok(value)
+}
+
+impl Cache {
+    pub(crate) fn new(scope: String, checkpoint: Option<PathBuf>) -> Self {
+        Self { scope, checkpoint, state: tokio::sync::Mutex::new(State { snapshot: None, expires: None, retry: None }) }
+    }
+
+    fn persist(&self, snapshot: &Snapshot, previous: Option<&Snapshot>) -> Result<(), ClientError> {
+        if let Some(previous) = previous {
+            previous.checkpoint().accepts(snapshot).map_err(|_| ClientError::Protocol)?;
+        }
+        let Some(path) = &self.checkpoint else { return Ok(()); };
+        let bytes = floor_bytes(path)?;
+        if let Some(raw) = &bytes {
+            let floor = read_floor(raw, &self.scope)?;
+            floor.checkpoint.accepts(snapshot).map_err(|_| ClientError::Protocol)?;
+            if floor.checkpoint == snapshot.checkpoint() {
+                return crate::config::guarded_trust_assert(path, raw).map_err(|_| ClientError::Configuration);
+            }
+        } else if previous.is_some() {
+            // A running instance must not recreate a deleted trust floor.
+            return Err(ClientError::Configuration);
+        }
+        let floor = Floor { scope: self.scope.clone(), checkpoint: snapshot.checkpoint() };
+        let text = toml::to_string(&floor).map_err(|_| ClientError::Configuration)?;
+        crate::config::guarded_trust_write(path, &text, bytes.as_deref()).map_err(|_| ClientError::Configuration)
+    }
+
+    pub(crate) async fn get<F, Fut>(&self, fetch: F) -> Result<Arc<Snapshot>, ClientError>
+    where F: FnOnce() -> Fut, Fut: Future<Output = Result<Vec<u8>, ClientError>> {
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+        if state.expires.is_some_and(|until| now < until) {
+            if let Some(snapshot) = &state.snapshot {
+                if let Some(path) = &self.checkpoint {
+                    let bytes = floor_bytes(path)?.ok_or(ClientError::Configuration)?;
+                    let floor = read_floor(&bytes, &self.scope)?;
+                    if floor.checkpoint == snapshot.checkpoint() {
+                        return Ok(snapshot.clone());
+                    }
+                    // Another cooperating client has advanced the floor.
+                } else {
+                    return Ok(snapshot.clone());
+                }
+            }
+        }
+        if state.retry.is_some_and(|until| now < until) { return Err(ClientError::Open(ErrorCode::PolicyDenied)); }
+        state.expires = None;
+        state.retry = Some(now + RETRY);
+        let wire = fetch().await?;
+        let scope = self.scope.clone();
+        let snapshot = tokio::task::spawn_blocking(move || Snapshot::decode(&wire, &scope))
+            .await.map_err(|_| ClientError::Protocol)?.map_err(|_| ClientError::Protocol)?;
+        self.persist(&snapshot, state.snapshot.as_deref())?;
+        let snapshot = Arc::new(snapshot);
+        state.snapshot = Some(snapshot.clone());
+        state.expires = Some(Instant::now() + TTL);
+        state.retry = None;
+        Ok(snapshot)
+    }
+    /// (revision, state): 0 unknown, 1 fresh, 2 expired, 3 synchronizing.
+    pub(crate) fn observation(&self) -> (u64, u8) {
+        let Ok(state) = self.state.try_lock() else { return (0, 3); };
+        match state.snapshot.as_ref() {
+            Some(s) => (s.manifest().revision, if state.expires.is_some_and(|t| Instant::now() < t) { 1 } else { 2 }),
+            None => (0, 0),
+        }
+    }
+
+    pub(crate) fn report(&self) -> String {
+        let Ok(state) = self.state.try_lock() else { return "Правила маршрутизации: обновляются".into(); };
+        let revision = state.snapshot.as_ref().map(|s| s.manifest().revision);
+        match (revision, state.expires.is_some_and(|t| Instant::now() < t)) {
+            (Some(rev), true) => format!("Правила маршрутизации: версия {rev}, актуальны"),
+            (Some(rev), false) => format!("Правила маршрутизации: версия {rev} просрочена, новые соединения ждут проверки"),
+            (None, _) => "Правила маршрутизации: ещё не подтверждены".into(),
+        }
+    }
+}
+
+pub(crate) async fn dial_direct(address: Address, port: u16, pinned: Option<Vec<IpAddr>>) -> Result<TcpStream, ClientError> {
+    if port == 0 { return Err(ClientError::Protocol); }
+    tokio::time::timeout(DIAL, async {
+        let candidates = if let Some(ips) = pinned {
+            ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect::<Vec<_>>()
+        } else {
+            match address {
+                Address::V4(ip) => vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port)],
+                Address::V6(ip) => vec![SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip)), port)],
+                Address::Dns(name) => tokio::net::lookup_host((name.as_str(), port)).await
+                    .map_err(|_| ClientError::Open(ErrorCode::DialFailed))?.take(65).collect(),
+            }
+        };
+        if candidates.len() > 64 { return Err(ClientError::Open(ErrorCode::ResourceLimit)); }
+        for addr in candidates {
+            if addr.ip().is_unspecified() || addr.ip().is_multicast() { continue; }
+            if let Ok(socket) = TcpStream::connect(addr).await { return Ok(socket); }
+        }
+        Err(ClientError::Open(ErrorCode::DialFailed))
+    }).await.map_err(|_| ClientError::Open(ErrorCode::DialTimeout))?
+}
+
+async fn copy_direction(
+    mut input: impl AsyncRead + Unpin,
+    mut output: impl AsyncWrite + Unpin,
+    activity: &crate::relay_liveness::Activity,
+    meter: &crate::traffic::Relay<'_>,
+    upload: bool,
+) -> Result<(), ClientError> {
+    let mut bytes = [0u8; 16 * 1024];
+    loop {
+        let count = input.read(&mut bytes).await.map_err(|_| ClientError::Io)?;
+        if count == 0 {
+            output.shutdown().await.map_err(|_| ClientError::Io)?;
+            activity.half_closed();
+            return Ok(());
+        }
+        output.write_all(&bytes[..count]).await.map_err(|_| ClientError::Io)?;
+        activity.data(count);
+        if upload { meter.upload(count); } else { meter.download(count); }
+    }
+}
+
+pub(crate) async fn relay_direct(client: TcpStream, target: TcpStream) -> Result<(), ClientError> {
+    let meter = crate::traffic::enter_direct();
+    let activity = crate::relay_liveness::Activity::new();
+    let (cr, cw) = client.into_split();
+    let (tr, tw) = target.into_split();
+    activity.run(
+        copy_direction(cr, tw, &activity, &meter, true),
+        copy_direction(tr, cw, &activity, &meter, false),
+        ClientError::Timeout,
+    ).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn cache_rejects_rollback_and_equivocation() {
+        let cache = Cache::new("scope".into(), None);
+        let (_, bytes) = Snapshot::build("scope", 2, &[], &[], &[]).unwrap();
+        let accepted = cache.get(|| async { Ok(bytes) }).await.unwrap();
+        assert_eq!(accepted.manifest().revision, 2);
+        assert!(cache.get(|| async { panic!("fresh cache must not fetch") }).await.is_ok());
+        cache.state.lock().await.expires = None;
+        let (_, bytes) = Snapshot::build("scope", 1, &[], &[], &[]).unwrap();
+        assert!(cache.get(|| async { Ok(bytes) }).await.is_err());
+        assert!(cache.get(|| async { panic!("retry throttled") }).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn direct_dial_and_relay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connected = dial_direct(Address::V4([127,0,0,1]), port, None).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let local = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut peer = TcpStream::connect(local.local_addr().unwrap()).await.unwrap();
+        let (client, _) = local.accept().await.unwrap();
+        let task = tokio::spawn(relay_direct(client, connected));
+        peer.write_all(b"hello").await.unwrap();
+        let mut received = [0; 5];
+        server.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"hello");
+        server.write_all(b"world").await.unwrap();
+        peer.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"world");
+        peer.shutdown().await.unwrap();
+        server.shutdown().await.unwrap();
+        assert!(task.await.unwrap().is_ok());
+    }
+}

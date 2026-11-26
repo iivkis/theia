@@ -69,9 +69,9 @@ async fn main() {
         }
         Ok(Command::ClientStatus)=>{
             match management::query_client_environment(management::StatusCommand::ClientStatus).await{
-                Ok(management::StatusReply::ClientRunning{revision,config_sha256,descriptor_revision,transport,xhttp,fallback})=>{
+                Ok(management::StatusReply::ClientRunning{revision,config_sha256,descriptor_revision,transport,xhttp,fallback,routing_revision,routing_state,routing_totals})=>{
                     let digest=config_sha256.iter().map(|b|format!("{b:02x}")).collect::<String>();
-                    Ok(format!("client running; revision={revision}; config_sha256={digest}; descriptor_revision={descriptor_revision}; last_open_transport={transport}; last_open_xhttp={xhttp}; h3_negative_cache={fallback}"))
+                    Ok(format!("client running; revision={revision}; config_sha256={digest}; descriptor_revision={descriptor_revision}; last_open_transport={transport}; last_open_xhttp={xhttp}; h3_negative_cache={fallback}; routing_revision={routing_revision}; routing_state={routing_state}; routing_totals={routing_totals:?}"))
                 }
                 Ok(_)=>Err(CliError::Management(management::ManagementError::InvalidReply)),
                 Err(error)=>Err(CliError::Management(error)),

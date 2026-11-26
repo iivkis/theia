@@ -37,6 +37,7 @@ fn inbound() -> Inbound {
 }
 fn policy(allow_private_ips: bool) -> ServerPolicy {
     ServerPolicy {
+        routing: None,
         allow_private_ips,
         max_connections_per_user: 2,
         max_connections_total: 8,

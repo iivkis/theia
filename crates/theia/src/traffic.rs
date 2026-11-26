@@ -74,6 +74,29 @@ static SERVER_H2: Counters = Counters::new();
 static SERVER_H3: Counters = Counters::new();
 static CLIENT_H2: Counters = Counters::new();
 static CLIENT_H3: Counters = Counters::new();
+static CLIENT_DIRECT: Counters = Counters::new();
+static CLIENT_BLOCKED: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn enter_direct() -> Relay<'static> { CLIENT_DIRECT.enter() }
+pub(crate) fn blocked() { CLIENT_BLOCKED.fetch_add(1, Ordering::Relaxed); }
+pub(crate) fn routing_totals() -> [u64; 7] {
+    let direct = CLIENT_DIRECT.snapshot();
+    let proxied = snapshot(Role::Client);
+    [direct.upload, direct.download, proxied[0].upload.saturating_add(proxied[1].upload),
+     proxied[0].download.saturating_add(proxied[1].download), CLIENT_BLOCKED.load(Ordering::Relaxed),
+     direct.active, proxied[0].active.saturating_add(proxied[1].active)]
+}
+
+pub(crate) fn routing_summary() -> String {
+    routing_summary_from(routing_totals())
+}
+
+pub(crate) fn routing_summary_from(totals: [u64; 7]) -> String {
+    let [direct_up, direct_down, proxy_up, proxy_down, blocked, direct_active, proxy_active] = totals;
+    format!("Маршрутизация: через VPS ↑ {} ↓ {} · напрямую ↑ {} ↓ {} · блокировок {}",
+        bytes(proxy_up), bytes(proxy_down), bytes(direct_up), bytes(direct_down), blocked)
+        + &format!("\nАктивные соединения: напрямую {direct_active}, через VPS {proxy_active}")
+}
 
 fn counters(role: Role, h3: bool) -> &'static Counters {
     match (role, h3) {

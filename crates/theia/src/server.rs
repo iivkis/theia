@@ -171,6 +171,7 @@ impl IdentityRoutePolicy {
 }
 
 pub struct SessionPermit {
+    routing: Arc<crate::routing::exchange::Published>,
     _global: Option<OwnedSemaphorePermit>,
     _user: Option<OwnedSemaphorePermit>,
     _live: Option<crate::quota::Lease>,
@@ -195,7 +196,7 @@ impl ServerContext {
         Self::with_limits(
             inbound,
             policy,
-            AuthCell::isolated(inbound, users),
+            AuthCell::isolated(inbound, users, policy, None),
             Arc::new(Semaphore::new(policy.max_connections_total as usize)),
             Arc::new(all_users),
             Arc::new(Semaphore::new(policy.max_connections_total as usize)),
@@ -282,6 +283,9 @@ impl ServerContext {
         }
         let paths = crate::split_http::IdentityRoutes::new(&d.path_prefix)
             .map_err(|_| ServerError::Config)?;
+        let users = self.authorization.load().map_err(|_| ServerError::Config)?.users.clone();
+        self.authorization = AuthCell::isolated(inbound, &users, &self.policy, Some(&inbound.id));
+        self.routing_publication()?;
         self.padding = d.padding.clone();
         self.identity_routes = Some(RwLock::new(IdentityRoutePolicy {
             paths,
@@ -426,6 +430,50 @@ impl ServerContext {
         }
     }
 
+    /// Routing data is private to authenticated grants, including own-TLS.
+    pub(crate) fn is_routing_request<T>(&self, request: &Request<T>) -> bool {
+        if request.method() != Method::GET { return false; }
+        match &self.identity_routes {
+            Some(routes) => routes.read().is_ok_and(|r| r.current() && request.uri().path() == r.paths.routing),
+            None => self.own_routes.as_ref().is_some_and(|r| request.uri().path() == r.routing),
+        }
+    }
+
+    pub(crate) fn authorize_routing<T>(
+        &self,
+        request: &Request<T>,
+        peer: IpAddr,
+    ) -> Result<(SessionPermit, Arc<crate::routing::exchange::Published>), StatusCode> {
+        if !self.is_routing_request(request) || request.uri().query().is_some()
+            || request.headers().contains_key(crate::split_http::PAIR_HEADER)
+        {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        if !self.peer_budget.admit(peer, Instant::now()) { return Err(StatusCode::TOO_MANY_REQUESTS); }
+        if request.headers().get_all(header::AUTHORIZATION).iter().count() != 1 {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        let permit = self.authorize(request.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()))
+            .map_err(AuthFailure::status)?;
+        let publication = permit.routing.clone();
+        Ok((permit, publication))
+    }
+
+    fn routing_publication(&self) -> Result<Arc<crate::routing::exchange::Published>, ServerError> {
+        self.authorization.load().map_err(|_| ServerError::Config)?.routing.get(&self.inbound_id).cloned().ok_or(ServerError::Config)
+    }
+
+    pub(crate) async fn routing_response(
+        &self,
+        publication: &crate::routing::exchange::Published,
+        headers: &http::HeaderMap,
+    ) -> Result<Arc<[u8]>, StatusCode> {
+        crate::routing::exchange::response_data(
+            publication, headers, self.policy.allow_private_ips,
+            Duration::from_millis(u64::from(self.policy.connect_timeout_ms)),
+        ).await
+    }
+
     pub(crate) fn is_descriptor_request<T>(&self, request: &Request<T>) -> bool {
         self.identity_routes.as_ref().is_some_and(|routes| {
             routes.read().is_ok_and(|routes| {
@@ -506,7 +554,8 @@ impl ServerContext {
         address: &Address,
         port: u16,
     ) -> Result<TcpStream, ErrorCode> {
-        connect_target(address, port, &self.policy).await
+        let routing = self.routing_publication().map_err(|_| ErrorCode::PolicyDenied)?;
+        connect_target(address, port, &self.policy, routing.snapshot.policy()).await
     }
 
     /// Identical admission, route, content type, credential and user quota
@@ -679,6 +728,7 @@ impl ServerContext {
         {
             return Err(AuthFailure::Forbidden);
         }
+        let routing = snapshot.routing.get(&self.inbound_id).cloned().ok_or(AuthFailure::Forbidden)?;
         // Admission and quota resize serialize through a single short
         // occupancy lock across old/new H2 and QUIC listener generations.
         if let Some(ledger) = &self.live_quota {
@@ -690,6 +740,7 @@ impl ServerContext {
                 })
                 .ok_or(AuthFailure::Busy)?;
             return Ok(SessionPermit {
+                routing,
                 _global: None,
                 _user: None,
                 _live: Some(permit),
@@ -709,6 +760,7 @@ impl ServerContext {
             .try_acquire_owned()
             .map_err(|_| AuthFailure::Busy)?;
         Ok(SessionPermit {
+            routing,
             _global: Some(global),
             _user: Some(per_user),
             _live: None,
@@ -784,7 +836,14 @@ async fn connect_target(
     address: &Address,
     port: u16,
     policy: &ServerPolicy,
+    routing: &crate::routing::Policy,
 ) -> Result<TcpStream, ErrorCode> {
+    let domain = match address { Address::Dns(name) => Some(name.as_str()), _ => None };
+    if let Some(name) = domain {
+        if matches!(routing.domain_decision(name).map_err(|_| ErrorCode::PolicyDenied)?, Some(crate::routing::Action::Direct | crate::routing::Action::Blocked)) {
+            return Err(ErrorCode::PolicyDenied);
+        }
+    }
     let duration = Duration::from_millis(u64::from(policy.connect_timeout_ms));
     let deadline = tokio::time::Instant::now() + duration;
     timeout(duration, async {
@@ -798,9 +857,16 @@ async fn connect_target(
                 .collect(),
         };
         let permitted = permitted_candidates(candidates, policy.allow_private_ips)?;
+        let mut routed = Vec::new();
+        for candidate in permitted {
+            if routing.matching_action(domain, Some(candidate.ip())).map_err(|_| ErrorCode::PolicyDenied)?.unwrap_or(crate::routing::Action::Allowed) == crate::routing::Action::Allowed {
+                routed.push(candidate);
+            }
+        }
+        if routed.is_empty() { return Err(ErrorCode::PolicyDenied); }
         // Pin each ACL-checked SocketAddr. Share the remaining deadline
         // between candidates so an unresponsive IPv6 route cannot starve IPv4.
-        dial_candidates(&permitted, deadline, TcpStream::connect).await
+        dial_candidates(&routed, deadline, TcpStream::connect).await
     })
     .await
     .map_err(|_| ErrorCode::DialTimeout)?
@@ -1092,7 +1158,9 @@ pub(crate) async fn serve_h2_socket<S>(
         let pair = pair.clone();
         let binding = binding.clone();
         handlers.spawn(async move {
-            let result = if context.is_descriptor_request(&request) {
+            let result = if context.is_routing_request(&request) {
+                handle_routing(request, respond, &context, peer.ip(), binding.as_deref()).await
+            } else if context.is_descriptor_request(&request) {
                 handle_descriptor(request, respond, &context, peer.ip()).await
             } else if context.accepts_split(&request) {
                 handle_split_request(
@@ -1193,6 +1261,74 @@ async fn handle_descriptor(
     .await
     .map_err(|_| ServerError::Io)?
 }
+
+async fn handle_routing(
+    mut request: Request<h2::RecvStream>,
+    mut respond: h2::server::SendResponse<Bytes>,
+    context: &ServerContext,
+    peer: IpAddr,
+    binding: Option<&crate::channel_binding::Admission>,
+) -> Result<(), ServerError> {
+    let (_permit, publication) = match context.authorize_routing(&request, peer) {
+        Ok(value) => value,
+        Err(status) => return reject(&mut respond, status).await,
+    };
+    if !crate::channel_binding::admit(binding, &[&request]) { return reject(&mut respond, StatusCode::UNAUTHORIZED).await; }
+    let empty = timeout(HANDSHAKE_TIMEOUT, async {
+        request.body_mut().data().await.is_none()
+            && request
+                .body_mut()
+                .trailers()
+                .await
+                .is_ok_and(|value| value.is_none())
+    })
+    .await
+    .unwrap_or(false);
+    if !empty {
+        return reject(&mut respond, StatusCode::BAD_REQUEST).await;
+    }
+    let signed = match context.routing_response(&publication, request.headers()).await {
+        Ok(bytes) => bytes,
+        Err(status) => return reject(&mut respond, status).await,
+    };
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, signed.len().to_string())
+        .body(())
+        .map_err(|_| ServerError::Http2)?;
+    let mut output = respond
+        .send_response(context.pad_response(response)?, false)
+        .map_err(|_| ServerError::Http2)?;
+    timeout(crate::routing::exchange::TRANSFER_TIMEOUT, async {
+        output.reserve_capacity(signed.len().min(64 * 1024));
+        let mut remaining: &[u8] = &signed;
+        while !remaining.is_empty() {
+            let credit = std::future::poll_fn(|cx| output.poll_capacity(cx))
+                .await
+                .ok_or(ServerError::Io)?
+                .map_err(|_| ServerError::Io)?;
+            if credit == 0 {
+                continue;
+            }
+            let count = credit.min(remaining.len()).min(64 * 1024);
+            output
+                .send_data(
+                    Bytes::copy_from_slice(&remaining[..count]),
+                    count == remaining.len(),
+                )
+                .map_err(|_| ServerError::Io)?;
+            remaining = &remaining[count..];
+            if !remaining.is_empty() {
+                output.reserve_capacity(remaining.len().min(64 * 1024));
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| ServerError::Io)?
+}
+
 
 async fn handle_request(
     request: Request<h2::RecvStream>,
@@ -2066,6 +2202,7 @@ async fn prepare_selected_listeners_inner(
                 limits.connections.clone(),
                 limits.peer_budget.clone(),
             );
+            // The staged AuthCell may not contain a newly added inbound until CAS.
             context.live_quota = Some(limits.ledger.clone());
             #[cfg(test)]
             let carrier = if let Some(start) = guard_start {
@@ -3055,6 +3192,52 @@ async fn run_supervised_file(
         .with_reality_ledger(limits.ledger.clone()),
     );
 
+    // Refresh the pinned pair through a durable TOML + live policy CAS.
+    let _geodata_refresh = SupervisorTask(tokio::spawn({
+        let runtime = runtime.clone();
+        let path = config_path.to_owned();
+        async move {
+            let mut next_refresh = tokio::time::Instant::now();
+            let mut last_directory = None;
+            loop {
+                if let Ok(view) = runtime.snapshot() {
+                    if let Some(settings) = view.document.server.policy.routing.clone() {
+                        if let Some(directory) = settings.geodata_directory {
+                            if last_directory.as_ref() != Some(&directory) || tokio::time::Instant::now() >= next_refresh {
+                                last_directory = Some(directory.clone());
+                                next_refresh = tokio::time::Instant::now() + crate::routing::geodata::REFRESH_INTERVAL;
+                                let result = async {
+                                    let store = crate::routing::geodata::Store::new(directory.into()).map_err(|_| ())?;
+                                    let pair = store.refresh(&settings.rules).await.map_err(|_| ())?;
+                                    let manifest = pair.manifest().clone();
+                                    drop(pair);
+                                    let prepare = runtime.clone();
+                                    let path = path.clone();
+                                    let stage = tokio::task::spawn_blocking(move || prepare.prepare_geodata(&view, &path, manifest))
+                                        .await.map_err(|_| ())?.map_err(|_| ())?;
+                                    match stage {
+                                        Some(stage) => { runtime.activate_geodata(stage).map_err(|_| ())?; Ok(true) }
+                                        None => Ok(false),
+                                    }
+                                }.await;
+                                match result {
+                                    Ok(true) => crate::diag!(Info, "server", "geodata_activated"),
+                                    Ok(false) => {},
+                                    Err(()) => {
+                                        // Retry conflicts and temporary failures without replacing pending edits.
+                                        next_refresh = tokio::time::Instant::now() + Duration::from_secs(300);
+                                        crate::diag!(Warn, "server", "geodata_refresh_or_apply_failed");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        }
+    }));
+
     // Only the original, protected management listener survives cutover.
     // Never expose a new administrative TCP port or loosen Named Pipe DACL.
     let (requests, mut queue) =
@@ -3469,6 +3652,7 @@ async fn run_reality_document_inner(
             connections.clone(),
             peers.clone(),
         );
+        context.routing_publication()?;
         context.live_quota = Some(ledger.clone());
         context.apply_own_tls_policy();
         if inbound.security_mode == crate::security_profile::SecurityMode::SmartReality {
@@ -3720,6 +3904,7 @@ async fn run_document_with_config(
             connections.clone(),
             peer_budget.clone(),
         );
+        context.routing_publication()?;
         context.apply_own_tls_policy();
         prepared.push((listener, acceptor, endpoint, Arc::new(context)));
     }
@@ -4168,6 +4353,7 @@ mod hardening_tests {
                     },
                 ],
                 policy: ServerPolicy {
+                    routing: None,
                     allow_private_ips: false,
                     max_connections_per_user: 1,
                     max_connections_total: 3,

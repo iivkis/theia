@@ -524,7 +524,7 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         tty.wait("Режим подключения")
         original = client.read_bytes()
         tty.send("i")
-        tty.wait("Импорт подключения")
+        tty.wait("Вставьте ключ (скрыто)")
         tty.send(str(own_link) + "\r")
         tty.wait("Проверка ключа · собственный TLS")
         tty.send("c")
@@ -565,7 +565,7 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
 
         def enroll():
             tty.send("i")
-            tty.wait("Импорт подключения")
+            tty.wait("Вставьте ключ (скрыто)")
             tty.send(str(reality_link) + "\r")
             tty.wait("ПРЕДПРОСМОТР: самодостаточный ключ REALITY")
             tty.send("y")
@@ -579,7 +579,7 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         assert client.read_bytes() == saved
         assert len(set(base.glob(".theia-enroll-*")) - before) == 1
         tty.send("\x1b")
-        tty.wait("Режим подключения")
+        tty.wait("Вставьте ключ (скрыто)")
         assert set(base.glob(".theia-enroll-*")) == before
         assert client.read_bytes() == saved
 

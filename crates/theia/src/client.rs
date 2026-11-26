@@ -326,6 +326,78 @@ impl H2Client {
         .map_err(|_| ClientError::Timeout)?
     }
 
+    /// Authenticated binary policy snapshot for this exact inbound path.
+    pub(crate) async fn fetch_routing(&self) -> Result<Vec<u8>, ClientError> {
+        self.routing_resource(None).await
+    }
+
+    pub(crate) async fn resolve_routing(&self, name: &str, digest: [u8; 32]) -> Result<Vec<std::net::IpAddr>, ClientError> {
+        let bytes = self.routing_resource(Some((name, digest))).await?;
+        crate::routing::exchange::decode_ips(&bytes)
+    }
+
+    pub(crate) fn own_routing_scope(&self) -> Option<&str> {
+        self.own_routes.as_ref()?.routing.strip_prefix("/v1/")?.strip_suffix("/routing")
+    }
+
+    async fn routing_resource(&self, domain: Option<(&str, [u8; 32])>) -> Result<Vec<u8>, ClientError> {
+        let routes = self
+            .identity_routes
+            .as_ref().or(self.own_routes.as_ref())
+            .ok_or(ClientError::Configuration)?;
+        timeout(crate::routing::exchange::TRANSFER_TIMEOUT, async {
+            let connection = self.connect_verified(diagnostics::next_id()).await?;
+            let sender = connection
+                .sender
+                .lock()
+                .map_err(|_| ClientError::Http2)?
+                .clone();
+            let mut sender = sender.ready().await.map_err(|_| ClientError::Http2)?;
+            let mut parts = self.uri.clone().into_parts();
+            parts.path_and_query = Some(
+                (&routes.routing)
+                .parse()
+                .map_err(|_| ClientError::Configuration)?,
+            );
+            let uri = http::Uri::from_parts(parts).map_err(|_| ClientError::Configuration)?;
+            let mut request = Request::get(uri)
+                .header(header::AUTHORIZATION, self.authorization.clone())
+                .body(())
+                .map_err(|_| ClientError::Configuration)?;
+            if let Some((name, digest)) = domain {
+                crate::routing::exchange::request_domain(&mut request, name, digest)?;
+            }
+            let request = crate::channel_binding::attach(connection.binding.as_ref(), self.padding.request(request)?)?;
+            let (response, _) = sender
+                .send_request(request, true)
+                .map_err(|_| ClientError::Http2)?;
+            let response = response.await.map_err(|_| ClientError::Http2)?;
+            crate::split_http::check_status(response.status())?;
+            let expected = crate::routing::exchange::validate_headers(response.headers())?;
+            if domain.is_some() && expected > crate::routing::exchange::DNS_LIMIT { return Err(ClientError::Protocol); }
+            let mut body = response.into_body();
+            let mut bytes = Vec::new();
+            while let Some(chunk) = body.data().await {
+                let chunk = chunk.map_err(|_| ClientError::Http2)?;
+                crate::routing::exchange::append(&mut bytes, &chunk, expected)?;
+                body.flow_control()
+                    .release_capacity(chunk.len())
+                    .map_err(|_| ClientError::Http2)?;
+            }
+            if body
+                .trailers()
+                .await
+                .map_err(|_| ClientError::Http2)?
+                .is_some()
+            {
+                return Err(ClientError::Protocol);
+            }
+            crate::routing::exchange::finish(bytes, expected)
+        })
+        .await
+        .map_err(|_| ClientError::Timeout)?
+    }
+
     /// Experimental API only: build a separately verified BoringSSL connector
     /// with one explicit CA PEM. Not selected by TOML, H3 or the default CLI;
     /// never treat this as a named Chrome/browser fingerprint.
