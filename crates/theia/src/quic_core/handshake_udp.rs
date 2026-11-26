@@ -474,7 +474,19 @@ pub async fn establish(
     }
     let server = matches!(&config, Config::Server(_));
     let original = if server { local } else { remote };
-    establish_inner(socket.into(), peer, InitialRoute { version, local, remote, original, retry: None, token: Vec::new() }, config)
+    establish_inner(
+        socket.into(),
+        peer,
+        InitialRoute {
+            version,
+            local,
+            remote,
+            original,
+            retry: None,
+            token: Vec::new(),
+        },
+        config,
+    )
     .await
 }
 
@@ -510,7 +522,19 @@ pub async fn accept(candidate: Candidate, tls: Arc<ServerConfig>) -> Result<LabS
     if remote == binding.retry || remote == [0; CID_LEN] || original == [0; CID_LEN] {
         return Err(Error::Scope);
     }
-    establish_inner(socket, peer, InitialRoute { version: binding.version, local: binding.retry, remote, original, retry: Some(binding.retry), token }, Config::Server(tls))
+    establish_inner(
+        socket,
+        peer,
+        InitialRoute {
+            version: binding.version,
+            local: binding.retry,
+            remote,
+            original,
+            retry: Some(binding.retry),
+            token,
+        },
+        Config::Server(tls),
+    )
     .await
 }
 
@@ -545,7 +569,14 @@ async fn establish_inner(
     route: InitialRoute,
     config: Config,
 ) -> Result<LabSession, Error> {
-    let InitialRoute { version, local, remote, original, retry, token } = route;
+    let InitialRoute {
+        version,
+        local,
+        remote,
+        original,
+        retry,
+        token,
+    } = route;
     let server = matches!(&config, Config::Server(_));
     let parameters = params(server, &local, &original, retry.as_ref())?;
     let connection = match config {
@@ -647,7 +678,12 @@ async fn establish_inner(
         server,
         local,
         handshake.remote,
-        super::endpoint::Established { keys, secrets, idle_timeout, binding },
+        super::endpoint::Established {
+            keys,
+            secrets,
+            idle_timeout,
+            binding,
+        },
     )
     .await
     .map_err(Error::Endpoint)

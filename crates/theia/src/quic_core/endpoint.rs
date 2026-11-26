@@ -116,7 +116,12 @@ impl LabSession {
         remote_cid: [u8; CID_LEN],
         established: Established,
     ) -> Result<Self, Error> {
-        let Established { keys, secrets, idle_timeout, binding } = established;
+        let Established {
+            keys,
+            secrets,
+            idle_timeout,
+            binding,
+        } = established;
         let mut session = Self::connect_inner(
             socket,
             peer,
