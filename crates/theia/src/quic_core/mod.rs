@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ack;
+pub mod initial;
 pub mod parameters;
 pub mod recovery;
 pub mod stream;
