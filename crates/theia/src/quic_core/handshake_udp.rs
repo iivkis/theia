@@ -342,6 +342,7 @@ impl HandshakeTail {
 
 struct FlightPacket {
     index: usize,
+    padded_ack: bool,
     header: Vec<u8>,
     payload: Vec<u8>,
     frame: Option<(u64, bool)>,
@@ -421,7 +422,7 @@ impl Handshake {
         if total > MTU || total == 0 {
             return Err(Error::Protocol);
         }
-        let ordinary: u64 = packets.iter().filter(|p| p.frame.is_some_and(|(_, probe)| !probe)).map(|p| p.size() as u64).sum();
+        let ordinary: u64 = packets.iter().filter(|p| p.padded_ack || p.frame.is_some_and(|(_, probe)| !probe)).map(|p| p.size() as u64).sum();
         let probes: u64 = packets.iter().filter(|p| p.frame.is_some_and(|(_, probe)| probe)).map(|p| p.size() as u64).sum();
         if !self.application_schedule.permits_flight(ordinary, probes, now) {
             return Ok(false);
@@ -437,10 +438,11 @@ impl Handshake {
                 .writer
                 .seal(&packet.header, &packet.payload)
                 .map_err(Error::Packet)?;
-            epoch
-                .schedule
-                .record(number, protected.len(), packet.frame, now)
-                .map_err(Error::Schedule)?;
+            if packet.padded_ack {
+                epoch.schedule.record_padded_ack(number, protected.len(), now).map_err(Error::Schedule)?;
+            } else {
+                epoch.schedule.record(number, protected.len(), packet.frame, now).map_err(Error::Schedule)?;
+            }
             datagram.extend_from_slice(&protected);
             if packet.frame.is_none() {
                 epoch.ack.sent();
@@ -457,7 +459,7 @@ impl Handshake {
     }
 
     fn pad_initial(&self, packet: &mut FlightPacket, minimum: usize) -> Result<(), Error> {
-        if packet.index != 0 {
+        if packet.index != 0 || (self.server && packet.frame.is_none()) {
             return Ok(());
         }
         let token = if self.server {
@@ -465,6 +467,7 @@ impl Handshake {
         } else {
             self.token.as_slice()
         };
+        let original_len = packet.payload.len();
         packet.header = header(
             self.version,
             0,
@@ -474,6 +477,7 @@ impl Handshake {
             &mut packet.payload,
             minimum,
         )?;
+        packet.padded_ack |= packet.frame.is_none() && packet.payload.len() > original_len;
         Ok(())
     }
 
@@ -510,6 +514,7 @@ impl Handshake {
             )?;
             packets.push(FlightPacket {
                 index,
+                padded_ack: false,
                 header,
                 payload,
                 frame,
@@ -521,7 +526,11 @@ impl Handshake {
             // Coalescing is opportunistic; if unvalidated budget is smaller
             // than a padded Initial, a standalone Handshake may still fit.
             if !self.server || self.budget.can_send(MTU as u64) {
-                return self.emit(socket, peer, packets, now).await;
+                let ordinary = packets.iter().filter(|p| p.padded_ack || p.frame.is_some_and(|(_, probe)| !probe)).map(|p| p.size() as u64).sum();
+                let probes = packets.iter().filter(|p| p.frame.is_some_and(|(_, probe)| probe)).map(|p| p.size() as u64).sum();
+                if self.application_schedule.permits_flight(ordinary, probes, now) {
+                    return self.emit(socket, peer, packets, now).await;
+                }
             }
         }
         let mut sent = false;

@@ -26,6 +26,7 @@ pub enum FrameRef {
     },
     Control(u64),
     MtuProbe,
+    PaddingOnly,
 }
 
 #[derive(Clone, Debug)]
@@ -149,6 +150,10 @@ impl Ledger {
         self.next += 1;
         self.last_send = Some(now);
         Ok(())
+    }
+
+    pub(crate) fn has_eliciting_flight(&self) -> bool {
+        self.sent.iter().any(|packet| packet.ack_eliciting)
     }
 
     pub fn bytes_in_flight(&self) -> u64 {

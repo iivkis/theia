@@ -36,6 +36,13 @@ struct Pending {
 
 // A single owner drives the connection. The lock protects synchronous
 // state transitions only; it is never held across I/O or an await.
+struct LossUndo {
+    cubic: super::congestion::Undo,
+    bbr: Option<super::bbr::Undo>,
+    pending: BTreeSet<u64>,
+    expires: Instant,
+}
+
 struct PathControl {
     window: Window,
     bbr: Option<Bbr>,
@@ -46,6 +53,7 @@ struct PathControl {
     persistent_reported: Option<Instant>,
     next_tx: u64,
     last_tx: Option<u64>,
+    undo: Option<LossUndo>,
 }
 
 impl PathControl {
@@ -60,6 +68,7 @@ impl PathControl {
             persistent_reported: None,
             next_tx: 0,
             last_tx: None,
+            undo: None,
         }
     }
 
@@ -325,6 +334,7 @@ impl Scheduler {
         let mtu = self.mtu.current();
         if before != mtu {
             let mut path = self.path.lock().expect("path lock");
+            path.undo = None;
             path.window.set_mtu(mtu as u64);
             if let Some(bbr) = path.bbr.as_mut() {
                 bbr.set_mtu(mtu as u64);
@@ -348,7 +358,7 @@ impl Scheduler {
 
     pub(crate) fn record_mtu_probe(&mut self, number: u64, bytes: usize, now: Instant) -> Result<(), Error> {
         if self.mtu_probe(now) != Some(bytes) { return Err(Error::Window); }
-        self.record_unreliable(number, bytes, now, true)?;
+        self.record_unreliable(number, bytes, now, Some(FrameRef::MtuProbe))?;
         self.mtu.sent(number, bytes);
         Ok(())
     }
@@ -429,7 +439,7 @@ impl Scheduler {
             } else {
                 path.window.pacing_interval(bytes as u64, path.rtt.smoothed())
             };
-            path.next_send = now.checked_add(spacing);
+            path.next_send = path.next_send.unwrap_or(now).max(now).checked_add(spacing);
         } else {
             self.ledger
                 .record(Sent {
@@ -457,12 +467,17 @@ impl Scheduler {
         if bytes == 0 || bytes > MTU as usize || !self.can_send_path() {
             return Err(Error::Window);
         }
-        self.record_unreliable(number, bytes, now, false)
+        self.record_unreliable(number, bytes, now, None)
     }
 
-    fn record_unreliable(&mut self, number: u64, bytes: usize, now: Instant, discovery: bool) -> Result<(), Error> {
+    pub(crate) fn record_padded_ack(&mut self, number: u64, bytes: usize, now: Instant) -> Result<(), Error> {
+        self.record_unreliable(number, bytes, now, Some(FrameRef::PaddingOnly))
+    }
+
+    fn record_unreliable(&mut self, number: u64, bytes: usize, now: Instant, marker: Option<FrameRef>) -> Result<(), Error> {
         let mut path = self.path.lock().expect("path lock");
         let before = path.window.in_flight();
+        let eliciting = marker != Some(FrameRef::PaddingOnly);
         path.window.reserve_discovery(bytes as u64).map_err(|_| Error::Window)?;
         if self
             .ledger
@@ -470,9 +485,9 @@ impl Scheduler {
                 number,
                 at: now,
                 bytes: bytes as u32,
-                ack_eliciting: true,
+                ack_eliciting: eliciting,
                 in_flight: true,
-                frames: if discovery { vec![FrameRef::MtuProbe] } else { vec![] },
+                frames: marker.into_iter().collect(),
             })
             .is_err()
         {
@@ -487,7 +502,9 @@ impl Scheduler {
             bbr.sent(tx, bytes as u64, now, before, true)
                 .map_err(|_| Error::Window)?;
         }
-        self.last_eliciting = Some(now);
+        if eliciting { self.last_eliciting = Some(now); }
+        let spacing = if let Some(bbr) = &path.bbr { bbr.pacing_interval(bytes as u64) } else { path.window.pacing_interval(bytes as u64, path.rtt.smoothed()) };
+        path.next_send = path.next_send.unwrap_or(now).max(now).checked_add(spacing);
         Ok(())
     }
 
@@ -558,9 +575,12 @@ impl Scheduler {
             }
         }
         let new_delivery = outcome.newly_acked_eliciting;
+        let ce = self.ecn.acknowledge(ack);
+        if ce.is_some() { self.path.lock().expect("path lock").undo = None; }
         self.apply_loss(outcome, now)?;
         let mut path = self.path.lock().expect("path lock");
-        if let Some(at) = self.ecn.acknowledge(ack) {
+        if let Some(at) = ce {
+            path.undo = None;
             if let Some(bbr) = path.bbr.as_mut() {
                 bbr.ecn_congestion(now);
                 let target = bbr.cwnd();
@@ -615,6 +635,29 @@ impl Scheduler {
         let persistent = path.first_rtt_at.filter(|_| !outcome.lost.is_empty()).and_then(|first| {
             self.ledger.persistent_end(first, pto.saturating_mul(3))
         }).filter(|end| path.persistent_reported.is_none_or(|old| *end > old));
+        // Undo is intentionally stricter than a heuristic: only a complete
+        // set of late original-PN ACKs proves the loss event spurious.
+        // Later loss, CE, path/MTU change, discard or expiry invalidates it.
+        if path.undo.as_ref().is_some_and(|undo| now >= undo.expires) { path.undo = None; }
+        let congestion: BTreeSet<_> = model.lost.iter().filter(|p| p.in_flight
+            && !p.frames.contains(&FrameRef::MtuProbe)).map(|p| p.number).collect();
+        if persistent.is_some() {
+            path.undo = None;
+        } else if !congestion.is_empty() {
+            // Multiple loss batches might overlap a prior congestion event.
+            // Never undo an older reduction on evidence of a newer batch.
+            if path.undo.take().is_none() {
+                let snapshot = LossUndo {
+                    cubic: path.window.checkpoint(),
+                    bbr: path.bbr.as_ref().map(Bbr::checkpoint),
+                    pending: congestion,
+                    expires: now.checked_add(pto.saturating_mul(3).min(Duration::from_secs(30))).ok_or(Error::Limit)?,
+                };
+                path.undo = Some(snapshot);
+            }
+        } else if let Some(undo) = path.undo.as_mut() {
+            for packet in &model.late_acknowledged { undo.pending.remove(&packet.number); }
+        }
         let in_flight = path.window.in_flight();
         if let Some(bbr) = path.bbr.as_mut() {
             bbr.feedback(&model, now, in_flight).map_err(|_| Error::Window)?;
@@ -649,6 +692,16 @@ impl Scheduler {
                     .map_err(|_| Error::Window)?;
             }
         }
+        if path.undo.as_ref().is_some_and(|undo| undo.pending.is_empty()) {
+            let undo = path.undo.take().expect("checked undo");
+            if let (Some(bbr), Some(old)) = (path.bbr.as_mut(), undo.bbr) {
+                bbr.undo_loss(old);
+                let target = bbr.cwnd();
+                path.window.set_target(target).map_err(|_| Error::Window)?;
+            } else if path.bbr.is_none() {
+                path.window.undo_loss(undo.cubic);
+            }
+        }
         if path.window.in_flight() == 0 && path.bbr.is_none() {
             path.window.mark_idle(now);
         }
@@ -676,7 +729,7 @@ impl Scheduler {
     }
 
     fn pto_deadline(&self) -> Option<Instant> {
-        if self.ledger.bytes_in_flight() == 0 {
+        if !self.ledger.has_eliciting_flight() {
             return None;
         }
         let path = self.path.lock().expect("path lock");
@@ -701,6 +754,7 @@ impl Scheduler {
 impl Drop for Scheduler {
     fn drop(&mut self) {
         let Ok(mut path) = self.path.lock() else { return; };
+        if path.undo.as_ref().is_some_and(|undo| self.lost_tx.values().any(|id| undo.pending.contains(id))) { path.undo = None; }
         let _ = path.window.retire(self.ledger.bytes_in_flight());
         if let Some(bbr) = path.bbr.as_mut() {
             for id in self.active_tx.values().chain(self.lost_tx.values()) {
@@ -721,6 +775,45 @@ mod tests {
             ranges: vec![Range { first: n, last: n }],
             ecn: None,
         }
+    }
+
+    #[test]
+    fn proven_spurious_loss_undoes_window_but_not_flight() {
+        let now = Instant::now();
+        for use_bbr in [false, true] {
+            let mut s = if use_bbr { Scheduler::with_bbr(now) } else { Scheduler::default() };
+            for n in 0..4 {
+                s.enqueue(vec![1]).unwrap();
+                s.record(n, 1200, Some((n, false)), now).unwrap();
+            }
+            let old = s.path.lock().unwrap().window.cwnd();
+            let at = now + Duration::from_millis(100);
+            s.acknowledge(&ack(3), at).unwrap();
+            let reduced = s.path.lock().unwrap().window.cwnd();
+            assert!(s.path.lock().unwrap().undo.is_some());
+            let flight = s.path.lock().unwrap().window.in_flight();
+            s.acknowledge(&ack(0), at).unwrap();
+            assert_eq!(s.path.lock().unwrap().window.in_flight(), flight);
+            assert!(s.path.lock().unwrap().undo.is_none());
+            assert!(s.path.lock().unwrap().window.cwnd() >= reduced);
+            assert!(s.path.lock().unwrap().window.cwnd() >= old);
+            let restored = s.path.lock().unwrap().window.cwnd();
+            s.acknowledge(&ack(0), at).unwrap();
+            assert_eq!(s.path.lock().unwrap().window.cwnd(), restored);
+        }
+    }
+
+    #[test]
+    fn padded_ack_consumes_shared_window_but_does_not_arm_pto() {
+        let now = Instant::now();
+        let mut initial = Scheduler::with_bbr(now);
+        let app = initial.fork_space();
+        initial.record_padded_ack(0, 1200, now).unwrap();
+        assert_eq!(app.path.lock().unwrap().window.in_flight(), 1200);
+        assert!(initial.pto_deadline().is_none());
+        initial.acknowledge(&ack(0), now + Duration::from_millis(50)).unwrap();
+        assert_eq!(app.path.lock().unwrap().window.in_flight(), 0);
+        assert!(app.measured_rtt().is_none());
     }
 
     #[test]

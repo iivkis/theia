@@ -70,6 +70,16 @@ impl SlowStart {
     }
 }
 
+/// Congestion response checkpoint, excluding authoritative flight bytes.
+pub(crate) struct Undo {
+    cwnd: u64,
+    ssthresh: u64,
+    last_max: f64,
+    prior_cwnd: f64,
+    friendly: f64,
+    recovery: Option<Instant>,
+}
+
 pub struct Window {
     mtu: u64,
     cwnd: u64,
@@ -134,6 +144,26 @@ impl Window {
         if !self.can_reserve_size(bytes) { return Err(Error::Limit); }
         self.in_flight += bytes;
         Ok(())
+    }
+
+    pub(crate) fn checkpoint(&self) -> Undo {
+        Undo {
+            cwnd: self.cwnd, ssthresh: self.ssthresh, last_max: self.last_max,
+            prior_cwnd: self.prior_cwnd, friendly: self.friendly, recovery: self.recovery,
+        }
+    }
+
+    pub(crate) fn undo_loss(&mut self, prior: Undo) {
+        if self.cwnd >= prior.cwnd { return; }
+        self.cwnd = prior.cwnd;
+        self.ssthresh = prior.ssthresh;
+        self.last_max = prior.last_max;
+        self.prior_cwnd = prior.prior_cwnd;
+        self.friendly = prior.friendly;
+        self.recovery = prior.recovery;
+        // Never accumulate cubic wall time while the reduced window was active.
+        self.epoch = None;
+        self.growth_credit = 0.0;
     }
 
     pub fn cwnd(&self) -> u64 {

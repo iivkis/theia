@@ -56,6 +56,15 @@ struct Sample {
     probing: bool,
 }
 
+pub(crate) struct Undo {
+    cwnd: u64,
+    prior_cwnd: u64,
+    bandwidth_cap: Option<u64>,
+    loss_ceiling: Option<u64>,
+    inflight_longterm: Option<u64>,
+    recovery_until: Option<u64>,
+}
+
 pub struct Bbr {
     mtu: u64,
     cwnd: u64,
@@ -157,6 +166,27 @@ impl Bbr {
             round_lost: 0,
             last_ecn_round: None,
         })
+    }
+
+    pub(crate) fn checkpoint(&self) -> Undo {
+        Undo {
+            cwnd: self.cwnd, prior_cwnd: self.prior_cwnd,
+            bandwidth_cap: self.bandwidth_cap, loss_ceiling: self.loss_ceiling,
+            inflight_longterm: self.inflight_longterm, recovery_until: self.recovery_until,
+        }
+    }
+
+    pub(crate) fn undo_loss(&mut self, old: Undo) {
+        // Do not rewind packet-timed rounds, delivered counters, filter
+        // samples or the ProbeRTT clock; they reflect actual observations.
+        self.bandwidth_cap = old.bandwidth_cap;
+        self.loss_ceiling = old.loss_ceiling;
+        self.inflight_longterm = old.inflight_longterm;
+        self.recovery_until = old.recovery_until;
+        self.prior_cwnd = self.prior_cwnd.max(old.prior_cwnd);
+        if self.mode != Mode::ProbeRtt {
+            self.cwnd = self.cwnd.max(old.cwnd).min(MAX_CWND);
+        }
     }
 
     pub(crate) fn discard(&mut self, tx: u64) {
