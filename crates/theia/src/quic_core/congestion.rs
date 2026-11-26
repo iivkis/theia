@@ -33,6 +33,7 @@ pub struct Window {
     last_max: f64,
     epoch: Option<(Instant, f64)>,
     growth_credit: f64,
+    friendly: f64,
 }
 
 impl Window {
@@ -50,6 +51,7 @@ impl Window {
             last_max: 0.0,
             epoch: None,
             growth_credit: 0.0,
+            friendly: 0.0,
         })
     }
 
@@ -153,14 +155,17 @@ impl Window {
             return Ok(());
         }
         let current = self.cwnd as f64 / self.mtu as f64;
-        let (start, initial) = *self.epoch.get_or_insert((now, current));
+        if self.epoch.is_none() { self.epoch = Some((now, current)); self.friendly = current; }
+        let (start, initial) = self.epoch.ok_or(Error::Accounting)?;
         let elapsed = now.checked_duration_since(start).ok_or(Error::Accounting)?;
         let rtt = rtt.max(Duration::from_micros(1));
         let w_max = self.last_max.max(initial);
         let cubic =
             cubic_target(w_max, initial, elapsed.saturating_add(rtt)).ok_or(Error::Accounting)?;
-        let friendly = initial
-            + 3.0 * (1.0 - BETA) / (1.0 + BETA) * (elapsed.as_secs_f64() / rtt.as_secs_f64());
+        // TCP-friendly growth is driven by newly acknowledged bytes, not
+        // merely wall time (an ACK after an idle period must not grant a burst).
+        self.friendly += (3.0 * (1.0 - BETA) / (1.0 + BETA)) * (bytes as f64 / self.mtu as f64) / self.friendly.max(1.0);
+        let friendly = self.friendly;
         // Limit ACK-driven growth to a bounded target; use fractional byte
         // credit rather than rounding every small ACK up to a whole MTU.
         let target = cubic.max(friendly).min(current * 1.5);

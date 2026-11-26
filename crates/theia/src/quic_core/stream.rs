@@ -135,7 +135,8 @@ impl ReceiveBuffer {
     }
 
     pub(crate) fn release_terminal(&mut self) -> Option<u64> {
-        if !self.finished() && self.reset_code.is_none() && !(self.abandoned && self.final_size.is_some()) { return None; }
+        let terminal = self.finished() || self.reset_code.is_some() || (self.abandoned && self.final_size.is_some());
+        if !terminal { return None; }
         let released = self.highest.saturating_sub(self.read_offset);
         self.read_offset = self.highest;
         self.bytes = VecDeque::new();

@@ -9,7 +9,7 @@ use super::{
     recovery::Rtt,
 };
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -43,6 +43,7 @@ pub struct Scheduler {
     last_eliciting: Option<Instant>,
     pto_count: u32,
     next_send: Option<Instant>,
+    cwnd_limited: BTreeSet<u64>,
 }
 
 impl Default for Scheduler {
@@ -59,6 +60,7 @@ impl Default for Scheduler {
             last_eliciting: None,
             pto_count: 0,
             next_send: None,
+            cwnd_limited: BTreeSet::new(),
         }
     }
 }
@@ -210,6 +212,7 @@ impl Scheduler {
                 bbr.sent(number, bytes as u64, now, before, app_limited)
                     .map_err(|_| Error::Window)?;
             }
+            if !app_limited && self.bbr.is_none() { self.cwnd_limited.insert(number); }
             self.aliases.insert(number, id);
             self.queue.retain(|queued| *queued != id);
             if let Some(f) = self.frames.get_mut(&id) {
@@ -313,7 +316,6 @@ impl Scheduler {
     }
 
     fn apply_loss(&mut self, outcome: loss::Outcome, now: Instant) -> Result<(), Error> {
-        let limited = self.window.in_flight().saturating_add(MTU) > self.window.cwnd();
         self.window
             .retire(outcome.acknowledged_bytes + outcome.lost_bytes)
             .map_err(|_| Error::Window)?;
@@ -333,6 +335,7 @@ impl Scheduler {
         // Apply loss before growth, so an ACK for a packet sent before
         // the new recovery boundary cannot undo the congestion event.
         for p in outcome.lost {
+            self.cwnd_limited.remove(&p.number);
             if p.in_flight && self.bbr.is_none() {
                 self.window.loss(p.at, now).map_err(|_| Error::Window)?;
             }
@@ -348,6 +351,7 @@ impl Scheduler {
             }
         }
         for p in outcome.acknowledged {
+            let limited = self.cwnd_limited.remove(&p.number);
             if p.in_flight && self.bbr.is_none() {
                 self.window
                     .on_ack(p.at, now, u64::from(p.bytes), self.rtt.smoothed(), limited)

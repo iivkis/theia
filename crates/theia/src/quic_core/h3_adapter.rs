@@ -170,6 +170,7 @@ fn progress(
     session: &mut LabSession,
     state: &mut State,
     wakes: &mut Vec<Waker>,
+    ready: &Notify,
 ) -> Result<(), NativeError> {
     state.discover(session, wakes);
     // Visit each queued open once: a blocked bidi must not starve uni.
@@ -234,8 +235,8 @@ fn progress(
                     Err(e) => return Err(e),
                 }
             } else if let Some(data) = s.outgoing.as_mut() {
-                let n = data.len().min(send_flow::MAX_CHUNK);
-                match session.queue(id, &data[..n], false) {
+                let n = data.len().min(session.send_capacity(id));
+                if n != 0 { match session.queue(id, &data[..n], false) {
                     Ok(()) => {
                         data.advance(n);
                         if data.is_empty() {
@@ -245,6 +246,7 @@ fn progress(
                     }
                     Err(e) if blocked(&e) => {}
                     Err(e) => return Err(e),
+                }
                 }
             } else if s.finish && !s.fin_queued {
                 match session.queue(id, &[], true) {
@@ -295,6 +297,7 @@ fn progress(
         }
         if (!s.tx || s.send_dropped) && (!s.rx || s.recv_dropped) && session.retire_stream(id, s.tx, s.rx)? {
             s.retired = true;
+            ready.notify_one();
             s.outgoing = None;
             s.incoming = None;
             s.send_waker = None;
@@ -323,7 +326,7 @@ async fn drive(mut session: LabSession, weak: Weak<Bridge>, ready: Arc<Notify>) 
                 if let Some(code) = state.close.take() {
                     session.close(code, Instant::now())
                 } else if state.error.is_none() {
-                    progress(&mut session, &mut state, &mut wakes)
+                    progress(&mut session, &mut state, &mut wakes, &ready)
                 } else {
                     Ok(())
                 }

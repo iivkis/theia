@@ -142,6 +142,12 @@ impl SendFlow {
         Ok(())
     }
 
+    pub(crate) fn available(&self, id: u64) -> usize {
+        self.streams.get(&id).filter(|s| !s.fin).map_or(0, |s| {
+            s.limit.saturating_sub(s.offset).min(self.max_data.saturating_sub(self.used)).min(MAX_CHUNK as u64) as usize
+        })
+    }
+
     pub fn max_data(&mut self, value: u64) -> Result<(), Error> {
         if value > MAX_VARINT {
             return Err(Error::Limit);
@@ -236,7 +242,9 @@ mod tests {
         assert_eq!(id, 2);
         assert_eq!(f.open(), Err(Error::Limit));
         assert_eq!(f.encode(id, b"abcd", false), Err(Error::Limit));
+        assert_eq!(f.available(id), 3);
         let bytes = f.encode(id, b"ab", false).unwrap();
+        assert_eq!(f.available(id), 1);
         assert_eq!(
             decode(&bytes, Space::Application).unwrap(),
             [Frame::Stream {

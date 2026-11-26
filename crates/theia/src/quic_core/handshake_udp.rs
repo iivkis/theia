@@ -330,7 +330,7 @@ impl Handshake {
     fn wait(&self, now: Instant, sent: bool) -> Duration {
         if sent { return Duration::ZERO; }
         self.epochs.iter().flatten().filter_map(|epoch| epoch.schedule.deadline())
-            .filter(|at| *at > now).min()
+            .filter(|at| *at > now || !self.server || self.budget.can_send(MTU as u64)).min()
             .map_or(DEADLINE, |at| at.saturating_duration_since(now).min(DEADLINE))
     }
 

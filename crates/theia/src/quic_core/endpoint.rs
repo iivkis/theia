@@ -366,6 +366,8 @@ impl LabSession {
         self.receive.abandon(id).map_err(Error::Receive)
     }
 
+    pub(crate) fn send_capacity(&self, id: u64) -> usize { self.send.available(id) }
+
     pub(crate) fn lifetime_exhausted(&self, bidi: bool) -> bool { self.send.lifetime_exhausted(bidi) }
 
     /// A peer stream earns a new stream ID only after both relevant halves
