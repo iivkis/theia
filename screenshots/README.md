@@ -1,6 +1,6 @@
 # Theia TUI visual review
 
-Source: abd7ffe3206cce3ff4d474c4130a272ea5b71fde
+Source: c1969af760283d16c6de239aa00088864ff123f2
 
 Linux · 120×40 · actual production renderer cells. State fixtures and unavailable actions are not runtime success.
 
@@ -278,6 +278,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![server-first-reality-dns-consent](server-first-reality-dns-consent.png)
 
+## server-first-reality-dns-expanded
+
+![server-first-reality-dns-expanded](server-first-reality-dns-expanded.png)
+
 ## server-first-reality-sources
 
 ![server-first-reality-sources](server-first-reality-sources.png)
@@ -441,3 +445,35 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## state-issuance-rotate-reveal-confirm
 
 ![state-issuance-rotate-reveal-confirm](state-issuance-rotate-reveal-confirm.png)
+
+## state-reality-step4-tls-consent
+
+![state-reality-step4-tls-consent](state-reality-step4-tls-consent.png)
+
+## state-reality-step4-tls-progress
+
+![state-reality-step4-tls-progress](state-reality-step4-tls-progress.png)
+
+## state-reality-step4-tls-recheck
+
+![state-reality-step4-tls-recheck](state-reality-step4-tls-recheck.png)
+
+## state-reality-step5-no-eligible
+
+![state-reality-step5-no-eligible](state-reality-step5-no-eligible.png)
+
+## state-reality-step5-ranked-review
+
+![state-reality-step5-ranked-review](state-reality-step5-ranked-review.png)
+
+## state-reality-step6-save-error
+
+![state-reality-step6-save-error](state-reality-step6-save-error.png)
+
+## state-reality-step6-save-uncertain
+
+![state-reality-step6-save-uncertain](state-reality-step6-save-uncertain.png)
+
+## state-reality-step6-saving
+
+![state-reality-step6-saving](state-reality-step6-saving.png)
