@@ -436,7 +436,10 @@ async fn compiled_dual_mode_tui_invitation_import_apply_and_rollback() {
                 Err(error) => errors.push(error),
             }
         }
-        panic!("cannot reserve a shared TCP/UDP port on {ip}: {:?}", errors.last());
+        panic!(
+            "cannot reserve a shared TCP/UDP port on {ip}: {:?}",
+            errors.last()
+        );
     };
     let own = reserve(localhost);
     let smart = reserve(std::net::Ipv4Addr::LOCALHOST.into());
