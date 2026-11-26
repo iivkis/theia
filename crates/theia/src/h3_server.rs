@@ -193,7 +193,7 @@ async fn run_h3<C, F>(
     binding: Option<Arc<crate::channel_binding::Admission>>,
     closed: F,
 ) where
-    C: quic::Connection<Bytes>,
+    C: quic::Connection<Bytes> + 'static,
     C::BidiStream: CarrierStream,
     <C::BidiStream as quic::BidiStream<Bytes>>::SendStream: Send + 'static,
     <C::BidiStream as quic::BidiStream<Bytes>>::RecvStream:
