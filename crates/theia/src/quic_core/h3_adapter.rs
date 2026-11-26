@@ -424,6 +424,17 @@ async fn drive(mut session: LabSession, weak: Weak<Bridge>, ready: Arc<Notify>) 
 pub struct NativeConnection {
     opener: Opener,
     closed: watch::Receiver<()>,
+    driver: tokio::task::AbortHandle,
+}
+
+/// Server generation owns this guard even after H3 consumes the connection.
+/// Cancellation of a generation cannot leave a detached UDP session alive.
+pub(crate) struct DriverGuard(tokio::task::AbortHandle);
+
+impl Drop for DriverGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl NativeConnection {
@@ -440,14 +451,15 @@ impl NativeConnection {
         });
         let (done, closed) = watch::channel(());
         let weak = Arc::downgrade(&shared);
-        tokio::spawn(async move {
+        let driver = tokio::spawn(async move {
             drive(session, weak, ready).await;
             drop(done);
-        });
+        }).abort_handle();
         Ok((
             Self {
                 opener: Opener::new(shared),
                 closed,
+                driver,
             },
             key,
         ))
@@ -456,6 +468,10 @@ impl NativeConnection {
     #[cfg(test)]
     pub(crate) fn test_opener(&self) -> Opener {
         self.opener.clone()
+    }
+
+    pub(crate) fn driver_guard(&self) -> DriverGuard {
+        DriverGuard(self.driver.clone())
     }
 
     pub(crate) fn closed_signal(&self) -> watch::Receiver<()> {

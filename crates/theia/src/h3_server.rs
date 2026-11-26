@@ -9,7 +9,12 @@ use crate::{
 use bytes::{Buf, Bytes};
 use h3::{error::Code, quic, server::RequestStream};
 use http::{Request, Response, StatusCode};
-use std::{collections::VecDeque, net::IpAddr, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, Mutex, RwLock},
+    time::Duration,
+};
 use tokio::{io::AsyncWriteExt, net::TcpStream, sync::watch, task::JoinSet, time::timeout};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -25,6 +30,200 @@ trait CarrierStream: quic::BidiStream<Bytes> + quic::RecvStream<Buf = Bytes> + S
 impl<S: quic::BidiStream<Bytes> + quic::RecvStream<Buf = Bytes> + Send + 'static> CarrierStream
     for S
 {
+}
+
+/// Prepared own-TLS material for both the migrated concrete-address listener
+/// and the remaining wildcard compatibility path. No keys are re-read on
+/// same-port rotation or rollback.
+#[derive(Clone)]
+pub(crate) struct OwnTlsConfig {
+    native: Arc<rustls::ServerConfig>,
+    legacy: quinn::ServerConfig,
+}
+
+impl OwnTlsConfig {
+    pub(crate) fn new(
+        certificates: Vec<rustls::pki_types::CertificateDer<'static>>,
+        key: rustls::pki_types::PrivateKeyDer<'static>,
+    ) -> Result<Self, crate::quic_transport::QuicError> {
+        let legacy = quic_transport::server_config(certificates.clone(), key.clone_key())?;
+        let mut native = crate::transport_policy::Carrier::H3
+            .server_tls(certificates, key)
+            .map_err(|_| crate::quic_transport::QuicError::Configuration)?;
+        native.send_tls13_tickets = 0;
+        Ok(Self {
+            native: Arc::new(native),
+            legacy,
+        })
+    }
+}
+
+/// Clones are configuration handles, not additional owners of the live UDP
+/// socket. The socket is moved exactly once into the serving generation.
+#[derive(Clone)]
+pub(crate) enum OwnTlsEndpoint {
+    Native {
+        socket: Arc<Mutex<Option<std::net::UdpSocket>>>,
+        config: Arc<RwLock<Arc<rustls::ServerConfig>>>,
+        scope: crate::quic_core::scope::NetworkScope,
+        local: SocketAddr,
+    },
+    // Wildcard destination/source ancillary metadata is not yet implemented
+    // by the native socket layer. Do not silently change a wildcard bind.
+    Wildcard(quinn::Endpoint),
+}
+
+impl OwnTlsEndpoint {
+    pub(crate) fn bind(
+        bind: SocketAddr,
+        tls: OwnTlsConfig,
+    ) -> Result<Self, crate::quic_transport::QuicError> {
+        use crate::quic_transport::QuicError;
+        if bind.ip().is_unspecified() {
+            return quic_transport::server_endpoint_with_config(bind, tls.legacy)
+                .map(Self::Wildcard);
+        }
+        let scope = crate::quic_core::scope::NetworkScope::external_server(bind.ip())
+            .ok_or(QuicError::Configuration)?;
+        let socket = std::net::UdpSocket::bind(bind).map_err(|_| QuicError::Bind)?;
+        socket.set_nonblocking(true).map_err(|_| QuicError::Bind)?;
+        let local = socket.local_addr().map_err(|_| QuicError::Bind)?;
+        Ok(Self::Native {
+            socket: Arc::new(Mutex::new(Some(socket))),
+            config: Arc::new(RwLock::new(tls.native)),
+            scope,
+            local,
+        })
+    }
+
+    pub(crate) fn set_server_config(&self, tls: OwnTlsConfig) {
+        match self {
+            Self::Native { config, .. } => {
+                // Publication is an infallible pointer replacement. No user
+                // code runs while this lock is held, and existing handshakes
+                // keep the exact immutable configuration they selected.
+                *config.write().unwrap_or_else(|e| e.into_inner()) = tls.native;
+            }
+            Self::Wildcard(endpoint) => endpoint.set_server_config(Some(tls.legacy)),
+        }
+    }
+
+    pub(crate) async fn serve(
+        self,
+        context: Arc<ServerContext>,
+    ) -> Result<(), ServerError> {
+        let (_owner, phase) = watch::channel(GenerationPhase::Active);
+        self.serve_generation(context, phase).await
+    }
+
+    pub(crate) async fn serve_generation(
+        self,
+        context: Arc<ServerContext>,
+        mut phase: watch::Receiver<GenerationPhase>,
+    ) -> Result<(), ServerError> {
+        match self {
+            Self::Wildcard(endpoint) => serve_generation(endpoint, context, phase).await,
+            Self::Native { socket, config, scope, local } => {
+                if !server::await_generation_activation(&mut phase).await {
+                    return Ok(());
+                }
+                let socket = socket
+                    .lock()
+                    .map_err(|_| ServerError::Io)?
+                    .take()
+                    .ok_or(ServerError::Io)?;
+                let socket = tokio::net::UdpSocket::from_std(socket).map_err(|_| ServerError::Io)?;
+                if socket.local_addr().map_err(|_| ServerError::Io)? != local {
+                    return Err(ServerError::Io);
+                }
+                serve_native_generation(socket, scope, config, context, phase).await
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn is_native(&self) -> bool {
+        matches!(self, Self::Native { .. })
+    }
+}
+
+async fn serve_native_generation(
+    socket: tokio::net::UdpSocket,
+    scope: crate::quic_core::scope::NetworkScope,
+    config: Arc<RwLock<Arc<rustls::ServerConfig>>>,
+    context: Arc<ServerContext>,
+    mut phase: watch::Receiver<GenerationPhase>,
+) -> Result<(), ServerError> {
+    use crate::quic_core::{handshake_udp, listener::Listener, negotiation::VersionPolicy};
+    let mut listener = Listener::with_scope(socket, 128, VersionPolicy::both(), scope)
+        .map_err(|_| ServerError::Io)?;
+    crate::diag!(Info, "server.h3", "listener_active");
+    let mut connections = JoinSet::new();
+    loop {
+        if *phase.borrow() == GenerationPhase::Drain {
+            break;
+        }
+        tokio::select! {
+            biased;
+            change = phase.changed() => {
+                if change.is_err() || *phase.borrow() == GenerationPhase::Drain {
+                    break;
+                }
+            }
+            _ = connections.join_next(), if !connections.is_empty() => {}
+            incoming = listener.accept() => {
+                let candidate = incoming.map_err(|_| ServerError::Io)?;
+                let Some(slot) = context.connection_slot() else { continue; };
+                let tls = config.read().unwrap_or_else(|e| e.into_inner()).clone();
+                let context = context.clone();
+                let phase = phase.clone();
+                connections.spawn(async move {
+                    let _slot = slot;
+                    if let Ok(Ok(session)) = timeout(HANDSHAKE_TIMEOUT, handshake_udp::accept(candidate, tls)).await {
+                        let _ = run_native_session(session, context, phase).await;
+                    }
+                });
+            }
+        }
+    }
+    listener.stop_accepting().await.map_err(|_| ServerError::Io)?;
+    crate::diag!(Info, "server.h3", "generation_draining");
+    let _ = timeout(server::GENERATION_DRAIN, async {
+        while !connections.is_empty() {
+            tokio::select! {
+                _ = connections.join_next() => {},
+                incoming = listener.accept() => {
+                    if incoming.is_err() { break; }
+                }
+            }
+        }
+    }).await;
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+    Ok(())
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+    #[tokio::test]
+    async fn concrete_own_tls_uses_native_and_prebinds_once() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let config = OwnTlsConfig::new(vec![cert.cert.der().clone()], key.into()).unwrap();
+        let endpoint = OwnTlsEndpoint::bind("127.0.0.1:0".parse().unwrap(), config.clone()).unwrap();
+        assert!(endpoint.is_native());
+        let OwnTlsEndpoint::Native { local, socket, .. } = &endpoint else { unreachable!() };
+        let address = *local;
+        assert!(std::net::UdpSocket::bind(address).is_err());
+        endpoint.set_server_config(config);
+        let clone = endpoint.clone();
+        let prepared = socket.lock().unwrap().take().unwrap();
+        assert!(socket.lock().unwrap().is_none());
+        drop(prepared);
+        assert!(std::net::UdpSocket::bind(address).is_ok());
+        drop(clone);
+    }
 }
 
 struct ConnectionGuard(quinn::Connection);
@@ -271,11 +470,16 @@ async fn run_native_session(
     phase: watch::Receiver<GenerationPhase>,
 ) -> Result<(), ServerError> {
     let peer = session.peer_addr().ip();
-    let (transport, _key) = crate::quic_core::h3_adapter::NativeConnection::start(session)
+    let (transport, key) = crate::quic_core::h3_adapter::NativeConnection::start(session)
         .map_err(|_| ServerError::Io)?;
+    let _driver = transport.driver_guard();
     let mut closed = transport.closed_signal();
     let mut drained = closed.clone();
-    let binding = None;
+    let binding = if context.requires_channel_binding() {
+        Some(Arc::new(crate::channel_binding::Admission::new(key)))
+    } else {
+        None
+    };
     run_h3(transport, context, phase, peer, binding, async move {
         let _ = closed.changed().await;
     })

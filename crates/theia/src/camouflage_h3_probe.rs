@@ -191,12 +191,6 @@ pub async fn probe_quic_h3_native(
     .map_err(|_| H3ProbeError::TimedOut)?
 }
 
-pub(crate) async fn finish_native_handshake(
-    session: &mut crate::quic_core::endpoint::LabSession,
-) -> Result<(), H3ProbeError> {
-    dial::confirm(session).await.map_err(map_error)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
