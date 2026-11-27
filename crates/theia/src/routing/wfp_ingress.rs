@@ -68,7 +68,7 @@ impl WfpLabSession {
         if raw == INVALID_HANDLE_VALUE || raw.is_null() { return Err(io::Error::last_os_error()); }
         let handle = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
         let mut token = Zeroizing::new([0u8;32]);
-        SystemRandom::new().fill(token.as_mut()).map_err(|_| io::Error::from(io::ErrorKind::Other))?;
+        SystemRandom::new().fill(&mut *token).map_err(|_| io::Error::other("session entropy unavailable"))?;
         let mut request = Zeroizing::new([0u8;40]);
         request[..4].copy_from_slice(&compartment.to_be_bytes());
         request[4..6].copy_from_slice(&port.to_be_bytes());

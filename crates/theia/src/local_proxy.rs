@@ -1856,6 +1856,18 @@ pub struct NativeIngress {
     _owner: NativeOwner,
 }
 
+/// A single experimental packet strategy bound to a specific native flow.
+/// The caller must prepare it before activating isolated queue rules.
+/// It is not a DNS/application attribution credential.
+#[cfg(target_os = "linux")]
+pub struct LabStunPermit {
+    key: crate::routing::packet::FlowKey,
+    flow: crate::routing::flow::FlowLease,
+    engine: Arc<crate::routing::dpi::Engine>,
+    verified: crate::routing::dpi::VerifiedUdp,
+    failed: bool,
+}
+
 #[cfg(target_os = "linux")]
 struct RawLease {
     flow: crate::routing::flow::FlowLease,
@@ -1973,6 +1985,86 @@ impl NativeIngress {
         } else {
             Ok(())
         }
+    }
+
+    /// Prepare a narrowly scoped laboratory Modify permit. The route must
+    /// be conclusive even with unknown application/domain evidence; the
+    /// supplied name is only an authenticated DNS/reachability probe hint,
+    /// never evidence of which name the application actually requested.
+    /// No probe is run on the captured application socket or packet.
+    #[cfg(target_os = "linux")]
+    pub async fn prepare_stun_lab(
+        &self,
+        key: crate::routing::packet::FlowKey,
+        domain: &str,
+    ) -> Result<LabStunPermit, ClientError> {
+        use crate::routing::{Evidence, PacketAction, packet::Transport, dpi::{UdpStrategy, udp::BindingStrategy}};
+        let denied = || ClientError::Open(ErrorCode::PolicyDenied);
+        self.ensure_running()?;
+        if key.transport != Transport::Udp || key.destination.port() != 3478 || key.source.port() == 0
+            || key.source.is_ipv4() != key.destination.is_ipv4()
+            || !crate::server::allowed_destination(key.destination.ip(), false) {
+            return Err(denied());
+        }
+        let (carrier, cache) = match &self.client {
+            ProxyClient::Direct(c) => (c.carrier.clone(), &c.routing),
+            ProxyClient::Reality(c) => (c.generation().await?.carrier.clone(), &c.routing),
+        };
+        let snapshot = cache.get(|known| carrier.fetch_routing(known)).await?;
+        let digest = snapshot.digest();
+        let name = crate::routing::domain_name(domain).map_err(|_| denied())?;
+        let policy = snapshot.policy();
+        for evidence in [Evidence::Unknown, Evidence::Known(name.as_str())] {
+            if policy.classify_with_application(evidence, Evidence::Known(key.destination.ip()), Evidence::Unknown)
+                .map_err(|_| denied())?.action() != Some(Action::DirectDpi) {
+                return Err(denied());
+            }
+        }
+        if !cache.dpi.stun_enabled() { return Err(denied()); }
+        let ips = carrier.resolve_routing(&name, digest).await?;
+        if !ips.contains(&key.destination.ip()) { return Err(denied()); }
+        let verified = cache.dpi.open_stun_udp(&name, 3478, &[key.destination.ip()], digest).await.ok_or_else(denied)?;
+        if verified.strategy != UdpStrategy::StunBinding(BindingStrategy::Fingerprint)
+            || verified.socket.peer_addr().ok() != Some(key.destination)
+            || !verified.socket.local_addr().is_ok_and(|a| a.ip() == key.source.ip())
+            || !verified.admissible()? {
+            return Err(denied());
+        }
+        self.ensure_running()?;
+        let flow = cache.flows.begin_native(cache.dpi.clone(), key, digest, PacketAction::Modify)?;
+        Ok(LabStunPermit { key, flow, engine: cache.dpi.clone(), verified, failed: false })
+    }
+
+    /// The actual NFQUEUE replacement is available only under an owned
+    /// isolated lab rules lease. Unsupported packets, stale evidence,
+    /// shutdown and all mismatches are terminal for this permit.
+    #[cfg(target_os = "linux")]
+    pub fn verdict_stun_lab(
+        &self,
+        rules: &crate::routing::linux_rules::LabRules,
+        permit: &mut LabStunPermit,
+        packet: crate::routing::nfqueue::Packet<'_>,
+    ) -> std::io::Result<crate::routing::PacketAction> {
+        use crate::routing::PacketAction;
+        let gate = self.verdict_gate.lock();
+        let acceptable = gate.is_ok() && !permit.failed && self.ensure_running().is_ok()
+            && Arc::ptr_eq(&permit.engine, &self.client.routing_cache().dpi)
+            && packet.local_output() && !packet.checksum_pending()
+            && packet.metadata().is_some_and(|meta| meta.flow == permit.key)
+            && rules.owns_packet(&packet).unwrap_or(false)
+            && permit.verified.admissible().unwrap_or(false);
+        if acceptable {
+            if let Some(changed) = crate::routing::packet_modify::stun_fingerprint(packet.bytes()) {
+                // Commit before the kernel verdict, never retry another egress.
+                if permit.flow.commit(PacketAction::Modify).is_ok() {
+                    let result = packet.finish_stun_lab(&changed);
+                    if !matches!(&result, Ok(PacketAction::Modify)) { permit.failed = true; }
+                    return result;
+                }
+            }
+        }
+        permit.failed = true;
+        packet.finish(PacketAction::Drop)
     }
 
     /// Deliver only a conclusive early Pass to NFQUEUE. Unknown domain/app,

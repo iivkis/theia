@@ -333,6 +333,7 @@ static VOID NTAPI classify(
 apply:
     out->actionType = permitted ? FWP_ACTION_PERMIT : FWP_ACTION_BLOCK;
     FwpsApplyModifiedLayerData0(classifyHandle, request, FWPS_CLASSIFY_FLAG_REAUTHORIZE_IF_MODIFIED_BY_OTHERS);
+    if (permitted) out->rights |= FWPS_RIGHT_ACTION_WRITE;
     FwpsReleaseClassifyHandle0(classifyHandle);
 wipe:
     RtlSecureZeroMemory(token, sizeof(token));

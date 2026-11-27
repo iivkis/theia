@@ -195,6 +195,7 @@ pub struct Queue {
     fd: Option<OwnedFd>,
     number: u16,
     namespace: (u64, u64),
+    identity: [u8; 16],
     buffer: Vec<u8>,
 }
 impl Queue {
@@ -238,7 +239,10 @@ impl Queue {
         attr(&mut attrs, 4, &5u32.to_be_bytes()); // mask FAIL_OPEN | GSO
         attr(&mut attrs, 5, &0u32.to_be_bytes());
         configure(raw, number, 2, &attrs, &mut buffer)?;
-        Ok(Self { fd: Some(fd), number, namespace: Self::namespace()?, buffer })
+        use ring::rand::{SecureRandom, SystemRandom};
+        let mut identity = [0u8; 16];
+        SystemRandom::new().fill(&mut identity).map_err(|_| invalid())?;
+        Ok(Self { fd: Some(fd), number, namespace: Self::namespace()?, identity, buffer })
     }
 
     fn namespace() -> io::Result<(u64, u64)> {
@@ -253,17 +257,25 @@ impl Queue {
         Ok(self.number)
     }
 
+    pub(super) fn identity(&self) -> [u8; 16] { self.identity }
+
     fn descriptor(&self) -> io::Result<RawFd> {
         self.fd.as_ref().map(AsRawFd::as_raw_fd).ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))
     }
 
     fn verdict(&mut self, id: u32, accept: bool) -> io::Result<()> {
+        self.verdict_payload(id, accept, None)
+    }
+
+    fn verdict_payload(&mut self, id: u32, accept: bool, payload: Option<&[u8]>) -> io::Result<()> {
+        if payload.is_some_and(|p| !accept || p.len() > 65_531) { return Err(invalid()); }
         let fd = self.descriptor()?;
         let mut data = Vec::with_capacity(8);
         data.extend_from_slice(&u32::from(accept).to_be_bytes()); // NF_DROP=0, NF_ACCEPT=1
         data.extend_from_slice(&id.to_be_bytes());
         let mut attrs = Vec::with_capacity(12);
         attr(&mut attrs, 2, &data);
+        if let Some(payload) = payload { attr(&mut attrs, 10, payload); } // NFQA_PAYLOAD
         let result = send(fd, &message(VERDICT, REQUEST, 0, self.number, &attrs));
         if result.is_err() {
             drop(self.fd.take());
@@ -300,6 +312,22 @@ impl Packet<'_> {
     pub fn bytes(&self) -> &[u8] { &self.captured.bytes }
     pub fn checksum_pending(&self) -> bool { self.captured.checksum_pending }
     pub fn local_output(&self) -> bool { self.captured.local_output }
+    pub(super) fn queue_identity(&self) -> [u8; 16] { self.queue.identity() }
+
+    /// Only the checked laboratory strategy may provide a replacement.
+    /// Reject inconsistent or unmodified output, rather than accepting the
+    /// original bytes. The flow lease must already be committed to Modify.
+    pub(crate) fn finish_stun_lab(mut self, changed: &[u8]) -> io::Result<PacketAction> {
+        let expected = if self.local_output() && !self.checksum_pending() && self.metadata().is_some() {
+            super::packet_modify::stun_fingerprint(self.bytes())
+        } else { None };
+        if expected.as_deref() != Some(changed) {
+            return self.finish(PacketAction::Drop);
+        }
+        let result = self.queue.verdict_payload(self.captured.id, true, Some(changed));
+        self.done = true;
+        result.map(|()| PacketAction::Modify)
+    }
 
     /// Pass only a complete supported packet. Until an actual redirect or
     /// modification adapter owns the payload, those actions are Drop.

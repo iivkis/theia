@@ -47,6 +47,9 @@ impl Scope {
         let mut stat: libc::statfs = unsafe { mem::zeroed() };
         if unsafe { libc::fstatfs(host_namespace.as_raw_fd(), &mut stat) } != 0 { return Err(io::Error::last_os_error()); }
         if stat.f_type as u64 != 0x6e736673 { return Err(refused()); } // NSFS_MAGIC
+        // NS_GET_NSTYPE rejects a mount/PID namespace presented as a host
+        // network-namespace handle.
+        if unsafe { libc::ioctl(host_namespace.as_raw_fd(), 0xb703 as libc::c_ulong) } != libc::CLONE_NEWNET { return Err(refused()); }
         if own.dev() == host.dev() && own.ino() == host.ino() { return Err(refused()); }
         let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim().to_owned();
         if boot.len() != 36 || !boot.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') { return Err(invalid()); }
@@ -274,8 +277,18 @@ fn parse_journal(bytes: &[u8], scope: &Scope) -> io::Result<Journal> {
 /// rules or restores open networking. Explicit reviewed recovery is needed.
 pub struct LabRules {
     _lock: UnixDatagram,
+    journal: Journal,
+    queue_identity: [u8; 16],
 }
 impl LabRules {
+    pub(crate) fn owns_packet(&self, packet: &super::nfqueue::Packet<'_>) -> io::Result<bool> {
+        let meta = fs::metadata("/proc/thread-self/ns/net")?;
+        if (meta.dev(), meta.ino()) != (self.journal.scope.dev, self.journal.scope.ino)
+            || packet.queue_identity() != self.queue_identity { return Ok(false); }
+        let net = Netlink::open()?;
+        Ok(net.generation()? == self.journal.installed && net.table(&self.journal)? && net.generation()? == self.journal.installed)
+    }
+
     /// Blocking operation; run on a dedicated namespace worker, not a Tokio
     /// executor that can change namespaces between tasks. The provided
     /// host_namespace handle must genuinely be the trusted host namespace.
@@ -304,7 +317,7 @@ impl LabRules {
         if net.generation()? != installed || !net.table(&journal)? || net.generation()? != installed {
             return Err(refused());
         }
-        Ok(Self { _lock: lock })
+        Ok(Self { _lock: lock, journal, queue_identity: queue.identity() })
     }
 }
 
