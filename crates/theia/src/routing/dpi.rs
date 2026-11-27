@@ -758,7 +758,7 @@ impl Engine {
         let Some(network) = network_scope::observe(address) else { continue; };
         let name = super::domain_name(name).map_err(|_| ClientError::Protocol)?;
         let key = Key { name: name.clone(), address, policy: pin.digest(), epoch: pin.epoch(), network };
-        let Some(_guard) = self.scheduler.lock((&key.name, address, pin.digest()), Duration::from_millis(250)).await else { return Ok(Vec::new()); };
+        let Some(_guard) = self.scheduler.lock((&key.name, address, pin.digest()), Duration::from_millis(250)).await else { continue; };
         let Ok(Some(config)) = tokio::task::spawn_blocking(tls::native_config).await else { return Ok(Vec::new()); };
         for strategy in Strategy::ALL {
             if !self.key_live(&key) { return Err(stale_policy()); }
@@ -1166,6 +1166,14 @@ pub(crate) async fn read_tcp_hint(
 }
 
 impl Tunnel {
+    pub(crate) fn diagnostic_strategy(&self) -> &'static str {
+        match self.strategy {
+            Strategy::Header => "Header",
+            Strategy::Middle => "Middle",
+            Strategy::Balanced => "Balanced",
+        }
+    }
+
     pub(crate) fn fallback_policy(&self) -> FallbackPolicy {
         FallbackPolicy {
             engine: self.engine.clone(),

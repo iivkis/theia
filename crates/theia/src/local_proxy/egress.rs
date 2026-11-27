@@ -174,7 +174,7 @@ async fn route_egress(
         pinned,
         authorization,
     } = route_decision(carrier, cache, &address).await?;
-    if diagnostic_digest.is_some_and(|digest| digest != snapshot.digest() || action == Action::Blocked || (action == Action::Direct && matches!(request, EgressRequest::Tcp { allow_dpi: false }))) {
+    if diagnostic_digest.is_some_and(|digest| digest != snapshot.digest() || action == Action::Blocked || (action == Action::Direct && !matches!(request, EgressRequest::Tcp { allow_dpi: true }))) {
         return Err(ClientError::Open(ErrorCode::PolicyDenied));
     }
     if action.packet_action() == PacketAction::Drop {
@@ -471,6 +471,21 @@ pub(super) async fn diagnostic_open(
         EgressRequest::Tcp { allow_dpi }, Some(digest)).await?;
     match egress {
         RoutedEgress::Tcp(tunnel) => Ok(RoutedTcp { tunnel, flow }),
+        _ => Err(ClientError::Protocol),
+    }
+}
+
+/// Control path for an explicitly consented UDP application probe. No local
+/// modification is requested; the production router must permit server egress.
+pub(super) async fn diagnostic_udp(
+    carrier: &Carrier, cache: &Cache, name: &str, digest: [u8; 32],
+    observed: &Arc<std::sync::atomic::AtomicU8>,
+) -> Result<RoutedUdp, ClientError> {
+    let candidate = crate::routing::dpi::udp::Candidate::Other;
+    let (egress, flow) = route_egress(carrier, cache, Address::Dns(name.to_owned()), 443,
+        EgressRequest::Udp { candidate: &candidate, first: &[], observed }, Some(digest)).await?;
+    match egress {
+        RoutedEgress::Udp(tunnel) => Ok(RoutedUdp { tunnel, flow }),
         _ => Err(ClientError::Protocol),
     }
 }

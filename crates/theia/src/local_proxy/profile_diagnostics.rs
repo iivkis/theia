@@ -6,7 +6,77 @@ use sha2::{Digest, Sha256};
 use std::{path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicU8, Ordering}, mpsc::Sender}, time::{Duration, Instant}};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, sync::{oneshot, watch}, time::timeout};
 
-pub(crate) enum Event { Line(String), Domains(Vec<String>), Done }
+#[derive(Clone, Debug)]
+pub(crate) enum CheckKind {
+    Carrier(&'static str), Policy, Strategy(String), Https(&'static str), Udp(&'static str), Proxy(&'static str),
+}
+#[derive(Clone, Debug)]
+pub(crate) enum Outcome {
+    Verified(u128), Failure(ClientError), Skipped(&'static str), Route(Action),
+    Tls(&'static str, u128), Http(u16, ActualRoute, u128), Udp(u16, u128), Proxy(u8, bool, u8),
+}
+#[derive(Clone, Debug)]
+pub(crate) enum ActualRoute {
+    Direct, AntiDpi(&'static str), Xhttp { carrier: &'static str, mode: &'static str, fallback: Option<&'static str> },
+    SystemProxy,
+}
+impl std::fmt::Display for ActualRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Direct => f.write_str("напрямую (без модификации)"),
+            Self::AntiDpi(strategy) => write!(f, "локальный Anti-DPI {strategy}"),
+            Self::Xhttp { carrier, mode, fallback } => {
+                write!(f, "XHTTP {carrier} {mode}")?;
+                if let Some(reason) = fallback { write!(f, " · резерв: {reason}")?; }
+                Ok(())
+            }
+            Self::SystemProxy => f.write_str("действующий listener"),
+        }
+    }
+}
+#[derive(Clone, Debug)]
+pub(crate) struct Check {
+    pub(crate) domain: Option<String>,
+    pub(crate) kind: CheckKind,
+    pub(crate) outcome: Outcome,
+}
+impl Check {
+    pub(crate) fn line(&self, anonymous: bool) -> String {
+        let kind = match &self.kind {
+            CheckKind::Carrier(label) => format!("Канал {label}"),
+            CheckKind::Policy => "Маршрут".to_owned(),
+            CheckKind::Strategy(label) => label.clone(),
+            CheckKind::Https(label) => format!("HTTPS {label}"),
+            CheckKind::Udp(label) => format!("UDP {label}"),
+            CheckKind::Proxy(label) => format!("System Proxy {label}"),
+        };
+        let outcome = match &self.outcome {
+            Outcome::Verified(ms) => format!("подтверждён, {ms} мс"),
+            Outcome::Failure(error) => format!("ошибка: {error}"),
+            Outcome::Skipped(reason) => format!("не проверен: {reason}"),
+            Outcome::Route(action) => action.name().to_owned(),
+            Outcome::Tls(status, ms) => format!("{status}, {ms} мс"),
+            Outcome::Http(status, route, ms) => format!("HTTP {status}, {route}, {ms} мс"),
+            Outcome::Udp(status, ms) => format!("QUIC v1 + HTTP/3 {status}, {ms} мс"),
+            Outcome::Proxy(phase, ready, applied) => format!("фаза {phase}, listeners {}, настройки {}", if *ready { "готовы" } else { "не готовы" }, match applied { 1 => "подтверждены", 0 => "не применены", _ => "не подтверждены" }),
+        };
+        let prefix = match (&self.domain, anonymous) {
+            (Some(domain), false) => format!("{domain} · "),
+            (Some(_), true) => "Ресурс · ".to_owned(),
+            _ => String::new(),
+        };
+        format!("{prefix}{kind}: {outcome}")
+    }
+    pub(crate) fn failed(&self) -> bool {
+        matches!(self.outcome, Outcome::Failure(_) | Outcome::Http(400..=599, _, _) | Outcome::Udp(400..=599, _))
+            || matches!(&self.outcome, Outcome::Tls(status, _) if *status != "TLS подтверждён")
+    }
+}
+pub(crate) enum Event { Line(String), Check(Check), Domains(Vec<String>), DomainDone(String), Done(Result<(), ClientError>) }
+
+fn record(tx: &Sender<Event>, domain: Option<&str>, kind: CheckKind, outcome: Outcome) -> Result<(), ClientError> {
+    tx.send(Event::Check(Check { domain: domain.map(str::to_owned), kind, outcome })).map_err(|_| ClientError::Io)
+}
 
 fn emit(tx: &Sender<Event>, line: impl Into<String>) -> Result<(), ClientError> {
     tx.send(Event::Line(line.into())).map_err(|_| ClientError::Io)
@@ -37,7 +107,7 @@ pub(crate) async fn run(
         } => result,
     };
     if let Err(error) = result { let _ = emit(&tx, format!("Проверка остановлена: {error}")); }
-    let _ = tx.send(Event::Done);
+    let _ = tx.send(Event::Done(result));
 }
 
 async fn session(
@@ -49,6 +119,8 @@ async fn session(
     let Config::Client(doc) = config::parse(std::str::from_utf8(&raw).map_err(|_| ClientError::Configuration)?)
         .map_err(|_| ClientError::Configuration)? else { return Err(ClientError::Configuration); };
     let profile = doc.client.profiles.iter().find(|p| p.id == id).ok_or(ClientError::Configuration)?;
+    let credential: [u8; 32] = Sha256::digest(super::read_token(profile)?.as_bytes()).into();
+    let ca = ca_digest(profile)?;
     let started = Instant::now();
     let client = timeout(Duration::from_secs(20), load_client_with_budget(profile, crate::connection_pool::profile_budget(), Some(path))).await.map_err(|_| ClientError::Timeout)??;
     let cache = client.routing_cache();
@@ -73,8 +145,6 @@ async fn session(
         Carrier::Auto(_) => Err(ClientError::Configuration),
     }).collect::<Result<Vec<_>, _>>()?;
     let scopes: Vec<_> = remotes.iter().map(|addr| crate::network_scope::observe(*addr)).collect();
-    let credential: [u8; 32] = Sha256::digest(super::read_token(profile)?.as_bytes()).into();
-    let ca = ca_digest(profile)?;
     let guard = async {
         loop {
             source(path, digest)?;
@@ -102,14 +172,14 @@ async fn session(
     for (label, transport, result) in [("H2", h2, h2_result), ("H3", h3, h3_result)] {
         match (transport, result) {
             (Some(transport), Some(Ok((digest, ms)))) => {
-                emit(tx, format!("{label}: авторизованный канал подтверждён, {ms} мс"))?;
+                record(tx, None, CheckKind::Carrier(label), Outcome::Verified(ms))?;
                 verified.push((label, transport, digest));
             }
             (_, Some(Err(error))) => {
-                emit(tx, format!("{label}: {error}"))?;
+                record(tx, None, CheckKind::Carrier(label), Outcome::Failure(error))?;
                 refused |= protective(error);
             }
-            _ => emit(tx, format!("{label}: не разрешён профилем"))?,
+            _ => record(tx, None, CheckKind::Carrier(label), Outcome::Skipped("не разрешён профилем"))?,
         }
     }
     if refused { return Err(ClientError::Protocol); }
@@ -134,10 +204,15 @@ async fn session(
     tx.send(Event::Domains(domains.clone())).map_err(|_| ClientError::Io)?;
     confirm.await.map_err(|_| ClientError::Io)?;
     source(path, digest)?;
+    let current = timeout(Duration::from_secs(30), client.refresh_routing_policy()).await.map_err(|_| ClientError::Timeout)??;
+    if current.digest() != expected { return Err(ClientError::Protocol); }
     let pin = cache.policy.pin(expected)?;
-    emit(tx, format!("UDP Anti-DPI: {}. UDP-проверки не выполняются.", crate::routing::dpi::UdpStrategy::capability_summary()))?;
+    emit(tx, format!("UDP Anti-DPI: {}. Локальные UDP-стратегии не запускаются; контроль XHTTP проверяет QUIC/HTTP3.", crate::routing::dpi::UdpStrategy::capability_summary()))?;
     let roots = tokio::task::spawn_blocking(crate::net::tls::native_roots).await.map_err(|_| ClientError::Tls)?;
+    let quic_tls = Arc::new(crate::net::tls::roots_tls13(roots.clone(), b"h3").map_err(|_| ClientError::Tls)?);
     let tls = Arc::new(crate::net::tls::application_probe(roots).map_err(|_| ClientError::Tls)?);
+    let proxy = proxy_lifecycle(&doc, id, digest, tx).await?;
+    let mut proxy_checked = false;
     for domain in domains {
         source(path, digest)?;
         pin.check()?;
@@ -146,38 +221,63 @@ async fn session(
         emit(tx, format!("── {domain} ──"))?;
         let (action, ips, pin) = match timeout(Duration::from_secs(12), egress::diagnostic_target(&carrier, cache, &domain, expected)).await {
             Ok(Ok(v)) => v,
-            Ok(Err(e)) => { emit(tx, format!("Политика/DNS: {e}; пропуск"))?; if protective(e) { return Err(e); } continue; }
-            Err(_) => { emit(tx, "Политика/DNS: таймаут; пропуск")?; continue; }
+            Ok(Err(e)) => { record(tx, Some(&domain), CheckKind::Policy, Outcome::Failure(e))?; if protective(e) { return Err(e); } continue; }
+            Err(_) => { record(tx, Some(&domain), CheckKind::Policy, Outcome::Failure(ClientError::Timeout))?; continue; }
         };
-        emit(tx, format!("Маршрут: {}", action.name()))?;
+        record(tx, Some(&domain), CheckKind::Policy, Outcome::Route(action))?;
         if action == Action::Blocked {
-            emit(tx, "Запрещённый маршрут: сетевые запросы не выполняются")?;
+            record(tx, Some(&domain), CheckKind::Https("авто"), Outcome::Skipped("запрещено политикой"))?;
+            tx.send(Event::DomainDone(domain)).map_err(|_| ClientError::Io)?;
             continue;
         }
         if action == Action::DirectDpi {
             match cache.dpi.diagnostic_tcp_strategies(&domain, &ips, &pin).await {
                 Ok(results) => {
                     if results.is_empty() { emit(tx, "TCP Anti-DPI: нет разрешённых/доступных проб")?; }
-                    for (strategy, status, ms) in results { emit(tx, format!("{strategy}: {status}, {ms} мс"))?; }
+                    for (strategy, status, ms) in results { record(tx, Some(&domain), CheckKind::Strategy(strategy), Outcome::Tls(status, ms))?; }
                 }
-                Err(e) => { emit(tx, format!("TCP Anti-DPI: {e}; остальные пробы домена отменены"))?; if protective(e) { return Err(e); } continue; }
+                Err(e) => { record(tx, Some(&domain), CheckKind::Strategy("TCP Anti-DPI".into()), Outcome::Failure(e))?; if protective(e) { return Err(e); } continue; }
             }
         } else { emit(tx, "TCP Anti-DPI: не назначен правилами")?; }
-        let result = https(&carrier, cache, &domain, expected, true, tls.clone()).await;
+        let result = https(&carrier, cache, &domain, expected, true, action, tls.clone()).await;
         match result {
             Ok((code, route, ms)) => {
-                let label = if action == Action::DirectDpi && route.starts_with("XHTTP") { "Фактический резерв XHTTP" } else { "Штатный маршрут" };
-                emit(tx, format!("{label}: HTTP {code}, {route}, {ms} мс"))?;
+                record(tx, Some(&domain), CheckKind::Https("штатный"), Outcome::Http(code, route, ms))?;
             }
-            Err(e) => { emit(tx, format!("Авто: {e}"))?; if protective(e) { return Err(e); } }
+            Err(e) => { record(tx, Some(&domain), CheckKind::Https("штатный"), Outcome::Failure(e))?; if protective(e) { return Err(e); } }
         }
-        if action == Action::Direct { continue; }
+        if !proxy_checked {
+            if let Some(instance) = &proxy {
+                for (label, address, socks) in [("HTTP CONNECT", &doc.client.proxy.http_listen, false), ("SOCKS5 CONNECT", &doc.client.proxy.socks5_listen, true)] {
+                    let result = proxy_https(instance, digest, address, socks, &domain, tls.clone()).await;
+                    match result {
+                        Ok((code, ms)) => record(tx, Some(&domain), CheckKind::Proxy(label), Outcome::Http(code, ActualRoute::SystemProxy, ms))?,
+                        Err(error) => {
+                            record(tx, Some(&domain), CheckKind::Proxy(label), Outcome::Failure(error))?;
+                            if protective(error) { return Err(error); }
+                        }
+                    }
+                }
+            }
+            proxy_checked = true;
+        }
+        if action != Action::Direct {
         for (label, transport, _) in &verified {
-            match https(transport, cache, &domain, expected, false, tls.clone()).await {
-                Ok((code, route, ms)) => emit(tx, format!("Контроль XHTTP {label}: HTTP {code}, {route}, {ms} мс"))?,
-                Err(e) => { emit(tx, format!("Контроль XHTTP {label}: {e}"))?; if protective(e) { return Err(e); } }
+            match https(transport, cache, &domain, expected, false, action, tls.clone()).await {
+                Ok((code, route, ms)) => record(tx, Some(&domain), CheckKind::Https(label), Outcome::Http(code, route, ms))?,
+                Err(e) => { record(tx, Some(&domain), CheckKind::Https(label), Outcome::Failure(e))?; if protective(e) { return Err(e); } }
+            }
+            pin.check()?;
+            match udp_https(transport, cache, &domain, expected, quic_tls.clone()).await {
+                Ok((status, ms)) => record(tx, Some(&domain), CheckKind::Udp(label), Outcome::Udp(status, ms))?,
+                Err(error) => {
+                    record(tx, Some(&domain), CheckKind::Udp(label), Outcome::Failure(error))?;
+                    if protective(error) { return Err(error); }
+                }
             }
         }
+        }
+        tx.send(Event::DomainDone(domain)).map_err(|_| ClientError::Io)?;
     }
     emit(tx, "Завершено. HTTP-ответ подтверждает обмен, не доступность всех функций сайта. TLS-проба стратегии не доказывает наличие блокировки.")
     };
@@ -210,13 +310,16 @@ async fn check_carrier(transport: Option<&Carrier>, scope: &str) -> Option<Resul
     }).await.unwrap_or(Err(ClientError::Timeout)))
 }
 
-async fn https(carrier: &Carrier, cache: &super::Cache, name: &str, digest: [u8; 32], allow_dpi: bool, tls: Arc<rustls::ClientConfig>) -> Result<(u16, String, u128), ClientError> {
+async fn https(carrier: &Carrier, cache: &super::Cache, name: &str, digest: [u8; 32], allow_dpi: bool, action: Action, tls: Arc<rustls::ClientConfig>) -> Result<(u16, ActualRoute, u128), ClientError> {
     let started = Instant::now();
     timeout(Duration::from_secs(12), async {
         let mut routed = egress::diagnostic_open(carrier, cache, name, digest, allow_dpi).await?;
         let direct = matches!(&routed.tunnel, ProxyTunnel::Direct(_));
         let observed = Arc::new(AtomicU8::new(routed.open_code()));
-        if let ProxyTunnel::Dpi(route) = &mut routed.tunnel { route.observed = Some(observed.clone()); }
+        let strategy = if let ProxyTunnel::Dpi(route) = &mut routed.tunnel {
+            route.observed = Some(observed.clone());
+            Some(route.tunnel.diagnostic_strategy())
+        } else { None };
         let listener = bind_proxy_listener("127.0.0.1:0").await?;
         let addr = listener.local_addr().map_err(|_| ClientError::Io)?;
         let local = TcpStream::connect(addr).await.map_err(|_| ClientError::Io)?;
@@ -224,18 +327,7 @@ async fn https(carrier: &Carrier, cache: &super::Cache, name: &str, digest: [u8;
         if local.local_addr().map_err(|_| ClientError::Io)? != peer { return Err(ClientError::Io); }
         drop(listener);
         let relay = routed.relay(socket);
-        let app = async {
-            let server_name = rustls::pki_types::ServerName::try_from(name.to_owned()).map_err(|_| ClientError::Configuration)?;
-            let mut stream = tokio_rustls::TlsConnector::from(tls).connect(server_name, local).await.map_err(|_| ClientError::Tls)?;
-            stream.write_all(format!("HEAD / HTTP/1.1\r\nHost: {name}\r\nConnection: close\r\n\r\n").as_bytes()).await.map_err(|_| ClientError::Io)?;
-            let mut line = Vec::new();
-            for _ in 0..1024 {
-                let b = stream.read_u8().await.map_err(|_| ClientError::Io)?;
-                if b == b'\n' { return status(&line); }
-                line.push(b);
-            }
-            Err(ClientError::Protocol)
-        };
+        let app = application_head(local, name, tls);
         tokio::pin!(relay, app);
         let status = tokio::select! {
             biased;
@@ -244,14 +336,181 @@ async fn https(carrier: &Carrier, cache: &super::Cache, name: &str, digest: [u8;
         };
         cache.policy.pin(digest)?.check()?;
         let code = observed.load(Ordering::Relaxed);
+        let fallback = if allow_dpi && action == Action::DirectDpi {
+            Some(if strategy.is_some() { "до первой отправки" } else if !cache.dpi.enabled() { "Anti-DPI отключён" } else { "локальный маршрут не выбран" })
+        } else { None };
         let route = match code >> 2 {
-            2 => format!("XHTTP H2 {}", xhttp_observation(code & 3)),
-            3 => format!("XHTTP H3 {}", xhttp_observation(code & 3)),
-            _ if direct => "напрямую (без модификации)".to_owned(),
-            _ if allow_dpi => "локальный Anti-DPI".to_owned(),
+            2 => ActualRoute::Xhttp { carrier: "H2", mode: xhttp_observation(code & 3), fallback },
+            3 => ActualRoute::Xhttp { carrier: "H3", mode: xhttp_observation(code & 3), fallback },
+            _ if direct => ActualRoute::Direct,
+            _ if allow_dpi => ActualRoute::AntiDpi(strategy.ok_or(ClientError::Protocol)?),
             _ => return Err(ClientError::Protocol),
         };
         Ok((status, route, started.elapsed().as_millis()))
+    }).await.map_err(|_| ClientError::Timeout)?
+}
+
+async fn application_head(local: TcpStream, name: &str, tls: Arc<rustls::ClientConfig>) -> Result<u16, ClientError> {
+    let server_name = rustls::pki_types::ServerName::try_from(name.to_owned()).map_err(|_| ClientError::Configuration)?;
+    let mut stream = tokio_rustls::TlsConnector::from(tls).connect(server_name, local).await.map_err(|_| ClientError::Tls)?;
+    stream.write_all(format!("HEAD / HTTP/1.1\r\nHost: {name}\r\nConnection: close\r\n\r\n").as_bytes()).await.map_err(|_| ClientError::Io)?;
+    for _ in 0..5 {
+        let mut line = Vec::new();
+        loop {
+            let b = stream.read_u8().await.map_err(|_| ClientError::Io)?;
+            if b == b'\n' { break; }
+            if line.len() >= 1024 { return Err(ClientError::Protocol); }
+            line.push(b);
+        }
+        let code = status(&line)?;
+        if code >= 200 { return Ok(code); }
+        // Informational responses are not a completed application exchange.
+        let mut tail = [0; 4];
+        for _ in 0..8192 {
+            tail.rotate_left(1);
+            tail[3] = stream.read_u8().await.map_err(|_| ClientError::Io)?;
+            if tail.ends_with(b"\r\n\r\n") || tail == [0, 0, b'\r', b'\n'] { break; }
+        }
+    }
+    Err(ClientError::Protocol)
+}
+
+async fn proxy_lifecycle(doc: &config::ClientDocument, id: &str, digest: [u8; 32], tx: &Sender<Event>) -> Result<Option<crate::management::ProxyLifecycle>, ClientError> {
+    use crate::management::{StatusCommand, StatusReply};
+    if doc.client.active_profile != id {
+        record(tx, None, CheckKind::Proxy("IPC"), Outcome::Skipped("выбран неактивный профиль"))?;
+        return Ok(None);
+    }
+    match timeout(Duration::from_secs(3), crate::management::query_client_environment(StatusCommand::ClientLifecycle)).await {
+        Ok(Ok(StatusReply::ClientLifecycle(view))) if view.config_sha256 == digest => {
+            record(tx, None, CheckKind::Proxy("IPC"), Outcome::Proxy(view.phase, view.listeners_ready, view.proxy_applied))?;
+            Ok((view.phase == 2 && view.listeners_ready && view.proxy_applied == 1).then_some(view))
+        }
+        _ => {
+            record(tx, None, CheckKind::Proxy("IPC"), Outcome::Skipped("владелец и применение настроек не подтверждены"))?;
+            Ok(None)
+        }
+    }
+}
+
+async fn check_proxy(instance: &crate::management::ProxyLifecycle, digest: [u8; 32]) -> Result<(), ClientError> {
+    use crate::management::{StatusCommand, StatusReply};
+    match timeout(Duration::from_secs(3), crate::management::query_client_environment(StatusCommand::ClientLifecycle)).await {
+        Ok(Ok(StatusReply::ClientLifecycle(view))) if view.instance == instance.instance && view.config_sha256 == digest
+            && view.phase == 2 && view.listeners_ready && view.proxy_applied == 1 => Ok(()),
+        _ => Err(ClientError::Configuration),
+    }
+}
+async fn proxy_https(instance: &crate::management::ProxyLifecycle, digest: [u8; 32], address: &str, socks: bool, name: &str, tls: Arc<rustls::ClientConfig>) -> Result<(u16, u128), ClientError> {
+    let started = Instant::now();
+    check_proxy(instance, digest).await?;
+    let status = timeout(Duration::from_secs(12), async {
+        let address: std::net::SocketAddr = address.parse().map_err(|_| ClientError::Configuration)?;
+        if !address.ip().is_loopback() { return Err(ClientError::Configuration); }
+        let mut socket = TcpStream::connect(address).await.map_err(|_| ClientError::Io)?;
+        if socks {
+            socket.write_all(&[5, 1, 0]).await.map_err(|_| ClientError::Io)?;
+            let mut method = [0; 2];
+            socket.read_exact(&mut method).await.map_err(|_| ClientError::Io)?;
+            if method != [5, 0] { return Err(ClientError::Protocol); }
+            let len = u8::try_from(name.len()).map_err(|_| ClientError::Configuration)?;
+            let mut req = vec![5, 1, 0, 3, len];
+            req.extend_from_slice(name.as_bytes()); req.extend_from_slice(&443u16.to_be_bytes());
+            socket.write_all(&req).await.map_err(|_| ClientError::Io)?;
+            let mut header = [0; 4];
+            socket.read_exact(&mut header).await.map_err(|_| ClientError::Io)?;
+            if header[..3] != [5, 0, 0] { return Err(ClientError::Protocol); }
+            let n = match header[3] { 1 => 4, 4 => 16, 3 => usize::from(socket.read_u8().await.map_err(|_| ClientError::Io)?), _ => return Err(ClientError::Protocol) };
+            socket.read_exact(&mut vec![0; n + 2]).await.map_err(|_| ClientError::Io)?;
+        } else {
+            socket.write_all(format!("CONNECT {name}:443 HTTP/1.1\r\nHost: {name}:443\r\n\r\n").as_bytes()).await.map_err(|_| ClientError::Io)?;
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                if head.len() >= 8192 { return Err(ClientError::Protocol); }
+                head.push(socket.read_u8().await.map_err(|_| ClientError::Io)?);
+            }
+            let code = self::status(head.split(|b| *b == b'\n').next().ok_or(ClientError::Protocol)?)?;
+            if code != 200 { return Err(ClientError::Rejected(code)); }
+        }
+        check_proxy(instance, digest).await?;
+        application_head(socket, name, tls).await
+    }).await.map_err(|_| ClientError::Timeout)??;
+    check_proxy(instance, digest).await?;
+    Ok((status, started.elapsed().as_millis()))
+}
+
+async fn udp_https(carrier: &Carrier, cache: &super::Cache, name: &str, digest: [u8; 32], tls: Arc<rustls::ClientConfig>) -> Result<(u16, u128), ClientError> {
+    use crate::quic_core::{dial, h3_adapter, handshake_udp, wire::Version};
+    let started = Instant::now();
+    timeout(Duration::from_secs(15), async {
+        let observed = Arc::new(AtomicU8::new(0));
+        let routed = egress::diagnostic_udp(carrier, cache, name, digest, &observed).await?;
+        routed.record_transport(&observed);
+        if !matches!(observed.load(Ordering::Relaxed) >> 2, 2 | 3) { return Err(ClientError::Protocol); }
+        let super::RoutedUdp { tunnel, flow } = routed;
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.map_err(|_| ClientError::Io)?;
+        let bridge = tokio::net::UdpSocket::bind("127.0.0.1:0").await.map_err(|_| ClientError::Io)?;
+        let peer = bridge.local_addr().map_err(|_| ClientError::Io)?;
+        bridge.connect(client.local_addr().map_err(|_| ClientError::Io)?).await.map_err(|_| ClientError::Io)?;
+        client.connect(peer).await.map_err(|_| ClientError::Io)?;
+        let (upload, upload_rx) = tokio::sync::mpsc::channel(8);
+        let (download, mut download_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let relay = tunnel.relay_guarded(upload_rx, download, Some(&flow));
+        let forward = async {
+            let mut buf = vec![0; 65535];
+            loop {
+                tokio::select! {
+                    result = bridge.recv(&mut buf) => {
+                        let count = result.map_err(|_| ClientError::Io)?;
+                        upload.send(buf[..count].to_vec()).await.map_err(|_| ClientError::Io)?;
+                    }
+                    packet = download_rx.recv() => {
+                        let packet = packet.ok_or(ClientError::Io)?;
+                        if bridge.send(&packet).await.map_err(|_| ClientError::Io)? != packet.len() { return Err(ClientError::Io); }
+                    }
+                }
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), ClientError>(())
+        };
+        let app = async {
+            let server_name = rustls::pki_types::ServerName::try_from(name.to_owned()).map_err(|_| ClientError::Configuration)?;
+            let mut session = Box::pin(handshake_udp::connect_diagnostic_socket(client, peer, tls, server_name, Version::V1)).await.map_err(|error| {
+                match error {
+                    handshake_udp::Error::Timeout => ClientError::Timeout,
+                    handshake_udp::Error::Scope => ClientError::Configuration,
+                    _ => ClientError::Tls,
+                }
+            })?;
+            dial::confirm(&mut session).await.map_err(|_| ClientError::Tls)?;
+            let (transport, _) = h3_adapter::NativeConnection::start(session).map_err(|_| ClientError::Tls)?;
+            let mut builder = h3::client::builder();
+            builder.max_field_section_size(u64::from(crate::transport_policy::MAX_HEADER_LIST_BYTES));
+            let (mut driver, mut sender) = builder.build::<_, _, bytes::Bytes>(transport).await.map_err(|_| ClientError::Http3)?;
+            let request = async {
+                let request = http::Request::head(format!("https://{name}/")).body(()).map_err(|_| ClientError::Configuration)?;
+                let mut stream = sender.send_request(request).await.map_err(|_| ClientError::Http3)?;
+                stream.finish().await.map_err(|_| ClientError::Http3)?;
+                for _ in 0..5 {
+                    let status = stream.recv_response().await.map_err(|_| ClientError::Http3)?.status().as_u16();
+                    if status >= 200 { return Ok(status); }
+                }
+                Err(ClientError::Protocol)
+            };
+            tokio::select! {
+                result = request => result,
+                _ = std::future::poll_fn(|cx| driver.poll_close(cx)) => Err(ClientError::Http3),
+            }
+        };
+        let status = tokio::select! {
+            biased;
+            result = flow.wait_revoked() => { result?; return Err(ClientError::Protocol); }
+            result = relay => { result?; return Err(ClientError::Io); }
+            result = forward => { result?; return Err(ClientError::Io); }
+            result = app => result?,
+        };
+        flow.check_pending()?;
+        Ok((status, started.elapsed().as_millis()))
     }).await.map_err(|_| ClientError::Timeout)?
 }
 

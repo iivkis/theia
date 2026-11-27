@@ -95,7 +95,6 @@ impl Settings {
                 &self.rules,
                 &[],
                 &[],
-                &self.diagnostic_domains,
             )?),
             _ => Err(Error::Invalid),
         }
