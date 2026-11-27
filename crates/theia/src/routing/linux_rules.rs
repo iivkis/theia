@@ -325,7 +325,7 @@ fn payload_cmp(out: &mut Vec<u8>, base: u32, offset: u32, value: &[u8]) {
     expression(out, "payload", &data);
     cmp(out, value);
 }
-fn carrier_expressions(key: super::packet::FlowKey, mark: u32) -> Vec<u8> {
+fn socket_matches(key: super::packet::FlowKey, mark: u32) -> Vec<u8> {
     use std::net::IpAddr;
     let mut out = Vec::new();
     let mut socket = Vec::new();
@@ -353,6 +353,10 @@ fn carrier_expressions(key: super::packet::FlowKey, mark: u32) -> Vec<u8> {
     ports[..2].copy_from_slice(&key.source.port().to_be_bytes());
     ports[2..].copy_from_slice(&key.destination.port().to_be_bytes());
     payload_cmp(&mut out, 2, 0, &ports);
+    out
+}
+fn carrier_expressions(key: super::packet::FlowKey, mark: u32) -> Vec<u8> {
+    let mut out = socket_matches(key, mark);
     let mut verdict = Vec::new();
     attr(&mut verdict, 1, &1u32.to_be_bytes()); // NF_ACCEPT
     let mut data = Vec::new();
@@ -372,10 +376,31 @@ fn parse_journal(bytes: &[u8], scope: &Scope) -> io::Result<Journal> {
 
 /// A lab rule lease keeps the namespace ownership lock. Drop never deletes
 /// rules or restores open networking. Explicit reviewed recovery is needed.
+struct SocketCapture {
+    socket: LabCarrierSocket,
+    queue_number: u16,
+    queue_identity: [u8;16],
+}
+
+/// Proof is available only while the packet is held by the distinct owned
+/// kernel queue and the connected descriptor and rules generation agree.
+/// It establishes socket identity, not which process sent through a shared
+/// socket. Never treat it alone as application/domain routing evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapturedSocket {
+    cookie: u64,
+    key: super::packet::FlowKey,
+}
+impl CapturedSocket {
+    pub fn cookie(&self) -> u64 { self.cookie }
+    pub fn key(&self) -> super::packet::FlowKey { self.key }
+}
+
 pub struct LabRules {
     journal: Journal,
     queue_identity: [u8; 16],
     _carriers: Vec<LabCarrierSocket>,
+    capture: Option<SocketCapture>,
     journal_path: PathBuf,
     admissions: std::collections::BTreeMap<u32, super::packet::FlowKey>,
     queue_number: u16,
@@ -403,6 +428,44 @@ impl LabRules {
         self.current()
     }
 
+    /// Corroborate an actual packet received on the dedicated socket
+    /// queue. The kernel rule selected socket mark AND full tuple before
+    /// enqueueing; the private queue identity is not a user header.
+    /// Caller must exclusively own the tagged socket and namespace; no
+    /// untrusted CAP_NET_RAW/CAP_NET_ADMIN or external nft modifications.
+    pub fn captured_socket(&self, packet: &super::nfqueue::Packet<'_>) -> io::Result<CapturedSocket> {
+        let capture = self.capture.as_ref().ok_or_else(refused)?;
+        if packet.queue_identity() != capture.queue_identity || !packet.local_output() || !self.current()? {
+            return Err(refused());
+        }
+        let mut key = packet.metadata().ok_or_else(refused)?.flow;
+        key.interface = 0;
+        capture.socket.verify()?;
+        if key != capture.socket.key() || !self.current()? { return Err(refused()); }
+        Ok(CapturedSocket { cookie: capture.socket.cookie(), key })
+    }
+
+    /// Install a non-bypass queue for a single already connected, owned
+    /// socket. Other packets enter the ordinary catch-all queue. This is
+    /// a laboratory attribution proof, not a carrier exemption. Dynamic
+    /// carrier updates are deliberately disabled for this proof session.
+    pub fn install_socket_capture(
+        queue: &Queue,
+        tagged: &Queue,
+        socket: LabCarrierSocket,
+        host_namespace: &File,
+        path: &Path,
+    ) -> io::Result<Self> {
+        let queue_number = tagged.number()?;
+        if queue.number()? == queue_number || tagged.identity() == queue.identity() {
+            return Err(refused());
+        }
+        socket.verify()?;
+        Self::install_inner(queue, host_namespace, path, Vec::new(), Some(SocketCapture {
+            socket, queue_number, queue_identity: tagged.identity(),
+        }))
+    }
+
     /// Blocking operation; run on a dedicated namespace worker, not a Tokio
     /// executor that can change namespaces between tasks. The provided
     /// host_namespace handle must genuinely be the trusted host namespace.
@@ -418,10 +481,15 @@ impl LabRules {
     /// The isolated namespace must not contain untrusted CAP_NET_ADMIN/
     /// CAP_NET_RAW holders capable of changing socket marks.
     pub fn install_with_carriers(queue: &Queue, host_namespace: &File, path: &Path, carriers: Vec<LabCarrierSocket>) -> io::Result<Self> {
+        Self::install_inner(queue,host_namespace,path,carriers,None)
+    }
+
+    fn install_inner(queue: &Queue, host_namespace: &File, path: &Path, carriers: Vec<LabCarrierSocket>, capture: Option<SocketCapture>) -> io::Result<Self> {
         let lock = scope_lock()?;
         let scope = Scope::current(host_namespace)?;
         check_parent(path)?;
-        if carriers.len() > MAX_CARRIERS { return Err(refused()); }
+        if carriers.len() > MAX_CARRIERS || (capture.is_some() && !carriers.is_empty()) { return Err(refused()); }
+        if let Some(tag) = &capture { tag.socket.verify()?; }
         let mut marks = std::collections::HashSet::new();
         let mut cookies = std::collections::HashSet::new();
         for socket in &carriers {
@@ -440,7 +508,13 @@ impl LabRules {
         let journal = Journal { version: 1, scope, nonce, before, installed, previous_present: false, restored: false };
         if net.table(&journal)? { return Err(refused()); }
         let queue_number = queue.number()?;
-        let operations = install_messages(&journal, queue_number, &carriers);
+        let mut operations = install_messages(&journal, queue_number, &carriers);
+        if let Some(tag) = &capture {
+            let mut last = operations.pop().ok_or_else(invalid)?;
+            operations.push(socket_capture_rule(&journal,tag.socket.key(),tag.socket.mark(),tag.queue_number,operations.len() as u32+2));
+            last[8..12].copy_from_slice(&(operations.len() as u32+2).to_ne_bytes());
+            operations.push(last);
+        }
         let admissions = carriers.iter().map(|socket| (socket.mark(), socket.key())).collect();
         // Durable intent before changing any OS state, with create-only/CAS
         // publication. All uncertain failures leave the journal intact.
@@ -449,14 +523,14 @@ impl LabRules {
         if net.generation()? != installed || !net.table(&journal)? || net.generation()? != installed {
             return Err(refused());
         }
-        Ok(Self { _lock: lock, journal, queue_identity: queue.identity(), _carriers: carriers,
+        Ok(Self { _lock: lock, journal, queue_identity: queue.identity(), _carriers: carriers, capture,
             journal_path: path.to_owned(), admissions, queue_number, poisoned: false })
     }
     /// Replace only our output chain's rules in one generation-checked
     /// transaction. The base chain (DROP policy) is never removed. All
     /// exact active exemptions precede the same non-bypass queue rule.
     fn replace_admissions(&mut self, next_admissions: std::collections::BTreeMap<u32, super::packet::FlowKey>) -> io::Result<()> {
-        if next_admissions.len() > MAX_CARRIERS || !self.current()? { return Err(refused()); }
+        if self.capture.is_some() || next_admissions.len() > MAX_CARRIERS || !self.current()? { return Err(refused()); }
         let raw = journal_bytes(&self.journal_path)?.ok_or_else(refused)?;
         if parse_journal(&raw, &self.journal.scope)? != self.journal { return Err(refused()); }
         let generation = self.journal.installed;
@@ -494,6 +568,20 @@ impl LabRules {
         if result.is_err() { self.poisoned = true; }
         result
     }
+}
+
+fn socket_capture_rule(journal: &Journal, key: super::packet::FlowKey, mark: u32, queue: u16, sequence: u32) -> Vec<u8> {
+    let mut expressions = socket_matches(key,mark);
+    let mut data = Vec::new();
+    attr(&mut data,1,&queue.to_be_bytes());
+    attr(&mut data,2,&1u16.to_be_bytes());
+    attr(&mut data,3,&0u16.to_be_bytes()); // no bypass
+    expression(&mut expressions,"queue",&data);
+    let mut attrs = Vec::new();
+    name_attr(&mut attrs,1,&journal.name());
+    name_attr(&mut attrs,2,"output");
+    attr(&mut attrs,4 | NESTED,&expressions);
+    nft_message(NEW_RULE,REQUEST | ACK | CREATE_EXCLUSIVE | APPEND,sequence,&attrs)
 }
 
 fn replace_messages(journal: &Journal, queue: u16, admissions: &std::collections::BTreeMap<u32, super::packet::FlowKey>) -> Vec<Vec<u8>> {
@@ -728,6 +816,50 @@ mod tests {
             recover(&host, &path).unwrap();
             assert!(!Netlink::open().unwrap().table(&journal).unwrap());
             recover(&host, &path).unwrap();
+            fs::remove_dir_all(dir).unwrap();
+        }).join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires Linux CAP_SYS_ADMIN, CAP_NET_ADMIN, iproute2 and isolated namespace"]
+    fn kernel_socket_queue_proves_descriptor_not_just_destination() {
+        std::thread::spawn(|| {
+            use std::{os::unix::fs::DirBuilderExt,process::Command};
+            let host = File::open("/proc/thread-self/ns/net").unwrap();
+            assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) },0);
+            assert!(Command::new("ip").args(["link","set","lo","up"]).status().unwrap().success());
+            let mut random = [0;16];
+            SystemRandom::new().fill(&mut random).unwrap();
+            let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
+            let dir = std::env::temp_dir().join(format!("theia-nft-cookie-{suffix}"));
+            fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+            let path = dir.join("journal.toml");
+            let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let other = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            for socket in [&sender,&other] { socket.connect(receiver.local_addr().unwrap()).unwrap(); }
+            let cookie = super::super::linux_attribution::socket_cookie(&sender).unwrap();
+            let socket = LabCarrierSocket::udp(&sender,&host).unwrap();
+            let mut queue = Queue::bind(49000,64).unwrap();
+            let mut tagged = Queue::bind(49001,64).unwrap();
+            let lease = LabRules::install_socket_capture(&queue,&tagged,socket,&host,&path).unwrap();
+            sender.send(b"owned").unwrap();
+            {
+                let packet = tagged.receive().unwrap();
+                let proof = lease.captured_socket(&packet).unwrap();
+                assert_eq!(proof.cookie(),cookie);
+                assert_eq!(proof.key().source,sender.local_addr().unwrap());
+                assert_eq!(proof.key().destination,receiver.local_addr().unwrap());
+                packet.finish(super::super::PacketAction::Drop).unwrap();
+            }
+            other.send(b"other").unwrap();
+            {
+                let packet = queue.receive().unwrap();
+                assert!(lease.captured_socket(&packet).is_err());
+                packet.finish(super::super::PacketAction::Drop).unwrap();
+            }
+            drop(lease);
+            recover(&host,&path).unwrap();
             fs::remove_dir_all(dir).unwrap();
         }).join().unwrap();
     }

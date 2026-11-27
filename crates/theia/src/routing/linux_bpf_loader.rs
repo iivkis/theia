@@ -107,6 +107,27 @@ pub struct CollectedEvent {
     live: Arc<AtomicBool>,
 }
 impl CollectedEvent {
+    /// Correlate a live collector event with an actual packet selected
+    /// by the dedicated kernel socket rule. A matching tuple alone is
+    /// insufficient: the private queue proof and kernel cookie must agree.
+    /// Shared-socket sender attribution remains diagnostic.
+    pub fn corroborate_packet(
+        &self,
+        rules: &super::linux_rules::LabRules,
+        packet: &super::nfqueue::Packet<'_>,
+        fd: i32,
+    ) -> io::Result<CorroboratedFlow> {
+        if !self.live.load(Ordering::Acquire) { return Err(denied()); }
+        let proof = rules.captured_socket(packet)?;
+        if proof.cookie() != self.event.cookie { return Err(denied()); }
+        let flow = self.event.corroborate(fd)?;
+        if flow.cookie() != proof.cookie() || flow.key() != proof.key()
+            || !self.live.load(Ordering::Acquire) || rules.captured_socket(packet)? != proof {
+            return Err(denied());
+        }
+        Ok(flow)
+    }
+
     pub fn corroborate_socket(&self, fd: i32, socket: &impl AsRawFd) -> io::Result<CorroboratedFlow> {
         if !self.live.load(Ordering::Acquire) || socket_cookie(socket)? != self.event.cookie {
             return Err(denied());
