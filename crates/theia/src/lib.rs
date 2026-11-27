@@ -546,7 +546,7 @@ Usage:\n\
   theia reference --help              # consented reference health checks\n\
   theia reality --help                # guarded identity and enrollment\n\
 \n--help, --version, config validate, server run and client run (H2/H3/auto) are implemented.\n\
-Client requires tls_ca PEM bundle. Windows system proxy requires explicit --system-proxy --confirm, a manual config flag and live bound listeners; normal client run and TUI never alter OS proxy.";
+Client requires tls_ca PEM bundle. Windows system proxy requires explicitly confirmed Connect (CLI --system-proxy --confirm or TUI) and live bound listeners; normal client run and TUI import never alter OS proxy.";
 
 /// Synchronous introspection/config validation. Server startup is async in the binary.
 pub fn help(topic: Option<&str>) -> Result<&'static str, CliError> {

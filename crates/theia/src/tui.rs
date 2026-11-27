@@ -591,7 +591,8 @@ fn recommendation_page(role: Role, key: char) -> (usize, char) {
         (Role::Server, 'u' | 'b' | 'G') => (2, key),
         (Role::Server, _) => (3, key),
         (Role::Client, 'i') => (2, key),
-        (Role::Client, 'A') => (3, key),
+        (Role::Client, 'A' | 'p') => (3, key),
+        (Role::Client, 'P') if cfg!(windows) => (3, 'p'),
         (Role::Client, _) => (3, 'V'),
     }
 }
@@ -8085,7 +8086,7 @@ mod tests {
                 assert_eq!(editor.selected_record_id(), "backup");
                 assert!(!editor.selected_record_is_active());
                 assert_eq!(recommended_step(editor, false).0, 'A');
-                assert_eq!(recommended_step(editor, true).0, 'V');
+                assert_eq!(recommended_step(editor, true).0, if cfg!(windows) { 'p' } else { 'V' });
                 let view = rendered_interaction(160, 42, &model, &ui);
                 assert!(view.contains("Активный профиль: №1 · edge.example.org:443"));
                 assert_eq!(ui.workspace_focus, WorkspaceFocus::Records);
