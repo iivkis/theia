@@ -346,7 +346,10 @@ jobs:
     cache-mode: write
     if: github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'dev' && github.event.pull_request.head.repo.full_name == github.repository && needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
     runs-on: windows-latest
-    timeout-minutes: 5
+    # A cold dependency producer must be able to finish and publish its
+    # dependency-only cache. The mandatory final gate still rejects attempts
+    # over 300 seconds; a cold recovery attempt is not an acceptance pass.
+    timeout-minutes: ${{ matrix.shard == 1 && 15 || 5 }}
     strategy:
       fail-fast: false
       matrix:
@@ -538,7 +541,9 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         shard: [1, 2, 3, 4, 5, 6]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 5
+    # Only the existing trusted Windows dependency-cache producer can
+    # complete a cold recovery. All reports and the 300s gate remain required.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && matrix.shard == 1 && 15 || 5 }}
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
