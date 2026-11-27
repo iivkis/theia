@@ -6825,6 +6825,15 @@ fn client_mode_lines(editor: &Editor, running: bool) -> Vec<Line<'static>> {
         }),
         Line::raw(""),
         Line::styled(
+            "Системный перехват TCP/UDP",
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(
+            "Основной Packet Interception Engine пока не активируется. Прокси ниже — режимы совместимости.",
+            Style::default().fg(MUTED),
+        ),
+        Line::raw(""),
+        Line::styled(
             "Локальный прокси",
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         ),
@@ -6849,15 +6858,6 @@ fn client_mode_lines(editor: &Editor, running: bool) -> Vec<Line<'static>> {
         } else {
             "На Linux пока недоступен. Настройте прокси в нужных приложениях."
         }),
-        Line::styled(
-            "TUN / VPN",
-            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
-        ),
-        Line::styled(
-            "Пока недоступен. Весь трафик устройства через Theia не направляется.",
-            Style::default().fg(MUTED),
-        ),
-
     ];
     if !editor.selected_record_is_active() {
         lines.insert(
@@ -8475,7 +8475,7 @@ mod tests {
         let screen = rendered_interaction(120, 40, &model, &ui);
         for label in [
             "Системный прокси",
-            "TUN / VPN",
+            "Системный перехват TCP/UDP",
             "Локальный прокси",
             "Активный профиль",
             "127.0.0.1",

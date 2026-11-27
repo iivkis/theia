@@ -1924,6 +1924,8 @@ impl ClientRuntime {
             verdict_gate: Mutex::new(()),
             #[cfg(target_os = "linux")]
             raw: Mutex::new(std::collections::HashMap::new()),
+            #[cfg(target_os = "linux")]
+            udp_consumer: std::sync::atomic::AtomicBool::new(false),
             _owner: owner,
         })
     }
@@ -2204,6 +2206,8 @@ pub struct NativeIngress {
     verdict_gate: Mutex<()>,
     #[cfg(target_os = "linux")]
     raw: Mutex<std::collections::HashMap<crate::routing::packet::FlowKey, RawLease>>,
+    #[cfg(target_os = "linux")]
+    udp_consumer: std::sync::atomic::AtomicBool,
     _owner: Arc<NativeOwner>,
 }
 
@@ -3055,6 +3059,10 @@ impl NativeIngress {
     /// supported here: local Pass must use a separate proven egress path.
     #[cfg(target_os = "linux")]
     pub async fn relay_linux_tcp(&self, stream: TcpStream) -> Result<(), ClientError> {
+        self.ensure_accepting()?;
+        if self.registrar()?.is_none() {
+            return Err(ClientError::Open(ErrorCode::PolicyDenied));
+        }
         let key = crate::routing::linux_ingress::original_tcp(&stream)
             .map_err(|_| ClientError::Open(ErrorCode::PolicyDenied))?;
         self.relay_terminated_tcp(key, stream).await
@@ -3106,6 +3114,77 @@ impl NativeIngress {
         }
     }
 
+    /// Supervise both transparent UDP listeners under the already ready
+    /// isolated native owner. The caller must provision the kernel redirect
+    /// and reverse path rules; this cannot create or publish capture itself.
+    /// No tuple can be recycled while its former relay still owns replies.
+    #[cfg(target_os = "linux")]
+    pub async fn serve_linux_udp_capture(
+        self: &Arc<Self>,
+        v4: crate::routing::linux_ingress::UdpCapture,
+        v6: crate::routing::linux_ingress::UdpCapture,
+    ) -> Result<(), ClientError> {
+        use std::sync::atomic::Ordering;
+        let denied = || ClientError::Open(ErrorCode::PolicyDenied);
+        self.ensure_accepting()?;
+        let a = v4.local_addr().map_err(|_| ClientError::Io)?;
+        let b = v6.local_addr().map_err(|_| ClientError::Io)?;
+        if !a.is_ipv4() || !b.is_ipv6() || a.port() == 0 || a.port() != b.port()
+            || self.registrar()?.is_none()
+            || self.udp_consumer.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err()
+        {
+            return Err(denied());
+        }
+        // A listener failure or cancellation retires the entire native
+        // runtime, not merely one address family. Never silently degrade.
+        struct StopOnDrop<'a>(&'a NativeIngress);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.shutdown();
+            }
+        }
+        let _stop = StopOnDrop(self);
+        let mut flows = NativeUdpDispatch::default();
+        let mut tasks = JoinSet::new();
+        let result = loop {
+            if self.ensure_accepting().is_err() {
+                break Err(denied());
+            }
+            let packet = tokio::select! {
+                () = self.stopped() => break Ok(()),
+                finished = tasks.join_next(), if !tasks.is_empty() => {
+                    match finished {
+                        Some(Ok(key)) if flows.complete(key) => continue,
+                        _ => break Err(ClientError::Io),
+                    }
+                }
+                packet = v4.receive() => packet,
+                packet = v6.receive() => packet,
+            };
+            let packet = match packet {
+                Ok(packet) => packet,
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    crate::traffic::udp_queue_drop();
+                    continue;
+                }
+                Err(_) => break Err(ClientError::Io),
+            };
+            if let Some((first, subsequent)) = flows.admit(packet) {
+                let key = first.key();
+                let ingress = self.clone();
+                tasks.spawn(async move {
+                    // Individual authenticated relay failure closes only
+                    // this flow. A panic or inconsistent ownership is fatal.
+                    let _ = ingress.relay_linux_udp(first, subsequent).await;
+                    key
+                });
+            }
+        };
+        self.shutdown();
+        tasks.shutdown().await;
+        result
+    }
+
     /// One terminated Linux UDP flow from UdpCapture. The platform owner
     /// demultiplexes subsequent captured datagrams by the exact key. The
     /// connected reply socket uses the original remote address as source
@@ -3120,6 +3199,8 @@ impl NativeIngress {
         >,
     ) -> Result<(), ClientError> {
         use crate::routing::PacketAction;
+        self.ensure_accepting()?;
+        let registrar = self.registrar()?.ok_or(ClientError::Open(ErrorCode::PolicyDenied))?;
         let key = first.key;
         if subsequent.max_capacity() > crate::udp_relay::QUEUE {
             return Err(ClientError::Protocol);
@@ -3131,7 +3212,7 @@ impl NativeIngress {
                 let (carrier, flow, address) = self.redirect(key).await?;
                 let tunnel = crate::routing::carrier_socket::scope(self.registrar()?, carrier.open_udp(address, key.destination.port())).await?;
                 let reply = crate::routing::linux_ingress::UdpReply::open(&first).map_err(|_| ClientError::Io)?;
-                let _reply_admission = self.registrar()?.map(|r| reply.admit_reply(r.as_ref())).transpose().map_err(|_| ClientError::Io)?;
+                let _reply_admission = reply.admit_reply(registrar.as_ref()).map_err(|_| ClientError::Io)?;
                 let (tx, up) = tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
                 let (down, mut rx) = tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
                 tx.send(first.payload).await.map_err(|_| ClientError::Io)?;
@@ -3319,6 +3400,49 @@ impl NativeIngress {
     }
 }
 
+/// Exact tuple dispatch shared by both Linux UDP listeners. The common
+/// FlowTable still owns egress authorization and process-wide flow quota.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct NativeUdpDispatch {
+    flows: std::collections::HashMap<
+        crate::routing::packet::FlowKey,
+        tokio::sync::mpsc::Sender<crate::routing::linux_ingress::CapturedDatagram>,
+    >,
+}
+
+#[cfg(target_os = "linux")]
+impl NativeUdpDispatch {
+    fn admit(
+        &mut self,
+        packet: crate::routing::linux_ingress::CapturedDatagram,
+    ) -> Option<(
+        crate::routing::linux_ingress::CapturedDatagram,
+        tokio::sync::mpsc::Receiver<crate::routing::linux_ingress::CapturedDatagram>,
+    )> {
+        let key = packet.key();
+        if let Some(tx) = self.flows.get(&key) {
+            // Closed and full both drop. Only the joined relay task may
+            // release the tuple, after its response drain and lease drop.
+            if tx.try_send(packet).is_err() {
+                crate::traffic::udp_queue_drop();
+            }
+            return None;
+        }
+        if self.flows.len() >= LOCAL_LIMIT {
+            crate::traffic::udp_queue_drop();
+            return None;
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
+        self.flows.insert(key, tx);
+        Some((packet, rx))
+    }
+
+    fn complete(&mut self, key: crate::routing::packet::FlowKey) -> bool {
+        self.flows.remove(&key).is_some()
+    }
+}
+
 /// A clean relay EOF must not cancel accepted reverse datagrams. Keep the
 /// flow lease and reply socket until a bounded drain finishes. Feed EOF is
 /// not relay EOF; dropping the upload sender lets the carrier send FIN.
@@ -3352,6 +3476,42 @@ async fn supervise_native_udp(
 #[cfg(all(test, target_os = "linux"))]
 mod native_udp_lifecycle_tests {
     use super::*;
+
+    #[test]
+    fn native_udp_tuple_not_reused_before_task_join_and_queues_are_bounded() {
+        use crate::routing::{linux_ingress::CapturedDatagram, packet::{FlowKey, Transport}};
+        let key = FlowKey {
+            source: "192.0.2.1:1234".parse().unwrap(),
+            destination: "198.51.100.1:443".parse().unwrap(),
+            transport: Transport::Udp,
+            interface: 0,
+        };
+        let packet = |key, n| CapturedDatagram { key, payload: vec![n] };
+        let mut dispatch = NativeUdpDispatch::default();
+        let (first, mut rx) = dispatch.admit(packet(key, 0)).unwrap();
+        assert_eq!(first.payload(), &[0]);
+        for n in 1..=crate::udp_relay::QUEUE + 1 {
+            assert!(dispatch.admit(packet(key, n as u8)).is_none());
+        }
+        for n in 1..=crate::udp_relay::QUEUE {
+            assert_eq!(rx.try_recv().unwrap().payload(), &[n as u8]);
+        }
+        assert!(rx.try_recv().is_err());
+        drop(rx);
+        assert!(dispatch.admit(packet(key, 99)).is_none());
+        assert!(dispatch.complete(key));
+        assert!(!dispatch.complete(key));
+        let (_, _new) = dispatch.admit(packet(key, 100)).unwrap();
+        // Keep receivers live to make the capacity test independent of EOF.
+        let mut receivers = Vec::new();
+        for n in 1..LOCAL_LIMIT {
+            let other = FlowKey { source: SocketAddr::new(key.source.ip(), 2000 + n as u16), ..key };
+            receivers.push(dispatch.admit(packet(other, 1)).unwrap().1);
+        }
+        let overflow = FlowKey { source: "192.0.2.1:65000".parse().unwrap(), ..key };
+        assert!(dispatch.admit(packet(overflow, 1)).is_none());
+        assert_eq!(dispatch.flows.len(), LOCAL_LIMIT);
+    }
 
     #[tokio::test]
     async fn relay_completion_drains_accepted_replies_after_upload_eof() {

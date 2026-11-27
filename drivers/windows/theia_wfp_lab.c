@@ -59,6 +59,7 @@ typedef struct _SESSION {
 
 static SESSION State;
 static KSPIN_LOCK StateLock;
+static EX_RUNDOWN_REF ClassifyRundown;
 static HANDLE Redirect;
 static UINT32 Id4, Id6;
 static PDEVICE_OBJECT Device;
@@ -141,6 +142,7 @@ static NTSTATUS control(PDEVICE_OBJECT dev, PIRP irp) {
     ULONG len = stack->Parameters.DeviceIoControl.InputBufferLength;
     ULONG code = stack->Parameters.DeviceIoControl.IoControlCode;
     NTSTATUS status = STATUS_ACCESS_DENIED;
+    BOOLEAN waitForClassify = FALSE;
     KIRQL irql;
     UNREFERENCED_PARAMETER(dev);
     if (bytes == NULL || irp->RequestorMode != UserMode || KeGetCurrentIrql() != PASSIVE_LEVEL
@@ -168,7 +170,10 @@ static NTSTATUS control(PDEVICE_OBJECT dev, PIRP irp) {
         // The same protected file, process, exact compartment, listener and
         // session token must agree. STATUS does not disclose the token.
         // STOP retires admission before userspace cancels its relay tasks.
-        if (code == IOCTL_STOP) deactivate_locked();
+        if (code == IOCTL_STOP) {
+            deactivate_locked();
+            waitForClassify = TRUE;
+        }
         status = STATUS_SUCCESS;
     } else if (code == IOCTL_ENDPOINT && len == ENDPOINT_SIZE && State.active
         && State.file == stack->FileObject && State.process == PsGetCurrentProcess()
@@ -195,6 +200,10 @@ static NTSTATUS control(PDEVICE_OBJECT dev, PIRP irp) {
         } else status = STATUS_INSUFFICIENT_RESOURCES;
     }
     KeReleaseSpinLock(&StateLock, irql);
+    // STOP is the only explicit drain operation for this one-shot driver
+    // session. Never wait under the spin lock or at classify IRQL.
+    // Once acknowledged, no in-flight callback can publish a new permit.
+    if (waitForClassify) ExWaitForRundownProtectionRelease(&ClassifyRundown);
     if (((code == IOCTL_CONFIG || code == IOCTL_STATUS || code == IOCTL_STOP) && len == CONFIG_SIZE)
         || (code == IOCTL_ENDPOINT && len == ENDPOINT_SIZE))
         RtlSecureZeroMemory(bytes, len);
@@ -243,6 +252,10 @@ static VOID NTAPI classify(
 
     if (!(out->rights & FWPS_RIGHT_ACTION_WRITE)) return;
     out->actionType = FWP_ACTION_BLOCK;
+    if (!ExAcquireRundownProtection(&ClassifyRundown)) {
+        out->rights &= ~FWPS_RIGHT_ACTION_WRITE;
+        return;
+    }
     if (values->layerId == FWPS_LAYER_ALE_CONNECT_REDIRECT_V4) {
         family = 4;
         protocol = values->incomingValue[FWPS_FIELD_ALE_CONNECT_REDIRECT_V4_IP_PROTOCOL].value.uint8;
@@ -369,6 +382,7 @@ done:
     } else if (filter->flags & FWPS_FILTER_FLAG_CLEAR_ACTION_RIGHT) {
         out->rights &= ~FWPS_RIGHT_ACTION_WRITE;
     }
+    ExReleaseRundownProtection(&ClassifyRundown);
 }
 
 static NTSTATUS NTAPI notify(FWPS_CALLOUT_NOTIFY_TYPE type, const GUID *key, FWPS_FILTER1 *filter) {
@@ -406,6 +420,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry) {
     NTSTATUS status;
     UNREFERENCED_PARAMETER(registry);
     KeInitializeSpinLock(&StateLock);
+    ExInitializeRundownProtection(&ClassifyRundown);
     for (ULONG i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; ++i) driver->MajorFunction[i] = unsupported;
     driver->MajorFunction[IRP_MJ_CREATE] = open_close;
     driver->MajorFunction[IRP_MJ_CLOSE] = open_close;

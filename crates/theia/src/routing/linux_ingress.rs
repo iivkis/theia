@@ -189,6 +189,10 @@ impl UdpCapture {
         })
     }
 
+    pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.get_ref().local_addr()
+    }
+
     pub async fn receive(&self) -> io::Result<CapturedDatagram> {
         loop {
             let mut ready = self.socket.readable().await?;
