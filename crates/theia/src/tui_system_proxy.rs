@@ -527,6 +527,19 @@ pub(crate) mod tests {
             confirm(panel);
         }
 
+        struct RestoreEnv(Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                if let Some(value) = self.0.take() {
+                    std::env::set_var("THEIA_CLIENT_CONTROL_PIPE", value);
+                } else {
+                    std::env::remove_var("THEIA_CLIENT_CONTROL_PIPE");
+                }
+            }
+        }
+        let _environment = RestoreEnv(std::env::var_os("THEIA_CLIENT_CONTROL_PIPE"));
+        let pipe = format!("proxy-lifecycle-{}", std::process::id());
+        std::env::set_var("THEIA_CLIENT_CONTROL_PIPE", &pipe);
         let directory =
             std::env::temp_dir().join(format!("theia-proxy-tui-{}", std::process::id()));
         fs::create_dir(&directory).unwrap();
@@ -664,9 +677,134 @@ pub(crate) mod tests {
         assert!(TcpStream::connect_timeout(&http, Duration::from_millis(100)).is_err());
         assert!(TcpStream::connect_timeout(&socks, Duration::from_millis(100)).is_err());
 
-        // Terminal failure/drop follows the same owned restoration path.
+        // A real SID-protected IPC request must bind to the exact instance.
+        use crate::management::{ManagementError, StatusCommand as C, StatusReply as R};
+        use std::io::{Read, Write};
+        let query = |command| runtime.block_on(crate::windows_control::query_client_pipe(&pipe, command));
         action(&mut panel, 'e');
         assert!(panel.view.owned);
+        let R::ClientLifecycle(first_instance) = query(C::ClientLifecycle).unwrap() else {
+            panic!("expected lifecycle");
+        };
+        assert_eq!(first_instance.phase, 2);
+        assert!(first_instance.listeners_ready);
+        assert_eq!(first_instance.proxy_applied, 1);
+        let disconnect = C::ClientDisconnect {
+            expected_revision: first_instance.revision,
+            config_sha256: first_instance.config_sha256,
+            instance: first_instance.instance,
+        };
+        assert_eq!(query(C::ClientDisconnect {
+            expected_revision: first_instance.revision,
+            config_sha256: first_instance.config_sha256,
+            instance: [0; 32],
+        }), Err(ManagementError::CandidateRejected));
+        assert_eq!(native::status().unwrap(), ProxyStatus::PendingOwned);
+
+        // Real active TCP CONNECT and UDP ASSOCIATE control socket, both
+        // kept open through IPC Disconnect. A late datagram cannot use a
+        // released association or reopen a retired flow.
+        let echo = TcpListener::bind("127.0.0.1:0").unwrap();
+        echo.set_nonblocking(true).unwrap();
+        let target = echo.local_addr().unwrap();
+        let echo_task = runtime.spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::from_std(echo).unwrap();
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4];
+            while stream.read_exact(&mut bytes).await.is_ok() {
+                if stream.write_all(&bytes).await.is_err() { break; }
+            }
+        });
+        let mut tcp = TcpStream::connect_timeout(&http, Duration::from_secs(2)).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        tcp.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes()).unwrap();
+        let mut response = Vec::new();
+        while !response.ends_with(b"\r\n\r\n") && response.len() < 1024 {
+            let mut byte = [0; 1];
+            tcp.read_exact(&mut byte).unwrap();
+            response.push(byte[0]);
+        }
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        tcp.write_all(b"ping").unwrap();
+        let mut echoed = [0; 4];
+        tcp.read_exact(&mut echoed).unwrap();
+        assert_eq!(&echoed, b"ping");
+
+        let mut udp_control = TcpStream::connect_timeout(&socks, Duration::from_secs(2)).unwrap();
+        udp_control.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        udp_control.write_all(&[5, 1, 0]).unwrap();
+        let mut selection = [0; 2];
+        udp_control.read_exact(&mut selection).unwrap();
+        assert_eq!(selection, [5, 0]);
+        udp_control.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+        let mut association = [0; 10];
+        udp_control.read_exact(&mut association).unwrap();
+        assert_eq!(&association[..4], &[5, 0, 0, 1]);
+        let relay = std::net::SocketAddr::from((
+            [association[4], association[5], association[6], association[7]],
+            u16::from_be_bytes([association[8], association[9]]),
+        ));
+        assert!(relay.ip().is_loopback());
+        // Exercise an actual datagram flow through the same XHTTP carrier.
+        let udp_origin = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        udp_origin.set_nonblocking(true).unwrap();
+        let origin_port = udp_origin.local_addr().unwrap().port();
+        let udp_echo = runtime.spawn(async move {
+            let socket = tokio::net::UdpSocket::from_std(udp_origin).unwrap();
+            let mut buf = [0; 256];
+            while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                if socket.send_to(&buf[..n], from).await.is_err() { break; }
+            }
+        });
+        let app_udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        app_udp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut packet = vec![0, 0, 0, 1, 127, 0, 0, 1];
+        packet.extend_from_slice(&origin_port.to_be_bytes());
+        packet.extend_from_slice(b"udp-live");
+        app_udp.send_to(&packet, relay).unwrap();
+        let mut datagram = [0; 256];
+        let (received, source) = app_udp.recv_from(&mut datagram).unwrap();
+        assert_eq!(source, relay);
+        assert_eq!(&datagram[..received], packet.as_slice());
+
+        assert_eq!(query(disconnect), Ok(R::ClientDisconnectAccepted {
+            revision: first_instance.revision, instance: first_instance.instance
+        }));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while panel.view.running || panel.view.owned {
+            assert!(Instant::now() < deadline, "IPC disconnect did not finish");
+            thread::sleep(Duration::from_millis(10));
+            panel.poll();
+        }
+        assert_original();
+        for stream in [&mut tcp, &mut udp_control] {
+            let mut byte = [0; 1];
+            match stream.read(&mut byte) {
+                Ok(0) => {},
+                Err(error) if matches!(error.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::BrokenPipe) => {},
+                result => panic!("session still live after disconnect: {result:?}"),
+            }
+        }
+        app_udp.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+        let _ = app_udp.send_to(&packet, relay);
+        assert!(app_udp.recv_from(&mut datagram).is_err());
+        echo_task.abort();
+        udp_echo.abort();
+        drop(tcp);
+        drop(udp_control);
+        drop(app_udp);
+
+        action(&mut panel, 'e');
+        let R::ClientLifecycle(second_instance) = query(C::ClientLifecycle).unwrap() else {
+            panic!("expected reconnected lifecycle");
+        };
+        assert_ne!(first_instance.instance, second_instance.instance);
+        assert_eq!(first_instance.config_sha256, second_instance.config_sha256);
+        assert_eq!(query(disconnect), Err(ManagementError::CandidateRejected));
+        assert_eq!(native::status().unwrap(), ProxyStatus::PendingOwned);
+
+        // Terminal failure/drop follows the same owned restoration path.
         drop(panel);
         assert_original();
 

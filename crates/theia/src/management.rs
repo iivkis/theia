@@ -1049,6 +1049,8 @@ where
         }
         command.push(byte[0]);
     }
+    #[cfg(windows)]
+    let mut disconnect_accepted = false;
     let response = if !newline {
         "ERR unsupported\n".into()
     } else if command == b"client-status" {
@@ -1099,8 +1101,10 @@ where
         #[cfg(windows)]
         {
             match parse_disconnect(&command) {
-                Some((revision, digest, instance)) if client.request_disconnect_bound(revision, digest, instance).is_ok() =>
-                    format!("theia-client-v1 disconnect-accepted r={revision} instance={}\n", encode_client_hex(instance)),
+                Some((revision, digest, instance)) if client.request_disconnect_bound(revision, digest, instance).is_ok() => {
+                    disconnect_accepted = true;
+                    format!("theia-client-v1 disconnect-accepted r={revision} instance={}\n", encode_client_hex(instance))
+                }
                 _ => "theia-client-v1 rejected\n".into(),
             }
         }
@@ -1123,11 +1127,13 @@ where
             None => "ERR unsupported\n".into(),
         }
     };
-    stream
-        .write_all(response.as_bytes())
-        .await
-        .map_err(|_| ManagementError::Io)?;
-    stream.shutdown().await.map_err(|_| ManagementError::Io)
+    let written = async {
+        stream.write_all(response.as_bytes()).await.map_err(|_| ManagementError::Io)?;
+        stream.shutdown().await.map_err(|_| ManagementError::Io)
+    }.await;
+    #[cfg(windows)]
+    if disconnect_accepted { client.mark_disconnect_reply_done(); }
+    written
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]

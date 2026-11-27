@@ -1963,6 +1963,10 @@ pub(crate) struct ClientRuntime {
     system_proxy_applied: std::sync::atomic::AtomicU8,
     #[cfg(windows)]
     disconnect_requested: tokio::sync::watch::Sender<bool>,
+    #[cfg(windows)]
+    disconnect_ipc: std::sync::atomic::AtomicBool,
+    #[cfg(windows)]
+    disconnect_reply_done: tokio::sync::watch::Sender<bool>,
 }
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 impl ClientRuntime {
@@ -1995,6 +1999,10 @@ impl ClientRuntime {
             system_proxy_applied: std::sync::atomic::AtomicU8::new(0),
             #[cfg(windows)]
             disconnect_requested: tokio::sync::watch::channel(false).0,
+            #[cfg(windows)]
+            disconnect_ipc: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(windows)]
+            disconnect_reply_done: tokio::sync::watch::channel(false).0,
         })
     }
     /// Pin exactly the published client generation for native capture.
@@ -2357,8 +2365,20 @@ impl ClientRuntime {
         drop(view);
         self.quiesce_locked();
         self.set_proxy_phase(3);
+        self.disconnect_ipc.store(true, std::sync::atomic::Ordering::Release);
         self.disconnect_requested.send_replace(true);
         Ok(())
+    }
+
+    pub(crate) fn mark_disconnect_reply_done(&self) {
+        self.disconnect_reply_done.send_replace(true);
+    }
+
+    async fn wait_disconnect_reply(&self) {
+        if self.disconnect_ipc.load(std::sync::atomic::Ordering::Acquire) {
+            let mut done = self.disconnect_reply_done.subscribe();
+            if !*done.borrow() { let _ = done.wait_for(|done| *done).await; }
+        }
     }
 }
 
@@ -2399,6 +2419,7 @@ impl SystemProxySession {
         let owner = runtime.clone();
         let task = tokio::spawn(async move {
             let mut lease = lease;
+            let (restored, result, cleanup) = {
             let serving = serve_managed_proxy(http, socks, owner.clone());
             tokio::pin!(serving);
             let management = async move {
@@ -2433,23 +2454,33 @@ impl SystemProxySession {
             owner.set_proxy_applied(if restored.is_ok() { 0 } else { 2 });
             owner.stop();
             let drain = async {
-                if !worker_ended {
-                    let _ = timeout(Duration::from_secs(5), &mut serving).await;
+                if worker_ended {
+                    Ok(())
+                } else {
+                    timeout(Duration::from_secs(5), &mut serving).await
+                        .map_err(|_| ClientError::Timeout)?
                 }
             };
             let replies = async {
                 if !management_ended {
-                    // Let the already-admitted IPC Disconnect handler return
-                    // its acknowledgement; never claim restore from that ack.
-                    let _ = timeout(Duration::from_millis(250), &mut management).await;
+                    // Await completion of the already-admitted reply, not
+                    // an arbitrary fixed grace period. A vanished caller
+                    // never prevents eventual shutdown.
+                    tokio::select! {
+                        () = owner.wait_disconnect_reply() => {},
+                        _ = &mut management => {},
+                        () = tokio::time::sleep(Duration::from_secs(2)) => {},
+                    }
                 }
             };
-            tokio::join!(drain, replies);
+            let (cleanup, ()) = tokio::join!(drain, replies);
+            (restored, result, cleanup)
+            }; // all serving/management futures and sockets dropped here
             // The product owner remains reserved across CAS and all
             // bounded cleanup. On conflict leave the journal for recovery.
             owner.set_proxy_phase(if restored.is_ok() { 0 } else { 4 });
             if restored.is_err() { lease.abandon_after_conflict(); } else { drop(lease); }
-            restored.and(result)
+            restored.and(result).and(cleanup)
         });
         Ok(Self { runtime, task: Some(task) })
     }
