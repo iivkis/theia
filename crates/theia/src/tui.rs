@@ -4208,7 +4208,10 @@ impl Interaction {
                                     let discovery_key = if ch == 'T' { 't' } else { ch };
                                     self.update(
                                         model,
-                                        KeyEvent::new(KeyCode::Char(discovery_key), KeyModifiers::NONE),
+                                        KeyEvent::new(
+                                            KeyCode::Char(discovery_key),
+                                            KeyModifiers::NONE,
+                                        ),
                                     );
                                     return false;
                                 }
@@ -10369,8 +10372,12 @@ mod tests {
             assert!(!page_has_records(role, 4));
             assert!(!page_has_records(role, 5));
         }
-        assert!(page_actions(Role::Server, 6, None).iter().any(|a| a.key == 'T'));
-        assert!(!page_actions(Role::Server, 6, None).iter().any(|a| a.key == 't'));
+        assert!(page_actions(Role::Server, 6, None)
+            .iter()
+            .any(|a| a.key == 'T'));
+        assert!(!page_actions(Role::Server, 6, None)
+            .iter()
+            .any(|a| a.key == 't'));
         assert_eq!(recommendation_page(Role::Server, 'b'), (2, 'b'));
         assert_eq!(recommendation_page(Role::Server, 'G'), (2, 'G'));
         let imports = page_actions(Role::Client, 2, None);
