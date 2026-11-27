@@ -629,6 +629,7 @@ async fn imported_server_invitation_reaches_real_connect_and_socks5_without_env_
         };
         let endpoint_port = endpoint.rsplit(':').next().unwrap().parse::<u16>().unwrap();
         source.server.inbounds[0].server_name = "localhost".into();
+        source.server.inbounds[0].tls_cert = ca_ref.clone();
         source.server.inbounds[0].h2_listen = format!("127.0.0.1:{endpoint_port}");
         source.server.inbounds[0].quic_listen = format!("127.0.0.1:{endpoint_port}");
         source.server.inbounds[0].allowed_user_ids = vec!["client".into()];
@@ -643,7 +644,7 @@ async fn imported_server_invitation_reaches_real_connect_and_socks5_without_env_
         let decoded = theia::client_import::read_source(&confidential).unwrap();
         let mut editor = Editor::load(Role::Client, &config_path).unwrap();
         editor
-            .import_invitation(&decoded, Some(&ca_ref), None)
+            .import_invitation(&decoded, None, None)
             .unwrap();
         let Config::Client(mut client) = config::read_file(&config_path).unwrap() else {
             panic!("client");
@@ -656,7 +657,7 @@ async fn imported_server_invitation_reaches_real_connect_and_socks5_without_env_
             .unwrap()
             .contains(&token()));
         assert_eq!(imported.server, endpoint);
-        assert_eq!(imported.tls_ca.as_deref(), Some(ca_ref.as_str()));
+        assert_eq!(imported.tls_ca, invitation.trust_reference());
 
         // The user separately selects the imported profile and starts the
         // client. Neither step was part of the import operation itself.

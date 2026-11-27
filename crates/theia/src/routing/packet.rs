@@ -164,6 +164,34 @@ impl PacketMeta {
     }
 }
 
+/// Explicit isolated fixture destinations. Never use a caller-supplied
+/// filter expression, hostname, wildcard or broad carrier permit.
+pub(crate) fn validate_redirect_lab_targets(targets: &[std::net::SocketAddr]) -> bool {
+    !targets.is_empty()
+        && targets.len() <= 8
+        && targets.iter().all(|target| reflect_address(*target))
+        && targets
+            .iter()
+            .enumerate()
+            .all(|(i, target)| !targets[..i].contains(target))
+}
+pub(crate) fn reflect_address(address: std::net::SocketAddr) -> bool {
+    let ip = address.ip();
+    address.port() != 0
+        && !ip.is_unspecified()
+        && !ip.is_multicast()
+        && !ip.is_loopback()
+        && match address {
+            std::net::SocketAddr::V4(v) => v.ip().octets()[0] > 0 && v.ip().octets()[0] < 224,
+            std::net::SocketAddr::V6(v) => {
+                v.scope_id() == 0
+                    && v.flowinfo() == 0
+                    && v.ip().to_ipv4_mapped().is_none()
+                    && !v.ip().is_unicast_link_local()
+            }
+        }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,32 +288,4 @@ mod tests {
         malformed[32] = 0x40;
         assert_eq!(PacketMeta::parse(&malformed, 1), Err(ParseError::Invalid));
     }
-}
-
-/// Explicit isolated fixture destinations. Never use a caller-supplied
-/// filter expression, hostname, wildcard or broad carrier permit.
-pub(crate) fn validate_redirect_lab_targets(targets: &[std::net::SocketAddr]) -> bool {
-    !targets.is_empty()
-        && targets.len() <= 8
-        && targets.iter().all(|target| reflect_address(*target))
-        && targets
-            .iter()
-            .enumerate()
-            .all(|(i, target)| !targets[..i].contains(target))
-}
-pub(crate) fn reflect_address(address: std::net::SocketAddr) -> bool {
-    let ip = address.ip();
-    address.port() != 0
-        && !ip.is_unspecified()
-        && !ip.is_multicast()
-        && !ip.is_loopback()
-        && match address {
-            std::net::SocketAddr::V4(v) => v.ip().octets()[0] > 0 && v.ip().octets()[0] < 224,
-            std::net::SocketAddr::V6(v) => {
-                v.scope_id() == 0
-                    && v.flowinfo() == 0
-                    && v.ip().to_ipv4_mapped().is_none()
-                    && !v.ip().is_unicast_link_local()
-            }
-        }
 }

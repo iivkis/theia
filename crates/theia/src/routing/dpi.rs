@@ -613,7 +613,7 @@ impl Engine {
                                 tokio::select! {
                                     biased;
                                     result = revoked => result?,
-                                    result = udp::probe_quic_checked(&name, address, Some(key.network), config, version, budget) => result?,
+                                    result = udp::probe_quic_checked(name, address, Some(key.network), config, version, budget) => result?,
                                 }
                             }
                             UdpStrategy::StunBinding(binding) => {
@@ -1142,8 +1142,7 @@ impl Tunnel {
         flow: Option<&super::flow::FlowLease>,
     ) -> Result<RelayOutcome, ClientError> {
         let (prefix, name) = read_tcp_hint(&mut client).await?;
-        self.relay_prefix(client, prefix, name.is_some(), flow)
-            .await
+        Box::pin(self.relay_prefix(client, prefix, name.is_some(), flow)).await
     }
 
     #[cfg(any(

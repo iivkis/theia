@@ -7,10 +7,8 @@ use theia::{
 fn main() {
     let mut runtime = tokio::runtime::Builder::new_multi_thread();
     runtime.enable_all();
-    // Windows' small default stacks are insufficient for the debug and
-    // instrumented async carrier call chains. Reserve, do not commit, 8 MiB
-    // per worker; ordinary allocation and queue limits remain unchanged.
-    #[cfg(windows)]
+    // Debug and instrumented async carrier call chains need bounded stack
+    // headroom on both platforms. Reserve 8 MiB per worker.
     runtime.thread_stack_size(8 * 1024 * 1024);
     runtime
         .build()

@@ -439,6 +439,7 @@ def drive_client_proxy(binary, config, http_port, socks_port, echo_port):
 
 def drive_dual_product(binary, server, client, cert, admission, fingerprint,
                        http_port, socks_port, echo_port):
+    assert Path(cert).is_file()  # The server fixture must have its certificate.
     # Full compiled-binary paths, not an injected TUI/IPC response. The
     # reference inventory is a local, pre-provisioned fixture; no internet.
     server = Path(server)
@@ -539,10 +540,8 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         tty.wait("Вставьте ключ (скрыто)")
         tty.send(str(own_link) + "\r")
         tty.wait("Проверка ключа · собственный TLS")
-        tty.send("c")
-        tty.wait("Проверка сертификата")
-        tty.send("file:" + cert + "\r")
-        tty.wait("CA указан")
+        # Issued Own-TLS keys carry their verified certificate anchor.
+        tty.wait("Закреплён в ключе, соединение ещё НЕ проверено")
         assert client.read_bytes() == original
         tty.send("y")
         tty.wait("Профиль сохранён")

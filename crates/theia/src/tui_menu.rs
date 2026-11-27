@@ -727,7 +727,7 @@ struct FirstInvite {
 enum FirstInviteAction {
     Stay,
     Back,
-    Save(crate::invite::Invitation, String, Option<String>),
+    Save(Box<crate::invite::Invitation>, String, Option<String>),
 }
 
 impl FirstInvite {
@@ -933,7 +933,7 @@ impl FirstInvite {
                 KeyCode::Char('y') if key.modifiers.is_empty() => {
                     if let Some(invite) = self.own.take() {
                         return FirstInviteAction::Save(
-                            invite,
+                            Box::new(invite),
                             std::mem::take(&mut self.ca),
                             (!self.reference.is_empty())
                                 .then(|| std::mem::take(&mut self.reference)),

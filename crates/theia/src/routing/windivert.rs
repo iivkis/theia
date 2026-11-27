@@ -1323,10 +1323,10 @@ pub struct ReverseDatagram {
 }
 
 fn word_sum(bytes: &[u8]) -> u32 {
-    let chunks = bytes.chunks_exact(2);
-    let tail = chunks.remainder().first().copied().unwrap_or(0);
-    chunks
-        .map(|w| u32::from(u16::from_be_bytes([w[0], w[1]])))
+    let (chunks, remainder) = bytes.as_chunks::<2>();
+    let tail = remainder.first().copied().unwrap_or(0);
+    chunks.iter()
+        .map(|w| u32::from(u16::from_be_bytes(*w)))
         .sum::<u32>()
         + (u32::from(tail) << 8)
 }
@@ -1456,7 +1456,7 @@ mod native {
             }
             match unsafe { WaitForSingleObject(event.0, 20) } {
                 WAIT_OBJECT_0 => {
-                    if unsafe { GetOverlappedResult(raw, &mut operation, &mut count, 0) } != 0 {
+                    if unsafe { GetOverlappedResult(raw, &operation, &mut count, 0) } != 0 {
                         return Ok(count);
                     }
                     return Err(io::Error::last_os_error());
@@ -1469,7 +1469,7 @@ mod native {
             CancelIoEx(raw, &operation);
             // Even when cancellation raced with completion, this waits
             // for the original operation, not a second operation.
-            GetOverlappedResult(raw, &mut operation, &mut count, 1);
+            GetOverlappedResult(raw, &operation, &mut count, 1);
         }
         Err(failure.into())
     }
@@ -3180,7 +3180,7 @@ mod native {
                     api.send(&injector, &reverse.packet, &incoming, &signal, deadline)?;
                     let mut data = [0u8; 1201];
                     let n = socket.recv(&mut data)?;
-                    if socket.peer_addr()? != target || &data[..n] != bytes {
+                    if socket.peer_addr()? != target || data[..n] != bytes {
                         return Err(io::ErrorKind::InvalidData.into());
                     }
                 }

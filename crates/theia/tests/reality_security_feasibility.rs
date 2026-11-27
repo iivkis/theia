@@ -158,7 +158,17 @@ fn v1_toml_refuses_unsupported_client_modes_even_if_supplied_as_profile() {
 
 #[test]
 fn replacement_v1_invite_rejects_unsupported_mode_and_identity_injection() {
-    let cfg = checked_server_fixture();
+    let mut cfg = checked_server_fixture();
+    let Config::Server(ref mut server) = cfg else { panic!("server fixture") };
+    struct CertFile(std::path::PathBuf);
+    impl Drop for CertFile { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+    let directory = CertFile(std::env::temp_dir().join(format!("theia-v1-invite-{}", std::process::id())));
+    std::fs::create_dir(&directory.0).unwrap();
+    let cert_path = directory.0.join("cert.pem");
+    let name = server.server.inbounds[0].server_name.clone();
+    let cert = generate_simple_self_signed(vec![name]).unwrap();
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    server.server.inbounds[0].tls_cert = format!("file:{}", cert_path.display());
     let public = Invitation::public_from_server(&cfg, "public").unwrap();
     let token = [0x42; 32];
     let issued = Invitation::issued_from_server(&cfg, "public", "device-a", &token).unwrap();
