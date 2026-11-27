@@ -52,8 +52,10 @@ require(jobs(extended) == deferred | {"specification", "extended-gate"}, "extend
 require(needs("ci-gate") == expected_set(job("ci-gate")) == mandatory, "MVP gate must require all jobs")
 require(needs("extended-gate", extended) == expected_set(job("extended-gate", extended))
         == deferred | {"specification"}, "extended gate must require all jobs")
-for name in ("rust-tests", "windows-smoke", "coverage-native", "native-checks", "f14-build"):
+for name in ("rust-tests", "windows-smoke", "coverage-native", "f14-build"):
     require(needs(name) == {"specification"}, f"{name} must run in parallel")
+require(needs("native-checks") == {"specification", "f14-build"},
+        "Windows Clippy requires the actual same-run native BoringSSL producer")
 require(needs("f14-cross-host") == {"specification", "f14-build"}, "cross-host must use early native builds")
 require(needs("coverage-gate") == {"specification", "coverage-native"}, "all native reports must arrive")
 for name in deferred:
@@ -69,6 +71,7 @@ contains(spec, "if: " + dev_merge, "fetch-depth: 2", 'test "$MERGED_SHA" = "$GIT
          'test "$(git rev-parse HEAD)" = "$MERGED_SHA"', "python3 -m compileall -q scripts tests",
          "python3 -m unittest discover -s tests/ci -p 'test_f14_*.py'", "test_ci_coverage.py",
          "test_ci_scope.py", "test_ci_timing.py", "test_independent_h2_probe.py",
+         "test_ci_boringssl.py",
          "python3 scripts/ci-native-targets.py", "test_ci_native_targets.py",
          "test_ci_format_repair.py", "scripts/check-spec.sh", "scripts/ci-format-repair.py prepare-merged",
          'echo "native_required=true"', 'echo "tested_sha=$FORMATTED_SHA"',
@@ -119,15 +122,20 @@ for name in ("rust-tests", "windows-smoke"):
              "if: matrix.shard == 2\n        run: cargo nextest run --workspace --test '*' --locked --no-fail-fast")
     require("--filter-expr" not in payload and "--retries" not in payload
             and "--partition" not in payload, "complete disjoint native build groups")
-contains(job("rust-tests"), "pyte==0.8.2")
-contains(job("windows-smoke"), "pywinpty==3.0.5 pyte==0.8.2")
+contains(job("rust-tests"), "if: matrix.shard == 2\n        run: python -m pip install --disable-pip-version-check --no-input pyte==0.8.2")
+contains(job("windows-smoke"), "if: matrix.shard == 2\n        run: python -m pip install --disable-pip-version-check --no-input pywinpty==3.0.5 pyte==0.8.2")
 checks = job("native-checks")
 contains(checks, "check: windows-clippy", "if: matrix.check == 'windows-clippy'",
          "cargo clippy --workspace --all-targets --features experimental-btls-h2 --locked -- -D warnings",
-         "id: clippy-cache", "shared-key: native-clippy-deps-v1",
+         "id: clippy-cache", "shared-key: native-clippy-deps-v2",
+         "name: f14-windows-boringssl", "scripts/ci-boringssl.py verify",
+         'BORING_BSSL_PATH: ${{ runner.temp }}/theia-boringssl',
          "if: steps.clippy-cache.outputs.cache-hit != 'true'",
          "shared-key: native-default-deps-v4", "save-if: false")
 require(checks.count("save-if: true") == 1, "only trusted Windows Clippy writes its dependency cache")
+require(checks.index("scripts/ci-boringssl.py verify") < checks.index("BORING_BSSL_PATH:"),
+        "the exact native bundle must be verified before use")
+require("BORING_BSSL_ASSUME_PATCHED" not in workflow, "do not bypass patch provenance")
 require("check: linux-clippy" not in checks and "check: windows-cross-sid" not in checks,
         "do not allocate duplicate runners for short checks")
 contains(job("rust-tests"), "Linux all-feature Clippy", "if: matrix.shard == 1\n        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings")
@@ -139,6 +147,8 @@ contains(f14, "os: [ubuntu-24.04, windows-latest]", "fail-fast: false",
          "Build genuine Linux server for Windows cross-OS F-14 E2E",
          "Stage Windows E2E binaries from Cargo JSON artifact paths",
          "name: f14-linux-server", "name: f14-windows-compiled",
+         "name: f14-windows-boringssl", "Tee-Object -FilePath $eventFile",
+         "scripts/ci-boringssl.py stage", "f14-cargo-events.jsonl",
          "$bins = @($testEvents | Where-Object", "if ($bins.Count -eq 0)",
          "$_.profile.test -eq $false", "$_.target.kind -contains 'bin'",
          "save-if: false", "actions/upload-artifact@v4")
@@ -154,6 +164,8 @@ cov, cg = job("coverage-native"), job("coverage-gate")
 contains(cov, "os: [ubuntu-latest, windows-latest]", "shard: [1, 2, 3, 4, 5, 6]",
          "fail-fast: false", "llvm-tools-preview", "cargo-llvm-cov@0.9.1", "tool: cargo-nextest@0.9.140",
          "cargo llvm-cov clean --profraw-only", 'workspaces: ". -> target/llvm-cov-target"',
+         "if: runner.os == 'Linux' && (matrix.shard == 2 || matrix.shard == 3)",
+         "if: runner.os == 'Windows' && (matrix.shard == 2 || matrix.shard == 3 || matrix.shard == 4)",
          "cache-targets: true",
          "if: matrix.shard == 1\n        run: cargo llvm-cov nextest --workspace --lib --bins --all-features --locked --no-report --no-fail-fast",
          "if: matrix.shard == 2\n        run: cargo llvm-cov nextest --workspace --test '*' --all-features --locked --no-report --no-fail-fast",

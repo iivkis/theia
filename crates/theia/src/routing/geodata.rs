@@ -319,9 +319,13 @@ async fn read_reply(
     })
 }
 
-async fn latest(roots: &rustls::RootCertStore) -> Result<String, Error> {
+async fn latest<F, Fut>(get: &F) -> Result<String, Error>
+where
+    F: Fn(Uri, usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Reply, Error>>,
+{
     let uri: Uri = LATEST.parse().map_err(|_| Error::Format)?;
-    let reply = tokio::time::timeout(CONNECT_TIMEOUT, get_once(uri.clone(), 0, roots))
+    let reply = tokio::time::timeout(CONNECT_TIMEOUT, get(uri.clone(), 0))
         .await
         .map_err(|_| Error::Network)??;
     if !reply.status.is_redirection() {
@@ -339,16 +343,15 @@ fn asset_uri(tag: &str, name: &str) -> Result<Uri, Error> {
         .map_err(|_| Error::Format)
 }
 
-async fn asset(
-    tag: &str,
-    name: &str,
-    limit: usize,
-    roots: &rustls::RootCertStore,
-) -> Result<Vec<u8>, Error> {
+async fn asset<F, Fut>(tag: &str, name: &str, limit: usize, get: &F) -> Result<Vec<u8>, Error>
+where
+    F: Fn(Uri, usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Reply, Error>>,
+{
     tokio::time::timeout(FETCH_TIMEOUT, async {
         let mut uri = asset_uri(tag, name)?;
         for _ in 0..=MAX_REDIRECTS {
-            let reply = get_once(uri.clone(), limit, roots).await?;
+            let reply = get(uri.clone(), limit).await?;
             match reply.redirect {
                 Some(raw) => {
                     let next = location(&uri, &raw)?;
@@ -385,17 +388,17 @@ fn decompress(compressed: &[u8], expected: [u8; 32]) -> Result<Vec<u8>, Error> {
     Ok(result)
 }
 
-async fn dataset(
-    tag: &str,
-    name: &str,
-    roots: &rustls::RootCertStore,
-) -> Result<(Vec<u8>, [u8; 32]), Error> {
-    let raw_sum = asset(tag, &format!("{name}.sha256sum"), MAX_CHECKSUM, roots).await?;
+async fn dataset<F, Fut>(tag: &str, name: &str, get: &F) -> Result<(Vec<u8>, [u8; 32]), Error>
+where
+    F: Fn(Uri, usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Reply, Error>>,
+{
+    let raw_sum = asset(tag, &format!("{name}.sha256sum"), MAX_CHECKSUM, get).await?;
     let expected = checksum(&raw_sum, name)?;
     let gz_name = format!("{name}.gz");
-    let gz_sum = asset(tag, &format!("{gz_name}.sha256sum"), MAX_CHECKSUM, roots).await?;
+    let gz_sum = asset(tag, &format!("{gz_name}.sha256sum"), MAX_CHECKSUM, get).await?;
     let expected_gz = checksum(&gz_sum, &gz_name)?;
-    let gz = asset(tag, &gz_name, MAX_COMPRESSED, roots).await?;
+    let gz = asset(tag, &gz_name, MAX_COMPRESSED, get).await?;
     if hash(&gz) != expected_gz {
         return Err(Error::Integrity);
     }
@@ -525,7 +528,17 @@ impl Store {
         let roots = tokio::task::spawn_blocking(roots)
             .await
             .map_err(|_| Error::Io)??;
-        let tag = latest(&roots).await?;
+        self.refresh_from(rules, previous, &|uri, limit| get_once(uri, limit, &roots)).await
+    }
+
+    // Share the complete release validation and publication transaction with
+    // deterministic fixtures; only the transport is supplied by the caller.
+    async fn refresh_from<F, Fut>(&self, rules: &[Rule], previous: Option<Vec<u8>>, get: &F) -> Result<Pair, Error>
+    where
+        F: Fn(Uri, usize) -> Fut,
+        Fut: std::future::Future<Output = Result<Reply, Error>>,
+    {
+        let tag = latest(get).await?;
         if let Some(bytes) = previous.as_deref() {
             let manifest: Manifest =
                 toml::from_str(std::str::from_utf8(bytes).map_err(|_| Error::Format)?)
@@ -539,8 +552,8 @@ impl Store {
             // A new release may contain categories missing in the old one.
             // Validate only the new pair before changing the active pointer.
         }
-        let (site, site_hash) = dataset(&tag, SITE, &roots).await?;
-        let (ip, ip_hash) = dataset(&tag, IP, &roots).await?;
+        let (site, site_hash) = dataset(&tag, SITE, get).await?;
+        let (ip, ip_hash) = dataset(&tag, IP, get).await?;
         let directory = self.directory.clone();
         let rules = rules.to_vec();
         tokio::task::spawn_blocking(move || {
@@ -590,6 +603,134 @@ mod tests {
     }
     fn ip() -> Vec<u8> {
         vec![10, 13, 10, 1, b'X', 18, 8, 10, 4, 192, 0, 2, 0, 16, 24]
+    }
+
+
+    fn release_reply(tag: &str) -> Reply {
+        Reply { status: StatusCode::FOUND, redirect: Some(format!("{REPO}/tag/{tag}")), bytes: vec![] }
+    }
+    fn data_reply(bytes: Vec<u8>) -> Reply {
+        Reply { status: StatusCode::OK, redirect: None, bytes }
+    }
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut writer = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        writer.write_all(bytes).unwrap();
+        writer.finish().unwrap()
+    }
+    fn dataset_responses(name: &str, bytes: &[u8]) -> [Reply; 3] {
+        let gz = gzip(bytes);
+        [
+            data_reply(format!("{}  {name}\n", hex(&hash(bytes))).into_bytes()),
+            data_reply(format!("{}  {name}.gz\n", hex(&hash(&gz))).into_bytes()),
+            data_reply(gz),
+        ]
+    }
+    struct Script {
+        replies: std::sync::Mutex<std::collections::VecDeque<(Uri, usize, Reply)>>,
+    }
+    impl Script {
+        fn new(tag: &str, site: &[u8], ip: &[u8]) -> Self {
+            let mut replies = std::collections::VecDeque::from([(LATEST.parse().unwrap(), 0, release_reply(tag))]);
+            for (name, data) in [(SITE, site), (IP, ip)] {
+                let names = [format!("{name}.sha256sum"), format!("{name}.gz.sha256sum"), format!("{name}.gz")];
+                for ((name, limit), reply) in names.into_iter().zip([MAX_CHECKSUM, MAX_CHECKSUM, MAX_COMPRESSED]).zip(dataset_responses(name, data)) {
+                    replies.push_back((asset_uri(tag, &name).unwrap(), limit, reply));
+                }
+            }
+            Self { replies: std::sync::Mutex::new(replies) }
+        }
+        fn get(&self, uri: Uri, limit: usize) -> std::future::Ready<Result<Reply, Error>> {
+            let (expected, budget, reply) = self.replies.lock().unwrap().pop_front().expect("unexpected request");
+            assert_eq!(uri, expected);
+            assert_eq!(limit, budget);
+            std::future::ready(Ok(reply))
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_release_refresh_reuses_exact_tag_refuses_rollback_and_preserves_old_pair() {
+        let mut random = [0; 16];
+        SystemRandom::new().fill(&mut random).unwrap();
+        let dir = std::env::temp_dir().join(format!("theia-geodata-refresh-{}", hex(&random)));
+        fs::create_dir(&dir).unwrap();
+        let store = Store::new(dir.clone()).unwrap();
+        let old_tag = "20261126014317";
+        let new_tag = "20261127014317";
+        let old_site = dat(b'X');
+        let new_site = dat(b'Y');
+        let ip = ip();
+        let script = Script::new(old_tag, &old_site, &ip);
+        let old = store.refresh_from(&[], None, &|uri, limit| script.get(uri, limit)).await.unwrap();
+        assert_eq!(old.geosite(), old_site);
+        assert!(script.replies.lock().unwrap().is_empty());
+        let baseline = store.current_bytes().unwrap().unwrap();
+        let same = store.refresh_from(&[], Some(baseline.clone()), &|uri, limit| {
+            assert_eq!(uri, LATEST.parse::<Uri>().unwrap());
+            assert_eq!(limit, 0);
+            std::future::ready(Ok(release_reply(old_tag)))
+        }).await.unwrap();
+        assert_eq!(same.manifest(), old.manifest());
+        assert_eq!(store.current_bytes().unwrap().unwrap(), baseline);
+
+        let bad = Script::new(new_tag, &new_site, &ip);
+        bad.replies.lock().unwrap().get_mut(3).unwrap().2.bytes.push(0x99);
+        assert!(matches!(store.refresh_from(&[], Some(baseline.clone()), &|u,l| bad.get(u,l)).await, Err(Error::Integrity)));
+        assert_eq!(store.current_bytes().unwrap().unwrap(), baseline);
+        let good = Script::new(new_tag, &new_site, &ip);
+        let next = store.refresh_from(&[], Some(baseline.clone()), &|u,l| good.get(u,l)).await.unwrap();
+        assert_eq!(next.geosite(), new_site);
+        assert_eq!(next.geoip(), ip);
+        assert_eq!(store.load(&[]).unwrap().unwrap().manifest(), next.manifest());
+        assert_eq!(store.load_pinned(old.manifest(), &[]).unwrap().geosite(), old_site);
+        assert!(good.replies.lock().unwrap().is_empty());
+
+        let active = store.current_bytes().unwrap().unwrap();
+        assert!(matches!(store.refresh_from(&[], Some(active.clone()), &|_,_| std::future::ready(Ok(release_reply(old_tag)))).await, Err(Error::Conflict)));
+        assert_eq!(store.current_bytes().unwrap().unwrap(), active);
+        let stale = Script::new("20261128014317", &old_site, &ip);
+        assert!(matches!(store.refresh_from(&[], Some(baseline), &|u,l| stale.get(u,l)).await, Err(Error::Conflict)));
+        assert_eq!(store.current_bytes().unwrap().unwrap(), active);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_redirect_chain_is_pinned_and_bounded() {
+        let tag = "20261126014317";
+        let source = asset_uri(tag, SITE).unwrap();
+        let location = "https://release-assets.githubusercontent.com/asset?signature=test";
+        let count = std::sync::atomic::AtomicUsize::new(0);
+        use std::sync::atomic::Ordering;
+        let output = asset(tag, SITE, 16, &|uri, limit| {
+            assert_eq!(limit, 16);
+            let first = count.fetch_add(1, Ordering::Relaxed) == 0;
+            let response = if first {
+                assert_eq!(uri, source);
+                Reply { status: StatusCode::FOUND, redirect: Some(location.into()), bytes: vec![] }
+            } else {
+                assert_eq!(uri, location.parse::<Uri>().unwrap());
+                data_reply(b"valid".to_vec())
+            };
+            std::future::ready(Ok(response))
+        }).await.unwrap();
+        assert_eq!(output, b"valid");
+        assert_eq!(count.load(Ordering::Relaxed), 2);
+        for bad in [
+            "https://github.com/other/repo/releases/download/20261126014317/geosite.dat",
+            "https://github.com/XTLS/Xray-rules-dat/releases/download/20261127014317/geosite.dat",
+            "https://github.com/XTLS/Xray-rules-dat/releases/download/20261126014317/geoip-lite.dat",
+            "https://github.com/XTLS/Xray-rules-dat/releases/download/20261126014317/geosite.dat?token=x",
+            "https://untrusted.invalid/asset",
+        ] {
+            assert_eq!(asset(tag, SITE, 16, &|_,_| std::future::ready(Ok(Reply { status: StatusCode::FOUND, redirect: Some(bad.into()), bytes: vec![] }))).await, Err(Error::Format));
+        }
+        count.store(0, Ordering::Relaxed);
+        assert_eq!(asset(tag, SITE, 16, &|_,_| {
+            count.fetch_add(1, Ordering::Relaxed);
+            std::future::ready(Ok(Reply { status: StatusCode::FOUND, redirect: Some(location.into()), bytes: vec![] }))
+        }).await, Err(Error::Format));
+        assert_eq!(count.load(Ordering::Relaxed), MAX_REDIRECTS + 1);
+        assert_eq!(latest(&|_,_| std::future::ready(Ok(data_reply(vec![])))).await, Err(Error::Format));
+        assert_eq!(latest(&|_,_| std::future::ready(Ok(Reply { status: StatusCode::FOUND, redirect: None, bytes: vec![] }))).await, Err(Error::Format));
     }
 
     async fn response_fixture(

@@ -472,11 +472,6 @@ impl NativeConnection {
         ))
     }
 
-    #[cfg(test)]
-    pub(crate) fn test_opener(&self) -> Opener {
-        self.opener.clone()
-    }
-
     pub(crate) fn driver_guard(&self) -> DriverGuard {
         DriverGuard(self.driver.clone())
     }
@@ -920,6 +915,36 @@ impl quic::SendStreamUnframed<Bytes> for Bidi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_close_is_committed_before_critical_stream_destructors() {
+        let shared = Arc::new(Bridge {
+            state: Mutex::new(State::default()),
+            ready: Arc::new(Notify::new()),
+        });
+        // Locally initiated control/QPACK send stream and remote receive
+        // stream. Neither has a FIN: their lifetime is the connection.
+        {
+            let mut state = shared.lock().unwrap();
+            state.streams.insert(2, StreamState::new(true, false));
+            state.streams.insert(3, StreamState::new(false, true));
+        }
+        let opener = Opener::new(shared.clone());
+        let send = SendSide::new(shared.clone(), 2);
+        let recv = RecvSide::new(shared.clone(), 3);
+        opener.close_inner(Code::H3_NO_ERROR);
+        drop(send);
+        drop(recv);
+        // The worker prioritizes state.close over stream progress, and
+        // State::fail prevents progress even after that close is consumed.
+        let mut state = shared.lock().unwrap();
+        assert_eq!(state.close.take(), Some(0x100));
+        assert!(matches!(state.error, Some(CE::ApplicationClose { error_code: 0x100 })));
+        drop(state);
+        // A later destructor must never replace a previously committed close.
+        opener.close_inner(Code::H3_INTERNAL_ERROR);
+        assert!(shared.lock().unwrap().close.is_none());
+    }
 
     #[test]
     fn peer_stop_preserves_completed_handoff_and_rejects_interrupted_write() {

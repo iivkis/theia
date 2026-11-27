@@ -673,8 +673,7 @@ impl H3Client {
         let (transport, key) =
             h3_adapter::NativeConnection::start(session).map_err(|_| ClientError::Tls)?;
         let binding = self.certificate_pin.map(|_| key);
-        #[cfg(test)]
-        let test_opener = transport.test_opener();
+        let close_opener = quic::Connection::opener(&transport);
         crate::diag!(
             Trace,
             "client.h3",
@@ -698,8 +697,7 @@ impl H3Client {
             sender: std::sync::Mutex::new(sender),
             driver,
             binding,
-            #[cfg(test)]
-            test_opener,
+            close_opener,
         })
     }
 
@@ -966,8 +964,22 @@ struct H3Connection {
     sender: std::sync::Mutex<h3::client::SendRequest<h3_adapter::Opener, Bytes>>,
     driver: Driver,
     binding: Option<crate::channel_binding::Key>,
-    #[cfg(test)]
-    test_opener: h3_adapter::Opener,
+    close_opener: h3_adapter::Opener,
+}
+
+impl Drop for H3Connection {
+    fn drop(&mut self) {
+        // The driver owns the HTTP/3 critical streams. Commit the connection
+        // close before aborting it or dropping SendRequest: otherwise their
+        // stream destructors can queue RESET_STREAM / STOP_SENDING while the
+        // native UDP worker is still open, racing the graceful close.
+        // close() preserves any earlier terminal transport error.
+        quic::OpenStreams::<Bytes>::close(
+            &mut self.close_opener,
+            h3::error::Code::H3_NO_ERROR,
+            b"",
+        );
+    }
 }
 
 struct Driver(JoinHandle<()>);
@@ -1025,7 +1037,7 @@ impl H3Tunnel {
     ) -> Result<(), ClientError> {
         self._lease
             .connection()
-            .test_opener
+            .close_opener
             .rebind_for_test(socket)
             .await
             .map_err(|_| ClientError::Io)
