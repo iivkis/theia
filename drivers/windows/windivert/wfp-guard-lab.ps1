@@ -6,7 +6,8 @@ param(
     [Parameter(Mandatory=$true)][string]$JournalDirectory,
     [Parameter(Mandatory=$true)][string]$Helper,
     [Parameter(Mandatory=$true)][string]$HelperSha256,
-    [string]$InterfaceGuid,
+    [string[]]$InterfaceGuid,
+    [switch]$IncludeBootTime,
     [string]$IntentSha256,
     [switch]$IsolatedTestMachine,
     [switch]$ConfirmRecovery,
@@ -16,6 +17,7 @@ $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
 if (!$IsolatedTestMachine) { throw 'Explicit disposable machine and local console consent required.' }
 if ($Mode -eq 'Recover' -and !$ConfirmRecovery) { throw 'Recovery requires explicit confirmation.' }
+if ($Mode -ne 'Prepare' -and ($IncludeBootTime -or $InterfaceGuid)) { throw 'Verify/recovery must use the exact pinned intent.' }
 $principal=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
 if (!$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Administrator required.' }
 $allowed=@('S-1-5-18','S-1-5-32-544')
@@ -92,12 +94,23 @@ try {
     try {
         if ($Mode -eq 'Prepare') {
             if ($RequireDifferentBoot -or $ConfirmRecovery -or (Test-Path -LiteralPath $intent)) { throw 'Existing or invalid transaction; review required.' }
-            $id=CanonicalGuid $InterfaceGuid
-            $luid=(& $helperFile.FullName interface $id)
-            if ($LASTEXITCODE -ne 0 -or $luid -cnotmatch '^[a-f0-9]{16}$' -or $luid -eq '0000000000000000') { throw 'Interface not verified.' }
-            $record=[pscustomobject]@{Version=1;Machine=$machine;BootUtc=$boot;HelperSha256=$hash;
-                Interface=$id;Luid=$luid;Sub=[Guid]::NewGuid().ToString('B');V4=[Guid]::NewGuid().ToString('B');
-                V6=[Guid]::NewGuid().ToString('B');Marker=[Guid]::NewGuid().ToString('B')}
+            if (!$InterfaceGuid -or @($InterfaceGuid).Count -gt 8) { throw 'Review one to eight explicit non-loopback interfaces.' }
+            $plans=@()
+            foreach ($value in $InterfaceGuid) {
+                $id=CanonicalGuid $value
+                $luid=(& $helperFile.FullName interface $id)
+                if ($LASTEXITCODE -ne 0 -or $luid -cnotmatch '^[a-f0-9]{16}$' -or $luid -eq '0000000000000000') { throw 'Interface not verified.' }
+                if (@($plans | Where-Object { $_.Interface -ceq $id -or $_.Luid -ceq $luid }).Count -ne 0) { throw 'Duplicate interface.' }
+                $plan=[ordered]@{Interface=$id;Luid=$luid;Sub=[Guid]::NewGuid().ToString('B');V4=[Guid]::NewGuid().ToString('B');
+                    V6=[Guid]::NewGuid().ToString('B');Marker=[Guid]::NewGuid().ToString('B')}
+                if ($IncludeBootTime) {
+                    $plan.Boot4=[Guid]::NewGuid().ToString('B')
+                    $plan.Boot6=[Guid]::NewGuid().ToString('B')
+                }
+                $plans+=[pscustomobject]$plan
+            }
+            $record=[pscustomobject]@{Version=2;Machine=$machine;BootUtc=$boot;HelperSha256=$hash;
+                BootTime=[bool]$IncludeBootTime;Interfaces=$plans}
             $IntentSha256=Write-Once $intent $record
             # Emit the digest before the transaction, even if it fails.
             Write-Host "Durable intent SHA256: $IntentSha256"
@@ -107,20 +120,46 @@ try {
         $intentLease=[IO.File]::Open($intent,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
         try {
             $r=Read-Pinned $intentLease $IntentSha256
-            if ($r.Version -ne 1 -or $r.Machine -cne $machine -or $r.HelperSha256 -cne $hash -or
-                $r.Luid -cnotmatch '^[a-f0-9]{16}$' -or $r.Luid -eq '0000000000000000') { throw 'Intent scope/version mismatch.' }
-            foreach($key in @('Interface','Sub','V4','V6','Marker')) {
-                if ((CanonicalGuid $r.$key) -cne $r.$key) { throw 'Noncanonical intent GUID.' }
-            }
+            if ($r.Version -notin @(1,2) -or $r.Machine -cne $machine -or $r.HelperSha256 -cne $hash) { throw 'Intent scope/version mismatch.' }
             if ($RequireDifferentBoot -and $r.BootUtc -eq $boot) { throw 'Reboot has not been observed.' }
             $operation=switch($Mode) {'Prepare' {'install'} 'Verify' {'inspect'} 'Recover' {'recover'}}
-            $state=(& $helperFile.FullName $operation $r.Interface $r.Luid $r.Sub $r.V4 $r.V6 $r.Marker isolated-test-machine)
+            if ($r.Version -eq 1) {
+                $plans=@($r)
+                $bootConfigured=$false
+                $native=@($operation)
+            } else {
+                if ($r.BootTime -isnot [bool] -or !$r.Interfaces -or @($r.Interfaces).Count -gt 8) { throw 'Invalid v2 guard scope.' }
+                $plans=@($r.Interfaces)
+                $bootConfigured=$r.BootTime
+                $variant=if ($bootConfigured) {'boot'} else {'persistent'}
+                $native=@("$operation-many",$variant)
+            }
+            $seenInterfaces=@();$seenLuids=@();$seenKeys=@()
+            foreach ($plan in $plans) {
+                if ($plan.Luid -cnotmatch '^[a-f0-9]{16}$' -or $plan.Luid -eq '0000000000000000' -or
+                    $plan.Interface -cin $seenInterfaces -or $plan.Luid -cin $seenLuids) { throw 'Invalid or duplicate interface scope.' }
+                $fields=@('Interface','Sub','V4','V6','Marker')
+                if ($bootConfigured) {$fields+=@('Boot4','Boot6')}
+                foreach ($key in $fields) {
+                    if ((CanonicalGuid $plan.$key) -cne $plan.$key) { throw 'Noncanonical intent GUID.' }
+                    if ($key -ne 'Interface') {
+                        if ($plan.$key -cin $seenKeys) {throw 'Duplicate object identity.'}
+                        $seenKeys+=$plan.$key
+                    }
+                }
+                $seenInterfaces+=$plan.Interface;$seenLuids+=$plan.Luid
+                $native+=@($plan.Interface,$plan.Luid,$plan.Sub,$plan.V4,$plan.V6,$plan.Marker)
+                if ($bootConfigured) {$native+=@($plan.Boot4,$plan.Boot6)}
+            }
+            $native+='isolated-test-machine'
+            $state=(& $helperFile.FullName @native)
             if ($LASTEXITCODE -ne 0) { throw 'WFP transaction failed or conflicted; retain journal.' }
             $expected=if ($Mode -eq 'Recover') {'absent'} else {'exact'}
             if ($state -cne $expected) { throw 'Unexpected committed WFP state; retain journal.' }
             $null=Read-Pinned $intentLease $IntentSha256
-            [pscustomobject]@{Version=1;IntentSha256=$IntentSha256;BootUtc=$boot;State=$state;
-                Interface=$r.Interface;TransactionalObjectCas=$true;PacketEnforcementVerified=$false;
+            [pscustomobject]@{Version=$r.Version;IntentSha256=$IntentSha256;BootUtc=$boot;State=$state;
+                Interfaces=$seenInterfaces;TransactionalObjectCas=$true;PacketEnforcementVerified=$false;
+                BootTimeObjectsConfigured=($bootConfigured -and $state -ceq 'exact');
                 BootTimeCoverageVerified=$false;ProductionCaptureReady=$false} | ConvertTo-Json -Compress
         } finally { $intentLease.Dispose() }
     } finally { $lock.Dispose() }

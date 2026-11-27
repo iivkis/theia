@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([Parameter(Mandatory=$true)][string]$OutputDirectory,[switch]$TestBfeTransaction)
+param([Parameter(Mandatory=$true)][string]$OutputDirectory,[switch]$TestBfeTransaction,[switch]$TestBootTimeTransaction)
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
 $out=[IO.Path]::GetFullPath($OutputDirectory)
@@ -20,5 +20,11 @@ if ($LASTEXITCODE -ne 0) { throw 'WFP guard self-test failed.' }
 if ($TestBfeTransaction) {
     & $exe transaction-self-test abort-only
     if ($LASTEXITCODE -ne 0) { throw 'BFE abort-only transaction test failed.' }
+    & $exe multi-transaction-self-test abort-only
+    if ($LASTEXITCODE -ne 0) { throw 'BFE multi-interface abort-only transaction test failed.' }
+}
+if ($TestBootTimeTransaction) {
+    & $exe boot-transaction-self-test abort-only
+    if ($LASTEXITCODE -ne 0) { throw 'BFE boot-time abort-only transaction test failed.' }
 }
 Get-FileHash -LiteralPath $exe -Algorithm SHA256
