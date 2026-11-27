@@ -45,7 +45,11 @@ async fn fixture(both: bool) -> Loopback {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let udp = if both {
-            match quic_transport::server_endpoint(address, vec![cert.clone()], key.clone_key().into()) {
+            match quic_transport::server_endpoint(
+                address,
+                vec![cert.clone()],
+                key.clone_key().into(),
+            ) {
                 Ok(endpoint) => Ok((Some(endpoint), None)),
                 Err(theia::quic_transport::QuicError::Bind) => continue,
                 Err(other) => Err(format!("QUIC fixture configuration: {other:?}")),
@@ -56,7 +60,8 @@ async fn fixture(both: bool) -> Loopback {
                 Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
                 Err(error) => Err(error.to_string()),
             }
-        }.unwrap();
+        }
+        .unwrap();
         pair = Some((listener, address, udp));
         break;
     }
@@ -70,7 +75,9 @@ async fn fixture(both: bool) -> Loopback {
     let udp_task = if let Some(endpoint) = endpoint {
         tokio::spawn(async move {
             let incoming = endpoint.accept().await.unwrap();
-            let Ok(conn) = quic_transport::accept(incoming).await else { return; };
+            let Ok(conn) = quic_transport::accept(incoming).await else {
+                return;
+            };
             tokio::time::sleep(Duration::from_millis(120)).await;
             drop(conn);
         })
