@@ -305,18 +305,51 @@ def test_only_attribute(raw: bytes) -> bool:
     return re.fullmatch(rb"#\[(?:test|tokio::test)(?:\(.*\))?\]", compact) is not None
 
 
-def test_only_lines(source: bytes) -> set[int]:
-    # Use the Rust syntax tree, not regex brace matching or a file allowlist.
-    # Exclude a line only if the test-only item occupies the entire line;
-    # shared production/test lines remain in the denominator.
+def rust_syntax_root(source: bytes):
     from tree_sitter import Language, Parser
     import tree_sitter_rust
 
     root = Parser(Language(tree_sitter_rust.language())).parse(source).root_node
     if root.has_error:
-        raise EvidenceError("Rust syntax parser cannot classify test-only code")
-    result: set[int] = set()
+        raise EvidenceError("Rust syntax parser cannot classify source")
+    return root
+
+
+def whole_file_test_only(source: bytes, root) -> bool:
+    # A provably test-only inner cfg disables the complete module.
+    for child in root.named_children:
+        if child.type == "inner_attribute_item":
+            raw = source[child.start_byte:child.end_byte]
+            compact = re.sub(rb"\s+", b"", raw)
+            if compact.startswith(b"#![cfg(") and test_only_attribute(b"#" + compact[2:]):
+                return True
+    return False
+
+
+def zero_executable_source(source: bytes) -> bool:
+    """Prove a source has no production executable items, without a path allowlist."""
+    root = rust_syntax_root(source)
+    if whole_file_test_only(source, root):
+        return True
+    # Out-of-line module declarations have no executable lines. The
+    # declared modules themselves remain in the exact-SHA inventory.
+    for child in root.named_children:
+        if child.type in {"line_comment", "block_comment"}:
+            continue
+        if child.type != "mod_item" or child.child_by_field_name("body") is not None:
+            return False
+    return True
+
+
+def test_only_lines(source: bytes) -> set[int]:
+    # Use the Rust syntax tree, not regex brace matching or a file allowlist.
+    # Exclude a line only if the test-only item occupies the entire line;
+    # shared production/test lines remain in the denominator.
+    root = rust_syntax_root(source)
     source_lines = source.splitlines()
+    if whole_file_test_only(source, root):
+        return set(range(1, len(source_lines) + 1))
+    result: set[int] = set()
 
     def exclude(first, last):
         start = first.start_point.row
@@ -362,7 +395,11 @@ def read_report(path: Path) -> dict:
 
 
 def combine(reports: list[dict], expected: dict[str, str], sha: str,
-            excluded: dict[str, set[int]], lengths: dict[str, int]) -> dict:
+            excluded: dict[str, set[int]], lengths: dict[str, int],
+            zero_executable: set[str] | None = None) -> dict:
+    zero_executable = zero_executable or set()
+    if not zero_executable <= set(expected):
+        raise EvidenceError("Unknown zero-executable source")
     if len(reports) != 2:
         raise EvidenceError("Exactly two native reports are required")
     seen = set()
@@ -391,13 +428,15 @@ def combine(reports: list[dict], expected: dict[str, str], sha: str,
                     combined[name][number] = max(combined[name].get(number, 0), hits)
     if seen != PLATFORMS:
         raise EvidenceError("Both native platforms must be measured")
-    missing = [name for name, lines in combined.items() if not lines]
+    missing = [name for name, lines in combined.items() if not lines and name not in zero_executable]
     if missing:
         raise EvidenceError("Production sources missing executable evidence: " + ", ".join(sorted(missing)))
     files = {name: {"covered": sum(lines.values()), "total": len(lines)}
              for name, lines in sorted(combined.items())}
     covered = sum(value["covered"] for value in files.values())
     total = sum(value["total"] for value in files.values())
+    if not total:
+        raise EvidenceError("No production executable lines measured")
     return {"schema": 1, "sha": sha, "platforms": sorted(seen), "minimum_percent": MIN_PERCENT,
             "covered": covered, "total": total, "percent": covered * 100 / total,
             "passed": covered * 100 >= MIN_PERCENT * total, "files": files}
@@ -433,7 +472,8 @@ def main() -> int:
     excluded = {name: test_only_lines(source) for name, source in sources.items()}
     lengths = {name: len(source.splitlines()) for name, source in sources.items()}
     summary = combine([read_report(args.linux), read_report(args.windows)], expected,
-                      args.sha, excluded, lengths)
+                      args.sha, excluded, lengths,
+                      {name for name, source in sources.items() if zero_executable_source(source)})
     write_json(args.output, summary)
     print(f'Production line coverage: {summary["covered"]}/{summary["total"]} '
           f'({summary["percent"]:.2f}%), required {MIN_PERCENT}%')

@@ -192,5 +192,34 @@ fn maybe_live() {}
         self.assertFalse(cov.test_only_attribute(b"#[custom::test]"))
 
 
+    def test_module_indexes_and_test_only_files_keep_inventory_without_fake_lines(self):
+        try:
+            import tree_sitter
+            import tree_sitter_rust
+        except ImportError:
+            if os.environ.get("THEIA_COVERAGE_SYNTAX_TESTS") == "required":
+                raise
+            self.skipTest("syntax parser installed in coverage-gate")
+        for source in (b"//! module index\npub(crate) mod tls;\nmod error;\n",
+                       b"#![cfg(test)]\nuse super::*;\nfn helper() {}\n"):
+            self.assertTrue(cov.zero_executable_source(source))
+        for source in (b"mod inline { fn live() {} }", b"mod tls;\nfn live() {}",
+                       b"#![cfg(any(test, windows))]\nfn live() {}",
+                       b"#[cfg(test)]\nfn helper() {}\nfn live() {}",
+                       b'include!("generated.rs");', b"macro_rules! live { () => {} }"):
+            self.assertFalse(cov.zero_executable_source(source))
+        self.assertEqual(cov.test_only_lines(b"#![cfg(test)]\nfn helper() {}\n"), {1, 2})
+        linux = report("Linux", {A: {"1": 1}})
+        windows = report("Windows", {A: {"1": 1}})
+        with self.assertRaises(cov.EvidenceError):
+            cov.combine([linux, windows], FILES, SHA, EXCLUDED, LENGTHS)
+        result = cov.combine([linux, windows], FILES, SHA, EXCLUDED, LENGTHS, {B})
+        self.assertEqual(result["files"][B], {"covered": 0, "total": 0})
+        self.assertEqual((result["covered"], result["total"]), (1, 1))
+        windows["files"][B] = {"1": 0}
+        result = cov.combine([linux, windows], FILES, SHA, EXCLUDED, LENGTHS, {B})
+        self.assertEqual((result["covered"], result["total"]), (1, 2))
+
+
 if __name__ == "__main__":
     unittest.main()
