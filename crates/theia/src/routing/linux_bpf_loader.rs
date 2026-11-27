@@ -270,6 +270,11 @@ impl CapturedObservation<'_, '_> {
 }
 
 impl CollectedEvent {
+    pub(crate) fn live_cookie(&self)->io::Result<u64> {
+        self.loss.check()?;
+        self.event.fresh()?;
+        Ok(self.event.cookie)
+    }
     pub fn capture_observation<'a, 'queue>(
         &'a self,
         rules: &'a super::linux_rules::LabRules,

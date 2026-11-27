@@ -2242,6 +2242,7 @@ struct RawLease {
     digest: [u8; 32],
     last: Instant,
     denied: bool,
+    socket_cookie:Option<u64>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -2425,8 +2426,49 @@ impl NativeIngress {
         rules: crate::routing::linux_rules::LabRules,
         host_namespace: std::fs::File,
     ) -> Result<(), ClientError> {
+        self.serve_linux_queues_inner(queue,None,rules,host_namespace,|_,_,_|Ok(None)).await
+    }
+
+    /// Consume both private queues through the same actual verdict path.
+    /// The proof establishes socket identity, not application identity.
+    #[cfg(target_os="linux")]
+    pub async fn serve_linux_socket_queues(
+        &self,queue:crate::routing::nfqueue::Queue,tagged:crate::routing::nfqueue::Queue,
+        rules:crate::routing::linux_rules::LabRules,host_namespace:std::fs::File,
+    )->Result<(),ClientError> {
+        self.serve_linux_queues_inner(queue,Some(tagged),rules,host_namespace,|_,_,_|Ok(None)).await
+    }
+
+    /// Private collector records can participate in the actual NFQUEUE
+    /// verdict, never as application Known. A stale record, wrong fd,
+    /// changed image/cookie or lost collector session denies that packet.
+    /// This lab API requires a fresh event for the tagged socket.
+    #[cfg(all(target_os="linux",feature="linux-ebpf-lab"))]
+    pub async fn serve_linux_collected_queues(
+        &self,queue:crate::routing::nfqueue::Queue,tagged:crate::routing::nfqueue::Queue,
+        rules:crate::routing::linux_rules::LabRules,host_namespace:std::fs::File,
+        events:&[(crate::routing::linux_bpf_loader::CollectedEvent,i32)],
+    )->Result<(),ClientError> {
+        if events.is_empty() || events.len()>16 {return Err(ClientError::Configuration);}
+        self.serve_linux_queues_inner(queue,Some(tagged),rules,host_namespace,|rules,packet,socket|{
+            let mut matches=events.iter().filter(|(event,_)|event.live_cookie().ok()==Some(socket.cookie()));
+            let (event,fd)=matches.next().ok_or(std::io::ErrorKind::PermissionDenied)?;
+            if matches.next().is_some() {return Err(std::io::ErrorKind::PermissionDenied.into());}
+            event.corroborate_packet(rules,packet,*fd).map(Some)
+        }).await
+    }
+
+    #[cfg(target_os="linux")]
+    async fn serve_linux_queues_inner<V>(
+        &self,queue:crate::routing::nfqueue::Queue,tagged:Option<crate::routing::nfqueue::Queue>,
+        rules:crate::routing::linux_rules::LabRules,host_namespace:std::fs::File,verify:V,
+    )->Result<(),ClientError>
+    where V:Fn(&crate::routing::linux_rules::LabRules,&crate::routing::nfqueue::Packet<'_>,
+        crate::routing::linux_rules::CapturedSocket)->std::io::Result<Option<crate::routing::linux_events::CorroboratedFlow>> {
         self.ensure_running()?;
-        if !rules.owns_queue(&queue).map_err(|_| ClientError::Io)? {
+        if !rules.owns_queue(&queue).map_err(|_|ClientError::Io)? ||
+            rules.has_capture_queue()!=tagged.is_some() ||
+            tagged.as_ref().is_some_and(|q|!rules.owns_capture_queue(q).unwrap_or(false)) {
             return Err(ClientError::Configuration);
         }
         let rules = Arc::new(Mutex::new(rules));
@@ -2443,16 +2485,20 @@ impl NativeIngress {
             }
             *slot = Some(registrar.clone());
         }
-        self.serve_linux_shared(queue, rules, registrar).await
+        self.serve_linux_shared(queue,tagged,rules,registrar,verify).await
     }
 
     #[cfg(target_os = "linux")]
-    async fn serve_linux_shared(
+    async fn serve_linux_shared<V>(
         &self,
         queue: crate::routing::nfqueue::Queue,
+        tagged:Option<crate::routing::nfqueue::Queue>,
         rules: Arc<Mutex<crate::routing::linux_rules::LabRules>>,
         registrar: Arc<dyn crate::routing::carrier_socket::Registrar>,
-    ) -> Result<(), ClientError> {
+        verify:V,
+    ) -> Result<(), ClientError>
+    where V:Fn(&crate::routing::linux_rules::LabRules,&crate::routing::nfqueue::Packet<'_>,
+        crate::routing::linux_rules::CapturedSocket)->std::io::Result<Option<crate::routing::linux_events::CorroboratedFlow>> {
         struct StopOnDrop<'a>(&'a NativeIngress);
         impl Drop for StopOnDrop<'_> {
             fn drop(&mut self) {
@@ -2469,7 +2515,15 @@ impl NativeIngress {
         {
             return Err(ClientError::Configuration);
         }
+        {
+            let owner=rules.lock().map_err(|_|ClientError::Configuration)?;
+            if owner.has_capture_queue()!=tagged.is_some() ||
+                tagged.as_ref().is_some_and(|q|!owner.owns_capture_queue(q).unwrap_or(false)) {
+                return Err(ClientError::Configuration);
+            }
+        }
         let mut queue = queue.into_async().map_err(|_| ClientError::Io)?;
+        let mut tagged=tagged.map(|q|q.into_async()).transpose().map_err(|_|ClientError::Io)?;
         self.runtime.capture_state.ready()?;
         let consume = async {
             let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
@@ -2484,18 +2538,14 @@ impl NativeIngress {
                         continue;
                     }
                     packet=queue.next()=>packet.map_err(|_| ClientError::Io)?,
+                    packet=async {
+                        match tagged.as_mut() {
+                            Some(q)=>q.next().await,
+                            None=>std::future::pending().await,
+                        }
+                    }=>packet.map_err(|_|ClientError::Io)?,
                 };
-                if !rules
-                    .lock()
-                    .map_err(|_| ClientError::Configuration)?
-                    .owns_packet(&packet)
-                    .map_err(|_| ClientError::Io)?
-                {
-                    return Err(ClientError::Open(ErrorCode::PolicyDenied));
-                }
-                self.verdict(&rules, packet)
-                    .await
-                    .map_err(|_| ClientError::Io)?;
+                self.verdict_with_evidence(&rules,packet,&verify).await.map_err(|_|ClientError::Io)?;
             }
         };
         tokio::select! {
@@ -2573,7 +2623,7 @@ impl NativeIngress {
         };
         let explicit = tokio::select! {
             biased;
-            result=ingress.serve_linux_shared(queue,rules.clone(),registrar.clone())=>{
+            result=ingress.serve_linux_shared(queue,None,rules.clone(),registrar.clone(),|_,_,_|Ok(None))=>{
                 result?;
                 Err(ClientError::Io) // unexpected consumer exit, never auto restore
             },
@@ -3139,25 +3189,39 @@ impl NativeIngress {
         rules: &Mutex<crate::routing::linux_rules::LabRules>,
         packet: crate::routing::nfqueue::Packet<'_>,
     ) -> std::io::Result<crate::routing::PacketAction> {
+        self.verdict_with_evidence(rules,packet,&|_,_,_|Ok(None)).await
+    }
+
+    #[cfg(target_os="linux")]
+    async fn verdict_with_evidence<V>(
+        &self,
+        rules:&Mutex<crate::routing::linux_rules::LabRules>,
+        packet:crate::routing::nfqueue::Packet<'_>,
+        verify:&V,
+    )->std::io::Result<crate::routing::PacketAction>
+    where V:Fn(&crate::routing::linux_rules::LabRules,&crate::routing::nfqueue::Packet<'_>,
+        crate::routing::linux_rules::CapturedSocket)->std::io::Result<Option<crate::routing::linux_events::CorroboratedFlow>> {
         use crate::routing::PacketAction;
-        // Check before doing any async policy work; a standalone queue
-        // without the exact owned rule set must not authorize native Pass.
-        if !rules
-            .lock()
-            .map_err(|_| std::io::ErrorKind::PermissionDenied)?
-            .owns_packet(&packet)?
-        {
-            return Err(std::io::ErrorKind::PermissionDenied.into());
-        }
-        let meta = packet.metadata();
-        let action = if packet.local_output() {
-            match meta {
-                Some(meta) => self.raw_verdict(meta).await,
-                None => PacketAction::Drop,
-            }
-        } else {
-            PacketAction::Drop
+        let evidence={
+            let owner=rules.lock().map_err(|_|std::io::ErrorKind::PermissionDenied)?;
+            if !owner.current()? {return Err(std::io::ErrorKind::PermissionDenied.into());}
+            owner.packet_evidence(&packet).and_then(|socket|{
+                let flow=socket.map(|proof|verify(&owner,&packet,proof)).transpose()?.flatten();
+                Ok((socket,flow))
+            })
         };
+        let (socket,corroborated)=match evidence {
+            Ok(value)=>value,
+            Err(_)=>return packet.finish(PacketAction::Drop),
+        };
+        let cookie=socket.map(|proof|proof.cookie());
+        let meta=packet.metadata();
+        let action=if packet.local_output() {
+            match meta {
+                Some(meta)=>self.raw_verdict_bound(meta,cookie).await,
+                None=>PacketAction::Drop,
+            }
+        } else {PacketAction::Drop};
         let gate = self.verdict_gate.lock();
         // Recheck AFTER the asynchronous policy fetch. Hold the rule mutex
         // through the actual verdict so our own dynamic lease transaction
@@ -3165,10 +3229,12 @@ impl NativeIngress {
         let owned = rules
             .lock()
             .map_err(|_| std::io::ErrorKind::PermissionDenied)?;
-        if !owned.owns_packet(&packet)? {
-            return Err(std::io::ErrorKind::PermissionDenied.into());
-        }
-        let mut action = if gate.is_ok() && self.ensure_accepting().is_ok() {
+        if !owned.current()? {return Err(std::io::ErrorKind::PermissionDenied.into());}
+        let unchanged=owned.packet_evidence(&packet).and_then(|current|{
+            let flow=current.map(|proof|verify(&owned,&packet,proof)).transpose()?.flatten();
+            Ok(current==socket && flow==corroborated)
+        }).unwrap_or(false);
+        let mut action = if unchanged && gate.is_ok() && self.ensure_accepting().is_ok() {
             action
         } else {
             PacketAction::Drop
@@ -3182,6 +3248,9 @@ impl NativeIngress {
                     };
                     let mut raw = self.raw.lock().ok()?;
                     let entry = raw.get_mut(&key)?;
+                    if entry.socket_cookie!=cookie {
+                        entry.denied=true;
+                    }
                     if self
                         .client
                         .routing_cache()
@@ -3198,15 +3267,29 @@ impl NativeIngress {
                 action = PacketAction::Drop;
             }
         }
+        if action==PacketAction::Drop {
+            if let Some(meta)=meta {
+                let key=crate::routing::packet::FlowKey{interface:0,..meta.flow};
+                if let Ok(mut raw)=self.raw.lock() {
+                    if let Some(entry)=raw.get_mut(&key) {entry.denied=true;}
+                }
+            }
+        }
         let result = packet.finish(action);
         drop(owned);
         result
     }
 
+    #[cfg(all(test,target_os="linux"))]
+    async fn raw_verdict(&self,meta:crate::routing::packet::PacketMeta)->crate::routing::PacketAction {
+        self.raw_verdict_bound(meta,None).await
+    }
+
     #[cfg(target_os = "linux")]
-    async fn raw_verdict(
+    async fn raw_verdict_bound(
         &self,
         mut meta: crate::routing::packet::PacketMeta,
+        socket_cookie:Option<u64>,
     ) -> crate::routing::PacketAction {
         use crate::routing::{packet::Transport, Evidence, PacketAction};
         meta.flow.interface = 0;
@@ -3247,7 +3330,7 @@ impl NativeIngress {
         let current = matched == Some(PacketAction::Pass) && cache.dpi.check_policy(digest).is_ok();
         if let Some(entry) = raw.get_mut(&meta.flow) {
             entry.last = now;
-            if !current || entry.digest != digest {
+            if !current || entry.digest != digest || entry.socket_cookie!=socket_cookie {
                 entry.denied = true;
             }
             return if !entry.denied && entry.flow.commit(PacketAction::Pass).is_ok() {
@@ -3281,6 +3364,7 @@ impl NativeIngress {
                 digest,
                 last: now,
                 denied: false,
+                socket_cookie,
             },
         );
         PacketAction::Pass

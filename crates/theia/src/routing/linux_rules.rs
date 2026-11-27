@@ -537,6 +537,9 @@ struct SocketCapture {
 pub struct CapturedSocket {
     cookie: u64,
     key: super::packet::FlowKey,
+    queue_identity: [u8; 16],
+    rules_nonce: [u8; 16],
+    generation: u32,
 }
 impl CapturedSocket {
     pub fn cookie(&self) -> u64 {
@@ -571,6 +574,13 @@ impl LabRules {
         }
         self.current()
     }
+
+    pub(crate) fn owns_capture_queue(&self,queue:&Queue)->io::Result<bool> {
+        let number=queue.number()?;
+        Ok(self.capture.as_ref().is_some_and(|tag|tag.queue_number==number &&
+            tag.queue_identity==queue.identity()) && self.current()?)
+    }
+    pub(crate) fn has_capture_queue(&self)->bool { self.capture.is_some() }
 
     pub(crate) fn current(&self) -> io::Result<bool> {
         if self.poisoned {
@@ -627,13 +637,31 @@ impl LabRules {
         Ok(CapturedSocket {
             cookie: capture.socket.cookie(),
             key,
+            queue_identity: capture.queue_identity,
+            rules_nonce: self.journal.nonce,
+            generation: self.journal.installed,
         })
+    }
+
+    /// The actual private queue, not the tuple alone, establishes the
+    /// provenance. Deny a reserved tuple arriving on the catch-all.
+    pub(crate) fn packet_evidence(&self,packet:&super::nfqueue::Packet<'_>)
+        ->io::Result<Option<CapturedSocket>> {
+        if packet.queue_identity()==self.queue_identity {
+            if !self.current()? {return Err(refused());}
+            if let (Some(tag),Some(meta))=(&self.capture,packet.metadata()) {
+                let key=super::packet::FlowKey{interface:0,..meta.flow};
+                if tag.socket.key()==key {return Err(refused());}
+            }
+            return Ok(None);
+        }
+        self.captured_socket(packet).map(Some)
     }
 
     /// Install a non-bypass queue for a single already connected, owned
     /// socket. Other packets enter the ordinary catch-all queue. This is
     /// a laboratory attribution proof, not a carrier exemption. Dynamic
-    /// carrier updates are deliberately disabled for this proof session.
+    /// carrier transactions preserve the tagged rule and queue identity.
     pub fn install_socket_capture(
         queue: &Queue,
         tagged: &Queue,
@@ -695,11 +723,13 @@ impl LabRules {
         if carriers.len() > MAX_CARRIERS || (capture.is_some() && !carriers.is_empty()) {
             return Err(refused());
         }
-        if let Some(tag) = &capture {
-            tag.socket.verify()?;
-        }
         let mut marks = std::collections::HashSet::new();
         let mut cookies = std::collections::HashSet::new();
+        if let Some(tag) = &capture {
+            tag.socket.verify()?;
+            marks.insert(tag.socket.mark());
+            cookies.insert(tag.socket.cookie());
+        }
         for socket in &carriers {
             socket.verify()?;
             if !marks.insert(socket.mark()) || !cookies.insert(socket.cookie()) {
@@ -789,7 +819,7 @@ impl LabRules {
         &mut self,
         next_admissions: std::collections::BTreeMap<u32, super::packet::FlowKey>,
     ) -> io::Result<()> {
-        if self.capture.is_some() || next_admissions.len() > MAX_CARRIERS || !self.current()? {
+        if next_admissions.len() > MAX_CARRIERS || !self.current()? {
             return Err(refused());
         }
         let raw = journal_bytes(&self.journal_path)?.ok_or_else(refused)?;
@@ -801,7 +831,14 @@ impl LabRules {
         next.before = generation;
         next.installed = generation.checked_add(1).ok_or_else(refused)?;
         next.previous_present = true;
-        let operations = replace_messages(&next, self.queue_number, &next_admissions);
+        let mut operations=replace_messages(&next,self.queue_number,&next_admissions);
+        if let Some(tag)=&self.capture {
+            let mut last=operations.pop().ok_or_else(invalid)?;
+            operations.push(socket_capture_rule(&next,tag.socket.key(),tag.socket.mark(),
+                tag.queue_number,operations.len() as u32+2));
+            last[8..12].copy_from_slice(&(operations.len() as u32+2).to_ne_bytes());
+            operations.push(last);
+        }
         self.poisoned = true;
         store(&self.journal_path, &next, Some(&raw))?;
         let net = Netlink::open()?;
@@ -822,6 +859,7 @@ impl LabRules {
             || self.used_marks.len() >= MAX_CARRIER_EPOCH
             || self.used_marks.contains(&socket.mark())
             || self.used_cookies.contains(&socket.cookie())
+            || self.capture.as_ref().is_some_and(|tag|tag.socket.key()==socket.key())
         {
             return Err(refused());
         }
@@ -1395,8 +1433,10 @@ mod tests {
             let socket = LabCarrierSocket::udp(&sender, &host).unwrap();
             let mut queue = Queue::bind(49000, 64).unwrap();
             let mut tagged = Queue::bind(49001, 64).unwrap();
-            let lease =
+            let mut lease =
                 LabRules::install_socket_capture(&queue, &tagged, socket, &host, &path).unwrap();
+            assert!(lease.owns_capture_queue(&tagged).unwrap());
+            assert!(!lease.owns_capture_queue(&queue).unwrap());
             sender.send(b"owned").unwrap();
             {
                 let packet = tagged.receive().unwrap();
@@ -1404,12 +1444,29 @@ mod tests {
                 assert_eq!(proof.cookie(), cookie);
                 assert_eq!(proof.key().source, sender.local_addr().unwrap());
                 assert_eq!(proof.key().destination, receiver.local_addr().unwrap());
+                assert_eq!(lease.packet_evidence(&packet).unwrap(),Some(proof));
+                lease.replace_admissions(Default::default()).unwrap();
+                assert_ne!(lease.packet_evidence(&packet).unwrap(),Some(proof));
+                packet.finish(super::super::PacketAction::Drop).unwrap();
+            }
+            sender.send(b"still-tagged").unwrap();
+            {
+                let packet=tagged.receive().unwrap();
+                assert_eq!(lease.packet_evidence(&packet).unwrap().unwrap().cookie(),cookie);
+                packet.finish(super::super::PacketAction::Drop).unwrap();
+            }
+            lease.capture.as_ref().unwrap().socket.clear_mark().unwrap();
+            sender.send(b"unmarked").unwrap();
+            {
+                let packet=queue.receive().unwrap();
+                assert!(lease.packet_evidence(&packet).is_err());
                 packet.finish(super::super::PacketAction::Drop).unwrap();
             }
             other.send(b"other").unwrap();
             {
                 let packet = queue.receive().unwrap();
                 assert!(lease.captured_socket(&packet).is_err());
+                assert_eq!(lease.packet_evidence(&packet).unwrap(),None);
                 packet.finish(super::super::PacketAction::Drop).unwrap();
             }
             drop(lease);
