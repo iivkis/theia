@@ -275,10 +275,13 @@ fn observe_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn flow_event(peer: std::net::SocketAddr, protocol: u32) -> super::super::linux_events::KernelFlowEvent {
+    fn flow_event(
+        peer: std::net::SocketAddr,
+        protocol: u32,
+    ) -> super::super::linux_events::KernelFlowEvent {
         let mut bytes = [0u8; 88];
         for offset in [0, 8, 16, 24] {
-            bytes[offset..offset+8].copy_from_slice(&1u64.to_ne_bytes());
+            bytes[offset..offset + 8].copy_from_slice(&1u64.to_ne_bytes());
         }
         bytes[32..40].copy_from_slice(&0x1_0000_0001u64.to_ne_bytes());
         bytes[52..56].copy_from_slice(&protocol.to_ne_bytes());
@@ -332,7 +335,8 @@ mod tests {
     #[test]
     fn live_process_and_executable_metadata_are_not_interchangeable() {
         let pid = std::process::id();
-        let pidfd = owned_syscall(unsafe { libc::syscall(libc::SYS_pidfd_open, pid as i32, 0) }).unwrap();
+        let pidfd =
+            owned_syscall(unsafe { libc::syscall(libc::SYS_pidfd_open, pid as i32, 0) }).unwrap();
         assert!(live(&pidfd).is_ok());
         let ticks = proc_start_ticks(pid).unwrap();
         let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u128;
@@ -346,7 +350,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "theia-executable-identity-{}-{}",
             pid,
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         std::fs::write(&path, b"fixture").unwrap();
         let file = File::open(&path).unwrap();
@@ -361,7 +368,9 @@ mod tests {
         // cookie must never succeed regardless of that permission.
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let other = UdpSocket::bind("127.0.0.1:0").unwrap();
-        assert!(observe_socket_owner(pid, socket.as_raw_fd(), socket_cookie(&other).unwrap()).is_err());
+        assert!(
+            observe_socket_owner(pid, socket.as_raw_fd(), socket_cookie(&other).unwrap()).is_err()
+        );
     }
 
     #[test]

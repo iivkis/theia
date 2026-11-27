@@ -242,7 +242,10 @@ async fn get_once(uri: Uri, limit: usize, roots: &rustls::RootCertStore) -> Resu
 }
 
 // Validate the real HTTP/2 response independently of socket and TLS setup.
-async fn read_reply(response: http::Response<h2::RecvStream>, limit: usize) -> Result<Reply, Error> {
+async fn read_reply(
+    response: http::Response<h2::RecvStream>,
+    limit: usize,
+) -> Result<Reply, Error> {
     let status = response.status();
     if status.is_redirection() {
         if response.headers().get_all(header::LOCATION).iter().count() != 1 {
@@ -611,7 +614,10 @@ mod tests {
             let count = chunks.len();
             for (index, chunk) in chunks.into_iter().enumerate() {
                 stream
-                    .send_data(bytes::Bytes::from_static(chunk), index + 1 == count && !trailers)
+                    .send_data(
+                        bytes::Bytes::from_static(chunk),
+                        index + 1 == count && !trailers,
+                    )
                     .unwrap();
             }
             if trailers {
@@ -626,7 +632,9 @@ mod tests {
         let driver = tokio::spawn(connection);
         let (response, _) = sender
             .send_request(
-                http::Request::get("https://github.com/fixture").body(()).unwrap(),
+                http::Request::get("https://github.com/fixture")
+                    .body(())
+                    .unwrap(),
                 true,
             )
             .unwrap();
@@ -656,7 +664,10 @@ mod tests {
         assert!(valid.redirect.is_none());
         let redirect = response_fixture(
             StatusCode::FOUND,
-            &[("location", "/XTLS/Xray-rules-dat/releases/tag/20261126014317")],
+            &[(
+                "location",
+                "/XTLS/Xray-rules-dat/releases/tag/20261126014317",
+            )],
             vec![],
             false,
             0,
@@ -664,12 +675,12 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(redirect.status, StatusCode::FOUND);
-        assert_eq!(redirect.redirect.as_deref(), Some("/XTLS/Xray-rules-dat/releases/tag/20261126014317"));
+        assert_eq!(
+            redirect.redirect.as_deref(),
+            Some("/XTLS/Xray-rules-dat/releases/tag/20261126014317")
+        );
         assert!(redirect.bytes.is_empty());
-        for headers in [
-            vec![],
-            vec![("location", "/a"), ("location", "/b")],
-        ] {
+        for headers in [vec![], vec![("location", "/a"), ("location", "/b")]] {
             assert!(matches!(
                 response_fixture(StatusCode::FOUND, &headers, vec![], false, 0).await,
                 Err(Error::Format)
@@ -680,11 +691,25 @@ mod tests {
             Err(Error::Network)
         ));
         assert!(matches!(
-            response_fixture(StatusCode::OK, &[("content-encoding", "gzip")], vec![], false, 16).await,
+            response_fixture(
+                StatusCode::OK,
+                &[("content-encoding", "gzip")],
+                vec![],
+                false,
+                16
+            )
+            .await,
             Err(Error::Network)
         ));
         assert!(matches!(
-            response_fixture(StatusCode::OK, &[("content-length", "6")], vec![b"abcdef"], false, 5).await,
+            response_fixture(
+                StatusCode::OK,
+                &[("content-length", "6")],
+                vec![b"abcdef"],
+                false,
+                5
+            )
+            .await,
             Err(Error::Limit)
         ));
         assert!(matches!(

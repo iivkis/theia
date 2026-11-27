@@ -773,7 +773,7 @@ mod tests {
     fn valid_callback_records_are_bounded_and_loss_revokes_queued_evidence() {
         let mut flow = [0u8; 88];
         for offset in [0, 8, 16, 24] {
-            flow[offset..offset+8].copy_from_slice(&1u64.to_ne_bytes());
+            flow[offset..offset + 8].copy_from_slice(&1u64.to_ne_bytes());
         }
         flow[32..40].copy_from_slice(&0x1_0000_0001u64.to_ne_bytes());
         flow[48..52].copy_from_slice(&4u32.to_ne_bytes());
@@ -782,13 +782,38 @@ mod tests {
         flow[64..68].copy_from_slice(&[192, 0, 2, 1]);
         flow[80..82].copy_from_slice(&443u16.to_ne_bytes());
         let live = Arc::new(AtomicBool::new(true));
-        let mut buffer = Buffer { queue: VecDeque::new(), failed: false, live: live.clone() };
-        assert_eq!(unsafe { sample(ptr::null_mut(), flow.as_mut_ptr().cast(), flow.len()) }, -libc::EINVAL);
+        let mut buffer = Buffer {
+            queue: VecDeque::new(),
+            failed: false,
+            live: live.clone(),
+        };
+        assert_eq!(
+            unsafe { sample(ptr::null_mut(), flow.as_mut_ptr().cast(), flow.len()) },
+            -libc::EINVAL
+        );
         for _ in 0..MAX_BUFFER {
-            assert_eq!(unsafe { sample((&mut buffer as *mut Buffer).cast(), flow.as_mut_ptr().cast(), flow.len()) }, 0);
+            assert_eq!(
+                unsafe {
+                    sample(
+                        (&mut buffer as *mut Buffer).cast(),
+                        flow.as_mut_ptr().cast(),
+                        flow.len(),
+                    )
+                },
+                0
+            );
         }
         assert_eq!(buffer.queue.len(), MAX_BUFFER);
-        assert_eq!(unsafe { sample((&mut buffer as *mut Buffer).cast(), flow.as_mut_ptr().cast(), flow.len()) }, -libc::ENOBUFS);
+        assert_eq!(
+            unsafe {
+                sample(
+                    (&mut buffer as *mut Buffer).cast(),
+                    flow.as_mut_ptr().cast(),
+                    flow.len(),
+                )
+            },
+            -libc::ENOBUFS
+        );
         assert!(buffer.queue.is_empty());
         assert!(!live.load(Ordering::Acquire));
         assert!(buffer.push(&flow).is_err());
@@ -805,13 +830,37 @@ mod tests {
         packet[64..66].copy_from_slice(&40000u16.to_ne_bytes());
         packet[66..68].copy_from_slice(&443u16.to_ne_bytes());
         let live = Arc::new(AtomicBool::new(true));
-        let mut buffer = PacketBuffer { queue: VecDeque::new(), live: live.clone() };
-        assert_eq!(unsafe { packet_sample(ptr::null_mut(), packet.as_mut_ptr().cast(), packet.len()) }, -libc::EINVAL);
+        let mut buffer = PacketBuffer {
+            queue: VecDeque::new(),
+            live: live.clone(),
+        };
+        assert_eq!(
+            unsafe { packet_sample(ptr::null_mut(), packet.as_mut_ptr().cast(), packet.len()) },
+            -libc::EINVAL
+        );
         for _ in 0..MAX_BUFFER {
-            assert_eq!(unsafe { packet_sample((&mut buffer as *mut PacketBuffer).cast(), packet.as_mut_ptr().cast(), packet.len()) }, 0);
+            assert_eq!(
+                unsafe {
+                    packet_sample(
+                        (&mut buffer as *mut PacketBuffer).cast(),
+                        packet.as_mut_ptr().cast(),
+                        packet.len(),
+                    )
+                },
+                0
+            );
         }
         assert_eq!(buffer.queue.len(), MAX_BUFFER);
-        assert_eq!(unsafe { packet_sample((&mut buffer as *mut PacketBuffer).cast(), packet.as_mut_ptr().cast(), packet.len()) }, -libc::ENOBUFS);
+        assert_eq!(
+            unsafe {
+                packet_sample(
+                    (&mut buffer as *mut PacketBuffer).cast(),
+                    packet.as_mut_ptr().cast(),
+                    packet.len(),
+                )
+            },
+            -libc::ENOBUFS
+        );
         assert!(!live.load(Ordering::Acquire));
         assert!(buffer.queue.is_empty());
         assert!(buffer.push(&packet).is_err());
@@ -820,9 +869,15 @@ mod tests {
     #[test]
     fn libbpf_error_and_cgroup_validation_fail_closed_before_attachment() {
         assert!(result(0).is_ok());
-        assert_eq!(result(-libc::EPERM).unwrap_err().raw_os_error(), Some(libc::EPERM));
+        assert_eq!(
+            result(-libc::EPERM).unwrap_err().raw_os_error(),
+            Some(libc::EPERM)
+        );
         assert_eq!(result(1).unwrap_err().kind(), io::ErrorKind::InvalidData);
-        assert_eq!(result(i32::MIN).unwrap_err().raw_os_error(), Some(libc::EINVAL));
+        assert_eq!(
+            result(i32::MIN).unwrap_err().raw_os_error(),
+            Some(libc::EINVAL)
+        );
         assert!(checked_pointer(ptr::null_mut()).is_err());
         // The kernel root cgroup is explicitly forbidden; /dev/null is not
         // a cgroup at all. Neither check attaches anything to the host.
