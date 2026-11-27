@@ -24,6 +24,8 @@
 #define ADMIT_TTL (10ull * 10000000ull)
 static const GUID Udp4 = {0x172b0ec2,0xc223,0x4ab6,{0x8c,0x52,0xa9,0x5e,0x08,0x2d,0x11,0x72}};
 static const GUID Udp6 = {0x172b0ec3,0xc223,0x4ab6,{0x8c,0x52,0xa9,0x5e,0x08,0x2d,0x11,0x72}};
+static const GUID Close4 = {0x172b0ec6,0xc223,0x4ab6,{0x8c,0x52,0xa9,0x5e,0x08,0x2d,0x11,0x72}};
+static const GUID Close6 = {0x172b0ec7,0xc223,0x4ab6,{0x8c,0x52,0xa9,0x5e,0x08,0x2d,0x11,0x72}};
 typedef struct _ADMISSION {
     UINT64 endpoint, expires;
     UCHAR family, address[16];
@@ -46,14 +48,14 @@ typedef struct _PACKET {
 static KSPIN_LOCK Lock;
 static EX_RUNDOWN_REF Classification;
 static BOOLEAN Active, ApplicationUdp;
-static ULONG Scope, Queued;
+static ULONG Scope, Queued, Reserved;
 static UINT64 NextGeneration;
 static FLOW Flows[FLOW_LIMIT];
 static ADMISSION Pending[PENDING_LIMIT];
 static LIST_ENTRY Queue;
-static UINT32 Id4, Id6;
+static UINT32 Id4, Id6, CloseId4, CloseId6;
 static THEIA_REPLY_ENGINE *Reply;
-static volatile LONG Installed4, Installed6;
+static volatile LONG Installed4, Installed6, Closure4, Closure6;
 
 static BOOLEAN same(const UCHAR *a, const UCHAR *b, SIZE_T n) {
     return RtlCompareMemory(a,b,n)==n;
@@ -79,9 +81,14 @@ static FLOW *find(UINT64 generation) {
     for (ULONG i=0;i<FLOW_LIMIT;++i) if (Flows[i].tuple.generation==generation) return &Flows[i];
     return NULL;
 }
+static BOOLEAN filters_ready(VOID) {
+    return InterlockedCompareExchange(&Installed4,0,0)==1
+        && InterlockedCompareExchange(&Installed6,0,0)==1
+        && InterlockedCompareExchange(&Closure4,0,0)==1
+        && InterlockedCompareExchange(&Closure6,0,0)==1;
+}
 static BOOLEAN ready_locked(VOID) {
-    return Active && InterlockedCompareExchange(&Installed4,0,0)==1
-        && InterlockedCompareExchange(&Installed6,0,0)==1;
+    return Active && filters_ready();
 }
 static BOOLEAN same_tuple(const THEIA_REPLY_FLOW *a,const THEIA_REPLY_FLOW *b) {
     return a->family==b->family && a->compartment==b->compartment
@@ -103,8 +110,7 @@ BOOLEAN TheiaUdpStart(ULONG scope,BOOLEAN applicationUdp) {
     KIRQL irql;
     BOOLEAN ok;
     KeAcquireSpinLock(&Lock,&irql);
-    ok=!Active&&scope>1&&InterlockedCompareExchange(&Installed4,0,0)==1
-        && InterlockedCompareExchange(&Installed6,0,0)==1;
+    ok=!Active&&scope>1&&filters_ready();
     if (ok) { Scope=scope; ApplicationUdp=applicationUdp; Active=TRUE; }
     KeReleaseSpinLock(&Lock,irql);
     return ok;
@@ -163,6 +169,39 @@ static VOID NTAPI flow_delete(UINT16 layer,UINT32 callout,UINT64 generation) {
     FLOW *f=find(generation);
     if (f&&f->layer==layer&&f->callout==callout) RtlZeroMemory(f,sizeof(*f));
     KeReleaseSpinLock(&Lock,irql);
+}
+/* Socket closure revokes even a permit that has not reached the first
+ * DATAGRAM_DATA packet. Flow deletion separately revokes an attached flow. */
+static VOID NTAPI classify_close(const FWPS_INCOMING_VALUES0 *v,const FWPS_INCOMING_METADATA_VALUES0 *m,
+    VOID *data,const VOID *context,const FWPS_FILTER1 *filter,UINT64 flowContext,FWPS_CLASSIFY_OUT0 *out) {
+    ULONG scope;
+    UCHAR protocol;
+    KIRQL irql;
+    UNREFERENCED_PARAMETER(data);
+    UNREFERENCED_PARAMETER(context);
+    UNREFERENCED_PARAMETER(filter);
+    UNREFERENCED_PARAMETER(flowContext);
+    if (out->rights&FWPS_RIGHT_ACTION_WRITE) out->actionType=FWP_ACTION_CONTINUE;
+    if (!ExAcquireRundownProtection(&Classification)) return;
+    if (v->layerId==FWPS_LAYER_ALE_ENDPOINT_CLOSURE_V4) {
+        scope=v->incomingValue[FWPS_FIELD_ALE_ENDPOINT_CLOSURE_V4_COMPARTMENT_ID].value.uint32;
+        protocol=v->incomingValue[FWPS_FIELD_ALE_ENDPOINT_CLOSURE_V4_IP_PROTOCOL].value.uint8;
+    } else if (v->layerId==FWPS_LAYER_ALE_ENDPOINT_CLOSURE_V6) {
+        scope=v->incomingValue[FWPS_FIELD_ALE_ENDPOINT_CLOSURE_V6_COMPARTMENT_ID].value.uint32;
+        protocol=v->incomingValue[FWPS_FIELD_ALE_ENDPOINT_CLOSURE_V6_IP_PROTOCOL].value.uint8;
+    } else goto done;
+    if (protocol!=IPPROTO_UDP || !(m->currentMetadataValues&FWPS_METADATA_FIELD_TRANSPORT_ENDPOINT_HANDLE)
+        || !m->transportEndpointHandle) goto done;
+    KeAcquireSpinLock(&Lock,&irql);
+    if (scope==Scope) {
+        for (ULONG i=0;i<PENDING_LIMIT;++i)
+            if (Pending[i].endpoint==m->transportEndpointHandle) RtlZeroMemory(&Pending[i],sizeof(Pending[i]));
+        for (ULONG i=0;i<FLOW_LIMIT;++i)
+            if (Flows[i].tuple.endpoint==m->transportEndpointHandle) Flows[i].closed=TRUE;
+    }
+    KeReleaseSpinLock(&Lock,irql);
+done:
+    ExReleaseRundownProtection(&Classification);
 }
 static BOOLEAN tuple_from(const FWPS_INCOMING_VALUES0 *v,const FWPS_INCOMING_METADATA_VALUES0 *m,
     THEIA_REPLY_FLOW *t,UINT32 *direction,UINT32 *flags) {
@@ -301,10 +340,16 @@ static VOID NTAPI classify_udp(const FWPS_INCOMING_VALUES0 *v,const FWPS_INCOMIN
         goto done;
     }
     if (direction!=FWP_DIRECTION_OUTBOUND) goto done;
-    packet=copy_udp((NET_BUFFER_LIST *)data,&tuple,generation);
-    if (!packet) goto done;
+    // Reserve capacity before allocating nonpaged payload storage.
     KeAcquireSpinLock(&Lock,&irql);
-    if (ready_locked()&&exact_live(find(generation),&tuple,m->flowHandle)&&Queued<PACKET_LIMIT) {
+    valid=ready_locked()&&exact_live(find(generation),&tuple,m->flowHandle)&&Queued+Reserved<PACKET_LIMIT;
+    if (valid) ++Reserved;
+    KeReleaseSpinLock(&Lock,irql);
+    if (!valid) goto done;
+    packet=copy_udp((NET_BUFFER_LIST *)data,&tuple,generation);
+    KeAcquireSpinLock(&Lock,&irql);
+    --Reserved;
+    if (packet&&ready_locked()&&exact_live(find(generation),&tuple,m->flowHandle)&&Queued<PACKET_LIMIT) {
         InsertTailList(&Queue,&packet->link);++Queued;packet=NULL;
         out->flags|=FWPS_CLASSIFY_OUT_FLAG_ABSORB;
     }
@@ -375,6 +420,8 @@ NTSTATUS TheiaUdpClose(UINT64 generation) {
 // old persistent filters cannot silently authorize a new session.
 static const GUID Filter4={0x172b0ec4,0xc223,0x4ab6,{0x8c,0x52,0xa9,0x5e,0x08,0x2d,0x11,0x72}};
 static const GUID Filter6={0x172b0ec5,0xc223,0x4ab6,{0x8c,0x52,0xa9,0x5e,0x08,0x2d,0x11,0x72}};
+static const GUID CloseFilter4={0x172b0ec8,0xc223,0x4ab6,{0x8c,0x52,0xa9,0x5e,0x08,0x2d,0x11,0x72}};
+static const GUID CloseFilter6={0x172b0ec9,0xc223,0x4ab6,{0x8c,0x52,0xa9,0x5e,0x08,0x2d,0x11,0x72}};
 static NTSTATUS notify_udp(FWPS_CALLOUT_NOTIFY_TYPE type,const GUID *key,const GUID *expected,volatile LONG *count) {
     if (type==FWPS_CALLOUT_NOTIFY_ADD_FILTER) {
         if (!key||!same((const UCHAR *)key,(const UCHAR *)expected,sizeof(GUID))
@@ -393,15 +440,26 @@ static NTSTATUS NTAPI notify6(FWPS_CALLOUT_NOTIFY_TYPE type,const GUID *key,FWPS
     UNREFERENCED_PARAMETER(filter);
     return notify_udp(type,key,&Filter6,&Installed6);
 }
-static NTSTATUS register_one(PDEVICE_OBJECT dev,const GUID *key,UINT32 *id,FWPS_CALLOUT_NOTIFY_FN1 notify) {
+static NTSTATUS NTAPI notify_close4(FWPS_CALLOUT_NOTIFY_TYPE type,const GUID *key,FWPS_FILTER1 *filter) {
+    UNREFERENCED_PARAMETER(filter);
+    return notify_udp(type,key,&CloseFilter4,&Closure4);
+}
+static NTSTATUS NTAPI notify_close6(FWPS_CALLOUT_NOTIFY_TYPE type,const GUID *key,FWPS_FILTER1 *filter) {
+    UNREFERENCED_PARAMETER(filter);
+    return notify_udp(type,key,&CloseFilter6,&Closure6);
+}
+static NTSTATUS register_one(PDEVICE_OBJECT dev,const GUID *key,UINT32 *id,FWPS_CALLOUT_NOTIFY_FN1 notify,BOOLEAN closure) {
     FWPS_CALLOUT1 c;
     RtlZeroMemory(&c,sizeof(c));
-    c.calloutKey=*key;c.classifyFn=classify_udp;c.notifyFn=notify;c.flowDeleteFn=flow_delete;
+    c.calloutKey=*key;c.classifyFn=closure?classify_close:classify_udp;c.notifyFn=notify;
+    if (!closure) c.flowDeleteFn=flow_delete;
     return FwpsCalloutRegister1(dev,&c,id);
 }
 NTSTATUS TheiaUdpRegister(PDEVICE_OBJECT dev) {
-    NTSTATUS status=register_one(dev,&Udp4,&Id4,notify4);
-    if (NT_SUCCESS(status)) status=register_one(dev,&Udp6,&Id6,notify6);
+    NTSTATUS status=register_one(dev,&Udp4,&Id4,notify4,FALSE);
+    if (NT_SUCCESS(status)) status=register_one(dev,&Udp6,&Id6,notify6,FALSE);
+    if (NT_SUCCESS(status)) status=register_one(dev,&Close4,&CloseId4,notify_close4,TRUE);
+    if (NT_SUCCESS(status)) status=register_one(dev,&Close6,&CloseId6,notify_close6,TRUE);
     return status;
 }
 VOID TheiaUdpUnregister(VOID) {
@@ -416,6 +474,10 @@ VOID TheiaUdpUnregister(VOID) {
     }
     // A pending deletion is completed by WFP before unregister can succeed.
     LARGE_INTEGER delay;delay.QuadPart=-100000;
+    if (CloseId6) while (FwpsCalloutUnregisterById0(CloseId6)==STATUS_DEVICE_BUSY)
+        KeDelayExecutionThread(KernelMode,FALSE,&delay);
+    if (CloseId4) while (FwpsCalloutUnregisterById0(CloseId4)==STATUS_DEVICE_BUSY)
+        KeDelayExecutionThread(KernelMode,FALSE,&delay);
     if (Id6) while (FwpsCalloutUnregisterById0(Id6)==STATUS_DEVICE_BUSY)
         KeDelayExecutionThread(KernelMode,FALSE,&delay);
     if (Id4) while (FwpsCalloutUnregisterById0(Id4)==STATUS_DEVICE_BUSY)

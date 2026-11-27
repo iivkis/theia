@@ -204,7 +204,7 @@ static NTSTATUS control(PDEVICE_OBJECT dev, PIRP irp) {
         status = (code == IOCTL_STOP || TheiaUdpReady()) ? STATUS_SUCCESS : STATUS_DEVICE_NOT_READY;
     } else if (code == IOCTL_ENDPOINT && len == ENDPOINT_SIZE && State.active
         && State.file == stack->FileObject && State.process == PsGetCurrentProcess()
-        && read64(bytes) != 0 && (bytes[9] == IPPROTO_TCP || bytes[9] == IPPROTO_UDP) && read16(bytes + 10) != 0
+        && TheiaUdpReady() && read64(bytes) != 0 && (bytes[9] == IPPROTO_TCP || bytes[9] == IPPROTO_UDP) && read16(bytes + 10) != 0
         && valid_ip(bytes[8], bytes + 12, FALSE)) {
         UINT64 now = KeQueryInterruptTime();
         LONG slot = -1;
