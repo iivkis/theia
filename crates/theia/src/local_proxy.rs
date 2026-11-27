@@ -2596,46 +2596,88 @@ impl NativeIngress {
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     pub async fn run_windows_udp_relay_lab(
         path:&Path, directory:std::path::PathBuf, dll:[u8;32], sys:[u8;32], target:SocketAddr,
+        flows:usize,
     )->Result<(),ClientError> {
-        use crate::routing::{carrier_socket,windivert::CarrierRegistry,PacketAction};
+        use crate::routing::{carrier_socket,windivert::{CarrierRegistry,RelayLab}};
+        if !(1..=8).contains(&flows) { return Err(ClientError::Configuration); }
         let registry=Arc::new(CarrierRegistry::default());
         let registrar:Arc<dyn carrier_socket::Registrar>=registry.clone();
-        let ingress=Self::prepare_with_registrar(path,Some(registrar.clone())).await?;
+        let ingress=Arc::new(Self::prepare_with_registrar(path,Some(registrar.clone())).await?);
         struct Stop<'a>(&'a NativeIngress,&'a CarrierRegistry);
         impl Drop for Stop<'_> { fn drop(&mut self) { self.0.shutdown();self.1.retire(); } }
         let _stop=Stop(&ingress,&registry);
-        let lab=crate::routing::windivert::begin_udp_relay_lab(directory,dll,sys,target).await
-            .map_err(|_|ClientError::Io)?;
-        // The worker has captured the actual datagram and installed its
-        // narrow guard. No other application's traffic is admitted here.
+        let mut preparing=JoinSet::new();
+        for _ in 0..flows {
+            let directory=directory.clone();
+            preparing.spawn(async move {
+                crate::routing::windivert::begin_udp_relay_lab(directory,dll,sys,target).await
+                    .map_err(|_|ClientError::Io)
+            });
+        }
+        let mut labs:Vec<RelayLab>=Vec::with_capacity(flows);
+        let mut keys=std::collections::HashSet::with_capacity(flows);
+        while let Some(joined)=preparing.join_next().await {
+            let lab=joined.map_err(|_|ClientError::Io)??;
+            if !keys.insert(lab.key) { return Err(ClientError::Open(ErrorCode::PolicyDenied)); }
+            labs.push(lab);
+        }
+        // Every own socket must be captured before the same policy
+        // generation can be published as isolated lab ready.
         ingress.runtime.capture_state.ready()?;
+        let mut relays=JoinSet::new();
+        for lab in labs {
+            let ingress=ingress.clone();
+            let registrar=registrar.clone();
+            relays.spawn(async move {
+                crate::routing::carrier_socket::scope(Some(registrar),ingress.relay_windows_udp_lab(lab)).await
+            });
+        }
+        while let Some(result)=relays.join_next().await {
+            if let Err(error)=result.map_err(|_|ClientError::Io).and_then(|result|result) {
+                ingress.shutdown();
+                relays.shutdown().await;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    async fn relay_windows_udp_lab(&self,lab:crate::routing::windivert::RelayLab)->Result<(),ClientError> {
+        use crate::routing::{carrier_socket,PacketAction};
         let key=lab.key;
-        let (carrier,flow,address)=carrier_socket::scope(Some(registrar.clone()),ingress.redirect(key)).await?;
-        let tunnel=carrier_socket::scope(Some(registrar),carrier.open_udp(address,key.destination.port())).await?;
+        let (carrier,flow,address)=self.redirect(key).await?;
+        let tunnel=carrier_socket::scope(self.registrar()?,carrier.open_udp(address,key.destination.port())).await?;
         let (tx,up)=tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
         let (down,mut rx)=tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
-        tx.send(lab.payload.clone()).await.map_err(|_|ClientError::Io)?;
+        let mut expected=lab.payloads.clone();
+        let count=expected.len();
+        if count==0 || count>crate::udp_relay::QUEUE { return Err(ClientError::Protocol); }
+        for payload in &expected { tx.send(payload.clone()).await.map_err(|_|ClientError::Io)?; }
         let relay=tunnel.relay_guarded(up,down,Some(&flow));
         tokio::pin!(relay);
-        let response=tokio::select! {
-            biased;
-            ()=ingress.stopped()=>return Err(ClientError::Open(ErrorCode::PolicyDenied)),
-            result=&mut relay=>{result?;return Err(ClientError::Io)},
-            data=timeout(Duration::from_secs(15),rx.recv())=>data.map_err(|_|ClientError::Timeout)?.ok_or(ClientError::Io)?,
-        };
-        ingress.ensure_accepting()?;
+        let deadline=tokio::time::Instant::now()+Duration::from_secs(15);
+        let mut responses=Vec::with_capacity(count);
+        while responses.len()<count {
+            let response=tokio::select! {
+                biased;
+                ()=self.stopped()=>return Err(ClientError::Open(ErrorCode::PolicyDenied)),
+                result=&mut relay=>{result?;return Err(ClientError::Io)},
+                data=tokio::time::timeout_at(deadline,rx.recv())=>data.map_err(|_|ClientError::Timeout)?.ok_or(ClientError::Io)?,
+            };
+            let index=expected.iter().position(|v|*v==response).ok_or(ClientError::Protocol)?;
+            expected.swap_remove(index);
+            responses.push(response);
+        }
+        self.ensure_accepting()?;
         if !flow.committed(PacketAction::Redirect) { return Err(ClientError::Open(ErrorCode::PolicyDenied)); }
-        // Retain the flow lease and live carrier while the exact owned
-        // socket receives the reverse packet. No retry on unknown outcome.
         tokio::select! {
             biased;
-            ()=ingress.stopped()=>return Err(ClientError::Open(ErrorCode::PolicyDenied)),
+            ()=self.stopped()=>return Err(ClientError::Open(ErrorCode::PolicyDenied)),
             result=&mut relay=>{result?;return Err(ClientError::Io)},
-            result=lab.finish(response)=>result.map_err(|_|ClientError::Io)?,
+            result=lab.finish(responses)=>result.map_err(|_|ClientError::Io)?,
         }
         drop(tx);
-        // Explicit stop: no further application datagram is accepted.
-        // A terminal relay error still fails the acceptance scenario.
         timeout(Duration::from_secs(3),&mut relay).await.map_err(|_|ClientError::Timeout)??;
         Ok(())
     }

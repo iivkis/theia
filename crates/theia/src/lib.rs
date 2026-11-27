@@ -176,7 +176,7 @@ pub enum Command {
     /// Internal bounded handle-lifetime fixture, no network operations.
     WinDivertGuardHolder,
     ClientWinDivertUdpRelayLab {
-        config:String, directory:String, dll_sha256:[u8;32], sys_sha256:[u8;32], target:std::net::SocketAddr,
+        config:String, directory:String, dll_sha256:[u8;32], sys_sha256:[u8;32], target:std::net::SocketAddr, flows:usize,
     },
     ClientWinDivertLoopback { directory: String, dll_sha256: [u8;32], sys_sha256: [u8;32] },
     ClientWinDivertCheck {
@@ -394,12 +394,14 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
         }
         ["client", "status"] => Ok(Command::ClientStatus),
         ["client", "windivert", "--guard-holder-lab"] => Ok(Command::WinDivertGuardHolder),
-        ["client", "windivert", "--udp-relay-lab", "--config", config, "--directory", directory, "--dll-sha256", dll, "--sys-sha256", sys, "--target", target, "--confirm"] => Ok(Command::ClientWinDivertUdpRelayLab {
+        ["client", "windivert", "--udp-relay-lab", "--config", config, "--directory", directory, "--dll-sha256", dll, "--sys-sha256", sys, "--target", target, "--confirm"]
+        | ["client", "windivert", "--udp-relay-lab", "--config", config, "--directory", directory, "--dll-sha256", dll, "--sys-sha256", sys, "--target", target, "--flows", _, "--confirm"] => Ok(Command::ClientWinDivertUdpRelayLab {
             config:config_path(config)?,
             directory:config_path(directory)?,
             dll_sha256:parse_restart_digest(dll).ok_or(CliError::InvalidArguments)?,
             sys_sha256:parse_restart_digest(sys).ok_or(CliError::InvalidArguments)?,
             target:target.parse().map_err(|_|CliError::InvalidArguments)?,
+            flows:if args.len()==16 { args[14].parse::<usize>().ok().filter(|n|(1..=8).contains(n)).ok_or(CliError::InvalidArguments)? } else { 1 },
         }),
         ["client", "windivert", "--loopback-lab", "--directory", directory, "--dll-sha256", dll, "--sys-sha256", sys, "--confirm"] => Ok(Command::ClientWinDivertLoopback {
             directory: config_path(directory)?,
@@ -475,7 +477,7 @@ pub fn help(topic: Option<&str>) -> Result<&'static str, CliError> {
             Ok("Usage: theia server run --config <path> | theia server status | theia server reload --check | theia server restart --check | theia server tls fingerprint --config <path> | theia server tls rollback --check | theia server tls rollback --apply --expected-revision N --confirm | theia server restart --apply --expected-revision N --sha256 HEX --tls-sha256 PEMHEX --confirm | theia server quota --check | theia server quota --apply --expected-revision N --sha256 HEX --confirm | theia server reload --apply --expected-revision N --sha256 HEX --confirm | theia server auth rollback --check | theia server auth rollback --apply --expected-revision N --confirm\nQuota CAS resizes only two session/connection caps, retaining all held permits and denying new admissions while over the decreased cap. All other config, TLS identity bytes, grants, user roster and listener addresses must remain unchanged. Requires private Linux/Windows IPC and exact saved SHA256 TOML; lost ACK is indeterminate, query status. Restart-only fresh-port/TLS cutover uses a separate confirmed dual-digest command; the old TOML-only restart syntax is rejected.")
         }
         Some("client") => {
-            Ok("Usage: theia client run --config <path> [--system-proxy --confirm]\ntheia client status\ntheia client reload --check --expected-revision N --sha256 HEX\ntheia client reload --apply --expected-revision N --sha256 HEX --confirm\ntheia client windivert --check --directory DIR --dll-sha256 HEX --sys-sha256 HEX [--install-lab --confirm]\ntheia client windivert --loopback-lab --directory DIR --dll-sha256 HEX --sys-sha256 HEX --confirm\ntheia client windivert --udp-relay-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --target IP:PORT --confirm\ntheia client proxy --status\ntheia client proxy --recover --confirm\nWindows only: explicitly opt in to user WinINet HTTP(S) proxy after binding local HTTP/SOCKS5 listeners. system_proxy=manual in TOML required. Snapshot+durable journal, conditional restore on Ctrl+C/normal stop, explicit CAS recovery after crash. Never overwrites foreign proxy changes. CLI flags and TUI import alone never apply OS changes.")
+            Ok("Usage: theia client run --config <path> [--system-proxy --confirm]\ntheia client status\ntheia client reload --check --expected-revision N --sha256 HEX\ntheia client reload --apply --expected-revision N --sha256 HEX --confirm\ntheia client windivert --check --directory DIR --dll-sha256 HEX --sys-sha256 HEX [--install-lab --confirm]\ntheia client windivert --loopback-lab --directory DIR --dll-sha256 HEX --sys-sha256 HEX --confirm\ntheia client windivert --udp-relay-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --target IP:PORT [--flows 1..8] --confirm\ntheia client proxy --status\ntheia client proxy --recover --confirm\nWindows only: explicitly opt in to user WinINet HTTP(S) proxy after binding local HTTP/SOCKS5 listeners. system_proxy=manual in TOML required. Snapshot+durable journal, conditional restore on Ctrl+C/normal stop, explicit CAS recovery after crash. Never overwrites foreign proxy changes. CLI flags and TUI import alone never apply OS changes.")
         }
         Some("trust") => Ok(descriptor_cli::HELP),
         Some("reference") => Ok(reference_cli::HELP),

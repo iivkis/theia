@@ -53,14 +53,14 @@ still owns the guard and no reboot guarantee is provided.
 On an authorized disposable Windows machine with an independently controlled
 UDP echo origin and a configured authenticated Theia server:
 
-    theia client windivert --udp-relay-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --target IP:PORT --confirm
+    theia client windivert --udp-relay-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --target IP:PORT --flows 4 --confirm
 
 Use a concrete non-loopback echo target which the configured policy routes
 via authenticated VPS Redirect (or its permitted pre-payload Modify fallback).
 The configured carrier endpoint must be a literal socket address; native
 carrier scope does not resolve an untrusted local hostname. The registry is
 attached before carrier preparation and retained by H2/H3 socket leases.
-The original application socket is created with SO_EXCLUSIVEADDRUSE and bound
+Up to eight simultaneous flows share one runtime and policy generation; each sends three distinct datagrams (32, 33 and 1200 bytes), including to the same target. Responses may be reordered but never duplicated or mixed across flows. Each original application socket is created with SO_EXCLUSIVEADDRUSE and bound
 to the observed source. Only its exact tuple is intercepted and guarded.
 The captured nonce is relayed using NativeIngress, FlowLease and H2/H3 XHTTP;
 only its exact authenticated echoed response is injected inbound while
