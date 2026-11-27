@@ -405,7 +405,7 @@ pub(crate) async fn dial_direct(
             if addr.ip().is_unspecified() || addr.ip().is_multicast() {
                 continue;
             }
-            if let Ok(socket) = TcpStream::connect(addr).await {
+            if let Ok(socket) = super::carrier_socket::connect_plain_tcp(addr).await {
                 return Ok(socket);
             }
         }

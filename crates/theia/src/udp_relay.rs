@@ -61,17 +61,7 @@ pub(crate) async fn connect(address: SocketAddr) -> io::Result<UdpSocket> {
     {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
     }
-    let bind = if address.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
-    let socket = UdpSocket::bind(bind).await?;
-    socket.connect(address).await?;
-    if socket.peer_addr()? != address {
-        return Err(io::Error::other("UDP peer mismatch"));
-    }
-    Ok(socket)
+    crate::routing::carrier_socket::connect_plain_udp(address).await
 }
 pub(crate) async fn send_datagram(socket: &UdpSocket, data: &[u8]) -> io::Result<()> {
     if data.len() > protocol::MAX_DATAGRAM || socket.send(data).await? != data.len() {

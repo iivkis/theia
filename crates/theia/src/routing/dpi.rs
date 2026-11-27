@@ -230,16 +230,11 @@ async fn scoped_udp_checked(
         if error.kind() == std::io::ErrorKind::PermissionDenied { Err(stale_policy()) }
         else { Ok(None) }
     }
-    let socket = match super::carrier_socket::bind_udp(scope.bind_address()).await {
-        Ok(socket) => socket,
-        Err(error) => { network_error(error)?; return Ok(None); }
+    let (socket, admission) = match super::carrier_socket::dial_udp(scope.bind_address(), address, true, |local| scope.matches_local(local)).await {
+        Ok(value) => value,
+        Err(error) => { network_error(error.into_io())?; return Ok(None); }
     };
-    let admission = super::carrier_socket::udp(&socket, address).map_err(|_| stale_policy())?;
-    if let Err(error) = socket.connect(address).await { network_error(error)?; return Ok(None); }
-    if socket.peer_addr().ok() != Some(address)
-        || !socket.local_addr().is_ok_and(|local| scope.matches_local(local)) {
-        return Err(stale_policy());
-    }
+    if !socket.local_addr().is_ok_and(|local| scope.matches_local(local)) { return Err(stale_policy()); }
     Ok(Some((socket, admission)))
 }
 

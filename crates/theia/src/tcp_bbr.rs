@@ -121,11 +121,7 @@ mod platform {
 pub(crate) use platform::{select, verify};
 
 fn new_socket(address: SocketAddr) -> Result<TcpSocket, Error> {
-    let socket = if address.is_ipv4() {
-        TcpSocket::new_v4()?
-    } else {
-        TcpSocket::new_v6()?
-    };
+    let socket = crate::routing::carrier_socket::new_tcp(address)?;
     select(&socket)?;
     Ok(socket)
 }
@@ -157,13 +153,11 @@ pub(crate) async fn connect_carrier(
     }
     for address in tokio::net::lookup_host(endpoint).await? {
         let socket = new_socket(address)?;
-        if carrier_socket::active() {
-            carrier_socket::prepare_tcp(&socket).map_err(|_|Error::Unavailable)?;
-            let source = crate::local_proxy::route_source(address).ok_or(Error::Unavailable)?;
-            socket.bind(source)?;
-        }
-        let lease = carrier_socket::tcp(&socket, address).map_err(|_| Error::Unavailable)?;
+        let lease = carrier_socket::admit_tcp_dial(&socket, address).map_err(|error| {
+            if error.kind() == io::ErrorKind::PermissionDenied { Error::Unavailable } else { Error::Network }
+        })?;
         if let Ok(stream) = socket.connect(address).await {
+            if stream.peer_addr().ok() != Some(address) { return Err(Error::Unavailable); }
             let controller = verify(&stream)?;
             return Ok((stream, controller, lease));
         }
