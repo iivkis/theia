@@ -165,7 +165,7 @@ mod tests {
         assert!(controls(&[valid.as_slice(), records.as_slice()].concat(), true).is_err());
         assert!(controls(&[valid.as_slice(), &[1]].concat(), true).is_err());
         let header = aligned(mem::size_of::<WSACMSGHDR>()).unwrap();
-        let truncated = [context.as_slice(), &records[..header + 4]].concat();
+        let truncated = [context.as_slice(), &records[..header + 2]].concat();
         assert!(controls(&truncated, true).is_err());
     }
 }
