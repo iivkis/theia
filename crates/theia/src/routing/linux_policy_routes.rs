@@ -149,7 +149,7 @@ fn relevant(object:&Object)->io::Result<bool> {
         if number(a.get(&6))?==Some(PRIORITY) {return Ok(true);}
         if let Some(mark)=number(a.get(&10))? {
             let mask=number(a.get(&16))?.unwrap_or(u32::MAX);
-            if mark&mask==REDIRECT_MARK&mask {return Ok(true);}
+            if mark&mask==REDIRECT_MARK&mask || mark&mask==super::PASS_MARK&mask {return Ok(true);}
         }
     }
     Ok(false)
@@ -238,7 +238,10 @@ impl PolicyRoutes {
         Ok(result)
     }
     pub(crate) fn current(&self)->io::Result<bool> {
-        Ok(self.intent.confirmed.len()==4 && loopback_index()?==self.intent.loopback &&
+        let meta=std::fs::metadata("/proc/thread-self/ns/net")?;
+        use std::os::unix::fs::MetadataExt;
+        Ok((meta.dev(),meta.ino())==(self.intent.scope.dev,self.intent.scope.ino) &&
+            self.intent.confirmed.len()==4 && loopback_index()?==self.intent.loopback &&
             read_intent(&self.path,&self.intent.scope)?.is_some_and(|(i,_)|i==self.intent) &&
             same(&snapshot()?,&self.intent.confirmed))
     }

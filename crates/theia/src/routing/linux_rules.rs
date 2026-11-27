@@ -35,6 +35,8 @@ const MAX_CARRIERS: usize = 16;
 const MAX_RULE_OPERATIONS: usize = 64;
 /// Reserved skb routing mark. It is never a carrier socket mark.
 pub const REDIRECT_MARK: u32 = 0x5449;
+pub(crate) const PASS_MARK:u32=0x544a;
+pub(super) fn reserved_mark(mark:u32)->bool {matches!(mark,REDIRECT_MARK|PASS_MARK)}
 const MAX_CARRIER_EPOCH: usize = 65_536;
 const NESTED: u16 = 0x8000;
 const FAMILY_INET: u8 = 1;
@@ -109,6 +111,8 @@ impl Scope {
 struct RedirectScope {
     port: u16,
     loopback: u32,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    policy_queue:Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -599,8 +603,19 @@ fn redirect_egress_rules(messages:&mut Vec<Vec<u8>>,journal:&Journal,scope:Redir
     for protocol in [6u8,17] {
         let mut route=Vec::new();
         meta_cmp(&mut route,16,&[protocol]);
-        set_skb_mark(&mut route,REDIRECT_MARK);
-        verdict_expression(&mut route,1);
+        if let Some(queue)=scope.policy_queue {
+            // Clear marks before queuing: only the owned userspace
+            // verdict can stamp an authorized Pass/Redirect packet.
+            set_skb_mark(&mut route,0);
+            let mut data=Vec::new();
+            attr(&mut data,1,&queue.to_be_bytes());
+            attr(&mut data,2,&1u16.to_be_bytes());
+            attr(&mut data,3,&0u16.to_be_bytes()); // never bypass
+            expression(&mut route,"queue",&data);
+        } else {
+            set_skb_mark(&mut route,REDIRECT_MARK);
+            verdict_expression(&mut route,1);
+        }
         push_rule(messages,journal,"route_out",&route);
     }
     let mut local=Vec::new();
@@ -615,6 +630,13 @@ fn redirect_egress_rules(messages:&mut Vec<Vec<u8>>,journal:&Journal,scope:Redir
     meta_cmp(&mut rerouted,3,&REDIRECT_MARK.to_ne_bytes());
     verdict_expression(&mut rerouted,1);
     push_rule(messages,journal,"output",&rerouted);
+    if scope.policy_queue.is_some() {
+        let mut passed=Vec::new();
+        meta_cmp(&mut passed,3,&PASS_MARK.to_ne_bytes());
+        verdict_expression(&mut passed,1);
+        push_rule(messages,journal,"output",&passed);
+        push_rule(messages,journal,"egress",&passed);
+    }
 }
 fn redirect_install(journal:&Journal,scope:RedirectScope,
     admissions:&std::collections::BTreeMap<u32,super::packet::FlowKey>)->Vec<Vec<u8>> {
@@ -932,10 +954,29 @@ impl LabRules {
     /// The caller provisions and owns policy routes for REDIRECT_MARK;
     /// this transaction changes only its journaled inet table.
     pub fn install_redirect(host_namespace:&File,path:&Path,port:u16)->io::Result<Self> {
-        let scope=RedirectScope{port,loopback:loopback_index()?};
+        let scope=RedirectScope{port,loopback:loopback_index()?,policy_queue:None};
         Scope::current(host_namespace)?;
         if port==0 || !redirect_routes_ready(scope)? {return Err(refused());}
         Self::install_inner(None,host_namespace,path,Vec::new(),None,Some(scope))
+    }
+
+    /// One policy queue decides the physical egress or transparent
+    /// termination before the first packet leaves the namespace.
+    pub(crate) fn install_unified(queue:&Queue,host:&File,path:&Path,port:u16)->io::Result<Self> {
+        let scope=RedirectScope{port,loopback:loopback_index()?,policy_queue:Some(queue.number()?)};
+        Scope::current(host)?;
+        if port==0 || !redirect_routes_ready(scope)? {return Err(refused());}
+        Self::install_inner(Some(queue),host,path,Vec::new(),None,Some(scope))
+    }
+
+    pub(crate) fn owns_policy_queue(&self,queue:&Queue)->io::Result<bool> {
+        Ok(self.journal.redirect.and_then(|scope|scope.policy_queue)==Some(queue.number()?) &&
+            queue.identity()==self.queue_identity && self.current()?)
+    }
+
+    pub(crate) fn owns_policy_packet(&self,packet:&super::nfqueue::Packet<'_>)->io::Result<bool> {
+        Ok(self.journal.redirect.and_then(|scope|scope.policy_queue).is_some() &&
+            packet.local_output() && packet.queue_identity()==self.queue_identity && self.current()?)
     }
 
     /// Check every retained descriptor against the published admissions,
@@ -1023,8 +1064,12 @@ impl LabRules {
         if net.table(&journal)? || net.generation()? != before {
             return Err(refused());
         }
-        if queue.is_some()==redirect.is_some() {return Err(refused());}
         let queue_number=queue.map(Queue::number).transpose()?.unwrap_or(0);
+        match redirect {
+            Some(scope) if scope.policy_queue==queue.map(Queue::number).transpose()?=>{},
+            None if queue.is_some()=>{},
+            _=>return Err(refused()),
+        }
         let mut operations=match redirect {
             Some(scope)=>redirect_install(&journal,scope,&carriers.iter().map(|socket|(socket.mark(),socket.key())).collect()),
             None=>install_messages(&journal,queue_number,&carriers),
@@ -1117,7 +1162,7 @@ impl LabRules {
     fn admit(&mut self, socket: Arc<LabCarrierSocket>) -> io::Result<()> {
         if self.carrier_retired || self.poisoned || self.admissions.len() >= MAX_CARRIERS
             || self.used_marks.len() >= MAX_CARRIER_EPOCH
-            || socket.mark()==REDIRECT_MARK
+            || reserved_mark(socket.mark())
             || self.used_marks.contains(&socket.mark())
             || self.used_cookies.contains(&socket.cookie())
             || self.admissions.values().any(|key|*key==socket.key())
@@ -1372,7 +1417,9 @@ pub fn recover(host_namespace: &File, path: &Path) -> io::Result<()> {
     let _lock = scope_lock()?;
     let scope = Scope::current(host_namespace)?;
     check_parent(path)?;
-    let raw = journal_bytes(path)?.ok_or_else(refused)?;
+    let Some(raw)=journal_bytes(path)? else {
+        return policy_routes::recover_if_present(host_namespace,path);
+    };
     let mut journal = parse_journal(&raw, &scope)?;
     let net = Netlink::open()?;
     let generation = net.generation()?;
@@ -1383,7 +1430,8 @@ pub fn recover(host_namespace: &File, path: &Path) -> io::Result<()> {
     if journal.restored {
         // Idempotence is evidence of absence, not permission to delete
         // an object that appeared after the recorded restoration.
-        return if present { Err(refused()) } else { Ok(()) };
+        if present {return Err(refused());}
+        return policy_routes::recover_if_present(host_namespace,path);
     }
     let expected = if present {
         journal.recovery_generation(generation)?;
@@ -1862,7 +1910,7 @@ mod tests {
     #[test]
     fn redirect_transaction_keeps_all_three_egress_gates_bounded() {
         let mut j=journal();
-        let scope=RedirectScope{port:49001,loopback:1};
+        let scope=RedirectScope{port:49001,loopback:1,policy_queue:Some(49000)};
         j.redirect=Some(scope);
         let mut admissions=std::collections::BTreeMap::new();
         for n in 0..MAX_CARRIERS {

@@ -332,11 +332,12 @@ impl Queue {
     }
 
     fn verdict(&mut self, id: u32, accept: bool) -> io::Result<()> {
-        self.verdict_payload(id, accept, None)
+        self.verdict_payload(id,accept,None,None)
     }
 
-    fn verdict_payload(&mut self, id: u32, accept: bool, payload: Option<&[u8]>) -> io::Result<()> {
-        if payload.is_some_and(|p| !accept || p.len() > 65_531) {
+    fn verdict_payload(&mut self,id:u32,accept:bool,payload:Option<&[u8]>,mark:Option<u32>)->io::Result<()> {
+        if mark.is_some_and(|m|!accept || !super::linux_rules::reserved_mark(m)) ||
+            payload.is_some_and(|p| !accept || p.len() > 65_531) {
             return Err(invalid());
         }
         let fd = self.descriptor()?;
@@ -344,7 +345,8 @@ impl Queue {
         data.extend_from_slice(&u32::from(accept).to_be_bytes()); // NF_DROP=0, NF_ACCEPT=1
         data.extend_from_slice(&id.to_be_bytes());
         let mut attrs = Vec::with_capacity(12);
-        attr(&mut attrs, 2, &data);
+        attr(&mut attrs,2,&data);
+        if let Some(mark)=mark {attr(&mut attrs,3,&mark.to_be_bytes());} // NFQA_MARK
         if let Some(payload) = payload {
             attr(&mut attrs, 10, payload);
         } // NFQA_PAYLOAD
@@ -468,9 +470,26 @@ impl Packet<'_> {
         }
         let result = self
             .queue
-            .verdict_payload(self.captured.id, true, Some(changed));
+            .verdict_payload(self.captured.id,true,Some(changed),None);
         self.done = true;
         result.map(|()| PacketAction::Modify)
+    }
+
+    /// Only the managed policy consumer can stamp the kernel's held
+    /// packet. The independent physical egress guard rejects Redirect
+    /// marks unless the packet was actually rerouted onto loopback.
+    pub(crate) fn finish_routed(mut self,action:PacketAction)->io::Result<PacketAction> {
+        if !self.local_output() || self.metadata().is_none() {
+            return self.finish(PacketAction::Drop);
+        }
+        let mark=match action {
+            PacketAction::Pass=>super::linux_rules::PASS_MARK,
+            PacketAction::Redirect=>super::linux_rules::REDIRECT_MARK,
+            _=>return self.finish(PacketAction::Drop),
+        };
+        let result=self.queue.verdict_payload(self.captured.id,true,None,Some(mark));
+        self.done=true;
+        result.map(|()|action)
     }
 
     /// Pass only a complete supported packet. Until an actual redirect or

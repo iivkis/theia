@@ -195,6 +195,12 @@ async fn load_client_with_budget(
 }
 
 async fn resolve_server(profile: &Profile) -> Result<SocketAddr, ClientError> {
+    // Bootstrap must not invoke the ordinary system resolver while the
+    // native owner is preparing or controlling DNS. A literal pinned
+    // carrier endpoint is mandatory until protected bootstrap exists.
+    if crate::routing::carrier_socket::active() {
+        return profile.server.parse::<SocketAddr>().map_err(|_|ClientError::Configuration);
+    }
     timeout(NEGOTIATE_TIMEOUT, tokio::net::lookup_host(&profile.server))
         .await
         .map_err(|_| ClientError::Timeout)?
@@ -1933,6 +1939,8 @@ impl ClientRuntime {
             verdict_gate: Mutex::new(()),
             #[cfg(target_os = "linux")]
             raw: Mutex::new(std::collections::HashMap::new()),
+            #[cfg(target_os="linux")]
+            unified:std::sync::atomic::AtomicBool::new(false),
             #[cfg(target_os = "linux")]
             udp_consumer: std::sync::atomic::AtomicBool::new(false),
             #[cfg(target_os = "linux")]
@@ -2217,6 +2225,8 @@ pub struct NativeIngress {
     verdict_gate: Mutex<()>,
     #[cfg(target_os = "linux")]
     raw: Mutex<std::collections::HashMap<crate::routing::packet::FlowKey, RawLease>>,
+    #[cfg(target_os="linux")]
+    unified:std::sync::atomic::AtomicBool,
     #[cfg(target_os = "linux")]
     udp_consumer: std::sync::atomic::AtomicBool,
     #[cfg(target_os = "linux")]
@@ -2238,7 +2248,8 @@ pub struct LabStunPermit {
 
 #[cfg(target_os = "linux")]
 struct RawLease {
-    flow: crate::routing::flow::FlowLease,
+    flow: Option<crate::routing::flow::FlowLease>,
+    action:crate::routing::PacketAction,
     digest: [u8; 32],
     last: Instant,
     denied: bool,
@@ -2616,13 +2627,14 @@ impl NativeIngress {
         // fail-closed table. No network preflight precedes its commit.
         let listeners=redirect_port.map(|port|crate::routing::linux_ingress::RedirectListeners::bind(&host_namespace,port))
             .transpose().map_err(|_|ClientError::Io)?;
-        let queue=queue_number.map(|number|Queue::bind(number,256)).transpose().map_err(|_|ClientError::Io)?;
+        let queue=queue_number.or_else(||listeners.as_ref().map(|_|49000))
+            .map(|number|Queue::bind(number,256)).transpose().map_err(|_|ClientError::Io)?;
         let routes=if listeners.is_some() {
             Some(linux_rules::PolicyRoutes::install(&host_namespace,journal).map_err(|_|ClientError::Io)?)
         } else {None};
         let rules=Arc::new(Mutex::new(match (&queue,&listeners) {
             (Some(queue),None)=>LabRules::install(queue,&host_namespace,journal),
-            (None,Some(listeners))=>LabRules::install_redirect(&host_namespace,journal,listeners.port()),
+            (Some(queue),Some(listeners))=>LabRules::install_unified(queue,&host_namespace,journal,listeners.port()),
             _=>return Err(ClientError::Configuration),
         }.map_err(|_|ClientError::Io)?));
         let registrar: Arc<dyn carrier_socket::Registrar> = Arc::new(LabRegistrar::new(
@@ -2648,8 +2660,12 @@ impl NativeIngress {
         let capture=async {
             match (queue,listeners) {
                 (Some(queue),None)=>ingress.serve_linux_shared(queue,None,rules.clone(),registrar.clone(),|_,_,_|Ok(None)).await,
-                (None,Some(listeners))=>{
+                (Some(queue),Some(listeners))=>{
                     let port=listeners.port();
+                    if !rules.lock().map_err(|_|ClientError::Configuration)?.owns_policy_queue(&queue).map_err(|_|ClientError::Io)? {
+                        return Err(ClientError::Open(ErrorCode::PolicyDenied));
+                    }
+                    ingress.unified.store(true,std::sync::atomic::Ordering::Release);
                     if !rules.lock().map_err(|_|ClientError::Configuration)?.redirect_ready(port).map_err(|_|ClientError::Io)? {
                         return Err(ClientError::Open(ErrorCode::PolicyDenied));
                     }
@@ -2669,6 +2685,7 @@ impl NativeIngress {
                     tokio::select! {
                         biased;
                         result=ingress.serve_linux_redirect_capture(listeners)=>result,
+                        result=carrier_socket::scope(Some(registrar.clone()),ingress.serve_linux_policy_queue(queue,&rules))=>result,
                         result=monitor=>result,
                         result=carrier_socket::scope(Some(registrar.clone()),runtime.maintain())=>result,
                         ()=ingress.stopped()=>Err(ClientError::Open(ErrorCode::PolicyDenied)),
@@ -3356,11 +3373,49 @@ impl NativeIngress {
         self.raw_verdict_bound(meta,None).await
     }
 
+    #[cfg(target_os="linux")]
+    async fn serve_linux_policy_queue(&self,queue:crate::routing::nfqueue::Queue,
+        rules:&Mutex<crate::routing::linux_rules::LabRules>)->Result<(),ClientError> {
+        use crate::routing::PacketAction;
+        let mut queue=queue.into_async().map_err(|_|ClientError::Io)?;
+        loop {
+            let packet=queue.next().await.map_err(|_|ClientError::Io)?;
+            if !rules.lock().map_err(|_|ClientError::Configuration)?.owns_policy_packet(&packet).map_err(|_|ClientError::Io)? {
+                return Err(ClientError::Open(ErrorCode::PolicyDenied));
+            }
+            let meta=packet.metadata();
+            let action=match meta {
+                Some(meta)=>self.raw_decision(meta,None,true).await,
+                None=>PacketAction::Drop,
+            };
+            let gate=self.verdict_gate.lock();
+            let owner=rules.lock().map_err(|_|ClientError::Configuration)?;
+            if !owner.owns_policy_packet(&packet).map_err(|_|ClientError::Io)? {
+                return Err(ClientError::Open(ErrorCode::PolicyDenied));
+            }
+            let current=meta.is_some_and(|m|{
+                let key=crate::routing::packet::FlowKey{interface:0,..m.flow};
+                self.raw.lock().ok().is_some_and(|raw|raw.get(&key).is_some_and(|entry|
+                    !entry.denied && entry.action==action &&
+                    self.client.routing_cache().dpi.check_policy(entry.digest).is_ok()))
+            });
+            let action=if current && gate.is_ok() && self.ensure_accepting().is_ok(){action}else{PacketAction::Drop};
+            if action==PacketAction::Drop {self.deny_raw_packet(meta);}
+            packet.finish_routed(action).map_err(|_|ClientError::Io)?;
+        }
+    }
+
+    #[cfg(target_os="linux")]
+    async fn raw_verdict_bound(&self,meta:crate::routing::packet::PacketMeta,socket_cookie:Option<u64>)->crate::routing::PacketAction {
+        self.raw_decision(meta,socket_cookie,false).await
+    }
+
     #[cfg(target_os = "linux")]
-    async fn raw_verdict_bound(
+    async fn raw_decision(
         &self,
         mut meta: crate::routing::packet::PacketMeta,
         socket_cookie:Option<u64>,
+        unified:bool,
     ) -> crate::routing::PacketAction {
         use crate::routing::{packet::Transport, Evidence, PacketAction};
         meta.flow.interface = 0;
@@ -3397,48 +3452,46 @@ impl NativeIngress {
             return PacketAction::Drop;
         }
         let now = Instant::now();
-        raw.retain(|_, entry| now.duration_since(entry.last) < Duration::from_secs(60));
-        let current = matched == Some(PacketAction::Pass) && cache.dpi.check_policy(digest).is_ok();
+        // A terminated flow must never fall back to native egress after
+        // its relay closes. Keep bounded route tombstones for the epoch.
+        if !unified {raw.retain(|_,entry|now.duration_since(entry.last)<Duration::from_secs(60));}
+        let action=match matched {
+            Some(PacketAction::Pass)=>PacketAction::Pass,
+            Some(PacketAction::Redirect|PacketAction::Modify) if unified=>PacketAction::Redirect,
+            _=>PacketAction::Drop,
+        };
+        // Raw DNS never goes direct or to an arbitrary resolver in the
+        // unified backend; the protected resolver adapter is separate.
+        let action=if unified && meta.flow.destination.port()==53 {PacketAction::Drop}else{action};
+        let current=action!=PacketAction::Drop && cache.dpi.check_policy(digest).is_ok();
         if let Some(entry) = raw.get_mut(&meta.flow) {
             entry.last = now;
-            if !current || entry.digest != digest || entry.socket_cookie!=socket_cookie {
-                entry.denied = true;
+            if !current || entry.digest!=digest || entry.socket_cookie!=socket_cookie || entry.action!=action {
+                entry.denied=true;
             }
-            return if !entry.denied && entry.flow.commit(PacketAction::Pass).is_ok() {
-                PacketAction::Pass
-            } else {
-                PacketAction::Drop
+            if entry.denied {return PacketAction::Drop;}
+            return match (entry.action,&entry.flow) {
+                (PacketAction::Pass,Some(flow)) if flow.commit(PacketAction::Pass).is_ok()=>PacketAction::Pass,
+                (PacketAction::Redirect,None) if unified=>PacketAction::Redirect,
+                _=>PacketAction::Drop,
             };
         }
         // TCP must start from a SYN without ACK/RST/FIN. A lost or expired
         // flow is never silently recreated from a middle-of-stream packet.
-        if !current
+        if !current || raw.len()>=crate::routing::flow::MAX_FLOWS
             || (meta.flow.transport == Transport::Tcp
                 && !meta.tcp_flags.is_some_and(|f| f & 0x17 == 0x02))
         {
             return PacketAction::Drop;
         }
-        let Ok(flow) =
-            cache
-                .flows
-                .begin_native(cache.dpi.clone(), meta.flow, digest, PacketAction::Pass)
-        else {
-            return PacketAction::Drop;
-        };
-        if flow.commit(PacketAction::Pass).is_err() {
-            return PacketAction::Drop;
-        }
-        raw.insert(
-            meta.flow,
-            RawLease {
-                flow,
-                digest,
-                last: now,
-                denied: false,
-                socket_cookie,
-            },
-        );
-        PacketAction::Pass
+        let flow=if action==PacketAction::Pass {
+            let Ok(flow)=cache.flows.begin_native(cache.dpi.clone(),meta.flow,digest,PacketAction::Pass)
+                else {return PacketAction::Drop;};
+            if flow.commit(PacketAction::Pass).is_err(){return PacketAction::Drop;}
+            Some(flow)
+        } else {None}; // Redirect owns its common FlowLease on accept.
+        raw.insert(meta.flow,RawLease{flow,action,digest,last:now,denied:false,socket_cookie});
+        action
     }
 
     /// Terminate an already redirected TCP connection using the original
@@ -3826,6 +3879,14 @@ impl NativeIngress {
             .packet_action();
         if !matches!(configured, PacketAction::Redirect | PacketAction::Modify) {
             return Err(denied());
+        }
+        #[cfg(target_os="linux")]
+        if self.unified.load(std::sync::atomic::Ordering::Acquire) {
+            let key=crate::routing::packet::FlowKey{interface:0,..key};
+            if !self.raw.lock().map_err(|_|denied())?.get(&key).is_some_and(|entry|
+                !entry.denied && entry.action==PacketAction::Redirect && entry.digest==snapshot.digest()) {
+                return Err(denied());
+            }
         }
         self.ensure_accepting()?;
         let flow =
