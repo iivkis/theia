@@ -157,6 +157,30 @@ static DWORD recover(HANDLE e, UINT32 scope, const UINT8 data[12]) {
     return FwpmProviderDeleteByKey0(e, &provider);
 }
 
+/* Prove absence of every owned key, not just absence of one filter.
+ * A foreign collision or partial recovery is a failure, never success. */
+static DWORD verify_absent(HANDLE e) {
+    FWPM_PROVIDER0 *p = NULL;
+    FWPM_SUBLAYER0 *s = NULL;
+    DWORD err = FwpmProviderGetByKey0(e, &provider, &p);
+    if (!err) { FwpmFreeMemory0((void **)&p); return ERROR_ALREADY_EXISTS; }
+    if (err != (DWORD)FWP_E_PROVIDER_NOT_FOUND) return err;
+    err = FwpmSubLayerGetByKey0(e, &sublayer, &s);
+    if (!err) { FwpmFreeMemory0((void **)&s); return ERROR_ALREADY_EXISTS; }
+    if (err != (DWORD)FWP_E_SUBLAYER_NOT_FOUND) return err;
+    for (unsigned i = 0; i < 2; ++i) {
+        FWPM_CALLOUT0 *callout = NULL;
+        FWPM_FILTER0 *filter = NULL;
+        err = FwpmCalloutGetByKey0(e, &callouts[i], &callout);
+        if (!err) { FwpmFreeMemory0((void **)&callout); return ERROR_ALREADY_EXISTS; }
+        if (err != (DWORD)FWP_E_CALLOUT_NOT_FOUND) return err;
+        err = FwpmFilterGetByKey0(e, &filters[i], &filter);
+        if (!err) { FwpmFreeMemory0((void **)&filter); return ERROR_ALREADY_EXISTS; }
+        if (err != (DWORD)FWP_E_FILTER_NOT_FOUND) return err;
+    }
+    return ERROR_SUCCESS;
+}
+
 int wmain(int argc, wchar_t **argv) {
     HANDLE engine = NULL;
     FWPM_SESSION0 session = {0};
@@ -164,11 +188,13 @@ int wmain(int argc, wchar_t **argv) {
     wchar_t *end = NULL;
     DWORD err;
     unsigned long scope;
-    BOOL is_install, is_recover;
+    BOOL is_install, is_recover, is_inspect, is_absent;
     if (argc != 4 || wcscmp(argv[3], L"--isolated-lab-confirm") != 0) return 2;
     is_install = wcscmp(argv[1], L"install") == 0;
     is_recover = wcscmp(argv[1], L"recover") == 0;
-    if (!is_install && !is_recover) return 2;
+    is_inspect = wcscmp(argv[1], L"inspect") == 0;
+    is_absent = wcscmp(argv[1], L"inspect-absent") == 0;
+    if (!is_install && !is_recover && !is_inspect && !is_absent) return 2;
     for (const wchar_t *p = argv[2]; *p; ++p) if (*p < L'0' || *p > L'9') return 2;
     errno = 0;
     scope = wcstoul(argv[2], &end, 10);
@@ -178,10 +204,14 @@ int wmain(int argc, wchar_t **argv) {
     session.txnWaitTimeoutInMSec = 3000;
     err = FwpmEngineOpen0(NULL, RPC_C_AUTHN_WINNT, NULL, &session, &engine);
     if (err) goto done;
-    err = FwpmTransactionBegin0(engine, 0);
+    err = FwpmTransactionBegin0(engine, (is_inspect || is_absent) ? FWPM_TXN_READ_ONLY : 0);
     if (err) goto done;
-    err = is_install ? install(engine, (UINT32)scope, data) : recover(engine, (UINT32)scope, data);
+    if (is_install) err = install(engine, (UINT32)scope, data);
+    else if (is_recover) err = recover(engine, (UINT32)scope, data);
+    else if (is_inspect) err = verify(engine, (UINT32)scope, data);
+    else err = verify_absent(engine);
     if (!err && is_install) err = verify(engine, (UINT32)scope, data);
+    if (!err && is_recover) err = verify_absent(engine);
     if (err) FwpmTransactionAbort0(engine);
     else {
         err = FwpmTransactionCommit0(engine);
@@ -190,6 +220,7 @@ int wmain(int argc, wchar_t **argv) {
 done:
     if (engine) FwpmEngineClose0(engine);
     if (err) fwprintf(stderr, L"BFE transaction refused/uncertain: 0x%08lx\n", err);
+    else if (is_inspect || is_absent) wprintf(L"BFE laboratory ownership inspection passed for compartment %lu\n", scope);
     else wprintf(L"BFE laboratory transaction committed for compartment %lu\n", scope);
     return err ? 1 : 0;
 }
