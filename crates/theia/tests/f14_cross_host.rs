@@ -464,17 +464,24 @@ async fn linux_server_windows_client_f14_h2_h3_open_ok() {
             ca: &trusted_ca,
             origin,
         };
-        for transport in [Transport::H2, Transport::H3] {
-            client_scenario(&fixture, transport, false, false).await;
-            client_scenario(&fixture, transport, true, false).await;
-            client_scenario(&fixture, transport, false, true).await;
+        // Each lane owns its own config, credentials, proxy sockets and
+        // process. Keep scenarios within a lane sequential, but overlap
+        // independent H2/H3/Auto lanes against the same bounded server.
+        async fn lane(fixture: &CrossOsFixture<'_>, transport: Transport) {
+            if transport != Transport::Auto {
+                client_scenario(fixture, transport, false, false).await;
+                client_scenario(fixture, transport, true, false).await;
+                client_scenario(fixture, transport, false, true).await;
+            }
             for stream_up in [false, true] {
-                explicit_xhttp_client_scenario(&fixture, transport, stream_up).await;
+                explicit_xhttp_client_scenario(fixture, transport, stream_up).await;
             }
         }
-        for stream_up in [false, true] {
-            explicit_xhttp_client_scenario(&fixture, Transport::Auto, stream_up).await;
-        }
+        tokio::join!(
+            lane(&fixture, Transport::H2),
+            lane(&fixture, Transport::H3),
+            lane(&fixture, Transport::Auto)
+        );
     })
     .await
     .expect("cross-OS Linux/Windows F-14 acceptance deadline");
