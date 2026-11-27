@@ -415,6 +415,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libbpf-dev
       - name: Native Linux tests
         run: cargo nextest run --workspace --all-targets --locked --no-fail-fast
+      - name: F-15 isolated kernel capture and hard-kill recovery (mandatory)
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n unshare -n true
+          cargo test --locked -p theia --lib --no-run --message-format=json > f15-test-build.json
+          python3 scripts/f15-kernel-tests.py f15-test-build.json
       - name: Lints
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       # Optional release-profile compilation uses the same post-merge CI.
