@@ -2585,10 +2585,10 @@ impl NativeIngress {
         recovered
     }
 
-    /// Managed Windows TCP Redirect laboratory. Requires a disposable
-    /// non-default compartment, signed installed driver and already-owned
-    /// BFE filters, provisioned outside this process. No production Connect,
-    /// user UDP or auto recovery is enabled by this entry point.
+    /// Managed Windows TCP/UDP Redirect laboratory. Requires a disposable
+    /// non-default, non-IPsec compartment, signed installed driver and
+    /// verified UDP-inclusive BFE filters. No production Connect or
+    /// automatic host recovery is enabled by this entry point.
     #[cfg(target_os = "windows")]
     pub async fn run_windows_lab(
         path: &Path,
@@ -2631,7 +2631,7 @@ impl NativeIngress {
             .map_err(|_| ClientError::Configuration)?;
         let [v4, v6] = bind_tcp_listeners(compartment, port).map_err(|_| ClientError::Io)?;
         let session =
-            Arc::new(WfpLabSession::open(compartment, port).map_err(|_| ClientError::Io)?);
+            Arc::new(WfpLabSession::open_udp_lab(compartment, port).map_err(|_| ClientError::Io)?);
         // Even if preflight or the owning future is cancelled, retire the
         // kernel session before releasing listeners. Persistent filters stay.
         struct StopDriver(Arc<WfpLabSession>);
@@ -2705,6 +2705,7 @@ impl NativeIngress {
             tokio::select! {
                 biased;
                 result = consume => result,
+                result = ingress.serve_windows_udp(session.clone()) => result,
                 result = carrier_socket::scope(Some(registrar.clone()),runtime.maintain()) => {
                     result?;
                     Err(ClientError::Io)
@@ -2729,6 +2730,107 @@ impl NativeIngress {
         proof.inspect().await.map_err(|_| ClientError::Io)?;
         drop(owner);
         Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    async fn serve_windows_udp(
+        self: &Arc<Self>,
+        session: Arc<crate::routing::wfp_ingress::WfpLabSession>,
+    ) -> Result<(), ClientError> {
+        use crate::routing::wfp_datagram::Datagram;
+        use tokio::sync::mpsc;
+        let mut flows = std::collections::HashMap::<u64, (crate::routing::packet::FlowKey, mpsc::Sender<Datagram>)>::new();
+        let mut tasks = JoinSet::new();
+        let mut poll = tokio::time::interval(Duration::from_millis(5));
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            self.ensure_accepting()?;
+            tokio::select! {
+                biased;
+                () = self.stopped() => return Ok(()),
+                finished = tasks.join_next(), if !tasks.is_empty() => {
+                    let generation = finished.ok_or(ClientError::Io)?.map_err(|_| ClientError::Io)?;
+                    if flows.remove(&generation).is_none() { return Err(ClientError::Protocol); }
+                }
+                _ = poll.tick() => {
+                    // Bound every polling turn so TCP, management, policy
+                    // refresh and STOP cannot starve behind UDP bursts.
+                    for _ in 0..16 {
+                        let Some(packet) = session.read_udp().map_err(|_| ClientError::Io)? else { break; };
+                        let generation = packet.generation;
+                        if let Some((key, tx)) = flows.get(&generation) {
+                            if *key != packet.key { return Err(ClientError::Protocol); }
+                            if tx.try_send(packet).is_err() { crate::traffic::udp_queue_drop(); }
+                            continue;
+                        }
+                        if tasks.len() >= LOCAL_LIMIT || flows.values().any(|(key, _)| *key == packet.key) {
+                            let _ = session.close_udp(generation);
+                            crate::traffic::udp_queue_drop();
+                            continue;
+                        }
+                        let (tx, rx) = mpsc::channel(crate::udp_relay::QUEUE);
+                        flows.insert(generation, (packet.key, tx));
+                        let ingress = self.clone();
+                        let session = session.clone();
+                        tasks.spawn(async move {
+                            let _ = ingress.relay_windows_udp(packet, rx, session).await;
+                            generation
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    async fn relay_windows_udp(
+        &self,
+        first: crate::routing::wfp_datagram::Datagram,
+        mut subsequent: tokio::sync::mpsc::Receiver<crate::routing::wfp_datagram::Datagram>,
+        session: Arc<crate::routing::wfp_ingress::WfpLabSession>,
+    ) -> Result<(), ClientError> {
+        use crate::routing::PacketAction;
+        let generation = first.generation;
+        let key = first.key;
+        struct Revoke(Arc<crate::routing::wfp_ingress::WfpLabSession>, u64);
+        impl Drop for Revoke {
+            fn drop(&mut self) { let _ = self.0.close_udp(self.1); }
+        }
+        let _revoke = Revoke(session.clone(), generation);
+        tokio::select! {
+            biased;
+            () = self.stopped() => Err(ClientError::Open(ErrorCode::PolicyDenied)),
+            result = async {
+                self.ensure_accepting()?;
+                session.check().map_err(|_| ClientError::Io)?;
+                let (carrier, flow, address) = self.redirect(key).await?;
+                let tunnel = crate::routing::carrier_socket::scope(
+                    self.registrar()?, carrier.open_udp(address, key.destination.port())
+                ).await?;
+                let (tx, up) = tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
+                let (down, mut rx) = tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
+                tx.send(first.payload).await.map_err(|_| ClientError::Io)?;
+                let relay = tunnel.relay_guarded(up, down, Some(&flow));
+                let feed = async move {
+                    while let Some(packet) = subsequent.recv().await {
+                        if packet.generation != generation || packet.key != key { return Err(ClientError::Protocol); }
+                        tx.send(packet.payload).await.map_err(|_| ClientError::Io)?;
+                    }
+                    Ok::<(), ClientError>(())
+                };
+                let replies = async {
+                    while let Some(bytes) = rx.recv().await {
+                        self.ensure_accepting()?;
+                        if !flow.committed(PacketAction::Redirect) {
+                            return Err(ClientError::Open(ErrorCode::PolicyDenied));
+                        }
+                        session.reply_udp(generation, bytes).await.map_err(|_| ClientError::Io)?;
+                    }
+                    Ok::<(), ClientError>(())
+                };
+                supervise_native_udp(relay, feed, replies).await
+            } => result,
+        }
     }
 
     /// Correlate an actual private collector/queue observation with
@@ -3574,7 +3676,7 @@ impl NativeUdpDispatch {
 /// flow lease and reply socket until a bounded drain finishes. Feed EOF is
 /// not relay EOF; dropping the upload sender lets the carrier send FIN.
 /// Errors and outer runtime cancellation still terminate immediately.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 async fn supervise_native_udp(
     relay: impl std::future::Future<Output = Result<(), ClientError>>,
     feed: impl std::future::Future<Output = Result<(), ClientError>>,

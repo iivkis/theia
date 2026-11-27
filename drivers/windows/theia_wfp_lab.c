@@ -201,7 +201,7 @@ static NTSTATUS control(PDEVICE_OBJECT dev, PIRP irp) {
             deactivate_locked();
             waitForClassify = TRUE;
         }
-        status = STATUS_SUCCESS;
+        status = (code == IOCTL_STOP || TheiaUdpReady()) ? STATUS_SUCCESS : STATUS_DEVICE_NOT_READY;
     } else if (code == IOCTL_ENDPOINT && len == ENDPOINT_SIZE && State.active
         && State.file == stack->FileObject && State.process == PsGetCurrentProcess()
         && read64(bytes) != 0 && (bytes[9] == IPPROTO_TCP || bytes[9] == IPPROTO_UDP) && read16(bytes + 10) != 0

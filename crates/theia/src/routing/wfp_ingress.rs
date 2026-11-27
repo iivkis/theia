@@ -86,6 +86,9 @@ const CONFIGURE: u32 = (0x22 << 16) | (2 << 14) | (0x800 << 2);
 const AUTHORIZE_ENDPOINT: u32 = (0x22 << 16) | (2 << 14) | (0x801 << 2);
 const STATUS: u32 = (0x22 << 16) | (2 << 14) | (0x802 << 2);
 const STOP: u32 = (0x22 << 16) | (2 << 14) | (0x803 << 2);
+const UDP_READ: u32 = (0x22 << 16) | (2 << 14) | (0x804 << 2);
+const UDP_REPLY: u32 = (0x22 << 16) | (2 << 14) | (0x805 << 2);
+const UDP_CLOSE: u32 = (0x22 << 16) | (2 << 14) | (0x806 << 2);
 const QUERY_ENDPOINT: u32 = SIO_QUERY_WFP_ALE_ENDPOINT_HANDLE;
 
 fn ioctl(handle: &OwnedHandle, code: u32, bytes: &[u8]) -> io::Result<()> {
@@ -117,6 +120,16 @@ impl WfpLabSession {
     /// driver and a non-default test compartment. The caller must bind the
     /// listener and arrange isolated BFE filters before admitting traffic.
     pub fn open(compartment: u32, port: u16) -> io::Result<Self> {
+        Self::open_inner(compartment, port, false)
+    }
+
+    /// The caller must have verified the complete UDP-inclusive BFE
+    /// transaction on an explicitly isolated, non-IPsec laboratory scope.
+    pub(crate) fn open_udp_lab(compartment: u32, port: u16) -> io::Result<Self> {
+        Self::open_inner(compartment, port, true)
+    }
+
+    fn open_inner(compartment: u32, port: u16, udp: bool) -> io::Result<Self> {
         use windows_sys::Win32::{
             Foundation::INVALID_HANDLE_VALUE,
             Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING},
@@ -153,6 +166,7 @@ impl WfpLabSession {
         let mut request = Zeroizing::new([0u8; 40]);
         request[..4].copy_from_slice(&compartment.to_be_bytes());
         request[4..6].copy_from_slice(&port.to_be_bytes());
+        request[6] = u8::from(udp);
         request[8..].copy_from_slice(token.as_ref());
         ioctl(&handle, CONFIGURE, request.as_ref())?;
         let session = Self {
@@ -198,6 +212,52 @@ impl WfpLabSession {
             let bytes = self.scope_request();
             ioctl(&self.handle, STOP, bytes.as_ref())
         })
+    }
+
+    /// Poll the bounded private driver queue. A zero-byte successful
+    /// response means no datagram is currently available.
+    pub(crate) fn read_udp(&self) -> io::Result<Option<super::wfp_datagram::Datagram>> {
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+        self.check()?;
+        let mut request = Zeroizing::new([0u8; 40]);
+        request[..32].copy_from_slice(self.token.as_ref());
+        let mut bytes = Zeroizing::new(vec![0u8; super::wfp_datagram::MAX_FRAME]);
+        let mut returned = 0u32;
+        let ok = unsafe {
+            DeviceIoControl(
+                self.handle.as_raw_handle().cast(), UDP_READ,
+                request.as_ptr().cast(), request.len() as u32,
+                bytes.as_mut_ptr().cast(), bytes.len() as u32,
+                &mut returned, ptr::null_mut(),
+            )
+        };
+        if ok == 0 { return Err(io::Error::last_os_error()); }
+        self.check()?;
+        if returned == 0 { return Ok(None); }
+        let data = bytes.get(..returned as usize).ok_or(io::ErrorKind::InvalidData)?;
+        super::wfp_datagram::Datagram::decode(data, self.compartment)
+            .map(Some).ok_or_else(|| io::ErrorKind::InvalidData.into())
+    }
+
+    /// DeviceIoControl waits for the kernel injection callback. Keep it
+    /// off the current-thread network-compartment executor; the blocking
+    /// worker performs only a protected IOCTL, never socket I/O.
+    pub(crate) async fn reply_udp(self: &std::sync::Arc<Self>, generation: u64, bytes: Vec<u8>) -> io::Result<()> {
+        self.check()?;
+        let request = super::wfp_datagram::reply_request(&self.token, generation, &bytes)
+            .ok_or(io::ErrorKind::InvalidInput)?;
+        let owner = self.clone();
+        tokio::task::spawn_blocking(move || {
+            if !owner.retirement.active() { return Err(io::ErrorKind::PermissionDenied.into()); }
+            ioctl(&owner.handle, UDP_REPLY, &request)
+        }).await.map_err(|_| io::Error::other("WFP reply worker failed"))??;
+        self.check()
+    }
+
+    pub(crate) fn close_udp(&self, generation: u64) -> io::Result<()> {
+        let request = super::wfp_datagram::reply_request(&self.token, generation, &[])
+            .ok_or(io::ErrorKind::InvalidInput)?;
+        ioctl(&self.handle, UDP_CLOSE, &request)
     }
 
     /// Register the actual ALE endpoint handle before the TCP connect.

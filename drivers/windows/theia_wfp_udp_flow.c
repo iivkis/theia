@@ -109,6 +109,14 @@ BOOLEAN TheiaUdpStart(ULONG scope,BOOLEAN applicationUdp) {
     KeReleaseSpinLock(&Lock,irql);
     return ok;
 }
+BOOLEAN TheiaUdpReady(VOID) {
+    KIRQL irql;
+    BOOLEAN ready;
+    KeAcquireSpinLock(&Lock,&irql);
+    ready=ready_locked();
+    KeReleaseSpinLock(&Lock,irql);
+    return ready;
+}
 VOID TheiaUdpStop(VOID) {
     KIRQL irql;
     KeAcquireSpinLock(&Lock,&irql);
@@ -201,7 +209,7 @@ static UINT64 attach(const FWPS_INCOMING_VALUES0 *v,const FWPS_INCOMING_METADATA
     UINT64 generation=0,now=KeQueryInterruptTime();
     UINT32 id=v->layerId==FWPS_LAYER_DATAGRAM_DATA_V4?Id4:Id6;
     KeAcquireSpinLock(&Lock,&irql);
-    if (!ready_locked()||t->compartment!=Scope||NextGeneration==MAXUINT64) goto unlock;
+    if (!ready_locked()||t->compartment!=Scope||NextGeneration==~(UINT64)0) goto unlock;
     for (ULONG i=0;i<FLOW_LIMIT;++i) {
         if (Flows[i].tuple.generation&&Flows[i].handle==m->flowHandle) goto unlock;
         if (!Flows[i].tuple.generation&&!slot) slot=&Flows[i];
@@ -338,7 +346,7 @@ NTSTATUS TheiaUdpRead(UCHAR *buffer,ULONG capacity,ULONG_PTR *written) {
     }
 out:
     KeReleaseSpinLock(&Lock,irql);
-    return status;
+    return status==STATUS_NO_MORE_ENTRIES?STATUS_SUCCESS:status;
 }
 NTSTATUS TheiaUdpReply(UINT64 generation,const UCHAR *data,ULONG length) {
     THEIA_REPLY_FLOW tuple;
@@ -361,28 +369,39 @@ NTSTATUS TheiaUdpClose(UINT64 generation) {
     KeReleaseSpinLock(&Lock,irql);
     return status;
 }
-static NTSTATUS NTAPI notify_udp(FWPS_CALLOUT_NOTIFY_TYPE type,const GUID *key,FWPS_FILTER1 *filter) {
-    volatile LONG *count;
-    UNREFERENCED_PARAMETER(filter);
-    if (same((const UCHAR *)key,(const UCHAR *)&Udp4,sizeof(GUID))) count=&Installed4;
-    else if (same((const UCHAR *)key,(const UCHAR *)&Udp6,sizeof(GUID))) count=&Installed6;
-    else return STATUS_INVALID_PARAMETER;
-    if (type==FWPS_CALLOUT_NOTIFY_ADD_FILTER) InterlockedIncrement(count);
-    else if (type==FWPS_CALLOUT_NOTIFY_DELETE_FILTER) {
-        InterlockedDecrement(count);
+// ADD_FILTER reports the filter key, not the callout key. DELETE
+// reports NULL. Separate callbacks retain the address family without
+// dereferencing a missing GUID. Filters must be installed after load;
+// old persistent filters cannot silently authorize a new session.
+static const GUID Filter4={0x172b0ec4,0xc223,0x4ab6,{0x8c,0x52,0xa9,0x5e,0x08,0x2d,0x11,0x72}};
+static const GUID Filter6={0x172b0ec5,0xc223,0x4ab6,{0x8c,0x52,0xa9,0x5e,0x08,0x2d,0x11,0x72}};
+static NTSTATUS notify_udp(FWPS_CALLOUT_NOTIFY_TYPE type,const GUID *key,const GUID *expected,volatile LONG *count) {
+    if (type==FWPS_CALLOUT_NOTIFY_ADD_FILTER) {
+        if (!key||!same((const UCHAR *)key,(const UCHAR *)expected,sizeof(GUID))
+            || InterlockedCompareExchange(count,1,0)!=0) return STATUS_ACCESS_DENIED;
+    } else if (type==FWPS_CALLOUT_NOTIFY_DELETE_FILTER) {
+        InterlockedExchange(count,0);
         TheiaUdpStop();
     }
     return STATUS_SUCCESS;
 }
-static NTSTATUS register_one(PDEVICE_OBJECT dev,const GUID *key,UINT32 *id) {
+static NTSTATUS NTAPI notify4(FWPS_CALLOUT_NOTIFY_TYPE type,const GUID *key,FWPS_FILTER1 *filter) {
+    UNREFERENCED_PARAMETER(filter);
+    return notify_udp(type,key,&Filter4,&Installed4);
+}
+static NTSTATUS NTAPI notify6(FWPS_CALLOUT_NOTIFY_TYPE type,const GUID *key,FWPS_FILTER1 *filter) {
+    UNREFERENCED_PARAMETER(filter);
+    return notify_udp(type,key,&Filter6,&Installed6);
+}
+static NTSTATUS register_one(PDEVICE_OBJECT dev,const GUID *key,UINT32 *id,FWPS_CALLOUT_NOTIFY_FN1 notify) {
     FWPS_CALLOUT1 c;
     RtlZeroMemory(&c,sizeof(c));
-    c.calloutKey=*key;c.classifyFn=classify_udp;c.notifyFn=notify_udp;c.flowDeleteFn=flow_delete;
+    c.calloutKey=*key;c.classifyFn=classify_udp;c.notifyFn=notify;c.flowDeleteFn=flow_delete;
     return FwpsCalloutRegister1(dev,&c,id);
 }
 NTSTATUS TheiaUdpRegister(PDEVICE_OBJECT dev) {
-    NTSTATUS status=register_one(dev,&Udp4,&Id4);
-    if (NT_SUCCESS(status)) status=register_one(dev,&Udp6,&Id6);
+    NTSTATUS status=register_one(dev,&Udp4,&Id4,notify4);
+    if (NT_SUCCESS(status)) status=register_one(dev,&Udp6,&Id6,notify6);
     return status;
 }
 VOID TheiaUdpUnregister(VOID) {
