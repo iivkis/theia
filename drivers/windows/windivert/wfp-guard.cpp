@@ -229,6 +229,10 @@ const GUID& layer(size_t i) {
     return i%2==0?FWPM_LAYER_OUTBOUND_IPPACKET_V4:FWPM_LAYER_OUTBOUND_IPPACKET_V6;
 }
 bool same_sublayer(const FWPM_SUBLAYER0& s,const Plan& p) {
+    if(fixture_diagnostics) std::fwprintf(stderr,L"BFE fixture sublayer: key=%d flags=0x%08lx expected-flags=0x%08lx provider=%d blob=%d weight=%u expected-weight=%u name=%d description=%d\n",
+        eq(s.subLayerKey,p.sub)?1:0,static_cast<unsigned long>(s.flags),static_cast<unsigned long>(FWPM_SUBLAYER_FLAG_PERSISTENT),
+        s.providerKey?1:0,same_blob(s.providerData,p)?1:0,static_cast<unsigned>(s.weight),static_cast<unsigned>(sub_weight),
+        text_eq(s.displayData.name,name)?1:0,s.displayData.description?1:0);
     return eq(s.subLayerKey,p.sub) && s.flags==FWPM_SUBLAYER_FLAG_PERSISTENT &&
         !s.providerKey && same_blob(s.providerData,p) && s.weight==sub_weight &&
         text_eq(s.displayData.name,name) && !s.displayData.description;
