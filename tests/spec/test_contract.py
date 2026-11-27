@@ -402,7 +402,15 @@ class SpecContractTests(unittest.TestCase):
 
     def test_m31_h3_client_gate(self):
         client = read("crates/theia/src/h3_client.rs")
-        self.assertIn("ObservedEndpoint::new", client)
+        # Production H3 now uses the native QUIC dialer; retain the
+        # transport observation and fail-closed handshake contract.
+        self.assertIn("dial::connect(self.remote", client)
+        self.assertIn("self.native_connection().await?", client)
+        self.assertIn("dial::close_probe(session)", client)
+        dialer = read("crates/theia/src/quic_core/dial.rs")
+        self.assertIn("observation.failure(true)", dialer)
+        self.assertIn("fallback_requires_observed_send_or_exact_send_error_and_no_response", dialer)
+        self.assertNotIn("quinn::", client.split("#[cfg(test)]\nmod probe_tests", 1)[0])
         self.assertIn("bearer_header(token)?", client)
         self.assertIn("Frame::OpenOk if state.tunnel_open()", client)
         self.assertIn(".run(upload, download, ClientError::Timeout)", client)
