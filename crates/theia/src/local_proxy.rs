@@ -1092,6 +1092,56 @@ struct DpiRoute {
 }
 
 impl Carrier {
+    async fn warm_carrier(&self) -> Result<(), ClientError> {
+        match self {
+            Self::H2(client) => client.warm_carrier().await,
+            Self::H3(client) => client.warm_carrier().await,
+            Self::Auto(client) => {
+                // Speculation never publishes negative evidence and cannot
+                // authorize an H3->H2 transition. Follow a live prior decision.
+                let scope = crate::network_scope::observe(client.h3.remote());
+                let cached = client.negative.lock().ok().is_some_and(|cache|
+                    scope.is_some() && cache.route == scope
+                    && cache.expires.is_some_and(|t| t > Instant::now()));
+                if cached { client.h2.warm_carrier().await }
+                else { client.h3.warm_carrier().await }
+            }
+        }
+    }
+
+    async fn warm_during<T>(&self, work: impl std::future::Future<Output = T>) -> T {
+        tokio::pin!(work);
+        tokio::select! {
+            biased;
+            result = &mut work => result,
+            _ = self.warm_carrier() => work.await,
+        }
+    }
+
+    async fn refresh_recent_tcp(&self, cache: &Cache, snapshot: &Snapshot) {
+        let Some(target) = cache.dpi.due_tcp_refresh() else { return };
+        if target.digest() != snapshot.digest() { return; }
+        let name = target.name();
+        let policy = snapshot.policy();
+        let address = target.address();
+        let digest = target.digest();
+        let Ok(pin) = cache.dpi.pin_policy(digest) else { return };
+        // Refresh never trusts old DNS pins. Bound control-plane delay,
+        // refuse any mixed rules or non-public IPs, and keep the exact IP.
+        let Ok(Ok(ips)) = timeout(Duration::from_secs(2), self.resolve_routing(name, digest)).await else {
+            cache.dpi.invalidate_refresh(target);
+            return;
+        };
+        if pin.check().is_err() || ips.is_empty() || ips.len() > 64 || !ips.contains(&address.ip())
+            || !ips.iter().all(|ip| crate::server::allowed_destination(*ip, false)
+                && policy.classify(crate::routing::Evidence::Known(name), crate::routing::Evidence::Known(*ip))
+                    == Ok(crate::routing::Classification::Matched(Action::DirectDpi))) {
+            cache.dpi.invalidate_refresh(target);
+            return;
+        }
+        cache.dpi.refresh_tcp(target).await;
+    }
+
     fn own_routing_scope(&self) -> Option<&str> {
         match self {
             Self::H2(c) => c.own_routing_scope(),
@@ -1361,7 +1411,7 @@ async fn routed_open_selected(
                     }
                     if permitted {
                         if let Some(tunnel) =
-                            cache.dpi.open_checked(name, port, &ips, snapshot.digest()).await?
+                            carrier.warm_during(cache.dpi.open_checked(name, port, &ips, snapshot.digest())).await?
                         {
                             authorization.check()?;
                             return Ok(ProxyTunnel::Dpi(Box::new(DpiRoute {
@@ -1496,9 +1546,9 @@ async fn routed_udp_selected(
                     ) == Ok(crate::routing::Classification::Matched(Action::DirectDpi))) {
                         return Err(ClientError::Open(ErrorCode::PolicyDenied));
                     }
-                    if let Some(verified) = cache.dpi.open_udp_checked(
+                    if let Some(verified) = carrier.warm_during(cache.dpi.open_proxy_udp_checked(
                         name, port, &ips, snapshot.digest(), strategy,
-                    ).await? {
+                    )).await? {
                         authorization.check()?;
                         let carrier = carrier.clone();
                         let target = address.clone();
@@ -1686,7 +1736,20 @@ impl ProxyClient {
         };
         let routing = async {
             loop {
-                let _ = self.refresh_routing_policy().await;
+                if let Ok(snapshot) = self.refresh_routing_policy().await {
+                    // No speculative native capture traffic. Proxy runtime
+                    // owns this future; generation change cancels it.
+                    if !crate::routing::carrier_socket::active() {
+                        match self {
+                            Self::Direct(client) => client.carrier.refresh_recent_tcp(&client.routing, &snapshot).await,
+                            Self::Reality(client) => {
+                                if let Ok(generation) = client.generation().await {
+                                    generation.carrier.refresh_recent_tcp(&client.routing, &snapshot).await;
+                                }
+                            }
+                        }
+                    }
+                }
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         };

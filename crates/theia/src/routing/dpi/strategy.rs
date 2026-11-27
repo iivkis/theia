@@ -38,6 +38,7 @@ pub(super) struct Key {
 pub(super) enum Verdict {
     Verified(Strategy),
     UdpVerified,
+    Denied,
     Unavailable,
     Avoid { strategy: Strategy, until: Instant },
 }
@@ -62,17 +63,25 @@ struct Entry {
     lease: Lease,
     verdict: Verdict,
     expires: Instant,
+    last_use: Option<Instant>,
+    refresh_attempt: Option<Instant>,
 }
 
 #[derive(Clone, Copy)]
 struct Sample {
     millis: u32,
+    deviation: u32,
+    observed: bool,
+    rtt: Option<(u32, u32)>,
     failures: u32,
 }
 impl Default for Sample {
     fn default() -> Self {
         Self {
             millis: 1000,
+            deviation: 0,
+            observed: false,
+            rtt: None,
             failures: 0,
         }
     }
@@ -101,9 +110,92 @@ impl Cache {
         }
         order
     }
-    pub(super) fn observe(&self, key: &Key, strategy: Strategy, good: bool, elapsed: Duration) {
+    /// Measured handshake latency AND independent round-trip estimates.
+    /// EWMA + variation and a conservative margin; failures back off,
+    /// never exceed the established per-protocol hard deadline.
+    fn budget(&self, key: &Key, index: usize, cap: Duration) -> Duration {
+        let sample = self.1.lock().ok().and_then(|mut history| {
+            history.retain(|entry| entry.expires > Instant::now());
+            history.iter().find(|entry| &entry.key == key).map(|entry| entry.samples[index])
+        }).unwrap_or_default();
+        if !sample.observed { return cap; }
+        let ceiling = cap.as_millis().min(u128::from(u32::MAX)) as u32;
+        let handshake = sample.millis.saturating_mul(2)
+            .saturating_add(sample.deviation.saturating_mul(4));
+        let network = sample.rtt.map_or(0, |(rtt, variation)| {
+            rtt.saturating_mul(3).saturating_add(variation.saturating_mul(4))
+        });
+        let predicted = handshake.max(network).saturating_add(100)
+            .saturating_mul(1 + sample.failures.min(3));
+        Duration::from_millis(u64::from(predicted.clamp(350.min(ceiling), ceiling)))
+    }
+
+    pub(super) fn tcp_budget(&self, key: &Key, strategy: Strategy, cap: Duration) -> Duration {
+        self.budget(key, strategy.index(), cap)
+    }
+
+    pub(super) fn udp_budget(&self, key: &Key, probe: UdpProbe, cap: Duration) -> Duration {
+        self.budget(key, probe.index(), cap)
+    }
+
+    /// Only actual foreground commitment marks a target recently used.
+    pub(super) fn touch_tcp(&self, key: &Key, lease: &Lease) {
+        let Ok(mut entries) = self.0.lock() else { return };
+        let now = Instant::now();
+        if let Some(entry) = entries.iter_mut().find(|e| &e.key == key && e.probe.is_none()
+            && e.expires > now && e.lease.same(lease) && matches!(e.verdict, Verdict::Verified(_))) {
+            entry.last_use = Some(now);
+        }
+    }
+
+    /// At most one background candidate per tick. No speculative targets,
+    /// no indefinite refresh without new application traffic.
+    pub(super) fn due_tcp(&self) -> Option<(Key, Strategy, Lease)> {
+        let mut entries = self.0.lock().ok()?;
+        let now = Instant::now();
+        let entry = entries.iter_mut().filter(|e| e.probe.is_none()
+            && e.expires > now && e.expires.saturating_duration_since(now) <= Duration::from_secs(12)
+            && e.last_use.is_some_and(|t| now.duration_since(t) <= Duration::from_secs(90))
+            && e.refresh_attempt.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(15))
+            && matches!(e.verdict, Verdict::Verified(_)))
+            .min_by_key(|e| e.expires)?;
+        let Verdict::Verified(strategy) = entry.verdict else { return None };
+        entry.refresh_attempt = Some(now);
+        Some((entry.key.clone(), strategy, entry.lease.clone()))
+    }
+
+    pub(super) fn denied_tcp(&self, key: &Key) -> bool {
+        self.evidence(key).is_some_and(|(verdict, _)| verdict == Verdict::Denied)
+    }
+
+    pub(super) fn deny_tcp(&self, key: &Key, lease: &Lease) {
+        let Ok(mut entries) = self.0.lock() else { return };
+        let now = Instant::now();
+        if let Some(entry) = entries.iter_mut().find(|e| &e.key == key && e.probe.is_none()
+            && e.expires > now && e.lease.same(lease) && matches!(e.verdict, Verdict::Verified(_))) {
+            entry.verdict = Verdict::Denied;
+            entry.expires = now + NEGATIVE_TTL;
+        }
+    }
+
+    /// Compare-and-refresh a positive publication. A stale background
+    /// result cannot overwrite a foreground outcome, and keeps last_use.
+    pub(super) fn renew_tcp(&self, key: &Key, strategy: Strategy, lease: &Lease) -> bool {
+        let Ok(mut entries) = self.0.lock() else { return false };
+        let now = Instant::now();
+        let Some(entry) = entries.iter_mut().find(|e| &e.key == key && e.probe.is_none()
+            && e.expires > now && e.lease.same(lease) && e.verdict == Verdict::Verified(strategy))
+        else { return false };
+        // Same immutable strategy and scope; do not invalidate a pending
+        // flow solely because its evidence was independently refreshed.
+        entry.expires = now + POSITIVE_TTL;
+        true
+    }
+
+    pub(super) fn observe(&self, key: &Key, strategy: Strategy, good: bool,
+        elapsed: Duration, rtt: Option<Duration>) {
         if network_scope::observe(key.address) == Some(key.network) {
-            self.sample(key, strategy, good, elapsed);
+            self.sample_timing(key, strategy.index(), good, elapsed, rtt);
         }
     }
     fn sample(&self, key: &Key, strategy: Strategy, good: bool, elapsed: Duration) {
@@ -111,6 +203,10 @@ impl Cache {
     }
 
     fn sample_index(&self, key: &Key, index: usize, good: bool, elapsed: Duration) {
+        self.sample_timing(key, index, good, elapsed, None);
+    }
+
+    fn sample_timing(&self, key: &Key, index: usize, good: bool, elapsed: Duration, rtt: Option<Duration>) {
         let Ok(mut history) = self.1.lock() else {
             return;
         };
@@ -128,7 +224,23 @@ impl Cache {
         if good {
             sample.failures = sample.failures.saturating_sub(1);
             let millis = elapsed.as_millis().clamp(1, 2000) as u32;
-            sample.millis = (sample.millis * 3 + millis) / 4;
+            if sample.observed {
+                sample.deviation = (sample.deviation * 3 + sample.millis.abs_diff(millis)) / 4;
+                sample.millis = (sample.millis * 3 + millis) / 4;
+            } else {
+                sample.millis = millis;
+                sample.deviation = millis / 2;
+                sample.observed = true;
+            }
+            // No RTT sample from a failed, canceled or unauthenticated probe.
+            if let Some(rtt) = rtt {
+                let value = rtt.as_millis().clamp(1, 2000) as u32;
+                sample.rtt = Some(match sample.rtt {
+                    Some((old, variation)) => ((old * 7 + value) / 8,
+                        (variation * 3 + old.abs_diff(value)) / 4),
+                    None => (value, value / 2),
+                });
+            }
         } else {
             sample.failures = sample.failures.saturating_add(1).min(8);
         }
@@ -187,7 +299,7 @@ impl Cache {
         }
         let ttl = match verdict {
             Verdict::Verified(_) | Verdict::UdpVerified | Verdict::Avoid { .. } => POSITIVE_TTL,
-            Verdict::Unavailable => NEGATIVE_TTL,
+            Verdict::Unavailable | Verdict::Denied => NEGATIVE_TTL,
         };
         let lease = Lease::new();
         cache.push_back(Entry {
@@ -196,6 +308,8 @@ impl Cache {
             lease: lease.clone(),
             verdict,
             expires: now + ttl,
+            last_use: None,
+            refresh_attempt: None,
         });
         Some(lease)
     }
@@ -209,9 +323,10 @@ impl Cache {
         self.insert_kind(key, Some(probe), if good { Verdict::UdpVerified } else { Verdict::Unavailable })
     }
 
-    pub(super) fn observe_udp(&self, key: &Key, probe: UdpProbe, good: bool, elapsed: Duration) {
+    pub(super) fn observe_udp(&self, key: &Key, probe: UdpProbe, good: bool,
+        elapsed: Duration, rtt: Option<Duration>) {
         if network_scope::observe(key.address) == Some(key.network) {
-            self.sample_index(key, probe.index(), good, elapsed);
+            self.sample_timing(key, probe.index(), good, elapsed, rtt);
         }
     }
 
@@ -327,6 +442,54 @@ mod tests {
         );
         key.policy = [2; 32];
         assert_eq!(cache.ranked(&key), Strategy::ALL);
+    }
+
+    #[test]
+    fn adaptive_budget_uses_successful_round_trip_and_latency_only() {
+        let cache = Cache::default();
+        let address = "127.0.0.1:443".parse().unwrap();
+        let mut key = Key { name: "example.org".into(), address, policy: [1;32], epoch: 1,
+            network: network_scope::Scope::fixture(address, 0) };
+        let cap = Duration::from_secs(2);
+        let index = Strategy::Header.index();
+        assert_eq!(cache.tcp_budget(&key, Strategy::Header, cap), cap);
+        cache.sample_timing(&key, index, true, Duration::from_millis(70), Some(Duration::from_millis(30)));
+        let fast = cache.tcp_budget(&key, Strategy::Header, cap);
+        assert!(fast >= Duration::from_millis(350) && fast < cap);
+        cache.sample_timing(&key, index, false, Duration::ZERO, Some(Duration::from_millis(1)));
+        assert!(cache.tcp_budget(&key, Strategy::Header, cap) > fast);
+        for _ in 0..8 {
+            cache.sample_timing(&key, index, true, Duration::from_millis(900), Some(Duration::from_millis(700)));
+        }
+        assert_eq!(cache.tcp_budget(&key, Strategy::Header, cap), cap);
+        key.epoch += 1;
+        assert_eq!(cache.tcp_budget(&key, Strategy::Header, cap), cap);
+    }
+
+    #[test]
+    fn refresh_requires_real_recent_use_and_exact_live_publication() {
+        let cache = Cache::default();
+        let address = "127.0.0.1:443".parse().unwrap();
+        let key = Key { name: "example.org".into(), address, policy: [1;32], epoch: 1,
+            network: network_scope::Scope::fixture(address, 0) };
+        let strategy = Strategy::Header;
+        let old = cache.insert(&key, Verdict::Verified(strategy)).unwrap();
+        cache.0.lock().unwrap()[0].expires = Instant::now() + Duration::from_secs(8);
+        assert!(cache.due_tcp().is_none(), "probe alone must not schedule background traffic");
+        cache.touch_tcp(&key, &old);
+        let (_, chosen, due) = cache.due_tcp().unwrap();
+        assert_eq!(chosen, strategy);
+        assert!(due.same(&old));
+        assert!(cache.due_tcp().is_none(), "refresh must be single flight/rate limited");
+        assert!(cache.renew_tcp(&key, strategy, &old));
+        assert!(cache.current(&key, strategy, &old));
+        let fresh = cache.insert(&key, Verdict::Verified(strategy)).unwrap();
+        assert!(!cache.renew_tcp(&key, strategy, &old));
+        cache.deny_tcp(&key, &old);
+        assert!(cache.current(&key, strategy, &fresh));
+        cache.deny_tcp(&key, &fresh);
+        assert!(cache.denied_tcp(&key));
+        assert!(!cache.renew_tcp(&key, strategy, &fresh));
     }
 
     #[test]

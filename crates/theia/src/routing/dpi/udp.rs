@@ -163,16 +163,20 @@ pub(super) async fn probe_stun(
     socket: &tokio::net::UdpSocket,
     strategy: BindingStrategy,
 ) -> Option<()> {
-    probe_stun_checked(socket, strategy, || true).await.ok().flatten()
+    probe_stun_checked(socket, strategy, || true).await.ok().flatten().map(|_| ())
 }
 
 /// An independent STUN request never contains application bytes. An
 /// unavailable response is not proof of modification or peer identity.
+pub(super) struct ProbeTiming {
+    pub(super) rtt: Option<Duration>,
+}
+
 pub(super) async fn probe_stun_checked(
     socket: &tokio::net::UdpSocket,
     strategy: BindingStrategy,
     live: impl Fn() -> bool,
-) -> Result<Option<()>, crate::client::ClientError> {
+) -> Result<Option<ProbeTiming>, crate::client::ClientError> {
     use crate::client::ClientError;
     use ring::rand::{SecureRandom, SystemRandom};
     let mut request = [0u8; 20];
@@ -182,6 +186,7 @@ pub(super) async fn probe_stun_checked(
     let expected = plain_binding(&request).ok_or(ClientError::Protocol)?;
     let packet = prepare_binding(&request, strategy).ok_or(ClientError::Protocol)?;
     if !live() { return Err(super::stale_policy()); }
+    let started = Instant::now();
     if let Err(error) = crate::udp_relay::send_datagram(socket, &packet).await {
         return if error.kind() == std::io::ErrorKind::PermissionDenied {
             Err(super::stale_policy())
@@ -197,7 +202,7 @@ pub(super) async fn probe_stun_checked(
         };
         if !live() { return Err(super::stale_policy()); }
         if binding_success(&response[..n]).is_some_and(|actual| expected.matches_response(actual)) {
-            return Ok(Some(()));
+            return Ok(Some(ProbeTiming { rtt: Some(started.elapsed()) }));
         }
     }
     Ok(None)
@@ -386,7 +391,7 @@ pub(super) async fn probe_quic(
     version: crate::quic_core::wire::Version,
 ) -> Option<()> {
     probe_quic_checked(name, address, scope, config, version, Duration::from_secs(5))
-        .await.ok().flatten()
+        .await.ok().flatten().map(|_| ())
 }
 
 /// Only a conclusively unavailable network endpoint permits fallback.
@@ -399,7 +404,7 @@ pub(super) async fn probe_quic_checked(
     config: std::sync::Arc<rustls::ClientConfig>,
     version: crate::quic_core::wire::Version,
     budget: Duration,
-) -> Result<Option<()>, crate::client::ClientError> {
+) -> Result<Option<ProbeTiming>, crate::client::ClientError> {
     use crate::{client::ClientError, quic_core::{dial, negotiation::VersionPolicy}};
     let mut tls = (*config).clone();
     tls.alpn_protocols = vec![b"h3".to_vec()];
@@ -416,8 +421,9 @@ pub(super) async fn probe_quic_checked(
         Err(_) => return Err(ClientError::Tls),
     };
     if negotiated != version { return Err(ClientError::Protocol); }
+    let rtt = session.measured_rtt();
     dial::close_probe(session).await.map_err(|_| ClientError::Tls)?;
-    Ok(Some(()))
+    Ok(Some(ProbeTiming { rtt }))
 }
 
 #[cfg(test)]

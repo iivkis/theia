@@ -45,6 +45,7 @@ use strategy::{Key, Lease, Strategy, Verdict};
 use tokio::{io::AsyncWriteExt, net::TcpStream, sync::Semaphore, time::timeout};
 
 const ATTEMPT: Duration = Duration::from_secs(2);
+const PROBE_WAVE: usize = 2;
 const OPEN_BUDGET: Duration = Duration::from_secs(6);
 const FIRST_FLIGHT: Duration = Duration::from_secs(5);
 
@@ -131,6 +132,7 @@ impl VerifiedUdp {
             epoch: self.key.epoch,
             scope: self.engine.enabled().then_some((self.key.address, self.key.network)),
             require_stun: matches!(self.strategy, UdpStrategy::StunBinding(_)),
+            tcp_evidence: None,
         }
     }
 
@@ -333,7 +335,7 @@ impl Engine {
     }
 
     pub(crate) fn pin_policy(self: &Arc<Self>, digest: [u8; 32]) -> Result<FallbackPolicy, ClientError> {
-        Ok(FallbackPolicy { engine: self.clone(), digest, epoch: self.policy_epoch(digest)?, scope: None, require_stun: false })
+        Ok(FallbackPolicy { engine: self.clone(), digest, epoch: self.policy_epoch(digest)?, scope: None, require_stun: false, tcp_evidence: None })
     }
 
     fn check_key_policy(&self, key: &Key) -> Result<(), ClientError> {
@@ -411,6 +413,27 @@ impl Engine {
         self.open_udp_checked(name, port, ips, policy, UdpStrategy::StunBinding(udp::BindingStrategy::Fingerprint)).await.ok().flatten()
     }
 
+    /// Product selection must not confuse ordinary QUIC reachability
+    /// with a verified active de-coalescing probe. The current native
+    /// dialer disables tickets/0-RTT and uses MTU 1200, so it cannot produce
+    /// the required independently originated coalesced first flight.
+    pub(crate) async fn open_proxy_udp_checked(
+        self: &Arc<Self>, name: &str, port: u16, ips: &[IpAddr], policy: [u8;32],
+        strategy: UdpStrategy,
+    ) -> Result<Option<VerifiedUdp>, ClientError> {
+        let pin = self.pin_policy(policy)?;
+        if matches!(strategy, UdpStrategy::Quic(_)) {
+            // Fail closed to an authorized pre-send XHTTP fallback, without
+            // probing the target or reusing lab-only reachability evidence.
+            if ips.len() > 64 || !ips.iter().all(|ip| crate::server::allowed_destination(*ip, false)) {
+                return Err(stale_policy());
+            }
+            pin.check()?;
+            return Ok(None);
+        }
+        self.open_udp_checked(name, port, ips, policy, strategy).await
+    }
+
     /// Ok(None) is a safe pre-user-write fallback. Err is a protective
     /// refusal. Probe evidence authenticates QUIC reachability only; the
     /// product route must separately require accepted active transformation.
@@ -432,8 +455,9 @@ impl Engine {
         let probe = strategy.probe();
         let deadline = tokio::time::Instant::now() + OPEN_BUDGET;
         let keys = self.ranked_udp_keys(&name, port, ips, policy, pin.epoch, probe);
-        let result = timeout(OPEN_BUDGET, async {
-            for key in keys {
+        let probe_key = |key: Key| {
+            let name = &name;
+            async move {
                 let address = key.address;
                 let live = || self.key_live(&key) && (!stun || self.stun_enabled());
                 let slot = &self.probe_slots[self.probe_slot(&name, address, policy)];
@@ -443,16 +467,17 @@ impl Engine {
                 if !live() { return Err(stale_policy()); }
                 let cached = self.udp_evidence(&key, probe);
                 let lease = match cached {
-                    Some((false, _)) => continue,
+                    Some((false, _)) => return Ok(None),
                     Some((true, lease)) if !stun => {
                         crate::traffic::dpi_cache_hit();
                         lease
                     }
                     _ => {
                         let Ok(_permit) = self.probes.try_acquire() else { return Ok(None) };
-                        let budget = if stun { Duration::from_millis(1200) } else { ATTEMPT };
+                        let ceiling = if stun { Duration::from_millis(1200) } else { ATTEMPT };
+                        let budget = self.cache.udp_budget(&key, probe, ceiling);
                         if deadline.saturating_duration_since(tokio::time::Instant::now()) < budget + ATTEMPT {
-                            break;
+                            return Ok(None);
                         }
                         let started = std::time::Instant::now();
                         let result = match strategy {
@@ -461,7 +486,7 @@ impl Engine {
                                 if !live() { return Err(stale_policy()); }
                                 // A shorter outer budget must not mask a
                                 // received but unauthenticated QUIC handshake.
-                                if deadline.saturating_duration_since(tokio::time::Instant::now()) < budget + ATTEMPT { break; }
+                                if deadline.saturating_duration_since(tokio::time::Instant::now()) < budget + ATTEMPT { return Ok(None); }
                                 let revoked = async {
                                     loop {
                                         if !live() { return Err(stale_policy()); }
@@ -475,7 +500,7 @@ impl Engine {
                                 }
                             }
                             UdpStrategy::StunBinding(binding) => {
-                                let Some((socket, _admission)) = scoped_udp_checked(address, key.network).await? else { continue };
+                                let Some((socket, _admission)) = scoped_udp_checked(address, key.network).await? else { return Ok(None) };
                                 if !live() { return Err(stale_policy()); }
                                 match timeout(budget, udp::probe_stun_checked(&socket, binding, &live)).await {
                                     Ok(result) => result?,
@@ -485,24 +510,38 @@ impl Engine {
                         };
                         if !live() { return Err(stale_policy()); }
                         let good = result.is_some();
-                        self.cache.observe_udp(&key, probe, good, started.elapsed());
+                        self.cache.observe_udp(&key, probe, good, started.elapsed(), result.and_then(|sample| sample.rtt));
                         if stun { crate::traffic::udp_stun_probe(good); } else { crate::traffic::dpi_probe(good); }
                         let Some(lease) = self.remember_udp(key.clone(), probe, good) else { return Err(stale_policy()) };
-                        if !good { continue; }
+                        if !good { return Ok(None); }
                         lease
                     }
                 };
                 if !live() { return Err(stale_policy()); }
-                if !self.udp_current(&key, probe, &lease) { continue; }
-                let Some((socket, admission)) = scoped_udp_checked(address, key.network).await? else { continue };
+                if !self.udp_current(&key, probe, &lease) { return Ok(None); }
+                let Some((socket, admission)) = scoped_udp_checked(address, key.network).await? else { return Ok(None) };
                 if !live() { return Err(stale_policy()); }
                 if self.udp_current(&key, probe, &lease) {
                     return Ok(Some(VerifiedUdp {
                         socket, strategy, lease, _admission: admission, engine: self.clone(), key,
                     }));
                 }
+                Ok(None)
             }
-            Ok(None)
+        };
+        let result = timeout(OPEN_BUDGET, async {
+            let mut keys = keys.into_iter();
+            let Some(first) = keys.next() else { return Ok(None) };
+            let second = keys.next();
+            let (left, right) = tokio::join!(
+                probe_key(first),
+                async { match second { Some(key) => probe_key(key).await, None => Ok(None) } }
+            );
+            // Never use a positive peer to mask an identity or policy error
+            // from the other completed probe. Both share the global cap.
+            let left = left?;
+            let right = right?;
+            Ok(left.or(right))
         }).await;
         pin.check()?;
         if !self.enabled() || (stun && !self.stun_enabled()) { return Err(stale_policy()); }
@@ -538,7 +577,7 @@ impl Engine {
                 let Some(network) = network_scope::observe(address) else { continue };
                 let key = Key { name: name.clone(), address, policy, epoch, network };
                 let slot = self.probe_slot(&key.name, address, policy);
-                let guard = self.probe_slots[slot].lock().await;
+                let Ok(guard) = timeout(Duration::from_millis(250), self.probe_slots[slot].lock()).await else { return Ok(None) };
                 if !self.key_live(&key) { return Err(stale_policy()); }
                 let (strategy, lease) = match self.cache.evidence(&key) {
                     Some((Verdict::Verified(strategy), lease)) => {
@@ -546,8 +585,8 @@ impl Engine {
                         (strategy, lease)
                     }
                     Some((Verdict::Unavailable, _)) => continue,
+                    Some((Verdict::Denied, _)) => return Err(stale_policy()),
                     previous => {
-                        let Ok(_permit) = self.probes.try_acquire() else { return Ok(None) };
                         let Ok(Some(config)) = tokio::task::spawn_blocking(tls::native_config).await else { return Ok(None) };
                         let mut verified = None;
                         let mut attempted = 0;
@@ -555,30 +594,59 @@ impl Engine {
                         if let Some((Verdict::Avoid { strategy: failed, .. }, _)) = previous {
                             order.sort_by_key(|strategy| *strategy == failed);
                         }
-                        for strategy in order {
+                        // Parallel bounded waves. Collect both completed
+                        // outcomes before selection so a protective refusal
+                        // cannot be hidden behind a faster positive probe.
+                        for wave in order.chunks(PROBE_WAVE) {
                             if !self.key_live(&key) { return Err(stale_policy()); }
-                            if deadline.saturating_duration_since(tokio::time::Instant::now()) < ATTEMPT + ATTEMPT {
-                                break;
-                            }
-                            let started = std::time::Instant::now();
-                            let verdict = tls::probe_guarded(
-                                &name, address, Some(network), strategy, config.clone(), ATTEMPT,
-                                || self.key_live(&key),
-                            ).await;
+                            let probe = |strategy: Strategy| {
+                                let key = &key;
+                                let name = &name;
+                                let config = config.clone();
+                                async move {
+                                    let budget = self.cache.tcp_budget(key, strategy, ATTEMPT);
+                                    if deadline.saturating_duration_since(tokio::time::Instant::now()) < budget + ATTEMPT {
+                                        return None;
+                                    }
+                                    let _permit = self.probes.try_acquire().ok()?;
+                                    let started = std::time::Instant::now();
+                                    let mut rtt = None;
+                                    let verdict = tls::probe_measured(
+                                        name, address, Some(network), strategy, config, budget,
+                                        || self.key_live(key), &mut rtt,
+                                    ).await;
+                                    Some((strategy, verdict, started.elapsed(), rtt))
+                                }
+                            };
+                            let (first, second) = tokio::join!(
+                                probe(wave[0]),
+                                async { match wave.get(1) { Some(&strategy) => probe(strategy).await, None => None } }
+                            );
                             if !self.key_live(&key) { return Err(stale_policy()); }
                             use tls::ProbeVerdict::*;
-                            match verdict {
-                                Verified | StrategyFailed => {
+                            let outcomes = [first, second];
+                            for (_, verdict, _, _) in outcomes.iter().flatten() {
+                                match verdict {
+                                    IdentityRejected => return Err(ClientError::Tls),
+                                    Denied => return Err(stale_policy()),
+                                    _ => {}
+                                }
+                            }
+                            let mut best = None;
+                            for (strategy, verdict, elapsed, rtt) in outcomes.into_iter().flatten() {
+                                if matches!(verdict, Verified | StrategyFailed) {
                                     let good = verdict == Verified;
                                     attempted += 1;
-                                    self.cache.observe(&key, strategy, good, started.elapsed());
+                                    self.cache.observe(&key, strategy, good, elapsed, rtt);
                                     crate::traffic::dpi_probe(good);
-                                    if good { verified = Some(strategy); break; }
+                                    if good && best.is_none_or(|(_, prior)| elapsed < prior) {
+                                        best = Some((strategy, elapsed));
+                                    }
                                 }
-                                // No first-write evidence: don't poison strategy history.
-                                Unavailable => break,
-                                IdentityRejected => return Err(ClientError::Tls),
-                                Denied => return Err(stale_policy()),
+                            }
+                            if let Some((strategy, _)) = best {
+                                verified = Some(strategy);
+                                break;
                             }
                         }
                         if !self.key_live(&key) { return Err(stale_policy()); }
@@ -596,6 +664,7 @@ impl Engine {
                 };
                 drop(guard);
                 if !self.key_live(&key) { return Err(stale_policy()); }
+                if self.cache.denied_tcp(&key) { return Err(stale_policy()); }
                 if !self.cache.current(&key, strategy, &lease) { continue; }
                 match timeout(ATTEMPT, tcp::connect(address)).await {
                     Ok(Ok((target, admission))) => {
@@ -624,6 +693,62 @@ impl Engine {
         result.unwrap_or(Ok(None))
     }
 
+    pub(crate) fn due_tcp_refresh(&self) -> Option<RefreshTarget> {
+        if !self.enabled() || self.retired() { return None; }
+        let (key, strategy, lease) = self.cache.due_tcp()?;
+        self.key_live(&key).then_some(RefreshTarget { key, strategy, lease })
+    }
+
+    /// Caller must freshly resolve protected DNS and classify all pins
+    /// against the current snapshot before invoking this background probe.
+    pub(crate) fn invalidate_refresh(&self, target: RefreshTarget) {
+        if self.key_live(&target.key) { self.cache.deny_tcp(&target.key, &target.lease); }
+    }
+
+    pub(crate) async fn refresh_tcp(&self, target: RefreshTarget) {
+        let RefreshTarget { key, strategy, lease } = target;
+        if !self.key_live(&key) { return; }
+        let slot = &self.probe_slots[self.probe_slot(&key.name, key.address, key.policy)];
+        let Ok(_guard) = slot.try_lock() else { return };
+        let Ok(_permit) = self.probes.try_acquire() else { return };
+        if !self.key_live(&key) || !self.cache.current(&key, strategy, &lease) { return; }
+        let Ok(Some(config)) = tokio::task::spawn_blocking(tls::native_config).await else { return };
+        let budget = self.cache.tcp_budget(&key, strategy, ATTEMPT);
+        let started = std::time::Instant::now();
+        let mut rtt = None;
+        let verdict = tls::probe_measured(&key.name, key.address, Some(key.network), strategy,
+            config, budget, || self.key_live(&key) && self.cache.current(&key, strategy, &lease), &mut rtt).await;
+        if !self.key_live(&key) || !self.cache.current(&key, strategy, &lease) { return; }
+        match verdict {
+            tls::ProbeVerdict::Verified => {
+                if self.cache.renew_tcp(&key, strategy, &lease) {
+                    self.cache.observe(&key, strategy, true, started.elapsed(), rtt);
+                    crate::traffic::dpi_probe(true);
+                }
+            }
+            tls::ProbeVerdict::StrategyFailed => {
+                self.cache.failed(&key, strategy, &lease);
+                crate::traffic::dpi_probe(false);
+            }
+            // Never convert a protective refusal to a cached fallback.
+            // Expire the original evidence, forcing fresh foreground validation.
+            tls::ProbeVerdict::IdentityRejected | tls::ProbeVerdict::Denied =>
+                self.cache.deny_tcp(&key, &lease),
+            tls::ProbeVerdict::Unavailable => {}
+        }
+    }
+
+}
+
+pub(crate) struct RefreshTarget {
+    key: Key,
+    strategy: Strategy,
+    lease: Lease,
+}
+impl RefreshTarget {
+    pub(crate) fn name(&self) -> &str { &self.key.name }
+    pub(crate) fn address(&self) -> SocketAddr { self.key.address }
+    pub(crate) fn digest(&self) -> [u8;32] { self.key.policy }
 }
 
 pub(crate) struct Tunnel {
@@ -648,11 +773,15 @@ pub(crate) struct FallbackPolicy {
     epoch: u64,
     scope: Option<(SocketAddr, network_scope::Scope)>,
     require_stun: bool,
+    tcp_evidence: Option<Key>,
 }
 impl FallbackPolicy {
     pub(crate) fn check(&self) -> Result<(), ClientError> {
         if self.engine.policy_epoch(self.digest)? != self.epoch { return Err(stale_policy()); }
         if self.require_stun && !self.engine.stun_enabled() { return Err(stale_policy()); }
+        if self.tcp_evidence.as_ref().is_some_and(|key| self.engine.cache.denied_tcp(key)) {
+            return Err(stale_policy());
+        }
         if self.scope.is_some_and(|(address, scope)| !self.engine.enabled() || network_scope::observe(address) != Some(scope)) {
             return Err(stale_policy());
         }
@@ -691,6 +820,7 @@ impl Tunnel {
             epoch: self.key.epoch,
             scope: self.engine.enabled().then_some((self.key.address, self.key.network)),
             require_stun: false,
+            tcp_evidence: Some(self.key.clone()),
         }
     }
 
@@ -719,6 +849,7 @@ impl Tunnel {
         // A superseded/expired policy is not permission for VPS fallback.
         self.engine.check_key_policy(&self.key)?;
         if flow.is_some() && !self.engine.key_live(&self.key) { return Err(stale_policy()); }
+        if self.engine.cache.denied_tcp(&self.key) { return Err(stale_policy()); }
         let transformed = if ready {
             tls::transform(&prefix, &self.key.name, self.strategy)
         } else {
@@ -743,6 +874,7 @@ impl Tunnel {
         if !self.target.local_addr().is_ok_and(|local| self.key.network.matches_local(local)) {
             return Err(stale_policy());
         }
+        if self.engine.cache.denied_tcp(&self.key) { return Err(stale_policy()); }
         if !self.engine.cache.current(&self.key, self.strategy, &self.lease) {
             return Ok(RelayOutcome::Fallback { client, prefix });
         }
@@ -795,6 +927,7 @@ impl Tunnel {
         timeout(FIRST_FLIGHT, tcp::write_checked(&mut client, &response, &check_scope))
             .await.map_err(|_| ClientError::Timeout)??;
         let hello_elapsed = started.elapsed();
+        if flow.is_some() { self.engine.cache.touch_tcp(&self.key, &self.lease); }
         crate::traffic::dpi_first_response();
         let (result, exchanged, peer_failure) = super::client_state::relay_direct_after_first(
             client,
@@ -952,6 +1085,7 @@ mod tests {
             epoch: engine.policy_epoch(digest).unwrap(),
             scope: None,
             require_stun: false,
+            tcp_evidence: None,
         };
         assert!(authorization.check().is_ok());
         engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(
@@ -992,6 +1126,26 @@ mod tests {
             engine.cached_udp(&key, UdpProbe::Quic(Version::V1)),
             Some(true)
         );
+    }
+
+    #[tokio::test]
+    async fn product_quic_requires_active_probe_not_reachability_cache() {
+        let engine = Arc::new(Engine::default());
+        let policy = [1; 32];
+        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(policy)));
+        engine.set_enabled(true);
+        let public: IpAddr = "8.8.8.8".parse().unwrap();
+        for version in [crate::quic_core::wire::Version::V1, crate::quic_core::wire::Version::V2] {
+            // The product path must exit before any local target network I/O
+            // while native active first-flight generation is unavailable.
+            assert!(matches!(engine.open_proxy_udp_checked(
+                "example.org", 443, &[public], policy, UdpStrategy::Quic(version)
+            ).await, Ok(None)));
+        }
+        let private: IpAddr = "127.0.0.1".parse().unwrap();
+        assert!(matches!(engine.open_proxy_udp_checked("localhost", 443, &[private], policy,
+            UdpStrategy::Quic(crate::quic_core::wire::Version::V1)).await,
+            Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied))));
     }
 
     #[tokio::test]

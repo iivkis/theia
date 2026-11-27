@@ -308,6 +308,7 @@ pub(super) async fn probe(
         == ProbeVerdict::Verified).then_some(())
 }
 
+#[cfg(test)]
 pub(super) async fn probe_guarded(
     name: &str,
     address: SocketAddr,
@@ -317,12 +318,29 @@ pub(super) async fn probe_guarded(
     budget: std::time::Duration,
     live: impl Fn() -> bool,
 ) -> ProbeVerdict {
+    let mut rtt = None;
+    probe_measured(name, address, scope, strategy, config, budget, live, &mut rtt).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn probe_measured(
+    name: &str,
+    address: SocketAddr,
+    scope: Option<crate::network_scope::Scope>,
+    strategy: Strategy,
+    config: Arc<rustls::ClientConfig>,
+    budget: std::time::Duration,
+    live: impl Fn() -> bool,
+    rtt: &mut Option<std::time::Duration>,
+) -> ProbeVerdict {
     use ProbeVerdict::*;
     use tokio::time::{timeout_at, Instant};
     if !live() { return Denied; }
     let Ok(server_name) = rustls::pki_types::ServerName::try_from(name.to_owned()) else { return Denied };
     let Ok(mut tls) = rustls::ClientConnection::new(config, server_name) else { return Unavailable };
     let deadline = Instant::now() + budget;
+    *rtt = None;
+    let connected_at = std::time::Instant::now();
     let (mut socket, _admission) = match timeout_at(deadline, super::tcp::connect(address)).await {
         Ok(Ok(value)) => value,
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => return Denied,
@@ -333,6 +351,9 @@ pub(super) async fn probe_guarded(
     }) {
         return Denied;
     }
+    // TCP connect duration is a portable SYN round-trip estimate, not
+    // kernel TCP_INFO SRTT. Only authenticated success publishes it.
+    *rtt = Some(connected_at.elapsed());
     let mut attempted = false;
     let result = timeout_at(deadline, async {
         let mut first = true;

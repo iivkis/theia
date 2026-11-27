@@ -743,6 +743,17 @@ impl H2Client {
         self.open_inner(open, operation, stream_up, stage).await
     }
 
+    pub(crate) async fn warm_carrier(&self) -> Result<(), ClientError> {
+        let reusable = self.reuse_connections && self.certificate_pin.is_none()
+            && matches!(&self.connector, H2Tls::Rustls(_));
+        if !reusable { return Ok(()); }
+        let route = self.endpoint.parse().ok().and_then(crate::network_scope::observe);
+        self.pool.warm(route, |connection| !connection.driver.0.is_finished(),
+            self.connect_verified(diagnostics::next_id()),
+            || route.is_some() && self.endpoint.parse().ok().and_then(crate::network_scope::observe) == route,
+        ).await
+    }
+
     async fn connect_verified(&self, operation: u64) -> Result<H2Connection, ClientError> {
         let (socket, controller, carrier_lease) =
             crate::tcp_bbr::connect_carrier(self.endpoint.as_str())

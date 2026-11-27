@@ -718,6 +718,15 @@ impl H3Client {
         }
     }
 
+    pub(crate) async fn warm_carrier(&self) -> Result<(), ClientError> {
+        if !self.reuse_connections || self.certificate_pin.is_some() { return Ok(()); }
+        let route = crate::network_scope::observe(self.remote);
+        self.pool.warm(route, |connection| !connection.driver.0.is_finished(),
+            self.connect_verified(crate::diagnostics::next_id()),
+            || route.is_some() && crate::network_scope::observe(self.remote) == route,
+        ).await
+    }
+
     async fn connect_verified(&self, operation: u64) -> Result<H3Connection, ClientError> {
         let session = self.native_connection().await?;
         let (transport, key) =

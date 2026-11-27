@@ -99,6 +99,11 @@ pub struct LabSession {
 }
 
 impl LabSession {
+    /// RTT learned by the native authenticated QUIC recovery path.
+    pub(crate) fn measured_rtt(&self) -> Option<Duration> {
+        self.scheduler.measured_rtt()
+    }
+
     /// Accept only explicitly provided application keys from a completed TLS
     /// session in a controlled fixture. This function does not verify TLS
     /// completion or identity, so it must not be used for product admission.
