@@ -1,6 +1,6 @@
 //! Explicit H3 client core with bounded per-profile connection reuse.
 use crate::{
-    client::{bearer_header, error_kind, ClientError},
+    client::{bearer_header, ClientError},
     diagnostics::{self, Value},
     protocol::{self, Address, Decoder, Direction, Frame, Role, Session},
     quic_core::{dial, h3_adapter, handshake_udp, negotiation::VersionPolicy, wire::Version},
@@ -11,13 +11,12 @@ use http::{header, HeaderValue, Request, StatusCode, Uri};
 use rustls::{pki_types::ServerName, RootCertStore};
 use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncWrite},
     task::JoinHandle,
     time::timeout,
 };
 
-const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
-const IO_TIMEOUT: Duration = Duration::from_secs(30);
+use crate::xhttp::session::{self, CarrierKind, FrameReader, FrameWriter, OpenAdapter, OPEN_TIMEOUT, IO_TIMEOUT};
 type Tx = RequestStream<h3_adapter::SendSide, Bytes>;
 type Rx = RequestStream<h3_adapter::RecvSide, Bytes>;
 
@@ -508,34 +507,7 @@ impl H3Client {
     }
 
     async fn open_frame(&self, open: Frame) -> Result<H3Tunnel, ClientError> {
-        let operation = diagnostics::next_id();
-        crate::diag!(
-            Debug,
-            "client.h3",
-            "open_begin",
-            "op" = Value::Count(operation)
-        );
-        protocol::encode(&open).map_err(|_| ClientError::Configuration)?;
-        let result = timeout(OPEN_TIMEOUT, self.open_selected(open, operation))
-            .await
-            .map_err(|_| ClientError::Timeout)
-            .and_then(|result| result);
-        match &result {
-            Ok(_) => crate::diag!(
-                Debug,
-                "client.h3",
-                "open_confirmed",
-                "op" = Value::Count(operation)
-            ),
-            Err(error) => crate::diag!(
-                Warn,
-                "client.h3",
-                "open_failed",
-                "op" = Value::Count(operation),
-                "reason" = Value::Label(error_kind(error))
-            ),
-        }
-        result
+        session::open(self, open).await
     }
 
     /// A full authenticated transport handshake, shared by tunnel opens and
@@ -661,61 +633,6 @@ impl H3Client {
     pub(crate) async fn probe(&self) -> Result<(), ClientError> {
         let session = self.native_connection().await?;
         dial::close_probe(session).await.map_err(dial_error)
-    }
-
-    async fn open_selected(&self, open: Frame, operation: u64) -> Result<H3Tunnel, ClientError> {
-        use crate::split_http::HelloOutcome;
-        let mut stage = HelloOutcome::Pending;
-        let Some(mode) = &self.auto_mode else {
-            return self
-                .open_mode(&open, operation, self.stream_up, &mut stage)
-                .await;
-        };
-        let ticket = mode.select()?;
-        let stream_up = ticket.stream_up;
-        let result = self
-            .open_mode(&open, operation, stream_up, &mut stage)
-            .await;
-        if !mode.after_attempt(ticket, stream_up, stage)? {
-            return result;
-        }
-        // The first attempt is fully dropped and never sent OPEN_TCP.
-        crate::diag!(Debug, "client.h3", "xhttp_pre_open_stream_up_retry");
-        let mut stage = HelloOutcome::Pending;
-        let result = self.open_mode(&open, operation, true, &mut stage).await;
-        mode.after_attempt(ticket, true, stage)?;
-        // The original H3 attempt already completed HTTP admission.
-        // UDP silence in the second attempt must not authorize H2 fallback.
-        match result {
-            Err(ClientError::QuicUnreachable | ClientError::QuicEndpointNetworkRefused) => {
-                Err(ClientError::Timeout)
-            }
-            other => other,
-        }
-    }
-
-    /// At most one fresh connection after an explicit graceful GOAWAY
-    /// before any HELLO/OPEN. Never replay a body or change XHTTP mode.
-    async fn open_mode(
-        &self,
-        open: &Frame,
-        operation: u64,
-        stream_up: bool,
-        stage: &mut crate::split_http::HelloOutcome,
-    ) -> Result<H3Tunnel, ClientError> {
-        use crate::split_http::HelloOutcome;
-        let result = self.open_inner(open, operation, stream_up, stage).await;
-        if *stage != HelloOutcome::Draining {
-            return result;
-        }
-        *stage = HelloOutcome::Pending;
-        let result = self.open_inner(open, operation, stream_up, stage).await;
-        match result {
-            Err(ClientError::QuicUnreachable | ClientError::QuicEndpointNetworkRefused) => {
-                Err(ClientError::Timeout)
-            }
-            other => other,
-        }
     }
 
     pub(crate) async fn warm_carrier(&self) -> Result<(), ClientError> {
@@ -997,6 +914,16 @@ fn dial_error(error: dial::Error) -> ClientError {
     }
 }
 
+impl OpenAdapter for H3Client {
+    type Tunnel = H3Tunnel;
+    const KIND: CarrierKind = CarrierKind::H3;
+    fn explicit_stream_up(&self) -> bool { self.stream_up }
+    fn automatic_mode(&self) -> Option<&crate::split_http::AutoMode> { self.auto_mode.as_ref() }
+    async fn open_attempt<'a>(&'a self, open: &'a Frame, operation: u64, stream_up: bool, stage: &'a mut crate::split_http::HelloOutcome) -> Result<H3Tunnel, ClientError> {
+        self.open_inner(open, operation, stream_up, stage).await
+    }
+}
+
 struct H3Connection {
     sender: std::sync::Mutex<h3::client::SendRequest<h3_adapter::Opener, Bytes>>,
     driver: Driver,
@@ -1027,74 +954,11 @@ pub struct H3Tunnel {
 
 impl H3Tunnel {
     pub(crate) async fn relay_udp(
-        mut self,
-        mut first: Option<Vec<u8>>,
-        mut upload: tokio::sync::mpsc::Receiver<Vec<u8>>,
-        download: tokio::sync::mpsc::Sender<Vec<u8>>,
-        flow: Option<&crate::routing::flow::FlowLease>,
+        mut self, first: Option<Vec<u8>>, upload: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        download: tokio::sync::mpsc::Sender<Vec<u8>>, flow: Option<&crate::routing::flow::FlowLease>,
     ) -> Result<(), ClientError> {
-        if !self.state.udp() {
-            return Err(ClientError::Protocol);
-        }
-        let traffic = crate::traffic::enter_udp(crate::Role::Client, true, false);
-        let tx = &mut self.tx;
-        let rx = &mut self.rx;
-        let decoder = &mut self.decoder;
-        let mut tx_state = self.state.clone();
-        let mut rx_state = self.state.clone();
-        let activity = crate::udp_relay::Activity::new();
-        let writing = std::sync::atomic::AtomicBool::new(false);
-        let send_loop = async {
-            let mut first_send =
-                crate::routing::flow::FirstSend::new(flow, crate::routing::PacketAction::Redirect);
-            while let Some(data) = crate::udp_relay::next_datagram(&mut first, &mut upload).await {
-                let size = data.len();
-                let frame = Frame::Datagram(data);
-                tx_state
-                    .apply(Direction::Send, &frame)
-                    .map_err(|_| ClientError::Protocol)?;
-                first_send.attempt()?;
-                writing.store(true, std::sync::atomic::Ordering::Relaxed);
-                send(tx, &frame).await?;
-                writing.store(false, std::sync::atomic::Ordering::Relaxed);
-                traffic.upload(size);
-                activity.touch();
-            }
-            Ok::<(), ClientError>(())
-        };
-        let receive_loop = async {
-            loop {
-                let frame = decoder.next(rx).await?.ok_or(ClientError::Protocol)?;
-                rx_state
-                    .apply(Direction::Receive, &frame)
-                    .map_err(|_| ClientError::Protocol)?;
-                match frame {
-                    Frame::Datagram(data) => {
-                        if let Some(flow)=flow {flow.commit(crate::routing::PacketAction::Redirect)?;}
-                        let size = data.len();
-                        if crate::udp_relay::deliver(&download, || data)? {
-                            traffic.download(size);
-                            activity.touch();
-                        }
-                    }
-                    Frame::Padding(_) => tokio::task::yield_now().await,
-                    Frame::Fin => return Ok::<(), ClientError>(()),
-                    Frame::Abort(code) => return Err(ClientError::Open(code)),
-                    _ => return Err(ClientError::Protocol),
-                }
-            }
-        };
-        let result = tokio::select! { result=send_loop=>result, result=receive_loop=>result, ()=activity.expire()=>Ok(()) };
-        if writing.load(std::sync::atomic::Ordering::Relaxed) || result.is_err() {
-            // Drop the interrupted request; never append FIN or retry.
-            return result.and(Err(ClientError::Timeout));
-        }
-        send(tx, &Frame::Fin).await?;
-        timeout(IO_TIMEOUT, tx.finish())
-            .await
-            .map_err(|_| ClientError::Timeout)?
-            .map_err(|_| ClientError::Http3)?;
-        Ok(())
+        let mut reader = H3FrameReader { decoder: &mut self.decoder, stream: &mut self.rx };
+        session::relay_udp(CarrierKind::H3, &self.state, &mut self.tx, &mut reader, first, upload, download, flow).await
     }
 
     pub(crate) fn opened_stream_up(&self) -> bool {
@@ -1127,170 +991,32 @@ impl H3Tunnel {
     }
 
     pub(crate) async fn relay_guarded<S>(
-        mut self,
-        local: S,
-        flow: Option<&crate::routing::flow::FlowLease>,
+        mut self, local: S, flow: Option<&crate::routing::flow::FlowLease>,
     ) -> Result<(), ClientError>
-    where
-        S: AsyncRead + AsyncWrite + Unpin,
+    where S: AsyncRead + AsyncWrite + Unpin,
     {
-        if self.state.udp() {
-            return Err(ClientError::Protocol);
-        }
-        let traffic = crate::traffic::enter(crate::Role::Client, true);
-        let operation = self.operation;
-        crate::diag!(
-            Debug,
-            "client.h3",
-            "relay_begin",
-            "op" = Value::Count(operation)
-        );
-        let (mut read, mut write) = tokio::io::split(local);
-        let tx = &mut self.tx;
-        let rx = &mut self.rx;
-        let decoder = &mut self.decoder;
-        let mut upload_state = self.state.clone();
-        let mut download_state = self.state.clone();
-        let activity = crate::relay_liveness::Activity::new();
-        let (upload_done, upload_finished) = tokio::sync::oneshot::channel();
-        let upload = async {
-            let mut buffer = [0; crate::relay_batch::MAX_BATCH];
-            let mut batch = crate::relay_batch::ReadyBatch::default();
-            let mut first_send =
-                crate::routing::flow::FirstSend::new(flow, crate::routing::PacketAction::Redirect);
-            loop {
-                let n = batch
-                    .read(&mut read, &mut buffer)
-                    .await
-                    .map_err(|_| ClientError::Io)?;
-                let frame = if n == 0 {
-                    Frame::Fin
-                } else {
-                    Frame::Data(buffer[..n].to_vec())
-                };
-                crate::diag!(
-                    Trace,
-                    "client.h3",
-                    "upload_frame",
-                    "op" = Value::Count(operation),
-                    "bytes" = Value::Count(n as u64),
-                    "fin" = Value::Flag(n == 0)
-                );
-                upload_state
-                    .apply(Direction::Send, &frame)
-                    .map_err(|_| ClientError::Protocol)?;
-                if n != 0 {
-                    first_send.attempt()?;
-                }
-                send(tx, &frame).await?;
-                if n == 0 {
-                    timeout(IO_TIMEOUT, tx.finish())
-                        .await
-                        .map_err(|_| ClientError::Timeout)?
-                        .map_err(|_| ClientError::Http3)?;
-                    activity.half_closed();
-                    let _ = upload_done.send(());
-                    return Ok::<(), ClientError>(());
-                }
-                self._lease.record_data(n);
-                traffic.upload(n);
-                activity.data(n);
-            }
-        };
-        let download = async {
-            loop {
-                let frame = decoder.next(rx).await?.ok_or(ClientError::Protocol)?;
-                download_state
-                    .apply(Direction::Receive, &frame)
-                    .map_err(|_| ClientError::Protocol)?;
-                match frame {
-                    Frame::Padding(_) => tokio::task::yield_now().await,
-                    Frame::Data(data) => {
-                        if let Some(flow)=flow {flow.commit(crate::routing::PacketAction::Redirect)?;}
-                        crate::diag!(
-                            Trace,
-                            "client.h3",
-                            "download_frame",
-                            "op" = Value::Count(operation),
-                            "bytes" = Value::Count(data.len() as u64)
-                        );
-                        timeout(IO_TIMEOUT, write.write_all(&data))
-                            .await
-                            .map_err(|_| ClientError::Timeout)?
-                            .map_err(|_| ClientError::Io)?;
-                        self._lease.record_data(data.len());
-                        traffic.download(data.len());
-                        activity.data(data.len());
-                    }
-                    Frame::Fin => {
-                        crate::diag!(
-                            Debug,
-                            "client.h3",
-                            "download_fin",
-                            "op" = Value::Count(operation)
-                        );
-                        timeout(IO_TIMEOUT, write.shutdown())
-                            .await
-                            .map_err(|_| ClientError::Timeout)?
-                            .map_err(|_| ClientError::Io)?;
-                        activity.half_closed();
-                        break;
-                    }
-                    Frame::Abort(code) => return Err(ClientError::Open(code)),
-                    _ => return Err(ClientError::Protocol),
-                }
-            }
-            if crate::relay_liveness::receive_tail(
-                async {
-                    loop {
-                        let frame = decoder.next(rx).await?;
-                        if let Some(padding @ Frame::Padding(_)) = &frame {
-                            if activity.both_finished() {
-                                return Err(ClientError::Protocol);
-                            }
-                            download_state
-                                .apply(Direction::Receive, padding)
-                                .map_err(|_| ClientError::Protocol)?;
-                            tokio::task::yield_now().await;
-                            continue;
-                        }
-                        return Ok(frame);
-                    }
-                },
-                upload_finished,
-                ClientError::Timeout,
-            )
-            .await?
-            .is_some()
-            {
-                return Err(ClientError::Protocol);
-            }
-            Ok::<(), ClientError>(())
-        };
-        if let Err(error) = activity.run(upload, download, ClientError::Timeout).await {
-            crate::diag!(
-                Warn,
-                "client.h3",
-                "relay_failed",
-                "op" = Value::Count(operation),
-                "reason" = Value::Label(error_kind(&error))
-            );
-            return Err(error);
-        }
-        crate::diag!(
-            Debug,
-            "client.h3",
-            "relay_completed",
-            "op" = Value::Count(operation)
-        );
-        self.state
-            .apply(Direction::Send, &Frame::Fin)
-            .map_err(|_| ClientError::Protocol)?;
-        self.state
-            .apply(Direction::Receive, &Frame::Fin)
-            .map_err(|_| ClientError::Protocol)?;
-        self.state.finish().map_err(|_| ClientError::Protocol)
+        let mut reader = H3FrameReader { decoder: &mut self.decoder, stream: &mut self.rx };
+        let lease = &self._lease;
+        session::relay_tcp(CarrierKind::H3, self.operation, &mut self.state, &mut self.tx, &mut reader, local, flow, |bytes| lease.record_data(bytes)).await
     }
+}
+
+impl FrameWriter for Tx {
+    async fn send<'a>(&'a mut self, frame: &'a Frame) -> Result<(), ClientError> {
+        send(self, frame).await
+    }
+    async fn finish(&mut self) -> Result<(), ClientError> {
+        send(self, &Frame::Fin).await?;
+        timeout(IO_TIMEOUT, RequestStream::finish(self)).await.map_err(|_| ClientError::Timeout)?.map_err(|_| ClientError::Http3)
+    }
+}
+
+struct H3FrameReader<'a> {
+    decoder: &'a mut Incoming,
+    stream: &'a mut Rx,
+}
+impl FrameReader for H3FrameReader<'_> {
+    async fn next(&mut self) -> Result<Option<Frame>, ClientError> { self.decoder.next(self.stream).await }
 }
 
 #[derive(Default)]

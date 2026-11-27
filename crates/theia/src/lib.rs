@@ -74,6 +74,7 @@ pub mod server;
 #[path = "../tests/support/shared_port.rs"]
 mod shared_port;
 mod split_http;
+mod xhttp;
 mod tcp_bbr;
 mod traffic;
 pub mod transport_policy;
