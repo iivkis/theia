@@ -1513,7 +1513,9 @@ mod coalescing_tests {
             let mut reader = Reader::new(initial_keys(version, &server, false).unwrap().remote);
             let opened = reader.open(packets[0].bytes, at).unwrap();
             assert!(matches!(
-                frames::decode(&opened.payload, Space::Initial).unwrap().as_slice(),
+                frames::decode(&opened.payload, Space::Initial)
+                    .unwrap()
+                    .as_slice(),
                 [Frame::Close { .. }]
             ));
         }
