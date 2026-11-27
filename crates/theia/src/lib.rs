@@ -172,6 +172,8 @@ pub enum Command {
         config: String,
     },
     ClientStatus,
+    ClientLinuxRedirectLab { config:String,journal:String,port:u16 },
+    ClientLinuxRecoverLab { journal:String },
     /// Explicit backend compatibility check, never activates capture.
     /// Internal bounded handle-lifetime fixture, no network operations.
     WinDivertGuardHolder,
@@ -403,6 +405,13 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
             })
         }
         ["client", "status"] => Ok(Command::ClientStatus),
+        ["client","linux","--redirect-lab","--config",config,"--journal",journal,"--port",port,"--confirm-isolated"]=>{
+            Ok(Command::ClientLinuxRedirectLab{config:config_path(config)?,journal:config_path(journal)?,
+                port:port.parse::<u16>().ok().filter(|n|*n>=1024).ok_or(CliError::InvalidArguments)?})
+        },
+        ["client","linux","--recover-lab","--journal",journal,"--confirm-isolated-recovery"]=>{
+            Ok(Command::ClientLinuxRecoverLab{journal:config_path(journal)?})
+        },
         ["client", "windivert", "--guard-holder-lab"] => Ok(Command::WinDivertGuardHolder),
         ["client", "windivert", "--scope-drop-lab", "--directory", directory, "--dll-sha256", dll,
             "--sys-sha256", sys, "--interface-index", interface, "--seconds", seconds, "--confirm-block"] =>

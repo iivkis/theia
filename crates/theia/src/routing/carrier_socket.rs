@@ -20,6 +20,10 @@ impl Lease {
 pub(crate) trait Registrar: Send + Sync {
     fn tcp(&self, socket: &TcpSocket, peer: SocketAddr) -> io::Result<Lease>;
     fn udp(&self, socket: &UdpSocket, peer: SocketAddr) -> io::Result<Lease>;
+    #[cfg(target_os="linux")]
+    fn udp_reply(&self,socket:&UdpSocket,peer:SocketAddr)->io::Result<Lease> {
+        self.udp(socket,peer)
+    }
     /// Permanently refuse new admission and revoke existing capabilities.
     /// This does not restore capture rules or authorize direct traffic.
     fn retire(&self) -> io::Result<()>;

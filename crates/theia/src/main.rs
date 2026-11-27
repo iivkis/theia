@@ -80,6 +80,38 @@ async fn run() {
                 Err(CliError::NotImplemented("Windows user proxy"))
             }
         }
+        Ok(Command::ClientLinuxRedirectLab{config,journal,port})=>{
+            #[cfg(target_os="linux")]
+            {
+                // Inherit the explicitly selected network namespace
+                // from the caller (e.g. ip netns exec). Compare against
+                // PID 1's namespace, not a user-selected arbitrary FD.
+                tokio::task::spawn_blocking(move || {
+                    let host=std::fs::File::open("/proc/1/ns/net").map_err(|_|theia::client::ClientError::Configuration)?;
+                    let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build()
+                        .map_err(|_|theia::client::ClientError::Io)?;
+                    runtime.block_on(Box::pin(local_proxy::NativeIngress::run_linux_redirect_lab(
+                        Path::new(&config),host,Path::new(&journal),port,tokio::signal::ctrl_c())))
+                }).await.map_err(|_|CliError::Client(theia::client::ClientError::Io))
+                    .and_then(|result|result.map_err(CliError::Client))
+                    .map(|_|"Linux isolated redirect stopped; owned nftables table restored; policy routes externally owned".to_owned())
+            }
+            #[cfg(not(target_os="linux"))]
+            {let _=(config,journal,port);Err(CliError::NotImplemented("Linux isolated redirect"))}
+        }
+        Ok(Command::ClientLinuxRecoverLab{journal})=>{
+            #[cfg(target_os="linux")]
+            {
+                tokio::task::spawn_blocking(move || {
+                    let host=std::fs::File::open("/proc/1/ns/net")?;
+                    theia::routing::linux_rules::recover(&host,Path::new(&journal))
+                }).await.map_err(|_|CliError::Client(theia::client::ClientError::Io))
+                    .and_then(|result|result.map_err(|_|CliError::Client(theia::client::ClientError::Io)))
+                    .map(|_|"Linux isolated guard recovered by exact CAS; policy routes externally owned".to_owned())
+            }
+            #[cfg(not(target_os="linux"))]
+            {let _=journal;Err(CliError::NotImplemented("Linux isolated guard recovery"))}
+        }
         Ok(Command::WinDivertGuardHolder) => {
             // The parent duplicates exactly one already-open lab handle
             // into this bounded fixture. No driver or network access here.

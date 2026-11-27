@@ -2566,6 +2566,27 @@ impl NativeIngress {
         queue_number: u16,
         stop: impl std::future::Future<Output = std::io::Result<()>>,
     ) -> Result<(), ClientError> {
+        Self::run_linux_managed_lab(path,host_namespace,journal,Some(queue_number),None,stop).await
+    }
+
+    /// The same native Runtime, but transparent TCP and UDP listeners
+    /// replace the raw NFQUEUE-only adapter. No target allowlist: every
+    /// nonlocal TCP/UDP destination is redirected or denied by policy.
+    /// Requires an explicitly isolated namespace and pre-owned policy
+    /// routes; never used by product Connect before physical acceptance.
+    #[cfg(target_os="linux")]
+    pub async fn run_linux_redirect_lab(
+        path:&Path,host_namespace:std::fs::File,journal:&Path,port:u16,
+        stop:impl std::future::Future<Output=std::io::Result<()>>,
+    )->Result<(),ClientError> {
+        Self::run_linux_managed_lab(path,host_namespace,journal,None,Some(port),stop).await
+    }
+
+    #[cfg(target_os="linux")]
+    async fn run_linux_managed_lab(
+        path:&Path,host_namespace:std::fs::File,journal:&Path,queue_number:Option<u16>,
+        redirect_port:Option<u16>,stop:impl std::future::Future<Output=std::io::Result<()>>,
+    )->Result<(),ClientError> {
         use crate::routing::{
             carrier_socket,
             linux_rules::{self, LabRegistrar, LabRules},
@@ -2591,10 +2612,16 @@ impl NativeIngress {
         };
         let digest: [u8; 32] = Sha256::digest(raw.as_slice()).into();
         saved_client_bytes(&path, digest)?;
-        let queue = Queue::bind(queue_number, 256).map_err(|_| ClientError::Io)?;
-        let rules = Arc::new(Mutex::new(
-            LabRules::install(&queue, &host_namespace, journal).map_err(|_| ClientError::Io)?,
-        ));
+        // Bind all four listeners before installing the persistent
+        // fail-closed table. No network preflight precedes its commit.
+        let listeners=redirect_port.map(|port|crate::routing::linux_ingress::RedirectListeners::bind(&host_namespace,port))
+            .transpose().map_err(|_|ClientError::Io)?;
+        let queue=queue_number.map(|number|Queue::bind(number,256)).transpose().map_err(|_|ClientError::Io)?;
+        let rules=Arc::new(Mutex::new(match (&queue,&listeners) {
+            (Some(queue),None)=>LabRules::install(queue,&host_namespace,journal),
+            (None,Some(listeners))=>LabRules::install_redirect(&host_namespace,journal,listeners.port()),
+            _=>return Err(ClientError::Configuration),
+        }.map_err(|_|ClientError::Io)?));
         let registrar: Arc<dyn carrier_socket::Registrar> = Arc::new(LabRegistrar::new(
             rules.clone(),
             host_namespace.try_clone().map_err(|_| ClientError::Io)?,
@@ -2606,9 +2633,7 @@ impl NativeIngress {
         let runtime = ClientRuntime::new(path, document, digest, client);
         // Keep the process/namespace owner alive across the entire explicit
         // recovery transaction, not just across the packet consumer.
-        let ingress = runtime
-            .attach_native(owner.clone(), Some(registrar.clone()))
-            .await?;
+        let ingress=Arc::new(runtime.attach_native(owner.clone(),Some(registrar.clone())).await?);
         let control = crate::management::client_server(runtime.clone())
             .map_err(|_| ClientError::Configuration)?;
         let management = async move {
@@ -2617,9 +2642,40 @@ impl NativeIngress {
                 None => std::future::pending::<Result<(), ClientError>>().await,
             }
         };
+        let capture=async {
+            match (queue,listeners) {
+                (Some(queue),None)=>ingress.serve_linux_shared(queue,None,rules.clone(),registrar.clone(),|_,_,_|Ok(None)).await,
+                (None,Some(listeners))=>{
+                    let port=listeners.port();
+                    if !rules.lock().map_err(|_|ClientError::Configuration)?.redirect_ready(port).map_err(|_|ClientError::Io)? {
+                        return Err(ClientError::Open(ErrorCode::PolicyDenied));
+                    }
+                    ingress.runtime.capture_state.ready()?;
+                    eprintln!("Theia isolated Linux all-destination TCP/UDP redirect ready; stop applications before explicit Stop");
+                    let monitor=async {
+                        let mut tick=tokio::time::interval(Duration::from_secs(1));
+                        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                        loop {
+                            tick.tick().await;
+                            if !rules.lock().map_err(|_|ClientError::Configuration)?.redirect_ready(port).map_err(|_|ClientError::Io)? {
+                                return Err(ClientError::Open(ErrorCode::PolicyDenied));
+                            }
+                        }
+                    };
+                    tokio::select! {
+                        biased;
+                        result=ingress.serve_linux_redirect_capture(listeners)=>result,
+                        result=monitor=>result,
+                        result=carrier_socket::scope(Some(registrar.clone()),runtime.maintain())=>result,
+                        ()=ingress.stopped()=>Err(ClientError::Open(ErrorCode::PolicyDenied)),
+                    }
+                },
+                _=>Err(ClientError::Configuration),
+            }
+        };
         let explicit = tokio::select! {
             biased;
-            result=ingress.serve_linux_shared(queue,None,rules.clone(),registrar.clone(),|_,_,_|Ok(None))=>{
+            result=capture=>{
                 result?;
                 Err(ClientError::Io) // unexpected consumer exit, never auto restore
             },
@@ -2629,10 +2685,18 @@ impl NativeIngress {
             result=stop=>result.map_err(|_| ClientError::Io),
         };
         ingress.shutdown();
+        explicit?;
+        // A dropped JoinSet aborts its tasks but the abort can be
+        // delivered later. Do not recover while native relay tasks
+        // still retain the ingress or their socket leases.
+        timeout(Duration::from_secs(3),async {
+            while Arc::strong_count(&ingress)!=1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.map_err(|_|ClientError::Timeout)?;
         drop(ingress);
         drop(runtime);
         drop(registrar);
-        explicit?;
         // A failed carrier revocation poisons the rule owner. Do not
         // interpret an explicit Stop as permission to erase that guard.
         if !rules.lock().map_err(|_|ClientError::Configuration)?.current().map_err(|_|ClientError::Io)? {

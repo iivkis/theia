@@ -458,7 +458,7 @@ fn set_int(fd: &OwnedFd, level: libc::c_int, option: libc::c_int) -> io::Result<
     Ok(())
 }
 
-fn is_local_ip(ip: std::net::IpAddr) -> io::Result<bool> {
+pub(super) fn is_local_ip(ip: std::net::IpAddr) -> io::Result<bool> {
     let mut list = std::ptr::null_mut();
     let rc = unsafe { libc::getifaddrs(&mut list) };
     if rc != 0 {
@@ -591,7 +591,7 @@ impl UdpReply {
         registrar: &dyn super::carrier_socket::Registrar,
     ) -> io::Result<super::carrier_socket::Lease> {
         // Only this connected reverse-path socket and original local peer.
-        registrar.udp(&self.socket, self.key.source)
+        registrar.udp_reply(&self.socket, self.key.source)
     }
 
     pub(crate) async fn send(&self, bytes: &[u8]) -> io::Result<()> {

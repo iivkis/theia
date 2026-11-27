@@ -889,7 +889,7 @@ impl LabRules {
         }
         socket.verify()?;
         Self::install_inner(
-            queue,
+            Some(queue),
             host_namespace,
             path,
             Vec::new(),
@@ -922,17 +922,17 @@ impl LabRules {
         path: &Path,
         carriers: Vec<LabCarrierSocket>,
     ) -> io::Result<Self> {
-        Self::install_inner(queue, host_namespace, path, carriers, None,None)
+        Self::install_inner(Some(queue), host_namespace, path, carriers, None,None)
     }
 
     /// Managed all-destination TCP/UDP redirect in a dedicated namespace.
     /// The caller provisions and owns policy routes for REDIRECT_MARK;
     /// this transaction changes only its journaled inet table.
-    pub fn install_redirect(queue:&Queue,host_namespace:&File,path:&Path,port:u16)->io::Result<Self> {
+    pub fn install_redirect(host_namespace:&File,path:&Path,port:u16)->io::Result<Self> {
         let scope=RedirectScope{port,loopback:loopback_index()?};
         Scope::current(host_namespace)?;
         if port==0 || !redirect_routes_ready(scope)? {return Err(refused());}
-        Self::install_inner(queue,host_namespace,path,Vec::new(),None,Some(scope))
+        Self::install_inner(None,host_namespace,path,Vec::new(),None,Some(scope))
     }
 
     pub(crate) fn redirect_ready(&self,port:u16)->io::Result<bool> {
@@ -941,7 +941,7 @@ impl LabRules {
     }
 
     fn install_inner(
-        queue: &Queue,
+        queue: Option<&Queue>,
         host_namespace: &File,
         path: &Path,
         carriers: Vec<LabCarrierSocket>,
@@ -1002,7 +1002,8 @@ impl LabRules {
         if net.table(&journal)? || net.generation()? != before {
             return Err(refused());
         }
-        let queue_number = queue.number()?;
+        if queue.is_some()==redirect.is_some() {return Err(refused());}
+        let queue_number=queue.map(Queue::number).transpose()?.unwrap_or(0);
         let mut operations=match redirect {
             Some(scope)=>redirect_install(&journal,scope,&carriers.iter().map(|socket|(socket.mark(),socket.key())).collect()),
             None=>install_messages(&journal,queue_number,&carriers),
@@ -1034,7 +1035,7 @@ impl LabRules {
         Ok(Self {
             _lock: lock,
             journal,
-            queue_identity: queue.identity(),
+            queue_identity: queue.map(Queue::identity).unwrap_or([0;16]),
             _carriers: carriers,
             capture,
             journal_path: path.to_owned(),
@@ -1286,6 +1287,23 @@ impl super::carrier_socket::Registrar for LabRegistrar {
         peer: std::net::SocketAddr,
     ) -> io::Result<super::carrier_socket::Lease> {
         self.admit(LabCarrierSocket::pending_udp(socket, peer, &self.host)?)
+    }
+    fn udp_reply(&self,socket:&tokio::net::UdpSocket,peer:std::net::SocketAddr)
+        ->io::Result<super::carrier_socket::Lease> {
+        {
+            let rules=self.rules.lock().map_err(|_|refused())?;
+            if rules.journal.redirect.is_some() {
+                // In the managed redirect backend, a reverse socket
+                // belongs only to the local path. Never grant a physical
+                // carrier exception to its nonlocal source address.
+                if rules.carrier_retired || !rules.current()? ||
+                    socket.peer_addr()?!=peer || !super::linux_ingress::is_local_ip(peer.ip())? {
+                    return Err(refused());
+                }
+                return Ok(Default::default());
+            }
+        }
+        self.udp(socket,peer)
     }
     fn retire(&self) -> io::Result<()> {
         self.rules.lock().map_err(|_|refused())?.retire_carriers()
