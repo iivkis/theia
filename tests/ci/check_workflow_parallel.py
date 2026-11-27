@@ -101,6 +101,11 @@ require("cache-mode: write" not in extended and "continue-on-error" not in workf
         "no advisory acceptance or extended cache write")
 contains(workflow, "cache-mode: read", "cancel-in-progress: false",
          "ci-main-merge-${{ github.event.pull_request.merge_commit_sha || github.run_id }}")
+# Only existing Windows cache producers get a cold recovery budget.
+# The separate mandatory wall-clock gate still rejects over-300s attempts.
+contains(job("windows-smoke"), "timeout-minutes: ${{ matrix.shard == 1 && 15 || 5 }}")
+contains(job("coverage-native"),
+         "timeout-minutes: ${{ matrix.os == 'windows-latest' && matrix.shard == 1 && 15 || 5 }}")
 writers = {"rust-tests", "windows-smoke", "coverage-native", "native-checks"}
 for name in mandatory - {"specification"}:
     payload = job(name)
