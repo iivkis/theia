@@ -447,6 +447,179 @@ impl TcpLoopbackMap {
     }
 }
 
+/// Non-loopback TCP reflection candidate. Windows sees the diverted
+/// original SYN as an inbound connection from the remote address to a
+/// dedicated local listener. The return path is reflected back to the
+/// original client socket. This is intentionally separate from admission:
+/// the live backend must prove the listener, original endpoint, route,
+/// capture ownership and policy before any injection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpRedirectToken {
+    generation: u64,
+    original: super::packet::FlowKey,
+}
+impl TcpRedirectToken {
+    pub fn original(self) -> super::packet::FlowKey { self.original }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpReflectionState {
+    Syn,
+    SynAck(u32),
+    Accepted(u32),
+    Retired,
+}
+struct TcpReflection {
+    token: TcpRedirectToken,
+    listener: std::net::SocketAddr,
+    sub_interface: u32,
+    first_timestamp: i64,
+    initial_seq: u32,
+    state: TcpReflectionState,
+}
+pub struct TcpRedirectTable {
+    entries: std::collections::HashMap<super::packet::FlowKey,TcpReflection>,
+    max_live: usize,
+    max_epoch: usize,
+    generation: u64,
+    retired: bool,
+}
+impl TcpRedirectTable {
+    pub fn new(max_live:usize,max_epoch:usize)->Option<Self> {
+        if !(1..=64).contains(&max_live) || max_epoch<max_live || max_epoch>4096 { return None; }
+        Some(Self { entries:std::collections::HashMap::new(),max_live,max_epoch,generation:0,retired:false })
+    }
+    pub fn retire(&mut self) { self.retired=true; }
+    /// Reserve a distinct, already-bound local listener for this exact
+    /// SYN. No reuse within an epoch, even after FIN/RST/task completion.
+    /// TCP Fast Open/early data is denied until independently accepted.
+    pub fn begin(&mut self,address:&Address,packet:&[u8],listener:std::net::SocketAddr)->Option<TcpRedirectToken> {
+        use super::packet::Transport;
+        if self.retired { return None; }
+        let obs=address.network(packet).ok()?;
+        let key=obs.meta.flow;
+        let (seq,_,off)=tcp_numbers(packet)?;
+        let flags=obs.meta.tcp_flags?;
+        if !obs.outbound || obs.sniffed || key.transport!=Transport::Tcp
+            || flags & !0xc0 != 2 || obs.meta.payload_len!=0 || off==0
+            || listener.port()==0 || listener.ip()!=key.source.ip()
+            || listener==key.source || key.source.ip()==key.destination.ip()
+            || !reflect_address(key.source) || !reflect_address(key.destination) { return None; }
+        if self.entries.contains_key(&key)
+            || self.entries.values().any(|e|e.listener==listener)
+            || self.entries.len()>=self.max_epoch
+            || self.entries.values().filter(|e|e.state!=TcpReflectionState::Retired).count()>=self.max_live { return None; }
+        self.generation=self.generation.checked_add(1)?;
+        let token=TcpRedirectToken {generation:self.generation,original:key};
+        self.entries.insert(key,TcpReflection {token,listener,sub_interface:obs.sub_interface,
+            first_timestamp:obs.timestamp,initial_seq:seq,state:TcpReflectionState::Syn});
+        Some(token)
+    }
+    /// The accept operation must be performed on the reserved listener,
+    /// not an unrelated stream or a client-supplied target header.
+    pub fn accept(&mut self,token:TcpRedirectToken,local:std::net::SocketAddr,peer:std::net::SocketAddr)->bool {
+        if self.retired { return false; }
+        let Some(entry)=self.entries.get_mut(&token.original) else { return false; };
+        let expected_peer=std::net::SocketAddr::new(token.original.destination.ip(),token.original.source.port());
+        if entry.token!=token || entry.listener!=local || peer!=expected_peer { return false; }
+        let TcpReflectionState::SynAck(seq)=entry.state else { return false; };
+        entry.state=TcpReflectionState::Accepted(seq);
+        true
+    }
+    pub fn complete(&mut self,token:TcpRedirectToken)->bool {
+        let Some(entry)=self.entries.get_mut(&token.original) else { return false; };
+        if entry.token!=token || entry.state==TcpReflectionState::Retired { return false; }
+        entry.state=TcpReflectionState::Retired;
+        true
+    }
+    /// Produces an inbound packet candidate for the exact generation;
+    /// does not transmit or authorize a packet. The TCP stack remains
+    /// responsible for sequence/window validation after the handshake.
+    pub fn reflect(&mut self,token:TcpRedirectToken,address:&Address,packet:&[u8])->Option<ReverseDatagram> {
+        if self.retired { return None; }
+        let obs=address.network(packet).ok()?;
+        let entry=self.entries.get_mut(&token.original)?;
+        let key=token.original;
+        if entry.token!=token || entry.state==TcpReflectionState::Retired || obs.sniffed || !obs.outbound
+            || obs.interface!=key.interface || obs.sub_interface!=entry.sub_interface
+            || obs.timestamp<entry.first_timestamp || obs.meta.flow.transport!=key.transport { return None; }
+        let peer=std::net::SocketAddr::new(key.destination.ip(),key.source.port());
+        let client=obs.meta.flow==key;
+        let relay=obs.meta.flow.source==entry.listener && obs.meta.flow.destination==peer;
+        if !client && !relay { return None; }
+        let (seq,ack,off)=tcp_numbers(packet)?;
+        let flags=obs.meta.tcp_flags?;
+        if flags & 2 !=0 {
+            if obs.meta.payload_len!=0 { return None; }
+            if client {
+                if flags & !0xc0!=2 || seq!=entry.initial_seq || matches!(entry.state,TcpReflectionState::Accepted(_)) { return None; }
+            } else {
+                if flags & !0xc0!=0x12 || ack!=entry.initial_seq.wrapping_add(1) { return None; }
+                match entry.state {
+                    TcpReflectionState::Syn=>entry.state=TcpReflectionState::SynAck(seq),
+                    TcpReflectionState::SynAck(previous) if previous==seq=>{},
+                    _=>return None,
+                }
+            }
+        } else {
+            // Do not reflect unsolicited data before the SYN/SYN-ACK pair.
+            // A final handshake ACK or its attached data is delivered only
+            // to the reserved local listener, never to the remote network.
+            match entry.state {
+                TcpReflectionState::Syn if flags&4==0=>return None,
+                TcpReflectionState::SynAck(server) if client && flags&4==0 &&
+                    (flags&16==0 || ack!=server.wrapping_add(1) || seq!=entry.initial_seq.wrapping_add(1))=>return None,
+                TcpReflectionState::SynAck(_) if relay && flags&4==0=>return None,
+                _=>{},
+            }
+        }
+        let (source,destination)=if client { (peer,entry.listener) } else { (key.destination,key.source) };
+        let mut out=packet.to_vec();
+        match (source.ip(),destination.ip()) {
+            (std::net::IpAddr::V4(a),std::net::IpAddr::V4(b)) if off==20=>{
+                out[12..16].copy_from_slice(&a.octets());
+                out[16..20].copy_from_slice(&b.octets());
+                out[10..12].fill(0);
+                let sum=checksum(word_sum(&out[..20]));
+                out[10..12].copy_from_slice(&sum.to_be_bytes());
+            }
+            (std::net::IpAddr::V6(a),std::net::IpAddr::V6(b)) if off==40=>{
+                out[8..24].copy_from_slice(&a.octets());
+                out[24..40].copy_from_slice(&b.octets());
+            }
+            _=>return None,
+        }
+        out[off..off+2].copy_from_slice(&source.port().to_be_bytes());
+        out[off+2..off+4].copy_from_slice(&destination.port().to_be_bytes());
+        out[off+16..off+18].fill(0);
+        let pseudo=if off==20 {word_sum(&out[12..20])}else{word_sum(&out[8..40])};
+        let sum=checksum(pseudo+6+(out.len()-off) as u32+word_sum(&out[off..]));
+        out[off+16..off+18].copy_from_slice(&sum.to_be_bytes());
+        let after=PacketMeta::parse(&out,key.interface).ok()?;
+        if after.flow.source!=source || after.flow.destination!=destination || after.tcp_flags!=obs.meta.tcp_flags
+            || after.payload_len!=obs.meta.payload_len { return None; }
+        if flags&4!=0 { entry.state=TcpReflectionState::Retired; }
+        Some(ReverseDatagram {packet:out,interface:key.interface,sub_interface:entry.sub_interface})
+    }
+}
+fn reflect_address(address:std::net::SocketAddr)->bool {
+    let ip=address.ip();
+    address.port()!=0 && !ip.is_unspecified() && !ip.is_multicast() && !ip.is_loopback()
+        && match address {
+            std::net::SocketAddr::V4(v)=>v.ip().octets()[0]>0 && v.ip().octets()[0]<224,
+            std::net::SocketAddr::V6(v)=>v.scope_id()==0 && v.flowinfo()==0 &&
+                v.ip().to_ipv4_mapped().is_none() && !v.ip().is_unicast_link_local(),
+        }
+}
+fn tcp_numbers(packet:&[u8])->Option<(u32,u32,usize)> {
+    let off=match packet.first().copied()? {
+        0x45 if *packet.get(9)?==6=>20,
+        v if v>>4==6 && *packet.get(6)?==6=>40,
+        _=>return None,
+    };
+    Some((u32::from_be_bytes(packet.get(off+4..off+8)?.try_into().ok()?),
+        u32::from_be_bytes(packet.get(off+8..off+12)?.try_into().ok()?),off))
+}
+
 /// Candidate bytes only, not a live WinDivert injection token.
 #[derive(Debug)]
 pub struct ReverseDatagram {
@@ -1380,6 +1553,65 @@ mod tests {
         assert!(registry.register(10,42,EndpointTuple {remote:"198.51.100.2:444".parse().unwrap(),..tuple}).is_none());
         registry.retire();
     }
+    #[test]
+    fn nonloopback_tcp_reflection_is_generation_bound_and_requires_handshake() {
+        use std::net::SocketAddr;
+        for v6 in [false,true] {
+            let client:SocketAddr=if v6 {"[2001:db8::1]:1234"}else{"192.0.2.1:1234"}.parse().unwrap();
+            let remote:SocketAddr=if v6 {"[2001:db8::2]:443"}else{"198.51.100.2:443"}.parse().unwrap();
+            let listener=SocketAddr::new(client.ip(),49001);
+            let peer=SocketAddr::new(remote.ip(),client.port());
+            let mut raw=[0u8;80];
+            raw[..8].copy_from_slice(&100i64.to_le_bytes());
+            raw[8..12].copy_from_slice(&((1u32<<17)|if v6{1<<20}else{0}).to_le_bytes());
+            raw[16..20].copy_from_slice(&7u32.to_le_bytes());
+            raw[20..24].copy_from_slice(&2u32.to_le_bytes());
+            let addr=Address::from_bytes(&raw);
+            let packet=|a:SocketAddr,b:SocketAddr,seq:u32,ack:u32,flags:u8,payload:&[u8]| {
+                let mut out=vec![0u8;if v6{60}else{40}];
+                let off=if v6 {
+                    out[0]=0x60;out[4..6].copy_from_slice(&((20+payload.len()) as u16).to_be_bytes());out[6]=6;
+                    let (std::net::IpAddr::V6(a),std::net::IpAddr::V6(b))=(a.ip(),b.ip())else{panic!()};
+                    out[8..24].copy_from_slice(&a.octets());out[24..40].copy_from_slice(&b.octets());40
+                }else{
+                    out[0]=0x45;out[2..4].copy_from_slice(&((40+payload.len()) as u16).to_be_bytes());out[9]=6;
+                    let (std::net::IpAddr::V4(a),std::net::IpAddr::V4(b))=(a.ip(),b.ip())else{panic!()};
+                    out[12..16].copy_from_slice(&a.octets());out[16..20].copy_from_slice(&b.octets());20
+                };
+                out[off..off+2].copy_from_slice(&a.port().to_be_bytes());out[off+2..off+4].copy_from_slice(&b.port().to_be_bytes());
+                out[off+4..off+8].copy_from_slice(&seq.to_be_bytes());out[off+8..off+12].copy_from_slice(&ack.to_be_bytes());
+                out[off+12]=0x50;out[off+13]=flags;out.extend_from_slice(payload);out
+            };
+            let mut table=TcpRedirectTable::new(1,4).unwrap();
+            assert!(table.begin(&addr,&packet(client,remote,9,0,2,b"x"),listener).is_none());
+            let syn=packet(client,remote,9,0,2,b"");
+            let token=table.begin(&addr,&syn,listener).unwrap();
+            assert!(table.begin(&addr,&syn,listener).is_none());
+            assert!(!table.accept(token,listener,peer));
+            let out=table.reflect(token,&addr,&syn).unwrap();
+            let parsed=PacketMeta::parse(&out.packet,7).unwrap();
+            assert_eq!(parsed.flow.source,peer);assert_eq!(parsed.flow.destination,listener);
+            assert!(table.reflect(token,&addr,&packet(client,remote,10,0,0x10,b"x")).is_none());
+            assert!(table.reflect(token,&addr,&packet(listener,peer,30,11,0x12,b"")).is_none());
+            let out=table.reflect(token,&addr,&packet(listener,peer,30,10,0x12,b"")).unwrap();
+            let parsed=PacketMeta::parse(&out.packet,7).unwrap();
+            assert_eq!(parsed.flow.source,remote);assert_eq!(parsed.flow.destination,client);
+            assert!(!table.accept(token,listener,remote));
+            assert!(table.reflect(token,&addr,&packet(client,remote,10,31,0x10,b"")).is_some());
+            assert!(table.accept(token,listener,peer));
+            assert!(!table.accept(token,listener,peer));
+            let data=packet(client,remote,10,31,0x18,b"hello");
+            let out=table.reflect(token,&addr,&data).unwrap();
+            assert!(out.packet.ends_with(b"hello"));
+            let off=if v6{40}else{20};
+            let pseudo=if v6{word_sum(&out.packet[8..40])}else{word_sum(&out.packet[12..20])};
+            assert_eq!(checksum(pseudo+6+(out.packet.len()-off) as u32+word_sum(&out.packet[off..])),0);
+            assert!(table.complete(token));
+            assert!(table.reflect(token,&addr,&data).is_none());
+            assert!(table.begin(&addr,&syn,listener).is_none());
+        }
+    }
+
     #[test]
     fn flow_event_is_candidate_only_and_wrong_event_is_denied() {
         let mut raw=[0u8;80];
