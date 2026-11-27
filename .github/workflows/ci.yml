@@ -1114,11 +1114,11 @@ jobs:
             $null=[System.Management.Automation.Language.Parser]::ParseFile($_.FullName,[ref]$tokens,[ref]$errors)
             if ($errors.Count -ne 0) { throw "PowerShell parser rejected $($_.Name): $errors" }
           }
-      - name: Compile native transactional WFP guard fixture (no policy mutation)
+      - name: Compile WFP guard and validate native BFE transactions (abort only)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          ./drivers/windows/windivert/build-wfp-guard-lab.ps1 -OutputDirectory "$env:RUNNER_TEMP/theia-wfp-guard"
+          ./drivers/windows/windivert/build-wfp-guard-lab.ps1 -OutputDirectory "$env:RUNNER_TEMP/theia-wfp-guard" -TestBfeTransaction
       - name: Record Windows package validation scope
         if: runner.os == 'Windows'
         shell: pwsh

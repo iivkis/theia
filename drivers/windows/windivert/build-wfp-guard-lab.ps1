@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([Parameter(Mandatory=$true)][string]$OutputDirectory)
+param([Parameter(Mandatory=$true)][string]$OutputDirectory,[switch]$TestBfeTransaction)
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
 $out=[IO.Path]::GetFullPath($OutputDirectory)
@@ -17,4 +17,8 @@ $cmd='call "'+$vc+'" && cl.exe /nologo /std:c++17 /EHsc /W4 /WX /DUNICODE /D_UNI
 if ($LASTEXITCODE -ne 0) { throw 'WFP guard compile failed.' }
 & $exe self-test
 if ($LASTEXITCODE -ne 0) { throw 'WFP guard self-test failed.' }
+if ($TestBfeTransaction) {
+    & $exe transaction-self-test abort-only
+    if ($LASTEXITCODE -ne 0) { throw 'BFE abort-only transaction test failed.' }
+}
 Get-FileHash -LiteralPath $exe -Algorithm SHA256

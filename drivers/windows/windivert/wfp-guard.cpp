@@ -110,6 +110,7 @@ struct Transaction {
     }
     ~Transaction(){ if(active) FwpmTransactionAbort0(engine); }
     void commit(){ check(FwpmTransactionCommit0(engine)); active=false; }
+    void abort(){ check(FwpmTransactionAbort0(engine)); active=false; }
     Transaction(const Transaction&)=delete;
     Transaction& operator=(const Transaction&)=delete;
 };
@@ -129,6 +130,37 @@ struct Security {
     }
     ~Security(){ if(value) LocalFree(value); }
 };
+// A changed owner or access-control list is also a CAS conflict.
+bool exact_security(HANDLE e,const GUID& key,bool sublayer) {
+    PSID owner=nullptr,group=nullptr;
+    PACL dacl=nullptr;
+    BfeObject<void> descriptor;
+    constexpr SECURITY_INFORMATION info=OWNER_SECURITY_INFORMATION|GROUP_SECURITY_INFORMATION|DACL_SECURITY_INFORMATION;
+    const DWORD status=sublayer
+        ? FwpmSubLayerGetSecurityInfoByKey0(e,&key,info,&owner,&group,&dacl,nullptr,&descriptor.value)
+        : FwpmFilterGetSecurityInfoByKey0(e,&key,info,&owner,&group,&dacl,nullptr,&descriptor.value);
+    check(status);
+    if(!descriptor.value || !owner || !group || !dacl ||
+        !IsWellKnownSid(owner,WinBuiltinAdministratorsSid) ||
+        !IsWellKnownSid(group,WinBuiltinAdministratorsSid) || !IsValidAcl(dacl)) return false;
+    SECURITY_DESCRIPTOR_CONTROL control{};
+    DWORD revision=0;
+    if(!GetSecurityDescriptorControl(descriptor.value,&control,&revision) ||
+        (control&SE_DACL_PROTECTED)==0 || dacl->AceCount!=2) return false;
+    bool system=false,admins=false;
+    for(DWORD i=0;i<dacl->AceCount;++i) {
+        void* raw=nullptr;
+        if(!GetAce(dacl,i,&raw) || !raw) return false;
+        const auto* ace=static_cast<const ACCESS_ALLOWED_ACE*>(raw);
+        if(ace->Header.AceType!=ACCESS_ALLOWED_ACE_TYPE || ace->Header.AceFlags!=0 ||
+            (ace->Mask!=GENERIC_ALL && ace->Mask!=FWPM_GENERIC_ALL)) return false;
+        PSID sid=const_cast<DWORD*>(&ace->SidStart);
+        if(IsWellKnownSid(sid,WinLocalSystemSid) && !system) system=true;
+        else if(IsWellKnownSid(sid,WinBuiltinAdministratorsSid) && !admins) admins=true;
+        else return false;
+    }
+    return system && admins;
+}
 FWP_BYTE_BLOB blob(Plan& p) {
     return FWP_BYTE_BLOB{static_cast<UINT32>(p.marker.size()),p.marker.data()};
 }
@@ -177,9 +209,10 @@ State inspect(HANDLE e,const Plan& p) {
         if(status==static_cast<DWORD>(FWP_E_FILTER_NOT_FOUND)) continue;
         check(status); require(f.value!=nullptr);
         present[i]=true;
-        exact[i]=same_filter(*f.value,p,i);
+        exact[i]=same_filter(*f.value,p,i) && exact_security(e,p.filters[i],false);
     }
-    return classify(sub_present,sub_present && same_sublayer(*s.value,p),present,exact);
+    return classify(sub_present,sub_present && same_sublayer(*s.value,p) &&
+        exact_security(e,p.sub,true),present,exact);
 }
 void install(HANDLE e,Plan& p) {
     Security security;
@@ -225,6 +258,41 @@ const wchar_t* status_name(State s) {
         default:return L"conflict";
     }
 }
+GUID fresh_guid() {
+    GUID result{};
+    require(CoCreateGuid(&result)==S_OK && !eq(result,GUID{}));
+    return result;
+}
+// Exercise actual BFE API and canonical read-back, but NEVER commit
+// any of the test filters. Even a failed assertion aborts via RAII.
+void transaction_self_test() {
+    Plan p{GUID{},fresh_guid(),{fresh_guid(),fresh_guid()},1,marker(fresh_guid())};
+    Engine engine;
+    {
+        Transaction tx(engine.value,false);
+        require(inspect(engine.value,p)==State::absent);
+        install(engine.value,p);
+        require(inspect(engine.value,p)==State::exact);
+        auto changed=p;
+        changed.luid=2;
+        require(inspect(engine.value,changed)==State::conflict);
+        changed=p;
+        changed.marker[0]^=1;
+        require(inspect(engine.value,changed)==State::conflict);
+        remove(engine.value,p);
+        require(inspect(engine.value,p)==State::absent);
+        install(engine.value,p);
+        check(FwpmFilterDeleteByKey0(engine.value,&p.filters[0]));
+        require(inspect(engine.value,p)==State::conflict);
+        tx.abort();
+    }
+    {
+        Transaction tx(engine.value,true);
+        require(inspect(engine.value,p)==State::absent);
+        tx.commit();
+    }
+    std::wprintf(L"BFE add/read/compare/delete/abort passed; no committed test filters\n");
+}
 void self_test() {
     require(classify(false,false,{false,false},{false,false})==State::absent);
     require(classify(true,true,{true,true},{true,true})==State::exact);
@@ -244,6 +312,8 @@ void self_test() {
 int wmain(int argc,wchar_t** argv) {
     try {
         if(argc==2 && wcscmp(argv[1],L"self-test")==0) { self_test(); return 0; }
+        if(argc==3 && wcscmp(argv[1],L"transaction-self-test")==0 &&
+            wcscmp(argv[2],L"abort-only")==0) { transaction_self_test(); return 0; }
         if(argc==3 && wcscmp(argv[1],L"interface")==0) {
             NET_LUID luid{};
             auto id=guid(argv[2]);
@@ -269,6 +339,7 @@ int wmain(int argc,wchar_t** argv) {
             require(before==State::absent);
             install(engine.value,p);
             require(inspect(engine.value,p)==State::exact);
+            verify_interface(p);
         } else if(mode==L"recover") {
             require(before!=State::conflict);
             if(before==State::exact) remove(engine.value,p);
@@ -282,6 +353,7 @@ int wmain(int argc,wchar_t** argv) {
         observed.commit();
         if(mode==L"install") require(after==State::exact);
         if(mode==L"recover") require(after==State::absent);
+        else verify_interface(p);
         std::wprintf(L"%ls\n",status_name(after));
         return after==State::conflict?2:0;
     } catch(const Failure& error) {
