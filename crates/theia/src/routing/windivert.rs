@@ -121,6 +121,110 @@ pub struct EndpointCandidate {
     pub remote_words: [u8; 16],
 }
 
+/// Correlation of NETWORK, FLOW and SOCKET observations. This deliberately
+/// produces candidates, not authenticated application identity. NETWORK
+/// does not carry the endpoint handle or compartment, and may race event
+/// delivery. Losing an event stream invalidates the entire epoch.
+#[derive(Debug,Clone,Copy,PartialEq,Eq,Hash)]
+pub struct EndpointTuple {
+    pub local: std::net::SocketAddr,
+    pub remote: std::net::SocketAddr,
+    pub transport: super::packet::Transport,
+}
+
+impl EndpointCandidate {
+    pub fn tuple(&self) -> Option<EndpointTuple> {
+        use std::net::{IpAddr,Ipv6Addr,SocketAddr};
+        let decode=|words:[u8;16]| {
+            // WinDivert's host-order 128-bit address uses the low word
+            // first; the pinned upstream helper reverses all 16 bytes.
+            let v6=Ipv6Addr::from(u128::from_le_bytes(words));
+            v6.to_ipv4_mapped().map_or(IpAddr::V6(v6),IpAddr::V4)
+        };
+        let local=decode(self.local_words);
+        let remote=decode(self.remote_words);
+        if self.local_port==0 || self.remote_port==0 || local.is_unspecified()
+            || remote.is_unspecified() || local.is_ipv4()!=remote.is_ipv4()
+            || local.is_multicast() || remote.is_multicast()
+        { return None; }
+        Some(EndpointTuple { local:SocketAddr::new(local,self.local_port),
+            remote:SocketAddr::new(remote,self.remote_port),
+            transport:match self.protocol { 6=>super::packet::Transport::Tcp,17=>super::packet::Transport::Udp,_=>return None } })
+    }
+}
+#[derive(Default)]
+struct EndpointHistory {
+    connect: Option<EndpointCandidate>,
+    flow: Option<EndpointCandidate>,
+    terminal: bool,
+}
+pub struct CandidateLedger {
+    entries: std::collections::HashMap<u64,EndpointHistory>,
+    capacity:usize,
+    poisoned:bool,
+    max_age:i64,
+}
+impl CandidateLedger {
+    /// QPC ticks, not wall-clock milliseconds. Caller must obtain the
+    /// actual QPC frequency and establish a fresh receive epoch.
+    pub fn new(capacity:usize,max_age:i64)->Option<Self> {
+        if !(1..=4096).contains(&capacity) || max_age<=0 { return None; }
+        Some(Self { entries:std::collections::HashMap::new(),capacity,poisoned:false,max_age })
+    }
+    pub fn invalidate(&mut self) { self.poisoned=true; self.entries.clear(); }
+    pub fn observe(&mut self,event:EndpointCandidate) {
+        if self.poisoned { return; }
+        if event.endpoint==0 || event.pid==0 || event.timestamp<=0 { self.invalidate(); return; }
+        if !self.entries.contains_key(&event.endpoint) && self.entries.len()>=self.capacity {
+            self.invalidate(); return;
+        }
+        let history=self.entries.entry(event.endpoint).or_default();
+        if history.terminal { return; }
+        if matches!((event.layer,event.event),(2,2)|(3,7)) {
+            history.terminal=true;return;
+        }
+        // Bind/listen may not yet have a remote. They cannot establish
+        // or refresh an exact candidate. Incoming flows are not admitted.
+        if !matches!((event.layer,event.event),(2,1)|(3,4)) { return; }
+        if !event.outbound || event.tuple().is_none() {
+            history.terminal=true;return;
+        }
+        let slot=if event.layer==2 { &mut history.flow } else { &mut history.connect };
+        if let Some(previous)=slot {
+            if *previous!=event { history.terminal=true; }
+            return;
+        }
+        *slot=Some(event);
+        if let (Some(a),Some(b))=(history.connect,history.flow) {
+            if a.pid!=b.pid || a.tuple()!=b.tuple() || a.timestamp>b.timestamp {
+                history.terminal=true;
+            }
+        }
+    }
+    /// Unique event agreement for the exact packet tuple, bounded age.
+    /// No match is returned when any conflicting live candidate exists.
+    pub fn correlate(&self,packet:&NetworkObservation)->Option<EndpointCandidate> {
+        if self.poisoned || !packet.outbound || packet.sniffed { return None; }
+        let key=packet.meta.flow;
+        let wanted=EndpointTuple { local:key.source,remote:key.destination,transport:key.transport };
+        let mut matched=None;
+        for history in self.entries.values() {
+            // Keep terminal matching records as ambiguity tombstones for
+            // the entire epoch. A tuple reused after close isn't trusted.
+            let related=[history.connect,history.flow].into_iter().flatten().any(|e|e.tuple()==Some(wanted));
+            if !related { continue; }
+            if history.terminal || matched.is_some() { return None; }
+            let (a,b)=(history.connect?,history.flow?);
+            if a.tuple()!=Some(wanted) || b.tuple()!=Some(wanted)
+                || a.pid!=b.pid || a.endpoint!=b.endpoint || packet.timestamp<b.timestamp
+                || packet.timestamp.saturating_sub(a.timestamp)>self.max_age
+            { return None; }
+            matched=Some(b);
+        }
+        matched
+    }
+}
+
 /// Offline reverse-datagram candidate for the native UDP relay.
 /// No injection API accepts this as authorization. Before using it with
 /// WinDivertSendEx, bind it to a live, exclusively owned flow generation,
@@ -309,11 +413,11 @@ mod native {
         path::Path,
     };
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, FreeLibrary, HANDLE, HMODULE, INVALID_HANDLE_VALUE, ERROR_IO_PENDING, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, FreeLibrary, HANDLE, HMODULE, INVALID_HANDLE_VALUE, ERROR_IO_PENDING, WAIT_OBJECT_0, WAIT_TIMEOUT},
         System::{
             IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
             LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32},
-            Threading::{CreateEventW, WaitForSingleObject},
+            Threading::{CreateEventW, GetCurrentProcess, WaitForSingleObject},
         },
     };
     use std::{sync::{Arc, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}, net::UdpSocket};
@@ -380,7 +484,10 @@ mod native {
     }
     impl Api {
         fn open_handle(&self, filter: &std::ffi::CStr, layer: u32, flags: u64) -> io::Result<Handle> {
-            let raw = unsafe { (self.open)(filter.as_ptr(), layer, 0, flags) };
+            self.open_priority(filter,layer,0,flags)
+        }
+        fn open_priority(&self,filter:&std::ffi::CStr,layer:u32,priority:i16,flags:u64)->io::Result<Handle> {
+            let raw = unsafe { (self.open)(filter.as_ptr(), layer, priority, flags) };
             if raw.is_null() || raw == INVALID_HANDLE_VALUE { return Err(io::Error::last_os_error()); }
             let handle = Handle(raw, self.close);
             for param in [3,4] {
@@ -668,6 +775,92 @@ mod native {
         api.retire(handle)
     }
 
+    // Read the kernel endpoint identity from the actual owned Winsock
+    // socket. WinDivert 2.2.2 FLOW/SOCKET EndpointId is the transport
+    // endpoint handle; it is not the raw socket descriptor or PID.
+    fn socket_endpoint(socket:&impl std::os::windows::io::AsRawSocket)->io::Result<u64> {
+        use windows_sys::Win32::Networking::WinSock::{WSAIoctl,WSAGetLastError,SIO_QUERY_WFP_ALE_ENDPOINT_HANDLE};
+        let mut endpoint=0u64;
+        let mut returned=0u32;
+        let rc=unsafe { WSAIoctl(socket.as_raw_socket() as usize,SIO_QUERY_WFP_ALE_ENDPOINT_HANDLE,
+            std::ptr::null(),0,(&mut endpoint as *mut u64).cast(),8,&mut returned,std::ptr::null_mut(),None) };
+        if rc!=0 { return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() })); }
+        if returned!=8 || endpoint==0 { return Err(io::ErrorKind::InvalidData.into()); }
+        Ok(endpoint)
+    }
+
+    fn guarded_lab(api:&Api,cancelled:&AtomicBool)->io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use std::process::{Child,Command,Stdio};
+        let client=UdpSocket::bind("127.0.0.1:0")?;
+        let peer=UdpSocket::bind("127.0.0.1:0")?;
+        let src=client.local_addr()?;
+        let dst=peer.local_addr()?;
+        client.connect(dst)?;
+        peer.connect(src)?;
+        peer.set_read_timeout(Some(Duration::from_millis(450)))?;
+        let endpoint=socket_endpoint(&client)?;
+        let filter=std::ffi::CString::new(format!(
+            "outbound and loopback and !impostor and udp and ip.SrcAddr == 127.0.0.1 and ip.DstAddr == 127.0.0.1 and udp.SrcPort == {} and udp.DstPort == {}",src.port(),dst.port()
+        )).map_err(|_|io::ErrorKind::InvalidInput)?;
+        // Guard is opened before the higher-priority runtime capture.
+        // On capture-handle closure, packets in this exact owned scope
+        // hit the independent lower-priority kernel DROP handle.
+        let guard=api.open_priority(&filter,0,-100,0x12)?;
+        let capture=api.open_priority(&filter,0,100,0x10)?;
+        api.bounded(&capture)?;
+        let injector=api.open_priority(c"false",0,-200,0x18)?;
+        let deadline=Instant::now()+Duration::from_secs(3);
+        client.send(b"owned-carrier")?;
+        let (packet,addr)=api.receive(&capture,cancelled,deadline)?;
+        let observation=addr.network_inner(&packet,true).map_err(|_|io::ErrorKind::InvalidData)?;
+        // This is a private loopback socket held exclusively by this
+        // worker, not a generic endpoint/PID-based application exemption.
+        if observation.meta.flow.source!=src || observation.meta.flow.destination!=dst
+            || observation.sniffed || !observation.outbound || !packet.ends_with(b"owned-carrier")
+            || socket_endpoint(&client)?!=endpoint
+        { return Err(io::ErrorKind::PermissionDenied.into()); }
+        api.send(&injector,&packet,&addr,cancelled,deadline)?;
+        let mut bytes=[0u8;64];
+        let count=peer.recv(&mut bytes)?;
+        if &bytes[..count]!=b"owned-carrier" { return Err(io::ErrorKind::InvalidData.into()); }
+
+        struct Holder(Child);
+        impl Drop for Holder {
+            fn drop(&mut self) { let _=self.0.kill();let _=self.0.wait(); }
+        }
+        // Give a separate process the capture handle and release our own
+        // reference, then hard-kill that process. The guard stays in this
+        // parent; no foreign process or machine-wide filter is involved.
+        let mut holder=Holder(Command::new(std::env::current_exe()?)
+            .args(["client","windivert","--guard-holder-lab"])
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?);
+        let mut duplicate=std::ptr::null_mut();
+        if unsafe { DuplicateHandle(GetCurrentProcess(),capture.0,holder.0.as_raw_handle().cast(),
+            &mut duplicate,0,0,DUPLICATE_SAME_ACCESS) }==0 || duplicate.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        capture.close()?;
+        if holder.0.try_wait()?.is_some() { return Err(io::ErrorKind::BrokenPipe.into()); }
+        holder.0.kill()?;
+        holder.0.wait()?;
+        if cancelled.load(Ordering::Acquire) { return Err(io::ErrorKind::Interrupted.into()); }
+        client.send(b"must-not-leak")?;
+        match peer.recv(&mut bytes) {
+            Err(e) if matches!(e.kind(),io::ErrorKind::TimedOut|io::ErrorKind::WouldBlock)=>{},
+            Ok(_)=>return Err(io::Error::other("guard allowed traffic after runtime handle owner died")),
+            Err(e)=>return Err(e),
+        }
+        // Explicit Disconnect: retire the injection handle before the
+        // blocking guard. Direct local delivery is permitted only now.
+        api.retire(injector)?;
+        guard.close()?;
+        client.send(b"explicit-stop")?;
+        let n=peer.recv(&mut bytes)?;
+        if &bytes[..n]!=b"explicit-stop" { return Err(io::ErrorKind::InvalidData.into()); }
+        Ok(())
+    }
+
     fn socket_lab(api:&Api,cancelled:&AtomicBool) -> io::Result<()> {
         // Only capture events belonging to the current process. The
         // socket is held open until the observed connect and close.
@@ -679,18 +872,34 @@ mod native {
         let filter=std::ffi::CString::new(format!("processId == {pid} and protocol == 17 and localPort == {}",src.port()))
             .map_err(|_|io::ErrorKind::InvalidInput)?;
         let handle=api.open_handle(&filter,3,0x15)?;
+        let flow=api.open_handle(&filter,2,0x15)?;
         api.bounded(&handle)?;
+        api.bounded(&flow)?;
+        let endpoint=socket_endpoint(&sender)?;
         sender.connect(dst)?;
+        sender.send(b"correlation-lab")?;
         let deadline=Instant::now()+Duration::from_secs(3);
         let event=api.receive_event(&handle,cancelled,deadline)?;
-        if event.pid!=pid || event.layer!=3 || event.event!=4 || event.local_port!=src.port() || event.remote_port!=dst.port() {
+        if event.pid!=pid || event.layer!=3 || event.event!=4 || event.endpoint!=endpoint
+            || event.tuple()!=Some(EndpointTuple { local:src,remote:dst,transport:super::super::packet::Transport::Udp }) {
             return Err(io::ErrorKind::InvalidData.into());
         }
+        let established=api.receive_event(&flow,cancelled,deadline)?;
+        if established.layer!=2 || established.event!=1 || established.endpoint!=endpoint
+            || established.pid!=pid || established.tuple()!=event.tuple()
+            || socket_endpoint(&sender)?!=endpoint { return Err(io::ErrorKind::InvalidData.into()); }
+        let mut ledger=CandidateLedger::new(8,i64::MAX).ok_or(io::ErrorKind::InvalidData)?;
+        ledger.observe(event);
+        ledger.observe(established);
+        // No real NETWORK packet is authenticated by event agreement.
+        // The separate lab capture verifies byte-level transport.
         drop(sender);
         let closed=api.receive_event(&handle,cancelled,deadline)?;
         if closed.pid!=pid || closed.endpoint!=event.endpoint || closed.event!=7 || closed.timestamp<event.timestamp {
             return Err(io::ErrorKind::InvalidData.into());
         }
+        ledger.observe(closed);
+        api.retire(flow)?;
         api.retire(handle)
     }
 
@@ -708,7 +917,8 @@ mod native {
             udp_lab(&api,true,&signal)?;
             tcp_lab(&api,false,&signal)?;
             tcp_lab(&api,true,&signal)?;
-            socket_lab(&api,&signal)
+            socket_lab(&api,&signal)?;
+            guarded_lab(&api,&signal)
         }).await.map_err(|_|io::Error::other("WinDivert worker failed"))?;
         drop(cancel);
         result
@@ -826,6 +1036,37 @@ mod tests {
         let out=map.rewrite(&addr,&p).unwrap();
         assert_eq!(&out[20..22],&4321u16.to_be_bytes());
         assert!(TcpLoopbackMap::new("192.0.2.1:1".parse().unwrap(),"192.0.2.1:2".parse().unwrap(),"192.0.2.1:3".parse().unwrap()).is_none());
+    }
+    #[test]
+    fn correlation_rejects_reuse_ambiguity_missing_events_and_loss() {
+        use super::super::packet::{FlowKey,Transport};
+        let words=|v:&str| u128::from(v.parse::<std::net::Ipv6Addr>().unwrap()).to_le_bytes();
+        let event=EndpointCandidate {endpoint:4,pid:42,timestamp:100,event:4,layer:3,protocol:17,outbound:true,
+            local_port:1000,remote_port:443,local_words:words("::ffff:192.0.2.1"),remote_words:words("::ffff:198.51.100.2")};
+        let flow=EndpointCandidate {timestamp:105,event:1,layer:2,..event};
+        let mut packet=NetworkObservation {timestamp:110,outbound:true,sniffed:false,interface:1,sub_interface:0,
+            meta:PacketMeta {flow:FlowKey {source:"192.0.2.1:1000".parse().unwrap(),destination:"198.51.100.2:443".parse().unwrap(),
+            transport:Transport::Udp,interface:1},payload_len:3,tcp_flags:None},transport_checksum_reported_valid:true};
+        let mut ledger=CandidateLedger::new(4,20).unwrap();
+        ledger.observe(flow);assert!(ledger.correlate(&packet).is_none());
+        ledger.observe(event);assert_eq!(ledger.correlate(&packet),Some(flow));
+        packet.timestamp=121;assert!(ledger.correlate(&packet).is_none());
+        packet.timestamp=104;assert!(ledger.correlate(&packet).is_none());
+        packet.timestamp=110;
+        ledger.observe(EndpointCandidate {event:7,timestamp:111,..event});
+        assert!(ledger.correlate(&packet).is_none());
+        ledger.observe(event);ledger.observe(flow);
+        assert!(ledger.correlate(&packet).is_none());
+        let mut ledger=CandidateLedger::new(4,20).unwrap();
+        ledger.observe(event);ledger.observe(flow);
+        ledger.observe(EndpointCandidate {endpoint:5,..event});
+        assert!(ledger.correlate(&packet).is_none());
+        ledger.invalidate();
+        ledger.observe(event);ledger.observe(flow);
+        assert!(ledger.correlate(&packet).is_none());
+        let mut small=CandidateLedger::new(1,20).unwrap();
+        small.observe(event);small.observe(flow);small.observe(EndpointCandidate {endpoint:5,..event});
+        assert!(small.correlate(&packet).is_none());
     }
     #[test]
     fn flow_event_is_candidate_only_and_wrong_event_is_denied() {

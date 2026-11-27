@@ -80,11 +80,17 @@ async fn run() {
                 Err(CliError::NotImplemented("Windows user proxy"))
             }
         }
+        Ok(Command::WinDivertGuardHolder) => {
+            // The parent duplicates exactly one already-open lab handle
+            // into this bounded fixture. No driver or network access here.
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            Ok("WinDivert handle holder exited".to_owned())
+        }
         Ok(Command::ClientWinDivertLoopback { directory, dll_sha256, sys_sha256 }) => {
             #[cfg(all(windows, target_arch = "x86_64"))]
             {
                 theia::routing::windivert::loopback_acceptance(directory.into(),dll_sha256,sys_sha256).await
-                    .map(|_| "WinDivert isolated IPv4/IPv6 TCP redirect, UDP receive/send/reverse and socket lifecycle verified; capture inactive".to_owned())
+                    .map(|_| "WinDivert isolated IPv4/IPv6 TCP redirect, UDP receive/send/reverse socket lifecycle and scoped crash guard verified; capture inactive".to_owned())
                     .map_err(|_| CliError::Client(theia::client::ClientError::Io))
             }
             #[cfg(not(all(windows, target_arch = "x86_64")))]

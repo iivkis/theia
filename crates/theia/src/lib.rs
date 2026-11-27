@@ -173,6 +173,8 @@ pub enum Command {
     },
     ClientStatus,
     /// Explicit backend compatibility check, never activates capture.
+    /// Internal bounded handle-lifetime fixture, no network operations.
+    WinDivertGuardHolder,
     ClientWinDivertLoopback { directory: String, dll_sha256: [u8;32], sys_sha256: [u8;32] },
     ClientWinDivertCheck {
         directory: String,
@@ -388,6 +390,7 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
             })
         }
         ["client", "status"] => Ok(Command::ClientStatus),
+        ["client", "windivert", "--guard-holder-lab"] => Ok(Command::WinDivertGuardHolder),
         ["client", "windivert", "--loopback-lab", "--directory", directory, "--dll-sha256", dll, "--sys-sha256", sys, "--confirm"] => Ok(Command::ClientWinDivertLoopback {
             directory: config_path(directory)?,
             dll_sha256: parse_restart_digest(dll).ok_or(CliError::InvalidArguments)?,
