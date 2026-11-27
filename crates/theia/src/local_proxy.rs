@@ -556,6 +556,14 @@ pub(crate) fn route_source(remote: SocketAddr) -> Option<SocketAddr> {
 // require native carrier admission while capture is active).
 #[cfg(target_os = "windows")]
 fn windows_route_source(remote: SocketAddr) -> Option<SocketAddr> {
+    windows_route_binding(remote).map(|(source,_)|source)
+}
+
+/// Return the same route source and its actual selected interface from
+/// one read-only route observation. The capture backend independently
+/// pins GUID/LUID and revalidates the network epoch.
+#[cfg(target_os = "windows")]
+pub(crate) fn windows_route_binding(remote: SocketAddr) -> Option<(SocketAddr,u32)> {
     use std::{mem, ptr};
     use windows_sys::Win32::{
         NetworkManagement::IpHelper::{GetBestInterfaceEx, GetBestRoute2, MIB_IPFORWARD_ROW2},
@@ -618,7 +626,8 @@ fn windows_route_source(remote: SocketAddr) -> Option<SocketAddr> {
         }
         _ => return None,
     };
-    (!ip.is_unspecified() && !ip.is_multicast()).then_some(SocketAddr::new(ip, 0))
+    (!ip.is_unspecified() && !ip.is_multicast() && route.InterfaceIndex==interface)
+        .then_some((SocketAddr::new(ip, 0),interface))
 }
 
 #[derive(Default)]
@@ -2611,6 +2620,7 @@ impl NativeIngress {
         let mut lab=windivert::begin_scope_relay_lab(directory,dll,sys,targets,seconds).await
             .map_err(|_|ClientError::Io)?;
         ingress.runtime.capture_state.ready()?;
+        eprintln!("WinDivert isolated redirect capture ready; start authorized test applications now");
         let mut udp=NativeUdpDispatch::default();
         let mut tasks=JoinSet::<Option<NativeUdpTicket>>::new();
         let maintenance=carrier_socket::scope(Some(registrar.clone()),ingress.runtime.maintain());
