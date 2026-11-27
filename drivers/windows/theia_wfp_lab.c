@@ -17,6 +17,7 @@
 #include <ws2ipdef.h>
 #include <fwpsk.h>
 #pragma warning(pop)
+#include "theia_wfp_udp_reply.h"
 
 #define THEIA_TAG 'aiHT'
 #define CONTEXT_SIZE 84
@@ -60,6 +61,8 @@ typedef struct _SESSION {
 static SESSION State;
 static KSPIN_LOCK StateLock;
 static EX_RUNDOWN_REF ClassifyRundown;
+static THEIA_REPLY_ENGINE ReplyEngine;
+static BOOLEAN ReplyInitialized;
 static HANDLE Redirect;
 static UINT32 Id4, Id6;
 static PDEVICE_OBJECT Device;
@@ -203,7 +206,10 @@ static NTSTATUS control(PDEVICE_OBJECT dev, PIRP irp) {
     // STOP is the only explicit drain operation for this one-shot driver
     // session. Never wait under the spin lock or at classify IRQL.
     // Once acknowledged, no in-flight callback can publish a new permit.
-    if (waitForClassify) ExWaitForRundownProtectionRelease(&ClassifyRundown);
+    if (waitForClassify) {
+        ExWaitForRundownProtectionRelease(&ClassifyRundown);
+        if (ReplyInitialized) TheiaReplyRetire(&ReplyEngine);
+    }
     if (((code == IOCTL_CONFIG || code == IOCTL_STATUS || code == IOCTL_STOP) && len == CONFIG_SIZE)
         || (code == IOCTL_ENDPOINT && len == ENDPOINT_SIZE))
         RtlSecureZeroMemory(bytes, len);
@@ -409,6 +415,10 @@ static VOID unload(PDRIVER_OBJECT driver) {
     if (Id6 != 0) FwpsCalloutUnregisterById0(Id6);
     if (Id4 != 0) FwpsCalloutUnregisterById0(Id4);
     if (ProcessNotifyRegistered) PsSetCreateProcessNotifyRoutineEx(process_notify, TRUE);
+    if (ReplyInitialized) {
+        TheiaReplyDestroy(&ReplyEngine);
+        ReplyInitialized = FALSE;
+    }
     if (Redirect != NULL) FwpsRedirectHandleDestroy0(Redirect);
     if (State.process != NULL) ObDereferenceObject(State.process);
     IoDeleteSymbolicLink(&LinkName);
@@ -442,6 +452,9 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry) {
     ProcessNotifyRegistered = TRUE;
     status = FwpsRedirectHandleCreate0(&Provider, 0, &Redirect);
     if (!NT_SUCCESS(status)) goto fail;
+    // Prepare the transport injection resource without enabling a UDP
+    // capture/IOCTL surface. A missing resource cannot grant UDP egress.
+    ReplyInitialized = NT_SUCCESS(TheiaReplyInitialize(&ReplyEngine));
     status = register_callout(&CalloutV4, &Id4);
     if (!NT_SUCCESS(status)) goto fail;
     status = register_callout(&CalloutV6, &Id6);

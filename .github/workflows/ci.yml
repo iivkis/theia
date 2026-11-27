@@ -1129,6 +1129,7 @@ jobs:
             f15-build-evidence/*.exe
             f15-build-evidence/*.o
             f15-build-evidence/hashes.json
+            f15-build-evidence/build-evidence.json
           if-no-files-found: error
           retention-days: 3
 
