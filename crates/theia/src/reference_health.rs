@@ -20,7 +20,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::{net::TcpStream, sync::Semaphore, task::JoinHandle, time::timeout};
+use tokio::{sync::Semaphore, task::JoinHandle, time::timeout};
 use tokio_rustls::TlsConnector;
 
 pub const MAX_PLAN: usize = 16 * 1024;
@@ -359,7 +359,7 @@ async fn h2_head(target: &Target, roots: RootCertStore) -> Option<u16> {
     tls.enable_early_data = false;
     tls.resumption = rustls::client::Resumption::disabled();
     let name = ServerName::try_from(target.server_name.clone()).ok()?;
-    let tcp = TcpStream::connect(target.address).await.ok()?;
+    let tcp = crate::routing::carrier_socket::connect_plain_tcp(target.address).await.ok()?;
     if tcp.peer_addr().ok()? != target.address {
         return None;
     }

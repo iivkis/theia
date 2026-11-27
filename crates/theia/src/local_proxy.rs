@@ -14,9 +14,11 @@ use crate::{
     security_profile::SecurityMode,
 };
 use rustls::RootCertStore;
+#[cfg(test)]
+use std::net::UdpSocket;
 use std::{
     io::BufReader,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -540,107 +542,16 @@ impl RealityClient {
     }
 }
 
-/// The OS chooses the UDP source address for the pinned server. Connecting
-/// this temporary socket sends no application datagram and performs no DNS.
-/// Preserve IPv6 scope, discard the ephemeral local port. A failed observation
-/// must never authorize reuse of an earlier negative cache entry.
+/// Preserve the established route observation contract for existing callers.
 pub(crate) fn route_source(remote: SocketAddr) -> Option<SocketAddr> {
-    #[cfg(target_os = "windows")]
-    if crate::routing::carrier_socket::active() {
-        return windows_route_source(remote);
-    }
-    let bind = if remote.is_ipv4() {
-        SocketAddr::from(([0, 0, 0, 0], 0))
-    } else {
-        SocketAddr::from(([0u16; 8], 0))
-    };
-    let socket = UdpSocket::bind(bind).ok()?;
-    socket.connect(remote).ok()?;
-    let mut local = socket.local_addr().ok()?;
-    if local.ip().is_unspecified() {
-        return None;
-    }
+    let mut local = crate::routing::carrier_socket::selected_source(remote).ok()?;
+    if local.ip().is_unspecified() { return None; }
     local.set_port(0);
     Some(local)
 }
 
-// Read-only route query, not a throwaway UDP connect (which would itself
-// require native carrier admission while capture is active).
 #[cfg(target_os = "windows")]
-fn windows_route_source(remote: SocketAddr) -> Option<SocketAddr> {
-    windows_route_binding(remote).map(|(source,_)|source)
-}
-
-/// Return the same route source and its actual selected interface from
-/// one read-only route observation. The capture backend independently
-/// pins GUID/LUID and revalidates the network epoch.
-#[cfg(target_os = "windows")]
-pub(crate) fn windows_route_binding(remote: SocketAddr) -> Option<(SocketAddr,u32)> {
-    use std::{mem, ptr};
-    use windows_sys::Win32::{
-        NetworkManagement::IpHelper::{GetBestInterfaceEx, GetBestRoute2, MIB_IPFORWARD_ROW2},
-        Networking::WinSock::{AF_INET, AF_INET6, SOCKADDR_INET},
-    };
-    if remote.ip().is_unspecified() || remote.ip().is_multicast() {
-        return None;
-    }
-    let mut dst: SOCKADDR_INET = unsafe { mem::zeroed() };
-    let mut source: SOCKADDR_INET = unsafe { mem::zeroed() };
-    if mem::size_of::<SOCKADDR_INET>() != 28 {
-        return None;
-    }
-    let raw = unsafe {
-        std::slice::from_raw_parts_mut((&mut dst as *mut SOCKADDR_INET).cast::<u8>(), 28)
-    };
-    match remote {
-        SocketAddr::V4(v4) => {
-            raw[..2].copy_from_slice(&AF_INET.to_ne_bytes());
-            raw[4..8].copy_from_slice(&v4.ip().octets());
-        }
-        SocketAddr::V6(v6) => {
-            if v6.scope_id() != 0 || v6.ip().to_ipv4_mapped().is_some() {
-                return None;
-            }
-            raw[..2].copy_from_slice(&AF_INET6.to_ne_bytes());
-            raw[8..24].copy_from_slice(&v6.ip().octets());
-        }
-    }
-    let mut interface = 0u32;
-    if unsafe { GetBestInterfaceEx((&mut dst as *mut SOCKADDR_INET).cast(), &mut interface) } != 0
-        || interface == 0
-    {
-        return None;
-    }
-    let mut route: MIB_IPFORWARD_ROW2 = unsafe { mem::zeroed() };
-    if unsafe {
-        GetBestRoute2(
-            ptr::null(),
-            interface,
-            ptr::null(),
-            &dst,
-            0,
-            &mut route,
-            &mut source,
-        )
-    } != 0
-    {
-        return None;
-    }
-    let raw =
-        unsafe { std::slice::from_raw_parts((&source as *const SOCKADDR_INET).cast::<u8>(), 28) };
-    let family = u16::from_ne_bytes(raw[..2].try_into().ok()?);
-    let ip = match (remote, family) {
-        (SocketAddr::V4(_), AF_INET) => {
-            IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(&raw[4..8]).ok()?))
-        }
-        (SocketAddr::V6(_), AF_INET6) if raw[24..28] == [0; 4] => {
-            IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&raw[8..24]).ok()?))
-        }
-        _ => return None,
-    };
-    (!ip.is_unspecified() && !ip.is_multicast() && route.InterfaceIndex==interface)
-        .then_some((SocketAddr::new(ip, 0),interface))
-}
+pub(crate) use crate::routing::carrier_socket::windows_route_binding;
 
 use crate::net::evidence::ScopedDecision as NegativeCache;
 
@@ -4949,11 +4860,7 @@ async fn bind_proxy_listener(address: &str) -> Result<TcpListener, ClientError> 
     if !matches!(address.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST) | IpAddr::V6(Ipv6Addr::LOCALHOST)) {
         return Err(ClientError::Configuration);
     }
-    let socket = if address.is_ipv4() {
-        tokio::net::TcpSocket::new_v4()
-    } else {
-        tokio::net::TcpSocket::new_v6()
-    }.map_err(|_| ClientError::Io)?;
+    let socket = crate::routing::carrier_socket::new_tcp(address).map_err(|_| ClientError::Io)?;
     let raw = socket.as_raw_socket() as usize;
     let enabled: i32 = 1;
     // SAFETY: socket is uniquely owned; the option is a live i32 for
@@ -4962,8 +4869,7 @@ async fn bind_proxy_listener(address: &str) -> Result<TcpListener, ClientError> 
         || unsafe { SetHandleInformation(raw as HANDLE, HANDLE_FLAG_INHERIT, 0) } == 0 {
         return Err(ClientError::Io);
     }
-    socket.bind(address).map_err(|_| ClientError::Io)?;
-    socket.listen(128).map_err(|_| ClientError::Io)
+    crate::routing::carrier_socket::listen_tcp(socket, address, 128).map_err(|_| ClientError::Io)
 }
 
 #[cfg(not(windows))]
@@ -5722,7 +5628,7 @@ async fn udp_association(
         return Err(ClientError::Open(ErrorCode::PolicyDenied));
     }
     let socket = Arc::new(
-        tokio::net::UdpSocket::bind(SocketAddr::new(local.ip(), 0))
+        crate::routing::carrier_socket::bind_plain_udp(SocketAddr::new(local.ip(), 0))
             .await
             .map_err(|_| ClientError::Io)?,
     );

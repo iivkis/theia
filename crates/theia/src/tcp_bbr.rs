@@ -169,8 +169,7 @@ pub(crate) fn bind(address: SocketAddr) -> Result<TcpListener, Error> {
     let socket = new_socket(address)?;
     #[cfg(target_os = "linux")]
     socket.set_reuseaddr(true)?;
-    socket.bind(address)?;
-    let listener = socket.listen(1024)?;
+    let listener = crate::routing::carrier_socket::listen_tcp(socket, address, 1024)?;
     verify(&listener)?;
     Ok(listener)
 }

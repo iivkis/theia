@@ -26,7 +26,7 @@ use crate::{
 use std::{
     collections::{HashMap, HashSet},
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::SocketAddr,
     sync::Arc,
     time::Duration,
 };
@@ -392,16 +392,6 @@ struct Reply {
     peer: SocketAddr,
     data: Vec<u8>,
 }
-fn wildcard(ip: IpAddr) -> SocketAddr {
-    match ip {
-        IpAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
-        IpAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
-    }
-}
-
-/// Each physical client path has its own connected upstream socket. A CID
-/// seen from a second address does not redirect or validate the old path.
-/// Responses return only to the physical peer owning this socket.
 async fn reference_path(
     source: (Arc<Live>, Arc<Lease>),
     signer: [u8; 32],
@@ -430,10 +420,10 @@ async fn reference_path(
     let Ok(address) = lease.address() else {
         return;
     };
-    let Ok(socket) = UdpSocket::bind(wildcard(address.ip())).await else {
+    let Ok(socket) = crate::routing::carrier_socket::connect_plain_udp(address).await else {
         return;
     };
-    if socket.connect(address).await.is_err() || lease.address().ok() != Some(address) {
+    if lease.address().ok() != Some(address) {
         return;
     }
     pump_path(socket, id, peer, deadline, incoming, replies, || {

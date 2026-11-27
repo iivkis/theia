@@ -15,7 +15,6 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
     sync::Semaphore,
     time::timeout,
 };
@@ -311,7 +310,7 @@ pub async fn observe_public_egress(
             .acquire()
             .await
             .map_err(|_| EgressError::ConnectFailed)?;
-        let tcp = TcpStream::connect(request.address)
+        let tcp = crate::routing::carrier_socket::connect_plain_tcp(request.address)
             .await
             .map_err(|_| EgressError::ConnectFailed)?;
         let mut stream = connector

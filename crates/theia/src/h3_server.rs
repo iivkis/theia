@@ -79,8 +79,7 @@ impl OwnTlsEndpoint {
         use crate::quic_transport::QuicError;
         let scope = crate::quic_core::scope::NetworkScope::listener(bind.ip())
             .ok_or(QuicError::Configuration)?;
-        let socket = std::net::UdpSocket::bind(bind).map_err(|_| QuicError::Bind)?;
-        socket.set_nonblocking(true).map_err(|_| QuicError::Bind)?;
+        let socket = crate::routing::carrier_socket::bind_std_udp_listener(bind).map_err(|_| QuicError::Bind)?;
         let local = socket.local_addr().map_err(|_| QuicError::Bind)?;
         Ok(Self::Native {
             socket: Arc::new(Mutex::new(Some(socket))),

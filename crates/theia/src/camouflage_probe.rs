@@ -9,11 +9,11 @@ use crate::camouflage_discovery::{plausible_public_address, Observation, TlsEvid
 use rustls::{pki_types::ServerName, RootCertStore};
 use std::{
     io,
-    net::{IpAddr, SocketAddr, UdpSocket},
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{net::TcpStream, sync::Semaphore, time::timeout};
+use tokio::{sync::Semaphore, time::timeout};
 use tokio_rustls::TlsConnector;
 
 const MAX_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(5);
@@ -24,14 +24,7 @@ static ACTIVE_PROBES: Semaphore = Semaphore::const_new(4);
 /// the public NAT egress nor the assigned subnet prefix/ownership; do not
 /// synthesize a /24 or treat this address as permission to scan neighbors.
 pub fn route_selected_local_ip(destination: SocketAddr) -> io::Result<IpAddr> {
-    let bind = if destination.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
-    let socket = UdpSocket::bind(bind)?;
-    socket.connect(destination)?;
-    Ok(socket.local_addr()?.ip())
+    Ok(crate::routing::carrier_socket::selected_source(destination)?.ip())
 }
 
 /// No active scanning by default. Public probes are permitted for exactly
@@ -155,7 +148,7 @@ pub async fn probe_tls_h2(
             .acquire()
             .await
             .map_err(|_| ProbeError::ConnectFailed)?;
-        let tcp = TcpStream::connect(request.address)
+        let tcp = crate::routing::carrier_socket::connect_plain_tcp(request.address)
             .await
             .map_err(|_| ProbeError::ConnectFailed)?;
         let tls = connector
