@@ -422,6 +422,33 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn diagnostic_metadata_rejects_mixed_duplicate_and_malformed_requests() {
+        let (snapshot, wire) = snapshot::Snapshot::build("scope", 2, &[], &[], &[]).unwrap();
+        let publication = Published { snapshot, wire: wire.into(), diagnostic_domains: vec!["discord.com".into()] };
+        let digest = publication.snapshot.digest();
+        let deadline = Duration::from_secs(1);
+        for header in [DIAGNOSTIC_HEADER, DOMAIN_HEADER, NATIVE_DNS_HEADER, DIGEST_HEADER] {
+            let mut request = http::Request::new(());
+            request_digest(&mut request, digest).unwrap();
+            request.headers_mut().insert(DIAGNOSTIC_HEADER, http::HeaderValue::from_static("1"));
+            request.headers_mut().append(header, http::HeaderValue::from_static("1"));
+            assert_eq!(response_data(&publication, request.headers(), false, deadline).await.unwrap_err(), http::StatusCode::BAD_REQUEST);
+        }
+        let mut request = http::Request::new(());
+        request.headers_mut().insert(DIAGNOSTIC_HEADER, http::HeaderValue::from_static("1"));
+        assert_eq!(response_data(&publication, request.headers(), false, deadline).await.unwrap_err(), http::StatusCode::BAD_REQUEST);
+        let mut malformed = DIAGNOSTIC_MAGIC.to_vec();
+        malformed.extend_from_slice(&digest);
+        for suffix in [b"".as_slice(), b"https://discord.com", b"discord.com\ndiscord.com", &[255]] {
+            let mut bytes = malformed.clone();
+            bytes.extend_from_slice(suffix);
+            assert!(decode_diagnostic_domains(&bytes, digest).is_err());
+        }
+        malformed.extend(std::iter::repeat_n(b'a', DIAGNOSTIC_LIMIT));
+        assert!(decode_diagnostic_domains(&malformed, digest).is_err());
+    }
+
     #[test]
     fn dns_response_exact_encoding() {
         let ips = vec!["192.0.2.1".parse().unwrap(), "2001:db8::1".parse().unwrap()];
