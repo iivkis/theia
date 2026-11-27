@@ -180,7 +180,7 @@ impl Tunnel {
                 };
                 let stun = match verified.strategy {
                     crate::routing::dpi::UdpStrategy::StunBinding(strategy) => Some(strategy),
-                    crate::routing::dpi::UdpStrategy::QuicV1 => None,
+                    crate::routing::dpi::UdpStrategy::Quic(_) => None,
                 };
                 let unmodified = flow.is_some() && stun.is_none_or(|strategy| {
                     crate::routing::dpi::udp::prepare_binding(&first, strategy)

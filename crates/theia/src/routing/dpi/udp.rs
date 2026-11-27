@@ -362,17 +362,19 @@ pub(super) async fn probe_quic(
     address: std::net::SocketAddr,
     scope: Option<crate::network_scope::Scope>,
     config: std::sync::Arc<rustls::ClientConfig>,
+    version: crate::quic_core::wire::Version,
 ) -> Option<()> {
-    use crate::quic_core::{dial, negotiation::VersionPolicy, wire::Version};
+    use crate::quic_core::{dial, negotiation::VersionPolicy};
     let mut tls = (*config).clone();
     tls.alpn_protocols = vec![b"h3".to_vec()];
     tls.enable_early_data = false;
     let name = rustls::pki_types::ServerName::try_from(name.to_owned()).ok()?;
-    let (_, session) = dial::connect(
+    let (negotiated, session) = dial::connect(
         address, name, std::sync::Arc::new(tls),
-        scope.map(|scope| scope.bind_address()), VersionPolicy::exact(Version::V1),
+        scope.map(|scope| scope.bind_address()), VersionPolicy::exact(version),
         Duration::from_secs(5),
     ).await.ok()?;
+    if negotiated != version { return None; }
     dial::close_probe(session).await.ok()
 
 }
@@ -410,13 +412,13 @@ mod tests {
         let deadline = std::time::Duration::from_secs(5);
         assert!(tokio::time::timeout(
             deadline,
-            probe_quic("localhost", addr, None, config.clone())
+            probe_quic("localhost", addr, None, config.clone(), crate::quic_core::wire::Version::V1)
         )
         .await
         .unwrap()
         .is_some());
         assert!(
-            tokio::time::timeout(deadline, probe_quic("wrong.invalid", addr, None, config))
+            tokio::time::timeout(deadline, probe_quic("wrong.invalid", addr, None, config, crate::quic_core::wire::Version::V1))
                 .await
                 .unwrap()
                 .is_none()

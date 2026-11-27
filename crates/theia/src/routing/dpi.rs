@@ -67,14 +67,27 @@ pub(crate) struct Engine {
 
 struct UdpEvidence {
     key: Key,
+    probe: UdpProbe,
     good: bool,
     expiry: std::time::Instant,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+enum UdpProbe {
+    Quic(crate::quic_core::wire::Version),
+    Stun,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UdpStrategy {
-    QuicV1,
+    Quic(crate::quic_core::wire::Version),
     StunBinding(udp::BindingStrategy),
+}
+
+impl UdpStrategy {
+    fn probe(self) -> UdpProbe {
+        match self { Self::Quic(version) => UdpProbe::Quic(version), Self::StunBinding(_) => UdpProbe::Stun }
+    }
 }
 
 pub(crate) struct VerifiedUdp {
@@ -105,21 +118,17 @@ impl VerifiedUdp {
                 .socket
                 .local_addr()
                 .is_ok_and(|local| self.key.network.matches_local(local))
-            && self.engine.cached_udp(&self.key) == Some(true))
+            && self.engine.cached_udp(&self.key, self.strategy.probe()) == Some(true))
     }
     #[cfg(target_os = "linux")]
     pub(crate) fn quic_batch(&self, first: &[u8]) -> Option<Vec<Vec<u8>>> {
-        // Current independent reachability preflight authenticates v1
-        // only. A v2 candidate must not inherit that evidence.
-        if self.strategy != UdpStrategy::QuicV1
-            || crate::reality_quic_wire::long(first)?.version != crate::reality_quic_wire::V1 {
-            return None;
-        }
+        let UdpStrategy::Quic(version) = self.strategy else { return None; };
+        if crate::reality_quic_wire::long(first)?.version != version.wire() { return None; }
         super::packet_modify::quic_initial_datagrams(first, &self.key.name)
     }
 
     pub(crate) fn failed(&self) {
-        self.engine.remember_udp(self.key.clone(), false);
+        self.engine.remember_udp(self.key.clone(), self.strategy.probe(), false);
     }
 
     #[cfg(test)]
@@ -129,7 +138,7 @@ impl VerifiedUdp {
         engine.authorize_policy(Some(super::client_state::LocalPolicy::fixture([1; 32])));
         Self {
             socket,
-            strategy: UdpStrategy::QuicV1,
+            strategy: UdpStrategy::Quic(crate::quic_core::wire::Version::V1),
             engine,
             key: Key {
                 name: "example.org".into(),
@@ -224,26 +233,27 @@ impl Engine {
         (hash.finish() as usize) % self.probe_slots.len()
     }
 
-    fn cached_udp(&self, key: &Key) -> Option<bool> {
+    fn cached_udp(&self, key: &Key, probe: UdpProbe) -> Option<bool> {
         let mut cache = self.udp_cache.lock().ok()?;
         cache.retain(|entry| entry.expiry > std::time::Instant::now());
         cache
             .iter()
-            .find(|entry| &entry.key == key)
+            .find(|entry| &entry.key == key && entry.probe == probe)
             .map(|entry| entry.good)
     }
 
-    fn remember_udp(&self, key: Key, good: bool) {
+    fn remember_udp(&self, key: Key, probe: UdpProbe, good: bool) {
         if network_scope::observe(key.address) != Some(key.network) {
             return;
         }
         if let Ok(mut cache) = self.udp_cache.lock() {
-            cache.retain(|entry| entry.key != key && entry.expiry > std::time::Instant::now());
+            cache.retain(|entry| (entry.key != key || entry.probe != probe) && entry.expiry > std::time::Instant::now());
             if cache.len() >= 128 {
                 cache.pop_front();
             }
             cache.push_back(UdpEvidence {
                 key,
+                probe,
                 good,
                 expiry: std::time::Instant::now() + Duration::from_secs(if good { 60 } else { 20 }),
             });
@@ -259,6 +269,18 @@ impl Engine {
         ips: &[IpAddr],
         policy: [u8; 32],
     ) -> Option<VerifiedUdp> {
+        self.open_quic_udp_version(name, port, ips, policy, crate::quic_core::wire::Version::V1).await
+    }
+
+    pub(crate) async fn open_quic_udp_version(
+        self: &Arc<Self>,
+        name: &str,
+        port: u16,
+        ips: &[IpAddr],
+        policy: [u8;32],
+        version: crate::quic_core::wire::Version,
+    ) -> Option<VerifiedUdp> {
+        let probe = UdpProbe::Quic(version);
         if !self.enabled()
             || !self.policy_current(policy)
             || port != 443
@@ -291,7 +313,7 @@ impl Engine {
                 {
                     continue;
                 }
-                let good = if let Some(good) = self.cached_udp(&key) {
+                let good = if let Some(good) = self.cached_udp(&key, probe) {
                     crate::traffic::dpi_cache_hit();
                     good
                 } else {
@@ -301,14 +323,14 @@ impl Engine {
                         .ok()??;
                     let good = timeout(
                         ATTEMPT,
-                        udp::probe_quic(&name, address, Some(network), config),
+                        udp::probe_quic(&name, address, Some(network), config, version),
                     )
                     .await
                     .ok()
                     .flatten()
                     .is_some();
                     crate::traffic::dpi_probe(good);
-                    self.remember_udp(key.clone(), good);
+                    self.remember_udp(key.clone(), probe, good);
                     good
                 };
                 drop(guard);
@@ -329,13 +351,13 @@ impl Engine {
                     {
                         return Some(VerifiedUdp {
                             socket,
-                            strategy: UdpStrategy::QuicV1,
+                            strategy: UdpStrategy::Quic(version),
                             engine: self.clone(),
                             key,
                         });
                     }
                 }
-                self.remember_udp(key, false);
+                self.remember_udp(key, probe, false);
             }
             None
         })
@@ -387,7 +409,7 @@ impl Engine {
                 {
                     continue;
                 }
-                if self.cached_udp(&key) == Some(false) {
+                if self.cached_udp(&key, UdpProbe::Stun) == Some(false) {
                     continue;
                 }
                 let _permit = self.probes.try_acquire().ok()?;
@@ -428,7 +450,7 @@ impl Engine {
                 {
                     continue;
                 }
-                self.remember_udp(key.clone(), selected.is_some());
+                self.remember_udp(key.clone(), UdpProbe::Stun, selected.is_some());
                 let Some(strategy) = selected else {
                     continue;
                 };
@@ -729,6 +751,26 @@ mod tests {
         assert!(authorization.check().is_err());
         engine.authorize_policy(None);
         assert!(authorization.check().is_err());
+    }
+
+    #[test]
+    fn udp_evidence_does_not_cross_protocol_versions() {
+        use crate::quic_core::wire::Version;
+        let engine = Engine::default();
+        let address = "192.0.2.1:443".parse().unwrap();
+        let key = Key { name: "example.org".into(), address, policy: [1;32], network: network_scope::Scope::fixture(address, 1) };
+        let expiry = std::time::Instant::now() + Duration::from_secs(60);
+        engine.udp_cache.lock().unwrap().push_back(UdpEvidence {
+            key: key.clone(), probe: UdpProbe::Quic(Version::V1), good: true, expiry,
+        });
+        assert_eq!(engine.cached_udp(&key, UdpProbe::Quic(Version::V1)), Some(true));
+        assert_eq!(engine.cached_udp(&key, UdpProbe::Quic(Version::V2)), None);
+        assert_eq!(engine.cached_udp(&key, UdpProbe::Stun), None);
+        engine.udp_cache.lock().unwrap().push_back(UdpEvidence {
+            key: key.clone(), probe: UdpProbe::Quic(Version::V2), good: false, expiry,
+        });
+        assert_eq!(engine.cached_udp(&key, UdpProbe::Quic(Version::V2)), Some(false));
+        assert_eq!(engine.cached_udp(&key, UdpProbe::Quic(Version::V1)), Some(true));
     }
 
     #[tokio::test]

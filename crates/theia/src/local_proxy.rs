@@ -2494,7 +2494,10 @@ impl NativeIngress {
                 }
                 let ips = carrier.resolve_routing(&name,digest).await?;
                 if !ips.contains(&key.destination.ip()) { return Err(denied()); }
-                let verified = cache.dpi.open_quic_udp(&name,443,&[key.destination.ip()],digest).await.ok_or_else(denied)?;
+                let version = crate::reality_quic_wire::long(&first.payload)
+                    .and_then(|header| crate::quic_core::wire::Version::from_wire(header.version))
+                    .ok_or_else(denied)?;
+                let verified = cache.dpi.open_quic_udp_version(&name,443,&[key.destination.ip()],digest,version).await.ok_or_else(denied)?;
                 if verified.quic_batch(&first.payload).is_none() || verified.socket.peer_addr().ok() != Some(key.destination)
                     || !verified.socket.local_addr().is_ok_and(|a| a.ip() == key.source.ip())
                     || !verified.admissible()? { return Err(denied()); }
