@@ -565,6 +565,20 @@ impl TcpRedirectTable {
         entry.state=TcpReflectionState::Accepted(seq);
         true
     }
+    /// Derive the token from an actual accept on a reserved listener.
+    /// The caller must own the listener and verify the accepted socket.
+    pub fn accept_captured(&mut self,local:std::net::SocketAddr,peer:std::net::SocketAddr)->Option<TcpRedirectToken> {
+        let token={
+            let mut candidates=self.entries.values().filter(|entry| {
+                let key=entry.token.original;
+                entry.listener==local && std::net::SocketAddr::new(key.destination.ip(),key.source.port())==peer
+            }).map(|entry|entry.token);
+            let token=candidates.next()?;
+            if candidates.next().is_some() { return None; }
+            token
+        };
+        self.accept(token,local,peer).then_some(token)
+    }
     pub fn complete(&mut self,token:TcpRedirectToken)->bool {
         let Some(entry)=self.entries.get_mut(&token.original) else { return false; };
         if entry.token!=token || entry.state==TcpReflectionState::Retired { return false; }
@@ -1305,6 +1319,171 @@ mod native {
         Ok(RelayLab { key,reply:reply_tx,worker,_cancel:cancel })
     }
 
+    /// Real non-loopback TCP reflection for an explicitly authorized
+    /// owned echo socket. Keep the lower DROP handle until the async
+    /// sockets close, including after a capture error.
+    /// Not a generic application or persistent guard.
+    pub(crate) async fn run_tcp_relay_lab<F,Fut>(
+        directory:std::path::PathBuf,dll:[u8;32],sys:[u8;32],
+        target:std::net::SocketAddr,relay:F,
+    )->io::Result<()>
+    where F:FnOnce(super::super::packet::FlowKey,tokio::net::TcpStream)->Fut,
+        Fut:std::future::Future<Output=io::Result<()>>
+    {
+        use ring::rand::{SecureRandom,SystemRandom};
+        use tokio::{io::{AsyncReadExt,AsyncWriteExt},sync::oneshot};
+        use std::{net::SocketAddr,sync::Mutex};
+        if !reflect_address(target) { return Err(io::ErrorKind::InvalidInput.into()); }
+        let cancel=Cancel(Arc::new(AtomicBool::new(false)));
+        let signal=cancel.0.clone();
+        let _winsock=WinsockLease::start()?;
+        let scope=crate::network_scope::observe(target).ok_or(io::ErrorKind::PermissionDenied)?;
+        let bind=||->io::Result<tokio::net::TcpSocket> {
+            let socket=if target.is_ipv4(){tokio::net::TcpSocket::new_v4()?}
+                else{tokio::net::TcpSocket::new_v6()?};
+            exclusive(&socket)?;
+            socket.bind(scope.bind_address())?;
+            Ok(socket)
+        };
+        let client=bind()?;
+        let listener=bind()?.listen(1)?;
+        let client_addr=client.local_addr()?;
+        let listener_addr=listener.local_addr()?;
+        if !scope.matches_local(client_addr) || !scope.matches_local(listener_addr)
+            || client_addr==listener_addr || client_addr.ip()==target.ip()
+            || !reflect_address(client_addr) {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        let endpoint=socket_endpoint(&client)?;
+        let peer=SocketAddr::new(target.ip(),client_addr.port());
+        let table=Arc::new(Mutex::new(TcpRedirectTable::new(1,1).ok_or(io::ErrorKind::InvalidInput)?));
+        let capture_table=table.clone();
+        let (ready_tx,ready_rx)=oneshot::channel();
+        let (failed_tx,mut failed_rx)=oneshot::channel::<()>();
+        let mut challenge=[0u8;128];
+        SystemRandom::new().fill(&mut challenge).map_err(|_|io::Error::other("entropy unavailable"))?;
+        let worker=tokio::task::spawn_blocking(move || {
+            let _winsock=WinsockLease::start()?;
+            let api=load(&directory,dll,sys)?;
+            let field=if target.is_ipv4(){"ip"}else{"ipv6"};
+            let filter=std::ffi::CString::new(format!(
+                "outbound and !loopback and !impostor and tcp and {field}.SrcAddr == {} and {field}.DstAddr == {} and ((tcp.SrcPort == {} and tcp.DstPort == {}) or (tcp.SrcPort == {} and tcp.DstPort == {}))",
+                client_addr.ip(),target.ip(),client_addr.port(),target.port(),listener_addr.port(),peer.port()
+            )).map_err(|_|io::ErrorKind::InvalidInput)?;
+            let guard=api.open_priority(&filter,0,-100,0x12)?;
+            let capture=api.open_priority(&filter,0,100,0x10)?;
+            api.bounded(&capture)?;
+            let injector=api.open_priority(c"false",0,-200,0x18)?;
+            ready_tx.send(()).map_err(|_|io::ErrorKind::BrokenPipe)?;
+            let deadline=Instant::now()+Duration::from_secs(30);
+            let result=(||->io::Result<()> {
+                let mut packets=0usize;
+                while !signal.load(Ordering::Acquire) {
+                    if Instant::now()>=deadline || packets>=512
+                        || crate::network_scope::observe(target)!=Some(scope) {
+                        return Err(io::ErrorKind::TimedOut.into());
+                    }
+                    let receive_until=std::cmp::min(deadline,Instant::now()+Duration::from_millis(100));
+                    let (packet,address)=match api.receive(&capture,&signal,receive_until) {
+                        Ok(data)=>data,
+                        Err(_) if signal.load(Ordering::Acquire)=>break,
+                        Err(error) if error.kind()==io::ErrorKind::TimedOut=>continue,
+                        Err(error)=>return Err(error),
+                    };
+                    let observation=address.network(&packet).map_err(|_|io::ErrorKind::InvalidData)?;
+                    let key=observation.meta.flow;
+                    let reverse={
+                        let mut table=capture_table.lock().map_err(|_|io::ErrorKind::PermissionDenied)?;
+                        let token=match table.lookup(&address,&packet) {
+                            Some(token)=>token,
+                            None if packets==0 && key.source==client_addr && key.destination==target=>
+                                table.begin(&address,&packet,listener_addr).ok_or(io::ErrorKind::PermissionDenied)?,
+                            _=>return Err(io::ErrorKind::PermissionDenied.into()),
+                        };
+                        table.reflect(token,&address,&packet).ok_or(io::ErrorKind::PermissionDenied)?
+                    };
+                    if signal.load(Ordering::Acquire) { break; }
+                    if crate::network_scope::observe(target)!=Some(scope) ||
+                        reverse.interface!=observation.interface || reverse.sub_interface!=observation.sub_interface {
+                        return Err(io::ErrorKind::PermissionDenied.into());
+                    }
+                    let mut incoming=address;
+                    incoming.flags=(1<<22) | if target.is_ipv6(){1<<20}else{1<<21};
+                    match api.send(&injector,&reverse.packet,&incoming,&signal,deadline) {
+                        Ok(())=>packets+=1,
+                        Err(_) if signal.load(Ordering::Acquire)=>break,
+                        Err(error)=>return Err(error),
+                    }
+                }
+                if packets==0 { return Err(io::ErrorKind::InvalidData.into()); }
+                Ok(())
+            })();
+            if result.is_err() { let _=failed_tx.send(()); }
+            // Keep the drop rule active until the socket-owning future
+            // has been destroyed, even on RecvEx/SendEx failure.
+            while !signal.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let capture_result=api.retire(capture);
+            let inject_result=api.retire(injector);
+            let guard_result=guard.close();
+            result?;
+            capture_result?;
+            inject_result?;
+            guard_result
+        });
+        if ready_rx.await.is_err() { return Err(io::ErrorKind::UnexpectedEof.into()); }
+        // Both socket-owning futures are dropped before the Cancel
+        // signal, including on timeout, worker error or cancellation.
+        let result=tokio::select! {
+            biased;
+            _=&mut failed_rx=>Err(io::Error::other("TCP capture worker failed")),
+            result=tokio::time::timeout(Duration::from_secs(25),async move {
+                tokio::try_join!(
+                    async {
+                        let mut stream=client.connect(target).await?;
+                        if stream.local_addr()?!=client_addr || stream.peer_addr()?!=target
+                            || socket_endpoint(&stream)?!=endpoint
+                            || crate::network_scope::observe(target)!=Some(scope) {
+                            return Err(io::ErrorKind::PermissionDenied.into());
+                        }
+                        stream.write_all(&challenge[..64]).await?;
+                        stream.write_all(&challenge[64..]).await?;
+                        let mut echoed=[0u8;128];
+                        stream.read_exact(&mut echoed).await?;
+                        if echoed!=challenge || socket_endpoint(&stream)?!=endpoint {
+                            return Err(io::ErrorKind::PermissionDenied.into());
+                        }
+                        stream.shutdown().await?;
+                        let mut eof=[0u8;1];
+                        if stream.read(&mut eof).await?!=0 { return Err(io::ErrorKind::InvalidData.into()); }
+                        Ok::<(),io::Error>(())
+                    },
+                    async {
+                        let (stream,accepted_peer)=listener.accept().await?;
+                        if accepted_peer!=peer || stream.peer_addr()?!=peer ||
+                            stream.local_addr()?!=listener_addr ||
+                            crate::network_scope::observe(target)!=Some(scope) {
+                            return Err(io::ErrorKind::PermissionDenied.into());
+                        }
+                        let token=table.lock().map_err(|_|io::ErrorKind::PermissionDenied)?
+                            .accept_captured(listener_addr,accepted_peer).ok_or(io::ErrorKind::PermissionDenied)?;
+                        drop(listener);
+                        relay(token.original(),stream).await
+                    }
+                )?;
+                Ok::<(),io::Error>(())
+            })=>match result {
+                Ok(result)=>result,
+                Err(_)=>Err(io::ErrorKind::TimedOut.into()),
+            },
+        };
+        drop(cancel);
+        let completed=worker.await.map_err(|_|io::Error::other("TCP capture worker panicked"))?;
+        result?;
+        completed
+    }
+
     fn guarded_lab(api:&Api,cancelled:&AtomicBool)->io::Result<()> {
         use std::os::windows::io::AsRawHandle;
         use std::process::{Child,Command,Stdio};
@@ -1545,7 +1724,7 @@ mod native {
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub use native::{loopback_acceptance, probe};
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-pub(crate) use native::{begin_udp_relay_lab, RelayLab, UDP_LAB_DATAGRAMS};
+pub(crate) use native::{begin_udp_relay_lab, run_tcp_relay_lab, RelayLab, UDP_LAB_DATAGRAMS};
 
 #[cfg(test)]
 mod tests {
@@ -1794,7 +1973,8 @@ mod tests {
             assert_eq!(parsed.flow.source,remote);assert_eq!(parsed.flow.destination,client);
             assert!(!table.accept(token,listener,remote));
             assert!(table.reflect(token,&addr,&packet(client,remote,10,31,0x10,b"")).is_some());
-            assert!(table.accept(token,listener,peer));
+            assert_eq!(table.accept_captured(listener,peer),Some(token));
+            assert_eq!(table.accept_captured(listener,peer),None);
             assert!(!table.accept(token,listener,peer));
             let data=packet(client,remote,10,31,0x18,b"hello");
             let out=table.reflect(token,&addr,&data).unwrap();

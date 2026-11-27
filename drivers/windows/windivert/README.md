@@ -123,3 +123,11 @@ and-delete; the script never removes a firewall rule. After explicit
 administrator review/removal, ReconcileAbsent records an observation of
 absence without mutating OS policy. A mismatch retains the journal. No
 automatic global firewall or default-policy changes, and no claim of OS CAS.
+
+### Scoped TCP carrier acceptance
+
+The explicit `client windivert --tcp-relay-lab` command requires a configured authenticated profile, pinned official package and an authorized literal non-loopback TCP echo target reachable from the VPS. It owns an exclusive source socket and a dedicated local listener. The NETWORK consumer reflects only those exact tuples, derives the original destination from the captured SYN, validates the local accept, and hands the accepted stream to the same guarded XHTTP TCP adapter used on Linux. It checks a random echo and TCP half-close, retaining a lower DROP handle until the owned sockets are closed even after a capture error. This is a bounded laboratory implementation, not evidence of generic application attribution, production persistent scope protection, atomic OS CAS or physical acceptance. Never use an unrelated third-party endpoint as an echo fixture.
+
+```powershell
+theia client windivert --tcp-relay-lab --config $Config --directory $Dir --dll-sha256 $DllHash --sys-sha256 $SysHash --target $AuthorizedTcpEcho --confirm
+```

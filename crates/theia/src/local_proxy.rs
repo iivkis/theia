@@ -2589,6 +2589,27 @@ impl NativeIngress {
         recovered
     }
 
+    /// Scoped real WinDivert TCP reflection into the existing XHTTP
+    /// stream handoff. No application evidence or system-wide Connect.
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    pub async fn run_windows_tcp_relay_lab(
+        path:&Path,directory:std::path::PathBuf,dll:[u8;32],sys:[u8;32],target:SocketAddr,
+    )->Result<(),ClientError> {
+        use crate::routing::{carrier_socket,windivert::CarrierRegistry};
+        let registry=Arc::new(CarrierRegistry::default());
+        let registrar:Arc<dyn carrier_socket::Registrar>=registry.clone();
+        let ingress=Arc::new(Self::prepare_with_registrar(path,Some(registrar.clone())).await?);
+        struct Stop<'a>(&'a NativeIngress,&'a CarrierRegistry);
+        impl Drop for Stop<'_> { fn drop(&mut self) { self.0.shutdown();self.1.retire(); } }
+        let _stop=Stop(&ingress,&registry);
+        let owner=ingress.clone();
+        crate::routing::windivert::run_tcp_relay_lab(directory,dll,sys,target,move |key,stream|async move {
+            owner.runtime.capture_state.ready().map_err(|_|std::io::ErrorKind::PermissionDenied)?;
+            carrier_socket::scope(Some(registrar),owner.relay_terminated_tcp(key,stream)).await
+                .map_err(|_|std::io::Error::other("authenticated TCP relay failed"))
+        }).await.map_err(|_|ClientError::Io)
+    }
+
     /// Explicit authorized echo acceptance, never a product Connect.
     /// All exact owned UDP tuples use one bounded live dispatcher. Each
     /// worker captures and injects while its authenticated XHTTP flow
@@ -3107,7 +3128,7 @@ impl NativeIngress {
         self.relay_terminated_tcp(key, stream).await
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
     async fn relay_terminated_tcp(
         &self,
         key: crate::routing::packet::FlowKey,
