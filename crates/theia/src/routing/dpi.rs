@@ -739,6 +739,43 @@ impl Engine {
         self.open_checked_pinned(name, port, ips, &pin).await
     }
 
+    /// Explicit, bounded diagnostic only. No strategy cache publication or policy override.
+    pub(crate) async fn diagnostic_tcp_strategies(
+        &self, name: &str, ips: &[IpAddr], pin: &PolicyLease,
+    ) -> Result<Vec<(String, &'static str, u128)>, ClientError> {
+        pin.check_owner(&self.policy)?;
+        if !self.enabled() || ips.is_empty() { return Ok(Vec::new()); }
+        if ips.len() > 64 || !ips.iter().all(|ip| crate::server::allowed_destination(*ip, false)) {
+            return Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied));
+        }
+        let address = SocketAddr::new(ips[0], 443);
+        let Some(network) = network_scope::observe(address) else { return Ok(Vec::new()); };
+        let name = super::domain_name(name).map_err(|_| ClientError::Protocol)?;
+        let key = Key { name: name.clone(), address, policy: pin.digest(), epoch: pin.epoch(), network };
+        let Some(_guard) = self.scheduler.lock((&key.name, address, pin.digest()), Duration::from_millis(250)).await else { return Ok(Vec::new()); };
+        let Ok(Some(config)) = tokio::task::spawn_blocking(tls::native_config).await else { return Ok(Vec::new()); };
+        let mut results = Vec::new();
+        for strategy in Strategy::ALL {
+            if !self.key_live(&key) { return Err(stale_policy()); }
+            if matches!(self.cache.evidence(&key), Some((Verdict::Denied, _))) { return Err(stale_policy()); }
+            let Ok(_permit) = self.scheduler.try_acquire() else { break; };
+            let started = std::time::Instant::now();
+            let mut rtt = None;
+            let verdict = tls::probe_measured(&name, address, Some(network), strategy, config.clone(), ATTEMPT, || self.key_live(&key), &mut rtt).await;
+            pin.check()?;
+            if !self.key_live(&key) { return Err(stale_policy()); }
+            use tls::ProbeVerdict::*;
+            let status = match verdict {
+                Verified => "TLS подтверждён",
+                StrategyFailed => "не сработала",
+                Unavailable => "недоступно",
+                _ => return Err(stale_policy()),
+            };
+            results.push((format!("{strategy:?}"), status, started.elapsed().as_millis()));
+        }
+        Ok(results)
+    }
+
     pub(crate) async fn open_checked_pinned(
         self: &Arc<Self>,
         name: &str,

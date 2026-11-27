@@ -3,6 +3,7 @@
 
 mod auto;
 mod egress;
+pub(crate) mod profile_diagnostics;
 mod ingress;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod runtime;
