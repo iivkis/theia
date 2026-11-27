@@ -1559,7 +1559,7 @@ impl ConfigDialog {
         if let Some(mode) = self.server_path_mode {
             return Some(Form {
                 fields: vec![
-                    Field { id: 0, label: "Файл настроек", value: self.input.clone(),
+                    Field { id: 0, label: "Файл настроек (введите путь)", value: self.input.clone(),
                         hint: if mode == 0 { "Введите путь к существующему TOML. Enter — открыть." }
                         else { "Введите путь к новому TOML. Существующий файл не заменяется." } },
                     Field { id: 1, label: "Выбрать файл или каталог", value: "Открыть файловый браузер".into(),

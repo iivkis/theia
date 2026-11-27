@@ -997,6 +997,17 @@ impl Editor {
         }
     }
 
+    /// Display endpoint without changing the exact identity used for guarded operations.
+    pub(crate) fn server_connection_label(&self, id: &str) -> Option<String> {
+        let Config::Server(doc) = &self.draft else { return None; };
+        let inbound = doc.server.inbounds.iter().find(|entry| entry.id == id)?;
+        let port = inbound.h2_listen.parse::<std::net::SocketAddr>().ok()?.port();
+        let host = inbound.server_name.as_str();
+        let endpoint = if host.parse::<std::net::Ipv6Addr>().is_ok() { format!("[{host}]:{port}") }
+            else { format!("{host}:{port}") };
+        Some(endpoint)
+    }
+
     /// Display address only; profile identity and selection remain keyed by ID.
     pub(crate) fn client_profile_address(&self, id: &str) -> Option<&str> {
         let Config::Client(doc) = &self.draft else {

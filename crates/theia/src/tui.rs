@@ -754,6 +754,7 @@ fn invitation_actions(flow: &IssueFlow) -> Vec<ActionItem> {
 struct RoutingPanel {
     settings: crate::routing::Settings,
     original: crate::routing::Settings,
+    search: Option<String>,
     selected: usize,
     fields: Option<(Option<usize>, [String; 5], usize)>,
     action_focus: Option<usize>,
@@ -787,6 +788,7 @@ impl RoutingPanel {
         Self {
             original: settings.clone(),
             settings,
+            search: None,
             selected: 0,
             fields: None,
             action_focus: None,
@@ -913,7 +915,7 @@ impl RoutingPanel {
         });
     }
     fn actions(&self) -> Vec<ActionItem> {
-        if self.fields.is_some() || self.download.is_some() {
+        if self.fields.is_some() || self.download.is_some() || self.search.is_some() {
             return Vec::new();
         }
         let count = self.settings.rules.len();
@@ -935,6 +937,9 @@ impl RoutingPanel {
             ActionItem { key: 'g', label: "Загрузить и проверить базы" },
             ActionItem { key: 'l', label: "Выбрать загруженные базы" },
         ]);
+        if count > 1 {
+            items.push(ActionItem { key: '/', label: "Найти правило" });
+        }
         if self.settings != self.original {
             items.push(ActionItem { key: 's', label: "Принять черновик правил" });
         }
@@ -965,7 +970,10 @@ impl RoutingPanel {
                 let table = Rect::new(report.x, report.y.saturating_add(3), report.width, report.height.saturating_sub(4));
                 let rows = self.settings.rules.iter().enumerate().skip(start).take(capacity).map(|(i, rule)| {
                     let chosen = i == self.selected;
-                    let conditions = format!("Доменов: {} · IP: {} · прил.: {}", rule.domains.len(), rule.ips.len(), rule.applications.len());
+                    let mut conditions = rule.domains.iter().chain(&rule.ips).take(2).cloned().collect::<Vec<_>>().join(", ");
+                    let count = rule.domains.len() + rule.ips.len() + rule.applications.len();
+                    if count > 2 || !rule.applications.is_empty() { conditions.push_str(&format!(" · всего {count}")); }
+                    if conditions.is_empty() { conditions = "Приложения (будущие режимы)".into(); }
                     Row::new(vec![format!("{} {}", if chosen { "›" } else { " " }, i + 1), rule.name.clone(),
                         conditions, Self::action_label(Self::action_name(rule.action)).to_owned()])
                         .style(Style::default().fg(if chosen { ACCENT } else { TEXT })
@@ -997,7 +1005,7 @@ impl RoutingPanel {
         (start, capacity)
     }
     fn select_at(&mut self, area: Rect, x: u16, y: u16) {
-        if self.fields.is_some() || self.download.is_some() {
+        if self.fields.is_some() || self.download.is_some() || self.search.is_some() {
             return;
         }
         if let Some([report, controls]) = self.layout(area) {
@@ -1019,6 +1027,29 @@ impl RoutingPanel {
     // true keeps the draft open; false returns to the workspace.
     fn key(&mut self, mut key: KeyEvent, editor: Option<&mut Editor>) -> bool {
         if self.download.is_some() {
+            return true;
+        }
+        if let Some(mut query) = self.search.take() {
+            match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Enter => {
+                    let needle = query.trim().to_lowercase();
+                    let found = self.settings.rules.iter().position(|rule| {
+                        rule.name.to_lowercase().contains(&needle)
+                            || rule.domains.iter().chain(&rule.ips).any(|value| value.to_lowercase().contains(&needle))
+                    });
+                    if let Some(index) = found {
+                        self.selected = index;
+                        self.action_focus = None;
+                        self.message.clear();
+                    } else { self.message = "Правило не найдено.".into(); }
+                }
+                KeyCode::Backspace => { query.pop(); self.search = Some(query); }
+                KeyCode::Char(c) if !c.is_control() && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) && query.len() + c.len_utf8() <= 256 => {
+                    query.push(c); self.search = Some(query);
+                }
+                _ => self.search = Some(query),
+            }
             return true;
         }
         if let Some((index, fields, focus)) = &mut self.fields {
@@ -1067,7 +1098,9 @@ impl RoutingPanel {
                     let rule = crate::routing::Rule {
                         name: fields[0].trim().into(),
                         action,
-                        domains: split(&fields[2]),
+                        domains: split(&fields[2]).into_iter().map(|value| {
+                            if value.contains(':') { value } else { format!("domain:{value}") }
+                        }).collect(),
                         ips: split(&fields[3]),
                         applications: split(&fields[4]),
                     };
@@ -1120,6 +1153,7 @@ impl RoutingPanel {
             KeyCode::Esc => return false,
             KeyCode::Up => self.selected = self.selected.saturating_sub(1),
             KeyCode::Down => self.selected = (self.selected + 1).min(len.saturating_sub(1)),
+            KeyCode::Char('/') if len > 1 => { self.search = Some(String::new()); self.message.clear(); }
             KeyCode::PageUp => self.selected = self.selected.saturating_sub(7),
             KeyCode::PageDown => self.selected = self.selected.saturating_add(7).min(len.saturating_sub(1)),
             KeyCode::Home => self.selected = 0,
@@ -1157,6 +1191,9 @@ impl RoutingPanel {
     }
     fn body(&self) -> String {
         let mut body = String::new();
+        if let Some(query) = &self.search {
+            return format!("Найти правило по имени, домену или IP\n\nЗапрос: {query}▏\n\nEnter: выбрать совпадение · Esc: отменить");
+        }
         if let Some((_, fields, focus)) = &self.fields {
             for (i, (label, value)) in [
                 "Имя",
@@ -1179,7 +1216,7 @@ impl RoutingPanel {
                     if i == *focus { "›" } else { " " }
                 ));
             }
-            body.push_str("\nПримеры: domain:example.org, geosite:google\nIP: 192.0.2.0/24, geoip:private · через запятую\nПриложение: sha256: + 64 строчных hex-символа; в MVP нет атрибуции\nGeoIP Lite: in-ru, in-cn, in-ir — региональные наборы, не геолокация\n\n↑↓ / Tab: поле · ←→: действие · Ctrl+U: очистить\nEnter: принять правило · Esc: отменить");
+            body.push_str("\nДомены: example.org или geosite:google\nIP: 192.0.2.0/24 или geoip:private · через запятую\nПриложение: sha256: + 64 строчных hex-символа; в MVP нет атрибуции\nGeoIP Lite: in-ru, in-cn, in-ir — региональные наборы, не геолокация\n\n↑↓ / Tab: поле · ←→: действие · Ctrl+U: очистить\nEnter: принять правило · Esc: отменить");
         } else {
             body.push_str(&format!(
                 "GeoData: {} (GeoSite Standard + GeoIP Lite)\nПравила проверяются сверху вниз. Без совпадения — через сервер.\n",
@@ -1882,6 +1919,25 @@ impl Interaction {
         true
     }
 
+    fn runtime_workspace_items(&self) -> Vec<ActionItem> {
+        let Some(runtime) = self.runtime.as_ref() else { return Vec::new(); };
+        let mut items = runtime.actions();
+        if self.workspace_page == 3 && self.editor_for(Role::Server).is_some() && !items.is_empty() {
+            if let Some(action) = self.server_process.actions().first() {
+                items.insert(0, ActionItem { key: 'P', label: action.label });
+            }
+        }
+        items
+    }
+
+    fn runtime_workspace_body(&self) -> String {
+        self.runtime.as_ref().map_or_else(String::new, |runtime| {
+            if self.workspace_page == 3 && self.editor_for(Role::Server).is_some() {
+                format!("Процесс этой панели: {}\n{}", self.server_process.status(), runtime.body())
+            } else { runtime.body() }
+        })
+    }
+
     fn editor_for(&self, role: Role) -> Option<&Editor> {
         self.editor.as_ref().filter(|edit| edit.role() == role)
     }
@@ -1931,10 +1987,11 @@ impl Interaction {
         // An uncertain save cannot be retried. Opening a file explicitly
         // re-reads it using the normal loader; the old editor is kept until
         // a successful load. No materials or original file are removed.
-        self.config_dialog = Some(ConfigDialog::new(
-            role,
-            self.editor_for(role).map(Editor::saved_path),
-        ));
+        let mut dialog = ConfigDialog::new(role, self.editor_for(role).map(Editor::saved_path));
+        if role == Role::Server && self.editor_for(role).is_some() {
+            dialog.choose_server_path(0);
+        }
+        self.config_dialog = Some(dialog);
     }
 
     fn poll_navigation(&mut self, model: &mut Model) {
@@ -2348,10 +2405,10 @@ impl Interaction {
             }
             return;
         }
-        if let Some(runtime) = self.runtime.as_ref() {
-            let items = runtime.actions();
+        if self.runtime.is_some() {
+            let items = self.runtime_workspace_items();
             let target = if self.workspace_page == 3 && self.editor_for(Role::Server).is_some() { workspace_columns(body).map_or(body, |c| c[2]) } else { body };
-            if let Some([_, controls]) = report_action_layout(target, items.len(), &runtime.body()) {
+            if let Some([_, controls]) = report_action_layout(target, items.len(), &self.runtime_workspace_body()) {
                 if let Some(i) = (Actions {
                     items: &items,
                     selected: self.modal_action,
@@ -3004,8 +3061,8 @@ impl Interaction {
             }
             return false;
         }
-        if let Some(runtime) = self.runtime.as_mut() {
-            let items = runtime.actions();
+        if self.runtime.is_some() {
+            let items = self.runtime_workspace_items();
             let code = if key.modifiers.is_empty() {
                 tui_widgets::action_key(&items, &mut self.modal_action, key.code)
             } else {
@@ -3014,7 +3071,16 @@ impl Interaction {
             let Some(code) = code else {
                 return false;
             };
-            if runtime.key(KeyEvent { code, ..key }) {
+            if code == KeyCode::Char('P') && items.iter().any(|a| a.key == 'P') {
+                if let Some(action) = self.server_process.actions().first().map(|a| a.key) {
+                    self.runtime = None;
+                    self.modal_action = 0;
+                    self.server_process.key(KeyCode::Char(action), self.editor.as_ref());
+                    self.show_server_process = self.server_process.confirmation().is_some();
+                    self.process_from_workspace = self.show_server_process;
+                    self.confirm_selected = false;
+                }
+            } else if self.runtime.as_mut().is_some_and(|runtime| runtime.key(KeyEvent { code, ..key })) {
                 self.runtime = None;
                 self.modal_action = 0;
             }
@@ -4027,8 +4093,14 @@ impl Interaction {
                 },
                 IssueFlow::Exporting => self.issuance = Some(IssueFlow::Exporting),
                 IssueFlow::Exported(path) => {
-                    if key.code != KeyCode::Esc {
-                        self.issuance = Some(IssueFlow::Exported(path));
+                    match key.code {
+                        KeyCode::Enter => {
+                            self.workspace_page = 3;
+                            self.workspace_focus = WorkspaceFocus::Actions;
+                            self.workspace_action = 1;
+                        }
+                        KeyCode::Esc => {}
+                        _ => self.issuance = Some(IssueFlow::Exported(path)),
                     }
                 }
                 IssueFlow::ExportFailed => {
@@ -5054,7 +5126,7 @@ fn record_rows(editor: &Editor, area: Rect) -> Vec<(usize, String)> {
                 editor.client_profile_address(&id).unwrap_or(&id)
             )
         } else {
-            format!("{} · {}", id, if reality { "REALITY" } else { "TLS" })
+            format!("{} · {}", editor.server_connection_label(&id).unwrap_or(id), if reality { "REALITY" } else { "TLS" })
         };
         let mut line = String::new();
         let mut used = 0;
@@ -6513,14 +6585,14 @@ fn draw_issuance(
         IssueFlow::Offer => (
             "Одноразовая выдача конфиденциальной ссылки",
             if first {
-                "Первый ключ доступа сохранён. Сервер ещё не изменён.\nПередайте ключ пользователю, затем запустите сервер или примените права.\n\nКОНФИДЕНЦИАЛЬНО: ключ предназначен только владельцу. После закрытия повторного показа не будет.".into()
+                "Первый ключ доступа сохранён. Сервер ещё не изменён.\nПередайте ключ пользователю, затем откройте «Управление» для запуска или применения прав.\n\nКОНФИДЕНЦИАЛЬНО: ключ предназначен только владельцу. После закрытия повторного показа не будет.".into()
             } else if recovering {
-                "Восстановление доступа сохранено в файле. Старый ключ восстановить нельзя.\nРаботающий сервер ещё не изменён. После передачи приглашения отдельно примените права доступа.\n\nКОНФИДЕНЦИАЛЬНО: передайте новую ссылку только её владельцу. После закрытия повторного показа не будет.".into()
+                "Восстановление доступа сохранено в файле. Старый ключ восстановить нельзя.\nРаботающий сервер ещё не изменён. После передачи приглашения откройте «Управление» и подтвердите применение прав доступа.\n\nКОНФИДЕНЦИАЛЬНО: передайте новую ссылку только её владельцу. После закрытия повторного показа не будет.".into()
             } else if rotating {
                 "Данные нового ключа сохранены. Работающий сервер ещё не изменён.\nСтарый ключ может использоваться для новых сеансов до отдельного применения прав.\n\nКОНФИДЕНЦИАЛЬНО: новая ссылка предназначена только её владельцу. После закрытия повторного показа не будет."
                     .into()
             } else {
-                "Новый пользователь сохранён в файле. Работающий сервер ещё не изменён.\nПосле передачи приглашения отдельно примените права доступа.\n\nКОНФИДЕНЦИАЛЬНО: ссылка содержит личный ключ. Не публикуйте её. После закрытия повторного показа не будет."
+                "Новый пользователь сохранён в файле. Работающий сервер ещё не изменён.\nПосле передачи приглашения откройте «Управление» и подтвердите применение прав доступа.\n\nКОНФИДЕНЦИАЛЬНО: ссылка содержит личный ключ. Не публикуйте её. После закрытия повторного показа не будет."
                     .into()
             },
         ),
@@ -6551,7 +6623,7 @@ fn draw_issuance(
         IssueFlow::Exported(path) => (
             "Конфиденциальный файл создан",
             format!(
-                "Файл содержит bearer. Не публикуйте его.\n\n{path:?}\n\nПуть показан в кавычках. Esc: закрыть. Работающий сервер не обновлён."
+                "Файл содержит bearer. Не публикуйте его.\n\n{path:?}\n\nПуть показан в кавычках. Работающий сервер не обновлён.\nEnter: перейти к управлению · Esc: вернуться."
             ),
         ),
         IssueFlow::ExportFailed => (
@@ -7147,14 +7219,15 @@ fn draw_page(
         return;
     }
     if role == Role::Server && page == 3 {
-        if let Some(runtime) = ui.and_then(|u| u.runtime.as_ref()) {
-            let items = runtime.actions();
-            let body = runtime.body();
+        if let Some(ui) = ui.filter(|u| u.runtime.is_some()) {
+            let items = ui.runtime_workspace_items();
+            let body = ui.runtime_workspace_body();
+            let title = ui.runtime.as_ref().unwrap().title();
             if let Some([report, controls]) = report_action_layout(area, items.len(), &body) {
-                panel_at(frame, report, runtime.title(), &body, false, ui.map(|u| &u.viewport));
-                Actions { items: &items, selected: ui.map_or(0, |u| u.modal_action) }.render(frame, controls);
+                panel_at(frame, report, title, &body, false, Some(&ui.viewport));
+                Actions { items: &items, selected: ui.modal_action }.render(frame, controls);
             } else {
-                panel_at(frame, area, runtime.title(), &body, true, ui.map(|u| &u.viewport));
+                panel_at(frame, area, title, &body, true, Some(&ui.viewport));
             }
             return;
         }
@@ -7251,10 +7324,9 @@ fn draw_page(
                 "Подключений пока нет".to_owned()
             } else {
                 format!(
-                    "{} · {} из {} пользователей имеют доступ",
-                    editor.selected_record_id(),
-                    allowed,
-                    users.len()
+                    "{} · {} из {} пользователей имеют доступ по {}",
+                    editor.server_connection_label(editor.selected_record_id()).unwrap_or_else(|| editor.selected_record_id().to_owned()),
+                    allowed, users.len(), if editor.dirty() { "черновику" } else { "файлу" }
                 )
             };
             let color = if editor.write_uncertain() {
@@ -7357,7 +7429,16 @@ fn draw_page(
     } else if page == 4 {
         if let Some(monitor) = ui.and_then(|u| u.workspace_monitor.as_ref()) {
             if role == Role::Server {
-                monitor.render(frame, area);
+                let status = if ui.is_some_and(|u| u.server_process.status() == "Запущен") {
+                    "Источник: счётчики процесса этой панели (с запуска Theia)."
+                } else {
+                    "Нет подтверждённых данных внешнего сервера. Ниже только локальные счётчики этой панели."
+                };
+                if area.height >= 8 {
+                    frame.render_widget(Paragraph::new(status).style(Style::default().fg(MUTED)).wrap(Wrap { trim: true }),
+                        Rect::new(area.x, area.y, area.width, 2));
+                    monitor.render(frame, Rect::new(area.x, area.y + 2, area.width, area.height.saturating_sub(2)));
+                } else { monitor.render(frame, area); }
                 return;
             }
             let monitor_area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(3));
@@ -7429,14 +7510,14 @@ fn draw_page(
                 ],
             )
             .header(
-                Row::new(["Пользователь", "Доступ по файлу", "Право на подключение"])
+                Row::new(["Пользователь", if editor.write_uncertain() { "Запись не подтверждена" } else if editor.dirty() { "Доступ в черновике" } else { "Доступ по файлу" }, "Право на подключение"])
                     .style(Style::default().fg(MUTED)),
             )
             .block(tui_widgets::section(
                 &format!(
                     "{}: {}",
                     "Пользователи и ключи для",
-                    editor.selected_record_id()
+                    editor.server_connection_label(editor.selected_record_id()).unwrap_or_else(|| editor.selected_record_id().to_owned())
                 ),
                 focus == WorkspaceFocus::Users,
             )),
@@ -7458,9 +7539,9 @@ fn draw_page(
         if users.len() <= 3 && content.height >= 9 {
             let y = content.y + 2 + users.len() as u16 + 1;
             let hint = match users.get(selected) {
-                Some((_, true, true)) => "Пользователь отключён по файлу. Восстановление создаёт новый ключ.\nФактический доступ проверяется и применяется в разделе «Управление».",
+                Some((_, true, true)) => "Пользователь отключён в настройках. Восстановление создаёт новый ключ.\nФактический доступ проверяется и применяется в разделе «Управление».",
                 Some((_, _, false)) => "У пользователя нет права на это подключение. Измените права доступа.\nУдаление возможно только без прав на всех подключениях.",
-                Some(_) => "Доступ указан по файлу, не по работающему серверу.\nЗамена ключа действует после применения прав в «Управлении».",
+                Some(_) => "Доступ указан по настройкам, не по работающему серверу.\nЗамена ключа действует после применения прав в «Управлении».",
                 None => "Добавьте пользователя и выдайте ему ключ.",
             };
             frame.render_widget(
@@ -9452,6 +9533,12 @@ mod tests {
             crate::routing::Action::DirectDpi
         );
         assert!(panel.body().contains("Anti-DPI / резерв VPS"));
+        panel.key(press(KeyCode::Char('/')), Some(&mut editor));
+        for ch in "local".chars() { panel.key(press(KeyCode::Char(ch)), Some(&mut editor)); }
+        panel.key(press(KeyCode::Enter), Some(&mut editor));
+        assert_eq!(panel.selected, 0);
+        assert!(panel.search.is_none());
+        assert!(!editor.dirty());
         assert!(!panel.key(press(KeyCode::Char('s')), Some(&mut editor)));
         assert!(editor.dirty());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
@@ -9923,18 +10010,26 @@ mod tests {
             });
             let mut ui = Interaction::new(None);
             let mut model = Model::new(Some(role));
+            if role == Role::Server {
+                let welcome = rendered_interaction(120, 40, &model, &ui);
+                assert!(welcome.contains("REALITY") && welcome.contains("Own-TLS"));
+                ui.welcome_choice = 1;
+            }
             ui.update(&mut model, press(KeyCode::Enter));
             let dialog = ui.config_dialog.as_mut().unwrap();
             dialog.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
             dialog.paste(path.to_str().unwrap());
             let snapshot = rendered_interaction(120, 40, &model, &ui);
-            assert!(snapshot.contains(if role == Role::Server {
-                "REALITY"
+            if role == Role::Server {
+                assert!(snapshot.contains("REALITY") && snapshot.contains("Файл настроек"));
+                assert!(!snapshot.contains("Own-TLS") && !snapshot.contains("Открыть сохранённые настройки"));
+                assert_eq!(ui.config_dialog.as_ref().unwrap().form().unwrap().fields.len(), 2);
+                ui.update(&mut model, press(KeyCode::Down));
+                ui.update(&mut model, press(KeyCode::Up));
             } else {
-                "Импорт ключа Theia"
-            }));
-            assert!(snapshot.contains("Own-TLS"));
-            ui.update(&mut model, press(KeyCode::Down));
+                assert!(snapshot.contains("Импорт ключа Theia") && snapshot.contains("Own-TLS"));
+                ui.update(&mut model, press(KeyCode::Down));
+            }
             ui.update(&mut model, press(KeyCode::Enter));
             let snapshot = rendered_interaction(120, 40, &model, &ui);
             assert!(snapshot.contains("1/"));
