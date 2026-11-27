@@ -565,10 +565,19 @@ impl LabRules {
         if (meta.dev(), meta.ino()) != (self.journal.scope.dev, self.journal.scope.ino) {
             return Ok(false);
         }
+        let Some(raw) = journal_bytes(&self.journal_path)? else {
+            return Ok(false);
+        };
+        if parse_journal(&raw, &self.journal.scope)? != self.journal {
+            return Ok(false);
+        }
         let net = Netlink::open()?;
+        // A missing/replaced journal invalidates the live capture lease,
+        // even if the kernel still has the expected generation and table.
         Ok(net.generation()? == self.journal.installed
             && net.table(&self.journal)?
-            && net.generation()? == self.journal.installed)
+            && net.generation()? == self.journal.installed
+            && journal_bytes(&self.journal_path)?.as_deref() == Some(raw.as_slice()))
     }
 
     pub(crate) fn owns_packet(&self, packet: &super::nfqueue::Packet<'_>) -> io::Result<bool> {

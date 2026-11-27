@@ -66,7 +66,11 @@ impl DnsCandidates {
         observation_deadline: Instant,
         now: Instant,
     ) -> Result<bool, RoutingError> {
-        self.entries.retain(|_, entry| entry.deadline > now);
+        // Retain expired entries as bounded tombstones until the owning
+        // flow is explicitly forgotten. An old request must not gain a
+        // fresh deadline just because its diagnostic observation expired.
+        // On exhaustion refuse new observations; never evict a tombstone
+        // to make room for an uncorroborated request.
         let name = super::domain_name(&link.domain)?;
         if link.key != flow.key
             || link.cookie != flow.cookie
@@ -82,6 +86,9 @@ impl DnsCandidates {
             return Ok(false);
         }
         if let Some(entry) = self.entries.get_mut(&flow.key) {
+            if entry.deadline <= now {
+                return Ok(false);
+            }
             if entry.flow != flow
                 || entry.digest != digest
                 || entry.domain != name
@@ -226,5 +233,16 @@ mod tests {
         assert!(!table
             .record_at(flow, &link, [1; 32], &ips, deadline, deadline)
             .unwrap());
+        // A new protected DNS exchange alone does not establish a fresh
+        // resolver event or prove a different sender on the same socket.
+        assert!(!table
+            .record_at(flow, &link, [1; 32], &ips, deadline + TTL, deadline)
+            .unwrap());
+        let mut changed = link.clone();
+        changed.request_id = [5; 16];
+        assert!(!table
+            .record_at(flow, &changed, [1; 32], &ips, deadline + TTL, deadline)
+            .unwrap());
+        assert!(table.candidate_at(flow, [1; 32], deadline).is_none());
     }
 }

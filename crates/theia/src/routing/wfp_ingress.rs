@@ -3,7 +3,7 @@
 //! No WFP filters or driver installation are performed here.
 use super::{packet::FlowKey, wfp_context};
 use ring::rand::{SecureRandom, SystemRandom};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::{
     io,
     net::SocketAddr,
@@ -56,7 +56,30 @@ pub struct WfpLabSession {
     token: Zeroizing<[u8; 32]>,
     compartment: u32,
     port: u16,
-    retired: AtomicBool,
+    retirement: Retirement,
+}
+
+// A failed or indeterminate STOP must never be reported as a successful
+// second STOP. Once retirement starts the session cannot admit more sockets.
+#[derive(Default)]
+struct Retirement(AtomicU8);
+
+impl Retirement {
+    fn active(&self) -> bool {
+        self.0.load(Ordering::Acquire) == 0
+    }
+
+    fn stop(&self, operation: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+        match self.0.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                let result = operation();
+                self.0.store(if result.is_ok() { 2 } else { 3 }, Ordering::Release);
+                result
+            }
+            Err(2) => Ok(()),
+            Err(_) => Err(io::ErrorKind::PermissionDenied.into()),
+        }
+    }
 }
 
 const CONFIGURE: u32 = (0x22 << 16) | (2 << 14) | (0x800 << 2);
@@ -137,7 +160,7 @@ impl WfpLabSession {
             token,
             compartment,
             port,
-            retired: AtomicBool::new(false),
+            retirement: Retirement::default(),
         };
         session.check()?;
         Ok(session)
@@ -153,7 +176,7 @@ impl WfpLabSession {
 
     /// Check the live kernel session on the same compartment worker.
     pub(crate) fn check(&self) -> io::Result<()> {
-        if self.retired.load(Ordering::Acquire)
+        if !self.retirement.active()
             || unsafe {
                 windows_sys::Win32::NetworkManagement::IpHelper::GetCurrentThreadCompartmentId()
             } != self.compartment
@@ -162,7 +185,7 @@ impl WfpLabSession {
         }
         let bytes = self.scope_request();
         ioctl(&self.handle, STATUS, bytes.as_ref())?;
-        if self.retired.load(Ordering::Acquire) {
+        if !self.retirement.active() {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
         Ok(())
@@ -171,11 +194,10 @@ impl WfpLabSession {
     /// Stop is explicit and irreversible for this driver session. The
     /// persistent filters are NOT removed; signed-driver recovery is separate.
     pub(crate) fn deactivate(&self) -> io::Result<()> {
-        if self.retired.swap(true, Ordering::AcqRel) {
-            return Ok(());
-        }
-        let bytes = self.scope_request();
-        ioctl(&self.handle, STOP, bytes.as_ref())
+        self.retirement.stop(|| {
+            let bytes = self.scope_request();
+            ioctl(&self.handle, STOP, bytes.as_ref())
+        })
     }
 
     /// Register the actual ALE endpoint handle before the TCP connect.
@@ -470,6 +492,23 @@ impl BfeInspector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_driver_stop_never_becomes_confirmed_retirement() {
+        let retirement = Retirement::default();
+        assert!(retirement.active());
+        assert!(retirement.stop(|| Err(io::ErrorKind::Other.into())).is_err());
+        assert!(!retirement.active());
+        assert!(retirement.stop(|| panic!("must not retry ambiguous stop")).is_err());
+        let retirement = Retirement::default();
+        retirement.stop(|| {
+            assert!(!retirement.active());
+            assert!(retirement.stop(|| panic!("concurrent stop")).is_err());
+            Ok(())
+        }).unwrap();
+        assert!(!retirement.active());
+        retirement.stop(|| panic!("already confirmed")).unwrap();
+    }
+
     #[test]
     fn rejects_default_compartment_and_unapproved_inspector_before_open() {
         assert!(WfpLabSession::open(1, 18080).is_err());

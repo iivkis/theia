@@ -1724,6 +1724,10 @@ impl CaptureLifecycle {
         matches!(self.0.load(std::sync::atomic::Ordering::Acquire), 1 | 2)
     }
 
+    fn accepting(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire) == 2
+    }
+
     fn begin(&self) -> Result<(), ClientError> {
         self.transition(0, 1)
     }
@@ -1792,6 +1796,7 @@ mod capture_lifecycle_tests {
         state.begin().unwrap();
         assert_eq!(state.reported(), 1);
         assert!(state.running());
+        assert!(!state.accepting());
         assert!(state.begin().is_err());
         state.stop();
         assert_eq!(state.reported(), 3);
@@ -1808,11 +1813,13 @@ mod capture_lifecycle_tests {
         state.begin().unwrap();
         state.ready().unwrap();
         assert_eq!(state.reported(), 2);
+        assert!(state.accepting());
         assert!(state.ready().is_err());
         assert!(state.running());
         state.stop();
         assert_eq!(state.reported(), 3);
         assert!(!state.running());
+        assert!(!state.accepting());
         assert!(state.ready().is_err());
     }
 
@@ -2223,12 +2230,25 @@ struct RawLease {
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 static NATIVE_OWNER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+// Field destruction is ordered: release the kernel scope handle before
+// allowing another owner in this process to try to acquire it.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+struct ProcessOwner;
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl Drop for ProcessOwner {
+    fn drop(&mut self) {
+        NATIVE_OWNER.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 struct NativeOwner {
     #[cfg(target_os = "linux")]
     _scope: std::os::unix::net::UnixDatagram,
     #[cfg(target_os = "windows")]
     _scope: std::os::windows::io::OwnedHandle,
+    _process: ProcessOwner,
 }
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 impl NativeOwner {
@@ -2260,7 +2280,7 @@ impl NativeOwner {
                 .map_err(|_| ClientError::Configuration)?;
         let socket = std::os::unix::net::UnixDatagram::bind_addr(&address)
             .map_err(|_| ClientError::Configuration)?;
-        Ok(Self { _scope: socket })
+        Ok(Self { _scope: socket, _process: ProcessOwner })
     }
 
     #[cfg(target_os = "windows")]
@@ -2289,16 +2309,9 @@ impl NativeOwner {
         if existed {
             return Err(ClientError::Configuration);
         }
-        Ok(Self { _scope: handle })
+        Ok(Self { _scope: handle, _process: ProcessOwner })
     }
 }
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-impl Drop for NativeOwner {
-    fn drop(&mut self) {
-        NATIVE_OWNER.store(false, std::sync::atomic::Ordering::Release);
-    }
-}
-
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 impl NativeIngress {
     /// Preflight only; the caller owns an isolated network namespace/rule
@@ -2365,6 +2378,14 @@ impl NativeIngress {
         } else {
             Ok(())
         }
+    }
+
+    fn ensure_accepting(&self) -> Result<(), ClientError> {
+        self.ensure_running()?;
+        if !self.runtime.capture_state.accepting() {
+            return Err(ClientError::Open(ErrorCode::PolicyDenied));
+        }
+        Ok(())
     }
 
     /// Own the actual queue consumer and the current runtime's maintenance
@@ -2847,7 +2868,7 @@ impl NativeIngress {
         let gate = self.verdict_gate.lock();
         let acceptable = gate.is_ok()
             && !permit.failed
-            && self.ensure_running().is_ok()
+            && self.ensure_accepting().is_ok()
             && Arc::ptr_eq(&permit.engine, &self.client.routing_cache().dpi)
             && packet.local_output()
             && !packet.checksum_pending()
@@ -2910,7 +2931,7 @@ impl NativeIngress {
         if !owned.owns_packet(&packet)? {
             return Err(std::io::ErrorKind::PermissionDenied.into());
         }
-        let mut action = if gate.is_ok() && self.ensure_running().is_ok() {
+        let mut action = if gate.is_ok() && self.ensure_accepting().is_ok() {
             action
         } else {
             PacketAction::Drop
@@ -2955,7 +2976,7 @@ impl NativeIngress {
         if [meta.flow.source.ip(), meta.flow.destination.ip()].iter().any(|ip| ip.is_unspecified() || ip.is_multicast() || matches!(ip, IpAddr::V6(v6) if v6.is_unicast_link_local() || v6.to_ipv4_mapped().is_some())) {
             return PacketAction::Drop;
         }
-        if self.ensure_running().is_err() {
+        if self.ensure_accepting().is_err() {
             return PacketAction::Drop;
         }
         let snapshot = match timeout(Duration::from_millis(250), self.client.routing_policy()).await
@@ -2981,7 +3002,7 @@ impl NativeIngress {
         let Ok(mut raw) = self.raw.lock() else {
             return PacketAction::Drop;
         };
-        if self.ensure_running().is_err() {
+        if self.ensure_accepting().is_err() {
             return PacketAction::Drop;
         }
         let now = Instant::now();
@@ -3048,7 +3069,7 @@ impl NativeIngress {
         stream: TcpStream,
         session: Arc<crate::routing::wfp_ingress::WfpLabSession>,
     ) -> Result<(), ClientError> {
-        self.ensure_running()?;
+        self.ensure_accepting()?;
         let expected = self
             .registrar()?
             .ok_or(ClientError::Open(ErrorCode::PolicyDenied))?;
@@ -3133,10 +3154,7 @@ impl NativeIngress {
                     }
                     Ok::<(), ClientError>(())
                 };
-                tokio::select! {
-                    result = relay => result,
-                    result = async { tokio::try_join!(feed, replies).map(|_| ()) } => result,
-                }
+                supervise_native_udp(relay, feed, replies).await
             } => result,
         }
     }
@@ -3170,7 +3188,7 @@ impl NativeIngress {
             biased;
             () = self.stopped() => Err(denied()),
             result = carrier_socket::scope(Some(registrar.clone()), async {
-                self.ensure_running()?;
+                self.ensure_accepting()?;
                 let name = crate::routing::domain_name(domain).map_err(|_| denied())?;
                 if crate::routing::packet_modify::quic_initial_datagrams(&first.payload, &name).is_none() {
                     return Err(denied());
@@ -3217,10 +3235,7 @@ impl NativeIngress {
                     }
                     Ok::<(),ClientError>(())
                 };
-                tokio::select! {
-                    result=relay=>result,
-                    result=async { tokio::try_join!(feed,replies).map(|_| ()) }=>result,
-                }
+                supervise_native_udp(relay, feed, replies).await
             }) => result,
         }
     }
@@ -3256,7 +3271,7 @@ impl NativeIngress {
         key: crate::routing::packet::FlowKey,
     ) -> Result<(Carrier, crate::routing::flow::FlowLease, Address), ClientError> {
         use crate::routing::{Evidence, PacketAction};
-        self.ensure_running()?;
+        self.ensure_accepting()?;
         let denied = || ClientError::Open(ErrorCode::PolicyDenied);
         if key.destination.port() == 0
             || key.source.port() == 0
@@ -3291,7 +3306,7 @@ impl NativeIngress {
         if !matches!(configured, PacketAction::Redirect | PacketAction::Modify) {
             return Err(denied());
         }
-        self.ensure_running()?;
+        self.ensure_accepting()?;
         let flow =
             cache
                 .flows
@@ -3301,6 +3316,78 @@ impl NativeIngress {
             IpAddr::V6(ip) => Address::V6(ip.octets()),
         };
         Ok((carrier, flow, address))
+    }
+}
+
+/// A clean relay EOF must not cancel accepted reverse datagrams. Keep the
+/// flow lease and reply socket until a bounded drain finishes. Feed EOF is
+/// not relay EOF; dropping the upload sender lets the carrier send FIN.
+/// Errors and outer runtime cancellation still terminate immediately.
+#[cfg(target_os = "linux")]
+async fn supervise_native_udp(
+    relay: impl std::future::Future<Output = Result<(), ClientError>>,
+    feed: impl std::future::Future<Output = Result<(), ClientError>>,
+    replies: impl std::future::Future<Output = Result<(), ClientError>>,
+) -> Result<(), ClientError> {
+    tokio::pin!(relay, feed, replies);
+    let mut fed = false;
+    let mut replied = false;
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut relay => {
+                result?;
+                if !replied {
+                    timeout(Duration::from_secs(2), &mut replies)
+                        .await.map_err(|_| ClientError::Timeout)??;
+                }
+                return Ok(());
+            }
+            result = &mut feed, if !fed => { result?; fed = true; }
+            result = &mut replies, if !replied => { result?; replied = true; }
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod native_udp_lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn relay_completion_drains_accepted_replies_after_upload_eof() {
+        let (up, mut upload) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let (down, mut download) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
+        let feed = async move {
+            up.send(vec![1]).await.unwrap();
+            Ok(())
+        };
+        let relay = async move {
+            assert_eq!(upload.recv().await, Some(vec![1]));
+            assert!(upload.recv().await.is_none());
+            down.send(vec![2]).await.unwrap();
+            down.send(vec![3]).await.unwrap();
+            Ok(())
+        };
+        let mut observed = Vec::new();
+        let replies = async {
+            while let Some(bytes) = download.recv().await {
+                tokio::task::yield_now().await;
+                observed.push(bytes);
+            }
+            Ok(())
+        };
+        supervise_native_udp(relay, feed, replies).await.unwrap();
+        assert_eq!(observed, [vec![2], vec![3]]);
+    }
+
+    #[tokio::test]
+    async fn failed_relay_does_not_drain_or_wait_for_upload() {
+        let result = supervise_native_udp(
+            async { Err(ClientError::Protocol) },
+            std::future::pending(),
+            std::future::pending(),
+        ).await;
+        assert!(matches!(result, Err(ClientError::Protocol)));
     }
 }
 
