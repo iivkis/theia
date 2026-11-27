@@ -189,17 +189,20 @@ impl PathEcn {
             self.disable();
         }
     }
-    pub(crate) fn acknowledge(&mut self, ack: &Ack) -> Option<Instant> {
+    pub(crate) fn acknowledge(
+        &mut self,
+        ack: &Ack,
+        largest_sent_at: Option<Instant>,
+        now: Instant,
+    ) -> Option<Instant> {
         if !self.enabled {
             return None;
         }
         let largest = ack.ranges.first()?.last;
         let mut newly = 0u64;
-        let mut newest = None;
-        self.pending.retain(|pn, at| {
+        self.pending.retain(|pn, _| {
             if ack.acknowledges(*pn) {
                 newly += 1;
-                newest = Some(newest.map_or(*at, |old: Instant| old.max(*at)));
                 false
             } else {
                 true
@@ -210,7 +213,21 @@ impl PathEcn {
                 self.disable();
                 None
             }
-            Feedback::Valid { ce_increase } if ce_increase != 0 => newest,
+            Feedback::Valid { ce_increase } if ce_increase != 0 => {
+                // RFC 9002 Appendix B.7 uses the largest ACKed packet's
+                // send time, even if it is unmarked or ACK-only. Counter
+                // feedback can cover marked packets whose ACK was lost or
+                // reordered; do not require a newly ACKed marked packet.
+                if let Some(at) = largest_sent_at {
+                    Some(at)
+                } else {
+                    // Bounded send history cannot prove the recovery epoch.
+                    // Conservatively report this authenticated congestion once
+                    // and stop marking rather than silently discard CE.
+                    self.disable();
+                    Some(now)
+                }
+            }
             _ => None,
         }
     }
@@ -233,7 +250,7 @@ mod tests {
             ranges: vec![Range { first: 1, last: 1 }],
             ecn: Some([0, 0, 1]),
         };
-        assert_eq!(p.acknowledge(&ack), Some(now));
+        assert_eq!(p.acknowledge(&ack, Some(now), now), Some(now));
         assert!(p.should_mark());
         p.disable();
         assert!(!p.should_mark());
@@ -241,6 +258,35 @@ mod tests {
         p.enable(true);
         p.sent(2, Mark::NotEct, now);
         assert!(!p.should_mark());
+    }
+
+    #[test]
+    fn ce_on_later_unmarked_ack_uses_largest_send_time_even_without_new_ect() {
+        use crate::quic_core::ack::Range;
+        let start = Instant::now();
+        let delta = Duration::from_millis(10);
+        let mut path = PathEcn::default();
+        path.enable(true);
+        path.sent(1, Mark::Ect0, start);
+        path.sent(2, Mark::Ect0, start + delta);
+        let ack = |n, counts| Ack {
+            delay: 0,
+            ranges: vec![Range { first: n, last: n }],
+            ecn: Some(counts),
+        };
+        assert_eq!(path.acknowledge(&ack(1, [1, 0, 0]), Some(start), start + delta * 2), None);
+        assert!(path.should_mark());
+        // ACK 3 arrives before ACK 2; ACK 2 cannot invalidate counters.
+        assert_eq!(path.acknowledge(&ack(3, [1, 0, 0]), Some(start + delta * 2), start + delta * 3), None);
+        assert_eq!(path.acknowledge(&ack(2, [1, 0, 1]), Some(start + delta), start + delta * 4), None);
+        let last = ack(4, [1, 0, 1]);
+        assert_eq!(path.acknowledge(&last, Some(start + delta * 3), start + delta * 5), Some(start + delta * 3));
+        assert_eq!(path.acknowledge(&last, Some(start + delta * 3), start + delta * 6), None);
+
+        // A missing timestamp must not swallow a valid congestion event.
+        path.sent(5, Mark::Ect0, start + delta * 6);
+        assert_eq!(path.acknowledge(&ack(5, [1, 0, 2]), None, start + delta * 7), Some(start + delta * 7));
+        assert!(!path.should_mark());
     }
 
     #[test]
