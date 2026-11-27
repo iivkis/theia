@@ -1747,13 +1747,18 @@ impl CaptureLifecycle {
 
     fn stop(&self) {
         use std::sync::atomic::Ordering;
-        let _ = self
-            .0
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| match state {
-                0 => Some(4),
-                1 | 2 => Some(3),
-                _ => None,
-            });
+        let mut state = self.0.load(Ordering::Acquire);
+        loop {
+            let next = match state {
+                0 => 4,
+                1 | 2 => 3,
+                _ => return,
+            };
+            match self.0.compare_exchange_weak(state, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return,
+                Err(observed) => state = observed,
+            }
+        }
     }
 
     fn reported(&self) -> u8 {
