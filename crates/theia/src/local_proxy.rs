@@ -5503,10 +5503,10 @@ mod selector_tests {
                 profile.transport = transport;
                 profile.server = remote.to_string();
                 let proxy_client = load_client(&profile).await.unwrap();
-                let policy = proxy_client.routing_policy().await.unwrap();
-                assert_eq!(policy.manifest().revision, 2);
+                let snapshot = proxy_client.routing_policy().await.unwrap();
+                assert_eq!(snapshot.manifest().revision, 2);
                 assert_eq!(
-                    policy
+                    snapshot
                         .policy()
                         .matching_action(None, Some("127.0.0.1".parse().unwrap()))
                         .unwrap(),
