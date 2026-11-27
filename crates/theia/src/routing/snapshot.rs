@@ -43,6 +43,9 @@ pub struct Manifest {
     pub geosite_payload_sha256: [u8; 32],
     pub geoip_payload_sha256: [u8; 32],
     pub rules: Vec<Rule>,
+    // Default lists are a protocol constant: preserve the old default wire
+    // bytes and durable revision floor. Custom lists always enter the digest.
+    #[serde(default = "default_diagnostic_domains", skip_serializing_if = "is_default_diagnostic_domains")]
     pub diagnostic_domains: Vec<String>,
 }
 

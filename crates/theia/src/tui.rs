@@ -8538,6 +8538,10 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
                     interaction.mouse(&mut model, mouse, Rect::new(0, 0, size.width, size.height));
                 }
                 Event::Paste(text) => {
+                    if let Some(panel) = interaction.profile_diagnostics.as_mut() {
+                        panel.paste(&text);
+                        continue;
+                    }
                     interaction.paste_record_field(&text);
                     interaction.paste_workspace_import(&model, &text);
                     if let Some(editor) = interaction.editor.as_mut().filter(|e| e.editing) {

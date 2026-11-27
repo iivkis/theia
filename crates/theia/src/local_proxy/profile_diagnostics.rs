@@ -115,7 +115,10 @@ async fn session(
         } else { emit(tx, "TCP Anti-DPI: не назначен правилами")?; }
         let result = https(&carrier, cache, &domain, expected, true, tls.clone()).await;
         match result {
-            Ok((code, route, ms)) => emit(tx, format!("Авто: HTTP {code}, {route}, {ms} мс"))?,
+            Ok((code, route, ms)) => {
+                let label = if action == Action::DirectDpi && route.starts_with("XHTTP") { "Фактический резерв XHTTP" } else { "Штатный маршрут" };
+                emit(tx, format!("{label}: HTTP {code}, {route}, {ms} мс"))?;
+            }
             Err(e) => { emit(tx, format!("Авто: {e}"))?; if matches!(e, ClientError::Tls | ClientError::Unauthorized | ClientError::Open(_) | ClientError::Protocol) { continue; } }
         }
         for (label, transport) in &verified {
@@ -164,7 +167,8 @@ async fn https(carrier: &Carrier, cache: &super::Cache, name: &str, digest: [u8;
         let route = match code >> 2 {
             2 => format!("XHTTP H2 {}", xhttp_observation(code & 3)),
             3 => format!("XHTTP H3 {}", xhttp_observation(code & 3)),
-            _ => "локальный Anti-DPI".to_owned(),
+            _ if allow_dpi => "локальный Anti-DPI".to_owned(),
+            _ => return Err(ClientError::Protocol),
         };
         Ok((status, route, started.elapsed().as_millis()))
     }).await.map_err(|_| ClientError::Timeout)?
