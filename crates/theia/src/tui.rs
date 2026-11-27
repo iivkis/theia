@@ -8388,11 +8388,32 @@ mod tests {
             ui.select_workspace_page(role, 4);
             ui.update(&mut model, press(KeyCode::Enter));
             ui.update(&mut model, press(KeyCode::Enter));
-            assert!(ui.traffic_monitor.is_some());
-            assert!(rendered_interaction(60, 18, &model, &ui).contains("Монитор трафика"));
-            ui.poll_navigation(&mut model);
-            ui.update(&mut model, press(KeyCode::Esc));
-            assert!(ui.traffic_monitor.is_none());
+            assert!(ui.workspace_monitor.is_some());
+            if role == Role::Server {
+                assert!(ui.traffic_monitor.is_none());
+                assert!(ui.workspace_visible());
+                assert_eq!(ui.workspace_page, 4);
+                let wide = rendered_interaction(120, 40, &model, &ui);
+                assert!(wide.contains("Разделы") && wide.contains("H2") && wide.contains("H3"));
+                let compact = rendered_interaction(60, 18, &model, &ui);
+                assert!(compact.contains("Монитор трафика"));
+                ui.poll_navigation(&mut model);
+                ui.update(&mut model, press(KeyCode::F(4)));
+                assert_eq!(ui.workspace_page, 4);
+                assert!(ui.workspace_monitor.is_some());
+                assert!(ui.traffic_monitor.is_none());
+                ui.update(&mut model, press(KeyCode::Left));
+                assert_eq!(ui.workspace_focus, WorkspaceFocus::Navigation);
+                ui.update(&mut model, press(KeyCode::Up));
+                assert_eq!(ui.workspace_page, 3);
+                assert!(ui.workspace_monitor.is_none());
+            } else {
+                assert!(ui.traffic_monitor.is_some());
+                assert!(rendered_interaction(60, 18, &model, &ui).contains("Монитор трафика"));
+                ui.poll_navigation(&mut model);
+                ui.update(&mut model, press(KeyCode::Esc));
+                assert!(ui.traffic_monitor.is_none());
+            }
             assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
             assert!(!ui.owned_running(role));
         }
