@@ -54,7 +54,8 @@ fn controls(mut data: &[u8], ipv4: bool) -> io::Result<(&[u8], &[u8])> {
             c = Some(value);
         }
         let next = aligned(len).ok_or_else(invalid)?;
-        if next >= data.len() { break; }
+        if len == data.len() { break; }
+        if next > data.len() { return Err(invalid()); }
         data = &data[next..];
     }
     Ok((r.ok_or_else(denied)?,c.ok_or_else(denied)?))
@@ -142,5 +143,29 @@ mod tests {
         assert!(controls(&[], true).is_err());
         assert!(controls(&[0;3], false).is_err());
         assert!(address(&[0;16]).is_err());
+    }
+
+    fn control(kind: i32, data: &[u8]) -> Vec<u8> {
+        let header = aligned(mem::size_of::<WSACMSGHDR>()).unwrap();
+        let size = header + data.len();
+        let mut bytes = vec![0u8; aligned(size).unwrap()];
+        let h = WSACMSGHDR { cmsg_len: size, cmsg_level: IPPROTO_IP as i32, cmsg_type: kind };
+        unsafe { ptr::write_unaligned(bytes.as_mut_ptr().cast::<WSACMSGHDR>(), h); }
+        bytes[header..size].copy_from_slice(data);
+        bytes
+    }
+
+    #[test]
+    fn exact_ancillary_pair_rejects_duplicate_wrong_family_and_trailing_fragment() {
+        let records = control(IP_WFP_REDIRECT_RECORDS as i32, &[1, 2, 3]);
+        let context = control(IP_WFP_REDIRECT_CONTEXT as i32, &[0; super::super::wfp_context::SIZE]);
+        let valid = [records.as_slice(), context.as_slice()].concat();
+        assert_eq!(controls(&valid, true).unwrap().0, &[1, 2, 3]);
+        assert!(controls(&valid, false).is_err());
+        assert!(controls(&[valid.as_slice(), records.as_slice()].concat(), true).is_err());
+        assert!(controls(&[valid.as_slice(), &[1]].concat(), true).is_err());
+        let header = aligned(mem::size_of::<WSACMSGHDR>()).unwrap();
+        let truncated = [context.as_slice(), &records[..header + 4]].concat();
+        assert!(controls(&truncated, true).is_err());
     }
 }

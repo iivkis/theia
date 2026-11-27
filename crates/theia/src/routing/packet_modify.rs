@@ -320,6 +320,50 @@ mod tests {
         }
     }
 
+    /// Independently decrypt the emitted Initial using pinned aioquic.
+    /// The opaque following packet is a structural fixture, not a live
+    /// handshake or evidence of bypass effectiveness.
+    #[test]
+    #[ignore = "requires pinned aioquic from browser-e2e CI"]
+    fn independent_aioquic_initial_modify_v1_v2() {
+        use crate::reality_quic_wire as wire;
+        use std::{io::Write, process::{Command, Stdio}};
+        for version in [wire::V1, wire::V2] {
+            let hello = super::super::dpi::packet_test_quic_hello("example.org");
+            let initial = wire::test_initial(version, &hello);
+            let header = wire::long(&initial).unwrap();
+            let mut tail = vec![if version == wire::V1 { 0xe0 } else { 0xf0 }];
+            tail.extend_from_slice(&version.to_be_bytes());
+            tail.push(header.dcid.len() as u8);
+            tail.extend_from_slice(header.dcid);
+            tail.push(header.scid.len() as u8);
+            tail.extend_from_slice(header.scid);
+            tail.push(20);
+            tail.extend([7; 20]);
+            let input = [initial.as_slice(), tail.as_slice()].concat();
+            let outputs = quic_initial_datagrams(&input, "example.org").unwrap();
+            assert_eq!(outputs.len(), 2);
+            assert_eq!(outputs.concat(), input);
+            assert!(quic_initial_datagrams(&input, "wrong.example").is_none());
+            let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/e2e/independent_quic_modify.py");
+            let mut peer = Command::new("python")
+                .arg(script)
+                .arg(version.to_string())
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap();
+            {
+                let mut stdin = peer.stdin.take().unwrap();
+                for data in [&input, &outputs[0], &outputs[1], &hello] {
+                    stdin.write_all(&(data.len() as u32).to_be_bytes()).unwrap();
+                    stdin.write_all(data).unwrap();
+                }
+            }
+            assert!(peer.wait().unwrap().success(), "independent Initial verification failed");
+        }
+    }
+
     #[test]
     fn dual_stack_binding_transform_preserves_tuple_and_integrity() {
         for v6 in [false, true] {

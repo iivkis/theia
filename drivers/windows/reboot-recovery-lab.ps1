@@ -44,8 +44,9 @@ function Read-State {
     $state = Get-CimInstance Win32_SystemDriver -Filter "Name='TheiaWfpLab'"
     if (!$state) { throw 'Driver state missing.' }
     [pscustomobject]@{
-        Version = 1
+        Version = 2
         Machine = $env:COMPUTERNAME
+        MachineGuid = [string](Get-ItemPropertyValue -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid)
         BootUtc = ([datetime]$os.LastBootUpTime).ToUniversalTime().ToString('o')
         Compartment = $Compartment
         ControllerSha256 = $expectedController
@@ -76,7 +77,8 @@ if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::Reparse
 }
 $before = Get-Content -LiteralPath $evidencePath -Raw | ConvertFrom-Json
 $after = Read-State
-if ($before.Version -ne 1 -or $before.Machine -ne $after.Machine -or
+if ($before.Version -ne 2 -or $before.Machine -ne $after.Machine -or
+    !$before.MachineGuid -or $before.MachineGuid -ne $after.MachineGuid -or
     $before.Compartment -ne $after.Compartment -or $before.ControllerSha256 -ne $after.ControllerSha256 -or
     $before.DriverSha256 -ne $after.DriverSha256 -or $before.DriverState -ne 'Running' -or
     [datetimeoffset]::Parse($after.BootUtc) -le [datetimeoffset]::Parse($before.BootUtc)) {
@@ -85,6 +87,9 @@ if ($before.Version -ne 1 -or $before.Machine -ne $after.Machine -or
 Invoke-Bfe 'inspect'
 $recovered = $false
 if ($Recover -and $PSCmdlet.ShouldProcess("compartment $Compartment", 'Delete only exact owned BFE objects after verified reboot')) {
+    # Demand-start driver must be stopped before destructive recovery.
+    # A running driver may have a live owner; do not infer owner death from reboot alone.
+    if ((Read-State).DriverState -ne 'Stopped') { throw 'Refuse recovery while driver is running or state is uncertain.' }
     Invoke-Bfe 'recover'
     Invoke-Bfe 'inspect-absent'
     $recovered = $true
