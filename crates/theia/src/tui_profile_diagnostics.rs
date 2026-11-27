@@ -224,10 +224,7 @@ impl Panel {
         }
     }
     fn export(&mut self) -> std::io::Result<()> {
-        use std::{
-            io::Write,
-            time::{SystemTime, UNIX_EPOCH},
-        };
+        use std::time::{SystemTime, UNIX_EPOCH};
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(std::io::Error::other)?;
@@ -244,6 +241,12 @@ impl Panel {
             options.mode(0o600);
         }
         let mut file = options.open(&name)?;
+        self.write_export(&mut file)?;
+        file.sync_all()?;
+        self.error = format!("Отчёт сохранён в текущем каталоге: {name}");
+        Ok(())
+    }
+    fn write_export(&self, mut file: impl std::io::Write) -> std::io::Result<()> {
         writeln!(
             file,
             "Theia · обезличенная сетевая диагностика\nЗавершена: {}",
@@ -259,8 +262,6 @@ impl Panel {
             }
             writeln!(file, "{}", check.line(true))?;
         }
-        file.sync_all()?;
-        self.error = format!("Отчёт сохранён в текущем каталоге: {name}");
         Ok(())
     }
     fn stop(&mut self) {
@@ -523,6 +524,80 @@ mod tests {
         assert!(panel.phase == Phase::Choose);
         assert!(panel.receiver.is_none());
     }
+    fn screen(panel: &Panel, width: u16, height: u16) -> String {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| panel.render(frame, frame.area())).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height).map(|y| {
+            (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>()
+        }).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn confirmation_and_partial_report_have_distinct_workspace_states() {
+        use crate::{client::ClientError, local_proxy::profile_diagnostics::ActualRoute};
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut panel = Panel::new(PathBuf::from("nonexistent"), [0; 32], "profile".into());
+        assert!(screen(&panel, 100, 25).contains("Домены, предложенные сервером"));
+        panel.key(key(KeyCode::Down));
+        panel.key(key(KeyCode::Enter));
+        assert!(panel.phase == Phase::Custom);
+        panel.paste("https://invalid");
+        assert!(panel.input.is_empty());
+        panel.paste("discord.com, x.com");
+        panel.key(key(KeyCode::Backspace));
+        assert_eq!(panel.input, "discord.com, x.co");
+        panel.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        panel.key(key(KeyCode::Enter));
+        assert!(panel.error.contains("Введите"));
+        panel.key(key(KeyCode::Esc));
+        assert!(panel.phase == Phase::Choose);
+        let (tx, rx) = mpsc::channel();
+        let (confirm, mut confirmation) = oneshot::channel();
+        let (cancel, cancelled) = watch::channel(false);
+        panel.phase = Phase::Fetching;
+        panel.receiver = Some(rx);
+        panel.confirm = Some(confirm);
+        panel.cancel = Some(cancel);
+        tx.send(Event::Check(Check { domain: None, kind: CheckKind::Carrier("H2"), outcome: Outcome::Verified(8) })).unwrap();
+        tx.send(Event::Line("Сервер проверен".into())).unwrap();
+        tx.send(Event::Domains(vec!["discord.com".into(), "x.com".into()])).unwrap();
+        panel.poll();
+        assert!(panel.phase == Phase::Confirm);
+        assert!(confirmation.try_recv().is_err());
+        assert!(screen(&panel, 100, 25).contains("discord.com"));
+        panel.key(key(KeyCode::Enter));
+        assert_eq!(confirmation.try_recv(), Ok(()));
+        assert!(panel.phase == Phase::Running);
+        tx.send(Event::Check(Check { domain: Some("discord.com".into()), kind: CheckKind::Https("штатный"), outcome: Outcome::Http(200, ActualRoute::Direct, 10) })).unwrap();
+        tx.send(Event::Check(Check { domain: Some("discord.com".into()), kind: CheckKind::Https("H2"), outcome: Outcome::Skipped("не разрешён") })).unwrap();
+        tx.send(Event::Check(Check { domain: Some("x.com".into()), kind: CheckKind::Udp("H3"), outcome: Outcome::Failure(ClientError::Timeout) })).unwrap();
+        tx.send(Event::DomainDone("discord.com".into())).unwrap();
+        panel.poll();
+        let table = screen(&panel, 100, 25);
+        assert!(table.contains("discord.com") && table.contains("200") && table.contains("UDP/H3"));
+        panel.key(key(KeyCode::Char('d')));
+        assert!(panel.details);
+        assert!(screen(&panel, 100, 25).contains("HTTP 200"));
+        panel.key(key(KeyCode::PageDown));
+        panel.key(key(KeyCode::PageUp));
+        panel.key(key(KeyCode::Esc));
+        assert!(*cancelled.borrow());
+        tx.send(Event::Done(Err(ClientError::Io))).unwrap();
+        panel.poll();
+        assert!(panel.phase == Phase::Done && !panel.completed);
+        assert_eq!(panel.failed_domains(), vec!["x.com"]);
+        assert!(panel.actions().iter().any(|a| a.key == 'r'));
+        let mut report = Vec::new();
+        panel.write_export(&mut report).unwrap();
+        let report = String::from_utf8(report).unwrap();
+        assert!(report.contains("№1") && report.contains("№2") && report.contains("HTTP 200"));
+        assert!(!report.contains("discord.com") && !report.contains("x.com") && !report.contains("profile"));
+        panel.key(key(KeyCode::Char('n')));
+        assert!(panel.phase == Phase::Choose);
+        assert!(panel.key(key(KeyCode::Esc)));
+    }
+
     #[test]
     fn retry_and_export_respect_privacy_and_policy() {
         let mut panel = Panel::new(

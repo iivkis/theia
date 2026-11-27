@@ -209,8 +209,9 @@ pub(crate) async fn run(
         Box::pin(session(&path, digest, &id, custom, &tx, confirm)),
     );
     let result = tokio::select! {
+        biased;
+        _ = async { if !*cancel.borrow() { let _ = cancel.changed().await; } } => Err(ClientError::Io),
         result = timeout(Duration::from_secs(240), work) => result.unwrap_or(Err(ClientError::Timeout)),
-        _ = cancel.changed() => Err(ClientError::Io),
         result = async {
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -846,13 +847,16 @@ async fn application_head(
         }
         // Informational responses are not a completed application exchange.
         let mut tail = [0; 4];
+        let mut complete = false;
         for _ in 0..8192 {
             tail.rotate_left(1);
             tail[3] = stream.read_u8().await.map_err(|_| ClientError::Io)?;
             if tail.ends_with(b"\r\n\r\n") || tail == [0, 0, b'\r', b'\n'] {
+                complete = true;
                 break;
             }
         }
+        if !complete { return Err(ClientError::Protocol); }
     }
     Err(ClientError::Protocol)
 }
@@ -1167,6 +1171,103 @@ mod tests {
         }
         assert!(!protective(ClientError::Timeout));
         assert!(!protective(ClientError::QuicUnreachable));
+    }
+
+    #[test]
+    fn typed_outcomes_preserve_status_and_anonymize_resource() {
+        use crate::net::error::ProbeVerdict;
+        let cases = [
+            (CheckKind::Carrier("H2"), Outcome::Verified(4), false, "4 мс"),
+            (CheckKind::Policy, Outcome::Route(Action::Blocked), false, "blocked"),
+            (CheckKind::Strategy("Header IPv4".into()), Outcome::Tls(ProbeVerdict::Verified, 5), false, "TLS подтверждён"),
+            (CheckKind::Strategy("Middle IPv6".into()), Outcome::Tls(ProbeVerdict::StrategyFailed, 6), true, "не сработала"),
+            (CheckKind::Strategy("Balanced IPv4".into()), Outcome::Tls(ProbeVerdict::Unavailable, 6), true, "недоступна"),
+            (CheckKind::Strategy("Header IPv4".into()), Outcome::Tls(ProbeVerdict::IdentityRejected, 7), true, "отклонена"),
+            (CheckKind::Strategy("Header IPv4".into()), Outcome::Tls(ProbeVerdict::Denied, 7), true, "запрещено"),
+            (CheckKind::Https("штатный"), Outcome::Http(204, ActualRoute::Direct, 8), false, "без модификации"),
+            (CheckKind::Https("штатный"), Outcome::Http(403, ActualRoute::AntiDpi("Balanced"), 8), true, "Balanced"),
+            (CheckKind::Https("H2"), Outcome::Http(200, ActualRoute::Xhttp { carrier: "H2", mode: "stream-one", fallback: Some(FallbackCause::Disabled) }, 9), false, "отключён"),
+            (CheckKind::Udp("H3"), Outcome::Udp(500, ActualRoute::Xhttp { carrier: "H3", mode: "stream-up", fallback: Some(FallbackCause::NoLocalRoute) }, 10), true, "не выбран"),
+            (CheckKind::Udp("штатный"), Outcome::Udp(200, ActualRoute::Xhttp { carrier: "H2", mode: "stream-one", fallback: Some(FallbackCause::BeforeFirstSend) }, 10), false, "до первой отправки"),
+            (CheckKind::Proxy("HTTP"), Outcome::Http(200, ActualRoute::SystemProxy, 11), false, "listener"),
+            (CheckKind::Proxy("IPC"), Outcome::Proxy(2, true, 1), false, "подтверждены"),
+            (CheckKind::Proxy("IPC"), Outcome::Proxy(0, false, 0), false, "не применены"),
+            (CheckKind::Proxy("IPC"), Outcome::Proxy(4, false, 2), false, "не подтверждены"),
+            (CheckKind::Https("H3"), Outcome::Skipped("не разрешён"), false, "не проверен"),
+            (CheckKind::Carrier("H3"), Outcome::Failure(ClientError::Unauthorized), true, "ошибка"),
+        ];
+        for (kind, outcome, failed, label) in cases {
+            let check = Check { domain: Some("private.example".into()), kind, outcome };
+            assert_eq!(check.failed(), failed);
+            assert!(check.line(false).contains("private.example"));
+            let redacted = check.line(true);
+            assert!(!redacted.contains("private.example"));
+            assert!(redacted.contains(label), "{redacted}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_bad_source_do_not_start_network() {
+        let path = std::env::temp_dir().join(crate::tui_editor::generated_id("diagnostic-missing").unwrap());
+        for (cancelled, expected) in [(true, ClientError::Io), (false, ClientError::Configuration)] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (_confirm, confirmation) = oneshot::channel();
+            let (_cancel, cancellation) = watch::channel(cancelled);
+            run(path.clone(), [0; 32], "absent".into(), None, tx, confirmation, cancellation).await;
+            let events = rx.try_iter().collect::<Vec<_>>();
+            assert!(events.iter().any(|e| matches!(e, Event::Done(Err(error)) if *error == expected)));
+            assert!(!events.iter().any(|e| matches!(e, Event::Domains(_) | Event::Check(_))));
+        }
+        assert!(check_carrier(None, "scope").await.is_none());
+    }
+
+    async fn head_fixture(reply: Vec<u8>, name: &str) -> Result<u16, ClientError> {
+        let cert = rcgen::generate_simple_self_signed(vec!["diagnostic.example".into()]).unwrap();
+        let der = cert.cert.der().clone();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(der.clone()).unwrap();
+        let tls = Arc::new(crate::net::tls::application_probe(roots).unwrap());
+        let server = Arc::new(crate::net::tls::server_tls13_builder().unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![der], rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into()).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let worker = async {
+            let (socket, _) = listener.accept().await.unwrap();
+            let Ok(mut stream) = tokio_rustls::TlsAcceptor::from(server).accept(socket).await else { return; };
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                assert!(request.len() < 1024);
+                request.push(stream.read_u8().await.unwrap());
+            }
+            assert_eq!(request, b"HEAD / HTTP/1.1\r\nHost: diagnostic.example\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(&reply).await;
+            let _ = stream.shutdown().await;
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(application_head(local, name, tls), worker)
+        }).await.expect("bounded local TLS fixture");
+        result
+    }
+
+    #[tokio::test]
+    async fn head_requires_authenticated_final_bounded_response() {
+        let ok = b"HTTP/1.1 100 Continue\r\nX-Test: interim\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n";
+        assert_eq!(head_fixture(ok.to_vec(), "diagnostic.example").await, Ok(204));
+        assert_eq!(head_fixture(ok.to_vec(), "wrong.example").await, Err(ClientError::Tls));
+        assert_eq!(head_fixture(b"not HTTP\r\n".to_vec(), "diagnostic.example").await, Err(ClientError::Protocol));
+        let mut long = b"HTTP/1.1 100 Continue\r\nX-Test: ".to_vec();
+        long.extend(std::iter::repeat_n(b'a', 8192));
+        long.extend_from_slice(b"\r\n\r\nHTTP/1.1 200 OK\r\n\r\n");
+        assert_eq!(head_fixture(long, "diagnostic.example").await, Err(ClientError::Protocol));
+    }
+
+    #[tokio::test]
+    async fn inactive_profile_cannot_claim_live_proxy() {
+        let Config::Client(doc) = config::parse(include_str!("../../../../examples/client.toml")).unwrap() else { panic!("client fixture"); };
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(proxy_lifecycle(&doc, "not-active", [0; 32], &tx).await.unwrap().is_none());
+        assert!(matches!(rx.try_recv().unwrap(), Event::Check(Check { outcome: Outcome::Skipped(_), .. })));
     }
 
     #[test]
