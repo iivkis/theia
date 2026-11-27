@@ -1,5 +1,5 @@
 
- //! User-initiated diagnostics; never installs or changes the system proxy.
+//! User-initiated diagnostics; never installs or changes the system proxy.
 use super::{bind_proxy_listener, egress, load_client_with_budget, xhttp_observation, Carrier, ProxyClient, ProxyTunnel};
 use crate::{client::ClientError, config::{self, Config}, routing::{Action, snapshot::{Snapshot, validate_diagnostic_domains}}};
 use sha2::{Digest, Sha256};

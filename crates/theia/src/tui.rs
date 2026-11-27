@@ -448,13 +448,14 @@ fn pages(role: Role) -> &'static [&'static str] {
             "Статистика",
             "Настройки",
             "Маршрутизация",
+            "Диагностика",
         ],
     }
 }
 
 /// Record selection is only useful on pages scoped to an inbound or profile.
 fn page_has_records(role: Role, page: usize) -> bool {
-    page == 1 || (role == Role::Server && page == 2) || (role == Role::Client && page == 3)
+    page == 1 || (role == Role::Server && page == 2) || (role == Role::Client && matches!(page, 3 | 7))
 }
 
 fn page_has_users(role: Role, page: usize) -> bool {
@@ -534,6 +535,7 @@ fn page_actions_for(
             ('L', "Выбрать другой профиль"),
             ('A', "Выбрать активный профиль"),
         ],
+        (Role::Client, 7) => &[('T', "Проверить сеть выбранного профиля")],
         (Role::Client, 6) => &[
             ('j', "Обновить состояние"),
             ('d', "Разрешить / отключить Anti-DPI"),
@@ -563,6 +565,7 @@ fn page_actions_for(
         .iter()
         .filter_map(|&(key, label)| {
             let available = match (role, key) {
+                (Role::Client, 'T') => has_record && !editor.dirty() && !editor.write_uncertain(),
                 (_, 'l' | 'M' | 'w' | 'K') if !advanced => false,
                 (Role::Server, 'V' | 'K') | (Role::Client, 'K') => has_record && reality,
                 (_, 'E') => has_record && !reality,
@@ -1505,6 +1508,7 @@ struct Interaction {
     records: Option<RecordFlow>,
     routing_panel: Option<RoutingPanel>,
     routing_observation: Option<RoutingObservation>,
+    profile_diagnostics: Option<crate::tui_profile_diagnostics::Panel>,
     discovery: Option<DiscoveryPanel>,
     candidates: Option<CandidateReview>,
     candidate_batch: Option<CandidateBatchPanel>,
@@ -1561,6 +1565,7 @@ impl Interaction {
             records: None,
             routing_panel: None,
             routing_observation: None,
+            profile_diagnostics: None,
             discovery: None,
             candidates: None,
             candidate_batch: None,
@@ -2159,6 +2164,7 @@ impl Interaction {
 
     fn poll_navigation(&mut self, model: &mut Model) {
         if let Some(observation) = self.access_observation.as_mut() { observation.poll(); }
+        if let Some(panel) = self.profile_diagnostics.as_mut() { panel.poll(); }
         if let Some(panel) = self.routing_panel.as_mut() {
             panel.poll();
         }
@@ -2432,6 +2438,7 @@ impl Interaction {
             && self.candidates.is_none()
             && self.candidate_batch.is_none()
             && self.domain.is_none()
+            && self.profile_diagnostics.is_none()
             && self.probe.is_none()
             && self.reality_provision.is_none()
             && self.reality_enrollment.is_none()
@@ -2450,6 +2457,10 @@ impl Interaction {
     }
 
     fn mouse(&mut self, model: &mut Model, event: MouseEvent, area: Rect) {
+        if let Some(panel) = self.profile_diagnostics.as_mut() {
+            match event.kind { MouseEventKind::ScrollUp => panel.scroll_up(), MouseEventKind::ScrollDown => panel.scroll_down(), _ => {} }
+            return;
+        }
         if self.routing_panel.is_some() {
             if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
                 let body = shell_layout(area)[1];
@@ -3009,6 +3020,15 @@ impl Interaction {
     }
 
     fn update(&mut self, model: &mut Model, mut key: KeyEvent) -> bool {
+        if let Some(panel) = self.profile_diagnostics.as_mut() {
+            if key.kind != KeyEventKind::Press { return false; }
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                self.profile_diagnostics = None;
+                return true;
+            }
+            if panel.key(key) { self.profile_diagnostics = None; }
+            return false;
+        }
         if key.kind == KeyEventKind::Press
             && (key.modifiers == KeyModifiers::SHIFT
                 || (key.modifiers.is_empty()
@@ -3771,6 +3791,19 @@ impl Interaction {
                                                 self.access_observation = AccessObservation::start(editor, id.clone(),
                                                     self.server_process.management_endpoint(), self.server_process.running());
                                             }
+                                        }
+                                    }
+                                    return false;
+                                }
+                                if ch == 'T' && role == Role::Client && self.workspace_page == 7 {
+                                    if let Some(editor) = self.editor.as_mut() {
+                                        match editor.require_clean_records() {
+                                            Ok(()) if !editor.write_uncertain() && !editor.selected_record_id().is_empty() => {
+                                                self.profile_diagnostics = Some(crate::tui_profile_diagnostics::Panel::new(editor.saved_path().to_path_buf(), editor.saved_sha256(), editor.selected_record_id().to_owned()));
+                                                editor.error = None;
+                                            }
+                                            Ok(()) => editor.error = Some("Сохраните профиль или откройте файл заново.".into()),
+                                            Err(e) => editor.error = Some(e.into()),
                                         }
                                     }
                                     return false;
@@ -6448,6 +6481,8 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             interaction.map_or(0, |u| u.modal_action),
             viewport,
         );
+    } else if let Some(panel) = interaction.and_then(|ui| ui.profile_diagnostics.as_ref()) {
+        panel.render(frame, parts[1]);
     } else if let Some(probe) = interaction.and_then(|ui| ui.probe.as_ref()) {
         diagnostic_report(
             frame,
@@ -7482,6 +7517,14 @@ fn draw_page(
                 ui.map_or(0, |u| u.modal_action), ui.map(|u| &u.viewport));
             return;
         }
+    }
+    if role == Role::Client && page == 7 {
+        let body = format!("Профиль: {}\nПроверка сервера, H2/H3, TCP Anti-DPI и XHTTP. Системный прокси не изменяется. Выберите профиль и запустите проверку.", editor.selected_record_id());
+        if let Some([report, controls]) = page_layout_for(area, role, page, Some(editor), 0, false) {
+            panel(frame, report, "Диагностика профиля", &body, false);
+            Actions { items: &items, selected }.render_with_focus(frame, controls, focus == WorkspaceFocus::Actions);
+        } else { panel(frame, area, "Диагностика профиля", &body, true); }
+        return;
     }
     if role == Role::Server && page == 7 {
         if let Some(routing) = ui.and_then(|u| u.routing_panel.as_ref()) {
@@ -9684,7 +9727,9 @@ mod tests {
         assert_eq!(recommendation_page(Role::Client, 'A'), (3, 'A'));
         assert_eq!(recommendation_page(Role::Server, 'S'), (5, 'S'));
         assert!(!page_has_users(Role::Server, 3));
-        assert_eq!(pages(Role::Client).len(), 7);
+        assert_eq!(pages(Role::Client).len(), 8);
+        assert!(page_has_records(Role::Client, 7));
+        assert_eq!(pages(Role::Client)[7], "Диагностика");
         assert_eq!(pages(Role::Server).len(), 8);
     }
 
