@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "source_sha": "902bceb366e07a2ff7f35831c81d8efa0fa6d47e",
+  "source_sha": "25bf2e7bbc64b7b66d66e3f0a124912d874a8023",
   "platform": "linux",
   "columns": 120,
   "rows": 40,
@@ -36,7 +36,7 @@
     {
       "scenario": "client-action-new-profile",
       "file": "client-action-new-profile.png",
-      "sha256": "34d318fcecbc46648e7351fabfb1058ead4a4c2e669cd33e2a639deb39ea6570",
+      "sha256": "811235e75496f0ee552a7a906caf989de7a36b1a5acbf3ced5da3fd7122a90cc",
       "state_fixture": false
     },
     {
@@ -48,13 +48,13 @@
     {
       "scenario": "client-connection-modes",
       "file": "client-connection-modes.png",
-      "sha256": "951be5505c461187029190f542be9f6e271eeab8524f8cf648899135618e51bd",
+      "sha256": "247bc14bbf97de280dfdc32d7f70327ebb633dddfae486d862eadb6de7896d76",
       "state_fixture": false
     },
     {
       "scenario": "client-direct-profile-action",
       "file": "client-direct-profile-action.png",
-      "sha256": "048dc2ae204b74e4b3a0cca9da2ca61d6fa9f2528c1eb625f9ef94ade2762ef7",
+      "sha256": "853b85f5402e9bccd7904e258195221d8713be8bc5377d27323897b841f5539b",
       "state_fixture": false
     },
     {
@@ -66,7 +66,7 @@
     {
       "scenario": "client-direct-profile-selection",
       "file": "client-direct-profile-selection.png",
-      "sha256": "4de0ff95434da71840a22b9ad135603fd2b735f07fd438f86be0a178d95d013c",
+      "sha256": "60e05bd4a476eb7931d41c694dfdec92e94ebfa6924d8f09638b1cf9ee7bf28d",
       "state_fixture": false
     },
     {
@@ -78,7 +78,7 @@
     {
       "scenario": "client-first-key-connect",
       "file": "client-first-key-connect.png",
-      "sha256": "951be5505c461187029190f542be9f6e271eeab8524f8cf648899135618e51bd",
+      "sha256": "247bc14bbf97de280dfdc32d7f70327ebb633dddfae486d862eadb6de7896d76",
       "state_fixture": false
     },
     {
@@ -90,7 +90,7 @@
     {
       "scenario": "client-first-key-save-review",
       "file": "client-first-key-save-review.png",
-      "sha256": "f31060e908b94a6b87444ffa99df4692907deed580cdab47bf27ed681aa7ac15",
+      "sha256": "639c833e8e4bd5bb4440d08e79f03f772101a070ee35ea4c00fefb90a6a1dac8",
       "state_fixture": false
     },
     {
@@ -102,7 +102,7 @@
     {
       "scenario": "client-first-key-trust",
       "file": "client-first-key-trust.png",
-      "sha256": "75f02430b09dea15a2f59db87f88c12ffb967633971892f6cf4ca837a7f13858",
+      "sha256": "76efd34dcda1cbcc6b91a323d96ee49f236d3b763bfee5424e9e1235face9136",
       "state_fixture": false
     },
     {
@@ -114,7 +114,7 @@
     {
       "scenario": "client-focus-fields",
       "file": "client-focus-fields.png",
-      "sha256": "8f50db4d22002bcf80cfc18b2da12c26b42903ee06108f2b97ae89c8d95425c8",
+      "sha256": "65a02c20272a64cec96b95ed9b669ab28ae0de4c05e5b9508f54d1b4f21f22bf",
       "state_fixture": false
     },
     {
@@ -126,7 +126,7 @@
     {
       "scenario": "client-focus-records",
       "file": "client-focus-records.png",
-      "sha256": "af460327ebf29ca85c8fb98fad87f6452baf31626c23e4b40384082093fb682a",
+      "sha256": "12105d2acf07429776f7e55b00a51f50dfe502dc8b6b4a438f7dee6670c121a6",
       "state_fixture": false
     },
     {
@@ -144,13 +144,13 @@
     {
       "scenario": "client-overview-next-step",
       "file": "client-overview-next-step.png",
-      "sha256": "951be5505c461187029190f542be9f6e271eeab8524f8cf648899135618e51bd",
+      "sha256": "247bc14bbf97de280dfdc32d7f70327ebb633dddfae486d862eadb6de7896d76",
       "state_fixture": false
     },
     {
       "scenario": "client-page-advanced",
       "file": "client-page-advanced.png",
-      "sha256": "22914de5b81c72630dec422b596ed63f5f8d1380fbf4131531dbc5380b6d29ca",
+      "sha256": "ea55033be2b8187a7d1613781866aadad4736bdccb91f73f4686665951385aa4",
       "state_fixture": false
     },
     {
@@ -174,25 +174,25 @@
     {
       "scenario": "client-page-profiles",
       "file": "client-page-profiles.png",
-      "sha256": "8f50db4d22002bcf80cfc18b2da12c26b42903ee06108f2b97ae89c8d95425c8",
+      "sha256": "65a02c20272a64cec96b95ed9b669ab28ae0de4c05e5b9508f54d1b4f21f22bf",
       "state_fixture": false
     },
     {
       "scenario": "client-page-proxy",
       "file": "client-page-proxy.png",
-      "sha256": "951be5505c461187029190f542be9f6e271eeab8524f8cf648899135618e51bd",
+      "sha256": "247bc14bbf97de280dfdc32d7f70327ebb633dddfae486d862eadb6de7896d76",
       "state_fixture": false
     },
     {
       "scenario": "client-page-routing",
       "file": "client-page-routing.png",
-      "sha256": "1487258688ea4cd82d410f735ddb4f4d20502de53f2258f8bbd8f9a7c652ec44",
+      "sha256": "dd5a466f44f8152c72b7930d77e717bcfbaa22efb0b3146657c332596108a0c1",
       "state_fixture": false
     },
     {
       "scenario": "client-page-settings",
       "file": "client-page-settings.png",
-      "sha256": "67b21721ffa86e535c508ede927a285de8dbb0a7d4506f5af343d0930bf50c4d",
+      "sha256": "cb882bc54b153b57687ba640d257958c3b079a16994dde65fd02e0ec508eac26",
       "state_fixture": false
     },
     {
@@ -204,7 +204,7 @@
     {
       "scenario": "client-reality-key-connect",
       "file": "client-reality-key-connect.png",
-      "sha256": "0ae62067a854c95bac657240983fb2d09704e6ccebfe24df5372cf3fcd315053",
+      "sha256": "f92578830951a6edc630fe6e8364d3a0b6b6a4971090453595ebdf2edb50e2b7",
       "state_fixture": false
     },
     {
@@ -252,25 +252,25 @@
     {
       "scenario": "client-routing-expired",
       "file": "client-routing-expired.png",
-      "sha256": "f587e41ef35721f419881cbaa254676272f49b71f21527ac760d4eeefa7a4569",
+      "sha256": "a0a5d7d94f2374a044195cfdbc82eb88f0ac747037ac4938afdf3467b87ba04c",
       "state_fixture": false
     },
     {
       "scenario": "client-routing-fresh",
       "file": "client-routing-fresh.png",
-      "sha256": "0a6de52bf29b45cf8e513616d5b1617c34cb3bf12cf8a9d3bd03f93341579c13",
+      "sha256": "ceb96e5b2398ca5deb15505fb5c346a46e17b2ef83d13bab7b6a73c00ca51bd8",
       "state_fixture": false
     },
     {
       "scenario": "client-routing-unconfirmed",
       "file": "client-routing-unconfirmed.png",
-      "sha256": "4ce61a1180f32dff1e3d45bc7c7fe49638ed4ce39a1f5d106754bc02b8856b67",
+      "sha256": "50e32d66f0dae6f5dc9e8a39362d3d9b2803ef7c5491e8633800daa2cee5e7ee",
       "state_fixture": false
     },
     {
       "scenario": "client-sections-focus",
       "file": "client-sections-focus.png",
-      "sha256": "becfe77f4283eab2102ea07eef4ead5d85ae5023eac6df57f737a179e5a2e611",
+      "sha256": "25f98251697af5227d85398b12616947ce05dc4477d6121bfed71a0c52356d67",
       "state_fixture": false
     },
     {
@@ -282,7 +282,7 @@
     {
       "scenario": "client-validation-error",
       "file": "client-validation-error.png",
-      "sha256": "724c900e321dd5aa6e76f280be009c9d68a7204ed1bebbe1b045578929ca8298",
+      "sha256": "055295d01aa41c4d39dd6acbf6d3d7b956b2712f4afc91bd05ba24fa5b7d89ef",
       "state_fixture": false
     },
     {
@@ -310,12 +310,6 @@
       "state_fixture": false
     },
     {
-      "scenario": "server-action-apply-rights",
-      "file": "server-action-apply-rights.png",
-      "sha256": "0740093f60cf515ca7ac8fbdf46e5dac806b2cd2ec778068dd60da963939d3b4",
-      "state_fixture": false
-    },
-    {
       "scenario": "server-action-certificate",
       "file": "server-action-certificate.png",
       "sha256": "c9e3fa6b2eb0eda155aa830383296b7b13d7afaf2f6c7d9e79c452a8bd452c13",
@@ -324,7 +318,7 @@
     {
       "scenario": "server-action-delete-connection",
       "file": "server-action-delete-connection.png",
-      "sha256": "63f54ae1229820d7bd266547ba58a273f61323f5b242bdcb21a13641e74b791d",
+      "sha256": "b651bdf13928aff78f8b6feb7d49e47978f6ecaa22385d24f524fc8ab5162dea",
       "state_fixture": false
     },
     {
@@ -342,13 +336,13 @@
     {
       "scenario": "server-action-disable-user",
       "file": "server-action-disable-user.png",
-      "sha256": "a51500e33e2ee11ce36125ecff31de9f2859e418feb6b0117b9c51bf302c6c20",
+      "sha256": "e827eab33931b7d81a171d61bd056c534fc0808fef861cc93a5d5118d1eb32cb",
       "state_fixture": false
     },
     {
       "scenario": "server-action-grant-picker",
       "file": "server-action-grant-picker.png",
-      "sha256": "0747675efab3b95bc23b8dd2b7661494a250e5fba78ea308f8f8429b66d0bdae",
+      "sha256": "cd1a029cf021ab9d34898d668935a02f834652597524839bba88d7e1f6ac537e",
       "state_fixture": false
     },
     {
@@ -378,7 +372,7 @@
     {
       "scenario": "server-action-reality-status-unavailable",
       "file": "server-action-reality-status-unavailable.png",
-      "sha256": "408db375055c0707863584f1f034b8979ff37198e99fbe52050fdba8a5f47eab",
+      "sha256": "4a1638b1342f3e368de778f592fa8aa50fc6d12168e6184c82572acee5afc8d5",
       "state_fixture": false
     },
     {
@@ -390,31 +384,19 @@
     {
       "scenario": "server-action-recover-user",
       "file": "server-action-recover-user.png",
-      "sha256": "004af0c2f6fa185000bae9bd44d5610dabd03fb0b859ed891aa7231cfaf63d5c",
-      "state_fixture": false
-    },
-    {
-      "scenario": "server-action-restart-preflight",
-      "file": "server-action-restart-preflight.png",
-      "sha256": "69d50779ad5821c0effa3d46a3cf5be2d625c51c9866471b1817c17c7f5d86d9",
+      "sha256": "426993dc3779cd264f69fe535e212f067578911b24d857281afeb9f1d2a31a14",
       "state_fixture": false
     },
     {
       "scenario": "server-action-rotate-token",
       "file": "server-action-rotate-token.png",
-      "sha256": "e0afc8a9605e53d9934430b9d35a798150130555f50480bb39ade02f9b761ca2",
+      "sha256": "5ddacb4cb1ff05cd02153beb7de02372fb955c2d787034e3642bb5864e3a4cfe",
       "state_fixture": false
     },
     {
       "scenario": "server-action-runtime-status",
       "file": "server-action-runtime-status.png",
-      "sha256": "0740093f60cf515ca7ac8fbdf46e5dac806b2cd2ec778068dd60da963939d3b4",
-      "state_fixture": false
-    },
-    {
-      "scenario": "server-action-server-process",
-      "file": "server-action-server-process.png",
-      "sha256": "c2a3c3239d902ec55128d8de5eef3e1cd327700671e4caf32cb9ff300f920544",
+      "sha256": "9c559bc9432a5a9c8bd3bac6603b74d75a982b95e58f299710adb113b32b3895",
       "state_fixture": false
     },
     {
@@ -474,7 +456,7 @@
     {
       "scenario": "server-focus-fields",
       "file": "server-focus-fields.png",
-      "sha256": "ee5a798ea81561aa733ec5f57757062c66e15b145487d3caa1fccee86d2d6d56",
+      "sha256": "03c53442daf0605d53a566d6e548d35e4f5f6eb4de5357ba2f2a9f9a7d817cb9",
       "state_fixture": false
     },
     {
@@ -486,25 +468,25 @@
     {
       "scenario": "server-focus-records",
       "file": "server-focus-records.png",
-      "sha256": "f9f8d1a8ffd39afe45afccd075bc98896b1e1109805c7708b7f5a2aba3e313e3",
+      "sha256": "3f565606c8b18ce53e99952e62b0311635ba7b5c9839ef9ea55e99d0c52c16da",
       "state_fixture": false
     },
     {
       "scenario": "server-overview-next-step",
       "file": "server-overview-next-step.png",
-      "sha256": "fe7074f918741b196b21cfd92fcac57547f7b61b95cb7ad7d5f1ec0106ab3a98",
+      "sha256": "e24ec4c18f587a533035589c047bb14882116b85b5b2531e909acacaa2bdb566",
       "state_fixture": false
     },
     {
       "scenario": "server-page-advanced",
       "file": "server-page-advanced.png",
-      "sha256": "d538d9c5e92cc1a393857741ae3e6edf9fdbaafcf9b32033355b7c797d34f05e",
+      "sha256": "717430a166bd13223cbe2dd823c1cb37e2570044c7b545d041eeee7b76ab49bb",
       "state_fixture": false
     },
     {
       "scenario": "server-page-connections",
       "file": "server-page-connections.png",
-      "sha256": "ee5a798ea81561aa733ec5f57757062c66e15b145487d3caa1fccee86d2d6d56",
+      "sha256": "03c53442daf0605d53a566d6e548d35e4f5f6eb4de5357ba2f2a9f9a7d817cb9",
       "state_fixture": false
     },
     {
@@ -516,7 +498,7 @@
     {
       "scenario": "server-page-management",
       "file": "server-page-management.png",
-      "sha256": "fe7074f918741b196b21cfd92fcac57547f7b61b95cb7ad7d5f1ec0106ab3a98",
+      "sha256": "e24ec4c18f587a533035589c047bb14882116b85b5b2531e909acacaa2bdb566",
       "state_fixture": false
     },
     {
@@ -528,19 +510,19 @@
     {
       "scenario": "server-page-routing",
       "file": "server-page-routing.png",
-      "sha256": "676bc9bfb7e26b8d73adde8d7dc8027054ed410f43ea4faf9af507d38be874d9",
+      "sha256": "aa4134fcfcd90c1eefa0dbe8564dc654b0e7972a3253c1f018b45056234d753c",
       "state_fixture": false
     },
     {
       "scenario": "server-page-settings",
       "file": "server-page-settings.png",
-      "sha256": "5740857741ddf7429a34b748052187f1c834d73e0b84e2786b9b2c39bae3b064",
+      "sha256": "7138ee680ba51002fa179167172c97be1a0b6d2e79caeb79b0e882fafd122404",
       "state_fixture": false
     },
     {
       "scenario": "server-page-traffic",
       "file": "server-page-traffic.png",
-      "sha256": "e013209a16770b0527734c577ee5e768c85bade767b8bcb202df83d9ee29bb3f",
+      "sha256": "62b850aeafc59f59760760fae08926fa22fb7c405442afe18cf498de0eeb5851",
       "state_fixture": false
     },
     {
@@ -570,7 +552,7 @@
     {
       "scenario": "server-reality-status-technical",
       "file": "server-reality-status-technical.png",
-      "sha256": "f4e743a5cb5cd05857244221941546e44a72c54531169fd1441d3a87b9302948",
+      "sha256": "e77fda6d06beeaf19437455184a4e2df1f206f3dc3f0daccfacaad7484f857f6",
       "state_fixture": false
     },
     {
@@ -588,19 +570,19 @@
     {
       "scenario": "server-routing-edit",
       "file": "server-routing-edit.png",
-      "sha256": "1e9529953797b952e2c19e833e940fd09aa0695c522e5574126289fedd404d1f",
+      "sha256": "c91c31efeb6e51ac087111f618ddaa6487c5c43197af68dc057d3e10a81cac9a",
       "state_fixture": false
     },
     {
       "scenario": "server-routing-rules",
       "file": "server-routing-rules.png",
-      "sha256": "a98e5bf9c54498d79c37f496b3323fb21bd003c1b4a9dbcd542352e5af44275a",
+      "sha256": "0ffca10fd41607257922969928186709fa50253837eed9e82752b8067971ccda",
       "state_fixture": false
     },
     {
       "scenario": "server-sections-focus",
       "file": "server-sections-focus.png",
-      "sha256": "505fe596a94ae370e0ed10294a2ffa66bca922f00e9def7565e6d7de05dd1679",
+      "sha256": "04f6663768fbb5d549611276ca275647e00606013fa0d37b863296f9fc35022e",
       "state_fixture": false
     },
     {
@@ -610,15 +592,9 @@
       "state_fixture": false
     },
     {
-      "scenario": "server-traffic-monitor-idle",
-      "file": "server-traffic-monitor-idle.png",
-      "sha256": "62342222f4c56d464b8c376feb9577a032c72369688e4c7ef67bbc095b3f4883",
-      "state_fixture": false
-    },
-    {
       "scenario": "server-validation-error",
       "file": "server-validation-error.png",
-      "sha256": "fa0eff0505a172502fc78c3db6401f33c4229ce186bb2bad98bab3ee036d8bfb",
+      "sha256": "2b8a9ddc0d446377900225167f1d410360ef2afc868f4780a901c398704adc59",
       "state_fixture": false
     },
     {
@@ -702,7 +678,7 @@
     {
       "scenario": "state-issuance-recover-input",
       "file": "state-issuance-recover-input.png",
-      "sha256": "004af0c2f6fa185000bae9bd44d5610dabd03fb0b859ed891aa7231cfaf63d5c",
+      "sha256": "426993dc3779cd264f69fe535e212f067578911b24d857281afeb9f1d2a31a14",
       "state_fixture": true
     },
     {
@@ -732,7 +708,7 @@
     {
       "scenario": "state-issuance-rotate-input",
       "file": "state-issuance-rotate-input.png",
-      "sha256": "e0afc8a9605e53d9934430b9d35a798150130555f50480bb39ade02f9b761ca2",
+      "sha256": "5ddacb4cb1ff05cd02153beb7de02372fb955c2d787034e3642bb5864e3a4cfe",
       "state_fixture": true
     },
     {
@@ -834,7 +810,7 @@
     {
       "scenario": "state-reality-step6-key-handoff",
       "file": "state-reality-step6-key-handoff.png",
-      "sha256": "4a0bea977fb2f8a53fd6593747efb44e95742ec6f9ce9dc636063ce5e8fdbb28",
+      "sha256": "5c73dbf0eef75d25c9d1286f71ec98274a29d69f33ec469ea0583cd5224c356b",
       "state_fixture": true
     },
     {
@@ -846,7 +822,7 @@
     {
       "scenario": "state-reality-step6-save-inspection",
       "file": "state-reality-step6-save-inspection.png",
-      "sha256": "9f37ea7cf370fa41536ccc2b178e503b9c299d3835ebd8fb30b20f353af259c1",
+      "sha256": "fdc80eb6247a90c120dcf3542d7532b1115600ca53b8027f99adcbbe7dc09f29",
       "state_fixture": true
     },
     {

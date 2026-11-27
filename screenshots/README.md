@@ -1,6 +1,6 @@
 # Theia TUI visual review
 
-Source: 902bceb366e07a2ff7f35831c81d8efa0fa6d47e
+Source: 25bf2e7bbc64b7b66d66e3f0a124912d874a8023
 
 Linux · 120×40 · actual production renderer cells. State fixtures and unavailable actions are not runtime success.
 
@@ -206,10 +206,6 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![home-role-selection](home-role-selection.png)
 
-## server-action-apply-rights
-
-![server-action-apply-rights](server-action-apply-rights.png)
-
 ## server-action-certificate
 
 ![server-action-certificate](server-action-certificate.png)
@@ -262,10 +258,6 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![server-action-recover-user](server-action-recover-user.png)
 
-## server-action-restart-preflight
-
-![server-action-restart-preflight](server-action-restart-preflight.png)
-
 ## server-action-rotate-token
 
 ![server-action-rotate-token](server-action-rotate-token.png)
@@ -273,10 +265,6 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## server-action-runtime-status
 
 ![server-action-runtime-status](server-action-runtime-status.png)
-
-## server-action-server-process
-
-![server-action-server-process](server-action-server-process.png)
 
 ## server-discovery-actions
 
@@ -405,10 +393,6 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## server-start-confirmation
 
 ![server-start-confirmation](server-start-confirmation.png)
-
-## server-traffic-monitor-idle
-
-![server-traffic-monitor-idle](server-traffic-monitor-idle.png)
 
 ## server-validation-error
 
