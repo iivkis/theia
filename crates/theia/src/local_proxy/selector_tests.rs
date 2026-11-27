@@ -1526,6 +1526,7 @@ async fn real_local_proxy_modes_fixture() {
         routing: Some(crate::routing::Settings {
             revision: 2,
             geodata_directory: None,
+            diagnostic_domains: crate::routing::snapshot::default_diagnostic_domains(),
             datasets: None,
             rules: vec![
                 crate::routing::Rule {

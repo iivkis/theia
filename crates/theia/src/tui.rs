@@ -780,6 +780,7 @@ impl RoutingPanel {
             .unwrap_or(crate::routing::Settings {
                 revision: 2,
                 geodata_directory: None,
+                diagnostic_domains: crate::routing::snapshot::default_diagnostic_domains(),
                 rules: Vec::new(),
                 datasets: None,
             });
