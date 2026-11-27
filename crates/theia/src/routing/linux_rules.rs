@@ -5,6 +5,7 @@
 //! dies, the kernel queue closes and the table remains fail closed.
 //! Recovery deletes ONLY our table, using the kernel ruleset generation CAS.
 //! Any unrelated ruleset change after installation requires manual review.
+use super::linux_carrier::LabCarrierSocket;
 use super::nfqueue::{align4, attr, checked_header, kernel_address, message, next_attr, receive, send, Queue};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,8 @@ const NFT: u16 = 10 << 8;
 const REQUEST: u16 = 1;
 const ACK: u16 = 4;
 const CREATE_EXCLUSIVE: u16 = 0x600;
+const APPEND: u16 = 0x800;
+const MAX_CARRIERS: usize = 16;
 const NESTED: u16 = 0x8000;
 const FAMILY_INET: u8 = 1;
 const NEW_TABLE: u16 = NFT;
@@ -182,17 +185,17 @@ impl Netlink {
         Ok(true)
     }
     fn batch(&self, generation: u32, operations: &[Vec<u8>]) -> io::Result<()> {
-        if generation == 0 || operations.is_empty() || operations.len() > 3 { return Err(invalid()); }
+        if generation == 0 || operations.is_empty() || operations.len() > MAX_CARRIERS + 3 { return Err(invalid()); }
         let mut attrs = Vec::new();
         attr(&mut attrs, 1, &generation.to_be_bytes());
         let mut bytes = message(16, REQUEST, 1, 10, &attrs);
         for operation in operations { bytes.extend_from_slice(operation); }
         bytes.extend_from_slice(&message(17, REQUEST, operations.len() as u32 + 2, 10, &[]));
         send(self.0.as_raw_fd(), &bytes)?;
-        let mut received = 0u8;
-        let expected = (1u8 << operations.len()) - 1;
+        let mut received = 0u32;
+        let expected = (1u32 << operations.len()) - 1;
         let mut buffer = vec![0u8; 65536];
-        for _ in 0..8 {
+        for _ in 0..32 {
             let n = receive(self.0.as_raw_fd(), &mut buffer)?;
             let mut rest = &buffer[..n];
             while !rest.is_empty() {
@@ -203,7 +206,7 @@ impl Netlink {
                 if kind != 2 { return Err(invalid()); }
                 if let Some(error) = ack_error(body)? { return Err(error); }
                 if seq < 2 || seq > operations.len() as u32 + 1 { return Err(invalid()); }
-                let bit = 1u8 << (seq - 2);
+                let bit = 1u32 << (seq - 2);
                 if received & bit != 0 { return Err(invalid()); }
                 received |= bit;
                 rest = &rest[align4(len)..];
@@ -234,7 +237,7 @@ fn nft_message(kind: u16, flags: u16, sequence: u32, attrs: &[u8]) -> Vec<u8> {
     if kind != GET_GEN { msg[16] = FAMILY_INET; }
     msg
 }
-fn install_messages(journal: &Journal, queue: u16) -> Vec<Vec<u8>> {
+fn install_messages(journal: &Journal, queue: u16, carriers: &[LabCarrierSocket]) -> Vec<Vec<u8>> {
     let name = journal.name();
     let mut table = Vec::new();
     name_attr(&mut table, 1, &name);
@@ -264,7 +267,89 @@ fn install_messages(journal: &Journal, queue: u16) -> Vec<Vec<u8>> {
     attr(&mut expressions, 1 | NESTED, &expression);
     attr(&mut rule, 4 | NESTED, &expressions);
     let flags = REQUEST | ACK | CREATE_EXCLUSIVE;
-    vec![nft_message(NEW_TABLE, flags, 2, &table), nft_message(NEW_CHAIN, flags, 3, &chain), nft_message(NEW_RULE, flags, 4, &rule)]
+    let mut messages = vec![nft_message(NEW_TABLE, flags, 2, &table), nft_message(NEW_CHAIN, flags, 3, &chain)];
+    for carrier in carriers {
+        let expressions = carrier_expressions(carrier.key(), carrier.mark());
+        let mut attrs = Vec::new();
+        name_attr(&mut attrs, 1, &name);
+        name_attr(&mut attrs, 2, "output");
+        attr(&mut attrs, 4 | NESTED, &expressions);
+        messages.push(nft_message(NEW_RULE, flags | APPEND, messages.len() as u32 + 2, &attrs));
+    }
+    // Append the queue rule last. No packet may bypass it unless a
+    // preceding kernel socket + exact tuple match admitted it.
+    messages.push(nft_message(NEW_RULE, flags | APPEND, messages.len() as u32 + 2, &rule));
+    messages
+}
+
+fn expression(out: &mut Vec<u8>, name: &str, data: &[u8]) {
+    let mut expr = Vec::new();
+    name_attr(&mut expr, 1, name);
+    attr(&mut expr, 2 | NESTED, data);
+    attr(out, 1 | NESTED, &expr);
+}
+fn cmp(out: &mut Vec<u8>, value: &[u8]) {
+    let mut data = Vec::new();
+    attr(&mut data, 1, &1u32.to_be_bytes()); // NFT_REG_1
+    attr(&mut data, 2, &0u32.to_be_bytes()); // NFT_CMP_EQ
+    let mut nested = Vec::new();
+    attr(&mut nested, 1, value);
+    attr(&mut data, 3 | NESTED, &nested);
+    expression(out, "cmp", &data);
+}
+fn meta_cmp(out: &mut Vec<u8>, key: u32, value: &[u8]) {
+    let mut data = Vec::new();
+    attr(&mut data, 1, &1u32.to_be_bytes());
+    attr(&mut data, 2, &key.to_be_bytes());
+    expression(out, "meta", &data);
+    cmp(out, value);
+}
+fn payload_cmp(out: &mut Vec<u8>, base: u32, offset: u32, value: &[u8]) {
+    let mut data = Vec::new();
+    attr(&mut data, 1, &1u32.to_be_bytes());
+    attr(&mut data, 2, &base.to_be_bytes());
+    attr(&mut data, 3, &offset.to_be_bytes());
+    attr(&mut data, 4, &(value.len() as u32).to_be_bytes());
+    expression(out, "payload", &data);
+    cmp(out, value);
+}
+fn carrier_expressions(key: super::packet::FlowKey, mark: u32) -> Vec<u8> {
+    use std::net::IpAddr;
+    let mut out = Vec::new();
+    let mut socket = Vec::new();
+    attr(&mut socket, 1, &1u32.to_be_bytes()); // NFT_SOCKET_MARK
+    attr(&mut socket, 2, &1u32.to_be_bytes()); // NFT_REG_1
+    expression(&mut out, "socket", &socket);
+    // Socket mark is a native-endian register value, not skb metadata.
+    cmp(&mut out, &mark.to_ne_bytes());
+    match (key.source.ip(), key.destination.ip()) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            meta_cmp(&mut out, 15, &[2]); // NFPROTO_IPV4
+            meta_cmp(&mut out, 16, &[if key.transport == super::packet::Transport::Tcp {6} else {17}]);
+            payload_cmp(&mut out, 1, 12, &src.octets());
+            payload_cmp(&mut out, 1, 16, &dst.octets());
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            meta_cmp(&mut out, 15, &[10]); // NFPROTO_IPV6
+            meta_cmp(&mut out, 16, &[if key.transport == super::packet::Transport::Tcp {6} else {17}]);
+            payload_cmp(&mut out, 1, 8, &src.octets());
+            payload_cmp(&mut out, 1, 24, &dst.octets());
+        }
+        _ => unreachable!("validated carrier family"),
+    }
+    let mut ports = [0;4];
+    ports[..2].copy_from_slice(&key.source.port().to_be_bytes());
+    ports[2..].copy_from_slice(&key.destination.port().to_be_bytes());
+    payload_cmp(&mut out, 2, 0, &ports);
+    let mut verdict = Vec::new();
+    attr(&mut verdict, 1, &1u32.to_be_bytes()); // NF_ACCEPT
+    let mut data = Vec::new();
+    attr(&mut data, 2 | NESTED, &verdict);
+    let mut immediate = Vec::new();
+    attr(&mut immediate, 1, &0u32.to_be_bytes()); // NFT_REG_VERDICT
+    attr(&mut immediate, 2 | NESTED, &data);
+    expression(&mut out, "immediate", &immediate);
+    out
 }
 
 fn parse_journal(bytes: &[u8], scope: &Scope) -> io::Result<Journal> {
@@ -279,6 +364,7 @@ pub struct LabRules {
     _lock: UnixDatagram,
     journal: Journal,
     queue_identity: [u8; 16],
+    _carriers: Vec<LabCarrierSocket>,
 }
 impl LabRules {
     pub(crate) fn owns_packet(&self, packet: &super::nfqueue::Packet<'_>) -> io::Result<bool> {
@@ -295,9 +381,25 @@ impl LabRules {
     /// The caller must own an isolated lab and a running NFQUEUE consumer.
     /// All its output will be queued; this is NOT production activation.
     pub fn install(queue: &Queue, host_namespace: &File, path: &Path) -> io::Result<Self> {
+        Self::install_with_carriers(queue, host_namespace, path, Vec::new())
+    }
+
+    /// The caller explicitly supplies already authenticated, connected
+    /// carrier sockets. Their exact kernel socket marks and four-tuples
+    /// are matched before the queue. No PID/UID/destination-wide bypass.
+    /// The isolated namespace must not contain untrusted CAP_NET_ADMIN/
+    /// CAP_NET_RAW holders capable of changing socket marks.
+    pub fn install_with_carriers(queue: &Queue, host_namespace: &File, path: &Path, carriers: Vec<LabCarrierSocket>) -> io::Result<Self> {
         let lock = scope_lock()?;
         let scope = Scope::current(host_namespace)?;
         check_parent(path)?;
+        if carriers.len() > MAX_CARRIERS { return Err(refused()); }
+        let mut marks = std::collections::HashSet::new();
+        let mut cookies = std::collections::HashSet::new();
+        for socket in &carriers {
+            socket.verify()?;
+            if !marks.insert(socket.mark()) || !cookies.insert(socket.cookie()) { return Err(refused()); }
+        }
         let old = journal_bytes(path)?;
         if let Some(bytes) = &old {
             if !parse_journal(bytes, &scope)?.restored { return Err(refused()); }
@@ -309,7 +411,7 @@ impl LabRules {
         SystemRandom::new().fill(&mut nonce).map_err(|_| refused())?;
         let journal = Journal { version: 1, scope, nonce, before, installed, restored: false };
         if net.table(&journal)? { return Err(refused()); }
-        let operations = install_messages(&journal, queue.number()?);
+        let operations = install_messages(&journal, queue.number()?, &carriers);
         // Durable intent before changing any OS state, with create-only/CAS
         // publication. All uncertain failures leave the journal intact.
         store(path, &journal, old.as_deref())?;
@@ -317,7 +419,7 @@ impl LabRules {
         if net.generation()? != installed || !net.table(&journal)? || net.generation()? != installed {
             return Err(refused());
         }
-        Ok(Self { _lock: lock, journal, queue_identity: queue.identity() })
+        Ok(Self { _lock: lock, journal, queue_identity: queue.identity(), _carriers: carriers })
     }
 }
 
@@ -392,15 +494,36 @@ mod tests {
     }
 
     #[test]
+    fn carrier_rule_uses_socket_mark_and_exact_four_tuple() {
+        let key = super::super::packet::FlowKey {
+            source: "192.0.2.1:1234".parse().unwrap(),
+            destination: "198.51.100.2:443".parse().unwrap(),
+            transport: super::super::packet::Transport::Tcp,
+            interface: 0,
+        };
+        let encoded = carrier_expressions(key, 0x1234abcd);
+        let mut rest = encoded.as_slice();
+        let mut names = Vec::new();
+        while let Some((_, mut expr)) = next_attr(&mut rest).unwrap() {
+            names.push(next_attr(&mut expr).unwrap().unwrap().1);
+        }
+        assert_eq!(names, [b"socket\0".as_slice(), b"cmp\0", b"meta\0", b"cmp\0", b"meta\0", b"cmp\0", b"payload\0", b"cmp\0", b"payload\0", b"cmp\0", b"payload\0", b"cmp\0", b"immediate\0"]);
+        assert!(encoded.windows(4).any(|w| w == 0x1234abcdu32.to_ne_bytes()));
+        assert!(encoded.windows(4).any(|w| w == [192,0,2,1]));
+        assert!(encoded.windows(4).any(|w| w == [198,51,100,2]));
+        assert!(encoded.windows(4).any(|w| w == [4,210,1,187]));
+    }
+
+    #[test]
     fn batch_objects_have_exclusive_creation_and_no_queue_bypass() {
         let j = journal();
-        let messages = install_messages(&j, 42);
+        let messages = install_messages(&j, 42, &[]);
         for (i, bytes) in messages.iter().enumerate() {
             let (kind, seq, body) = checked_header(bytes).unwrap();
             assert_eq!(kind, [NEW_TABLE, NEW_CHAIN, NEW_RULE][i]);
             assert_eq!(seq, i as u32 + 2);
             assert_eq!(body[0], FAMILY_INET);
-            assert_eq!(u16::from_ne_bytes(bytes[6..8].try_into().unwrap()), REQUEST | ACK | CREATE_EXCLUSIVE);
+            assert_eq!(u16::from_ne_bytes(bytes[6..8].try_into().unwrap()), REQUEST | ACK | CREATE_EXCLUSIVE | if i == 2 { APPEND } else { 0 });
         }
         let (_, _, body) = checked_header(&messages[2]).unwrap();
         let mut attrs = &body[4..];

@@ -18,6 +18,8 @@ pub mod wfp_ingress;
 pub mod nfqueue;
 #[cfg(target_os = "linux")]
 pub mod linux_rules;
+#[cfg(target_os = "linux")]
+pub mod linux_carrier;
 pub mod geodata;
 mod settings;
 pub mod snapshot;
