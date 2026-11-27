@@ -124,6 +124,14 @@ impl LabCarrierSocket {
         }
         Ok(())
     }
+    pub(super) fn clear_mark(&self) -> io::Result<()> {
+        if socket_cookie(&self.fd)? != self.cookie { return Err(denied()); }
+        match get_mark(&self.fd)? {
+            0 => Ok(()),
+            mark if mark == self.mark => set_mark(&self.fd, 0),
+            _ => Err(denied()),
+        }
+    }
     pub(super) fn key(&self) -> FlowKey { self.key }
     pub(super) fn cookie(&self) -> u64 { self.cookie }
     pub(super) fn mark(&self) -> u32 { self.mark }

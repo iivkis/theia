@@ -516,9 +516,13 @@ impl Drop for DynamicAdmission {
             let mark = socket.mark();
             // The original socket may still exist in a caller. Reset the
             // mark before freeing the kernel exemption and its slot.
+            let cleared = socket.clear_mark().is_ok();
             drop(socket);
             if let Ok(mut rules) = self.rules.lock() {
-                let _ = rules.revoke(mark);
+                let revoked = rules.revoke(mark).is_ok();
+                // Even if rule removal succeeds, do not issue new leases
+                // after an uncertain descriptor reset.
+                if !cleared || !revoked { rules.poisoned = true; }
             }
         }
     }

@@ -580,7 +580,7 @@ fn windows_route_source(remote: SocketAddr) -> Option<SocketAddr> {
         }
     }
     let mut interface = 0u32;
-    if unsafe { GetBestInterfaceEx((&dst as *const SOCKADDR_INET).cast(), &mut interface) } != 0 || interface == 0 { return None; }
+    if unsafe { GetBestInterfaceEx((&mut dst as *mut SOCKADDR_INET).cast(), &mut interface) } != 0 || interface == 0 { return None; }
     let mut route: MIB_IPFORWARD_ROW2 = unsafe { mem::zeroed() };
     if unsafe { GetBestRoute2(ptr::null(), interface, ptr::null(), &dst, 0, &mut route, &mut source) } != 0 { return None; }
     let raw = unsafe { std::slice::from_raw_parts((&source as *const SOCKADDR_INET).cast::<u8>(),28) };
