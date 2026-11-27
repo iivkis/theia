@@ -387,7 +387,9 @@ async fn h2_head(target: &Target, roots: RootCertStore) -> Option<u16> {
 /// Separate H3 application witness over the existing strict QUIC verifier.
 /// A QUIC handshake alone cannot produce a successful observation.
 async fn h3_head(target: &Target, roots: RootCertStore) -> Option<u16> {
-    let tls = crate::transport_policy::Carrier::H3.client_tls(roots).ok()?;
+    let tls = crate::transport_policy::Carrier::H3
+        .client_tls(roots)
+        .ok()?;
     let name = ServerName::try_from(target.server_name.clone()).ok()?;
     let (_, session) = dial::connect(
         target.address,
@@ -405,10 +407,7 @@ async fn h3_head(target: &Target, roots: RootCertStore) -> Option<u16> {
     let (connection, _) = h3_adapter::NativeConnection::start(session).ok()?;
     let mut builder = h3::client::builder();
     builder.max_field_section_size(8192);
-    let (mut driver, mut sender) = builder
-        .build::<_, _, Bytes>(connection)
-        .await
-        .ok()?;
+    let (mut driver, mut sender) = builder.build::<_, _, Bytes>(connection).await.ok()?;
     let keep = sender.clone();
     let _driver = Driver(tokio::spawn(async move {
         let _keep = keep;

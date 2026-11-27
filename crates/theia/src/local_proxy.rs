@@ -1754,7 +1754,10 @@ impl CaptureLifecycle {
                 1 | 2 => 3,
                 _ => return,
             };
-            match self.0.compare_exchange_weak(state, next, Ordering::AcqRel, Ordering::Acquire) {
+            match self
+                .0
+                .compare_exchange_weak(state, next, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => return,
                 Err(observed) => state = observed,
             }
