@@ -187,7 +187,7 @@ require("#[ignore" not in live, "real liveness remains mandatory")
 contains((ROOT / "crates/theia/src/relay_liveness.rs").read_text(encoding="utf-8"),
          "async fn sustained_progress_beyond_300_seconds_in_either_direction()",
          "#[tokio::test(start_paused = true)]", "for _ in 0..32", "Duration::from_secs(320)",
-         "activity.run(progress, inactive", "activity.run(inactive, progress)")
+         "activity.run(progress, inactive", "activity.run(inactive, progress, \"idle\")")
 profile = tomllib.loads((ROOT / ".config/nextest.toml").read_text(encoding="utf-8"))["profile"]["default"]
 require(profile["default-filter"] == "all()" and profile["retries"] == 0
         and profile["fail-fast"] is False and profile["test-threads"] == 4,
