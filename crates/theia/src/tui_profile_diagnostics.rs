@@ -44,7 +44,7 @@ impl Panel {
         let path = self.path.clone();
         let digest = self.digest;
         let id = self.id.clone();
-        let thread = std::thread::Builder::new().name("profile-diagnostics".into()).spawn(move || {
+        let thread = std::thread::Builder::new().name("profile-diagnostics".into()).stack_size(8 * 1024 * 1024).spawn(move || {
             match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(runtime) => runtime.block_on(profile_diagnostics::run(path, digest, id, custom, tx, confirmed, cancelled)),
                 Err(_) => { let _ = tx.send(Event::Done(Err(crate::client::ClientError::Io))); }
@@ -196,7 +196,7 @@ impl Panel {
     fn cell(&self, domain: &str, check_kind: fn(&CheckKind) -> bool) -> String {
         self.checks.iter().rev().find(|c| c.domain.as_deref() == Some(domain) && check_kind(&c.kind))
             .map_or_else(|| "—".into(), |c| match c.outcome {
-                Outcome::Http(status, _, _) | Outcome::Udp(status, _) => format!("{status}"),
+                Outcome::Http(status, _, _) | Outcome::Udp(status, _, _) => format!("{status}"),
                 Outcome::Failure(_) => "Ошибка".into(),
                 Outcome::Skipped(_) => "Пропуск".into(),
                 _ => "—".into(),
@@ -212,17 +212,18 @@ impl Panel {
         if table_mode {
             let regions = Layout::vertical([Constraint::Length(8.min(parts[0].height.saturating_sub(4))), Constraint::Min(1)]).split(parts[0]);
             frame.render_widget(Paragraph::new(body).block(tui_widgets::section("Сетевая диагностика профиля", true)).wrap(Wrap { trim: false }), regions[0]);
-            let rows = self.domains.iter().skip(usize::from(self.scroll)).map(|domain| {
+            let rows = self.domains.iter().skip(usize::from(self.scroll).min(self.domains.len().saturating_sub(1))).map(|domain| {
                 Row::new(vec![domain.clone(),
                     self.cell(domain, |k| matches!(k, CheckKind::Https("штатный"))),
                     self.cell(domain, |k| matches!(k, CheckKind::Https("H2"))),
                     self.cell(domain, |k| matches!(k, CheckKind::Https("H3"))),
+                    self.cell(domain, |k| matches!(k, CheckKind::Udp("штатный"))),
                     self.cell(domain, |k| matches!(k, CheckKind::Udp("H2"))),
                     self.cell(domain, |k| matches!(k, CheckKind::Udp("H3"))),
                 ])
             });
-            frame.render_widget(Table::new(rows, [Constraint::Min(15), Constraint::Length(7), Constraint::Length(7), Constraint::Length(7), Constraint::Length(7), Constraint::Length(7)])
-                .header(Row::new(["Ресурс", "Авто", "H2", "H3", "UDP/H2", "UDP/H3"]).style(Style::default().fg(tui_widgets::MUTED)))
+            frame.render_widget(Table::new(rows, [Constraint::Min(12), Constraint::Length(6), Constraint::Length(6), Constraint::Length(6), Constraint::Length(7), Constraint::Length(7), Constraint::Length(7)])
+                .header(Row::new(["Ресурс", "Авто", "H2", "H3", "UDP авт", "UDP/H2", "UDP/H3"]).style(Style::default().fg(tui_widgets::MUTED)))
                 .block(tui_widgets::section("HTTP-коды · — не проверено", false)), regions[1]);
         } else {
             let lines = if self.details || matches!(self.phase, Phase::Running | Phase::Done) {

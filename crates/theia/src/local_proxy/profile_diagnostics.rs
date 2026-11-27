@@ -13,7 +13,7 @@ pub(crate) enum CheckKind {
 #[derive(Clone, Debug)]
 pub(crate) enum Outcome {
     Verified(u128), Failure(ClientError), Skipped(&'static str), Route(Action),
-    Tls(crate::net::error::ProbeVerdict, u128), Http(u16, ActualRoute, u128), Udp(u16, u128), Proxy(u8, bool, u8),
+    Tls(crate::net::error::ProbeVerdict, u128), Http(u16, ActualRoute, u128), Udp(u16, ActualRoute, u128), Proxy(u8, bool, u8),
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum FallbackCause { BeforeFirstSend, Disabled, NoLocalRoute }
@@ -74,7 +74,7 @@ impl Check {
                 crate::net::error::ProbeVerdict::Denied => "запрещено",
             }),
             Outcome::Http(status, route, ms) => format!("HTTP {status}, {route}, {ms} мс"),
-            Outcome::Udp(status, ms) => format!("QUIC v1 + HTTP/3 {status}, {ms} мс"),
+            Outcome::Udp(status, route, ms) => format!("QUIC v1 + HTTP/3 {status}, {route}, {ms} мс"),
             Outcome::Proxy(phase, ready, applied) => format!("фаза {phase}, listeners {}, настройки {}", if *ready { "готовы" } else { "не готовы" }, match applied { 1 => "подтверждены", 0 => "не применены", _ => "не подтверждены" }),
         };
         let prefix = match (&self.domain, anonymous) {
@@ -85,7 +85,7 @@ impl Check {
         format!("{prefix}{kind}: {outcome}")
     }
     pub(crate) fn failed(&self) -> bool {
-        matches!(self.outcome, Outcome::Failure(_) | Outcome::Http(400..=599, _, _) | Outcome::Udp(400..=599, _))
+        matches!(self.outcome, Outcome::Failure(_) | Outcome::Http(400..=599, _, _) | Outcome::Udp(400..=599, _, _))
             || matches!(&self.outcome, Outcome::Tls(status, _) if *status != crate::net::error::ProbeVerdict::Verified)
     }
 }
@@ -110,7 +110,7 @@ pub(crate) async fn run(
     path: PathBuf, digest: [u8; 32], id: String, custom: Option<Vec<String>>,
     tx: Sender<Event>, confirm: oneshot::Receiver<()>, mut cancel: watch::Receiver<bool>,
 ) {
-    let work = crate::traffic::PROFILE_DIAGNOSTIC.scope((), session(&path, digest, &id, custom, &tx, confirm));
+    let work = crate::traffic::PROFILE_DIAGNOSTIC.scope((), Box::pin(session(&path, digest, &id, custom, &tx, confirm)));
     let result = tokio::select! {
         result = timeout(Duration::from_secs(240), work) => result.unwrap_or(Err(ClientError::Timeout)),
         _ = cancel.changed() => Err(ClientError::Io),
@@ -162,7 +162,9 @@ async fn session(
         Carrier::Auto(_) => Err(ClientError::Configuration),
     }).collect::<Result<Vec<_>, _>>()?;
     let scopes: Vec<_> = remotes.iter().map(|addr| crate::network_scope::observe(*addr)).collect();
+    let accepted_digest = std::cell::Cell::new(None);
     let guard = async {
+        let mut next_refresh = Instant::now();
         loop {
             source(path, digest)?;
             if credential != <[u8; 32]>::from(Sha256::digest(super::read_token(profile)?.as_bytes()))
@@ -173,6 +175,11 @@ async fn session(
             if let (ProxyClient::Reality(c), Some(pinned)) = (&client, &generation) {
                 if !Arc::ptr_eq(&c.generation().await?, pinned) { return Err(ClientError::Tls); }
             }
+            if let Some(expected) = accepted_digest.get().filter(|_| Instant::now() >= next_refresh) {
+                let current = timeout(Duration::from_secs(15), client.refresh_routing_policy()).await.map_err(|_| ClientError::Timeout)??;
+                if current.digest() != expected { return Err(ClientError::Protocol); }
+                next_refresh = Instant::now() + Duration::from_secs(3);
+            }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
         #[allow(unreachable_code)]
@@ -182,7 +189,7 @@ async fn session(
     // Independent read-only carrier observations. Neither check authorizes a
     // target request or changes the production Auto fallback decision.
     let (h2_result, h3_result) = tokio::join!(
-        check_carrier(h2.as_ref(), cache.scope()), check_carrier(h3.as_ref(), cache.scope())
+        Box::pin(check_carrier(h2.as_ref(), cache.scope())), Box::pin(check_carrier(h3.as_ref(), cache.scope()))
     );
     let mut verified = Vec::new();
     let mut refused = false;
@@ -204,6 +211,7 @@ async fn session(
     let snapshot = timeout(Duration::from_secs(30), client.routing_policy()).await.map_err(|_| ClientError::Timeout)??;
     let expected = snapshot.digest();
     if verified.is_empty() || verified.iter().any(|(_, _, digest)| *digest != expected) { return Err(ClientError::Protocol); }
+    accepted_digest.set(Some(expected));
     emit(tx, format!("Сервер: авторизация и политика подтверждены, {} мс; ревизия {}", started.elapsed().as_millis(), snapshot.manifest().revision))?;
     let domains = match custom {
         Some(domains) => domains,
@@ -243,7 +251,7 @@ async fn session(
         };
         record(tx, Some(&domain), CheckKind::Policy, Outcome::Route(action))?;
         if action == Action::Blocked {
-            record(tx, Some(&domain), CheckKind::Https("авто"), Outcome::Skipped("запрещено политикой"))?;
+            record(tx, Some(&domain), CheckKind::Https("штатный"), Outcome::Skipped("запрещено политикой"))?;
             tx.send(Event::DomainDone(domain)).map_err(|_| ClientError::Io)?;
             continue;
         }
@@ -256,7 +264,7 @@ async fn session(
                 Err(e) => { record(tx, Some(&domain), CheckKind::Strategy("TCP Anti-DPI".into()), Outcome::Failure(e))?; if protective(e) { return Err(e); } continue; }
             }
         } else { record(tx, Some(&domain), CheckKind::Strategy("TCP Anti-DPI".into()), Outcome::Skipped("не назначен правилами"))?; }
-        let result = https(&carrier, cache, &domain, expected, true, action, tls.clone()).await;
+        let result = Box::pin(https(&carrier, cache, &domain, expected, true, action, tls.clone())).await;
         match result {
             Ok((code, route, ms)) => {
                 record(tx, Some(&domain), CheckKind::Https("штатный"), Outcome::Http(code, route, ms))?;
@@ -279,14 +287,24 @@ async fn session(
             proxy_checked = true;
         }
         if action != Action::Direct {
+        if action == Action::DirectDpi {
+            pin.check()?;
+            match Box::pin(udp_https(&carrier, cache, &domain, expected, true, action, quic_tls.clone())).await {
+                Ok((status, route, ms)) => record(tx, Some(&domain), CheckKind::Udp("штатный"), Outcome::Udp(status, route, ms))?,
+                Err(error) => {
+                    record(tx, Some(&domain), CheckKind::Udp("штатный"), Outcome::Failure(error))?;
+                    if protective(error) { return Err(error); }
+                }
+            }
+        }
         for (label, transport, _) in &verified {
-            match https(transport, cache, &domain, expected, false, action, tls.clone()).await {
+            match Box::pin(https(transport, cache, &domain, expected, false, action, tls.clone())).await {
                 Ok((code, route, ms)) => record(tx, Some(&domain), CheckKind::Https(label), Outcome::Http(code, route, ms))?,
                 Err(e) => { record(tx, Some(&domain), CheckKind::Https(label), Outcome::Failure(e))?; if protective(e) { return Err(e); } }
             }
             pin.check()?;
-            match udp_https(transport, cache, &domain, expected, quic_tls.clone()).await {
-                Ok((status, ms)) => record(tx, Some(&domain), CheckKind::Udp(label), Outcome::Udp(status, ms))?,
+            match Box::pin(udp_https(transport, cache, &domain, expected, false, action, quic_tls.clone())).await {
+                Ok((status, route, ms)) => record(tx, Some(&domain), CheckKind::Udp(label), Outcome::Udp(status, route, ms))?,
                 Err(error) => {
                     record(tx, Some(&domain), CheckKind::Udp(label), Outcome::Failure(error))?;
                     if protective(error) { return Err(error); }
@@ -305,7 +323,7 @@ async fn session(
 
 fn protective(error: ClientError) -> bool {
     matches!(error, ClientError::Configuration | ClientError::Tls | ClientError::Unauthorized |
-        ClientError::Protocol | ClientError::Open(_) | ClientError::Rejected(400..=499))
+        ClientError::Protocol | ClientError::Open(crate::protocol::ErrorCode::PolicyDenied | crate::protocol::ErrorCode::AddressInvalid | crate::protocol::ErrorCode::UnsupportedVersion | crate::protocol::ErrorCode::ProtocolError | crate::protocol::ErrorCode::Truncated | crate::protocol::ErrorCode::General) | ClientError::Rejected(400..=499))
 }
 
 fn ca_digest(profile: &config::Profile) -> Result<Option<[u8; 32]>, ClientError> {
@@ -330,6 +348,7 @@ async fn check_carrier(transport: Option<&Carrier>, scope: &str) -> Option<Resul
 async fn https(carrier: &Carrier, cache: &super::Cache, name: &str, digest: [u8; 32], allow_dpi: bool, action: Action, tls: Arc<rustls::ClientConfig>) -> Result<(u16, ActualRoute, u128), ClientError> {
     let started = Instant::now();
     timeout(Duration::from_secs(12), async {
+        let authorization = cache.policy.pin(digest)?;
         let mut routed = egress::diagnostic_open(carrier, cache, name, digest, allow_dpi).await?;
         let direct = matches!(&routed.tunnel, ProxyTunnel::Direct(_));
         let observed = Arc::new(AtomicU8::new(routed.open_code()));
@@ -351,7 +370,7 @@ async fn https(carrier: &Carrier, cache: &super::Cache, name: &str, digest: [u8;
             result = &mut app => result?,
             result = &mut relay => { result?; app.await? }
         };
-        cache.policy.pin(digest)?.check()?;
+        authorization.check()?;
         let code = observed.load(Ordering::Relaxed);
         let fallback = if allow_dpi && action == Action::DirectDpi {
             Some(if strategy.is_some() { FallbackCause::BeforeFirstSend } else if !cache.dpi.enabled() { FallbackCause::Disabled } else { FallbackCause::NoLocalRoute })
@@ -456,39 +475,68 @@ async fn proxy_https(instance: &crate::management::ProxyLifecycle, digest: [u8; 
     Ok((status, started.elapsed().as_millis()))
 }
 
-async fn udp_https(carrier: &Carrier, cache: &super::Cache, name: &str, digest: [u8; 32], tls: Arc<rustls::ClientConfig>) -> Result<(u16, u128), ClientError> {
+async fn udp_https(carrier: &Carrier, cache: &super::Cache, name: &str, digest: [u8; 32], automatic: bool, action: Action, tls: Arc<rustls::ClientConfig>) -> Result<(u16, ActualRoute, u128), ClientError> {
     use crate::quic_core::{dial, h3_adapter, handshake_udp, wire::Version};
     let started = Instant::now();
     timeout(Duration::from_secs(15), async {
         let observed = Arc::new(AtomicU8::new(0));
-        let routed = egress::diagnostic_udp(carrier, cache, name, digest, &observed).await?;
-        routed.record_transport(&observed);
-        if !matches!(observed.load(Ordering::Relaxed) >> 2, 2 | 3) { return Err(ClientError::Protocol); }
-        let super::RoutedUdp { tunnel, flow } = routed;
+        let authorization = cache.policy.pin(digest)?;
+        let local_selected = std::cell::Cell::new(false);
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.map_err(|_| ClientError::Io)?;
         let bridge = tokio::net::UdpSocket::bind("127.0.0.1:0").await.map_err(|_| ClientError::Io)?;
         let peer = bridge.local_addr().map_err(|_| ClientError::Io)?;
         bridge.connect(client.local_addr().map_err(|_| ClientError::Io)?).await.map_err(|_| ClientError::Io)?;
         client.connect(peer).await.map_err(|_| ClientError::Io)?;
-        let (upload, upload_rx) = tokio::sync::mpsc::channel(8);
-        let (download, mut download_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
-        let relay = tunnel.relay_guarded(upload_rx, download, Some(&flow));
-        let forward = async {
+        let relay_path = async {
+            use crate::routing::dpi::udp::{Candidate, Observer};
             let mut buf = vec![0; 65535];
-            loop {
-                tokio::select! {
-                    result = bridge.recv(&mut buf) => {
-                        let count = result.map_err(|_| ClientError::Io)?;
-                        upload.send(buf[..count].to_vec()).await.map_err(|_| ClientError::Io)?;
-                    }
-                    packet = download_rx.recv() => {
-                        let packet = packet.ok_or(ClientError::Io)?;
-                        if bridge.send(&packet).await.map_err(|_| ClientError::Io)? != packet.len() { return Err(ClientError::Io); }
+            let count = bridge.recv(&mut buf).await.map_err(|_| ClientError::Io)?;
+            let first = buf[..count].to_vec();
+            let mut observer = Observer::default();
+            let mut candidate = if automatic { observer.outgoing(&first) } else { Candidate::Other };
+            let mut pending = vec![first];
+            let mut total = count;
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(30);
+            while candidate == Candidate::Pending && pending.len() < 8 && total < 65536 {
+                let Ok(result) = tokio::time::timeout_at(deadline, bridge.recv(&mut buf)).await else { break; };
+                let n = result.map_err(|_| ClientError::Io)?;
+                total = total.saturating_add(n);
+                if total > 65536 { return Err(ClientError::Protocol); }
+                candidate = observer.outgoing(&buf[..n]);
+                pending.push(buf[..n].to_vec());
+            }
+            authorization.check()?;
+            let routed = egress::diagnostic_udp(carrier, cache, name, digest, &observed, &candidate, &pending[0]).await?;
+            routed.record_transport(&observed);
+            local_selected.set(matches!(&routed.tunnel, crate::udp_relay::Tunnel::VerifiedLocal(..)));
+            if !local_selected.get() && !matches!(observed.load(Ordering::Relaxed) >> 2, 2 | 3) { return Err(ClientError::Protocol); }
+            let super::RoutedUdp { tunnel, flow } = routed;
+            let (upload, upload_rx) = tokio::sync::mpsc::channel(8);
+            let (download, mut download_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+            let relay = tunnel.relay_guarded(upload_rx, download, Some(&flow));
+            let forward = async {
+                for packet in pending { upload.send(packet).await.map_err(|_| ClientError::Io)?; }
+                loop {
+                    tokio::select! {
+                        result = bridge.recv(&mut buf) => {
+                            let count = result.map_err(|_| ClientError::Io)?;
+                            upload.send(buf[..count].to_vec()).await.map_err(|_| ClientError::Io)?;
+                        }
+                        packet = download_rx.recv() => {
+                            let packet = packet.ok_or(ClientError::Io)?;
+                            if bridge.send(&packet).await.map_err(|_| ClientError::Io)? != packet.len() { return Err(ClientError::Io); }
+                        }
                     }
                 }
+                #[allow(unreachable_code)]
+                Ok::<(), ClientError>(())
+            };
+            tokio::select! {
+                biased;
+                result = flow.wait_revoked() => result,
+                result = relay => result,
+                result = forward => result,
             }
-            #[allow(unreachable_code)]
-            Ok::<(), ClientError>(())
         };
         let app = async {
             let server_name = rustls::pki_types::ServerName::try_from(name.to_owned()).map_err(|_| ClientError::Configuration)?;
@@ -521,13 +569,21 @@ async fn udp_https(carrier: &Carrier, cache: &super::Cache, name: &str, digest: 
         };
         let status = tokio::select! {
             biased;
-            result = flow.wait_revoked() => { result?; return Err(ClientError::Protocol); }
-            result = relay => { result?; return Err(ClientError::Io); }
-            result = forward => { result?; return Err(ClientError::Io); }
+            result = relay_path => { result?; return Err(ClientError::Io); }
             result = app => result?,
         };
-        flow.check_pending()?;
-        Ok((status, started.elapsed().as_millis()))
+        authorization.check()?;
+        let code = observed.load(Ordering::Relaxed);
+        let fallback = if automatic && action == Action::DirectDpi {
+            Some(if local_selected.get() { FallbackCause::BeforeFirstSend } else if !cache.dpi.enabled() { FallbackCause::Disabled } else { FallbackCause::NoLocalRoute })
+        } else { None };
+        let route = match code >> 2 {
+            2 => ActualRoute::Xhttp { carrier: "H2", mode: xhttp_observation(code & 3), fallback },
+            3 => ActualRoute::Xhttp { carrier: "H3", mode: xhttp_observation(code & 3), fallback },
+            _ if local_selected.get() => ActualRoute::AntiDpi("QUIC v1"),
+            _ => return Err(ClientError::Protocol),
+        };
+        Ok((status, route, started.elapsed().as_millis()))
     }).await.map_err(|_| ClientError::Timeout)?
 }
 

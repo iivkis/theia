@@ -475,15 +475,16 @@ pub(super) async fn diagnostic_open(
     }
 }
 
-/// Control path for an explicitly consented UDP application probe. No local
-/// modification is requested; the production router must permit server egress.
+/// Explicitly consented UDP application probe. A control passes Other;
+/// an automatic test passes the observed production candidate and first datagram.
 pub(super) async fn diagnostic_udp(
     carrier: &Carrier, cache: &Cache, name: &str, digest: [u8; 32],
     observed: &Arc<std::sync::atomic::AtomicU8>,
+    candidate: &crate::routing::dpi::udp::Candidate,
+    first: &[u8],
 ) -> Result<RoutedUdp, ClientError> {
-    let candidate = crate::routing::dpi::udp::Candidate::Other;
     let (egress, flow) = route_egress(carrier, cache, Address::Dns(name.to_owned()), 443,
-        EgressRequest::Udp { candidate: &candidate, first: &[], observed }, Some(digest)).await?;
+        EgressRequest::Udp { candidate, first, observed }, Some(digest)).await?;
     match egress {
         RoutedEgress::Udp(tunnel) => Ok(RoutedUdp { tunnel, flow }),
         _ => Err(ClientError::Protocol),
