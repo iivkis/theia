@@ -3,6 +3,8 @@ schema_version = 1
 
 [client]
 active_profile = "home"
+# Saved choice only; changes OS settings only after explicit Connect.
+ingress_mode = "system_proxy"
 
 [[client.profiles]]
 path_prefix = "/v1/theia-example"
@@ -19,17 +21,16 @@ transport = "auto"
 quic_connect_timeout_ms = 1600
 quic_negative_cache_ttl_s = 900
 
-[client.proxy]
-http_listen = "127.0.0.1:7890"
-socks5_listen = "127.0.0.1:7891"
-# Only off/manual are allowed. Manual needs a separate user-confirmed TUI action.
-system_proxy = "off"
 # Explicit local consent: selected direct_dpi rules may expose your device IP
 # to the destination and perform a separate authenticated TLS probe. Off by default.
 # direct_dpi = true
 # Separate opt-in for credential-free STUN Binding on pinned public domain:3478.
 # The STUN server sees your device IP; reachability is not authentication.
 # direct_dpi_stun = true
+
+[client.proxy]
+http_listen = "127.0.0.1:7890"
+socks5_listen = "127.0.0.1:7891"
 
 [management]
 ipc = "auto"

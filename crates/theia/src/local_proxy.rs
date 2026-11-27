@@ -2072,7 +2072,8 @@ impl ClientRuntime {
             return Err(ClientError::Configuration);
         };
         // Structural loopback and OS proxy changes require explicit stop/start.
-        if candidate.client.proxy != previous.document.client.proxy
+        if candidate.client.ingress_mode != previous.document.client.ingress_mode
+            || candidate.client.proxy != previous.document.client.proxy
             || candidate.management != previous.document.management
         {
             return Err(ClientError::Configuration);
@@ -2118,11 +2119,11 @@ impl ClientRuntime {
         client
             .routing_cache()
             .dpi
-            .set_enabled(candidate.client.proxy.direct_dpi.unwrap_or(false));
+            .set_enabled(next.direct_dpi.unwrap_or(false));
         client
             .routing_cache()
             .dpi
-            .set_stun_enabled(candidate.client.proxy.direct_dpi_stun.unwrap_or(false));
+            .set_stun_enabled(next.direct_dpi_stun.unwrap_or(false));
         Box::pin(client.routing_policy()).await?;
         saved_client_bytes(&self.path, digest)?;
         Ok((candidate, client))
@@ -2197,10 +2198,6 @@ async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result
     if enable_system_proxy {
         #[cfg(not(windows))]
         return Err(ClientError::SystemProxy);
-        #[cfg(windows)]
-        if document.client.proxy.system_proxy != config::SystemProxy::Manual {
-            return Err(ClientError::SystemProxy);
-        }
     }
     let (http, socks, client) = Box::pin(prepare_proxy(&document, config_path)).await?;
     #[cfg(windows)]
@@ -4767,11 +4764,11 @@ async fn prepare_client(
     client
         .routing_cache()
         .dpi
-        .set_enabled(document.client.proxy.direct_dpi.unwrap_or(false));
+        .set_enabled(profile.direct_dpi.unwrap_or(false));
     client
         .routing_cache()
         .dpi
-        .set_stun_enabled(document.client.proxy.direct_dpi_stun.unwrap_or(false));
+        .set_stun_enabled(profile.direct_dpi_stun.unwrap_or(false));
     client.routing_policy().await?;
     crate::diag!(Info, "client.proxy", "transport_preflight_passed");
     Ok(client)
@@ -4784,8 +4781,6 @@ pub(crate) struct PreparedLocalProxy {
     http: TcpListener,
     socks: TcpListener,
     client: ProxyClient,
-    #[cfg(windows)]
-    pub(crate) manual: bool,
 }
 
 impl PreparedLocalProxy {
@@ -4803,7 +4798,6 @@ impl PreparedLocalProxy {
             http,
             socks,
             client,
-            manual: document.client.proxy.system_proxy == config::SystemProxy::Manual,
         })
     }
 
@@ -4831,8 +4825,6 @@ impl PreparedLocalProxy {
             http,
             socks,
             client,
-            #[cfg(windows)]
-            manual: document.client.proxy.system_proxy == config::SystemProxy::Manual,
         })
     }
 

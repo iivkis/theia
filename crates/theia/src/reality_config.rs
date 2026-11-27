@@ -226,6 +226,8 @@ fn approved_client_profile(
         transport: policy.transport,
         quic_connect_timeout_ms: 1600,
         quic_negative_cache_ttl_s: 900,
+        direct_dpi: None,
+        direct_dpi_stun: None,
     };
     Ok((entry, value))
 }
@@ -243,13 +245,11 @@ pub(crate) fn first_client_candidate(r: &ClientRequest, now: u64) -> Result<Conf
         },
         client: config::ClientSettings {
             active_profile: r.id.clone(),
+            ingress_mode: config::IngressMode::SystemProxy,
             profiles: vec![profile],
             proxy: config::LocalProxy {
                 http_listen: "127.0.0.1:7890".into(),
                 socks5_listen: "127.0.0.1:7891".into(),
-                system_proxy: config::SystemProxy::Off,
-                direct_dpi: None,
-                direct_dpi_stun: None,
             },
         },
     });
@@ -611,7 +611,10 @@ pub(crate) fn save_credential_refresh(
 /// Runtime Apply may accept a replacement enrollment only if every
 /// trust-bearing field stays equal and the selected credential changes.
 pub(crate) fn credential_only_change(old: &Profile, new: &Profile) -> bool {
-    if old.auth_token == new.auth_token {
+    if old.auth_token == new.auth_token
+        || old.direct_dpi != new.direct_dpi
+        || old.direct_dpi_stun != new.direct_dpi_stun
+    {
         return false;
     }
     match (pinned_client(old), pinned_client(new)) {

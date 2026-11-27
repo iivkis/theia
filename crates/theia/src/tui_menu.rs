@@ -1764,6 +1764,7 @@ impl FirstSetup {
                 ui,
                 client: config::ClientSettings {
                     active_profile: f(0),
+                    ingress_mode: config::IngressMode::SystemProxy,
                     profiles: vec![config::Profile {
                         id: f(0),
                         path_prefix: Some(f(5)),
@@ -1777,13 +1778,12 @@ impl FirstSetup {
                         transport: config::Transport::Auto,
                         quic_connect_timeout_ms: 1600,
                         quic_negative_cache_ttl_s: 900,
+                        direct_dpi: None,
+                        direct_dpi_stun: None,
                     }],
                     proxy: config::LocalProxy {
                         http_listen: "127.0.0.1:7890".into(),
                         socks5_listen: "127.0.0.1:7891".into(),
-                        system_proxy: config::SystemProxy::Off,
-                        direct_dpi: None,
-                        direct_dpi_stun: None,
                     },
                 },
             }),

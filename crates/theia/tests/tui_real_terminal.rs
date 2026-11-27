@@ -758,7 +758,6 @@ async fn compiled_client_proxy_conpty_lifecycle() {
     let socks_port = second.local_addr().unwrap().port();
     client.client.proxy.http_listen = format!("127.0.0.1:{http_port}");
     client.client.proxy.socks5_listen = format!("127.0.0.1:{socks_port}");
-    client.client.proxy.system_proxy = theia::config::SystemProxy::Manual;
     fs::write(&client_file, Config::Client(client).to_toml().unwrap()).unwrap();
     drop(first);
     drop(second);

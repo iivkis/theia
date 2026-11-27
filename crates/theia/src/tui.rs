@@ -568,9 +568,6 @@ fn page_actions_for(
                 _ => true,
             };
             let label = match (role, key) {
-                (Role::Client, 'p') if !editor.system_proxy_allowed() => {
-                    "Настроить и включить системный прокси"
-                }
                 (Role::Client, 'd') if editor.direct_dpi_allowed() => "Отключить Anti-DPI",
                 (Role::Client, 'd') => "Разрешить Anti-DPI",
                 (Role::Client, 'u') if editor.direct_dpi_stun_allowed() => {
@@ -1167,7 +1164,6 @@ struct Interaction {
     workspace_action: usize,
     workspace_user: usize,
     workspace_advanced: bool,
-    proxy_permission_pending: bool,
     value_preview: bool,
     preview_text: Option<String>,
     modal_action: usize,
@@ -1219,7 +1215,6 @@ impl Interaction {
             workspace_action: 0,
             workspace_user: 0,
             workspace_advanced: false,
-            proxy_permission_pending: false,
             value_preview: false,
             preview_text: None,
             modal_action: 0,
@@ -1452,23 +1447,6 @@ impl Interaction {
             Ok((editor, saved)) => {
                 self.saving = None;
                 self.editor = Some(editor);
-                if std::mem::take(&mut self.proxy_permission_pending) {
-                    #[cfg(windows)]
-                    if saved {
-                        if let Some(editor) = self.editor.as_mut() {
-                            match crate::tui_system_proxy::Panel::open(
-                                editor.saved_path().to_owned(),
-                                editor.saved_sha256(),
-                            ) {
-                                Ok(panel) => {
-                                    self.system_proxy = Some(panel);
-                                    self.modal_action = 0;
-                                }
-                                Err(message) => editor.error = Some(message.into()),
-                            }
-                        }
-                    }
-                }
                 if matches!(self.issuance, Some(IssueFlow::Saving)) {
                     self.modal_action = 0;
                     self.issuance = Some(if saved {
@@ -3627,14 +3605,11 @@ impl Interaction {
                         match editor.stage_record(*review) {
                             Ok(()) => self.start_save(),
                             Err(message) => {
-                                self.proxy_permission_pending = false;
                                 editor.error = Some(message.into());
                             }
                         }
                     }
-                    KeyCode::Esc | KeyCode::Char('n') => {
-                        self.proxy_permission_pending = false;
-                    }
+                    KeyCode::Esc | KeyCode::Char('n') => {}
                     _ => self.records = Some(RecordFlow::Confirm(review)),
                 },
                 RecordFlow::Input {
@@ -4548,27 +4523,16 @@ impl Interaction {
                 } else {
                     #[cfg(windows)]
                     {
-                        if !editor.system_proxy_allowed() {
-                            match editor.review_system_proxy_permission() {
-                                Ok(review) => {
-                                    self.proxy_permission_pending = true;
-                                    self.records = Some(RecordFlow::Confirm(Box::new(review)));
-                                    editor.error = None;
-                                }
-                                Err(message) => editor.error = Some(message.into()),
+                        match crate::tui_system_proxy::Panel::open(
+                            editor.saved_path().to_owned(),
+                            editor.saved_sha256(),
+                        ) {
+                            Ok(panel) => {
+                                self.system_proxy = Some(panel);
+                                self.modal_action = 0;
+                                editor.error = None;
                             }
-                        } else {
-                            match crate::tui_system_proxy::Panel::open(
-                                editor.saved_path().to_owned(),
-                                editor.saved_sha256(),
-                            ) {
-                                Ok(panel) => {
-                                    self.system_proxy = Some(panel);
-                                    self.modal_action = 0;
-                                    editor.error = None;
-                                }
-                                Err(message) => editor.error = Some(message.into()),
-                            }
+                            Err(message) => editor.error = Some(message.into()),
                         }
                     }
                     #[cfg(not(windows))]
@@ -6825,17 +6789,14 @@ fn client_mode_lines(editor: &Editor, running: bool) -> Vec<Line<'static>> {
         }),
         Line::raw(""),
         Line::styled(
-            "Системный перехват TCP/UDP",
-            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+            "Системный прокси",
+            Style::default().fg(if cfg!(windows) { TEXT } else { MUTED }).add_modifier(Modifier::BOLD),
         ),
-        Line::styled(
-            if cfg!(windows) {
-                "Системное подключение недоступно: не подтверждены атрибуция пакетов, исключения carrier и аварийное восстановление. Прокси не защищают весь трафик."
-            } else {
-                "Основной Packet Interception Engine пока не активируется. Прокси ниже — режимы совместимости."
-            },
-            Style::default().fg(MUTED),
-        ),
+        Line::raw(if cfg!(windows) {
+            "Основной режим MVP. Для приложений, использующих прокси Windows. Подключение требует подтверждения."
+        } else {
+            "Основной режим MVP; Linux backend пока недоступен. Возможен локальный диагностический прокси."
+        }),
         Line::raw(""),
         Line::styled(
             "Локальный прокси",
@@ -6843,25 +6804,14 @@ fn client_mode_lines(editor: &Editor, running: bool) -> Vec<Line<'static>> {
         ),
         Line::raw(format!("HTTP {http} · SOCKS5 {socks}")),
         Line::styled(
-            "Укажите адрес в приложении после запуска. Остальной трафик не защищается этим режимом.",
+            "Ручной режим диагностики. Остальной трафик не защищается.",
             Style::default().fg(MUTED),
         ),
         Line::raw(""),
         Line::styled(
-            "Системный прокси",
-            Style::default()
-                .fg(if cfg!(windows) { TEXT } else { MUTED })
-                .add_modifier(Modifier::BOLD),
+            "TUN / WinDivert / NFQUEUE — в будущем",
+            Style::default().fg(MUTED),
         ),
-        Line::raw(if cfg!(windows) {
-            if editor.system_proxy_allowed() {
-                "Для программ, использующих настройки прокси Windows. Не VPN."
-            } else {
-                "Для программ с системным прокси Windows. Сначала потребуется разрешение."
-            }
-        } else {
-            "На Linux пока недоступен. Настройте прокси в нужных приложениях."
-        }),
     ];
     if !editor.selected_record_is_active() {
         lines.insert(
@@ -7223,7 +7173,7 @@ fn draw_page(
                 } else {
                     ui.and_then(|u| u.routing_observation.as_ref()).filter(|o| o.digest == editor.saved_sha256()).map_or_else(|| "Проверяем состояние клиента…".into(), RoutingObservation::body)
                 };
-                format!("Anti-DPI в сохранённом файле: {}\n{observation}", if editor.direct_dpi_stun_allowed() { "разрешён; TLS/QUIC v1 и STUN Binding (экспериментально)" } else if editor.direct_dpi_allowed() { "разрешён; TLS/QUIC v1, STUN выключен" } else { "выключен (резерв VPS)" })
+                format!("Anti-DPI выбранного профиля: {}\n{observation}", if editor.direct_dpi_stun_allowed() { "разрешён; TLS/QUIC v1 и STUN Binding (экспериментально)" } else if editor.direct_dpi_allowed() { "разрешён; TLS/QUIC v1, STUN выключен" } else { "выключен (резерв VPS)" })
             }
             (Role::Server,7) => editor.routing_settings().map_or_else(|| "Правил нет. По умолчанию весь трафик Theia идёт через сервер.".into(), |s| format!("Ревизия: {} · правил: {}\nGeoData: {}\nСохраните TOML, затем примените через Управление.", s.revision, s.rules.len(), s.datasets.as_ref().map_or("не выбраны", |m| m.release.as_str()))),
             (_,5) => format!("Файл: {}\n{}\nСохранение не меняет работающий процесс.", editor.saved_path().display(), editor.settings_summary()),
@@ -8479,7 +8429,7 @@ mod tests {
         let screen = rendered_interaction(120, 40, &model, &ui);
         for label in [
             "Системный прокси",
-            "Системный перехват TCP/UDP",
+            "TUN / WinDivert / NFQUEUE",
             "Локальный прокси",
             "Активный профиль",
             "127.0.0.1",
@@ -8493,22 +8443,13 @@ mod tests {
         let keys = page_actions(Role::Client, 3, ui.editor.as_ref());
         assert_eq!(keys.iter().any(|a| a.key == 'p'), cfg!(windows));
         #[cfg(windows)]
-        assert_eq!(keys[0].label, "Настроить и включить системный прокси");
+        assert_eq!(keys[0].label, "Включить / выключить системный прокси");
         ui.update(&mut model, press(KeyCode::Down));
         assert!(!ui.owned_running(Role::Client));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-        // The saved permission is separate from all operating-system effects.
-        let editor = ui.editor.as_mut().unwrap();
-        assert!(!editor.system_proxy_allowed());
-        let review = editor.review_system_proxy_permission().unwrap();
-        assert!(review
-            .body()
-            .contains("Прокси Windows и соединение не изменятся"));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-        editor.stage_record(review).unwrap();
-        assert!(!editor.system_proxy_allowed());
-        assert!(editor.save());
-        assert!(editor.system_proxy_allowed());
+        // Saved ingress selection is not an OS mutation or activation.
+        let Config::Client(doc) = config::read_file(&path).unwrap() else { panic!("client") };
+        assert_eq!(doc.client.ingress_mode, config::IngressMode::SystemProxy);
         assert!(!ui.owned_running(Role::Client));
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -10093,7 +10034,9 @@ mod tests {
         };
         assert_eq!(doc.client.profiles.len(), 1);
         assert_eq!(doc.client.active_profile, doc.client.profiles[0].id);
-        assert_eq!(doc.client.proxy.system_proxy, config::SystemProxy::Off);
+        assert_eq!(doc.client.ingress_mode, config::IngressMode::SystemProxy);
+        assert_ne!(doc.client.profiles[0].direct_dpi, Some(true));
+        assert_ne!(doc.client.profiles[0].direct_dpi_stun, Some(true));
         assert!(doc.client.profiles[0].auth_token.starts_with("file:"));
         assert_eq!(doc.client.profiles[0].tls_ca, invite.trust_reference());
         let bytes = std::fs::read(&path).unwrap();

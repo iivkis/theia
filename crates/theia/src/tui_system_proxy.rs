@@ -40,7 +40,6 @@ enum Pending {
 
 struct Local {
     address: SocketAddr,
-    manual: bool,
     task: JoinHandle<Result<(), ClientError>>,
     reality: Option<std::sync::Arc<crate::local_proxy::RealityClient>>,
 }
@@ -154,12 +153,6 @@ impl Worker {
                 else {
                     return Err("Требуется клиентский профиль.".into());
                 };
-                if document.client.proxy.system_proxy != crate::config::SystemProxy::Manual {
-                    return Err(
-                        "Сначала разрешите управление системным прокси в настройках клиента."
-                            .into(),
-                    );
-                }
                 let address: SocketAddr = document
                     .client
                     .proxy
@@ -167,7 +160,7 @@ impl Worker {
                     .parse()
                     .map_err(|_| "Некорректный адрес локального HTTP-прокси.")?;
                 if self.local.as_ref().is_some_and(|local| {
-                    !local.manual || local.task.is_finished() || local.address != address
+                    local.task.is_finished() || local.address != address
                 }) {
                     return Err("Остановите старое локальное подключение и повторите.".into());
                 }
@@ -182,8 +175,8 @@ impl Worker {
                 let local = self
                     .local
                     .as_ref()
-                    .filter(|local| local.manual && !local.task.is_finished())
-                    .ok_or("Сначала запустите локальный клиент с system_proxy=manual.")?;
+                    .filter(|local| !local.task.is_finished())
+                    .ok_or("Сначала запустите локальный клиент.")?;
                 self.unchanged()?;
                 let review =
                     native::review_apply(local.address).map_err(|error| error.to_string())?;
@@ -219,12 +212,10 @@ impl Worker {
             .map_err(|error| error.to_string())?;
         let address = prepared.http_address().map_err(|error| error.to_string())?;
         self.unchanged()?;
-        let manual = prepared.manual;
         let reality = prepared.reality_monitor();
         let task = tokio::spawn(prepared.serve());
         self.local = Some(Local {
             address,
-            manual,
             task,
             reality,
         });
@@ -241,7 +232,7 @@ impl Worker {
             self.local
                 .as_ref()
                 .filter(|local| {
-                    local.manual && !local.task.is_finished() && local.address == address
+                    !local.task.is_finished() && local.address == address
                 })
                 .ok_or("Локальный клиент не готов.")?;
             OwnedProxy::apply_reviewed(address, review).map_err(|error| error.to_string())
@@ -279,7 +270,7 @@ impl Worker {
                 let local = self
                     .local
                     .as_ref()
-                    .filter(|local| local.manual && !local.task.is_finished())
+                    .filter(|local| !local.task.is_finished())
                     .ok_or("Локальный клиент не готов.")?;
                 self.unchanged()?;
                 let lease = OwnedProxy::apply_reviewed(local.address, review)
@@ -765,7 +756,6 @@ pub(crate) mod tests {
         let socks = second.local_addr().unwrap();
         doc.client.proxy.http_listen = http.to_string();
         doc.client.proxy.socks5_listen = socks.to_string();
-        doc.client.proxy.system_proxy = config::SystemProxy::Manual;
         let source = Config::Client(doc.clone()).to_toml().unwrap();
         fs::write(&path, &source).unwrap();
         let digest = Sha256::digest(source.as_bytes()).into();
@@ -845,15 +835,16 @@ pub(crate) mod tests {
         drop(panel);
         assert_original();
 
-        // Off permits a local client but must never grant WinINet consent.
-        doc.client.proxy.system_proxy = config::SystemProxy::Off;
-        let off = Config::Client(doc).to_toml().unwrap();
-        fs::write(&path, &off).unwrap();
-        let mut panel = Panel::open(path, Sha256::digest(off.as_bytes()).into()).unwrap();
+        // A saved System Proxy mode and local diagnostic listener are not
+        // permission to modify WinINet; review must still be confirmed.
+        let saved = Config::Client(doc).to_toml().unwrap();
+        fs::write(&path, &saved).unwrap();
+        let mut panel = Panel::open(path, Sha256::digest(saved.as_bytes()).into()).unwrap();
         wait(&mut panel);
         action(&mut panel, 's');
         assert!(panel.view.running);
-        panel.key(key('e'));
+        review(&mut panel, 'e');
+        panel.key(key('n'));
         wait(&mut panel);
         assert!(panel.phase == Phase::Idle);
         assert!(!panel.view.owned);

@@ -342,13 +342,11 @@ impl Editor {
             },
             client: config::ClientSettings {
                 active_profile: profile.id.clone(),
+                ingress_mode: config::IngressMode::SystemProxy,
                 profiles: vec![profile],
                 proxy: config::LocalProxy {
                     http_listen: "127.0.0.1:7890".into(),
                     socks5_listen: "127.0.0.1:7891".into(),
-                    system_proxy: config::SystemProxy::Off,
-                    direct_dpi: None,
-                    direct_dpi_stun: None,
                 },
             },
         });
@@ -1167,6 +1165,8 @@ impl Editor {
                     transport: Transport::Auto,
                     quic_connect_timeout_ms: 1600,
                     quic_negative_cache_ttl_s: 900,
+                    direct_dpi: None,
+                    direct_dpi_stun: None,
                 });
                 next_selection = doc.client.profiles.len() - 1;
                 format!(
@@ -1338,13 +1338,19 @@ impl Editor {
             .map(|inbound| inbound.server_name.as_str())
     }
 
-    /// Saved local consent is not an observation of a working DPI route.
+    /// Saved local consent belongs to the selected profile, not the backend.
+    /// A draft or another profile never grants consent to this one.
+    fn saved_selected_profile(&self) -> Option<&config::Profile> {
+        let Config::Client(doc) = &self.original else { return None };
+        doc.client.profiles.iter().find(|p| p.id == self.selected_record_id())
+    }
+
     pub(crate) fn direct_dpi_allowed(&self) -> bool {
-        matches!(&self.original, Config::Client(doc) if doc.client.proxy.direct_dpi == Some(true))
+        self.saved_selected_profile().is_some_and(|p| p.direct_dpi == Some(true))
     }
 
     pub(crate) fn direct_dpi_stun_allowed(&self) -> bool {
-        matches!(&self.original, Config::Client(doc) if doc.client.proxy.direct_dpi == Some(true) && doc.client.proxy.direct_dpi_stun == Some(true))
+        self.saved_selected_profile().is_some_and(|p| p.direct_dpi == Some(true) && p.direct_dpi_stun == Some(true))
     }
 
     pub(crate) fn review_direct_dpi_permission(&self) -> Result<RecordReview, &'static str> {
@@ -1357,9 +1363,12 @@ impl Editor {
         let Config::Client(doc) = &mut candidate else {
             return Err("Требуется клиентская конфигурация.");
         };
-        doc.client.proxy.direct_dpi = Some(enable);
+        let profile = doc.client.profiles.iter_mut()
+            .find(|p| p.id == self.selected_record_id())
+            .ok_or("Профиль не найден.")?;
+        profile.direct_dpi = Some(enable);
         if !enable {
-            doc.client.proxy.direct_dpi_stun = Some(false);
+            profile.direct_dpi_stun = Some(false);
         }
         candidate
             .validate()
@@ -1375,7 +1384,7 @@ impl Editor {
                 "Отключить Anti-DPI"
             },
             body: if enable {
-                "Разрешить локальный Anti-DPI для этого файла клиента?\n\nДля правил direct_dpi возможен прямой выход и независимая TLS/QUIC-проверка назначения: сайт увидит IP вашего устройства. STUN разрешается отдельно. DNS запрашивается через Theia. Остальные правила не меняются.\nСохранение не запускает режим; перезапустите клиент.\n\ny: разрешить · n/Esc: отменить".into()
+                "Разрешить локальный Anti-DPI для выбранного профиля?\n\nДля правил direct_dpi возможен прямой выход и независимая TLS/QUIC-проверка назначения: сайт увидит IP вашего устройства. STUN разрешается отдельно. DNS запрашивается через Theia. Остальные правила не меняются.\nСохранение не запускает режим; перезапустите клиент.\n\ny: разрешить · n/Esc: отменить".into()
             } else {
                 "Отключить локальный Anti-DPI?\nПравила direct_dpi будут использовать VPS после перезапуска клиента. Текущие соединения не изменятся.\n\ny: отключить · n/Esc: отменить".into()
             },
@@ -1395,7 +1404,10 @@ impl Editor {
         let Config::Client(doc) = &mut candidate else {
             return Err("Требуется клиентская конфигурация.");
         };
-        doc.client.proxy.direct_dpi_stun = Some(enable);
+        let profile = doc.client.profiles.iter_mut()
+            .find(|p| p.id == self.selected_record_id())
+            .ok_or("Профиль не найден.")?;
+        profile.direct_dpi_stun = Some(enable);
         candidate
             .validate()
             .map_err(|_| "Настройки клиента не прошли проверку.")?;
@@ -1417,39 +1429,6 @@ impl Editor {
         })
     }
 
-    /// Display the saved permission, never infer the operating-system state.
-    pub(crate) fn system_proxy_allowed(&self) -> bool {
-        matches!(&self.original, Config::Client(doc)
-            if doc.client.proxy.system_proxy == config::SystemProxy::Manual)
-    }
-
-    #[cfg(any(windows, test))]
-    pub(crate) fn review_system_proxy_permission(&self) -> Result<RecordReview, &'static str> {
-        self.require_clean_records()?;
-        if self.write_uncertain {
-            return Err("Откройте настройки заново.");
-        }
-        let mut candidate = self.original.clone();
-        let Config::Client(doc) = &mut candidate else {
-            return Err("Требуется клиентский профиль.");
-        };
-        if doc.client.active_profile != self.selected_record_id() {
-            return Err("Сначала выберите активный профиль.");
-        }
-        doc.client.proxy.system_proxy = config::SystemProxy::Manual;
-        candidate
-            .validate()
-            .map_err(|_| "Настройки клиента не прошли проверку.")?;
-        Ok(RecordReview {
-            source: self.saved_sha256(),
-            selected: self.selected_record_id().to_owned(),
-            candidate,
-            next_selection: self.selected_record,
-            confirmation_label: "Сохранить разрешение",
-            body: "Разрешить управление системным прокси?\n\nTheia сможет менять HTTP(S)-прокси текущего пользователя Windows только после отдельного подтверждения.\nСейчас сохраняется только разрешение в файле настроек. Прокси Windows и соединение не изменятся.\n\ny: сохранить разрешение · n/Esc: отменить".into(),
-        })
-    }
-
     /// Non-secret values for the settings page. These are saved, not live.
     pub(crate) fn settings_summary(&self) -> String {
         match &self.original {
@@ -1458,14 +1437,9 @@ impl Editor {
                 doc.server.policy.max_connections_per_user, doc.server.policy.max_connections_total
             ),
             Config::Client(doc) => format!(
-                "HTTP: {}\nSOCKS5: {}\nРазрешение управления системным прокси: {}",
+                "HTTP: {}\nSOCKS5: {}\nРежим: System Proxy (сохранённый выбор, не состояние ОС)",
                 doc.client.proxy.http_listen,
-                doc.client.proxy.socks5_listen,
-                if self.system_proxy_allowed() {
-                    "разрешено"
-                } else {
-                    "нет"
-                }
+                doc.client.proxy.socks5_listen
             ),
         }
     }

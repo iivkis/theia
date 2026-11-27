@@ -1,6 +1,6 @@
 //! Strict replacement Theia v1 invitation for SmartTheia XHTTP. Never log bearer URIs.
 use crate::config::{
-    ClientDocument, ClientSettings, Config, LocalProxy, Management, Profile, SystemProxy,
+    ClientDocument, ClientSettings, Config, LocalProxy, Management, Profile, IngressMode,
     Transport, Ui, XhttpMode,
 };
 use crate::security_profile::SecurityMode;
@@ -718,6 +718,8 @@ impl Invitation {
             transport: self.transport,
             quic_connect_timeout_ms: 1600,
             quic_negative_cache_ttl_s: 900,
+            direct_dpi: None,
+            direct_dpi_stun: None,
         })
     }
 
@@ -750,6 +752,8 @@ impl Invitation {
             transport: self.transport,
             quic_connect_timeout_ms: 1600,
             quic_negative_cache_ttl_s: 900,
+            direct_dpi: None,
+            direct_dpi_stun: None,
         })
     }
 }
@@ -760,13 +764,11 @@ fn validate_profile(profile: Profile) -> Result<Profile, InviteError> {
         schema_version: 1,
         client: ClientSettings {
             active_profile: profile.id.clone(),
+            ingress_mode: IngressMode::SystemProxy,
             profiles: vec![profile.clone()],
             proxy: LocalProxy {
                 http_listen: "127.0.0.1:7890".into(),
                 socks5_listen: "127.0.0.1:7891".into(),
-                system_proxy: SystemProxy::Off,
-                direct_dpi: None,
-                direct_dpi_stun: None,
             },
         },
         management: Management {

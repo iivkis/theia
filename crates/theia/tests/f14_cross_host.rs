@@ -14,7 +14,7 @@ use std::{
 };
 use theia::{
     client_import,
-    config::{self, ClientDocument, Config, SystemProxy, Transport},
+    config::{self, ClientDocument, Config, IngressMode, Transport},
     invite::Invitation,
     tui_editor::Editor,
     Role,
@@ -211,7 +211,8 @@ async fn client_scenario(
         assert!(imported.auth_token.starts_with("file:"));
         assert_eq!(imported.tls_ca, invitation.trust_reference());
     }
-    assert_eq!(client_doc.client.proxy.system_proxy, SystemProxy::Off);
+    assert_eq!(client_doc.client.ingress_mode, IngressMode::SystemProxy);
+    assert_ne!(client_doc.client.profiles[0].direct_dpi, Some(true));
     assert!(!fs::read_to_string(&config_path)
         .unwrap()
         .contains(&URL_SAFE_NO_PAD.encode(token)));
