@@ -61,6 +61,8 @@ $ddf=Join-Path $output 'submission.ddf'
     '.OPTION EXPLICIT'
     '.Set CabinetNameTemplate=TheiaWfpLab.cab'
     ".Set DiskDirectoryTemplate=""$output"""
+    ".Set InfFileName=""$(Join-Path $output 'makecab.inf')"""
+    ".Set RptFileName=""$(Join-Path $output 'makecab.rpt')"""
     '.Set CompressionType=MSZIP'
     '.Set Cabinet=on'
     '.Set Compress=on'

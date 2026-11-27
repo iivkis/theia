@@ -65,3 +65,33 @@ function Assert-TheiaMicrosoftKernelSignature([string]$Path) {
         throw 'Expected a valid embedded Microsoft hardware publisher signature.'
     }
 }
+
+# Read the currently enforced kernel code-integrity state. Never change
+# BCD, Secure Boot, HVCI or the machine certificate trust configuration.
+function Assert-TheiaCodeIntegrity {
+    if (!('TheiaInstallCodeIntegrity' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class TheiaInstallCodeIntegrity {
+    [StructLayout(LayoutKind.Sequential)]
+    struct Information { public uint Length; public uint Options; }
+    [DllImport("ntdll.dll")]
+    static extern int NtQuerySystemInformation(int kind, ref Information value, uint length, out uint returned);
+    public static uint Read() {
+        var info = new Information { Length = 8 };
+        uint returned;
+        int status = NtQuerySystemInformation(103, ref info, 8, out returned);
+        if (status != 0 || info.Length != 8 || returned != 8)
+            throw new InvalidOperationException("Code integrity state unavailable");
+        return info.Options;
+    }
+}
+'@
+    }
+    $options=[TheiaInstallCodeIntegrity]::Read()
+    if (($options -band 1) -eq 0 -or ($options -band 0xe2) -ne 0) {
+        throw 'Kernel code integrity must be enabled without test/preproduction/debug signing allowances.'
+    }
+    return $options
+}

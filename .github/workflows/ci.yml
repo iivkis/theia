@@ -1104,6 +1104,10 @@ jobs:
           mkdir f15-build-evidence
           cp drivers/linux/theia_flow_events.bpf.o f15-build-evidence/
           sha256sum f15-build-evidence/theia_flow_events.bpf.o
+      - name: Test offline driver attestation and manifest validation
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./drivers/windows/test-attestation.ps1
       - name: Restore pinned Microsoft SDK and WDK packages
         if: runner.os == 'Windows'
         shell: pwsh

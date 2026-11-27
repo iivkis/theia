@@ -5,6 +5,8 @@ param(
     [Parameter(Mandatory=$true)][string]$BuildEvidence,
     [Parameter(Mandatory=$true)][ValidatePattern('^[0-9a-fA-F]{64}$')][string]$BuildEvidenceSha256,
     [Parameter(Mandatory=$true)][ValidatePattern('^[0-9a-fA-F]{40}$')][string]$SourceSha,
+    [Parameter(Mandatory=$true)][ValidateRange(2,4294967294)][uint32]$Compartment,
+    [Parameter(Mandatory=$true)][string]$InstallEvidence,
     [Parameter(Mandatory=$true)][switch]$IsolatedTestMachine
 )
 $ErrorActionPreference = 'Stop'
@@ -24,6 +26,21 @@ $expected = $ExpectedSha256.ToUpperInvariant()
 . (Join-Path $PSScriptRoot 'build-evidence.ps1')
 . (Join-Path $PSScriptRoot 'attestation-common.ps1')
 $proof = Read-TheiaBuildEvidence $BuildEvidence $BuildEvidenceSha256 $SourceSha $expected
+$integrityBefore=Assert-TheiaCodeIntegrity
+$evidencePath=[IO.Path]::GetFullPath($InstallEvidence)
+if (Test-Path -LiteralPath $evidencePath) { throw 'Installation evidence must be create-only.' }
+$controller=(Get-TheiaRegularFile (Join-Path $source.DirectoryName 'theia_bfe_lab.exe')).FullName
+# Pin the approved BFE inspector while invoking it. Its inspect-absent
+# operation is read-only and refuses even partially existing owned keys.
+$controllerLease=[IO.File]::Open($controller,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+try {
+Assert-TheiaHash $controller $proof.ControllerSha256
+function Assert-BfeAbsent {
+    Assert-TheiaHash $controller $proof.ControllerSha256
+    & $controller inspect-absent $Compartment --isolated-lab-confirm | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw 'Existing or uncertain BFE objects: refuse installation.' }
+}
+Assert-BfeAbsent
 $service = 'TheiaWfpLab'
 $destination = Join-Path ([Environment]::SystemDirectory) 'drivers\TheiaWfpLab.sys'
 $serviceKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$service"
@@ -74,7 +91,18 @@ $driverRecord = Get-CimInstance Win32_SystemDriver -Filter "Name='$service'"
 if (!$driverRecord -or $driverRecord.State -ne 'Running') {
     throw 'Driver running state not confirmed.'
 }
-[pscustomobject]@{
+Assert-Driver $destination
+Assert-BfeAbsent
+$integrityAfter=Assert-TheiaCodeIntegrity
+if ($integrityBefore -ne $integrityAfter) { throw 'Code integrity state changed during installation.' }
+$os=Get-CimInstance Win32_OperatingSystem
+$record=[pscustomobject]@{
+    Version = 1
+    MachineGuid = [string](Get-ItemPropertyValue -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid)
+    BootUtc = ([datetime]$os.LastBootUpTime).ToUniversalTime().ToString('o')
+    InstalledUtc = [DateTime]::UtcNow.ToString('o')
+    Compartment = $Compartment
+    CodeIntegrityOptions = $integrityAfter
     Service = $service
     SourceSha = $proof.SourceSha
     BuildEvidenceSha256 = $BuildEvidenceSha256.ToUpperInvariant()
@@ -83,4 +111,10 @@ if (!$driverRecord -or $driverRecord.State -ne 'Running') {
     MicrosoftKernelSignatureVerified = $true
     BfeFiltersInstalled = $false
     CaptureReady = $false
-} | ConvertTo-Json
+    PhysicalAcceptanceVerified = $false
+}
+$bytes=[Text.Encoding]::UTF8.GetBytes(($record | ConvertTo-Json))
+$stream=[IO.File]::Open($evidencePath,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+try { $stream.Write($bytes,0,$bytes.Length);$stream.Flush($true) } finally { $stream.Dispose() }
+$record | ConvertTo-Json
+} finally { $controllerLease.Dispose() }
