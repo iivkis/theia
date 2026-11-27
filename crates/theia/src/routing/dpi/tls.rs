@@ -259,28 +259,14 @@ pub(super) fn server_hello(mut message: &[u8]) -> bool {
 }
 
 pub(super) fn tls_config(roots: rustls::RootCertStore) -> Option<Arc<rustls::ClientConfig>> {
-    if roots.is_empty() {
-        return None;
-    }
-    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .ok()?
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    config.resumption = rustls::client::Resumption::disabled();
-    config.enable_early_data = false;
-    Some(Arc::new(config))
+    crate::net::tls::application_probe(roots).ok().map(Arc::new)
 }
 
 pub(super) fn native_config() -> Option<Arc<rustls::ClientConfig>> {
     static CONFIG: OnceLock<Option<Arc<rustls::ClientConfig>>> = OnceLock::new();
     CONFIG
         .get_or_init(|| {
-            let mut roots = rustls::RootCertStore::empty();
-            roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
-            tls_config(roots)
+            tls_config(crate::net::tls::native_roots())
         })
         .clone()
 }

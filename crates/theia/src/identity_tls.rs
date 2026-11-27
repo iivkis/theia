@@ -318,9 +318,7 @@ impl Identity {
     pub fn server_tls(&self, name: &str, branch: Branch) -> Result<ServerConfig, Error> {
         let resolver = Arc::new(RenewingLeaf::new(self, name, branch)?);
         let mut config =
-            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_protocol_versions(&[&rustls::version::TLS13])
-                .map_err(|_| Error::Tls)?
+            crate::net::tls::server_tls13_builder().map_err(|_| Error::Tls)?
                 .with_no_client_auth()
                 .with_cert_resolver(resolver);
         branch.carrier().configure_server(&mut config);
@@ -337,9 +335,7 @@ impl Identity {
     ) -> Result<ServerConfig, Error> {
         let (leaf, key) = self.leaf(name, branch, now)?;
         let mut config =
-            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_protocol_versions(&[&rustls::version::TLS13])
-                .map_err(|_| Error::Tls)?
+            crate::net::tls::server_tls13_builder().map_err(|_| Error::Tls)?
                 .with_no_client_auth()
                 .with_single_cert(vec![leaf], key)
                 .map_err(|_| Error::Tls)?;
@@ -444,7 +440,7 @@ pub fn client_tls(scope: &Scope, public: [u8; 32], branch: Branch) -> Result<Cli
         .carrier()
         .client_tls(pinned_roots(scope, public, branch)?)
         .map_err(|_| Error::Tls)?;
-    config.resumption = rustls::client::Resumption::disabled();
+    crate::net::tls::require_full_handshake(&mut config);
     Ok(config)
 }
 

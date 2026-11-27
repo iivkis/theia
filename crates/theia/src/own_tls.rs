@@ -152,14 +152,13 @@ impl Trust {
         match self {
             Self::Roots(roots) => carrier.client_tls(roots.clone()),
             Self::Pinned(anchor) => {
-                let mut config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                    .with_protocol_versions(&[&rustls::version::TLS13])?
+                let mut config = crate::net::tls::client_tls13_builder()?
                     .dangerous()
                     .with_custom_certificate_verifier(Arc::new(*anchor))
                     .with_no_client_auth();
                 carrier.configure_client(&mut config);
                 // Revalidate the anchor on every new physical TLS connection.
-                config.resumption = rustls::client::Resumption::disabled();
+                crate::net::tls::require_full_handshake(&mut config);
                 Ok(config)
             }
         }

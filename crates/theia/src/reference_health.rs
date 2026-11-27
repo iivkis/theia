@@ -346,18 +346,7 @@ impl Drop for Driver {
 /// One complete PKI-verified TLS 1.3/X25519 + H2 request, not just ALPN.
 /// No arbitrary path, redirect, authentication or application payload.
 async fn h2_head(target: &Target, roots: RootCertStore) -> Option<u16> {
-    let mut provider = rustls::crypto::ring::default_provider();
-    provider
-        .kx_groups
-        .retain(|group| group.name() == rustls::NamedGroup::X25519);
-    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .ok()?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    tls.alpn_protocols = vec![b"h2".to_vec()];
-    tls.enable_early_data = false;
-    tls.resumption = rustls::client::Resumption::disabled();
+    let tls = crate::net::tls::reference_h2(roots).ok()?;
     let name = ServerName::try_from(target.server_name.clone()).ok()?;
     let tcp = crate::routing::carrier_socket::connect_plain_tcp(target.address).await.ok()?;
     if tcp.peer_addr().ok()? != target.address {
@@ -488,9 +477,7 @@ pub async fn check(plan: &Plan, approved: [u8; 32]) -> Result<Vec<Evidence>, Err
         return Err(Error::Approval);
     }
     let roots = {
-        let mut roots = RootCertStore::empty();
-        let native = rustls_native_certs::load_native_certs();
-        roots.add_parsable_certificates(native.certs);
+        let roots = crate::net::tls::native_roots();
         if roots.is_empty() {
             return Err(Error::NoRoots);
         }
@@ -530,8 +517,7 @@ pub(crate) async fn check_search(
     if search.digest()? != approved {
         return Err(Error::Approval);
     }
-    let mut roots = RootCertStore::empty();
-    roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+    let roots = crate::net::tls::native_roots();
     if roots.is_empty() {
         return Err(Error::NoRoots);
     }

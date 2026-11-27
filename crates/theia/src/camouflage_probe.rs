@@ -125,20 +125,7 @@ pub async fn probe_tls_h2(
     }
     // F-18 requires a real TLS 1.3 X25519 witness. A successful
     // handshake using a different group is not that evidence.
-    let mut provider = rustls::crypto::ring::default_provider();
-    provider
-        .kx_groups
-        .retain(|group| group.name() == rustls::NamedGroup::X25519);
-    if provider.kx_groups.is_empty() {
-        return Err(ProbeError::TlsRejected);
-    }
-    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|_| ProbeError::TlsRejected)?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    tls.alpn_protocols = vec![b"h2".to_vec()];
-    tls.enable_early_data = false;
+    let tls = crate::net::tls::reference_h2(roots).map_err(|_| ProbeError::TlsRejected)?;
     let connector = TlsConnector::from(Arc::new(tls));
     let deadline = request.deadline.min(MAX_HANDSHAKE_DEADLINE);
     let start = Instant::now();

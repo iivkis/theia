@@ -290,15 +290,7 @@ pub async fn observe_public_egress(
     if !matches!(server_name, ServerName::DnsName(_)) {
         return Err(EgressError::InvalidRequest);
     }
-    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .map_err(|_| EgressError::TlsRejected)?
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-    tls.enable_early_data = false;
+    let tls = crate::net::tls::roots_tls13(roots, b"http/1.1").map_err(|_| EgressError::TlsRejected)?;
     let connector = TlsConnector::from(Arc::new(tls));
     let source = EgressSource {
         server_name: request.server_name.clone(),
