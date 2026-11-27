@@ -105,13 +105,14 @@ pub(crate) struct VerifiedUdp {
 }
 impl VerifiedUdp {
     pub(crate) fn check_policy(&self) -> Result<(), ClientError> {
-        self.engine.check_policy(self.key.policy)
+        self.engine.check_key_policy(&self.key)
     }
 
     pub(crate) fn fallback_policy(&self) -> FallbackPolicy {
         FallbackPolicy {
             engine: self.engine.clone(),
             digest: self.key.policy,
+            epoch: self.key.epoch,
         }
     }
 
@@ -157,6 +158,7 @@ impl VerifiedUdp {
                 name: "example.org".into(),
                 address,
                 policy: [1; 32],
+                epoch: 1,
                 network: network_scope::Scope::fixture(address, 0),
             },
         }
@@ -253,6 +255,16 @@ impl Engine {
         }
     }
 
+    fn check_key_policy(&self, key: &Key) -> Result<(), ClientError> {
+        if self.policy_epoch(key.policy)? == key.epoch { Ok(()) } else { Err(stale_policy()) }
+    }
+
+    fn key_live(&self, key: &Key) -> bool {
+        self.enabled()
+            && self.check_key_policy(key).is_ok()
+            && network_scope::observe(key.address) == Some(key.network)
+    }
+
     pub(crate) fn enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
     }
@@ -274,7 +286,7 @@ impl Engine {
     }
 
     fn remember_udp(&self, key: Key, probe: UdpProbe, good: bool) {
-        if network_scope::observe(key.address) != Some(key.network) {
+        if !self.key_live(&key) {
             return;
         }
         if let Ok(mut cache) = self.udp_cache.lock() {
@@ -296,6 +308,7 @@ impl Engine {
 
     /// Local reachability strategy; not a ciphertext transformation. Fail
     /// closed to the authenticated VPS before the first application datagram.
+    #[cfg(test)]
     pub(crate) async fn open_quic_udp(
         self: &Arc<Self>,
         name: &str,
@@ -327,6 +340,7 @@ impl Engine {
         {
             return None;
         }
+        let epoch = self.policy_epoch(policy).ok()?;
         let name = super::domain_name(name).ok()?;
         timeout(OPEN_BUDGET, async {
             for ip in ips.iter().take(2) {
@@ -338,14 +352,12 @@ impl Engine {
                     name: name.clone(),
                     address,
                     policy,
+                    epoch,
                     network,
                 };
                 let slot = self.probe_slot(&name, address, policy);
                 let guard = self.probe_slots[slot].lock().await;
-                if !self.enabled()
-                    || !self.policy_current(policy)
-                    || network_scope::observe(address) != Some(network)
-                {
+                if !self.key_live(&key) {
                     continue;
                 }
                 let good = if let Some(good) = self.cached_udp(&key, probe) {
@@ -369,17 +381,11 @@ impl Engine {
                     good
                 };
                 drop(guard);
-                if !good
-                    || !self.enabled()
-                    || !self.policy_current(policy)
-                    || network_scope::observe(address) != Some(network)
-                {
+                if !good || !self.key_live(&key) {
                     continue;
                 }
                 if let Some((socket, admission)) = scoped_udp(address, network).await {
-                    if self.enabled()
-                        && self.policy_current(policy)
-                        && network_scope::observe(address) == Some(network)
+                    if self.key_live(&key)
                         && socket
                             .local_addr()
                             .is_ok_and(|local| network.matches_local(local))
@@ -423,6 +429,7 @@ impl Engine {
         {
             return None;
         }
+        let epoch = self.policy_epoch(policy).ok()?;
         let name = super::domain_name(name).ok()?;
         timeout(OPEN_BUDGET, async {
             for ip in ips.iter().take(2) {
@@ -434,15 +441,13 @@ impl Engine {
                     name: name.clone(),
                     address,
                     policy,
+                    epoch,
                     network,
                 };
                 let _guard = self.probe_slots[self.probe_slot(&name, address, policy)]
                     .lock()
                     .await;
-                if !self.stun_enabled()
-                    || !self.policy_current(policy)
-                    || network_scope::observe(address) != Some(network)
-                {
+                if !self.stun_enabled() || !self.key_live(&key) {
                     continue;
                 }
                 if self.cached_udp(&key, UdpProbe::Stun) == Some(false) {
@@ -456,10 +461,7 @@ impl Engine {
                 ] {
                     let good = timeout(Duration::from_millis(1200), async {
                         let (socket, _admission) = scoped_udp(address, network).await?;
-                        if !self.stun_enabled()
-                            || !self.policy_current(policy)
-                            || network_scope::observe(address) != Some(network)
-                        {
+                        if !self.stun_enabled() || !self.key_live(&key) {
                             return None;
                         }
                         udp::probe_stun(&socket, strategy).await
@@ -468,10 +470,7 @@ impl Engine {
                     .ok()
                     .flatten()
                     .is_some();
-                    if !self.stun_enabled()
-                        || !self.policy_current(policy)
-                        || network_scope::observe(address) != Some(network)
-                    {
+                    if !self.stun_enabled() || !self.key_live(&key) {
                         break;
                     }
                     crate::traffic::udp_stun_probe(good);
@@ -480,10 +479,7 @@ impl Engine {
                         break;
                     }
                 }
-                if !self.stun_enabled()
-                    || !self.policy_current(policy)
-                    || network_scope::observe(address) != Some(network)
-                {
+                if !self.stun_enabled() || !self.key_live(&key) {
                     continue;
                 }
                 self.remember_udp(key.clone(), UdpProbe::Stun, selected.is_some());
@@ -491,10 +487,7 @@ impl Engine {
                     continue;
                 };
                 if let Some((socket, admission)) = scoped_udp(address, network).await {
-                    if self.stun_enabled()
-                        && self.policy_current(policy)
-                        && network_scope::observe(address) == Some(network)
-                    {
+                    if self.stun_enabled() && self.key_live(&key) {
                         return Some(VerifiedUdp {
                             socket,
                             strategy: UdpStrategy::StunBinding(strategy),
@@ -530,30 +523,50 @@ impl Engine {
         {
             return None;
         }
+        let epoch = self.policy_epoch(policy).ok()?;
         let name = super::domain_name(name).ok()?;
+        let deadline = tokio::time::Instant::now() + OPEN_BUDGET;
         timeout(OPEN_BUDGET, async {
             for ip in ips.iter().take(2) {
                 let address = SocketAddr::new(*ip, port);
-                let Some(network) = network_scope::observe(address) else {
-                    continue;
-                };
-                let key = Key { name: name.clone(), address, policy, network };
+                let Some(network) = network_scope::observe(address) else { continue };
+                let key = Key { name: name.clone(), address, policy, epoch, network };
                 let slot = self.probe_slot(&key.name, address, policy);
                 let guard = self.probe_slots[slot].lock().await;
-                if !self.enabled() || !self.policy_current(policy) || network_scope::observe(address) != Some(network) { continue; }
+                if !self.key_live(&key) { continue; }
                 let (strategy, lease) = match self.cache.evidence(&key) {
-                    Some((Verdict::Verified(strategy), lease)) => { crate::traffic::dpi_cache_hit(); (strategy, lease) },
+                    Some((Verdict::Verified(strategy), lease)) => {
+                        crate::traffic::dpi_cache_hit();
+                        (strategy, lease)
+                    }
                     Some((Verdict::Unavailable, _)) => continue,
                     previous => {
                         let _permit = self.probes.try_acquire().ok()?;
                         let config = tokio::task::spawn_blocking(tls::native_config).await.ok()??;
                         let mut verified = None;
-                        for strategy in self.cache.ranked(&key) {
-                            if !self.enabled() || !self.policy_current(policy) || network_scope::observe(address) != Some(network) { break; }
-                            if matches!(&previous, Some((Verdict::Avoid { strategy: failed, .. }, _)) if *failed == strategy) { continue; }
+                        let mut attempted = 0;
+                        let mut order = self.cache.ranked(&key);
+                        // A recently failed strategy is last, not permanently
+                        // excluded. A new complete round can rehabilitate it.
+                        if let Some((Verdict::Avoid { strategy: failed, .. }, _)) = previous {
+                            order.sort_by_key(|strategy| *strategy == failed);
+                        }
+                        for strategy in order {
+                            if !self.key_live(&key) { break; }
+                            // Reserve a real application TCP dial before
+                            // starting another independent probe. Never
+                            // record overall budget exhaustion as peer failure.
+                            if deadline.saturating_duration_since(tokio::time::Instant::now())
+                                < ATTEMPT + ATTEMPT {
+                                break;
+                            }
                             let started = std::time::Instant::now();
-                            let good = timeout(ATTEMPT, tls::probe(&name, address, Some(network), strategy, config.clone()))
-                                .await.ok().flatten().is_some();
+                            let good = timeout(ATTEMPT, tls::probe_guarded(
+                                &name, address, Some(network), strategy, config.clone(),
+                                || self.key_live(&key),
+                            )).await.ok().flatten().is_some();
+                            if !self.key_live(&key) { break; }
+                            attempted += 1;
                             self.cache.observe(&key, strategy, good, started.elapsed());
                             crate::traffic::dpi_probe(good);
                             if good {
@@ -561,11 +574,13 @@ impl Engine {
                                 break;
                             }
                         }
-                        if !self.enabled() || !self.policy_current(policy) || network_scope::observe(address) != Some(network) {
-                            continue;
-                        }
+                        if !self.key_live(&key) { continue; }
                         let Some(strategy) = verified else {
-                            let _ = self.cache.remember(&key, Verdict::Unavailable);
+                            // Only a complete, still-authorized strategy round
+                            // may publish negative evidence.
+                            if attempted == Strategy::ALL.len() {
+                                let _ = self.cache.remember(&key, Verdict::Unavailable);
+                            }
                             continue;
                         };
                         let Some(lease) = self.cache.remember(&key, Verdict::Verified(strategy)) else {
@@ -575,38 +590,23 @@ impl Engine {
                     }
                 };
                 drop(guard);
-                if !self.enabled() || !self.policy_current(policy) || network_scope::observe(address) != Some(network) {
+                if !self.key_live(&key) || !self.cache.current(&key, strategy, &lease) {
                     continue;
                 }
-                match timeout(ATTEMPT, tcp::connect(address)).await {
-                    Ok(Ok((target, admission))) if self.enabled() && self.policy_current(policy)
-                        && network_scope::observe(address) == Some(network)
-                        && target.local_addr().is_ok_and(|local| network.matches_local(local)) => {
+                if let Ok(Ok((target, admission))) = timeout(ATTEMPT, tcp::connect(address)).await {
+                    if self.key_live(&key)
+                        && self.cache.current(&key, strategy, &lease)
+                        && target.local_addr().is_ok_and(|local| network.matches_local(local)) {
                         return Some(Tunnel {
-                            target,
-                            _admission: admission,
-                            strategy,
-                            lease,
-                            engine: self.clone(),
-                            key,
+                            target, _admission: admission, strategy, lease,
+                            engine: self.clone(), key,
                         });
                     }
-                    Ok(Ok(_)) => {
-                        // Local scope/consent changed, not evidence against
-                        // the peer or a strategy on the previous network.
-                    }
-                    _ if self.enabled() && self.policy_current(policy) => {
-                        self.cache.failed(&key, strategy, &lease);
-                    }
-                    _ => {}
-
                 }
+                // A failed plain TCP dial is not a failed TLS strategy.
             }
             None
-        })
-        .await
-        .ok()
-        .flatten()
+        }).await.ok().flatten()
     }
 }
 
@@ -629,10 +629,11 @@ pub(crate) enum RelayOutcome {
 pub(crate) struct FallbackPolicy {
     engine: Arc<Engine>,
     digest: [u8; 32],
+    epoch: u64,
 }
 impl FallbackPolicy {
     pub(crate) fn check(&self) -> Result<(), ClientError> {
-        self.engine.check_policy(self.digest)
+        if self.engine.policy_epoch(self.digest)? == self.epoch { Ok(()) } else { Err(stale_policy()) }
     }
 
     #[cfg(test)]
@@ -664,6 +665,7 @@ impl Tunnel {
         FallbackPolicy {
             engine: self.engine.clone(),
             digest: self.key.policy,
+            epoch: self.key.epoch,
         }
     }
 
@@ -690,9 +692,7 @@ impl Tunnel {
         flow: Option<&super::flow::FlowLease>,
     ) -> Result<RelayOutcome, ClientError> {
         // A superseded/expired policy is not permission for VPS fallback.
-        if !self.engine.policy_current(self.key.policy) {
-            return Err(stale_policy());
-        }
+        self.engine.check_key_policy(&self.key)?;
         let transformed = if ready {
             tls::transform(&prefix, &self.key.name, self.strategy)
         } else {
@@ -713,7 +713,7 @@ impl Tunnel {
         {
             return Ok(RelayOutcome::Fallback { client, prefix });
         }
-        self.engine.check_policy(self.key.policy)?;
+        self.engine.check_key_policy(&self.key)?;
         if let Some(flow) = flow {
             flow.commit(super::PacketAction::Modify)?;
         }
@@ -799,6 +799,7 @@ impl Tunnel {
                 name: name.into(),
                 address,
                 policy: [1; 32],
+                epoch: 1,
                 network: network_scope::Scope::fixture(address, 0),
             },
         }
@@ -913,6 +914,7 @@ mod tests {
         let authorization = FallbackPolicy {
             engine: engine.clone(),
             digest,
+            epoch: engine.policy_epoch(digest).unwrap(),
         };
         assert!(authorization.check().is_ok());
         engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(
@@ -921,6 +923,8 @@ mod tests {
         assert!(authorization.check().is_err());
         engine.authorize_policy(None);
         assert!(authorization.check().is_err());
+        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(digest)));
+        assert!(authorization.check().is_err(), "same digest must not revive fallback");
     }
 
     #[test]
@@ -932,6 +936,7 @@ mod tests {
             name: "example.org".into(),
             address,
             policy: [1; 32],
+            epoch: 1,
             network: network_scope::Scope::fixture(address, 1),
         };
         let expiry = std::time::Instant::now() + Duration::from_secs(60);
@@ -1021,6 +1026,7 @@ mod tests {
             name: "example.org".into(),
             address,
             policy,
+            epoch: engine.policy_epoch(policy).unwrap(),
             network,
         };
         let (socket, admission) = scoped_udp(address, network).await.unwrap();

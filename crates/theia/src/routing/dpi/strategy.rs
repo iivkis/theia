@@ -30,6 +30,7 @@ pub(super) struct Key {
     pub(super) name: String,
     pub(super) address: SocketAddr,
     pub(super) policy: [u8; 32],
+    pub(super) epoch: u64,
     pub(super) network: network_scope::Scope,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -245,6 +246,7 @@ mod tests {
             name: "example.org".into(),
             address,
             policy: [1; 32],
+            epoch: 1,
             network: network_scope::Scope::fixture(address, 0),
         };
         cache.sample(&key, Strategy::Header, false, Duration::ZERO);
@@ -265,6 +267,7 @@ mod tests {
             name: "example.org".into(),
             address,
             policy: [1; 32],
+            epoch: 1,
             network: network_scope::Scope::fixture(address, 0),
         };
         let lease = cache.insert(&key, Verdict::Verified(Strategy::Middle)).unwrap();
@@ -288,6 +291,7 @@ mod tests {
             name: "example.org".into(),
             address,
             policy: [1; 32],
+            epoch: 1,
             network: network_scope::Scope::fixture(address, 0),
         };
         let old = cache.insert(&key, Verdict::Verified(Strategy::Header)).unwrap();
@@ -323,6 +327,7 @@ mod tests {
             name: "example.org".into(),
             address,
             policy: [1; 32],
+            epoch: 1,
             network: network_scope::Scope::fixture(address, 1),
         };
         let _ = cache.insert(&key, Verdict::Verified(Strategy::Header));
@@ -333,6 +338,10 @@ mod tests {
         key.policy = [2; 32];
         assert!(cache.cached(&key).is_none());
         key.policy = [1; 32];
+        key.epoch = 2;
+        assert!(cache.cached(&key).is_none());
+        assert_eq!(cache.ranked(&key), Strategy::ALL);
+        key.epoch = 1;
         key.network = network_scope::Scope::fixture(address, 2);
         assert!(cache.cached(&key).is_none());
         key.network = network_scope::Scope::fixture(address, 1);

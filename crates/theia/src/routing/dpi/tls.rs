@@ -287,6 +287,7 @@ pub(super) fn native_config() -> Option<Arc<rustls::ClientConfig>> {
 
 // A separate authenticated TLS probe to the exact policy-pinned address.
 // Never send application data or disable hostname/certificate validation.
+#[cfg(test)]
 pub(super) async fn probe(
     name: &str,
     address: SocketAddr,
@@ -294,6 +295,18 @@ pub(super) async fn probe(
     strategy: Strategy,
     config: Arc<rustls::ClientConfig>,
 ) -> Option<()> {
+    probe_guarded(name, address, scope, strategy, config, || true).await
+}
+
+pub(super) async fn probe_guarded(
+    name: &str,
+    address: SocketAddr,
+    scope: Option<crate::network_scope::Scope>,
+    strategy: Strategy,
+    config: Arc<rustls::ClientConfig>,
+    live: impl Fn() -> bool,
+) -> Option<()> {
+    if !live() { return None; }
     let server_name = rustls::pki_types::ServerName::try_from(name.to_owned()).ok()?;
     let mut tls = rustls::ClientConnection::new(config, server_name).ok()?;
     let (mut socket, _admission) = super::tcp::connect(address).await.ok()?;
@@ -313,13 +326,16 @@ pub(super) async fn probe(
                 return None;
             }
             if first {
-                output = transform(&output, name, strategy)?;
+                let transformed = transform(&output, name, strategy)?;
+                if transformed == output { return None; }
+                output = transformed;
                 first = false;
             }
+            if !live() { return None; }
             socket.write_all(&output).await.ok()?;
         }
         if !tls.is_handshaking() {
-            return (!first).then_some(());
+            return (!first && live()).then_some(());
         }
         if !tls.wants_read() {
             return None;

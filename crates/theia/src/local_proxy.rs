@@ -1427,7 +1427,7 @@ async fn routed_udp_selected(
     address: Address,
     port: u16,
     candidate: &crate::routing::dpi::udp::Candidate,
-    observed: &Arc<std::sync::atomic::AtomicU8>,
+    _observed: &Arc<std::sync::atomic::AtomicU8>,
     snapshot: Arc<Snapshot>,
     action: Action,
     pinned: Option<Vec<IpAddr>>,
@@ -1451,74 +1451,9 @@ async fn routed_udp_selected(
         }
         crate::routing::PacketAction::Modify => {
             use crate::routing::dpi::udp::Candidate;
-            // The locked Quinn backend cannot authenticate QUIC v2.
-            // Never treat a v1 handshake as evidence for v2.
-            let stun = matches!(candidate, Candidate::StunBinding);
-            let local_candidate = match (&address, candidate) {
-                (Address::Dns(name), Candidate::QuicH3(sni))
-                    if port == 443 && cache.dpi.enabled() =>
-                {
-                    crate::routing::domain_name(name).as_deref() == Ok(sni.as_str())
-                }
-                (Address::Dns(_), Candidate::StunBinding)
-                    if port == 3478 && cache.dpi.stun_enabled() =>
-                {
-                    true
-                }
-                _ => false,
-            };
-            if local_candidate {
-                if let Address::Dns(name) = &address {
-                    let ips = match pinned {
-                        Some(ips) => ips,
-                        None => match carrier.resolve_routing(name, snapshot.digest()).await {
-                            Ok(ips) => ips,
-                            Err(ClientError::Rejected(502 | 504)) => Vec::new(),
-                            Err(error) => return Err(error),
-                        },
-                    };
-                    let permitted = ips.iter().all(|ip| {
-                        snapshot.policy().classify(
-                            crate::routing::Evidence::Known(name),
-                            crate::routing::Evidence::Known(*ip),
-                        ) == Ok(crate::routing::Classification::Matched(Action::DirectDpi))
-                    });
-                    if !permitted {
-                        return Err(ClientError::Open(ErrorCode::PolicyDenied));
-                    }
-                    if !ips.is_empty() {
-                        let verified = if stun {
-                            cache
-                                .dpi
-                                .open_stun_udp(name, port, &ips, snapshot.digest())
-                                .await
-                        } else {
-                            cache
-                                .dpi
-                                .open_quic_udp(name, port, &ips, snapshot.digest())
-                                .await
-                        };
-                        if let Some(verified) = verified {
-                            let carrier = carrier.clone();
-                            let target = address.clone();
-                            let observed = observed.clone();
-                            let fallback = Box::pin(async move {
-                                let tunnel = carrier.open_udp(target, port).await?;
-                                tunnel.record_transport(&observed);
-                                crate::traffic::udp_dpi_fallback();
-                                if stun {
-                                    crate::traffic::udp_stun_fallback();
-                                }
-                                Ok(tunnel)
-                            });
-                            return Ok(crate::udp_relay::Tunnel::VerifiedLocal(
-                                Box::new(verified),
-                                fallback,
-                            ));
-                        }
-                    }
-                }
-            }
+            // MVP: local UDP Modify has no accepted independent capability.
+            // Consent alone cannot authorize QUIC/STUN probes or user
+            // datagrams. Use the already-authorized XHTTP fallback.
             if !cache.dpi.policy_current(snapshot.digest()) {
                 return Err(crate::routing::dpi::stale_policy());
             }
@@ -1738,8 +1673,10 @@ impl ProxyTunnel {
                         // The origin received no application bytes. The carrier
                         // repeats server admission/ACL for the original target.
                         authorization.check()?;
+                        if let Some(flow) = flow { flow.check_pending()?; }
                         let tunnel = carrier.open(address, port).await?;
                         authorization.check()?;
+                        if let Some(flow) = flow { flow.check_pending()?; }
                         if let Some(observed) = observed {
                             observed
                                 .store(tunnel.open_code(), std::sync::atomic::Ordering::Relaxed);
