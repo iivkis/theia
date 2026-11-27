@@ -29,6 +29,9 @@ const ACK: u16 = 4;
 const CREATE_EXCLUSIVE: u16 = 0x600;
 const APPEND: u16 = 0x800;
 const MAX_CARRIERS: usize = 16;
+const MAX_RULE_OPERATIONS: usize = 64;
+/// Reserved skb routing mark. It is never a carrier socket mark.
+pub const REDIRECT_MARK: u32 = 0x5449;
 const MAX_CARRIER_EPOCH: usize = 65_536;
 const NESTED: u16 = 0x8000;
 const FAMILY_INET: u8 = 1;
@@ -98,6 +101,13 @@ impl Scope {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RedirectScope {
+    port: u16,
+    loopback: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Journal {
@@ -110,6 +120,8 @@ struct Journal {
     // Old journals without this field retain the stricter recovery rule.
     #[serde(default)]
     previous_present: bool,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    redirect: Option<RedirectScope>,
     restored: bool,
 }
 impl Journal {
@@ -123,6 +135,7 @@ impl Journal {
             || self.nonce == [0; 16]
             || self.before == 0
             || self.before.checked_add(1) != Some(self.installed)
+            || self.redirect.is_some_and(|scope|scope.port==0 || scope.loopback==0)
         {
             return Err(refused());
         }
@@ -286,14 +299,14 @@ impl Netlink {
         let expected = journal.name() + "\0";
         if name != Some(expected.as_bytes())
             || nonce != Some(journal.nonce.as_slice())
-            || use_count != Some(1)
+            || use_count != Some(if journal.redirect.is_some() {5} else {1})
         {
             return Err(refused());
         }
         Ok(true)
     }
     fn batch(&self, generation: u32, operations: &[Vec<u8>]) -> io::Result<()> {
-        if generation == 0 || operations.is_empty() || operations.len() > MAX_CARRIERS + 3 {
+        if generation == 0 || operations.is_empty() || operations.len() > MAX_RULE_OPERATIONS {
             return Err(invalid());
         }
         let mut attrs = Vec::new();
@@ -304,10 +317,10 @@ impl Netlink {
         }
         bytes.extend_from_slice(&message(17, REQUEST, operations.len() as u32 + 2, 10, &[]));
         send(self.0.as_raw_fd(), &bytes)?;
-        let mut received = 0u32;
-        let expected = (1u32 << operations.len()) - 1;
+        let mut seen=vec![false;operations.len()];
+        let mut received=0usize;
         let mut buffer = vec![0u8; 65536];
-        for _ in 0..32 {
+        for _ in 0..MAX_RULE_OPERATIONS {
             let n = receive(self.0.as_raw_fd(), &mut buffer)?;
             let mut rest = &buffer[..n];
             while !rest.is_empty() {
@@ -327,14 +340,13 @@ impl Netlink {
                 if seq < 2 || seq > operations.len() as u32 + 1 {
                     return Err(invalid());
                 }
-                let bit = 1u32 << (seq - 2);
-                if received & bit != 0 {
-                    return Err(invalid());
-                }
-                received |= bit;
+                let slot=&mut seen[(seq-2) as usize];
+                if *slot {return Err(invalid());}
+                *slot=true;
+                received+=1;
                 rest = &rest[align4(len)..];
             }
-            if received == expected {
+            if received == operations.len() {
                 return Ok(());
             }
         }
@@ -456,19 +468,26 @@ fn payload_cmp(out: &mut Vec<u8>, base: u32, offset: u32, value: &[u8]) {
     cmp(out, value);
 }
 fn socket_matches(key: super::packet::FlowKey, mark: u32) -> Vec<u8> {
-    use std::net::IpAddr;
-    let mut out = Vec::new();
+    let mut out=Vec::new();
     let mut socket = Vec::new();
     attr(&mut socket, 1, &1u32.to_be_bytes()); // NFT_SOCKET_MARK
     attr(&mut socket, 2, &1u32.to_be_bytes()); // NFT_REG_1
     expression(&mut out, "socket", &socket);
     // Socket mark is a native-endian register value, not skb metadata.
     cmp(&mut out, &mark.to_ne_bytes());
+    tuple_matches(&mut out,key);
+    out
+}
+
+/// L3/L4 checks used after a route change. A tuple alone never authorizes
+/// egress: LOCAL_OUT must first have authenticated the actual socket mark.
+fn tuple_matches(out:&mut Vec<u8>,key:super::packet::FlowKey) {
+    use std::net::IpAddr;
     match (key.source.ip(), key.destination.ip()) {
         (IpAddr::V4(src), IpAddr::V4(dst)) => {
-            meta_cmp(&mut out, 15, &[2]); // NFPROTO_IPV4
+            meta_cmp(out, 15, &[2]); // NFPROTO_IPV4
             meta_cmp(
-                &mut out,
+                out,
                 16,
                 &[if key.transport == super::packet::Transport::Tcp {
                     6
@@ -476,13 +495,13 @@ fn socket_matches(key: super::packet::FlowKey, mark: u32) -> Vec<u8> {
                     17
                 }],
             );
-            payload_cmp(&mut out, 1, 12, &src.octets());
-            payload_cmp(&mut out, 1, 16, &dst.octets());
+            payload_cmp(out, 1, 12, &src.octets());
+            payload_cmp(out, 1, 16, &dst.octets());
         }
         (IpAddr::V6(src), IpAddr::V6(dst)) => {
-            meta_cmp(&mut out, 15, &[10]); // NFPROTO_IPV6
+            meta_cmp(out, 15, &[10]); // NFPROTO_IPV6
             meta_cmp(
-                &mut out,
+                out,
                 16,
                 &[if key.transport == super::packet::Transport::Tcp {
                     6
@@ -490,28 +509,222 @@ fn socket_matches(key: super::packet::FlowKey, mark: u32) -> Vec<u8> {
                     17
                 }],
             );
-            payload_cmp(&mut out, 1, 8, &src.octets());
-            payload_cmp(&mut out, 1, 24, &dst.octets());
+            payload_cmp(out, 1, 8, &src.octets());
+            payload_cmp(out, 1, 24, &dst.octets());
         }
         _ => unreachable!("validated carrier family"),
     }
     let mut ports = [0; 4];
     ports[..2].copy_from_slice(&key.source.port().to_be_bytes());
     ports[2..].copy_from_slice(&key.destination.port().to_be_bytes());
-    payload_cmp(&mut out, 2, 0, &ports);
-    out
+    payload_cmp(out, 2, 0, &ports);
 }
-fn carrier_expressions(key: super::packet::FlowKey, mark: u32) -> Vec<u8> {
-    let mut out = socket_matches(key, mark);
+fn verdict_expression(out:&mut Vec<u8>,code:u32) {
     let mut verdict = Vec::new();
-    attr(&mut verdict, 1, &1u32.to_be_bytes()); // NF_ACCEPT
+    attr(&mut verdict, 1, &code.to_be_bytes());
     let mut data = Vec::new();
     attr(&mut data, 2 | NESTED, &verdict);
     let mut immediate = Vec::new();
     attr(&mut immediate, 1, &0u32.to_be_bytes()); // NFT_REG_VERDICT
     attr(&mut immediate, 2 | NESTED, &data);
-    expression(&mut out, "immediate", &immediate);
+    expression(out, "immediate", &immediate);
+}
+fn carrier_expressions(key: super::packet::FlowKey, mark: u32) -> Vec<u8> {
+    let mut out=socket_matches(key,mark);
+    verdict_expression(&mut out,1);
     out
+}
+
+fn register_value(out:&mut Vec<u8>,value:&[u8]) {
+    let mut data=Vec::new();
+    attr(&mut data,1,&1u32.to_be_bytes()); // NFT_REG_1
+    let mut nested=Vec::new();
+    attr(&mut nested,1,value);
+    attr(&mut data,2|NESTED,&nested);
+    expression(out,"immediate",&data);
+}
+fn set_skb_mark(out:&mut Vec<u8>,mark:u32) {
+    register_value(out,&mark.to_ne_bytes());
+    let mut data=Vec::new();
+    attr(&mut data,2,&3u32.to_be_bytes()); // NFT_META_MARK
+    attr(&mut data,3,&1u32.to_be_bytes()); // NFTA_META_SREG
+    expression(out,"meta",&data);
+}
+fn redirect_chain(journal:&Journal,name:&str,kind:&str,hook:u32,priority:i32,policy:u32,sequence:u32)->Vec<u8> {
+    let mut chain=Vec::new();
+    name_attr(&mut chain,1,&journal.name());
+    name_attr(&mut chain,3,name);
+    name_attr(&mut chain,7,kind);
+    let mut hook_data=Vec::new();
+    attr(&mut hook_data,1,&hook.to_be_bytes());
+    attr(&mut hook_data,2,&priority.to_be_bytes());
+    attr(&mut chain,4|NESTED,&hook_data);
+    attr(&mut chain,5,&policy.to_be_bytes());
+    nft_message(NEW_CHAIN,REQUEST|ACK|CREATE_EXCLUSIVE,sequence,&chain)
+}
+fn push_rule(messages:&mut Vec<Vec<u8>>,journal:&Journal,chain:&str,expressions:&[u8]) {
+    let mut attrs=Vec::new();
+    name_attr(&mut attrs,1,&journal.name());
+    name_attr(&mut attrs,2,chain);
+    attr(&mut attrs,4|NESTED,expressions);
+    messages.push(nft_message(NEW_RULE,REQUEST|ACK|CREATE_EXCLUSIVE|APPEND,
+        messages.len() as u32+2,&attrs));
+}
+fn redirect_egress_rules(messages:&mut Vec<Vec<u8>>,journal:&Journal,scope:RedirectScope,
+    admissions:&std::collections::BTreeMap<u32,super::packet::FlowKey>) {
+    // All three gates are replaced atomically. The postrouting hook sees
+    // the effective output interface after the LOCAL_OUT route lookup.
+    for (&mark,&key) in admissions {
+        let mut route=socket_matches(key,mark);
+        set_skb_mark(&mut route,mark);
+        verdict_expression(&mut route,1);
+        push_rule(messages,journal,"route_out",&route);
+        push_rule(messages,journal,"output",&carrier_expressions(key,mark));
+        let mut post=Vec::new();
+        meta_cmp(&mut post,3,&mark.to_ne_bytes());
+        tuple_matches(&mut post,key);
+        verdict_expression(&mut post,1);
+        push_rule(messages,journal,"egress",&post);
+    }
+    // Ordinary traffic to a local service remains in the explicitly
+    // excluded local scope. Reset its packet mark, never trust user marks.
+    let mut local=Vec::new();
+    meta_cmp(&mut local,5,&scope.loopback.to_ne_bytes());
+    set_skb_mark(&mut local,0);
+    verdict_expression(&mut local,1);
+    push_rule(messages,journal,"route_out",&local);
+    for protocol in [6u8,17] {
+        let mut route=Vec::new();
+        meta_cmp(&mut route,16,&[protocol]);
+        set_skb_mark(&mut route,REDIRECT_MARK);
+        verdict_expression(&mut route,1);
+        push_rule(messages,journal,"route_out",&route);
+    }
+    let mut local=Vec::new();
+    meta_cmp(&mut local,5,&scope.loopback.to_ne_bytes());
+    verdict_expression(&mut local,1);
+    push_rule(messages,journal,"output",&local);
+    push_rule(messages,journal,"egress",&local);
+    // LOCAL_OUT may still expose its original state->out after reroute.
+    // The following is not an external permit: postrouting checks the
+    // actual device and admits only loopback or exact carrier traffic.
+    let mut rerouted=Vec::new();
+    meta_cmp(&mut rerouted,3,&REDIRECT_MARK.to_ne_bytes());
+    verdict_expression(&mut rerouted,1);
+    push_rule(messages,journal,"output",&rerouted);
+}
+fn redirect_install(journal:&Journal,scope:RedirectScope,
+    admissions:&std::collections::BTreeMap<u32,super::packet::FlowKey>)->Vec<Vec<u8>> {
+    let mut table=Vec::new();
+    name_attr(&mut table,1,&journal.name());
+    attr(&mut table,6,&journal.nonce);
+    let mut messages=vec![nft_message(NEW_TABLE,REQUEST|ACK|CREATE_EXCLUSIVE,2,&table)];
+    // Forwarding is outside desktop ingress. Deny it in this isolated
+    // namespace; never allow a failed reroute to forward a packet.
+    for (name,kind,hook,priority,policy) in [
+        ("route_out","route",3,-150,0),("output","filter",3,0,0),
+        ("redirect_in","filter",0,-150,1),("egress","filter",4,0,0),
+        ("forward","filter",2,0,0),
+    ] {
+        messages.push(redirect_chain(journal,name,kind,hook,priority,policy,messages.len() as u32+2));
+    }
+    redirect_egress_rules(&mut messages,journal,scope,admissions);
+    for protocol in [6u8,17] {
+        let mut expressions=Vec::new();
+        meta_cmp(&mut expressions,4,&scope.loopback.to_ne_bytes());
+        meta_cmp(&mut expressions,3,&REDIRECT_MARK.to_ne_bytes());
+        meta_cmp(&mut expressions,16,&[protocol]);
+        register_value(&mut expressions,&scope.port.to_be_bytes());
+        let mut tproxy=Vec::new();
+        attr(&mut tproxy,1,&0u32.to_be_bytes()); // NFPROTO_UNSPEC, port only
+        attr(&mut tproxy,3,&1u32.to_be_bytes()); // NFTA_TPROXY_REG_PORT
+        expression(&mut expressions,"tproxy",&tproxy);
+        verdict_expression(&mut expressions,1);
+        push_rule(&mut messages,journal,"redirect_in",&expressions);
+    }
+    // No listener or failed tproxy expression: do not deliver normally.
+    let mut deny=Vec::new();
+    meta_cmp(&mut deny,3,&REDIRECT_MARK.to_ne_bytes());
+    verdict_expression(&mut deny,0);
+    push_rule(&mut messages,journal,"redirect_in",&deny);
+    messages
+}
+fn redirect_replace(journal:&Journal,scope:RedirectScope,
+    admissions:&std::collections::BTreeMap<u32,super::packet::FlowKey>)->Vec<Vec<u8>> {
+    let mut messages=Vec::new();
+    for chain in ["route_out","output","egress"] {
+        let mut attrs=Vec::new();
+        name_attr(&mut attrs,1,&journal.name());
+        name_attr(&mut attrs,2,chain);
+        messages.push(nft_message(DEL_RULE,REQUEST|ACK,messages.len() as u32+2,&attrs));
+    }
+    redirect_egress_rules(&mut messages,journal,scope,admissions);
+    messages
+}
+
+fn loopback_index()->io::Result<u32> {
+    let index=unsafe {libc::if_nametoindex(c"lo".as_ptr())};
+    if index==0 {Err(io::Error::last_os_error())} else {Ok(index)}
+}
+
+/// Verify the pre-provisioned policy routing from the actual kernel,
+/// without making a network connection or writing host routing rules.
+/// These are readiness probes, not authority to bypass the egress guard.
+fn marked_route_is_local(destination:std::net::IpAddr,loopback:u32)->io::Result<bool> {
+    let raw=unsafe {libc::socket(libc::AF_NETLINK,libc::SOCK_RAW|libc::SOCK_CLOEXEC,libc::NETLINK_ROUTE)};
+    if raw<0 {return Err(io::Error::last_os_error());}
+    let fd=unsafe {OwnedFd::from_raw_fd(raw)};
+    let local=kernel_address();
+    if unsafe {libc::bind(fd.as_raw_fd(),(&local as *const libc::sockaddr_nl).cast(),
+        mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t)}!=0 {
+        return Err(io::Error::last_os_error());
+    }
+    let timeout=libc::timeval{tv_sec:0,tv_usec:250_000};
+    for option in [libc::SO_RCVTIMEO,libc::SO_SNDTIMEO] {
+        if unsafe {libc::setsockopt(fd.as_raw_fd(),libc::SOL_SOCKET,option,
+            (&timeout as *const libc::timeval).cast(),mem::size_of_val(&timeout) as libc::socklen_t)}!=0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    let (family,prefix,address)=match destination {
+        std::net::IpAddr::V4(ip)=>(libc::AF_INET as u8,32,ip.octets().to_vec()),
+        std::net::IpAddr::V6(ip)=>(libc::AF_INET6 as u8,128,ip.octets().to_vec()),
+    };
+    let mut body=vec![family,prefix,0,0,0,0,0,0,0,0,0,0]; // rtmsg
+    attr(&mut body,1,&address); // RTA_DST
+    attr(&mut body,16,&REDIRECT_MARK.to_ne_bytes()); // RTA_MARK
+    let mut request=Vec::new();
+    request.extend_from_slice(&((16+body.len()) as u32).to_ne_bytes());
+    request.extend_from_slice(&26u16.to_ne_bytes()); // RTM_GETROUTE
+    request.extend_from_slice(&REQUEST.to_ne_bytes());
+    request.extend_from_slice(&1u32.to_ne_bytes());
+    request.extend_from_slice(&0u32.to_ne_bytes());
+    request.extend_from_slice(&body);
+    send(fd.as_raw_fd(),&request)?;
+    let mut bytes=[0u8;8192];
+    let length=receive(fd.as_raw_fd(),&mut bytes)?;
+    let (kind,sequence,body)=checked_header(&bytes[..length])?;
+    if kind==2 {return Err(ack_error(body)?.ok_or_else(invalid)?);}
+    if kind!=24 || sequence!=1 || body.len()<12 || body[0]!=family {return Err(invalid());}
+    if body[7]!=2 {return Ok(false);} // RTN_LOCAL
+    let mut rest=&body[12..];
+    let mut output=None;
+    while let Some((kind,value))=next_attr(&mut rest)? {
+        if kind==4 {
+            if output.is_some() || value.len()!=4 {return Err(invalid());}
+            output=Some(u32::from_ne_bytes(value.try_into().map_err(|_|invalid())?));
+        }
+    }
+    Ok(output==Some(loopback))
+}
+fn redirect_routes_ready(scope:RedirectScope)->io::Result<bool> {
+    if loopback_index()?!=scope.loopback {return Ok(false);}
+    for address in ["198.51.100.2","203.0.113.2","2001:db8:2::2","2001:db8:3::2"] {
+        if !marked_route_is_local(address.parse().map_err(|_|invalid())?,scope.loopback)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn parse_journal(bytes: &[u8], scope: &Scope) -> io::Result<Journal> {
@@ -569,7 +782,7 @@ pub struct LabRules {
 impl LabRules {
     pub(crate) fn owns_queue(&self, queue: &Queue) -> io::Result<bool> {
         queue.number()?;
-        if queue.identity() != self.queue_identity {
+        if self.journal.redirect.is_some() || queue.identity() != self.queue_identity {
             return Ok(false);
         }
         self.current()
@@ -606,7 +819,7 @@ impl LabRules {
     }
 
     pub(crate) fn owns_packet(&self, packet: &super::nfqueue::Packet<'_>) -> io::Result<bool> {
-        if packet.queue_identity() != self.queue_identity {
+        if self.journal.redirect.is_some() || packet.queue_identity() != self.queue_identity {
             return Ok(false);
         }
         self.current()
@@ -647,6 +860,7 @@ impl LabRules {
     /// provenance. Deny a reserved tuple arriving on the catch-all.
     pub(crate) fn packet_evidence(&self,packet:&super::nfqueue::Packet<'_>)
         ->io::Result<Option<CapturedSocket>> {
+        if self.journal.redirect.is_some() {return Err(refused());}
         if packet.queue_identity()==self.queue_identity {
             if !self.current()? {return Err(refused());}
             if let (Some(tag),Some(meta))=(&self.capture,packet.metadata()) {
@@ -684,6 +898,7 @@ impl LabRules {
                 queue_number,
                 queue_identity: tagged.identity(),
             }),
+            None,
         )
     }
 
@@ -707,7 +922,22 @@ impl LabRules {
         path: &Path,
         carriers: Vec<LabCarrierSocket>,
     ) -> io::Result<Self> {
-        Self::install_inner(queue, host_namespace, path, carriers, None)
+        Self::install_inner(queue, host_namespace, path, carriers, None,None)
+    }
+
+    /// Managed all-destination TCP/UDP redirect in a dedicated namespace.
+    /// The caller provisions and owns policy routes for REDIRECT_MARK;
+    /// this transaction changes only its journaled inet table.
+    pub fn install_redirect(queue:&Queue,host_namespace:&File,path:&Path,port:u16)->io::Result<Self> {
+        let scope=RedirectScope{port,loopback:loopback_index()?};
+        Scope::current(host_namespace)?;
+        if port==0 || !redirect_routes_ready(scope)? {return Err(refused());}
+        Self::install_inner(queue,host_namespace,path,Vec::new(),None,Some(scope))
+    }
+
+    pub(crate) fn redirect_ready(&self,port:u16)->io::Result<bool> {
+        let Some(scope)=self.journal.redirect else {return Ok(false);};
+        Ok(scope.port==port && self.current()? && redirect_routes_ready(scope)?)
     }
 
     fn install_inner(
@@ -716,11 +946,12 @@ impl LabRules {
         path: &Path,
         carriers: Vec<LabCarrierSocket>,
         capture: Option<SocketCapture>,
+        redirect: Option<RedirectScope>,
     ) -> io::Result<Self> {
         let lock = scope_lock()?;
         let scope = Scope::current(host_namespace)?;
         check_parent(path)?;
-        if carriers.len() > MAX_CARRIERS || (capture.is_some() && !carriers.is_empty()) {
+        if carriers.len() > MAX_CARRIERS || (capture.is_some() && (!carriers.is_empty() || redirect.is_some())) {
             return Err(refused());
         }
         let mut marks = std::collections::HashSet::new();
@@ -765,13 +996,17 @@ impl LabRules {
             before,
             installed,
             previous_present: false,
+            redirect,
             restored: false,
         };
         if net.table(&journal)? || net.generation()? != before {
             return Err(refused());
         }
         let queue_number = queue.number()?;
-        let mut operations = install_messages(&journal, queue_number, &carriers);
+        let mut operations=match redirect {
+            Some(scope)=>redirect_install(&journal,scope,&carriers.iter().map(|socket|(socket.mark(),socket.key())).collect()),
+            None=>install_messages(&journal,queue_number,&carriers),
+        };
         if let Some(tag) = &capture {
             let mut last = operations.pop().ok_or_else(invalid)?;
             operations.push(socket_capture_rule(
@@ -831,7 +1066,10 @@ impl LabRules {
         next.before = generation;
         next.installed = generation.checked_add(1).ok_or_else(refused)?;
         next.previous_present = true;
-        let mut operations=replace_messages(&next,self.queue_number,&next_admissions);
+        let mut operations=match next.redirect {
+            Some(scope)=>redirect_replace(&next,scope,&next_admissions),
+            None=>replace_messages(&next,self.queue_number,&next_admissions),
+        };
         if let Some(tag)=&self.capture {
             let mut last=operations.pop().ok_or_else(invalid)?;
             operations.push(socket_capture_rule(&next,tag.socket.key(),tag.socket.mark(),
@@ -857,6 +1095,7 @@ impl LabRules {
     fn admit(&mut self, socket: Arc<LabCarrierSocket>) -> io::Result<()> {
         if self.carrier_retired || self.poisoned || self.admissions.len() >= MAX_CARRIERS
             || self.used_marks.len() >= MAX_CARRIER_EPOCH
+            || socket.mark()==REDIRECT_MARK
             || self.used_marks.contains(&socket.mark())
             || self.used_cookies.contains(&socket.cookie())
             || self.capture.as_ref().is_some_and(|tag|tag.socket.key()==socket.key())
@@ -1145,6 +1384,7 @@ mod tests {
             before: 12,
             installed: 13,
             previous_present: false,
+            redirect: None,
             restored: false,
         }
     }

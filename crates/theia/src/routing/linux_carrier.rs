@@ -204,7 +204,7 @@ impl LabCarrierSocket {
         let mut bytes = [0u8; 4];
         SystemRandom::new().fill(&mut bytes).map_err(|_| denied())?;
         let mark = u32::from_ne_bytes(bytes);
-        if mark == 0 {
+        if mark == 0 || mark==super::linux_rules::REDIRECT_MARK {
             return Err(denied());
         }
         let lease = Self {
