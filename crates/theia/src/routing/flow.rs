@@ -199,6 +199,17 @@ pub(crate) struct FlowLease {
 }
 
 impl FlowLease {
+    /// Native egress is authorized only while its pinned policy is live.
+    /// Compatibility flows deliberately retain their prior drain semantics.
+    /// This does not change the irreversible first-send action.
+    pub(crate) fn check_live(&self,action:PacketAction)->Result<(),ClientError> {
+        if self.identity.native.is_some() {
+            self.engine.check_policy(self.identity.digest)?;
+            if action==PacketAction::Modify && !self.engine.enabled() {return Err(denied());}
+        }
+        Ok(())
+    }
+
     /// Check a live native flow against its pinned policy and configured
     /// action without committing payload. This is not a kernel identity.
     #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
@@ -217,6 +228,7 @@ impl FlowLease {
 
     #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
     pub(crate) fn committed(&self, action: PacketAction) -> bool {
+        if self.check_live(action).is_err() {return false;}
         self.table
             .state
             .lock()
@@ -240,7 +252,7 @@ impl FlowLease {
         }
         if let Some(committed) = entry.committed {
             return if committed == action {
-                Ok(())
+                self.check_live(action)
             } else {
                 Err(denied())
             };
@@ -275,7 +287,8 @@ impl Drop for FlowLease {
 }
 
 /// A cheap local latch, used directly at the actual egress writer.
-/// Only the first send acquires the shared table lock.
+/// Only the first send acquires the shared table lock. Native writes
+/// also revalidate the pinned policy on each subsequent attempt.
 pub(crate) struct FirstSend<'a> {
     flow: Option<&'a FlowLease>,
     action: PacketAction,
@@ -290,12 +303,14 @@ impl<'a> FirstSend<'a> {
         }
     }
     pub(crate) fn attempt(&mut self) -> Result<(), ClientError> {
-        if !self.started {
-            if let Some(flow) = self.flow {
+        if let Some(flow)=self.flow {
+            if !self.started {
                 flow.commit(self.action)?;
+            } else {
+                flow.check_live(self.action)?;
             }
-            self.started = true;
         }
+        self.started=true;
         Ok(())
     }
 }
@@ -394,6 +409,25 @@ mod tests {
         assert!(table
             .begin_native(engine, key, [1; 32], PacketAction::Redirect)
             .is_ok());
+    }
+
+    #[test]
+    fn native_committed_flow_stops_writes_on_policy_revocation() {
+        let (table,engine)=setup();
+        let key=FlowKey {
+            source:"192.0.2.1:1234".parse().unwrap(),
+            destination:"198.51.100.1:443".parse().unwrap(),
+            transport:super::super::packet::Transport::Tcp,
+            interface:1,
+        };
+        let flow=table.begin_native(engine.clone(),key,[1;32],PacketAction::Modify).unwrap();
+        let mut send=FirstSend::new(Some(&flow),PacketAction::Modify);
+        send.attempt().unwrap();
+        engine.authorize_policy(None);
+        assert!(send.attempt().is_err());
+        assert!(flow.commit(PacketAction::Modify).is_err());
+        assert!(flow.commit(PacketAction::Redirect).is_err());
+        assert!(flow.check_live(PacketAction::Modify).is_err());
     }
 
     #[test]

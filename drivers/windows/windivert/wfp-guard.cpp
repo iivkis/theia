@@ -302,6 +302,169 @@ State inspect_all(HANDLE engine,const std::vector<Plan>& plans) {
     }
     return all_absent?State::absent:all_exact?State::exact:State::conflict;
 }
+// Owned-object change notifications are asynchronous and lossy. Use them
+// as a terminal alarm, in addition to fresh exact read transactions.
+// The callback never invokes BFE or touches the child process.
+struct WatchContext {
+    std::vector<GUID> keys;
+    HANDLE changed=nullptr;
+    void notify(const GUID& key) const {
+        for(const auto& owned:keys) {
+            if(eq(key,owned)) { SetEvent(changed); return; }
+        }
+    }
+};
+// Process-lifetime storage avoids use-after-free even if RPC
+// unsubscribe fails during service teardown.
+// Intentionally process-lifetime storage. Even a failed unsubscribe
+// cannot call into destructed C++ storage during shutdown.
+WatchContext& watch_context=*new WatchContext;
+void CALLBACK filter_changed(void* context,const FWPM_FILTER_CHANGE0* change) {
+    auto* watch=static_cast<WatchContext*>(context);
+    if(change) watch->notify(change->filterKey);
+    else SetEvent(watch->changed);
+}
+void CALLBACK sublayer_changed(void* context,const FWPM_SUBLAYER_CHANGE0* change) {
+    auto* watch=static_cast<WatchContext*>(context);
+    if(change) watch->notify(change->subLayerKey);
+    else SetEvent(watch->changed);
+}
+struct Watch {
+    HANDLE engine;
+    HANDLE filters=nullptr,sublayers=nullptr;
+    explicit Watch(HANDLE e):engine(e) {}
+    void start(const std::vector<Plan>& plans) {
+        require(!watch_context.changed);
+        for(const auto& p:plans) {
+            watch_context.keys.push_back(p.sub);
+            for(size_t i=0;i<p.count();++i) watch_context.keys.push_back(p.filters[i]);
+        }
+        watch_context.changed=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+        if(!watch_context.changed) throw Failure{GetLastError()};
+        FWPM_FILTER_SUBSCRIPTION0 filter{};
+        filter.flags=FWPM_SUBSCRIPTION_FLAG_NOTIFY_ON_ADD|FWPM_SUBSCRIPTION_FLAG_NOTIFY_ON_DELETE;
+        check(FwpmFilterSubscribeChanges0(engine,&filter,filter_changed,&watch_context,&filters));
+        FWPM_SUBLAYER_SUBSCRIPTION0 sub{};
+        sub.flags=filter.flags;
+        check(FwpmSubLayerSubscribeChanges0(engine,&sub,sublayer_changed,&watch_context,&sublayers));
+    }
+    ~Watch() {
+        if(sublayers) FwpmSubLayerUnsubscribeChanges0(engine,sublayers);
+        if(filters) FwpmFilterUnsubscribeChanges0(engine,filters);
+        // Keep callback state and its event alive until process exit.
+    }
+    void current() const {
+        require(WaitForSingleObject(watch_context.changed,0)==WAIT_TIMEOUT);
+    }
+};
+struct Handle {
+    HANDLE value=nullptr;
+    ~Handle(){if(value) CloseHandle(value);}
+    Handle()=default;
+    Handle(const Handle&)=delete;
+    Handle& operator=(const Handle&)=delete;
+};
+std::wstring quote_argument(const wchar_t* arg) {
+    // Standard CRT quoting: reject embedded quotes/control characters
+    // and double trailing backslashes before the final quote.
+    std::wstring value(arg);
+    require(value.find_first_of(L"\"\r\n")==std::wstring::npos);
+    size_t slash=0;
+    for(size_t i=value.size();i>0 && value[i-1]==L'\\';--i) ++slash;
+    return L"\""+value+std::wstring(slash,L'\\')+L"\"";
+}
+ULONGLONG parse_decimal(const wchar_t* text) {
+    ULONGLONG value=0;
+    require(*text!=0);
+    for(const wchar_t* p=text;*p;++p) {
+        require(*p>=L'0' && *p<=L'9');
+        const auto digit=static_cast<ULONGLONG>(*p-L'0');
+        require(value<=(~ULONGLONG{0}-digit)/10);
+        value=value*10+digit;
+    }
+    return value;
+}
+void supervised_redirect(HANDLE engine,const std::vector<Plan>& plans,
+                         const wchar_t* parent_pid,const wchar_t* parent_created,
+                         int count,wchar_t** args) {
+    require(count==19 && wcscmp(args[1],L"client")==0 &&
+        wcscmp(args[2],L"windivert")==0 &&
+        wcscmp(args[3],L"--interface-redirect-lab")==0 &&
+        wcscmp(args[18],L"--confirm-isolated-two-interface")==0);
+    // Tie the supervisor to the exact wrapper process, whose protected
+    // file leases and ownership lock must remain live. A recycled PID
+    // cannot satisfy the creation-time identity.
+    Handle parent;
+    const auto pid=parse_decimal(parent_pid);
+    require(pid>0 && pid<=MAXDWORD);
+    parent.value=OpenProcess(SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION,FALSE,static_cast<DWORD>(pid));
+    if(!parent.value) throw Failure{GetLastError()};
+    FILETIME creation{},exit_time{},kernel{},user{};
+    if(!GetProcessTimes(parent.value,&creation,&exit_time,&kernel,&user)) throw Failure{GetLastError()};
+    const ULONGLONG created=(static_cast<ULONGLONG>(creation.dwHighDateTime)<<32)|creation.dwLowDateTime;
+    require(created==parse_decimal(parent_created));
+
+    // Subscribe before the first exact read; never reset an alarm.
+    Watch watch(engine);
+    watch.start(plans);
+    auto inspect_current=[&]() {
+        watch.current();
+        require(WaitForSingleObject(parent.value,0)==WAIT_TIMEOUT);
+        for(const auto& p:plans) verify_interface(p);
+        Transaction tx(engine,true);
+        require(inspect_all(engine,plans)==State::exact);
+        tx.commit();
+        watch.current();
+        require(WaitForSingleObject(parent.value,0)==WAIT_TIMEOUT);
+    };
+    inspect_current();
+
+    // The supervisor owns the job for the entire lifetime. Closing its
+    // handle, including on hard-kill, terminates the child. No detached
+    // redirect can survive the supervisor; persistent Guard is unchanged.
+    Handle job,process,thread;
+    job.value=CreateJobObjectW(nullptr,nullptr);
+    if(!job.value) throw Failure{GetLastError()};
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags=JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if(!SetInformationJobObject(job.value,JobObjectExtendedLimitInformation,&limits,static_cast<DWORD>(sizeof(limits))))
+        throw Failure{GetLastError()};
+    std::wstring command;
+    for(int i=0;i<count;++i) {
+        if(i) command+=L" ";
+        command+=quote_argument(args[i]);
+    }
+    STARTUPINFOW startup{};
+    startup.cb=static_cast<DWORD>(sizeof(startup));
+    PROCESS_INFORMATION pi{};
+    if(!CreateProcessW(args[0],command.data(),nullptr,nullptr,FALSE,
+        CREATE_SUSPENDED,nullptr,nullptr,&startup,&pi)) throw Failure{GetLastError()};
+    process.value=pi.hProcess;
+    thread.value=pi.hThread;
+    if(!AssignProcessToJobObject(job.value,process.value)) {
+        const DWORD error=GetLastError();
+        TerminateProcess(process.value,1);
+        throw Failure{error};
+    }
+    inspect_current();
+    require(ResumeThread(thread.value)!=static_cast<DWORD>(-1));
+    const ULONGLONG deadline=GetTickCount64()+150000;
+    const HANDLE waits[]={watch_context.changed,parent.value,process.value};
+    for(;;) {
+        require(GetTickCount64()<deadline);
+        const DWORD result=WaitForMultipleObjects(3,waits,FALSE,250);
+        if(result==WAIT_OBJECT_0+2) {
+            DWORD code=1;
+            require(GetExitCodeProcess(process.value,&code)!=0 && code==0);
+            inspect_current();
+            std::wprintf(L"supervised-redirect-exact\n");
+            return;
+        }
+        require(result==WAIT_TIMEOUT);
+        inspect_current();
+    }
+}
+
 const wchar_t* status_name(State s) {
     switch(s) {
         case State::absent:return L"absent";
@@ -389,6 +552,30 @@ void self_test() {
     bool rejected=false;
     try { (void)parse_luid(L"0000000000000000"); } catch(const Failure&) { rejected=true; }
     require(rejected);
+    require(parse_decimal(L"18446744073709551615")==~ULONGLONG{0});
+    rejected=false;
+    try { (void)parse_decimal(L"18446744073709551616"); } catch(const Failure&) { rejected=true; }
+    require(rejected);
+    require(quote_argument(L"C:\\test path\\")==L"\"C:\\test path\\\\\"");
+    rejected=false;
+    try { (void)quote_argument(L"a\"b"); } catch(const Failure&) { rejected=true; }
+    require(rejected);
+    // Test the sticky notification latch without modifying BFE.
+    Handle signal;
+    signal.value=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+    require(signal.value!=nullptr);
+    const auto key=fresh_guid();
+    WatchContext local{{key},signal.value};
+    FWPM_FILTER_CHANGE0 f{};
+    f.filterKey=fresh_guid();
+    filter_changed(&local,&f);
+    require(WaitForSingleObject(signal.value,0)==WAIT_TIMEOUT);
+    FWPM_SUBLAYER_CHANGE0 sub{};
+    sub.subLayerKey=key;
+    sublayer_changed(&local,&sub);
+    require(WaitForSingleObject(signal.value,0)==WAIT_OBJECT_0);
+    filter_changed(&local,&f);
+    require(WaitForSingleObject(signal.value,0)==WAIT_OBJECT_0);
     std::wprintf(L"self-test passed (no OS mutation)\n");
 }
 }
@@ -412,18 +599,27 @@ int wmain(int argc,wchar_t** argv) {
             return 0;
         }
         // Only the protected journal wrapper should call these commands.
-        require(argc>=9 && wcscmp(argv[argc-1],L"isolated-test-machine")==0);
+        require(argc>=9);
         std::wstring mode=argv[1];
+        const bool supervise=mode==L"watch-redirect" || mode==L"watch-redirect-many";
+        int plan_end=argc-1;
+        if(supervise) {
+            mode=mode==L"watch-redirect-many"?L"inspect-many":L"inspect";
+            // Fixed child argument count, including executable path.
+            plan_end=argc-22;
+            require(plan_end>=8);
+        }
+        require(wcscmp(argv[plan_end],L"isolated-test-machine")==0);
         std::vector<Plan> plans;
         if(mode==L"install-many" || mode==L"inspect-many" || mode==L"recover-many") {
             mode.resize(mode.size()-5);
             const bool boot=wcscmp(argv[2],L"boot")==0;
             require(boot || wcscmp(argv[2],L"persistent")==0);
             const int width=boot?8:6;
-            require((argc-4)%width==0 && (argc-4)/width>=1 && (argc-4)/width<=8);
-            for(int offset=3;offset<argc-1;offset+=width) plans.push_back(parse_plan(argv+offset,boot));
+            require((plan_end-3)%width==0 && (plan_end-3)/width>=1 && (plan_end-3)/width<=8);
+            for(int offset=3;offset<plan_end;offset+=width) plans.push_back(parse_plan(argv+offset,boot));
         } else {
-            require(argc==9);
+            require(plan_end==8);
             plans.push_back(parse_plan(argv+2,false));
         }
         require(mode==L"install" || mode==L"inspect" || mode==L"recover");
@@ -433,6 +629,11 @@ int wmain(int argc,wchar_t** argv) {
         // interface change, but cannot delete a partial or foreign set.
         if(mode!=L"recover") verify_all();
         Engine engine;
+        if(supervise) {
+            supervised_redirect(engine.value,plans,argv[plan_end+1],argv[plan_end+2],
+                argc-plan_end-3,argv+plan_end+3);
+            return 0;
+        }
         Transaction tx(engine.value,mode==L"inspect");
         const auto before=inspect_all(engine.value,plans);
         if(mode==L"install") {

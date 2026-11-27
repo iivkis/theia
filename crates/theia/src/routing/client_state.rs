@@ -390,6 +390,7 @@ impl DirectRelayError {
         }
     }
 }
+#[allow(clippy::too_many_arguments)]
 async fn copy_direction(
     mut input: impl AsyncRead + Unpin,
     mut output: impl AsyncWrite + Unpin,
@@ -398,8 +399,9 @@ async fn copy_direction(
     upload: bool,
     evidence: Option<&ExchangeEvidence>,
     flow: Option<&super::flow::FlowLease>,
+    action:super::PacketAction,
 ) -> Result<(), DirectRelayError> {
-    let mut first_send = super::flow::FirstSend::new(flow, super::PacketAction::Pass);
+    let mut first_send = super::flow::FirstSend::new(flow, action);
     let mut bytes = [0u8; 16 * 1024];
     loop {
         let count = input
@@ -418,6 +420,8 @@ async fn copy_direction(
             first_send
                 .attempt()
                 .map_err(|error| DirectRelayError { error, peer: false })?;
+        } else if let Some(flow)=flow {
+            flow.check_live(action).map_err(|error|DirectRelayError{error,peer:false})?;
         }
         output
             .write_all(&bytes[..count])
@@ -445,7 +449,7 @@ pub(crate) async fn relay_direct_guarded(
     target: TcpStream,
     flow: Option<&super::flow::FlowLease>,
 ) -> Result<(), ClientError> {
-    relay_direct_inner(client, target, 0, 0, flow).await.0
+    relay_direct_inner(client,target,0,0,flow,super::PacketAction::Pass).await.0
 }
 
 pub(crate) async fn relay_direct_after_first(
@@ -453,8 +457,9 @@ pub(crate) async fn relay_direct_after_first(
     target: TcpStream,
     upload: usize,
     download: usize,
+    flow:Option<&super::flow::FlowLease>,
 ) -> (Result<(), ClientError>, bool, bool) {
-    relay_direct_inner(client, target, upload, download, None).await
+    relay_direct_inner(client,target,upload,download,flow,super::PacketAction::Modify).await
 }
 
 async fn relay_direct_inner(
@@ -463,6 +468,7 @@ async fn relay_direct_inner(
     upload: usize,
     download: usize,
     flow: Option<&super::flow::FlowLease>,
+    action:super::PacketAction,
 ) -> (Result<(), ClientError>, bool, bool) {
     let meter = crate::traffic::enter_direct();
     meter.upload(upload);
@@ -474,8 +480,8 @@ async fn relay_direct_inner(
     let (tr, tw) = target.into_split();
     let result = activity
         .run(
-            copy_direction(cr, tw, &activity, &meter, true, evidence.as_ref(), flow),
-            copy_direction(tr, cw, &activity, &meter, false, evidence.as_ref(), None),
+            copy_direction(cr, tw, &activity, &meter, true, evidence.as_ref(), flow,action),
+            copy_direction(tr, cw, &activity, &meter, false, evidence.as_ref(), flow,action),
             DirectRelayError {
                 error: ClientError::Timeout,
                 peer: false,

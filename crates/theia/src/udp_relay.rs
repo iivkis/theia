@@ -384,18 +384,17 @@ async fn relay_local_batch(
             }
             None => vec![data.clone()],
         };
-        first_send.attempt().map_err(LocalRelayError::Application)?;
         // One deadline for the entire actual emission. Failure/cancellation
         // after any attempt is terminal; no replay of the original flight.
         timeout(deadline, async {
             for part in &parts {
-                send_datagram(socket, part).await?;
+                first_send.attempt().map_err(LocalRelayError::Application)?;
+                send_datagram(socket, part).await.map_err(|_|LocalRelayError::Peer(ClientError::Io))?;
             }
-            Ok::<(), io::Error>(())
+            Ok::<(), LocalRelayError>(())
         })
         .await
-        .map_err(|_| LocalRelayError::Peer(ClientError::Timeout))?
-        .map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
+        .map_err(|_| LocalRelayError::Peer(ClientError::Timeout))??;
         traffic.upload(data.len());
         crate::traffic::udp_verified_local();
         activity.touch();
@@ -428,6 +427,10 @@ async fn relay_local_batch(
             }
             if waiting.take().is_some() {
                 crate::traffic::udp_peer_reply();
+            }
+            if let Some(flow)=flow {
+                flow.check_live(if verification_deadline.is_some(){PacketAction::Modify}else{PacketAction::Pass})
+                    .map_err(LocalRelayError::Application)?;
             }
             if deliver(&download, || buf[..n].to_vec()).map_err(LocalRelayError::Application)? {
                 traffic.download(n);
@@ -489,6 +492,9 @@ async fn relay_stun(
             }
             let packet = prepare_binding(&data, strategy)
                 .ok_or(LocalRelayError::Application(ClientError::Protocol))?;
+            if let Some(flow)=flow {
+                flow.check_live(crate::routing::PacketAction::Modify).map_err(LocalRelayError::Application)?;
+            }
             send_datagram(socket, &packet)
                 .await
                 .map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
@@ -520,6 +526,9 @@ async fn relay_stun(
             }
             if waiting.take().is_some() {
                 crate::traffic::udp_peer_reply();
+            }
+            if let Some(flow)=flow {
+                flow.check_live(crate::routing::PacketAction::Modify).map_err(LocalRelayError::Application)?;
             }
             if deliver(&download, || buf[..n].to_vec()).map_err(LocalRelayError::Application)? {
                 traffic.download(n);

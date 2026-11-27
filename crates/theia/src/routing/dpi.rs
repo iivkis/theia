@@ -717,6 +717,7 @@ impl Tunnel {
                 crate::traffic::dpi_tls_alert();
                 // Forward the genuine alert; do not retry or manufacture a
                 // replacement response on a different connection.
+                if let Some(flow)=flow {flow.check_live(super::PacketAction::Modify)?;}
                 timeout(FIRST_FLIGHT, client.write_all(&alert))
                     .await
                     .map_err(|_| ClientError::Timeout)?
@@ -735,6 +736,7 @@ impl Tunnel {
                 return Err(ClientError::Timeout);
             }
         };
+        if let Some(flow)=flow {flow.check_live(super::PacketAction::Modify)?;}
         timeout(FIRST_FLIGHT, client.write_all(&response))
             .await
             .map_err(|_| ClientError::Timeout)?
@@ -746,6 +748,7 @@ impl Tunnel {
             self.target,
             prefix.len(),
             response.len(),
+            flow,
         )
         .await;
         // A ServerHello alone is insufficient evidence of usable application

@@ -2289,6 +2289,7 @@ struct RawLease {
     last: Instant,
     denied: bool,
     socket_cookie:Option<u64>,
+    dns_capture:crate::routing::native_dns::CapturedQueries,
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -3489,7 +3490,10 @@ impl NativeIngress {
         if let Some(meta)=meta {
             let key=crate::routing::packet::FlowKey{interface:0,..meta.flow};
             if let Ok(mut raw)=self.raw.lock() {
-                if let Some(entry)=raw.get_mut(&key) {entry.denied=true;}
+                if let Some(entry)=raw.get_mut(&key) {
+                    entry.denied=true;
+                    entry.dns_capture.retire();
+                }
             }
         }
     }
@@ -3526,6 +3530,36 @@ impl NativeIngress {
                     self.client.routing_cache().dpi.check_policy(entry.digest).is_ok()))
             });
             let action=if current && gate.is_ok() && self.ensure_accepting().is_ok(){action}else{PacketAction::Drop};
+            if action==PacketAction::Redirect {
+                if let Some(meta)=meta.filter(|m|m.flow.transport==crate::routing::packet::Transport::Udp
+                    && m.flow.destination.port()==53) {
+                    // Hold the raw lease mutex through publication and the
+                    // kernel verdict; TPROXY cannot consume the commitment
+                    // before the exact original datagram is redirected.
+                    let key=crate::routing::packet::FlowKey{interface:0,..meta.flow};
+                    let mut raw=self.raw.lock().map_err(|_|ClientError::Io)?;
+                    let entry=raw.get_mut(&key).ok_or(ClientError::Open(ErrorCode::PolicyDenied))?;
+                    let allowed=!entry.denied && entry.action==PacketAction::Redirect &&
+                        self.client.routing_cache().dpi.check_policy(entry.digest).is_ok() &&
+                        packet.bytes().len().checked_sub(meta.payload_len)
+                            .and_then(|offset|packet.bytes().get(offset..))
+                            .is_some_and(|payload|entry.dns_capture.record(payload));
+                    if !allowed {
+                        entry.denied=true;
+                        entry.dns_capture.retire();
+                        packet.finish_routed(PacketAction::Drop).map_err(|_|ClientError::Io)?;
+                        continue;
+                    }
+                    match packet.finish_routed(PacketAction::Redirect) {
+                        Ok(PacketAction::Redirect)=>continue,
+                        _=>{
+                            entry.denied=true;
+                            entry.dns_capture.retire();
+                            return Err(ClientError::Io);
+                        }
+                    }
+                }
+            }
             if action==PacketAction::Drop {self.deny_raw_packet(meta);}
             packet.finish_routed(action).map_err(|_|ClientError::Io)?;
         }
@@ -3589,7 +3623,9 @@ impl NativeIngress {
         // Port 53 is locally terminated for protected resolution; this
         // does not authorize the original resolver or infer a domain
         // for subsequent application flows.
-        let action=if unified && meta.flow.destination.port()==53 {PacketAction::Redirect}else{action};
+        let action=if meta.flow.destination.port()==53 {
+            if unified {PacketAction::Redirect} else {PacketAction::Drop}
+        } else {action};
         let current=action!=PacketAction::Drop && cache.dpi.check_policy(digest).is_ok();
         if let Some(entry) = raw.get_mut(&meta.flow) {
             entry.last = now;
@@ -3617,7 +3653,8 @@ impl NativeIngress {
             if flow.commit(PacketAction::Pass).is_err(){return PacketAction::Drop;}
             Some(flow)
         } else {None}; // Redirect owns its common FlowLease on accept.
-        raw.insert(meta.flow,RawLease{flow,action,digest,last:now,denied:false,socket_cookie});
+        raw.insert(meta.flow,RawLease{flow,action,digest,last:now,denied:false,socket_cookie,
+            dns_capture:Default::default()});
         action
     }
 
@@ -4126,6 +4163,22 @@ impl NativeIngress {
         self.ensure_accepting()?;
         if key.destination.port()!=53 {return Err(denied());}
         let question=Question::parse(query).ok_or(ClientError::Protocol)?;
+        // UDP delivered by Linux TPROXY must consume a one-shot capture
+        // commitment from the actual owned queue. Tuple alone is not
+        // sufficient. TCP is stream-terminated; it has no such proof.
+        #[cfg(target_os="linux")]
+        let capture_digest=if !tcp {
+            let key=crate::routing::packet::FlowKey{interface:0,..key};
+            let mut raw=self.raw.lock().map_err(|_|denied())?;
+            let entry=raw.get_mut(&key).ok_or_else(denied)?;
+            if entry.denied || entry.action!=PacketAction::Redirect ||
+                !entry.dns_capture.consume(query) {
+                entry.denied=true;
+                entry.dns_capture.retire();
+                return Err(denied());
+            }
+            Some(entry.digest)
+        } else {None};
         let registrar=self.registrar()?.ok_or_else(denied)?;
         crate::routing::carrier_socket::scope(Some(registrar),async {
             let (carrier,cache)=match &self.client {
@@ -4136,6 +4189,8 @@ impl NativeIngress {
             let digest=snapshot.digest();
             let failure=||ProtectedDnsAnswer{key,wire:question.failure(),digest,hint:None};
             let allowed=||->Result<(),ClientError>{
+                #[cfg(target_os="linux")]
+                if capture_digest.is_some_and(|pinned|pinned!=digest) {return Err(denied());}
                 if let Some((flow,pinned))=session {
                     if pinned!=digest {return Err(denied());}
                     flow.check_native(key,digest,PacketAction::Redirect)?;
@@ -7069,7 +7124,7 @@ mod selector_tests {
                             ingress
                                 .raw_verdict(meta("192.0.2.2:53", PacketTransport::Udp, None))
                                 .await,
-                            PacketAction::Pass
+                            PacketAction::Drop
                         );
                         for destination in [
                             "0.0.0.0:443",

@@ -47,6 +47,55 @@ impl ProbeHints {
     }
 }
 
+/// Per-flow, one-shot commitments to actual NFQUEUE UDP DNS payloads.
+/// Created only by the owned policy queue before the TPROXY verdict;
+/// consumed by the local resolver on exact delivery. The commitment is
+/// not a PID, socket cookie or application identity. Any loss, reorder,
+/// mismatch or timeout retires the flow instead of guessing provenance.
+#[cfg(target_os="linux")]
+#[derive(Default)]
+pub(crate) struct CapturedQueries {
+    pending:std::collections::VecDeque<([u8;32],Instant)>,
+    retired:bool,
+}
+#[cfg(target_os="linux")]
+impl CapturedQueries {
+    const LIMIT:usize=64;
+    const WINDOW:Duration=Duration::from_secs(10);
+
+    fn digest(bytes:&[u8])->[u8;32] {
+        use sha2::{Digest,Sha256};
+        Sha256::digest(bytes).into()
+    }
+    pub(crate) fn record(&mut self,bytes:&[u8])->bool {
+        self.record_at(bytes,Instant::now())
+    }
+    fn record_at(&mut self,bytes:&[u8],now:Instant)->bool {
+        if self.retired || self.pending.len()>=Self::LIMIT || Question::parse(bytes).is_none()
+            || self.pending.front().is_some_and(|(_,deadline)|*deadline<=now) {
+            self.retire();
+            return false;
+        }
+        self.pending.push_back((Self::digest(bytes),now+Self::WINDOW));
+        true
+    }
+    pub(crate) fn consume(&mut self,bytes:&[u8])->bool {
+        self.consume_at(bytes,Instant::now())
+    }
+    fn consume_at(&mut self,bytes:&[u8],now:Instant)->bool {
+        if self.retired || !self.pending.pop_front().is_some_and(|(digest,deadline)|
+            deadline>now && digest==Self::digest(bytes)) {
+            self.retire();
+            return false;
+        }
+        true
+    }
+    pub(crate) fn retire(&mut self) {
+        self.retired=true;
+        self.pending.clear();
+    }
+}
+
 pub(crate) const MAX_QUERY:usize=4096;
 const MAX_UDP:usize=1232;
 const MAX_TCP:usize=4096;
@@ -155,6 +204,32 @@ mod tests {
         assert!(hints.get_at(source,ip,[1;32],now+Duration::from_secs(5)).is_none());
         hints.record_at(source,[1;32],"two.example",&[ip],now+Duration::from_secs(4));
         assert!(hints.get_at(source,ip,[1;32],now+Duration::from_secs(4)).is_none());
+    }
+    #[cfg(target_os="linux")]
+    #[test]
+    fn captured_dns_is_exact_one_shot_ordered_and_bounded() {
+        let q=query();
+        let mut other=q.clone();
+        other[0]^=1; // same name, different transaction
+        let now=Instant::now();
+        let mut capture=CapturedQueries::default();
+        assert!(capture.record_at(&q,now));
+        assert!(capture.record_at(&other,now));
+        assert!(capture.consume_at(&q,now));
+        assert!(capture.consume_at(&other,now));
+        assert!(!capture.consume_at(&other,now)); // replay
+        assert!(!capture.record_at(&q,now));
+        let mut capture=CapturedQueries::default();
+        assert!(capture.record_at(&q,now));
+        assert!(!capture.consume_at(&other,now)); // reordered/forged
+        assert!(!capture.consume_at(&q,now));
+        let mut capture=CapturedQueries::default();
+        assert!(capture.record_at(&q,now));
+        assert!(!capture.consume_at(&q,now+CapturedQueries::WINDOW));
+        let mut capture=CapturedQueries::default();
+        for _ in 0..CapturedQueries::LIMIT {assert!(capture.record_at(&q,now));}
+        assert!(!capture.record_at(&q,now));
+        assert!(!capture.consume_at(&q,now));
     }
     #[test]
     fn exact_question_zero_ttl_family_and_truncation() {

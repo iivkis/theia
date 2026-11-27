@@ -230,7 +230,16 @@ try {
                                 '--directory',$driverDir,'--dll-sha256',$DllSha256,'--sys-sha256',$SysSha256,
                                 '--capture-interface',[string]$CaptureInterfaceIndex,'--carrier-interface',[string]$CarrierInterfaceIndex,
                                 '--seconds',[string]$CaptureSeconds,'--confirm-isolated-two-interface')
-                            $child=Start-PinnedNative $exe.FullName $argsForRedirect
+                            # The native supervisor owns a kill-on-close Job and
+                            # monitors BFE changes from before the child starts.
+                            $watchArgs=@($native)
+                            $watchArgs[0]=if ($watchArgs[0] -eq 'inspect-many') {'watch-redirect-many'} else {'watch-redirect'}
+                            $wrapper=[Diagnostics.Process]::GetCurrentProcess()
+                            try {
+                                $created=$wrapper.StartTime.ToUniversalTime().ToFileTimeUtc()
+                                $watchArgs+=@([string]$wrapper.Id,[string]$created,$exe.FullName)+$argsForRedirect
+                            } finally { $wrapper.Dispose() }
+                            $child=Start-PinnedNative $helperFile.FullName $watchArgs
                             try {
                                 $clock=[Diagnostics.Stopwatch]::StartNew()
                                 # Sampling is not a continuous kernel arbitration proof.
@@ -281,6 +290,7 @@ try {
             [pscustomobject]@{Version=$r.Version;IntentSha256=$IntentSha256;BootUtc=$boot;State=$state;
                 JointCaptureChecked=($Mode -eq 'CaptureVerify');CaptureObserved=$captureObserved;
                 JointRedirectCommandCompleted=$redirectCompleted;LiveGuardSamples=$guardSamples;
+                BfeNotificationSupervisorUsed=$redirectCompleted;
                 ContinuousArbitrationVerified=$false;RedirectExchangeVerified=$false;
                 FullHostCarrierExclusionVerified=$false;
                 Interfaces=$seenInterfaces;TransactionalObjectCas=$true;PacketEnforcementVerified=$false;
