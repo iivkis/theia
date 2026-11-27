@@ -28,14 +28,6 @@ pub mod packet_modify;
 pub mod windivert;
 mod settings;
 pub mod snapshot;
-#[cfg(any(target_os = "windows", test))]
-mod wfp_context;
-#[cfg(any(target_os = "windows", test))]
-pub(crate) mod wfp_datagram;
-#[cfg(target_os = "windows")]
-pub mod wfp_ingress;
-#[cfg(target_os = "windows")]
-pub mod wfp_udp;
 pub use settings::Settings;
 
 use regex::{Regex, RegexBuilder};

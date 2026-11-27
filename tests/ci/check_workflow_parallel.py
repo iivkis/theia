@@ -63,9 +63,11 @@ for name in ("windows-smoke", "browser-e2e", "f14-build", "native-performance", 
     )
 require(needs("ci-gate") == mandatory, "ci-gate must depend on EVERY required job")
 require(needs("f15-driver-build") == {"specification"}, "F-15 driver build must use exact tested source in parallel")
-for term in ("make -C drivers/linux", "build-lab.ps1", "nuget restore drivers/windows/packages.config", "if-no-files-found: error"):
+for term in ("make -C drivers/linux", "drivers/windows/windivert/test-package.ps1", "OfficialPackageVerified=$false", "if-no-files-found: error"):
     require(term in job("f15-driver-build"), "missing F-15 driver build contract: " + term)
-require("continue-on-error" not in job("f15-driver-build"), "driver compilation cannot be advisory")
+require("continue-on-error" not in job("f15-driver-build"), "native prerequisite validation cannot be advisory")
+for retired in ("build-lab.ps1", "nuget restore drivers/windows/packages.config", "test-attestation.ps1"):
+    require(retired not in job("f15-driver-build"), "retired custom driver build: " + retired)
 require("F-15 isolated kernel capture and hard-kill recovery (mandatory)" in job("rust-tests")
         and "sudo -n unshare -n true" in job("rust-tests")
         and "scripts/f15-kernel-tests.py" in job("rust-tests"),

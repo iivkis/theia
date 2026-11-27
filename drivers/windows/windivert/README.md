@@ -2,8 +2,7 @@
 
 Target: unmodified upstream WinDivert 2.2.2, x64, dynamically loaded under
 LGPL-3.0. No custom WFP driver build/signing/installation is required.
-The previous WFP laboratory code is retained only for reference and existing
-explicit lab entry points; do not activate it in a WinDivert deployment.
+WinDivert is the only Windows packet interception backend.
 
 ## Approved package
 
@@ -51,5 +50,4 @@ and inbound interface still need verified correlation.
   explicit owner/CAS recovery; WinDivert alone is not a kill switch.
 - Physical IPv4/IPv6, offload, fragment, DNS, policy, disconnect/reboot,
   actual H2/H3 UDP and TCP egress, interoperability and throughput evidence.
-Until accepted, Connect remains inactive. No silent fallback to custom WFP
-or direct traffic.
+Until accepted, Connect remains inactive. No silent direct fallback.
