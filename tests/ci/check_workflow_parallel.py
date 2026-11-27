@@ -71,7 +71,10 @@ contains(spec, "if: " + dev_merge, "fetch-depth: 2", 'test "$MERGED_SHA" = "$GIT
          'test "$(git rev-parse HEAD)" = "$MERGED_SHA"', "python3 -m compileall -q scripts tests",
          "python3 -m unittest discover -s tests/ci -p 'test_f14_*.py'", "test_ci_coverage.py",
          "test_ci_scope.py", "test_ci_timing.py", "test_independent_h2_probe.py",
-         "test_ci_boringssl.py",
+         "test_ci_boringssl.py", "test_ci_rust_toolchain.py",
+         "python3 scripts/ci-rust-toolchain.py record",
+         "rust_release: "+ "${{ steps.compiler.outputs.release }}",
+         "rust_commit: "+ "${{ steps.compiler.outputs.commit }}",
          "python3 scripts/ci-native-targets.py", "test_ci_native_targets.py",
          "test_ci_format_repair.py", "scripts/check-spec.sh", "scripts/ci-format-repair.py prepare-merged",
          'echo "native_required=true"', 'echo "tested_sha=$FORMATTED_SHA"',
@@ -110,6 +113,11 @@ for name in mandatory - {"specification"}:
         contains(payload, "if: " + dev_merge, "cache-workspace-crates: false", "cache-bin: false")
         if name != "native-checks":
             contains(payload, "save-if: ${{ matrix.shard == 1 }}")
+    if name in {"rust-tests", "windows-smoke", "native-checks", "f14-build", "coverage-native"}:
+        contains(payload, "CI_RUST_RELEASE: "+ "${{ needs.specification.outputs.rust_release }}",
+                 "CI_RUST_COMMIT: "+ "${{ needs.specification.outputs.rust_commit }}",
+                 "python scripts/ci-rust-toolchain.py prepare")
+        require("dtolnay/rust-toolchain" not in payload, "native toolchain must verify exact compiler")
     if name in {"rust-tests", "windows-smoke", "native-checks", "f14-build"}:
         contains(payload, "shared-key: native-default-deps-v4",
                  'CARGO_PROFILE_DEV_DEBUG: "line-tables-only"',

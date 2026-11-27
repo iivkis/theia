@@ -598,6 +598,44 @@ mod tests {
     }
 
     #[test]
+    fn queue_metadata_never_promotes_incomplete_unknown_or_mixed_family_packets() {
+        let mut attrs = Vec::new();
+        // An input packet has a distinct interface and no local-output authority.
+        attr(&mut attrs, 1, &[0, 0, 0, 7, 8, 0, 1]);
+        attr(&mut attrs, 5, &19u32.to_be_bytes());
+        attr(&mut attrs, 10, &udp4());
+        attr(&mut attrs, 99, &[9, 8]);
+        let mut data = message(PACKET, 0, 17, 9, &attrs);
+        data[HEADER] = 2;
+        let captured = decode(&data, 9).unwrap();
+        assert_eq!(captured.id, 7);
+        assert!(!captured.local_output && !captured.checksum_pending);
+        assert_eq!(captured.meta.unwrap().flow.interface, 19);
+        data[HEADER] = 10;
+        assert!(decode(&data, 9).unwrap().meta.is_none());
+        data[HEADER + 1] = 1;
+        assert!(decode(&data, 9).is_err());
+        for flags in [2, 8, 16, u32::MAX] {
+            assert!(decode(&packet(&udp4(), flags, 28), 9).unwrap().meta.is_none());
+        }
+        assert!(decode(&packet(&udp4(), 4, 28), 9).unwrap().checksum_pending);
+        let mut header_only = Vec::new();
+        attr(&mut header_only, 1, &[0, 0, 0, 7, 8, 0, 3]);
+        let empty = decode(&message(PACKET, 0, 0, 9, &header_only), 9).unwrap();
+        assert!(empty.meta.is_none() && empty.bytes.is_empty());
+        assert!(decode(&message(PACKET, 0, 0, 9, &[]), 9).is_err());
+        for kind in [5, 6, 13, 14] {
+            let mut invalid = header_only.clone();
+            attr(&mut invalid, kind, &[0, 1, 2]);
+            assert!(decode(&message(PACKET, 0, 0, 9, &invalid), 9).is_err());
+        }
+        // Low-level netlink wrappers refuse invalid descriptors, not silently
+        // returning successful writes or fabricated kernel responses.
+        assert!(send(-1, &[0; 16]).is_err());
+        assert!(receive(-1, &mut [0; 16]).is_err());
+    }
+
+    #[test]
     fn duplicate_or_invalid_attributes_fail_closed() {
         let mut attrs = Vec::new();
         attr(&mut attrs, 1, &[0, 0, 0, 7, 8, 0, 3]);

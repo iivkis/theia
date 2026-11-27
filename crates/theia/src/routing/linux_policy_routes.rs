@@ -489,6 +489,105 @@ pub(super) fn recover_if_present(host: &File, guard: &Path, host_mode: bool) -> 
 mod tests {
     use super::*;
     #[test]
+    fn route_journal_cas_boot_scope_and_object_validation() {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut random = [0; 16];
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut random).unwrap();
+        let name: String = random.iter().map(|n| format!("{n:02x}")).collect();
+        let dir = std::env::temp_dir().join(format!("theia-route-journal-{name}"));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        let guard = dir.join("guard.toml");
+        let path = path_for(&guard);
+        assert_eq!(path, dir.join("guard.toml.routes"));
+        check_parent(&path).unwrap();
+        let scope = Scope {
+            boot: "00000000-0000-0000-0000-000000000001".into(),
+            dev: 1,
+            ino: 2,
+            machine: Some("a".repeat(32)),
+        };
+        let mut intent = Intent {
+            version: 1,
+            scope: scope.clone(),
+            loopback: 1,
+            confirmed: vec![expected(NEW_ROUTE, FAMILIES[0], 1)],
+            restored: false,
+        };
+        assert!(read_intent(&path, &scope).unwrap().is_none());
+        let initial = write_intent(&path, &intent, None).unwrap();
+        assert_eq!(read_intent(&path, &scope).unwrap(), Some((intent.clone(), initial.clone())));
+        intent.confirmed.push(expected(NEW_RULE, FAMILIES[1], 1));
+        assert!(write_intent(&path, &intent, None).is_err());
+        let second = write_intent(&path, &intent, Some(&initial)).unwrap();
+        assert!(write_intent(&path, &intent, Some(&initial)).is_err());
+        let mut reboot = scope.clone();
+        reboot.boot = "00000000-0000-0000-0000-000000000002".into();
+        assert!(read_intent(&path, &reboot).is_err());
+        assert_eq!(read_intent_mode(&path, &reboot, true).unwrap(), Some((intent.clone(), second.clone())));
+        reboot.machine = Some("b".repeat(32));
+        assert!(read_intent_mode(&path, &reboot, true).is_err());
+        reboot.machine = None;
+        assert!(read_intent_mode(&path, &reboot, true).is_err());
+        let mut raw = second;
+        for variant in 0..6 {
+            let mut bad = intent.clone();
+            match variant {
+                0 => bad.version = 2,
+                1 => bad.loopback = 0,
+                2 => bad.confirmed.push(bad.confirmed[0].clone()),
+                3 => bad.confirmed[0].body.clear(),
+                4 => bad.confirmed[0].body.resize(257, 0),
+                _ => bad.confirmed = vec![bad.confirmed[0].clone(); 5],
+            }
+            raw = write_intent(&path, &bad, Some(&raw)).unwrap();
+            assert!(read_intent(&path, &scope).is_err());
+        }
+        let raw = write_intent(&path, &intent, Some(&raw)).unwrap();
+        assert_eq!(read_intent(&path, &scope).unwrap(), Some((intent, raw)));
+    }
+
+    #[test]
+    fn route_inventory_rejects_foreign_marks_and_malformed_attributes() {
+        let foreign = Object { kind: NEW_RULE, body: vec![0; 12] };
+        assert!(!relevant(&foreign).unwrap());
+        for (key, value) in [(6, PRIORITY), (10, REDIRECT_MARK), (10, super::super::PASS_MARK), (15, TABLE)] {
+            let mut object = foreign.clone();
+            attr(&mut object.body, key, &value.to_ne_bytes());
+            assert!(relevant(&object).unwrap());
+        }
+        let mut masked = foreign.clone();
+        attr(&mut masked.body, 10, &0u32.to_ne_bytes());
+        attr(&mut masked.body, 16, &0u32.to_ne_bytes());
+        assert!(relevant(&masked).unwrap());
+        let mut duplicate = foreign.clone();
+        attr(&mut duplicate.body, 6, &1u32.to_ne_bytes());
+        attr(&mut duplicate.body, 6, &2u32.to_ne_bytes());
+        assert!(relevant(&duplicate).is_err());
+        let mut malformed = foreign.clone();
+        attr(&mut malformed.body, 15, &[1, 2]);
+        assert!(relevant(&malformed).is_err());
+        assert!(attrs(&[0; 11]).is_err());
+        assert!(!exact(&Object { kind: NEW_ROUTE, body: vec![] }, 1));
+        assert!(!exact(&Object { kind: 255, body: vec![FAMILIES[0]; 12] }, 1));
+        let mut rule = expected(NEW_RULE, FAMILIES[0], 1);
+        attr(&mut rule.body, 14, &u32::MAX.to_ne_bytes());
+        assert!(exact(&rule, 1));
+        let mut route = expected(NEW_ROUTE, FAMILIES[1], 1);
+        attr(&mut route.body, 20, &[0]);
+        attr(&mut route.body, 12, &[0; 32]);
+        assert!(exact(&route, 1));
+        assert!(same(&[route.clone(), rule.clone()], &[rule.clone(), route.clone()]));
+        assert!(!same(&[route], &[rule]));
+    }
+
+    #[test]
     fn exact_route_and_rule_reject_changes() {
         for family in FAMILIES {
             for kind in [NEW_ROUTE, NEW_RULE] {

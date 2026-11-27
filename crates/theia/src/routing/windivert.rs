@@ -2173,6 +2173,73 @@ mod native {
     }
     #[cfg(test)]
     #[test]
+    fn native_package_hash_pinning_refuses_missing_wrong_and_unloadable_files() {
+        use ring::rand::{SecureRandom, SystemRandom};
+        let mut random = [0; 16];
+        SystemRandom::new().fill(&mut random).unwrap();
+        let name: String = random.iter().map(|n| format!("{n:02x}")).collect();
+        let dir = std::env::temp_dir().join(format!("theia-windivert-pin-{name}"));
+        std::fs::create_dir(&dir).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        let dll = dir.join("WinDivert.dll");
+        let sys = dir.join("WinDivert64.sys");
+        let dll_data = vec![0x31; 8192];
+        let sys_data = vec![0x42; 8192];
+        let dll_hash: [u8; 32] = Sha256::digest(&dll_data).into();
+        let sys_hash: [u8; 32] = Sha256::digest(&sys_data).into();
+        assert!(pinned(&dll, dll_hash).is_err());
+        std::fs::write(&dll, [0; 64]).unwrap();
+        assert_eq!(pinned(&dll, dll_hash).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        std::fs::write(&dll, &dll_data).unwrap();
+        assert!(pinned(&dll, sys_hash).is_err());
+        let held = pinned(&dll, dll_hash).unwrap();
+        assert!(OpenOptions::new().write(true).open(&dll).is_err());
+        assert!(std::fs::remove_file(&dll).is_err());
+        drop(held);
+        assert!(load(Path::new("relative"), dll_hash, sys_hash).is_err());
+        assert!(load(&dir, dll_hash, sys_hash).is_err());
+        std::fs::write(&sys, &sys_data).unwrap();
+        // These are deliberately non-PE fixtures: LoadLibrary must refuse
+        // them even when their hashes match. No driver is installed or loaded.
+        assert!(probe(&dir, dll_hash, sys_hash, false).is_err());
+    }
+
+    #[cfg(test)]
+    #[tokio::test]
+    async fn native_socket_admission_is_exclusive_noninheritable_and_loopback_exact() {
+        let _winsock = WinsockLease::start().unwrap();
+        for address in ["127.0.0.1:0", "[::1]:0"] {
+            let local: std::net::SocketAddr = address.parse().unwrap();
+            let udp = bind_carrier_udp(local).unwrap();
+            verify_carrier_socket(&udp).unwrap();
+            let bound = udp.local_addr().unwrap();
+            assert_eq!(bound.ip(), local.ip());
+            assert_ne!(bound.port(), 0);
+            assert!(bind_carrier_udp(bound).is_err());
+            let peer = tokio::net::UdpSocket::bind(local).await.unwrap();
+            udp.send_to(b"fixture", peer.local_addr().unwrap()).await.unwrap();
+            let mut bytes = [0; 16];
+            let (n, from) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut bytes)).await.unwrap().unwrap();
+            assert_eq!(&bytes[..n], b"fixture");
+            assert_eq!(from, bound);
+            let tcp = if local.is_ipv4() { tokio::net::TcpSocket::new_v4() } else { tokio::net::TcpSocket::new_v6() }.unwrap();
+            prepare_carrier_tcp(&tcp).unwrap();
+            tcp.bind(local).unwrap();
+            verify_carrier_socket(&tcp).unwrap();
+        }
+        let scoped = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(std::net::Ipv6Addr::LOCALHOST, 0, 0, 1));
+        assert_eq!(bind_udp(scoped).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert!(loopback_udp("not-an-address").is_err());
+    }
+
+    #[cfg(test)]
+    #[test]
     fn native_modify_without_two_interface_owner_is_denied() {
         let registry = CarrierRegistry::default();
         let key = super::super::packet::FlowKey {

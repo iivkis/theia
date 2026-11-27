@@ -31,6 +31,8 @@ jobs:
     outputs:
       tested_sha: ${{ steps.publish-format.outputs.tested_sha }}
       rust_ready: ${{ steps.detect.outputs.rust_ready }}
+      rust_release: ${{ steps.compiler.outputs.release }}
+      rust_commit: ${{ steps.compiler.outputs.commit }}
       native_required: ${{ steps.scope.outputs.native_required }}
     steps:
       - uses: actions/checkout@v4
@@ -94,6 +96,12 @@ jobs:
         if: steps.detect.outputs.rust_ready == 'true' && steps.scope.outputs.native_required == 'true'
         with:
           components: rustfmt
+      - name: Record exact stable compiler and test native toolchain selection
+        id: compiler
+        if: steps.detect.outputs.rust_ready == 'true' && steps.scope.outputs.native_required == 'true'
+        run: |
+          python3 scripts/ci-rust-toolchain.py record
+          python3 -m unittest discover -s tests/ci -p 'test_ci_rust_toolchain.py'
       - name: Verify exhaustive Cargo target groups before fan-out
         if: steps.detect.outputs.rust_ready == 'true' && steps.scope.outputs.native_required == 'true'
         run: |
@@ -174,7 +182,11 @@ jobs:
         with:
           ref: ${{ needs.specification.outputs.tested_sha }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Select exact verified native Rust toolchain
+        env:
+          CI_RUST_RELEASE: ${{ needs.specification.outputs.rust_release }}
+          CI_RUST_COMMIT: ${{ needs.specification.outputs.rust_commit }}
+        run: python scripts/ci-rust-toolchain.py prepare
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: native-default-deps-v4
@@ -287,9 +299,11 @@ jobs:
         with:
           ref: ${{ needs.specification.outputs.tested_sha }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - name: Select exact verified native Rust toolchain
+        env:
+          CI_RUST_RELEASE: ${{ needs.specification.outputs.rust_release }}
+          CI_RUST_COMMIT: ${{ needs.specification.outputs.rust_commit }}
+        run: python scripts/ci-rust-toolchain.py prepare --component clippy
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.140
@@ -352,7 +366,11 @@ jobs:
         with:
           ref: ${{ needs.specification.outputs.tested_sha }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Select exact verified native Rust toolchain
+        env:
+          CI_RUST_RELEASE: ${{ needs.specification.outputs.rust_release }}
+          CI_RUST_COMMIT: ${{ needs.specification.outputs.rust_commit }}
+        run: python scripts/ci-rust-toolchain.py prepare
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.140
@@ -409,9 +427,11 @@ jobs:
         with:
           ref: ${{ needs.specification.outputs.tested_sha }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - name: Select exact verified native Rust toolchain
+        env:
+          CI_RUST_RELEASE: ${{ needs.specification.outputs.rust_release }}
+          CI_RUST_COMMIT: ${{ needs.specification.outputs.rust_commit }}
+        run: python scripts/ci-rust-toolchain.py prepare --component clippy
       # Cold check cache: seed from the existing trusted default dependency
       # cache instead of fetching and recompiling the entire dependency graph.
       - uses: Swatinem/rust-cache@v2
@@ -528,9 +548,11 @@ jobs:
         with:
           ref: ${{ needs.specification.outputs.tested_sha }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
+      - name: Select exact verified native Rust toolchain
+        env:
+          CI_RUST_RELEASE: ${{ needs.specification.outputs.rust_release }}
+          CI_RUST_COMMIT: ${{ needs.specification.outputs.rust_commit }}
+        run: python scripts/ci-rust-toolchain.py prepare --component llvm-tools-preview
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov@0.9.1

@@ -996,6 +996,63 @@ mod tests {
         assert!(!is_local_ip("0.0.0.0".parse().unwrap()).unwrap());
     }
 
+    #[tokio::test]
+    async fn ordinary_loopback_sockets_never_become_transparent_ingress() {
+        for address in ["127.0.0.1:0", "[::1]:0"] {
+            let socket = std::net::UdpSocket::bind(address).unwrap();
+            let local = socket.local_addr().unwrap();
+            let peer = std::net::UdpSocket::bind(address).unwrap();
+            // The real socket is not transparent. Do not grant capture or
+            // turn an ordinary datagram into a redirected original flow.
+            assert!(UdpCapture::from_bound_socket(socket.try_clone().unwrap()).is_err());
+            assert!(matches!(receive_udp(&socket), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+            peer.send_to(b"ordinary", local).unwrap();
+            // Use a bounded readiness wait instead of a scheduling assumption.
+            socket.set_nonblocking(true).unwrap();
+            let socket = tokio::io::unix::AsyncFd::new(socket).unwrap();
+            let mut ready = tokio::time::timeout(std::time::Duration::from_secs(2), socket.readable()).await.unwrap().unwrap();
+            assert!(matches!(ready.try_io(|inner| receive_udp(inner.get_ref())), Ok(Err(_))));
+            let listener = TcpListener::bind(address).await.unwrap();
+            let peer = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let (accepted, _) = listener.accept().await.unwrap();
+            assert!(original_tcp(&accepted).is_err());
+            drop(peer);
+        }
+    }
+
+    #[test]
+    fn ipv6_original_destination_control_message_is_bounded_and_exact() {
+        let header = align_cmsg(mem::size_of::<libc::cmsghdr>()).unwrap();
+        let size = mem::size_of::<libc::sockaddr_in6>();
+        let len = header + size;
+        let mut bytes = vec![0u8; align_cmsg(len).unwrap()];
+        let cmsg = libc::cmsghdr {
+            cmsg_len: len as _,
+            cmsg_level: libc::SOL_IPV6,
+            cmsg_type: IPV6_ORIGDSTADDR,
+        };
+        let mut address: libc::sockaddr_in6 = unsafe { mem::zeroed() };
+        address.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+        address.sin6_port = 443u16.to_be();
+        address.sin6_addr.s6_addr = "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets();
+        unsafe {
+            std::ptr::write_unaligned(bytes.as_mut_ptr().cast::<libc::cmsghdr>(), cmsg);
+            std::ptr::write_unaligned(bytes.as_mut_ptr().add(header).cast::<libc::sockaddr_in6>(), address);
+        }
+        let target = "[2001:db8::1]:443".parse().unwrap();
+        assert_eq!(original_ancillary(&bytes, false).unwrap(), target);
+        assert!(original_ancillary(&bytes, true).is_err());
+        assert!(original_ancillary(&bytes[..len - 1], false).is_err());
+        assert!(read_address(&[0]).is_err());
+        assert!(align_cmsg(usize::MAX).is_none());
+        let local = "[::1]:10000".parse().unwrap();
+        let source = "[::1]:20000".parse().unwrap();
+        assert_eq!(validate_redirect(local, source, target).unwrap().destination, target);
+        for bad in ["[::]:443", "[ff02::1]:443", "[fe80::1]:443", "[::ffff:192.0.2.1]:443", "[2001:db8::1]:0"] {
+            assert!(validate_redirect(local, source, bad.parse().unwrap()).is_err());
+        }
+    }
+
     #[test]
     fn original_udp_ancillary_is_exact_and_unambiguous() {
         let bytes = cmsg4();
