@@ -16,7 +16,7 @@ function Open-ApprovedArchive([string]$Path,[string]$Expected) {
     } catch { $stream.Dispose(); throw }
 }
 function Copy-UniqueEntry([IO.Compression.ZipArchive]$Zip,[string]$Suffix,[string]$Destination,[long]$Maximum,[switch]$RootOnly) {
-    $matches=@()
+    $matchingEntries=@()
     foreach ($entry in $Zip.Entries) {
         $name=$entry.FullName
         # Reject malformed names globally rather than trusting extraction
@@ -28,10 +28,10 @@ function Copy-UniqueEntry([IO.Compression.ZipArchive]$Zip,[string]$Suffix,[strin
         if ($parts.Length -gt 1 -and $parts[0] -match '^WinDivert-2\.2\.2(?:-[ABC])?$') {
             $relative=($parts[1..($parts.Length-1)] -join '/')
         }
-        if ($relative -ieq $Suffix -or ($RootOnly -and $relative -ieq "$Suffix.txt")) { $matches+= $entry }
+        if ($relative -ieq $Suffix -or ($RootOnly -and $relative -ieq "$Suffix.txt")) { $matchingEntries+= $entry }
     }
-    if ($matches.Count -ne 1) { throw "Expected one official entry: $Suffix" }
-    $entry=$matches[0]
+    if ($matchingEntries.Count -ne 1) { throw "Expected one official entry: $Suffix" }
+    $entry=$matchingEntries[0]
     if ($entry.Length -lt 1 -or $entry.Length -gt $Maximum) { throw 'Entry length outside bounds.' }
     $input=$entry.Open()
     try {
