@@ -167,8 +167,10 @@ impl KernelPacketEvent {
     pub fn cookie(&self)->u64 { self.cookie }
     pub fn key(&self)->FlowKey { self.key }
     pub fn length(&self)->u32 { self.length }
+    #[cfg(feature="linux-ebpf-lab")]
     pub(super) fn fresh(&self)->io::Result<()> { fresh_timestamp(self.timestamp) }
     /// No PID or executable identity is inferred from this event.
+    #[cfg(any(test,feature="linux-ebpf-lab"))]
     pub(super) fn matches_flow(&self,flow:&KernelFlowEvent)->bool {
         self.cookie==flow.cookie && self.key.destination==flow.destination &&
             (match self.key.transport { super::packet::Transport::Tcp=>6,super::packet::Transport::Udp=>17 })==flow.protocol &&
