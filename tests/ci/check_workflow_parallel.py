@@ -42,7 +42,7 @@ def expected_set(payload):
     return set(re.findall(r'"([^"]+)"', match.group(1)))
 
 
-mandatory = {"specification", "rust-tests", "windows-smoke", "f14-build",
+mandatory = {"specification", "rust-tests", "windows-smoke", "native-checks", "f14-build",
              "f14-cross-host", "coverage-native", "coverage-gate"}
 deferred = {"m0-1-api-spike", "m0-1-windows-spike", "native-performance",
             "f19-performance", "m3-4-btls-spike", "m3-4e-btls-production-feature",
@@ -52,7 +52,7 @@ require(jobs(extended) == deferred | {"specification", "extended-gate"}, "extend
 require(needs("ci-gate") == expected_set(job("ci-gate")) == mandatory, "MVP gate must require all jobs")
 require(needs("extended-gate", extended) == expected_set(job("extended-gate", extended))
         == deferred | {"specification"}, "extended gate must require all jobs")
-for name in ("rust-tests", "windows-smoke", "coverage-native", "f14-build"):
+for name in ("rust-tests", "windows-smoke", "coverage-native", "native-checks", "f14-build"):
     require(needs(name) == {"specification"}, f"{name} must run in parallel")
 require(needs("f14-cross-host") == {"specification", "f14-build"}, "cross-host must use early native builds")
 require(needs("coverage-gate") == {"specification", "coverage-native"}, "all native reports must arrive")
@@ -69,6 +69,7 @@ contains(spec, "if: " + dev_merge, "fetch-depth: 2", 'test "$MERGED_SHA" = "$GIT
          'test "$(git rev-parse HEAD)" = "$MERGED_SHA"', "python3 -m compileall -q scripts tests",
          "python3 -m unittest discover -s tests/ci -p 'test_f14_*.py'", "test_ci_coverage.py",
          "test_ci_scope.py", "test_ci_timing.py", "test_independent_h2_probe.py",
+         "python3 scripts/ci-native-targets.py", "test_ci_native_targets.py",
          "test_ci_format_repair.py", "scripts/check-spec.sh", "scripts/ci-format-repair.py prepare-merged",
          'echo "native_required=true"', 'echo "tested_sha=$FORMATTED_SHA"',
          'git push --atomic origin "$FORMATTED_SHA:refs/heads/main" "$FORMATTED_SHA:refs/heads/dev"',
@@ -105,7 +106,7 @@ for name in mandatory - {"specification"}:
     if name in writers:
         contains(payload, "if: " + dev_merge, "cache-workspace-crates: false", "cache-bin: false",
                  "save-if: ${{ matrix.shard == 1 }}")
-    if name in {"rust-tests", "windows-smoke", "f14-build"}:
+    if name in {"rust-tests", "windows-smoke", "native-checks", "f14-build"}:
         contains(payload, "shared-key: native-default-deps-v4",
                  'CARGO_PROFILE_DEV_DEBUG: "line-tables-only"',
                  'CARGO_PROFILE_TEST_DEBUG: "line-tables-only"')
@@ -113,12 +114,23 @@ require("CARGO_PROFILE_RELEASE_DEBUG" not in workflow, "release settings must no
 for name in ("rust-tests", "windows-smoke"):
     payload = job(name)
     contains(payload, "shard: [1, 2]", "fail-fast: false", "tool: cargo-nextest@0.9.140",
-             "cargo nextest run --workspace --all-targets --locked --no-fail-fast --partition count:${{ matrix.shard }}/2")
-    require("--filter-expr" not in payload and "--retries" not in payload, "complete native inventory")
-contains(job("rust-tests"), "cargo clippy --workspace --all-targets --all-features -- -D warnings", "pyte==0.8.2")
-contains(job("windows-smoke"), "pywinpty==3.0.5 pyte==0.8.2",
+             "if: matrix.shard == 1\n        run: cargo nextest run --workspace --lib --bins --locked --no-fail-fast",
+             "if: matrix.shard == 2\n        run: cargo nextest run --workspace --test '*' --locked --no-fail-fast")
+    require("--filter-expr" not in payload and "--retries" not in payload
+            and "--partition" not in payload, "complete disjoint native build groups")
+contains(job("rust-tests"), "pyte==0.8.2")
+contains(job("windows-smoke"), "pywinpty==3.0.5 pyte==0.8.2")
+checks = job("native-checks")
+contains(checks, "check: linux-clippy", "check: windows-clippy", "check: windows-cross-sid",
+         "if: matrix.check == 'linux-clippy'",
+         "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings",
+         "if: matrix.check == 'windows-clippy'",
+         "cargo clippy --workspace --all-targets --features experimental-btls-h2 --locked -- -D warnings",
+         "if: matrix.check == 'windows-cross-sid'",
          "Cross-logon Windows pipe kernel-denial E2E (mandatory)", "windows-cross-sid-ci.ps1",
-         "cargo clippy --workspace --all-targets --features experimental-btls-h2 -- -D warnings")
+         "save-if: false")
+require("cargo clippy" not in job("rust-tests") + job("windows-smoke"),
+        "lint must not delay native tests")
 f14, cross = job("f14-build"), job("f14-cross-host")
 contains(f14, "os: [ubuntu-24.04, windows-latest]", "fail-fast: false",
          "cargo tree --locked -p theia -e normal,build",
@@ -136,8 +148,10 @@ cov, cg = job("coverage-native"), job("coverage-gate")
 contains(cov, "os: [ubuntu-latest, windows-latest]", "shard: [1, 2, 3, 4, 5, 6]",
          "fail-fast: false", "llvm-tools-preview", "cargo-llvm-cov@0.9.1", "tool: cargo-nextest@0.9.140",
          "cargo llvm-cov clean --profraw-only", 'workspaces: ". -> target/llvm-cov-target"',
-         "cache-targets: true", "cargo llvm-cov nextest --workspace --all-targets --all-features --locked --no-report --no-fail-fast",
-         "if: matrix.shard <= 2", "if: matrix.shard == 3", "--partition count:${{ matrix.shard }}/2",
+         "cache-targets: true",
+         "if: matrix.shard == 1\n        run: cargo llvm-cov nextest --workspace --lib --bins --all-features --locked --no-report --no-fail-fast",
+         "if: matrix.shard == 2\n        run: cargo llvm-cov nextest --workspace --test '*' --all-features --locked --no-report --no-fail-fast",
+         "if: matrix.shard == 3",
          "--no-report --test tui_real_terminal -- compiled_dual_mode_tui_invitation_import_apply_and_rollback --ignored --exact",
          "THEIA_WINDOWS_PROXY_E2E_ALLOWED",
          "--no-report --lib -- windows_system_proxy::tests::native_wininet_cas_recovery_and_foreign_override --ignored --exact",
@@ -162,7 +176,8 @@ fixtures = {"client_binary_chromium_socks5": 4, "client_binary_chromium_socks5_o
 observed = re.findall(r"name = '([^']+)'; shard = (\d+) \}", cov)
 require(len(observed) == len(fixtures) and {n: int(s) for n, s in observed} == fixtures,
         "every independent MVP fixture must execute once per platform")
-require("shared-key: native-default-deps-v4" not in cov and "--filter-expr" not in cov,
+require("shared-key: native-default-deps-v4" not in cov and "--filter-expr" not in cov
+        and "--partition" not in cov,
         "instrumentation must be isolated and complete")
 require(cov.count("cargo llvm-cov report --lcov --include-build-script") == 1, "export once per shard")
 for name in ("Instrument real dual-mode TUI", "Instrument real disposable Windows",
@@ -192,6 +207,10 @@ profile = tomllib.loads((ROOT / ".config/nextest.toml").read_text(encoding="utf-
 require(profile["default-filter"] == "all()" and profile["retries"] == 0
         and profile["fail-fast"] is False and profile["test-threads"] == 4,
         "bounded scheduling without exclusions or retries")
+require({entry["filter"]: entry["priority"] for entry in profile["overrides"]} == {
+    "test(=production_h2_h3_asymmetric_traffic_half_close_and_idle)": 100,
+    "test(=compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas)": 90,
+}, "start both long integration cases early without changing their deadlines")
 for term in ("run_f13_observations.py f13-observations", "run_native_quic_comparison.py",
              "native_binary_performance_comparison", "comparison_records_all_controller_scenarios_ci_only",
              "drivers/windows/windivert/test-package.ps1", "scripts/f15-kernel-tests.py",

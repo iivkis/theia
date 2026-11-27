@@ -92,6 +92,11 @@ jobs:
         if: steps.detect.outputs.rust_ready == 'true' && steps.scope.outputs.native_required == 'true'
         with:
           components: rustfmt
+      - name: Verify exhaustive Cargo target groups before fan-out
+        if: steps.detect.outputs.rust_ready == 'true' && steps.scope.outputs.native_required == 'true'
+        run: |
+          python3 scripts/ci-native-targets.py
+          python3 -m unittest discover -s tests/ci -p 'test_ci_native_targets.py'
       - name: Prepare verified Rustfmt-only child of merged main
         id: format
         if: steps.detect.outputs.rust_ready == 'true' && steps.scope.outputs.native_required == 'true'
@@ -266,8 +271,6 @@ jobs:
           ref: ${{ needs.specification.outputs.tested_sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.140
@@ -282,14 +285,12 @@ jobs:
           python-version: '3.12'
       - name: Install pinned CI-only VT screen driver for real Linux PTY
         run: python -m pip install pyte==0.8.2
-      - name: Install native eBPF linker for all-feature lint
+      - name: Native Linux unit and binary tests
+        if: matrix.shard == 1
+        run: cargo nextest run --workspace --lib --bins --locked --no-fail-fast
+      - name: Native Linux integration tests
         if: matrix.shard == 2
-        run: sudo apt-get install -y --no-install-recommends libbpf-dev
-      - name: Native Linux tests
-        run: cargo nextest run --workspace --all-targets --locked --no-fail-fast --partition count:${{ matrix.shard }}/2
-      - name: Lints
-        if: matrix.shard == 2
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo nextest run --workspace --test '*' --locked --no-fail-fast
       - name: Upload sanitized trace logs on CI failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -326,8 +327,6 @@ jobs:
           ref: ${{ needs.specification.outputs.tested_sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.140
@@ -342,15 +341,12 @@ jobs:
           python-version: '3.12'
       - name: Install pinned CI-only Windows ConPTY and VT screen drivers
         run: python -m pip install pywinpty==3.0.5 pyte==0.8.2
-      - name: Native Windows tests
-        run: cargo nextest run --workspace --all-targets --locked --no-fail-fast --partition count:${{ matrix.shard }}/2
-      - name: Production feature Clippy (Windows)
+      - name: Native Windows unit and binary tests
         if: matrix.shard == 1
-        run: cargo clippy --workspace --all-targets --features experimental-btls-h2 -- -D warnings
-      - name: Cross-logon Windows pipe kernel-denial E2E (mandatory)
+        run: cargo nextest run --workspace --lib --bins --locked --no-fail-fast
+      - name: Native Windows integration tests
         if: matrix.shard == 2
-        shell: pwsh
-        run: ./scripts/windows-cross-sid-ci.ps1
+        run: cargo nextest run --workspace --test '*' --locked --no-fail-fast
       - name: Upload sanitized trace logs on CI failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -359,6 +355,54 @@ jobs:
           path: ${{ env.THEIA_TRACE_DIR }}/*.log*
           if-no-files-found: ignore
           retention-days: 3
+
+  native-checks:
+    name: Native prerequisite (${{ matrix.check }})
+    needs: specification
+    if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            check: linux-clippy
+          - os: windows-latest
+            check: windows-clippy
+          - os: windows-latest
+            check: windows-cross-sid
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.specification.outputs.tested_sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: native-default-deps-v4
+          cache-workspace-crates: false
+          cache-bin: false
+          save-if: false
+      - name: Install native eBPF linker for all-feature lint
+        if: matrix.check == 'linux-clippy'
+        run: sudo apt-get install -y --no-install-recommends libbpf-dev
+      - name: Linux all-feature Clippy
+        if: matrix.check == 'linux-clippy'
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Production feature Clippy (Windows)
+        if: matrix.check == 'windows-clippy'
+        run: cargo clippy --workspace --all-targets --features experimental-btls-h2 --locked -- -D warnings
+      - name: Cross-logon Windows pipe kernel-denial E2E (mandatory)
+        if: matrix.check == 'windows-cross-sid'
+        shell: pwsh
+        run: ./scripts/windows-cross-sid-ci.ps1
 
   f14-cross-host:
     name: F-14 Linux VM server to native Windows client
@@ -474,9 +518,12 @@ jobs:
           python -m playwright install chromium
       - name: Purge any restored profile counters before instrumenting this SHA
         run: cargo llvm-cov clean --profraw-only
-      - name: Instrument full native workspace tests
-        if: matrix.shard <= 2
-        run: cargo llvm-cov nextest --workspace --all-targets --all-features --locked --no-report --no-fail-fast --partition count:${{ matrix.shard }}/2
+      - name: Instrument all native unit and binary tests
+        if: matrix.shard == 1
+        run: cargo llvm-cov nextest --workspace --lib --bins --all-features --locked --no-report --no-fail-fast
+      - name: Instrument all native integration tests
+        if: matrix.shard == 2
+        run: cargo llvm-cov nextest --workspace --test '*' --all-features --locked --no-report --no-fail-fast
       - name: Instrument real dual-mode TUI and startup replay guard
         if: matrix.shard == 3
         shell: pwsh
@@ -577,7 +624,7 @@ jobs:
 
   ci-gate:
     name: ci-gate
-    needs: [specification, rust-tests, windows-smoke, f14-build, f14-cross-host, coverage-native, coverage-gate]
+    needs: [specification, rust-tests, windows-smoke, native-checks, f14-build, f14-cross-host, coverage-native, coverage-gate]
     if: ${{ always() && github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'dev' && github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -603,7 +650,7 @@ jobs:
           from datetime import datetime, timezone
 
           results = json.loads(os.environ["JOB_RESULTS"])
-          expected = {"specification", "rust-tests", "windows-smoke", "f14-build", "f14-cross-host", "coverage-native", "coverage-gate"}
+          expected = {"specification", "rust-tests", "windows-smoke", "native-checks", "f14-build", "f14-cross-host", "coverage-native", "coverage-gate"}
           native = os.environ["NATIVE_REQUIRED"]
           if native != "true":
               raise SystemExit("Every merge requires full native CI; fail closed")

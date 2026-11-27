@@ -314,8 +314,9 @@ class SpecContractTests(unittest.TestCase):
         workflow = read(".github/workflows/ci.yml")
         self.assertIn("Swatinem/rust-cache@v2", workflow)
         self.assertIn("scripts/check-spec.sh", workflow)
-        self.assertIn("cargo nextest run --workspace --all-targets --locked --no-fail-fast", workflow)
-        self.assertLess(workflow.index("cargo nextest run --workspace --all-targets --locked --no-fail-fast"),
+        self.assertIn("cargo nextest run --workspace --lib --bins --locked --no-fail-fast", workflow)
+        self.assertIn("cargo nextest run --workspace --test '*' --locked --no-fail-fast", workflow)
+        self.assertLess(workflow.index("cargo nextest run --workspace --lib --bins --locked --no-fail-fast"),
                         workflow.index("cargo clippy"))
         self.assertIn("Cargo.lock", workflow)
 
@@ -323,7 +324,7 @@ class SpecContractTests(unittest.TestCase):
         workflow = read(".github/workflows/ci.yml")
         gate = workflow.split("\n  ci-gate:\n", 1)[1]
         for job in ("specification", "rust-tests", "windows-smoke",
-                    "f14-build", "f14-cross-host", "coverage-native", "coverage-gate"):
+                    "native-checks", "f14-build", "f14-cross-host", "coverage-native", "coverage-gate"):
             self.assertIn(job, gate.split("if:", 1)[0])
         self.assertIn("always()", gate)
         self.assertIn('get("result") != "success"', gate)
@@ -348,7 +349,7 @@ class SpecContractTests(unittest.TestCase):
                      "connection.graceful_shutdown()", "connection.shutdown(0).await",
                      "shares_transport_with", "h2_scenario(true)", "h3_scenario(true)"):
             self.assertIn(term, code)
-        self.assertIn("cargo nextest run --workspace --all-targets --locked --no-fail-fast", read(".github/workflows/ci.yml"))
+        self.assertIn("cargo nextest run --workspace --lib --bins --locked --no-fail-fast", read(".github/workflows/ci.yml"))
 
     def test_m22_local_proxy_gate_and_cli_wiring(self):
         implementation = read("crates/theia/src/local_proxy.rs")
