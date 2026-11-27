@@ -121,8 +121,9 @@ jobs:
           # Build the exact locked lib-test harness once. Keep each test in its
           # own process as before; no shared global state or parallel port races.
           build_json="$RUNNER_TEMP/tui-review-build.jsonl"
-          if ! time cargo test --locked -p theia --lib --no-run --message-format=json > "$build_json"; then
-            cat "$build_json"
+          if ! time cargo test --locked -p theia --lib --no-run --message-format=json-render-diagnostics > "$build_json"; then
+            # rustc diagnostics are already printed on stderr by Cargo.
+            echo "::error::Locked lib-test harness failed to compile"
             exit 1
           fi
           test_bin="$("$REVIEW_PYTHON" - "$build_json" <<'PY'

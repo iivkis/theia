@@ -146,7 +146,8 @@ fn visual_review_gallery() {
         let config::Config::Client(doc) = config::read_file(&path).unwrap() else { panic!("client fixture") };
         assert_eq!(doc.client.profiles.len(), 1);
         assert_eq!(doc.client.active_profile, doc.client.profiles[0].id);
-        assert_eq!(doc.client.proxy.system_proxy, config::SystemProxy::Off);
+        assert_eq!(doc.client.ingress_mode, config::IngressMode::SystemProxy);
+        // Saved mode is configuration, not OS proxy activation.
         assert!(!ui.owned_running(Role::Client));
         review_capture("client-reality-key-saved", &model, &ui);
         ui.update(&mut model, press(KeyCode::Enter));
@@ -350,7 +351,14 @@ fn visual_review_gallery() {
                 tx.send(Ok(crate::management::StatusReply::ClientRunning {
                     revision: 1, config_sha256: digest, descriptor_revision: 0,
                     transport: 2, xhttp: 1, fallback: false, routing_revision: revision,
-                    routing_state: state, routing_totals: [1024,2048,5120,10240,2,1,2],
+                    routing_state: state,
+                    routing_totals: Box::new({
+                        let mut totals = [0u64; 38];
+                        totals[..7].copy_from_slice(&[1024, 2048, 5120, 10240, 2, 1, 2]);
+                        totals
+                    }),
+                    flow_counts: None,
+                    capture_state: 0,
                 })).unwrap();
                 observation.poll();
                 ui.routing_observation = Some(observation);
