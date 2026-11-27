@@ -390,7 +390,11 @@ async fn registered_reality_scenario(drain_only: bool) {
         let mut bearer = crate::client_import::PrivateBearer::create(&client_path, &token).unwrap();
         let reference = bearer.reference().unwrap();
         bearer.commit();
-        std::fs::write(&client_path, include_str!("../../../../examples/client.toml")).unwrap();
+        std::fs::write(
+            &client_path,
+            include_str!("../../../../examples/client.toml"),
+        )
+        .unwrap();
         for (id, transport, mode) in [
             ("native-h2", Transport::H2, XhttpMode::StreamOne),
             ("native-h3", Transport::H3, XhttpMode::StreamOne),
@@ -1424,7 +1428,8 @@ async fn real_local_proxy_modes_validate_credentials_and_relay_over_both_transpo
     let secret =
         crate::client_import::PrivateBearer::create(&directory.join("client.toml"), &token)
             .unwrap();
-    let Config::Client(doc) = config::parse(include_str!("../../../../examples/client.toml")).unwrap()
+    let Config::Client(doc) =
+        config::parse(include_str!("../../../../examples/client.toml")).unwrap()
     else {
         panic!("client fixture");
     };

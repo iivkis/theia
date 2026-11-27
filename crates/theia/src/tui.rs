@@ -8509,7 +8509,10 @@ mod tests {
         let crate::config::Config::Client(doc) = crate::config::read_file(&path).unwrap() else {
             panic!("client")
         };
-        assert_eq!(doc.client.ingress_mode, crate::config::IngressMode::SystemProxy);
+        assert_eq!(
+            doc.client.ingress_mode,
+            crate::config::IngressMode::SystemProxy
+        );
         assert!(!ui.owned_running(Role::Client));
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -2623,7 +2623,9 @@ mod native {
                                     Instant::now() + Duration::from_millis(100),
                                 ) {
                                     Ok(event) => {
-                                        if u32::from(event.layer) != layer || sender.try_send(event).is_err() {
+                                        if u32::from(event.layer) != layer
+                                            || sender.try_send(event).is_err()
+                                        {
                                             return Err(io::ErrorKind::InvalidData.into());
                                         }
                                     }
