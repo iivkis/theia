@@ -338,6 +338,9 @@ fn visual_review_gallery() {
             ui.workspace_focus = WorkspaceFocus::Fields;
             ui.routing_panel.as_mut().unwrap().action_focus = Some(0);
             review_capture("server-routing-rules", &model, &ui);
+            ui.routing_panel.as_mut().unwrap().geodata_mode = true;
+            review_capture("server-routing-geodata", &model, &ui);
+            ui.routing_panel.as_mut().unwrap().geodata_mode = false;
             ui.routing_panel.as_mut().unwrap().edit(Some(0));
             review_capture("server-routing-edit", &model, &ui);
         } else {
@@ -442,7 +445,7 @@ fn visual_review_gallery() {
             &[(1,'N',"new-connection"),(2,'G',"grant-picker"),(2,'u',"new-user"),
               (2,'t',"rotate-token"),(2,'x',"disable-user"),
               (5,'Q',"limits"),(1,'E',"certificate"),(3,'s',"server-process"),
-              (3,'v',"runtime-status"),(6,'p',"network-diagnostics")]
+              (3,'v',"runtime-status"),(6,'i',"network-diagnostics")]
         } else {
             &[(1,'N',"new-profile"),(2,'i',"invitation-import"),
               (1,'E',"trust-material"),(3,'V',"connection-status")]
@@ -459,9 +462,12 @@ fn visual_review_gallery() {
             assert!(!ui.workspace_visible(), "action {key} did not open its workflow");
             assert!(!ui.owned_running(role));
             assert_eq!(std::fs::read(path).unwrap(), before);
-            if *key == 'i' {
+            if role == Role::Client && *key == 'i' {
                 assert!(matches!(ui.importing, Some(ImportFlow::Input(_))));
                 assert!(ui.reality_enrollment.is_none());
+            }
+            if role == Role::Server && *key == 'i' {
+                assert!(ui.discovery.as_ref().is_some_and(DiscoveryPanel::is_consent_pending));
             }
             if role == Role::Server && *key == 's' {
                 assert!(ui.show_server_process);
@@ -519,6 +525,16 @@ fn visual_review_gallery() {
             assert!(!items.iter().any(|a| matches!(a.key, 'b' | 't' | 'x')));
             ui.workspace_action = items.iter().position(|a| a.key == 'U').unwrap();
             review_capture("server-page-users-ungranted", &model, &ui);
+            {
+                let editor = ui.editor.as_ref().unwrap();
+                ui.access_observation = Some(AccessObservation {
+                    digest: editor.saved_sha256(), inbound: editor.selected_record_id().to_owned(),
+                    user: editor.workspace_users()[0].0.clone(), requested: std::time::Instant::now(),
+                    receiver: None, observed: Some((7, 2)),
+                });
+                review_capture("server-page-users-observed", &model, &ui);
+                ui.access_observation = None;
+            }
             ui.update(&mut model, press(KeyCode::Enter));
             assert!(matches!(&ui.records, Some(RecordFlow::Confirm(review)) if review.body().contains("review-ungranted")));
             assert_eq!(ui.confirmation_choice(), Some(('y', "Удалить пользователя")));
