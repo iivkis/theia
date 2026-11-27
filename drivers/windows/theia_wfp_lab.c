@@ -7,9 +7,16 @@
  */
 #include <ntddk.h>
 #include <wdmsec.h>
-#include <fwpsk.h>
+/* WFP kernel headers require NDIS 6 packet-list declarations. The
+ * Microsoft headers intentionally use anonymous structures and unions. */
+#define NDIS_SUPPORT_NDIS6 1
+#pragma warning(push)
+#pragma warning(disable: 4201)
+#include <ndis.h>
 #include <ws2def.h>
 #include <ws2ipdef.h>
+#include <fwpsk.h>
+#pragma warning(pop)
 
 #define THEIA_TAG 'aiHT'
 #define CONTEXT_SIZE 84
