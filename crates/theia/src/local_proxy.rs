@@ -1629,14 +1629,150 @@ struct ClientView {
     revision: u64,
     client: ProxyClient,
 }
+// One atomic lifecycle: a concurrent Stop must never be overwritten by
+// preparation or a backend's final readiness publication. State 4 is an
+// internal terminal state for runtimes that never owned native capture.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[derive(Default)]
+struct CaptureLifecycle(std::sync::atomic::AtomicU8);
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl CaptureLifecycle {
+    fn idle(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire) == 0
+    }
+
+    fn running(&self) -> bool {
+        matches!(self.0.load(std::sync::atomic::Ordering::Acquire), 1 | 2)
+    }
+
+    fn begin(&self) -> Result<(), ClientError> {
+        self.transition(0, 1)
+    }
+
+    fn ready(&self) -> Result<(), ClientError> {
+        self.transition(1, 2)
+    }
+
+    fn transition(&self, from: u8, to: u8) -> Result<(), ClientError> {
+        use std::sync::atomic::Ordering;
+        self.0.compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| ClientError::Configuration)
+    }
+
+    fn stop(&self) {
+        use std::sync::atomic::Ordering;
+        let _ = self.0.fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            match state {
+                0 => Some(4),
+                1 | 2 => Some(3),
+                _ => None,
+            }
+        });
+    }
+
+    fn reported(&self) -> u8 {
+        match self.0.load(std::sync::atomic::Ordering::Acquire) {
+            4 => 0,
+            state => state,
+        }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
+mod capture_lifecycle_tests {
+    use super::CaptureLifecycle;
+
+    #[test]
+    fn stopped_before_preparation_cannot_publish_capture() {
+        let state = CaptureLifecycle::default();
+        assert!(state.idle());
+        state.stop();
+        assert_eq!(state.reported(), 0);
+        assert!(!state.idle());
+        assert!(!state.running());
+        assert!(state.begin().is_err());
+        assert!(state.ready().is_err());
+        state.stop();
+        assert_eq!(state.reported(), 0);
+    }
+
+    #[test]
+    fn interrupted_preparation_is_recovery_required() {
+        let state = CaptureLifecycle::default();
+        assert!(state.ready().is_err());
+        state.begin().unwrap();
+        assert_eq!(state.reported(), 1);
+        assert!(state.running());
+        assert!(state.begin().is_err());
+        state.stop();
+        assert_eq!(state.reported(), 3);
+        assert!(state.ready().is_err());
+        assert!(state.begin().is_err());
+        assert!(!state.running());
+        state.stop();
+        assert_eq!(state.reported(), 3);
+    }
+
+    #[test]
+    fn ready_then_stop_is_terminal() {
+        let state = CaptureLifecycle::default();
+        state.begin().unwrap();
+        state.ready().unwrap();
+        assert_eq!(state.reported(), 2);
+        assert!(state.ready().is_err());
+        assert!(state.running());
+        state.stop();
+        assert_eq!(state.reported(), 3);
+        assert!(!state.running());
+        assert!(state.ready().is_err());
+    }
+
+    #[test]
+    fn concurrent_ready_and_stop_cannot_resurrect_capture() {
+        let state = CaptureLifecycle::default();
+        state.begin().unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                let _ = state.ready();
+            });
+            barrier.wait();
+            state.stop();
+        });
+        assert_eq!(state.reported(), 3);
+        assert!(!state.running());
+        assert!(state.ready().is_err());
+    }
+
+    #[test]
+    fn concurrent_prepare_and_stop_never_leaves_a_live_state() {
+        let state = CaptureLifecycle::default();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                let _ = state.begin();
+            });
+            barrier.wait();
+            state.stop();
+        });
+        assert!(matches!(state.reported(), 0 | 3));
+        assert!(!state.running());
+        assert!(!state.idle());
+        assert!(state.begin().is_err());
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) struct ClientRuntime {
     path: std::path::PathBuf,
     slot: tokio::sync::watch::Sender<Arc<ClientView>>,
     // Bound one staging operation per process, with no commit on cancellation.
     stage: tokio::sync::Mutex<()>,
-    native_attached: std::sync::atomic::AtomicBool,
-    capture_state: std::sync::atomic::AtomicU8,
+    capture_state: CaptureLifecycle,
     stopped: tokio::sync::watch::Sender<bool>,
 }
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1658,8 +1794,7 @@ impl ClientRuntime {
             path,
             slot,
             stage: tokio::sync::Mutex::new(()),
-            native_attached: std::sync::atomic::AtomicBool::new(false),
-            capture_state: std::sync::atomic::AtomicU8::new(0),
+            capture_state: CaptureLifecycle::default(),
             stopped,
         })
     }
@@ -1668,7 +1803,7 @@ impl ClientRuntime {
     /// carrier and rule changes can be committed in one platform transaction.
     async fn attach_native(self: &Arc<Self>, owner: Arc<NativeOwner>, registrar: Option<Arc<dyn crate::routing::carrier_socket::Registrar>>) -> Result<NativeIngress, ClientError> {
         let _stage = self.stage.try_lock().map_err(|_| ClientError::Configuration)?;
-        if *self.stopped.borrow() || self.native_attached.load(std::sync::atomic::Ordering::Acquire) {
+        if *self.stopped.borrow() || !self.capture_state.idle() {
             return Err(ClientError::Configuration);
         }
         let view = self.slot.borrow().clone();
@@ -1676,8 +1811,7 @@ impl ClientRuntime {
         crate::routing::carrier_socket::scope(registrar.clone(), view.client.routing_policy()).await?;
         saved_client_bytes(&self.path, view.digest)?;
         if *self.stopped.borrow() { return Err(ClientError::Configuration); }
-        self.capture_state.store(1, std::sync::atomic::Ordering::Release);
-        self.native_attached.store(true, std::sync::atomic::Ordering::Release);
+        self.capture_state.begin()?;
         Ok(NativeIngress {
             runtime: self.clone(),
             client: view.client.clone(),
@@ -1691,11 +1825,9 @@ impl ClientRuntime {
     }
 
     fn stop(&self) {
-        if self.native_attached.load(std::sync::atomic::Ordering::Acquire) {
-            // Capture rules may remain after the queue stops. Never publish
-            // inactive/connected until the owner has finished recovery.
-            self.capture_state.store(3, std::sync::atomic::Ordering::Release);
-        }
+        // Capture rules may remain after the queue stops. Never publish
+        // inactive/connected until the owner has finished recovery.
+        self.capture_state.stop();
         self.stopped.send_replace(true);
         self.slot.borrow().client.routing_cache().dpi.retire();
     }
@@ -1740,7 +1872,7 @@ impl ClientRuntime {
             view.client.routing_cache().observation(),
             crate::traffic::routing_totals(),
             view.client.routing_cache().flows.counts(),
-            self.capture_state.load(std::sync::atomic::Ordering::Acquire),
+            self.capture_state.reported(),
         )
     }
     async fn candidate(
@@ -1821,7 +1953,7 @@ impl ClientRuntime {
             .stage
             .try_lock()
             .map_err(|_| ClientError::Configuration)?;
-        if *self.stopped.borrow() || self.native_attached.load(std::sync::atomic::Ordering::Acquire) {
+        if *self.stopped.borrow() || !self.capture_state.idle() {
             return Err(ClientError::Configuration);
         }
         let previous = self.slot.borrow().clone();
@@ -2071,7 +2203,10 @@ impl NativeIngress {
     }
 
     fn ensure_running(&self) -> Result<(), ClientError> {
-        if *self.runtime.stopped.borrow() || self.runtime.slot.borrow().revision != self.revision {
+        if !self.runtime.capture_state.running()
+            || *self.runtime.stopped.borrow()
+            || self.runtime.slot.borrow().revision != self.revision
+        {
             Err(ClientError::Open(ErrorCode::PolicyDenied))
         } else {
             Ok(())
@@ -2115,8 +2250,7 @@ impl NativeIngress {
         self.ensure_running()?;
         if !rules.lock().map_err(|_| ClientError::Configuration)?.owns_queue(&queue).map_err(|_| ClientError::Io)? { return Err(ClientError::Configuration); }
         let mut queue = queue.into_async().map_err(|_| ClientError::Io)?;
-        self.runtime.capture_state.compare_exchange(1,2,std::sync::atomic::Ordering::AcqRel,std::sync::atomic::Ordering::Acquire)
-            .map_err(|_| ClientError::Configuration)?;
+        self.runtime.capture_state.ready()?;
         let consume = async {
             let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
             heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2139,9 +2273,9 @@ impl NativeIngress {
         };
         tokio::select! {
             biased;
+            result=crate::routing::carrier_socket::scope(Some(registrar.clone()), consume)=>result,
+            result=crate::routing::carrier_socket::scope(Some(registrar), self.runtime.maintain())=>result,
             ()=self.stopped()=>Ok(()),
-            result=crate::routing::carrier_socket::scope(Some(registrar.clone()), self.runtime.maintain())=>result,
-            result=crate::routing::carrier_socket::scope(Some(registrar), consume)=>result,
         }
     }
 
@@ -2267,8 +2401,7 @@ impl NativeIngress {
         };
         proof.inspect().await.map_err(|_| ClientError::Configuration)?;
         session.check().map_err(|_| ClientError::Io)?;
-        ingress.runtime.capture_state.compare_exchange(1,2,std::sync::atomic::Ordering::AcqRel,std::sync::atomic::Ordering::Acquire)
-            .map_err(|_| ClientError::Configuration)?;
+        ingress.runtime.capture_state.ready()?;
         let mut relays = JoinSet::new();
         let result = {
             let consume = async {
