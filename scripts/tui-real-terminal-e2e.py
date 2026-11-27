@@ -439,6 +439,10 @@ def drive_client_proxy(binary, config, http_port, socks_port, echo_port):
 
 def drive_dual_product(binary, server, client, cert, admission, fingerprint,
                        http_port, socks_port, echo_port):
+    # Rust starts this process only after real server IPC readiness. The
+    # monotonic barrier therefore cannot expire before startup + 121s.
+    scenario_started = time.monotonic()
+    replay_deadline = scenario_started + 121.0
     assert Path(cert).is_file()  # The server fixture must have its certificate.
     # Full compiled-binary paths, not an injected TUI/IPC response. The
     # reference inventory is a local, pre-provisioned fixture; no internet.
@@ -574,6 +578,15 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         headless.terminate()
         headless.wait(timeout=3)
 
+        # All preceding operations use Own-TLS or local server management.
+        # Do not enroll or connect REALITY before the real replay window ends.
+        replay_wait_started = time.monotonic()
+        remaining = max(0.0, replay_deadline - replay_wait_started)
+        time.sleep(remaining)
+        assert time.monotonic() >= replay_deadline
+        replay_wait = time.monotonic() - replay_wait_started
+        revision(binary, 2)
+
         def enroll():
             tty.send("i")
             tty.wait("Вставьте ключ (скрыто)")
@@ -655,6 +668,10 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
     finally:
         if tty.alive():
             tty.close(expect_success=False)
+
+    # Preserve the previous active driver budget; only real barrier waiting
+    # is excluded. The Rust harness independently enforces the total budget.
+    assert time.monotonic() - scenario_started - replay_wait <= 50.0
 
 
 def main():

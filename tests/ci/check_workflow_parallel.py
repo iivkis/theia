@@ -95,7 +95,7 @@ require("cache-mode: write" not in extended and "continue-on-error" not in workf
         "no advisory acceptance or extended cache write")
 contains(workflow, "cache-mode: read", "cancel-in-progress: false",
          "ci-main-merge-${{ github.event.pull_request.merge_commit_sha || github.run_id }}")
-writers = {"rust-tests", "windows-smoke", "coverage-native"}
+writers = {"rust-tests", "windows-smoke", "coverage-native", "native-checks"}
 for name in mandatory - {"specification"}:
     payload = job(name)
     contains(payload, "needs.specification.outputs.native_required",
@@ -104,8 +104,9 @@ for name in mandatory - {"specification"}:
     require("git push" not in payload and "cargo fmt " not in payload, "publish only in specification")
     require(("    cache-mode: write" in payload) == (name in writers), "cache permission drift")
     if name in writers:
-        contains(payload, "if: " + dev_merge, "cache-workspace-crates: false", "cache-bin: false",
-                 "save-if: ${{ matrix.shard == 1 }}")
+        contains(payload, "if: " + dev_merge, "cache-workspace-crates: false", "cache-bin: false")
+        if name != "native-checks":
+            contains(payload, "save-if: ${{ matrix.shard == 1 }}")
     if name in {"rust-tests", "windows-smoke", "native-checks", "f14-build"}:
         contains(payload, "shared-key: native-default-deps-v4",
                  'CARGO_PROFILE_DEV_DEBUG: "line-tables-only"',
@@ -128,7 +129,9 @@ contains(checks, "check: linux-clippy", "check: windows-clippy", "check: windows
          "cargo clippy --workspace --all-targets --features experimental-btls-h2 --locked -- -D warnings",
          "if: matrix.check == 'windows-cross-sid'",
          "Cross-logon Windows pipe kernel-denial E2E (mandatory)", "windows-cross-sid-ci.ps1",
-         "save-if: false")
+         "save-if: false",
+         "if: matrix.check == 'windows-clippy'\n        with:\n          shared-key: native-clippy-deps-v1\n          cache-workspace-crates: false\n          cache-bin: false\n          save-if: true")
+require(checks.count("save-if: true") == 1, "only trusted Windows Clippy writes its dependency cache")
 require("cargo clippy" not in job("rust-tests") + job("windows-smoke"),
         "lint must not delay native tests")
 f14, cross = job("f14-build"), job("f14-cross-host")
@@ -142,7 +145,11 @@ contains(f14, "os: [ubuntu-24.04, windows-latest]", "fail-fast: false",
          "save-if: false", "actions/upload-artifact@v4")
 contains(cross, "runs-on: windows-2025", "wsl-version: 2", "distribution: Ubuntu-24.04",
          "name: f14-linux-server", "name: f14-windows-compiled", "scripts/f14-cross-os-ci.py",
-         "--windows-client", "--windows-test")
+         "--windows-client", "--windows-test", "Verify guest fixture dependencies; install only when missing",
+         "command -v python3 >/dev/null && command -v openssl >/dev/null",
+         "apt-get update", "apt-get install --yes --no-install-recommends python3 openssl",
+         "sys.version_info >= (3, 10)", "openssl version")
+require("additional-packages:" not in cross, "avoid unconditional WSL apt update")
 require("cargo build" not in cross and "|| true" not in cross, "cross-host must use native artifacts")
 cov, cg = job("coverage-native"), job("coverage-gate")
 contains(cov, "os: [ubuntu-latest, windows-latest]", "shard: [1, 2, 3, 4, 5, 6]",
@@ -158,7 +165,8 @@ contains(cov, "os: [ubuntu-latest, windows-latest]", "shard: [1, 2, 3, 4, 5, 6]"
          "--no-report --test tui_real_terminal -- compiled_client_proxy_conpty_lifecycle --ignored --exact",
          "Instrumented real WinINet CAS and recovery failed or did not execute",
          "Instrumented real ConPTY lifecycle failed or did not execute",
-         "if: runner.os == 'Windows' && matrix.shard == 6",
+         "Instrument real disposable Windows WinINet lifecycle\n        if: runner.os == 'Windows' && matrix.shard == 1",
+         "Instrument real disposable Windows ConPTY lifecycle\n        if: runner.os == 'Windows' && matrix.shard == 2",
          "if: matrix.shard >= 4", "$_.shard -eq [int]$env:COVERAGE_SHARD",
          "No mandatory fixtures assigned to coverage shard", "$name --ignored --exact", "test result: ok",
          "cargo llvm-cov report --lcov --include-build-script",
@@ -180,8 +188,8 @@ require("shared-key: native-default-deps-v4" not in cov and "--filter-expr" not 
         and "--partition" not in cov,
         "instrumentation must be isolated and complete")
 require(cov.count("cargo llvm-cov report --lcov --include-build-script") == 1, "export once per shard")
-for name in ("Instrument real dual-mode TUI", "Instrument real disposable Windows",
-             "Instrument independent protocol and browser interoperability"):
+for name in ("Instrument real dual-mode TUI", "Instrument real disposable Windows WinINet",
+             "Instrument real disposable Windows ConPTY", "Instrument independent protocol and browser interoperability"):
     require(cov.index(name) < cov.index("Export LCOV once"), "fixture must precede export")
 contains(cg, "pattern: coverage-shard-*", "merge-multiple: false",
          "ci-coverage.py gate --reports-dir coverage-shards --shards 6",
@@ -193,7 +201,17 @@ contains((ROOT / "scripts/ci-coverage.py").read_text(encoding="utf-8"), "MIN_PER
 tui = (ROOT / "crates/theia/tests/tui_real_terminal.rs").read_text(encoding="utf-8")
 contains(tui, '#[ignore = "mandatory dedicated native coverage shard: real startup replay guard"]',
          "async fn compiled_dual_mode_tui_invitation_import_apply_and_rollback()",
-         "sleep(Duration::from_secs(121)).await")
+         "Duration::from_secs(171)",
+         'assert!(running.0.try_wait().unwrap().is_none())')
+driver = (ROOT / "scripts/tui-real-terminal-e2e.py").read_text(encoding="utf-8")
+contains(driver, "scenario_started = time.monotonic()", "replay_deadline = scenario_started + 121.0",
+         "remaining = max(0.0, replay_deadline - replay_wait_started)", "time.sleep(remaining)",
+         "assert time.monotonic() >= replay_deadline",
+         "assert time.monotonic() - scenario_started - replay_wait <= 50.0")
+require(driver.index("replay_deadline = scenario_started + 121.0")
+        < driver.index("assert time.monotonic() >= replay_deadline")
+        < driver.index("        def enroll():"),
+        "REALITY cannot enroll before the full real startup window")
 live = (ROOT / "crates/theia/tests/tunnel_liveness.rs").read_text(encoding="utf-8")
 contains(live, "async fn production_h2_h3_asymmetric_traffic_half_close_and_idle()",
          "for transport in [Transport::H2, Transport::H3]", "cases.spawn(async move", "Case::LongUpload,",
