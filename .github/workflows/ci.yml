@@ -1107,7 +1107,13 @@ jobs:
       - name: Validate WinDivert package staging without installing a driver
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./drivers/windows/windivert/test-package.ps1
+        run: |
+          ./drivers/windows/windivert/test-package.ps1
+          Get-ChildItem drivers/windows/windivert -Filter '*.ps1' | ForEach-Object {
+            $tokens=$null; $errors=$null
+            $null=[System.Management.Automation.Language.Parser]::ParseFile($_.FullName,[ref]$tokens,[ref]$errors)
+            if ($errors.Count -ne 0) { throw "PowerShell parser rejected $($_.Name): $errors" }
+          }
       - name: Record Windows package validation scope
         if: runner.os == 'Windows'
         shell: pwsh

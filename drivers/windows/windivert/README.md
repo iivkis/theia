@@ -106,3 +106,20 @@ process. Do not treat it as trusted application evidence.
 - Physical IPv4/IPv6, offload, fragment, DNS, policy, disconnect/reboot,
   actual H2/H3 UDP and TCP egress, interoperability and throughput evidence.
 Until accepted, Connect remains inactive. No silent direct fallback.
+
+## Persistent guard experiment
+
+persistent-guard-lab.ps1 prepares one exact, independently authorized UDP
+block rule in Windows Firewall PersistentStore and records a durable
+create-only intent first. Use an existing administrator/SYSTEM-only journal
+directory with protected ACL and trusted ancestry, a reviewed executable/hash
+and literal local and controlled remote IP/ports. Prepare requires
+-IsolatedTestMachine. Verify with the independently recorded -IntentSha256
+after both WinDivert owners exit and with -RequireDifferentBoot after reboot;
+use independent remote packet capture to prove no egress. The guard blocks
+the chosen tuple, not general traffic, and is not integrated with the
+WinDivert relay or production Connect. NetSecurity has no atomic compare-
+and-delete; the script never removes a firewall rule. After explicit
+administrator review/removal, ReconcileAbsent records an observation of
+absence without mutating OS policy. A mismatch retains the journal. No
+automatic global firewall or default-policy changes, and no claim of OS CAS.
