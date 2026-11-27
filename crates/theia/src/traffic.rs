@@ -376,7 +376,7 @@ impl Monitor {
             area.height.min(if area.width >= 86 { 25 } else { 36 }),
         );
         let layout = Layout::vertical([
-            Constraint::Length(4),
+            Constraint::Length(5),
             Constraint::Min(1),
             Constraint::Length(3),
         ])
@@ -391,7 +391,9 @@ impl Monitor {
             .iter()
             .map(|s| s.opened)
             .fold(0u64, u64::saturating_add);
-        let scope = format!("Активные туннели: {active}   •   Всего открыто: {opened}\nДанные этого процесса без служебного трафика; доставка не подтверждается.");
+        let upload = self.current.iter().map(|s| s.upload).fold(0u64, u64::saturating_add);
+        let download = self.current.iter().map(|s| s.download).fold(0u64, u64::saturating_add);
+        let scope = format!("Активные туннели: {active}   •   Всего открыто: {opened}\nВсего ↑ {} · ↓ {}\nИсточник: только текущий процесс; доставка не подтверждается.", bytes(upload), bytes(download));
         frame.render_widget(
             Paragraph::new(scope)
                 .wrap(Wrap { trim: true })
@@ -497,6 +499,9 @@ impl Monitor {
 
     pub(crate) fn body(&self) -> String {
         let mut result = String::from("Только трафик текущего процесса Theia; внешние сервисы не измеряются.\nДанные после открытия туннеля, без служебного трафика. Доставка не подтверждается.\n");
+        let upload = self.current.iter().map(|s| s.upload).fold(0u64, u64::saturating_add);
+        let download = self.current.iter().map(|s| s.download).fold(0u64, u64::saturating_add);
+        result.push_str(&format!("Всего ↑ {} · ↓ {}\n", bytes(upload), bytes(download)));
         for (i, s) in self.current.iter().enumerate() {
             let transport = if i == 0 { "H2" } else { "H3" };
             let (up, down) = self.rate[i];

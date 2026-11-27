@@ -497,7 +497,7 @@ fn page_actions_for(
         ],
         (Role::Server, 3) => &[
             ('s', "Запуск / остановка"),
-            ('v', "Проверить сервер и применить изменения"),
+            ('v', "Проверить состояние сервера"),
         ],
         (Role::Server, 4) => &[],
         (Role::Client, 4) => &[('4', "Развернуть монитор")],
@@ -753,6 +753,7 @@ fn invitation_actions(flow: &IssueFlow) -> Vec<ActionItem> {
 // the existing guarded save/Apply workflows are explicitly invoked.
 struct RoutingPanel {
     settings: crate::routing::Settings,
+    original: crate::routing::Settings,
     selected: usize,
     fields: Option<(Option<usize>, [String; 5], usize)>,
     action_focus: Option<usize>,
@@ -784,6 +785,7 @@ impl RoutingPanel {
                     .join("geodata")
             });
         Self {
+            original: settings.clone(),
             settings,
             selected: 0,
             fields: None,
@@ -932,8 +934,10 @@ impl RoutingPanel {
         items.extend([
             ActionItem { key: 'g', label: "Загрузить и проверить базы" },
             ActionItem { key: 'l', label: "Выбрать загруженные базы" },
-            ActionItem { key: 's', label: "Принять черновик правил" },
         ]);
+        if self.settings != self.original {
+            items.push(ActionItem { key: 's', label: "Принять черновик правил" });
+        }
         items
     }
 
@@ -951,7 +955,34 @@ impl RoutingPanel {
         let items = self.actions();
         let body = self.body();
         if let Some([report, controls]) = self.layout(area) {
-            panel(frame, report, "Маршрутизация", &body, active && self.action_focus.is_none());
+            if self.fields.is_none() && self.download.is_none() {
+                let info = format!("GeoData: {} · {}\nПервое совпадение сверху; остальные — через сервер.",
+                    self.settings.datasets.as_ref().map_or("не выбраны", |m| m.release.as_str()),
+                    if self.settings == self.original { "без изменений" } else { "черновик изменён" });
+                let header = Rect::new(report.x, report.y, report.width, 3.min(report.height));
+                panel(frame, header, "Маршрутизация", &info, active && self.action_focus.is_none());
+                let (start, capacity) = self.rule_window(report);
+                let table = Rect::new(report.x, report.y.saturating_add(3), report.width, report.height.saturating_sub(4));
+                let rows = self.settings.rules.iter().enumerate().skip(start).take(capacity).map(|(i, rule)| {
+                    let chosen = i == self.selected;
+                    let conditions = format!("Доменов: {} · IP: {} · прил.: {}", rule.domains.len(), rule.ips.len(), rule.applications.len());
+                    Row::new(vec![format!("{} {}", if chosen { "›" } else { " " }, i + 1), rule.name.clone(),
+                        conditions, Self::action_label(Self::action_name(rule.action)).to_owned()])
+                        .style(Style::default().fg(if chosen { ACCENT } else { TEXT })
+                            .bg(if chosen && active && self.action_focus.is_none() { FOCUS } else { SURFACE }))
+                });
+                frame.render_widget(Table::new(rows, [Constraint::Length(5), Constraint::Percentage(30), Constraint::Percentage(38), Constraint::Min(12)])
+                    .header(Row::new(["№", "Правило", "Условия", "Действие"]).style(Style::default().fg(MUTED))), table);
+                if report.height >= 5 {
+                    let footer = if !self.message.is_empty() { self.message.clone() }
+                        else if self.settings.rules.is_empty() { "Нет правил · добавьте первое правило".into() }
+                        else { format!("{}–{} / {} · ↑↓ / PgUp/PgDn · Tab действия", start + 1, (start + capacity).min(self.settings.rules.len()), self.settings.rules.len()) };
+                    frame.render_widget(Paragraph::new(footer).style(Style::default().fg(MUTED)),
+                        Rect::new(report.x, report.bottom().saturating_sub(1), report.width, 1));
+                }
+            } else {
+                panel(frame, report, "Маршрутизация", &body, active && self.action_focus.is_none());
+            }
             Actions { items: &items, selected: self.action_focus.unwrap_or(0) }
                 .render_with_focus(frame, controls, active && self.action_focus.is_some());
         } else {
@@ -959,6 +990,12 @@ impl RoutingPanel {
         }
     }
 
+    fn rule_window(&self, report: Rect) -> (usize, usize) {
+        let capacity = usize::from(report.height.saturating_sub(5));
+        let start = self.selected.saturating_sub(capacity.saturating_sub(1))
+            .min(self.settings.rules.len().saturating_sub(capacity));
+        (start, capacity)
+    }
     fn select_at(&mut self, area: Rect, x: u16, y: u16) {
         if self.fields.is_some() || self.download.is_some() {
             return;
@@ -967,9 +1004,11 @@ impl RoutingPanel {
             let items = self.actions();
             if let Some(i) = (Actions { items: &items, selected: self.action_focus.unwrap_or(0) }).hit(controls, x, y) {
                 self.action_focus = Some(i);
-            } else if x > report.x && x < report.right() && y >= report.y + 3 && y < report.bottom() {
-                let i = self.selected.saturating_sub(3) + usize::from(y - report.y - 3);
-                if i < self.settings.rules.len() {
+            } else if x >= report.x && x < report.right() && y >= report.y + 4 && y < report.bottom().saturating_sub(1) {
+                let (start, capacity) = self.rule_window(report);
+                let offset = usize::from(y - report.y - 4);
+                let i = start + offset;
+                if offset < capacity && i < self.settings.rules.len() {
                     self.selected = i;
                     self.action_focus = None;
                 }
@@ -1081,6 +1120,10 @@ impl RoutingPanel {
             KeyCode::Esc => return false,
             KeyCode::Up => self.selected = self.selected.saturating_sub(1),
             KeyCode::Down => self.selected = (self.selected + 1).min(len.saturating_sub(1)),
+            KeyCode::PageUp => self.selected = self.selected.saturating_sub(7),
+            KeyCode::PageDown => self.selected = self.selected.saturating_add(7).min(len.saturating_sub(1)),
+            KeyCode::Home => self.selected = 0,
+            KeyCode::End => self.selected = len.saturating_sub(1),
             KeyCode::Char('n') if len < 1024 => self.edit(None),
             KeyCode::Enter if self.selected < len => self.edit(Some(self.selected)),
             KeyCode::Delete if self.selected < len => {
@@ -1099,7 +1142,7 @@ impl RoutingPanel {
             }
             KeyCode::Char('g') => self.refresh(true),
             KeyCode::Char('l') => self.refresh(false),
-            KeyCode::Char('s') => {
+            KeyCode::Char('s') if self.settings != self.original => {
                 if let Some(editor) = editor {
                     match editor.stage_routing(self.settings.clone()) {
                         Ok(()) => return false,
@@ -1120,7 +1163,7 @@ impl RoutingPanel {
                 "Действие",
                 "Домены / GeoSite",
                 "IP / CIDR / GeoIP",
-                "Приложения",
+                "Приложения (будущие режимы)",
             ]
             .iter()
             .zip(fields)
@@ -1136,7 +1179,7 @@ impl RoutingPanel {
                     if i == *focus { "›" } else { " " }
                 ));
             }
-            body.push_str("\nПримеры: domain:example.org, geosite:google\nIP: 192.0.2.0/24, geoip:private · через запятую\nПриложение: sha256: + 64 строчных hex-символа\nGeoIP Lite: in-ru, in-cn, in-ir — региональные наборы, не геолокация\n\n↑↓ / Tab: поле · ←→: действие · Ctrl+U: очистить\nEnter: принять правило · Esc: отменить");
+            body.push_str("\nПримеры: domain:example.org, geosite:google\nIP: 192.0.2.0/24, geoip:private · через запятую\nПриложение: sha256: + 64 строчных hex-символа; в MVP нет атрибуции\nGeoIP Lite: in-ru, in-cn, in-ir — региональные наборы, не геолокация\n\n↑↓ / Tab: поле · ←→: действие · Ctrl+U: очистить\nEnter: принять правило · Esc: отменить");
         } else {
             body.push_str(&format!(
                 "GeoData: {} (GeoSite Standard + GeoIP Lite)\nПравила проверяются сверху вниз. Без совпадения — через сервер.\n",
@@ -3206,6 +3249,8 @@ impl Interaction {
                             if let Some(dialog) = self.config_dialog.as_mut() {
                                 if role == Role::Client && self.welcome_choice == 1 {
                                     dialog.begin_client_import();
+                                } else if role == Role::Server {
+                                    dialog.choose_server_path(self.welcome_choice);
                                 } else {
                                     dialog.prefer_mode(self.welcome_choice);
                                 }
@@ -3543,31 +3588,24 @@ impl Interaction {
                                 };
                                 let result = self.update(model, command);
                                 if let Some(id) = selected {
-                                    if ch == 'x' {
-                                        if let Some(DisableFlow::Input(value)) =
-                                            self.revocation.as_mut()
-                                        {
-                                            *value = id.clone();
-                                        }
+                                    if ch == 'x' && matches!(self.revocation, Some(DisableFlow::Input(_))) {
+                                        self.revocation = Some(DisableFlow::Confirm(id.clone()));
+                                        self.confirm_selected = false;
                                     }
-                                    if ch == 'U' {
-                                        if let Some(RecordFlow::Input {
-                                            action: RecordAction::DeleteUser,
-                                            fields,
-                                            ..
-                                        }) = self.records.as_mut()
-                                        {
-                                            if let Some(value) = fields.first_mut() {
-                                                *value = id.clone();
+                                    if ch == 'U' && matches!(self.records, Some(RecordFlow::Input { action: RecordAction::DeleteUser, .. })) {
+                                        if let Some(editor) = self.editor.as_mut() {
+                                            match editor.review_record(RecordAction::DeleteUser, std::slice::from_ref(&id)) {
+                                                Ok(review) => {
+                                                    self.records = Some(RecordFlow::Confirm(Box::new(review)));
+                                                    self.confirm_selected = false;
+                                                }
+                                                Err(message) => { editor.error = Some(message.into()); }
                                             }
                                         }
                                     }
-                                    if matches!(ch, 'b' | 't') {
-                                        if let Some(IssueFlow::Input(value)) =
-                                            self.issuance.as_mut()
-                                        {
-                                            *value = id;
-                                        }
+                                    if matches!(ch, 'b' | 't') && matches!(self.issuance, Some(IssueFlow::Input(_))) {
+                                        self.issuance = Some(IssueFlow::Confirm(id));
+                                        self.confirm_selected = false;
                                     }
                                 }
                                 return result;
@@ -4138,8 +4176,14 @@ impl Interaction {
                     _ => self.revocation = Some(DisableFlow::SaveFailed),
                 },
                 DisableFlow::Done => {
-                    if !matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
-                        self.revocation = Some(DisableFlow::Done);
+                    match key.code {
+                        KeyCode::Enter => {
+                            self.workspace_page = 3;
+                            self.workspace_focus = WorkspaceFocus::Actions;
+                            self.workspace_action = 1;
+                        }
+                        KeyCode::Esc => {}
+                        _ => self.revocation = Some(DisableFlow::Done),
                     }
                 }
             }
@@ -6106,6 +6150,8 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             interaction.map_or(0, |u| u.modal_action),
             viewport,
         );
+    } else if interaction.is_some_and(|ui| ui.discovery.is_some() && ui.workspace_page == 6 && ui.editor_for(Role::Server).is_some()) {
+        draw_workspace(frame, parts[1], Role::Server, interaction.and_then(|ui| ui.editor.as_ref()), 0, interaction);
     } else if let Some(discovery) = interaction.and_then(|ui| ui.discovery.as_ref()) {
         diagnostic_report(
             frame,
@@ -6638,7 +6684,7 @@ fn draw_revocation(
         ),
         DisableFlow::Done => (
             "Отключение сохранено",
-            "Настройки сохранены. Работающий сервер ещё не изменён.\n\nСледующий шаг: закройте это окно и выберите «Применить права доступа». После подтверждения новые подключения пользователя будут запрещены. Уже открытые туннели продолжатся.\n\nEnter/Esc: закрыть.".into(),
+            "Настройки сохранены. Работающий сервер ещё не изменён.\n\nСледующий шаг: перейдите в «Управление», проверьте состояние сервера, затем подтвердите применение прав доступа. Уже открытые туннели продолжатся.\n\nEnter: перейти к управлению · Esc: вернуться к пользователям.".into(),
         ),
     };
     let body = if let DisableFlow::Input(id) = flow {
@@ -7113,6 +7159,13 @@ fn draw_page(
             return;
         }
     }
+    if role == Role::Server && page == 6 {
+        if let Some(discovery) = ui.and_then(|u| u.discovery.as_ref()) {
+            diagnostic_report(frame, area, "Сетевая диагностика", &discovery.body(), &discovery.report_actions(),
+                ui.map_or(0, |u| u.modal_action), ui.map(|u| &u.viewport));
+            return;
+        }
+    }
     if role == Role::Server && page == 7 {
         if let Some(routing) = ui.and_then(|u| u.routing_panel.as_ref()) {
             routing.render(frame, area, true);
@@ -7217,7 +7270,7 @@ fn draw_page(
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ),
                 Line::styled(status, Style::default().fg(color)),
-                Line::raw(format!("Сервер: {local}")),
+                Line::raw(format!("Процесс этой панели: {local}")),
                 Line::styled(
                     format!("Далее: {next_label}"),
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -7232,7 +7285,7 @@ fn draw_page(
             }
             frame.render_widget(
                 Paragraph::new(lines)
-                    .block(tui_widgets::section("Настройка сервера", true))
+                    .block(tui_widgets::section("Обзор сервера", true))
                     .wrap(Wrap { trim: true }),
                 content,
             );
@@ -7351,18 +7404,14 @@ fn draw_page(
                             " "
                         }
                     ),
-                    if *granted {
-                        "Разрешено"
-                    } else {
-                        "Нет права"
-                    }
-                    .into(),
                     if *disabled {
                         "Отключён"
+                    } else if *granted {
+                        "Разрешён"
                     } else {
-                        "Включён"
-                    }
-                    .into(),
+                        "Нет права"
+                    }.into(),
+                    if *granted { "Выдано" } else { "Нет" }.into(),
                 ])
                 .style(Style::default().fg(color).bg(if active {
                     FOCUS
@@ -7380,7 +7429,7 @@ fn draw_page(
                 ],
             )
             .header(
-                Row::new(["Пользователь", "Право доступа", "Учётная запись"])
+                Row::new(["Пользователь", "Доступ по файлу", "Право на подключение"])
                     .style(Style::default().fg(MUTED)),
             )
             .block(tui_widgets::section(
@@ -7409,9 +7458,9 @@ fn draw_page(
         if users.len() <= 3 && content.height >= 9 {
             let y = content.y + 2 + users.len() as u16 + 1;
             let hint = match users.get(selected) {
-                Some((_, true, true)) => "Пользователь отключён. «Восстановить доступ и выдать ключ» подготовит новый ключ.\nИзменения действуют после применения прав.",
+                Some((_, true, true)) => "Пользователь отключён по файлу. Восстановление создаёт новый ключ.\nФактический доступ проверяется и применяется в разделе «Управление».",
                 Some((_, _, false)) => "У пользователя нет права на это подключение. Измените права доступа.\nУдаление возможно только без прав на всех подключениях.",
-                Some(_) => "Личный ключ показывается один раз. Замена лишит старый ключ доступа после применения прав.\nУдаление доступно только после снятия прав во всех подключениях.",
+                Some(_) => "Доступ указан по файлу, не по работающему серверу.\nЗамена ключа действует после применения прав в «Управлении».",
                 None => "Добавьте пользователя и выдайте ему ключ.",
             };
             frame.render_widget(
@@ -7433,7 +7482,7 @@ fn draw_page(
                 let applied = ui.and_then(|u| u.last_apply)
                     .filter(|(sha, _, _)| !editor.dirty() && *sha == editor.saved_sha256())
                     .map_or_else(|| "Работа с сохранёнными настройками не подтверждена".into(), |(_, kind, revision)| format!("Последнее подтверждение: {kind}, rev {revision}"));
-                format!("Сервер этой панели: {status}\n{applied}\nПроверка внешней службы и применение — через единое действие ниже.")
+                format!("Процесс этой панели: {status}\n{applied}\nПроверка состояния ничего не изменяет. Применение и откат доступны после ответа сервера.")
             }
             (Role::Client,6) => {
                 let observation = if editor.dirty() || editor.write_uncertain() { "Сохранённые настройки изменились. Состояние выбранного файла не подтверждено.".into() }
@@ -7446,6 +7495,7 @@ fn draw_page(
             }
             (Role::Server,7) => editor.routing_settings().map_or_else(|| "Правил нет. По умолчанию весь трафик Theia идёт через сервер.".into(), |s| format!("Ревизия: {} · правил: {}\nGeoData: {}\nСохраните TOML, затем примените через Управление.", s.revision, s.rules.len(), s.datasets.as_ref().map_or("не выбраны", |m| m.release.as_str()))),
             (_,5) => format!("Файл: {}\n{}\nСохранение не меняет работающий процесс.", editor.saved_path().display(), editor.settings_summary()),
+            (Role::Server,6) => "Сетевые адреса и доступность. Результатов пока нет.\nОткройте диагностику; внешние запросы требуют отдельного согласия.".into(),
             _ => "Проверьте состояние подключения.\nСетевые проверки требуют согласия.".into(),
         };
         panel(frame, content, pages(role)[page], &description, true);
@@ -8548,13 +8598,13 @@ mod tests {
             ui.update(&mut model, press(KeyCode::Enter));
             match command {
                 'x' => assert!(
-                    matches!(&ui.revocation, Some(DisableFlow::Input(id)) if id == "device-b")
+                    matches!(&ui.revocation, Some(DisableFlow::Confirm(id)) if id == "device-b")
                 ),
                 't' => {
-                    assert!(matches!(&ui.issuance, Some(IssueFlow::Input(id)) if id == "device-b"))
+                    assert!(matches!(&ui.issuance, Some(IssueFlow::Confirm(id)) if id == "device-b"))
                 }
                 'U' => assert!(
-                    matches!(&ui.records, Some(RecordFlow::Input { action: RecordAction::DeleteUser, fields, .. }) if fields.first().is_some_and(|id| id == "device-c"))
+                    matches!(&ui.records, Some(RecordFlow::Confirm(review)) if review.confirmation_label() == "Удалить пользователя" && review.body().contains("device-c"))
                 ),
                 _ => unreachable!(),
             }
