@@ -1123,14 +1123,30 @@ pub(crate) async fn connect_diagnostic_socket(
         return Err(Error::Protocol);
     }
     let route = InitialRoute {
-        version, local: cid, remote: original.to_vec(), original: original.to_vec(),
-        retry: None, initial_reset: None, token: Vec::new(),
-        versions: VersionPolicy::exact(version), restarted: false,
+        version,
+        local: cid,
+        remote: original.to_vec(),
+        original: original.to_vec(),
+        retry: None,
+        initial_reset: None,
+        token: Vec::new(),
+        versions: VersionPolicy::exact(version),
+        restarted: false,
     };
     establish_inner(
-        SessionIo::direct_carrier(socket, super::scope::NetworkScope::loopback(), Default::default(), Some(peer)),
-        peer, route, Config::Client { tls, name }, Congestion::Bbr, None,
-    ).await
+        SessionIo::direct_carrier(
+            socket,
+            super::scope::NetworkScope::loopback(),
+            Default::default(),
+            Some(peer),
+        ),
+        peer,
+        route,
+        Config::Client { tls, name },
+        Congestion::Bbr,
+        None,
+    )
+    .await
 }
 
 /// The candidate is created exclusively after the listener validates Retry.

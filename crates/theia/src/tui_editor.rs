@@ -999,12 +999,21 @@ impl Editor {
 
     /// Display endpoint without changing the exact identity used for guarded operations.
     pub(crate) fn server_connection_label(&self, id: &str) -> Option<String> {
-        let Config::Server(doc) = &self.draft else { return None; };
+        let Config::Server(doc) = &self.draft else {
+            return None;
+        };
         let inbound = doc.server.inbounds.iter().find(|entry| entry.id == id)?;
-        let port = inbound.h2_listen.parse::<std::net::SocketAddr>().ok()?.port();
+        let port = inbound
+            .h2_listen
+            .parse::<std::net::SocketAddr>()
+            .ok()?
+            .port();
         let host = inbound.server_name.as_str();
-        let endpoint = if host.parse::<std::net::Ipv6Addr>().is_ok() { format!("[{host}]:{port}") }
-            else { format!("{host}:{port}") };
+        let endpoint = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        };
         Some(endpoint)
     }
 
@@ -1504,7 +1513,12 @@ impl Editor {
                 "REALITY {}/{}: {} [защищённое подключение]",
                 self.selected_record + 1,
                 self.record_count(),
-                if self.role == Role::Server { self.server_connection_label(self.selected_record_id()).unwrap_or_else(|| self.selected_record_id().into()) } else { self.selected_record_id().into() }
+                if self.role == Role::Server {
+                    self.server_connection_label(self.selected_record_id())
+                        .unwrap_or_else(|| self.selected_record_id().into())
+                } else {
+                    self.selected_record_id().into()
+                }
             );
         }
         match self.role {
@@ -1512,7 +1526,8 @@ impl Editor {
                 "Подключение {}/{}: {}",
                 self.selected_record + 1,
                 self.record_count(),
-                self.server_connection_label(self.selected_record_id()).unwrap_or_else(|| self.selected_record_id().into()),
+                self.server_connection_label(self.selected_record_id())
+                    .unwrap_or_else(|| self.selected_record_id().into()),
             ),
             Role::Client => format!(
                 "Профиль {}/{}: {}{}",
@@ -1533,7 +1548,9 @@ impl Editor {
     pub(crate) fn set_compact_server_fields(&mut self, compact: bool) {
         if self.role == Role::Server && !self.editing {
             self.compact_server_fields = compact;
-            self.selected_field = self.selected_field.min(self.field_count().saturating_sub(1));
+            self.selected_field = self
+                .selected_field
+                .min(self.field_count().saturating_sub(1));
         }
     }
 
@@ -1542,7 +1559,9 @@ impl Editor {
     }
 
     fn common_listener(&self) -> Option<std::net::SocketAddr> {
-        let Config::Server(doc) = &self.draft else { return None; };
+        let Config::Server(doc) = &self.draft else {
+            return None;
+        };
         let inbound = doc.server.inbounds.get(self.selected_record)?;
         let h2 = inbound.h2_listen.parse::<std::net::SocketAddr>().ok()?;
         let h3 = inbound.quic_listen.parse::<std::net::SocketAddr>().ok()?;
@@ -1551,7 +1570,13 @@ impl Editor {
 
     pub fn field_count(&self) -> usize {
         match self.role {
-            Role::Server if self.compact_server_fields => if self.common_listener().is_some() { 2 } else { 1 },
+            Role::Server if self.compact_server_fields => {
+                if self.common_listener().is_some() {
+                    2
+                } else {
+                    1
+                }
+            }
             Role::Server => 3,
             Role::Client => 4,
         }
@@ -1626,7 +1651,9 @@ impl Editor {
 
     pub fn field_value(&self) -> String {
         if self.compact_server_fields() && self.selected_field == 1 {
-            return self.common_listener().map_or_else(String::new, |address| address.port().to_string());
+            return self
+                .common_listener()
+                .map_or_else(String::new, |address| address.port().to_string());
         }
         match &self.draft {
             Config::Server(doc) => doc
@@ -1673,7 +1700,9 @@ impl Editor {
                 .map(|inbound| {
                     if self.compact_server_fields {
                         let mut fields = vec![inbound.server_name.clone()];
-                        if let Some(address) = self.common_listener() { fields.push(address.port().to_string()); }
+                        if let Some(address) = self.common_listener() {
+                            fields.push(address.port().to_string());
+                        }
                         return fields;
                     }
                     vec![
@@ -1852,7 +1881,8 @@ impl Editor {
                     0 => inbound.server_name.clone_from(&self.input),
                     1 if compact => {
                         let Some(mut address) = common else {
-                            self.error = Some("Раздельные адреса требуют расширенных настроек.".into());
+                            self.error =
+                                Some("Раздельные адреса требуют расширенных настроек.".into());
                             return false;
                         };
                         let Ok(port) = self.input.parse::<u16>() else {

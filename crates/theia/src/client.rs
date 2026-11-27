@@ -286,7 +286,10 @@ impl H2Client {
         self.routing_resource(None, known, false).await
     }
 
-    pub(crate) async fn diagnostic_domains(&self, digest: [u8; 32]) -> Result<Vec<String>, ClientError> {
+    pub(crate) async fn diagnostic_domains(
+        &self,
+        digest: [u8; 32],
+    ) -> Result<Vec<String>, ClientError> {
         let bytes = self.routing_resource(None, Some(digest), true).await?;
         crate::routing::exchange::decode_diagnostic_domains(&bytes, digest)
     }
@@ -318,7 +321,9 @@ impl H2Client {
     }
 
     pub(crate) fn diagnostic_remote(&self) -> Result<std::net::SocketAddr, ClientError> {
-        self.endpoint.parse().map_err(|_| ClientError::Configuration)
+        self.endpoint
+            .parse()
+            .map_err(|_| ClientError::Configuration)
     }
 
     pub(crate) fn own_routing_scope(&self) -> Option<&str> {
@@ -403,7 +408,10 @@ impl H2Client {
                 crate::routing::exchange::request_digest(&mut request, digest)?;
             }
             if diagnostic {
-                request.headers_mut().insert(crate::routing::exchange::DIAGNOSTIC_HEADER, http::HeaderValue::from_static("1"));
+                request.headers_mut().insert(
+                    crate::routing::exchange::DIAGNOSTIC_HEADER,
+                    http::HeaderValue::from_static("1"),
+                );
             }
             let request = crate::channel_binding::attach(
                 connection.binding.as_ref(),
@@ -415,7 +423,9 @@ impl H2Client {
             let response = response.await.map_err(|_| ClientError::Http2)?;
             crate::split_http::check_status(response.status())?;
             let expected = crate::routing::exchange::validate_headers(response.headers())?;
-            if (diagnostic && expected > crate::routing::exchange::DIAGNOSTIC_LIMIT) || (domain.is_some() && expected > crate::routing::exchange::DNS_LIMIT) {
+            if (diagnostic && expected > crate::routing::exchange::DIAGNOSTIC_LIMIT)
+                || (domain.is_some() && expected > crate::routing::exchange::DNS_LIMIT)
+            {
                 return Err(ClientError::Protocol);
             }
             let mut body = response.into_body();

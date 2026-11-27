@@ -285,7 +285,10 @@ impl H3Client {
         self.routing_resource(None, known, false).await
     }
 
-    pub(crate) async fn diagnostic_domains(&self, digest: [u8; 32]) -> Result<Vec<String>, ClientError> {
+    pub(crate) async fn diagnostic_domains(
+        &self,
+        digest: [u8; 32],
+    ) -> Result<Vec<String>, ClientError> {
         let bytes = self.routing_resource(None, Some(digest), true).await?;
         crate::routing::exchange::decode_diagnostic_domains(&bytes, digest)
     }
@@ -384,7 +387,10 @@ impl H3Client {
                 crate::routing::exchange::request_digest(&mut request, digest)?;
             }
             if diagnostic {
-                request.headers_mut().insert(crate::routing::exchange::DIAGNOSTIC_HEADER, http::HeaderValue::from_static("1"));
+                request.headers_mut().insert(
+                    crate::routing::exchange::DIAGNOSTIC_HEADER,
+                    http::HeaderValue::from_static("1"),
+                );
             }
             let request = crate::channel_binding::attach(
                 connection.binding.as_ref(),
@@ -401,7 +407,9 @@ impl H3Client {
                 .map_err(|_| ClientError::Http3)?;
             crate::split_http::check_status(response.status())?;
             let expected = crate::routing::exchange::validate_headers(response.headers())?;
-            if (diagnostic && expected > crate::routing::exchange::DIAGNOSTIC_LIMIT) || (domain.is_some() && expected > crate::routing::exchange::DNS_LIMIT) {
+            if (diagnostic && expected > crate::routing::exchange::DIAGNOSTIC_LIMIT)
+                || (domain.is_some() && expected > crate::routing::exchange::DNS_LIMIT)
+            {
                 return Err(ClientError::Protocol);
             }
             let mut bytes = Vec::new();

@@ -12,7 +12,10 @@ pub struct Settings {
     pub geodata_directory: Option<String>,
     #[serde(default)]
     pub rules: Vec<Rule>,
-    #[serde(default = "snapshot::default_diagnostic_domains", skip_serializing_if = "snapshot::is_default_diagnostic_domains")]
+    #[serde(
+        default = "snapshot::default_diagnostic_domains",
+        skip_serializing_if = "snapshot::is_default_diagnostic_domains"
+    )]
     pub diagnostic_domains: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub datasets: Option<geodata::Manifest>,

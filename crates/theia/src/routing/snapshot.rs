@@ -12,8 +12,16 @@ pub const MAX_SNAPSHOT: usize = 64 * 1024 * 1024;
 pub const MAX_DIAGNOSTIC_DOMAINS: usize = 16;
 
 pub fn default_diagnostic_domains() -> Vec<String> {
-    ["web.telegram.org", "discord.com", "www.youtube.com", "www.instagram.com", "x.com"]
-        .into_iter().map(str::to_owned).collect()
+    [
+        "web.telegram.org",
+        "discord.com",
+        "www.youtube.com",
+        "www.instagram.com",
+        "x.com",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
 }
 
 pub(crate) fn is_default_diagnostic_domains(domains: &[String]) -> bool {
@@ -24,12 +32,16 @@ pub(crate) fn is_default_diagnostic_domains(domains: &[String]) -> bool {
 /// arbitrary ports. Destination IP authorization still belongs to the router.
 pub fn validate_diagnostic_domains(domains: &[String]) -> bool {
     let mut seen = HashSet::new();
-    !domains.is_empty() && domains.len() <= MAX_DIAGNOSTIC_DOMAINS && domains.iter().all(|name| {
-        name.contains('.')
-            && super::domain_name(name).is_ok_and(|canonical| canonical == *name)
-            && ![".local", ".localhost", ".internal", ".onion"].iter().any(|suffix| name.ends_with(suffix))
-            && seen.insert(name)
-    })
+    !domains.is_empty()
+        && domains.len() <= MAX_DIAGNOSTIC_DOMAINS
+        && domains.iter().all(|name| {
+            name.contains('.')
+                && super::domain_name(name).is_ok_and(|canonical| canonical == *name)
+                && ![".local", ".localhost", ".internal", ".onion"]
+                    .iter()
+                    .any(|suffix| name.ends_with(suffix))
+                && seen.insert(name)
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,7 +57,10 @@ pub struct Manifest {
     pub rules: Vec<Rule>,
     // Default lists are a protocol constant: preserve the old default wire
     // bytes and durable revision floor. Custom lists always enter the digest.
-    #[serde(default = "default_diagnostic_domains", skip_serializing_if = "is_default_diagnostic_domains")]
+    #[serde(
+        default = "default_diagnostic_domains",
+        skip_serializing_if = "is_default_diagnostic_domains"
+    )]
     pub diagnostic_domains: Vec<String>,
 }
 
@@ -133,7 +148,14 @@ impl Snapshot {
         geosite: &[u8],
         geoip: &[u8],
     ) -> Result<(Self, Vec<u8>), SnapshotError> {
-        Self::build_with_diagnostic_domains(inbound_id, revision, rules, geosite, geoip, &default_diagnostic_domains())
+        Self::build_with_diagnostic_domains(
+            inbound_id,
+            revision,
+            rules,
+            geosite,
+            geoip,
+            &default_diagnostic_domains(),
+        )
     }
 
     pub fn build_with_diagnostic_domains(
@@ -144,7 +166,10 @@ impl Snapshot {
         geoip: &[u8],
         diagnostic_domains: &[String],
     ) -> Result<(Self, Vec<u8>), SnapshotError> {
-        if !scope_valid(inbound_id) || revision == 0 || !validate_diagnostic_domains(diagnostic_domains) {
+        if !scope_valid(inbound_id)
+            || revision == 0
+            || !validate_diagnostic_domains(diagnostic_domains)
+        {
             return Err(SnapshotError::Invalid);
         }
         let policy = Policy::compile(rules, geosite, geoip)?;
@@ -220,8 +245,10 @@ impl Snapshot {
         let text =
             std::str::from_utf8(&wire[HEADER..site_start]).map_err(|_| SnapshotError::Invalid)?;
         let manifest: Manifest = toml::from_str(text).map_err(|_| SnapshotError::Invalid)?;
-        if manifest.revision == 0 || !scope_valid(&manifest.inbound_id)
-            || !validate_diagnostic_domains(&manifest.diagnostic_domains) {
+        if manifest.revision == 0
+            || !scope_valid(&manifest.inbound_id)
+            || !validate_diagnostic_domains(&manifest.diagnostic_domains)
+        {
             return Err(SnapshotError::Invalid);
         }
         if manifest.inbound_id != expected_inbound {
@@ -426,7 +453,8 @@ mod diagnostic_domain_tests {
         assert_eq!(defaults.len(), 5);
         assert!(validate_diagnostic_domains(&defaults));
         let custom = vec!["example.com".to_owned()];
-        let (snapshot, wire) = Snapshot::build_with_diagnostic_domains("scope", 2, &[], &[], &[], &custom).unwrap();
+        let (snapshot, wire) =
+            Snapshot::build_with_diagnostic_domains("scope", 2, &[], &[], &[], &custom).unwrap();
         let decoded = Snapshot::decode(&wire, "scope").unwrap();
         assert_eq!(decoded.manifest().diagnostic_domains, custom);
         assert_eq!(snapshot.digest(), decoded.digest());
@@ -438,11 +466,27 @@ mod diagnostic_domain_tests {
 
     #[test]
     fn rejects_invalid_and_duplicate_names() {
-        for name in ["localhost", "127.0.0.1", "https://example.com", "example.com:443", "*.example.com", "Example.COM", "example.com.", "foo.local"] {
+        for name in [
+            "localhost",
+            "127.0.0.1",
+            "https://example.com",
+            "example.com:443",
+            "*.example.com",
+            "Example.COM",
+            "example.com.",
+            "foo.local",
+        ] {
             assert!(!validate_diagnostic_domains(&[name.to_owned()]));
         }
         assert!(!validate_diagnostic_domains(&[]));
-        assert!(!validate_diagnostic_domains(&["example.com".into(), "example.com".into()]));
-        assert!(!validate_diagnostic_domains(&(0..17).map(|i| format!("host{i}.example.com")).collect::<Vec<_>>()));
+        assert!(!validate_diagnostic_domains(&[
+            "example.com".into(),
+            "example.com".into()
+        ]));
+        assert!(!validate_diagnostic_domains(
+            &(0..17)
+                .map(|i| format!("host{i}.example.com"))
+                .collect::<Vec<_>>()
+        ));
     }
 }

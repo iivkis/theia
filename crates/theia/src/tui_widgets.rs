@@ -381,7 +381,10 @@ impl Form {
             if picker && g.stride >= 2 {
                 let style = label_style.bg(if selected { FOCUS } else { SURFACE });
                 let grant = matches!(field.label, "[x] Доступ выбран" | "[ ] Нет доступа");
-                let user = matches!(field.label, "Отключённый пользователь" | "Пользователь с доступом");
+                let user = matches!(
+                    field.label,
+                    "Отключённый пользователь" | "Пользователь с доступом"
+                );
                 let primary = if grant {
                     format!(
                         "{marker}{} {}",
@@ -393,7 +396,11 @@ impl Form {
                         field.value
                     )
                 } else if user {
-                    format!("{marker}{}  {}", if selected { "●" } else { "○" }, field.value)
+                    format!(
+                        "{marker}{}  {}",
+                        if selected { "●" } else { "○" },
+                        field.value
+                    )
                 } else {
                     label
                 };
@@ -715,7 +722,10 @@ impl ReferenceReview {
 fn append_wrapped(lines: &mut Vec<Line<'static>>, text: &str, width: u16, style: Style) {
     let width = usize::from(width.max(1));
     for paragraph in text.split('\n') {
-        let clean: String = paragraph.chars().map(|c| if c.is_control() { '�' } else { c }).collect();
+        let clean: String = paragraph
+            .chars()
+            .map(|c| if c.is_control() { '�' } else { c })
+            .collect();
         let mut rest = clean.as_str();
         while !rest.is_empty() {
             let mut used = 0;
@@ -723,16 +733,24 @@ fn append_wrapped(lines: &mut Vec<Line<'static>>, text: &str, width: u16, style:
             let mut boundary = 0;
             for (i, c) in rest.char_indices() {
                 let cells = Span::raw(c.to_string()).width();
-                if end > 0 && used + cells > width { break; }
+                if end > 0 && used + cells > width {
+                    break;
+                }
                 used += cells;
                 end = i + c.len_utf8();
-                if c.is_whitespace() { boundary = end; }
+                if c.is_whitespace() {
+                    boundary = end;
+                }
             }
-            if end < rest.len() && boundary > 0 { end = boundary; }
+            if end < rest.len() && boundary > 0 {
+                end = boundary;
+            }
             lines.push(Line::styled(rest[..end].to_owned(), style));
             rest = &rest[end..];
         }
-        if clean.is_empty() { lines.push(Line::styled(String::new(), style)); }
+        if clean.is_empty() {
+            lines.push(Line::styled(String::new(), style));
+        }
     }
 }
 

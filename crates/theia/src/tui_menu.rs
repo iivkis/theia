@@ -1107,19 +1107,29 @@ impl ConfigDialog {
     }
 
     fn start_reopen(&mut self) {
-        let Some(path) = self.reopen_only.clone() else { return; };
+        let Some(path) = self.reopen_only.clone() else {
+            return;
+        };
         let role = self.role;
         let (tx, rx) = std::sync::mpsc::channel();
-        match std::thread::Builder::new().name("theia-reopen-config".into()).spawn(move || {
-            let _ = tx.send(crate::tui_editor::Editor::load(role, &path));
-        }) {
-            Ok(_) => { self.loading = Some(rx); self.error = None; }
+        match std::thread::Builder::new()
+            .name("theia-reopen-config".into())
+            .spawn(move || {
+                let _ = tx.send(crate::tui_editor::Editor::load(role, &path));
+            }) {
+            Ok(_) => {
+                self.loading = Some(rx);
+                self.error = None;
+            }
             Err(_) => self.error = Some("Не удалось начать чтение файла."),
         }
     }
 
     pub(crate) fn is_server_path_form(&self) -> bool {
-        self.server_path_mode.is_some() && self.browser.is_none() && self.setup.is_none() && self.reality.is_none()
+        self.server_path_mode.is_some()
+            && self.browser.is_none()
+            && self.setup.is_none()
+            && self.reality.is_none()
     }
 
     pub(crate) fn recovery_path(&self) -> Option<&std::path::Path> {
@@ -1242,7 +1252,10 @@ impl ConfigDialog {
         }
         if self.reopen_only.is_some() {
             return match key.code {
-                KeyCode::Enter => { self.start_reopen(); false }
+                KeyCode::Enter => {
+                    self.start_reopen();
+                    false
+                }
                 KeyCode::Esc => true,
                 _ => false,
             };
@@ -1381,23 +1394,25 @@ impl ConfigDialog {
                 KeyCode::F(2) | KeyCode::F(4) => return false,
                 code => code,
             }
-        } else { match key.code {
-            KeyCode::Up | KeyCode::BackTab => {
-                self.choice = (self.choice + 3) % 4;
-                return false;
+        } else {
+            match key.code {
+                KeyCode::Up | KeyCode::BackTab => {
+                    self.choice = (self.choice + 3) % 4;
+                    return false;
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    self.choice = (self.choice + 1) % 4;
+                    return false;
+                }
+                KeyCode::Enter if self.choice == 1 => KeyCode::F(4),
+                KeyCode::Enter if self.choice == 2 => KeyCode::F(2),
+                KeyCode::Enter if self.choice == 3 => {
+                    self.browser = Some(FileBrowser::new(&self.input));
+                    return false;
+                }
+                code => code,
             }
-            KeyCode::Down | KeyCode::Tab => {
-                self.choice = (self.choice + 1) % 4;
-                return false;
-            }
-            KeyCode::Enter if self.choice == 1 => KeyCode::F(4),
-            KeyCode::Enter if self.choice == 2 => KeyCode::F(2),
-            KeyCode::Enter if self.choice == 3 => {
-                self.browser = Some(FileBrowser::new(&self.input));
-                return false;
-            }
-            code => code,
-        }};
+        };
         match code {
             KeyCode::Esc => return true,
             KeyCode::F(2) => {
@@ -1595,14 +1610,28 @@ impl ConfigDialog {
         if let Some(mode) = self.server_path_mode {
             return Some(Form {
                 fields: vec![
-                    Field { id: 0, label: "Файл настроек (введите путь)", value: self.input.clone(),
-                        hint: if mode == 0 { "Введите путь к существующему TOML. Enter — открыть." }
-                        else { "Введите путь к новому TOML. Существующий файл не заменяется." } },
-                    Field { id: 1, label: "Выбрать файл или каталог", value: "Открыть файловый браузер".into(),
-                        hint: "Выбор пути ничего не записывает. Enter — открыть браузер." },
+                    Field {
+                        id: 0,
+                        label: "Файл настроек (введите путь)",
+                        value: self.input.clone(),
+                        hint: if mode == 0 {
+                            "Введите путь к существующему TOML. Enter — открыть."
+                        } else {
+                            "Введите путь к новому TOML. Существующий файл не заменяется."
+                        },
+                    },
+                    Field {
+                        id: 1,
+                        label: "Выбрать файл или каталог",
+                        value: "Открыть файловый браузер".into(),
+                        hint: "Выбор пути ничего не записывает. Enter — открыть браузер.",
+                    },
                 ],
                 selected: self.server_path_focus,
-                lead: format!("{} · ↑↓ выбрать · Enter продолжить · Ctrl+U очистить", self.server_path_title()),
+                lead: format!(
+                    "{} · ↑↓ выбрать · Enter продолжить · Ctrl+U очистить",
+                    self.server_path_title()
+                ),
                 error: self.error.unwrap_or_default().to_owned(),
             });
         }
@@ -1649,7 +1678,9 @@ impl ConfigDialog {
                 setup.focus = id;
             }
         } else if self.server_path_mode.is_some() {
-            if id < 2 { self.server_path_focus = id; }
+            if id < 2 {
+                self.server_path_focus = id;
+            }
         } else if id < 4 {
             self.choice = id;
         }

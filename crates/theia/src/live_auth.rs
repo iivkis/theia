@@ -266,7 +266,11 @@ impl LiveAuthorization {
 
     /// One immutable authorization snapshot; never return token digests.
     #[cfg(any(target_os = "linux", target_os = "windows"))]
-    pub(crate) fn access_observation(&self, inbound: &str, user: &str) -> Result<(u64, u8), LiveAuthError> {
+    pub(crate) fn access_observation(
+        &self,
+        inbound: &str,
+        user: &str,
+    ) -> Result<(u64, u8), LiveAuthError> {
         let snapshot = self.shared.load()?;
         let state = match snapshot.grants.get(inbound) {
             None => 0,
