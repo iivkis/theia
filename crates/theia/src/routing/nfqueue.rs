@@ -421,6 +421,15 @@ impl AsyncQueue {
     }
 }
 
+/// Optional queue future for a single fair select over both capture
+/// queues. Returning a packet borrows the actual queue, not the future.
+pub(crate) async fn next_optional(queue:&mut Option<AsyncQueue>)->io::Result<Packet<'_>> {
+    match queue.as_mut() {
+        Some(queue)=>queue.next().await,
+        None=>std::future::pending().await,
+    }
+}
+
 /// A packet verdict is scoped to its exact queue and kernel packet ID.
 pub struct Packet<'a> {
     queue: &'a mut Queue,

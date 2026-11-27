@@ -2439,22 +2439,24 @@ impl NativeIngress {
         self.serve_linux_queues_inner(queue,Some(tagged),rules,host_namespace,|_,_,_|Ok(None)).await
     }
 
-    /// Private collector records can participate in the actual NFQUEUE
+    /// Live private collector records participate in the actual NFQUEUE
     /// verdict, never as application Known. A stale record, wrong fd,
     /// changed image/cookie or lost collector session denies that packet.
-    /// This lab API requires a fresh event for the tagged socket.
+    /// The non-Send collector and both queues stay on the namespace's
+    /// current-thread executor. This is a single tagged-socket lab.
     #[cfg(all(target_os="linux",feature="linux-ebpf-lab"))]
     pub async fn serve_linux_collected_queues(
         &self,queue:crate::routing::nfqueue::Queue,tagged:crate::routing::nfqueue::Queue,
         rules:crate::routing::linux_rules::LabRules,host_namespace:std::fs::File,
-        events:&[(crate::routing::linux_bpf_loader::CollectedEvent,i32)],
+        collector:crate::routing::linux_bpf_loader::VerdictCollector,
     )->Result<(),ClientError> {
-        if events.is_empty() || events.len()>16 {return Err(ClientError::Configuration);}
+        if tokio::runtime::Handle::current().runtime_flavor()!=tokio::runtime::RuntimeFlavor::CurrentThread {
+            return Err(ClientError::Configuration);
+        }
+        let collector=std::cell::RefCell::new(collector);
         self.serve_linux_queues_inner(queue,Some(tagged),rules,host_namespace,|rules,packet,socket|{
-            let mut matches=events.iter().filter(|(event,_)|event.live_cookie().ok()==Some(socket.cookie()));
-            let (event,fd)=matches.next().ok_or(std::io::ErrorKind::PermissionDenied)?;
-            if matches.next().is_some() {return Err(std::io::ErrorKind::PermissionDenied.into());}
-            event.corroborate_packet(rules,packet,*fd).map(Some)
+            collector.try_borrow_mut().map_err(|_|std::io::ErrorKind::PermissionDenied)?
+                .verify(rules,packet,socket).map(Some)
         }).await
     }
 
@@ -2530,7 +2532,6 @@ impl NativeIngress {
             heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 let packet = tokio::select! {
-                    biased;
                     _ = heartbeat.tick() => {
                         if !rules.lock().map_err(|_| ClientError::Configuration)?.current().map_err(|_| ClientError::Io)? {
                             return Err(ClientError::Open(ErrorCode::PolicyDenied));
@@ -2538,12 +2539,7 @@ impl NativeIngress {
                         continue;
                     }
                     packet=queue.next()=>packet.map_err(|_| ClientError::Io)?,
-                    packet=async {
-                        match tagged.as_mut() {
-                            Some(q)=>q.next().await,
-                            None=>std::future::pending().await,
-                        }
-                    }=>packet.map_err(|_|ClientError::Io)?,
+                    packet=crate::routing::nfqueue::next_optional(&mut tagged)=>packet.map_err(|_|ClientError::Io)?,
                 };
                 self.verdict_with_evidence(&rules,packet,&verify).await.map_err(|_|ClientError::Io)?;
             }
@@ -3212,7 +3208,10 @@ impl NativeIngress {
         };
         let (socket,corroborated)=match evidence {
             Ok(value)=>value,
-            Err(_)=>return packet.finish(PacketAction::Drop),
+            Err(_)=>{
+                self.deny_raw_packet(packet.metadata());
+                return packet.finish(PacketAction::Drop);
+            }
         };
         let cookie=socket.map(|proof|proof.cookie());
         let meta=packet.metadata();
@@ -3267,17 +3266,20 @@ impl NativeIngress {
                 action = PacketAction::Drop;
             }
         }
-        if action==PacketAction::Drop {
-            if let Some(meta)=meta {
-                let key=crate::routing::packet::FlowKey{interface:0,..meta.flow};
-                if let Ok(mut raw)=self.raw.lock() {
-                    if let Some(entry)=raw.get_mut(&key) {entry.denied=true;}
-                }
-            }
-        }
+        if action==PacketAction::Drop {self.deny_raw_packet(meta);}
         let result = packet.finish(action);
         drop(owned);
         result
+    }
+
+    #[cfg(target_os="linux")]
+    fn deny_raw_packet(&self,meta:Option<crate::routing::packet::PacketMeta>) {
+        if let Some(meta)=meta {
+            let key=crate::routing::packet::FlowKey{interface:0,..meta.flow};
+            if let Ok(mut raw)=self.raw.lock() {
+                if let Some(entry)=raw.get_mut(&key) {entry.denied=true;}
+            }
+        }
     }
 
     #[cfg(all(test,target_os="linux"))]
@@ -6403,6 +6405,15 @@ mod selector_tests {
                         };
                         assert_eq!(ingress.raw_verdict(syn).await, PacketAction::Pass);
                         assert_eq!(ingress.raw_verdict(first).await, PacketAction::Pass);
+                        // A tagged packet cannot inherit an ordinary flow,
+                        // even with the same exact tuple and fresh policy.
+                        assert_eq!(ingress.raw_verdict_bound(first,Some(91)).await,PacketAction::Drop);
+                        assert_eq!(ingress.raw_verdict(first).await,PacketAction::Drop);
+                        let tagged=meta("192.0.2.1:8443",PacketTransport::Tcp,Some(2));
+                        assert_eq!(ingress.raw_verdict_bound(tagged,Some(92)).await,PacketAction::Pass);
+                        assert_eq!(ingress.raw_verdict_bound(tagged,Some(92)).await,PacketAction::Pass);
+                        assert_eq!(ingress.raw_verdict_bound(tagged,Some(93)).await,PacketAction::Drop);
+                        assert_eq!(ingress.raw_verdict_bound(tagged,Some(92)).await,PacketAction::Drop);
                         assert_eq!(
                             ingress
                                 .raw_verdict(meta("192.0.2.2:53", PacketTransport::Udp, None))

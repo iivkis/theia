@@ -90,6 +90,15 @@ impl KernelFlowEvent {
     pub(super) fn fresh(&self) -> io::Result<()> {
         fresh_timestamp(self.timestamp)
     }
+    #[cfg(feature="linux-ebpf-lab")]
+    pub(super) fn same_actor(&self,other:&Self)->bool {
+        self.cookie==other.cookie && self.pid==other.pid &&
+            self.process_start==other.process_start && self.inode==other.inode &&
+            self.dev_major==other.dev_major && self.dev_minor==other.dev_minor &&
+            self.protocol==other.protocol && self.destination==other.destination
+    }
+    #[cfg(feature="linux-ebpf-lab")]
+    pub(super) fn timestamp(&self)->u64 { self.timestamp }
     /// Blocking diagnostic: event cookie, PID start, executable inode/dev,
     /// executable hash and the live connected socket must all agree.
     /// A shared/inherited socket and unconnected UDP still need additional

@@ -270,11 +270,6 @@ impl CapturedObservation<'_, '_> {
 }
 
 impl CollectedEvent {
-    pub(crate) fn live_cookie(&self)->io::Result<u64> {
-        self.loss.check()?;
-        self.event.fresh()?;
-        Ok(self.event.cookie)
-    }
     pub fn capture_observation<'a, 'queue>(
         &'a self,
         rules: &'a super::linux_rules::LabRules,
@@ -418,30 +413,30 @@ impl Collector {
     }
     /// Blocking bounded poll; execute only on the dedicated collector worker.
     /// Loss is terminal for the entire session, not just for one event.
-    pub fn poll(&mut self, timeout_ms: u32) -> io::Result<Option<CollectedEvent>> {
-        if timeout_ms > 250 || !self.loss.live.load(Ordering::Acquire) {
-            return Err(denied());
-        }
-        self.check_loss()?;
-        if self.buffer.queue.is_empty() {
-            let rc = unsafe { ring_buffer__poll(self.ring.0.as_ptr(), timeout_ms as c_int) };
-            if rc < 0 {
-                self.buffer.poison();
-                return Err(io::Error::from_raw_os_error(
-                    rc.checked_neg().unwrap_or(libc::EINVAL),
-                ));
-            }
-        }
-        self.check_loss()?;
-        while let Some(event) = self.buffer.queue.pop_front() {
-            if event.fresh().is_ok() {
-                return Ok(Some(CollectedEvent {
-                    event,
-                    loss: self.loss.clone(),
-                }));
-            }
+    pub fn poll(&mut self,timeout_ms:u32)->io::Result<Option<CollectedEvent>> {
+        let mut wait=timeout_ms;
+        while let Some(record)=self.poll_record(wait)? {
+            if record.event.fresh().is_ok() {return Ok(Some(record));}
+            wait=0;
         }
         Ok(None)
+    }
+
+    /// Keep stale records for the verdict collector's ambiguity
+    /// tombstones. An expired event cannot grant access, but an observed
+    /// conflicting sender must not disappear merely because it expired.
+    fn poll_record(&mut self,timeout_ms:u32)->io::Result<Option<CollectedEvent>> {
+        if timeout_ms>250 || !self.loss.live.load(Ordering::Acquire) {return Err(denied());}
+        self.check_loss()?;
+        if self.buffer.queue.is_empty() {
+            let rc=unsafe {ring_buffer__poll(self.ring.0.as_ptr(),timeout_ms as c_int)};
+            if rc<0 {
+                self.buffer.poison();
+                return Err(io::Error::from_raw_os_error(rc.checked_neg().unwrap_or(libc::EINVAL)));
+            }
+        }
+        self.check_loss()?;
+        Ok(self.buffer.queue.pop_front().map(|event|CollectedEvent{event,loss:self.loss.clone()}))
     }
 }
 impl Drop for Collector {
@@ -450,6 +445,63 @@ impl Drop for Collector {
     }
 }
 
+
+/// Live pre-verdict reader for one explicitly owned, tagged socket.
+/// Owns the private cgroup collector from before the socket was
+/// connected. A flow record is not an authenticated sender identity;
+/// this gate only narrows the existing socket proof and never upgrades
+/// application evidence. No public raw-record insertion API.
+pub struct VerdictCollector {
+    collector:Collector,
+    expected_cookie:u64,
+    fd:i32,
+    candidate:Option<CollectedEvent>,
+    retired:bool,
+}
+impl VerdictCollector {
+    pub fn new(collector:Collector,socket:&impl AsRawFd,fd:i32)->io::Result<Self> {
+        if fd<0 {return Err(denied());}
+        Ok(Self{collector,expected_cookie:socket_cookie(socket)?,fd,candidate:None,retired:false})
+    }
+
+    fn observe(&mut self,record:CollectedEvent)->io::Result<()> {
+        if record.event.cookie!=self.expected_cookie {return Ok(());}
+        if let Some(previous)=&self.candidate {
+            if !previous.event.same_actor(&record.event) ||
+                record.event.timestamp()<previous.event.timestamp() {
+                self.retired=true;
+                return Err(denied());
+            }
+        }
+        self.candidate=Some(record);
+        Ok(())
+    }
+
+    /// Called while the packet is held in NFQUEUE, both before and after
+    /// policy evaluation. Drain the actual private ring, never the
+    /// downstream cgroup_skb egress observations. A busy/overflowed or
+    /// revoked session cannot silently fall back to a cached identity.
+    pub(crate) fn verify(&mut self,rules:&super::linux_rules::LabRules,
+        packet:&super::nfqueue::Packet<'_>,proof:super::linux_rules::CapturedSocket)
+        ->io::Result<CorroboratedFlow> {
+        if self.retired || proof.cookie()!=self.expected_cookie {return Err(denied());}
+        for _ in 0..MAX_BUFFER {
+            match self.collector.poll_record(0) {
+                Ok(Some(record))=>self.observe(record)?,
+                Ok(None)=>{
+                    let candidate=self.candidate.as_ref().ok_or_else(denied)?;
+                    let observed=candidate.corroborate_packet(rules,packet,self.fd)?;
+                    if observed.cookie()!=proof.cookie() || observed.key()!=proof.key() ||
+                        rules.captured_socket(packet)?!=proof {return Err(denied());}
+                    return Ok(observed);
+                },
+                Err(error)=>{self.retired=true;return Err(error);}
+            }
+        }
+        self.retired=true;
+        Err(denied())
+    }
+}
 
 // Separate collector for actual cgroup egress skb observations. Its
 // private ring cannot be fed by the public packet parser. It is not
