@@ -1108,7 +1108,18 @@ async fn relay_udp<T: quic::SendStream<Bytes>, R: quic::RecvStream>(
                     activity.touch();
                 }
                 Frame::Padding(_) => tokio::task::yield_now().await,
-                Frame::Fin => return Ok::<(), ServerError>(()),
+                Frame::Fin => {
+                    // The protocol FIN can arrive before the HTTP/3 request
+                    // stream FIN. Do not send STOP_SENDING while the peer is
+                    // still committing its graceful transport close.
+                    let tail = timeout(CLOSE_TIMEOUT, decoder.next(rx))
+                        .await
+                        .map_err(|_| ServerError::TimedOut)??;
+                    if tail.is_some() {
+                        return Err(ServerError::Protocol);
+                    }
+                    return Ok::<(), ServerError>(());
+                }
                 _ => return Err(ServerError::Protocol),
             }
         }
