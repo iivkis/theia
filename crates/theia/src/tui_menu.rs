@@ -1052,6 +1052,7 @@ pub(crate) struct ConfigDialog {
     choice: usize,
     server_path_mode: Option<usize>,
     server_path_focus: usize,
+    reopen_only: Option<std::path::PathBuf>,
     error: Option<&'static str>,
     loading: Option<std::sync::mpsc::Receiver<Result<crate::tui_editor::Editor, &'static str>>>,
     setup: Option<FirstSetup>,
@@ -1084,6 +1085,7 @@ impl ConfigDialog {
             choice: 0,
             server_path_mode: None,
             server_path_focus: 0,
+            reopen_only: None,
             error: None,
             loading: None,
             setup: None,
@@ -1097,6 +1099,33 @@ impl ConfigDialog {
             browser: None,
         }
     }
+    pub(crate) fn reopen(role: Role, path: std::path::PathBuf) -> Self {
+        let mut dialog = Self::new(role, Some(&path));
+        dialog.reopen_only = Some(path);
+        dialog.start_reopen();
+        dialog
+    }
+
+    fn start_reopen(&mut self) {
+        let Some(path) = self.reopen_only.clone() else { return; };
+        let role = self.role;
+        let (tx, rx) = std::sync::mpsc::channel();
+        match std::thread::Builder::new().name("theia-reopen-config".into()).spawn(move || {
+            let _ = tx.send(crate::tui_editor::Editor::load(role, &path));
+        }) {
+            Ok(_) => { self.loading = Some(rx); self.error = None; }
+            Err(_) => self.error = Some("Не удалось начать чтение файла."),
+        }
+    }
+
+    pub(crate) fn is_server_path_form(&self) -> bool {
+        self.server_path_mode.is_some() && self.browser.is_none() && self.setup.is_none() && self.reality.is_none()
+    }
+
+    pub(crate) fn recovery_path(&self) -> Option<&std::path::Path> {
+        self.reality.as_ref().and_then(|p| p.recovery_path())
+    }
+
     pub(crate) fn imported(&self) -> bool {
         self.imported
     }
@@ -1153,7 +1182,7 @@ impl ConfigDialog {
         }
     }
     pub(crate) fn paste(&mut self, text: &str) {
-        if self.browser.is_some() {
+        if self.reopen_only.is_some() || self.browser.is_some() {
             return;
         }
         if let Some(panel) = self.first_invite.as_mut() {
@@ -1210,6 +1239,13 @@ impl ConfigDialog {
     pub(crate) fn key(&mut self, key: KeyEvent) -> bool {
         if self.loading.is_some() {
             return false;
+        }
+        if self.reopen_only.is_some() {
+            return match key.code {
+                KeyCode::Enter => { self.start_reopen(); false }
+                KeyCode::Esc => true,
+                _ => false,
+            };
         }
         if let Some(panel) = self.first_invite.as_mut() {
             match panel.key(key) {
@@ -1498,7 +1534,7 @@ impl ConfigDialog {
     }
     pub(crate) fn form(&self) -> Option<crate::tui_widgets::Form> {
         use crate::tui_widgets::{Field, Form};
-        if self.loading.is_some() {
+        if self.loading.is_some() || self.reopen_only.is_some() {
             return None;
         }
         if let Some(panel) = &self.first_invite {
@@ -1665,6 +1701,10 @@ impl ConfigDialog {
         }
     }
     pub(crate) fn body(&self) -> String {
+        if let Some(path) = &self.reopen_only {
+            return format!("Повторное открытие того же файла: {:?}\n{}\nЗапись, удаление файлов и изменение runtime не выполняются.\nEnter: повторить чтение · Esc: закрыть", path,
+                if self.loading.is_some() { "Проверка файла…" } else { self.error.unwrap_or("Файл не подтверждён") });
+        }
         if self.loading.is_some() {
             return if self.creating {
                 "Создаётся новый TOML без замены существующих файлов. Runtime не запускается."

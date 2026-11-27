@@ -507,7 +507,11 @@ fn page_actions_for(
             ('o', "Открыть другой файл"),
             ('Q', "Лимиты подключений"),
         ],
-        (Role::Server, 6) => &[('p', "Сетевая диагностика")],
+        (Role::Server, 6) => &[
+            ('i', "Узнать внешний IP"),
+            ('r', "Посмотреть области поиска"),
+            ('t', "Проверить назначенный IP"),
+        ],
         (Role::Server, 7) => &[],
         (Role::Client, 1) => &[
             ('N', "Добавить профиль вручную (Own-TLS)"),
@@ -692,7 +696,9 @@ fn recommended_step(editor: &Editor, owned_running: bool) -> (char, &'static str
 
 fn save_failure_actions(editor: Option<&Editor>) -> Vec<ActionItem> {
     let mut items = Vec::new();
-    if !editor.is_some_and(Editor::write_uncertain) {
+    if editor.is_some_and(Editor::write_uncertain) {
+        items.push(ActionItem { key: 'o', label: "Открыть настройки заново" });
+    } else {
         items.push(ActionItem {
             key: 'r',
             label: "Повторить сохранение",
@@ -757,6 +763,7 @@ struct RoutingPanel {
     settings: crate::routing::Settings,
     original: crate::routing::Settings,
     search: Option<String>,
+    geodata_mode: bool,
     selected: usize,
     fields: Option<(Option<usize>, [String; 5], usize)>,
     action_focus: Option<usize>,
@@ -791,6 +798,7 @@ impl RoutingPanel {
             original: settings.clone(),
             settings,
             search: None,
+            geodata_mode: false,
             selected: 0,
             fields: None,
             action_focus: None,
@@ -920,6 +928,13 @@ impl RoutingPanel {
         if self.fields.is_some() || self.download.is_some() || self.search.is_some() {
             return Vec::new();
         }
+        if self.geodata_mode {
+            return vec![
+                ActionItem { key: 'g', label: "Загрузить и проверить базы" },
+                ActionItem { key: 'l', label: "Выбрать загруженные базы" },
+                ActionItem { key: 'B', label: "К таблице правил" },
+            ];
+        }
         let count = self.settings.rules.len();
         let mut items = Vec::new();
         if count < 1024 {
@@ -935,15 +950,12 @@ impl RoutingPanel {
             }
             items.push(ActionItem { key: 'D', label: "Удалить правило из черновика" });
         }
-        items.extend([
-            ActionItem { key: 'g', label: "Загрузить и проверить базы" },
-            ActionItem { key: 'l', label: "Выбрать загруженные базы" },
-        ]);
+        items.push(ActionItem { key: 'B', label: "Управление базами GeoData" });
         if count > 1 {
             items.push(ActionItem { key: '/', label: "Найти правило" });
         }
         if self.settings != self.original {
-            items.push(ActionItem { key: 's', label: "Принять черновик правил" });
+            items.push(ActionItem { key: 's', label: "Сохранить изменения" });
         }
         items
     }
@@ -965,7 +977,6 @@ impl RoutingPanel {
             ("Действие (←→)", "Стрелки влево и вправо выбирают действие из списка."),
             ("Домены / GeoSite", "Через запятую: example.org или geosite:google."),
             ("IP / CIDR / GeoIP", "Через запятую: 192.0.2.0/24 или geoip:private."),
-            ("Приложения (будущие режимы)", "В MVP атрибуция отсутствует. Формат: sha256: и 64 hex-символа."),
         ];
         Some(Form {
             fields: definitions.iter().enumerate().map(|(id, &(label, hint))| Field {
@@ -986,7 +997,7 @@ impl RoutingPanel {
         let items = self.actions();
         let body = self.body();
         if let Some([report, controls]) = self.layout(area) {
-            if self.fields.is_none() && self.download.is_none() {
+            if self.fields.is_none() && self.download.is_none() && !self.geodata_mode {
                 let info = format!("GeoData: {} · {}\nПервое совпадение сверху; остальные — через сервер.",
                     self.settings.datasets.as_ref().map_or("не выбраны", |m| m.release.as_str()),
                     if self.settings == self.original { "без изменений" } else { "черновик изменён" });
@@ -996,7 +1007,11 @@ impl RoutingPanel {
                 let table = Rect::new(report.x, report.y.saturating_add(3), report.width, report.height.saturating_sub(4));
                 let rows = self.settings.rules.iter().enumerate().skip(start).take(capacity).map(|(i, rule)| {
                     let chosen = i == self.selected;
-                    let mut conditions = rule.domains.iter().chain(&rule.ips).take(2).cloned().collect::<Vec<_>>().join(", ");
+                    let mut conditions = rule.domains.iter().chain(&rule.ips).take(2).map(|value| {
+                        if let Some(domain) = value.strip_prefix("domain:") { format!("{domain} + поддомены") }
+                        else if let Some(domain) = value.strip_prefix("full:") { format!("{domain} (точно)") }
+                        else { value.clone() }
+                    }).collect::<Vec<_>>().join(", ");
                     let count = rule.domains.len() + rule.ips.len() + rule.applications.len();
                     if count > 2 || !rule.applications.is_empty() { conditions.push_str(&format!(" · всего {count}")); }
                     if conditions.is_empty() { conditions = "Приложения (будущие режимы)".into(); }
@@ -1009,8 +1024,8 @@ impl RoutingPanel {
                     .header(Row::new(["№", "Правило", "Условия", "Действие"]).style(Style::default().fg(MUTED))), table);
                 if report.height >= 5 {
                     let footer = if !self.message.is_empty() { self.message.clone() }
-                        else if self.settings.rules.is_empty() { "Нет правил · добавьте первое правило".into() }
-                        else { format!("{}–{} / {} · ↑↓ / PgUp/PgDn · Tab действия", start + 1, (start + capacity).min(self.settings.rules.len()), self.settings.rules.len()) };
+                        else if self.settings.rules.is_empty() { "Нет правил · по умолчанию: через сервер".into() }
+                        else { format!("{}–{} / {} · по умолчанию: через сервер · Tab действия", start + 1, (start + capacity).min(self.settings.rules.len()), self.settings.rules.len()) };
                     frame.render_widget(Paragraph::new(footer).style(Style::default().fg(MUTED)),
                         Rect::new(report.x, report.bottom().saturating_sub(1), report.width, 1));
                 }
@@ -1047,6 +1062,7 @@ impl RoutingPanel {
             if let Some(i) = (Actions { items: &items, selected: self.action_focus.unwrap_or(0) }).hit(controls, x, y) {
                 self.action_focus = Some(i);
             } else if x >= report.x && x < report.right() && y >= report.y + 4 && y < report.bottom().saturating_sub(1) {
+                if self.geodata_mode { return; }
                 let (start, capacity) = self.rule_window(report);
                 let offset = usize::from(y - report.y - 4);
                 let i = start + offset;
@@ -1092,8 +1108,8 @@ impl RoutingPanel {
                     self.fields = None;
                 }
                 KeyCode::Up | KeyCode::BackTab => *focus = focus.saturating_sub(1),
-                KeyCode::Down | KeyCode::Tab => *focus = (*focus + 1).min(4),
-                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                KeyCode::Down | KeyCode::Tab => *focus = (*focus + 1).min(3),
+                KeyCode::Char('u') if *focus != 1 && key.modifiers.contains(KeyModifiers::CONTROL) => {
                     fields[*focus].clear()
                 }
                 KeyCode::Left | KeyCode::Right if *focus == 1 => {
@@ -1106,11 +1122,11 @@ impl RoutingPanel {
                     };
                     fields[1] = options[next].into();
                 }
-                KeyCode::Backspace => {
+                KeyCode::Backspace if *focus != 1 => {
                     fields[*focus].pop();
                 }
                 KeyCode::Char(c)
-                    if !key
+                    if *focus != 1 && !key
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                         && !c.is_control()
@@ -1136,6 +1152,8 @@ impl RoutingPanel {
                             if value.contains(':') { value } else { format!("domain:{value}") }
                         }).collect(),
                         ips: split(&fields[3]),
+                        // MVP cannot attribute processes. Preserve existing advanced
+                        // conditions byte-for-byte; never silently strip them.
                         applications: split(&fields[4]),
                     };
                     if crate::routing::Policy::validate_rules(std::slice::from_ref(&rule)).is_err()
@@ -1183,7 +1201,17 @@ impl RoutingPanel {
                 };
             }
         }
+        if self.geodata_mode {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('B') => { self.geodata_mode = false; self.action_focus = Some(0); }
+                KeyCode::Char('g') => self.refresh(true),
+                KeyCode::Char('l') => self.refresh(false),
+                _ => {}
+            }
+            return true;
+        }
         match key.code {
+            KeyCode::Char('B') => { self.geodata_mode = true; self.action_focus = Some(0); }
             KeyCode::Esc => return false,
             KeyCode::Up => self.selected = self.selected.saturating_sub(1),
             KeyCode::Down => self.selected = (self.selected + 1).min(len.saturating_sub(1)),
@@ -1225,6 +1253,9 @@ impl RoutingPanel {
     }
     fn body(&self) -> String {
         let mut body = String::new();
+        if self.geodata_mode {
+            return format!("Базы GeoData · GeoSite Standard + GeoIP Lite\nВыбранный выпуск: {}\nКаталог: {}\n{}\nИзменения вступят в силу после сохранения и применения.", self.settings.datasets.as_ref().map_or("нет", |m| m.release.as_str()), self.directory.display(), self.message);
+        }
         if let Some(query) = &self.search {
             return format!("Найти правило по имени, домену или IP\n\nЗапрос: {query}▏\n\nEnter: выбрать совпадение · Esc: отменить");
         }
@@ -2047,7 +2078,7 @@ impl Interaction {
         let mut items = runtime.actions();
         if self.workspace_page == 3 && self.editor_for(Role::Server).is_some() && !items.is_empty() {
             if let Some(action) = self.server_process.actions().first() {
-                items.push(ActionItem { key: 'P', label: action.label });
+                items.insert(0, ActionItem { key: 'P', label: action.label });
             }
         }
         items
@@ -2056,7 +2087,9 @@ impl Interaction {
     fn runtime_workspace_body(&self) -> String {
         self.runtime.as_ref().map_or_else(String::new, |runtime| {
             if self.workspace_page == 3 && self.editor_for(Role::Server).is_some() {
-                format!("Процесс этой панели: {}\n{}", self.server_process.status(), runtime.body())
+                format!("Процесс этой панели: {}\nКонфигурация: {}\n{}", self.server_process.status(),
+                    if self.editor_for(Role::Server).is_some_and(Editor::dirty) { "не сохранена" } else { "сохранена" },
+                    runtime.body())
             } else { runtime.body() }
         })
     }
@@ -2074,6 +2107,11 @@ impl Interaction {
     }
     fn open_config(&mut self, role: Role) {
         self.access_observation = None;
+        if let Some(editor) = self.editor_for(role).filter(|e| e.write_uncertain()) {
+            self.last_apply = None;
+            self.config_dialog = Some(ConfigDialog::reopen(role, editor.saved_path().to_owned()));
+            return;
+        }
         #[cfg(windows)]
         if self.proxy_background.as_ref().is_some_and(|p| p.running()) {
             self.system_proxy = self.proxy_background.take();
@@ -2637,8 +2675,11 @@ impl Interaction {
         }
         if let Some(flow) = self.records.as_mut() {
             if let Some(form) = flow.form(self.editor.as_ref()) {
+                let target = if self.workspace_page == 5 && matches!(flow, RecordFlow::Input { action: RecordAction::SetQuota, .. }) {
+                    workspace_columns(body).map_or(body, |c| c[2])
+                } else { guided_form_area(body, form.fields.len()) };
                 if let Some(id) = form.hit(
-                    guided_form_area(body, form.fields.len()),
+                    target,
                     event.column,
                     event.row,
                 ) {
@@ -3005,10 +3046,20 @@ impl Interaction {
             return false;
         }
         if let Some(mut panel) = self.routing_panel.take() {
+            if key.code == KeyCode::Char('s') && key.modifiers == KeyModifiers::CONTROL
+                && panel.fields.is_none() && panel.search.is_none() {
+                key = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
+            }
             if panel.key(key, self.editor.as_mut()) {
                 self.routing_panel = Some(panel);
             } else {
                 self.workspace_focus = WorkspaceFocus::Navigation;
+                // The only staging exit is the explicit Save action. Esc cannot
+                // dirty the editor; failed validation keeps the panel open.
+                if panel.settings != panel.original && self.editor.as_ref().is_some_and(Editor::dirty)
+                    && key.code != KeyCode::Esc {
+                    self.start_save();
+                }
             }
             return false;
         }
@@ -3070,6 +3121,12 @@ impl Interaction {
             return false;
         }
         if let Some(dialog) = self.config_dialog.as_mut() {
+            if key.code == KeyCode::Char('o') && key.modifiers.is_empty() {
+                if let Some(path) = dialog.recovery_path().map(Path::to_path_buf) {
+                    self.config_dialog = Some(ConfigDialog::reopen(Role::Server, path));
+                    return false;
+                }
+            }
             let next = dialog.reality_succeeded()
                 && key.code == KeyCode::Char('y')
                 && key.modifiers.is_empty();
@@ -3176,6 +3233,13 @@ impl Interaction {
             return false;
         }
         if let Some(panel) = self.reality_provision.as_mut() {
+            if key.code == KeyCode::Char('o') && key.modifiers.is_empty() {
+                if let Some(path) = panel.recovery_path().map(Path::to_path_buf) {
+                    self.reality_provision = None;
+                    self.config_dialog = Some(ConfigDialog::reopen(Role::Server, path));
+                    return false;
+                }
+            }
             let next =
                 panel.succeeded() && key.code == KeyCode::Char('y') && key.modifiers.is_empty();
             let first_user = panel.success_first_user().map(str::to_owned);
@@ -3692,6 +3756,12 @@ impl Interaction {
                                 &mut self.workspace_action,
                                 key.code,
                             ) {
+                                if role == Role::Server && self.workspace_page == 6 && matches!(ch, 'i' | 'r' | 't') {
+                                    self.discovery = Some(DiscoveryPanel::new());
+                                    self.modal_action = 0;
+                                    self.update(model, KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+                                    return false;
+                                }
                                 if ch == 'j' && role == Role::Server && self.workspace_page == 2 {
                                     if !self.access_observation.as_ref().is_some_and(|o| o.receiver.is_some()) {
                                         if let Some(editor) = self.editor_for(role) {
@@ -4187,6 +4257,7 @@ impl Interaction {
                         self.issuance = Some(IssueFlow::Saving);
                         self.start_save();
                     }
+                    KeyCode::Char('o') if editor.write_uncertain() => self.open_config(Role::Server),
                     KeyCode::Char('d') => editor.discard(),
                     _ => self.issuance = Some(IssueFlow::SaveFailed),
                 },
@@ -4304,13 +4375,21 @@ impl Interaction {
                 },
                 IssueFlow::Sharing => self.issuance = Some(IssueFlow::Sharing),
                 IssueFlow::ShareDone(message) => {
-                    if key.code != KeyCode::Esc {
-                        self.issuance = Some(IssueFlow::ShareDone(message));
+                    match key.code {
+                        KeyCode::Enter => { self.workspace_page = 3; self.workspace_focus = WorkspaceFocus::Actions; self.workspace_action = 1; }
+                        KeyCode::Esc => {}
+                        _ => self.issuance = Some(IssueFlow::ShareDone(message)),
                     }
                 }
                 IssueFlow::Showing(link) => {
-                    if key.code == KeyCode::Esc {
+                    if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                         editor.clear_issued();
+                        drop(link);
+                        if key.code == KeyCode::Enter {
+                            self.workspace_page = 3;
+                            self.workspace_focus = WorkspaceFocus::Actions;
+                            self.workspace_action = 1;
+                        }
                     } else {
                         self.issuance = Some(IssueFlow::Showing(link));
                     }
@@ -4389,6 +4468,7 @@ impl Interaction {
                         self.revocation = Some(DisableFlow::Saving);
                         self.start_save();
                     }
+                    KeyCode::Char('o') if editor.write_uncertain() => self.open_config(Role::Server),
                     KeyCode::Char('d') => editor.discard(),
                     _ => self.revocation = Some(DisableFlow::SaveFailed),
                 },
@@ -5868,12 +5948,15 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     let file = interaction
         .and_then(|ui| Interaction::panel_role(model).and_then(|role| ui.editor_for(role)));
     let saved = match file {
+        _ if interaction.is_some_and(|ui| ui.saving.is_some()) => "Файл: сохранение…",
         Some(e) if e.write_uncertain() => "Файл: запись не подтверждена",
+        Some(_) if interaction.is_some_and(|ui| ui.routing_panel.as_ref().is_some_and(|p| p.settings != p.original)) => "Файл: есть несохранённые правила",
+        Some(_) if interaction.is_some_and(|ui| ui.routing_panel.as_ref().is_some_and(|p| p.fields.is_some())) => "Файл: редактируется правило",
         Some(e) if e.dirty() => "Файл: не сохранён · Ctrl+S сохранить",
         Some(_) => "Файл: сохранён",
         None => "Файл: не открыт",
     };
-    let applied = if model.screen == Screen::Server {
+    let applied = if model.screen == Screen::Server && !interaction.is_some_and(|ui| ui.routing_panel.as_ref().is_some_and(|p| p.settings != p.original || p.fields.is_some())) {
         interaction
             .and_then(|ui| ui.last_apply)
             .and_then(|(digest, kind, revision)| {
@@ -5983,7 +6066,11 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
                 (dialog.form(), dialog.reference_review()),
             );
         } else if let Some(form) = dialog.form() {
-            form.render_picker(frame, centered_column(parts[1], 108), dialog.title());
+            if dialog.is_server_path_form() {
+                form.render(frame, centered_column(parts[1], 108), dialog.title());
+            } else {
+                form.render_picker(frame, centered_column(parts[1], 108), dialog.title());
+            }
         } else {
             modal_panel!(frame, parts[1], dialog.title(), &dialog.body(), true);
         }
@@ -6171,6 +6258,8 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             true,
         );
     } else if interaction.is_some_and(|ui| ui.routing_panel.is_some()) {
+        draw_workspace(frame, parts[1], Role::Server, interaction.and_then(|ui| ui.editor.as_ref()), 0, interaction);
+    } else if interaction.is_some_and(|ui| ui.workspace_page == 5 && matches!(ui.records, Some(RecordFlow::Input { action: RecordAction::SetQuota, .. }))) {
         draw_workspace(frame, parts[1], Role::Server, interaction.and_then(|ui| ui.editor.as_ref()), 0, interaction);
     } else if let Some(flow) = interaction.and_then(|ui| ui.records.as_ref()) {
         let mut body = flow.body();
@@ -6756,7 +6845,7 @@ fn draw_issuance(
                 if public.is_none() { "КОНФИДЕНЦИАЛЬНО: будет использован одноразовый bearer; не передавайте недоверенному терминалу или получателю." } else { "Публичное приглашение без bearer." })
         ),
         IssueFlow::Sharing => ("Передача приглашения", "Операция выполняется; URI скрыт.".into()),
-        IssueFlow::ShareDone(message) => ("Результат передачи", format!("{message}\nEsc: закрыть. Работающий процесс не изменён.")),
+        IssueFlow::ShareDone(message) => ("Результат передачи", format!("{message}\nEnter: перейти к управлению · Esc: закрыть. Работающий процесс не изменён.")),
         IssueFlow::ConfirmExport => (
             "Подтверждение конфиденциального экспорта",
             "Создать новый защищённый файл рядом с конфигурацией сервера? Ссылка не будет показана. Файл содержит bearer; храните и передавайте его только доверенным способом. Повторная выдача недоступна.\n\ny: сохранить  n/Esc: назад"
@@ -6786,7 +6875,7 @@ fn draw_issuance(
         IssueFlow::Showing(link) => (
             "СЕКРЕТ: ссылка подключения (однократный просмотр)",
             format!(
-                "КОНФИДЕНЦИАЛЬНО. Скопируйте ссылку целиком.\nТерминал/SSH и экран должны быть доверенными.\n\n{link}\n\nEsc: скрыть и стереть из памяти.\nРаботающий процесс не перезапущен.",
+                "КОНФИДЕНЦИАЛЬНО. Скопируйте ссылку целиком.\nТерминал/SSH и экран должны быть доверенными.\n\n{link}\n\nEnter: скрыть и перейти к управлению · Esc: скрыть и закрыть.\nРаботающий процесс не перезапущен.",
                 link = link.as_str()
             ),
         ),
@@ -7368,7 +7457,7 @@ fn draw_page(
         if let Some(ui) = ui.filter(|u| u.runtime.is_some()) {
             let items = ui.runtime_workspace_items();
             let body = ui.runtime_workspace_body();
-            let title = ui.runtime.as_ref().unwrap().title();
+            let title = "Управление";
             if let Some([report, controls]) = report_action_layout(area, items.len(), &body) {
                 panel_at(frame, report, title, &body, false, Some(&ui.viewport));
                 Actions { items: &items, selected: ui.modal_action }.render(frame, controls);
@@ -7376,6 +7465,14 @@ fn draw_page(
                 panel_at(frame, area, title, &body, true, Some(&ui.viewport));
             }
             return;
+        }
+    }
+    if role == Role::Server && page == 5 {
+        if let Some(flow @ RecordFlow::Input { action: RecordAction::SetQuota, .. }) = ui.and_then(|u| u.records.as_ref()) {
+            if let Some(form) = flow.form(Some(editor)) {
+                form.render(frame, area, "Настройки · лимиты соединений");
+                return;
+            }
         }
     }
     if role == Role::Server && page == 6 {
@@ -7575,11 +7672,11 @@ fn draw_page(
     } else if page == 4 {
         if let Some(monitor) = ui.and_then(|u| u.workspace_monitor.as_ref()) {
             if role == Role::Server {
-                let status = if ui.is_some_and(|u| u.server_process.status() == "Запущен") {
-                    "Источник: счётчики процесса этой панели (с запуска Theia)."
-                } else {
-                    "Нет подтверждённых данных внешнего сервера. Ниже только локальные счётчики этой панели."
-                };
+                if !ui.is_some_and(|u| u.server_process.status() == "Запущен") {
+                    panel(frame, area, "Статистика", "Нет подтверждённого источника данных.\nСервер этой панели не готов; метрики внешнего сервера недоступны.\nПерейдите в «Управление», чтобы проверить состояние или запустить сервер.", true);
+                    return;
+                }
+                let status = "Источник: счётчики процесса этой панели (с запуска Theia).";
                 if area.height >= 8 {
                     frame.render_widget(Paragraph::new(status).style(Style::default().fg(MUTED)).wrap(Wrap { trim: true }),
                         Rect::new(area.x, area.y, area.width, 2));
@@ -7723,7 +7820,7 @@ fn draw_page(
             }
             (Role::Server,7) => editor.routing_settings().map_or_else(|| "Правил нет. По умолчанию весь трафик Theia идёт через сервер.".into(), |s| format!("Ревизия: {} · правил: {}\nGeoData: {}\nСохраните TOML, затем примените через Управление.", s.revision, s.rules.len(), s.datasets.as_ref().map_or("не выбраны", |m| m.release.as_str()))),
             (_,5) => format!("Файл: {}\n{}\nСохранение не меняет работающий процесс.", editor.saved_path().display(), editor.settings_summary()),
-            (Role::Server,6) => "Сетевые адреса и доступность. Результатов пока нет.\nОткройте диагностику; внешние запросы требуют отдельного согласия.".into(),
+            (Role::Server,6) => "Сетевые адреса и доступность. Проверки ещё не выполнялись.\nВыберите нужную проверку. Внешние запросы требуют отдельного согласия.".into(),
             _ => "Проверьте состояние подключения.\nСетевые проверки требуют согласия.".into(),
         };
         panel(frame, content, pages(role)[page], &description, true);

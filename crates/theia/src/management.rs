@@ -2421,6 +2421,24 @@ mod strict_wire_matrix_tests {
     }
 
     #[tokio::test]
+    async fn access_status_is_bounded_read_only_and_strictly_parsed() {
+        let mut inbound = [0; 64];
+        inbound[..4].copy_from_slice(b"edge");
+        let mut user = [0; 64];
+        user[..5].copy_from_slice(b"alice");
+        let command = StatusCommand::AccessStatus { inbound, user, saved_sha256: [0xab; 32] };
+        let request = format!("access-status inbound=edge user=alice sha256={}\n", "ab".repeat(32));
+        assert!(request.len() < MAX_COMMAND_BYTES);
+        assert_eq!(parse_access_status(request.trim_end().as_bytes()), Some(("edge", "alice", [0xab; 32])));
+        assert_eq!(peer(command, &request, b"theia-access-v1 revision=7 state=3\n").await,
+            Ok(StatusReply::AccessObserved { revision: 7, state: 3 }));
+        for invalid in [b"theia-access-v1 revision=0 state=3\n".as_slice(), b"theia-access-v1 revision=7 state=4\n", b"theia-access-v1 revision=7 state=3 extra\n"] {
+            assert_eq!(peer(command, &request, invalid).await, Err(ManagementError::InvalidReply));
+        }
+        assert_eq!(peer(command, &request, b"ERR unsupported\n").await, Err(ManagementError::Unsupported));
+    }
+
+    #[tokio::test]
     async fn rollback_and_preview_receipts_cannot_claim_an_unapproved_revision() {
         for (check, apply, verb, check_reply, apply_reply) in [
             (

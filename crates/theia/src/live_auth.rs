@@ -396,6 +396,12 @@ mod tests {
         };
         let live = LiveAuthorization::new(doc.clone()).unwrap();
         assert_eq!(live.revision(), Ok(1));
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            assert_eq!(live.access_observation("alpha", "alice"), Ok((1, 3)));
+            assert_eq!(live.access_observation("alpha", "missing"), Ok((1, 1)));
+            assert_eq!(live.access_observation("missing", "alice"), Ok((1, 0)));
+        }
         let mut routed = doc.clone();
         routed.server.policy.routing = Some(crate::routing::Settings {
             revision: 2,

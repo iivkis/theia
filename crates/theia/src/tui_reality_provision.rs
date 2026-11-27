@@ -2084,6 +2084,11 @@ impl ProvisionPanel {
         }
     }
 
+    pub(crate) fn recovery_path(&self) -> Option<&Path> {
+        let wizard = self.wizard.as_ref()?;
+        matches!(wizard.stage, WizardStage::SaveFailed { retry: false, .. }).then_some(wizard.config.as_path())
+    }
+
     pub(crate) fn confirmation_choice(&self) -> Option<(char, &'static str)> {
         if let Some(wizard) = &self.wizard {
             if let Some(panel) = &wizard.registration {
@@ -2099,6 +2104,7 @@ impl ProvisionPanel {
                 }
                 WizardStage::CreateConfirm(_) if !wizard.result_details => Some(('y', "Сохранить")),
                 WizardStage::SaveFailed { retry: true, .. } => Some(('y', "Повторить настройку")),
+                WizardStage::SaveFailed { retry: false, .. } => Some(('o', "Открыть настройки заново")),
                 WizardStage::Success => Some((
                     'y',
                     if wizard.source.is_none() {

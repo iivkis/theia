@@ -1504,7 +1504,7 @@ impl Editor {
                 "REALITY {}/{}: {} [защищённое подключение]",
                 self.selected_record + 1,
                 self.record_count(),
-                self.selected_record_id()
+                if self.role == Role::Server { self.server_connection_label(self.selected_record_id()).unwrap_or_else(|| self.selected_record_id().into()) } else { self.selected_record_id().into() }
             );
         }
         match self.role {
@@ -1512,7 +1512,7 @@ impl Editor {
                 "Подключение {}/{}: {}",
                 self.selected_record + 1,
                 self.record_count(),
-                self.selected_record_id(),
+                self.server_connection_label(self.selected_record_id()).unwrap_or_else(|| self.selected_record_id().into()),
             ),
             Role::Client => format!(
                 "Профиль {}/{}: {}{}",
