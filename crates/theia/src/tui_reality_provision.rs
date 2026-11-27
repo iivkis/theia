@@ -2532,7 +2532,8 @@ mod tests {
 
     #[test]
     fn pinned_resolution_review_and_expired_evidence_require_separate_approval() {
-        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("wizard-pinned-review").unwrap());
+        let dir = std::env::temp_dir()
+            .join(crate::tui_editor::generated_id("wizard-pinned-review").unwrap());
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("server.toml");
         let mut panel = ProvisionPanel::first(path.clone()).unwrap();
@@ -2555,10 +2556,16 @@ mod tests {
         assert!(panel.confirmation_choice().is_none());
         panel.key(key(KeyCode::Esc));
         panel.key(key(KeyCode::Char('y')));
-        assert!(matches!(panel.wizard.as_ref().unwrap().stage, WizardStage::Resolving(..)));
+        assert!(matches!(
+            panel.wizard.as_ref().unwrap().stage,
+            WizardStage::Resolving(..)
+        ));
         assert!(panel.body().contains("Фаза 1/3"));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while matches!(panel.wizard.as_ref().unwrap().stage, WizardStage::Resolving(..)) {
+        while matches!(
+            panel.wizard.as_ref().unwrap().stage,
+            WizardStage::Resolving(..)
+        ) {
             assert!(panel.poll().is_none());
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2574,9 +2581,17 @@ mod tests {
         assert!(!path.exists() && !input.health.exists());
         // Inject a completed worker result, not a network success claim.
         // Old evidence must never authorize creation of credentials or TOML.
-        let (state, report) = rank_checked(&input, targets.clone(), vec![Evidence {
-            h2_status: Some(200), h3_status: None,
-        }], 1000, Vec::new()).unwrap();
+        let (state, report) = rank_checked(
+            &input,
+            targets.clone(),
+            vec![Evidence {
+                h2_status: Some(200),
+                h3_status: None,
+            }],
+            1000,
+            Vec::new(),
+        )
+        .unwrap();
         let (tx, rx) = mpsc::channel();
         let (cancel, _cancelled) = tokio::sync::oneshot::channel();
         panel.wizard.as_mut().unwrap().stage = WizardStage::Checking(rx, cancel);
@@ -2585,7 +2600,11 @@ mod tests {
         tx.send(Ok((input.clone(), state, report))).unwrap();
         assert!(panel.poll().is_none());
         assert_eq!(panel.guide().unwrap().0, 5);
-        assert!(panel.reference_review().unwrap().note.contains("не запустит сервер"));
+        assert!(panel
+            .reference_review()
+            .unwrap()
+            .note
+            .contains("не запустит сервер"));
         panel.key(key(KeyCode::Char('y')));
         let WizardStage::ProbeConfirm(value) = &panel.wizard.as_ref().unwrap().stage else {
             panic!("expired evidence must require an exact new probe");
@@ -2593,13 +2612,17 @@ mod tests {
         assert_eq!(value.1.plan.as_ref().unwrap().targets(), targets.as_slice());
         assert!(!path.exists() && !input.bundle.exists() && !input.health.exists());
         panel.key(key(KeyCode::Esc));
-        assert!(matches!(panel.wizard.as_ref().unwrap().stage, WizardStage::Input));
+        assert!(matches!(
+            panel.wizard.as_ref().unwrap().stage,
+            WizardStage::Input
+        ));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn wizard_worker_failure_and_empty_search_do_not_create_material() {
-        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("wizard-worker-refusal").unwrap());
+        let dir = std::env::temp_dir()
+            .join(crate::tui_editor::generated_id("wizard-worker-refusal").unwrap());
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("server.toml");
         let mut panel = ProvisionPanel::first(path.clone()).unwrap();
@@ -2614,14 +2637,33 @@ mod tests {
         panel.wizard.as_mut().unwrap().stage = WizardStage::Resolving(rx, cancel);
         panel.key(key(KeyCode::Esc));
         assert_eq!(cancelled.try_recv(), Ok(()));
-        assert!(tx.send(Ok((input.clone(), ResolvedSearch { plan: None, unresolved: Vec::new() }))).is_err());
+        assert!(tx
+            .send(Ok((
+                input.clone(),
+                ResolvedSearch {
+                    plan: None,
+                    unresolved: Vec::new()
+                }
+            )))
+            .is_err());
         let (tx, rx) = mpsc::channel();
         let (cancel, _cancelled) = tokio::sync::oneshot::channel();
         panel.wizard.as_mut().unwrap().stage = WizardStage::Resolving(rx, cancel);
-        tx.send(Ok((input.clone(), ResolvedSearch { plan: None, unresolved: Vec::new() }))).unwrap();
+        tx.send(Ok((
+            input.clone(),
+            ResolvedSearch {
+                plan: None,
+                unresolved: Vec::new(),
+            },
+        )))
+        .unwrap();
         assert!(panel.poll().is_none());
         assert!(panel.body().contains("TLS не выполнялся"));
-        assert!(panel.reference_review().unwrap().note.contains("Ничего не сохранено"));
+        assert!(panel
+            .reference_review()
+            .unwrap()
+            .note
+            .contains("Ничего не сохранено"));
         assert!(panel.confirmation_choice().is_none());
         panel.key(key(KeyCode::F(2)));
         assert!(panel.reference_review().unwrap().expanded);
@@ -2634,10 +2676,14 @@ mod tests {
         panel.wizard.as_mut().unwrap().stage = WizardStage::Checking(rx, cancel);
         drop(tx);
         assert!(panel.poll().is_none());
-        assert!(matches!(panel.wizard.as_ref().unwrap().stage, WizardStage::Input));
+        assert!(matches!(
+            panel.wizard.as_ref().unwrap().stage,
+            WizardStage::Input
+        ));
         assert!(!panel.wizard.as_ref().unwrap().error.is_empty());
         let (tx, rx) = mpsc::channel();
-        panel.wizard.as_mut().unwrap().stage = WizardStage::SavingInitial(rx, input.health.parent().unwrap().to_owned());
+        panel.wizard.as_mut().unwrap().stage =
+            WizardStage::SavingInitial(rx, input.health.parent().unwrap().to_owned());
         assert_eq!(panel.guide().unwrap().0, 6);
         assert!(panel.body().contains("Сохраняем"));
         tx.send(Err(Error::Approval)).unwrap();

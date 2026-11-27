@@ -1274,8 +1274,11 @@ mod tests {
             use std::{os::unix::fs::DirBuilderExt, process::Command, time::Duration};
             let host = File::open("/proc/thread-self/ns/net").unwrap();
             assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) }, 0);
-            assert!(Command::new("ip").args(["link", "set", "lo", "up"])
-                .status().unwrap().success());
+            assert!(Command::new("ip")
+                .args(["link", "set", "lo", "up"])
+                .status()
+                .unwrap()
+                .success());
             let mut random = [0; 16];
             SystemRandom::new().fill(&mut random).unwrap();
             let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
@@ -1283,19 +1286,27 @@ mod tests {
             fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
             let path = dir.join("journal.toml");
             let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-            receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            receiver
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
             let peer = receiver.local_addr().unwrap();
             let mut queue = Queue::bind(49000, 64).unwrap();
             let rules = Arc::new(Mutex::new(LabRules::install(&queue, &host, &path).unwrap()));
             let registrar = LabRegistrar::new(rules.clone(), host.try_clone().unwrap());
-            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
             runtime.block_on(async {
                 for _ in 0..MAX_CARRIERS + 1 {
                     let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
                     let lease = registrar.udp(&socket, peer).unwrap();
                     assert_eq!(rules.lock().unwrap().admissions.len(), 1);
                     socket.connect(peer).await.unwrap();
-                    assert!(registrar.udp(&socket, peer).is_err(), "cannot claim an already marked socket");
+                    assert!(
+                        registrar.udp(&socket, peer).is_err(),
+                        "cannot claim an already marked socket"
+                    );
                     socket.send(b"admitted").await.unwrap();
                     let mut received = [0u8; 32];
                     let (n, source) = receiver.recv_from(&mut received).unwrap();
@@ -1308,18 +1319,31 @@ mod tests {
                     let packet = queue.receive().unwrap();
                     assert!(rules.lock().unwrap().owns_packet(&packet).unwrap());
                     assert_eq!(packet.metadata().unwrap().flow.source, source);
-                    assert_eq!(packet.finish(super::super::PacketAction::Drop).unwrap(),
-                        super::super::PacketAction::Drop);
+                    assert_eq!(
+                        packet.finish(super::super::PacketAction::Drop).unwrap(),
+                        super::super::PacketAction::Drop
+                    );
                 }
             });
-            assert!(recover(&host, &path).is_err(), "live owner excludes recovery");
+            assert!(
+                recover(&host, &path).is_err(),
+                "live owner excludes recovery"
+            );
             drop(registrar);
             drop(rules);
             recover(&host, &path).unwrap();
-            assert!(parse_journal(&journal_bytes(&path).unwrap().unwrap(),
-                &Scope::current(&host).unwrap()).unwrap().restored);
+            assert!(
+                parse_journal(
+                    &journal_bytes(&path).unwrap().unwrap(),
+                    &Scope::current(&host).unwrap()
+                )
+                .unwrap()
+                .restored
+            );
             fs::remove_dir_all(dir).unwrap();
-        }).join().unwrap();
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]

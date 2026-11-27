@@ -9113,7 +9113,8 @@ mod tests {
 
     #[test]
     fn routing_rule_editor_preserves_order_cancel_and_offline_dataset_failure() {
-        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("routing-draft").unwrap());
+        let dir =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("routing-draft").unwrap());
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("server.toml");
         let source = server_issuance_fixture();
@@ -9136,7 +9137,13 @@ mod tests {
             panel.key(press(KeyCode::Enter), None);
             assert!(panel.fields.is_none());
         }
-        let names = |p: &RoutingPanel| p.settings.rules.iter().map(|r| r.name.clone()).collect::<Vec<_>>();
+        let names = |p: &RoutingPanel| {
+            p.settings
+                .rules
+                .iter()
+                .map(|r| r.name.clone())
+                .collect::<Vec<_>>()
+        };
         assert_eq!(names(&panel), ["alpha", "beta", "gamma"]);
         panel.key(press(KeyCode::Char('[')), None);
         assert_eq!(names(&panel), ["alpha", "gamma", "beta"]);
@@ -9144,7 +9151,10 @@ mod tests {
         assert_eq!(names(&panel), ["alpha", "beta", "gamma"]);
         panel.key(press(KeyCode::Up), None);
         panel.key(press(KeyCode::Enter), None);
-        panel.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), None);
+        panel.key(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            None,
+        );
         panel.key(press(KeyCode::Char('x')), None);
         panel.key(press(KeyCode::Backspace), None);
         panel.key(press(KeyCode::Enter), None);
@@ -9154,7 +9164,10 @@ mod tests {
         panel.key(press(KeyCode::Esc), None);
         assert_eq!(names(&panel), ["alpha", "beta", "gamma"]);
         panel.key(press(KeyCode::Enter), None);
-        panel.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), None);
+        panel.key(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            None,
+        );
         panel.paste("beta-edited");
         panel.key(press(KeyCode::Enter), None);
         assert_eq!(names(&panel), ["alpha", "beta-edited", "gamma"]);
@@ -9194,11 +9207,19 @@ mod tests {
             let (tx, rx) = mpsc::channel();
             observation.pending = Some(rx);
             tx.send(Ok(crate::management::StatusReply::ClientRunning {
-                revision: 1, config_sha256: digest, descriptor_revision: 0,
-                transport: 2, xhttp: 1, fallback: false, routing_revision: 5,
-                routing_state, routing_totals: Box::new([0; 38]), flow_counts: None,
+                revision: 1,
+                config_sha256: digest,
+                descriptor_revision: 0,
+                transport: 2,
+                xhttp: 1,
+                fallback: false,
+                routing_revision: 5,
+                routing_state,
+                routing_totals: Box::new([0; 38]),
+                flow_counts: None,
                 capture_state,
-            })).unwrap();
+            }))
+            .unwrap();
             observation.poll();
             assert!(observation.body().contains(expected));
         }
@@ -9207,11 +9228,19 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         observation.pending = Some(rx);
         tx.send(Ok(crate::management::StatusReply::ClientRunning {
-            revision: 1, config_sha256: [8; 32], descriptor_revision: 0,
-            transport: 2, xhttp: 1, fallback: false, routing_revision: 5,
-            routing_state: 1, routing_totals: Box::new([0; 38]), flow_counts: None,
+            revision: 1,
+            config_sha256: [8; 32],
+            descriptor_revision: 0,
+            transport: 2,
+            xhttp: 1,
+            fallback: false,
+            routing_revision: 5,
+            routing_state: 1,
+            routing_totals: Box::new([0; 38]),
+            flow_counts: None,
             capture_state: 2,
-        })).unwrap();
+        }))
+        .unwrap();
         observation.poll();
         assert!(observation.observed.is_none());
         assert!(observation.body().contains("не подтверждено"));

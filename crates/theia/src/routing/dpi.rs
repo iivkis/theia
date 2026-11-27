@@ -850,17 +850,28 @@ mod tests {
         use crate::quic_core::wire::Version;
         let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let address = peer.local_addr().unwrap();
-        let network = (0..16).find_map(|_| network_scope::observe(address)).unwrap();
+        let network = (0..16)
+            .find_map(|_| network_scope::observe(address))
+            .unwrap();
         let engine = Arc::new(Engine::default());
         let policy = [1; 32];
-        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(policy)));
+        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(
+            policy,
+        )));
         engine.set_enabled(true);
         engine.set_stun_enabled(true);
-        let key = Key { name: "example.org".into(), address, policy, network };
+        let key = Key {
+            name: "example.org".into(),
+            address,
+            policy,
+            network,
+        };
         let socket = scoped_udp(address, network).await.unwrap();
         let verified = VerifiedUdp {
-            socket, strategy: UdpStrategy::StunBinding(udp::BindingStrategy::Fingerprint),
-            engine: engine.clone(), key: key.clone(),
+            socket,
+            strategy: UdpStrategy::StunBinding(udp::BindingStrategy::Fingerprint),
+            engine: engine.clone(),
+            key: key.clone(),
         };
         assert!(!verified.admissible().unwrap());
         engine.remember_udp(key.clone(), UdpProbe::Stun, true);
@@ -887,17 +898,24 @@ mod tests {
         assert!(engine.udp_cache.lock().unwrap().is_empty());
         let fallback = verified.fallback_policy();
         engine.retire();
-        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(policy)));
+        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(
+            policy,
+        )));
         assert!(verified.admissible().is_err());
         assert!(fallback.check().is_err());
-        assert!(peer.try_recv_from(&mut [0; 1]).is_err(), "scope/cache checks must not send");
+        assert!(
+            peer.try_recv_from(&mut [0; 1]).is_err(),
+            "scope/cache checks must not send"
+        );
     }
 
     #[tokio::test]
     async fn authorized_engine_rejects_invalid_scope_before_network_io() {
         let engine = Arc::new(Engine::default());
         let policy = [1; 32];
-        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(policy)));
+        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(
+            policy,
+        )));
         engine.set_enabled(true);
         engine.set_stun_enabled(true);
         let public: IpAddr = "8.8.8.8".parse().unwrap();
@@ -909,14 +927,32 @@ mod tests {
             ("example.org", vec![public; 65]),
         ] {
             assert!(engine.open(name, 443, &ips, policy).await.is_none());
-            assert!(engine.open_quic_udp(name, 443, &ips, policy).await.is_none());
-            assert!(engine.open_stun_udp(name, 3478, &ips, policy).await.is_none());
+            assert!(engine
+                .open_quic_udp(name, 443, &ips, policy)
+                .await
+                .is_none());
+            assert!(engine
+                .open_stun_udp(name, 3478, &ips, policy)
+                .await
+                .is_none());
         }
-        assert!(engine.open("example.org", 80, &[public], policy).await.is_none());
-        assert!(engine.open_quic_udp("example.org", 80, &[public], policy).await.is_none());
-        assert!(engine.open_stun_udp("example.org", 443, &[public], policy).await.is_none());
+        assert!(engine
+            .open("example.org", 80, &[public], policy)
+            .await
+            .is_none());
+        assert!(engine
+            .open_quic_udp("example.org", 80, &[public], policy)
+            .await
+            .is_none());
+        assert!(engine
+            .open_stun_udp("example.org", 443, &[public], policy)
+            .await
+            .is_none());
         engine.retire();
-        assert!(engine.open_stun_udp("example.org", 3478, &[public], policy).await.is_none());
+        assert!(engine
+            .open_stun_udp("example.org", 3478, &[public], policy)
+            .await
+            .is_none());
     }
 
     #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -925,7 +961,10 @@ mod tests {
         use tokio::io::AsyncReadExt;
         async fn pair() -> (TcpStream, TcpStream) {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let (a, b) = tokio::join!(TcpStream::connect(listener.local_addr().unwrap()), listener.accept());
+            let (a, b) = tokio::join!(
+                TcpStream::connect(listener.local_addr().unwrap()),
+                listener.accept()
+            );
             (a.unwrap(), b.unwrap().0)
         }
         for alert in [true, false] {
@@ -933,13 +972,25 @@ mod tests {
                 let (app, client) = pair().await;
                 let (target, mut origin) = pair().await;
                 let mut tunnel = Tunnel::fixture(target, "example.org");
-                tunnel.key.network = (0..16).find_map(|_| network_scope::observe(tunnel.key.address)).unwrap();
+                tunnel.key.network = (0..16)
+                    .find_map(|_| network_scope::observe(tunnel.key.address))
+                    .unwrap();
                 tunnel.engine.set_enabled(true);
-                tunnel.engine.cache.remember(&tunnel.key, Verdict::Verified(Strategy::Header));
-                let expected = tls::transform(&tls::fixture("example.org"), "example.org", Strategy::Header).unwrap();
+                tunnel
+                    .engine
+                    .cache
+                    .remember(&tunnel.key, Verdict::Verified(Strategy::Header));
+                let expected = tls::transform(
+                    &tls::fixture("example.org"),
+                    "example.org",
+                    Strategy::Header,
+                )
+                .unwrap();
                 let mut app = app;
                 app.write_all(&tls::fixture("example.org")).await.unwrap();
-                let wire = if alert { vec![21, 3, 3, 0, 2, 2, 40] } else {
+                let wire = if alert {
+                    vec![21, 3, 3, 0, 2, 2, 40]
+                } else {
                     let mut message = vec![2, 0, 0, 38, 3, 3];
                     message.extend([1; 32]);
                     message.extend([0, 0x13, 1, 0]);
@@ -974,7 +1025,9 @@ mod tests {
                 } else {
                     assert!(matches!(result, Ok(RelayOutcome::Finished)));
                 }
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
         }
     }
 
