@@ -203,7 +203,7 @@ pub(crate) struct FlowLease {
 impl FlowLease {
     /// Every ingress, including explicit proxy requests, pins the same
     /// policy generation. A reaccepted digest cannot revive revoked flows.
-    fn check_epoch(&self) -> Result<(), ClientError> {
+    pub(crate) fn check_pending(&self) -> Result<(), ClientError> {
         if self.engine.policy_epoch(self.identity.digest)? != self.epoch {
             return Err(denied());
         }
@@ -211,7 +211,7 @@ impl FlowLease {
     }
 
     pub(crate) fn check_live(&self, action: PacketAction) -> Result<(), ClientError> {
-        self.check_epoch()?;
+        self.check_pending()?;
         if action == PacketAction::Modify && !self.engine.enabled() {
             return Err(denied());
         }
@@ -236,7 +236,7 @@ impl FlowLease {
     /// retirement even when neither side is sending application bytes.
     pub(crate) async fn wait_revoked(&self) -> Result<(), ClientError> {
         loop {
-            self.check_epoch()?;
+            self.check_pending()?;
             if let Some(action) = self.actual_action()? {
                 self.check_live(action)?;
             }
@@ -257,7 +257,7 @@ impl FlowLease {
             || !state.entries.get(&self.id).is_some_and(|entry|entry.identity==self.identity) {
             return Err(denied());
         }
-        self.check_epoch()
+        self.check_pending()
     }
 
     #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
@@ -482,13 +482,16 @@ mod tests {
         // An unchanged, still-current receipt does not interrupt a relay.
         engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture([1; 32])));
         assert!(flow.check_delivery().is_ok());
-        engine.authorize_policy(None);
-        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture([1; 32])));
-        assert_eq!(flow.check_delivery(), Err(denied()));
-        assert_eq!(
-            tokio::time::timeout(std::time::Duration::from_secs(2), flow.wait_revoked()).await.unwrap(),
-            Err(denied())
+        let (revoked, ()) = tokio::join!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), flow.wait_revoked()),
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                engine.authorize_policy(None);
+                engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture([1; 32])));
+            },
         );
+        assert_eq!(revoked.unwrap(), Err(denied()));
+        assert_eq!(flow.check_delivery(), Err(denied()));
         drop(flow);
         let fresh = begin(&table, &engine, PacketAction::Redirect).unwrap();
         assert!(fresh.commit(PacketAction::Redirect).is_ok());

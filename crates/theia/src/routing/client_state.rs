@@ -603,6 +603,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proactive_refresh_continues_current_epoch_but_failed_refresh_revokes() {
+        use super::super::{flow::Protocol, PacketAction};
+        let cache = Cache::new("scope".into(), None);
+        let (_, wire) = Snapshot::build("scope", 1, &[], &[], &[]).unwrap();
+        let snapshot = cache.get(|_| async { Ok(wire) }).await.unwrap();
+        let digest = snapshot.digest();
+        let flow = cache.flows.begin(
+            cache.dpi.clone(),
+            Protocol::Tcp,
+            crate::protocol::Address::V4([192, 0, 2, 1]),
+            443,
+            digest,
+            PacketAction::Redirect,
+        ).unwrap();
+        flow.commit(PacketAction::Redirect).unwrap();
+        cache.state.lock().await.expires = Some(Instant::now() + Duration::from_secs(5));
+        cache.refresh(|known| async {
+            assert_eq!(known, Some(digest));
+            assert!(flow.check_delivery().is_ok());
+            Ok(super::super::exchange::unchanged_receipt(digest).to_vec())
+        }).await.unwrap();
+        assert!(flow.check_delivery().is_ok());
+        cache.state.lock().await.expires = Some(Instant::now() + Duration::from_secs(5));
+        assert!(cache.refresh(|_| async { Err(ClientError::Io) }).await.is_err());
+        assert!(flow.check_delivery().is_err());
+        cache.state.lock().await.retry = None;
+        cache.get(|_| async { Ok(super::super::exchange::unchanged_receipt(digest).to_vec()) }).await.unwrap();
+        assert!(flow.check_delivery().is_err());
+    }
+
+    #[tokio::test]
     async fn cache_rejects_rollback_and_equivocation() {
         let cache = Cache::new("scope".into(), None);
         let (_, bytes) = Snapshot::build("scope", 2, &[], &[], &[]).unwrap();

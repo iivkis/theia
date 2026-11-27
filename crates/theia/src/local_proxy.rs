@@ -1302,6 +1302,7 @@ async fn routed_open(
     )?;
     let tunnel =
         routed_open_selected(carrier, cache, address, port, snapshot, action, pinned, allow_dpi).await?;
+    flow.check_pending()?;
     Ok(RoutedTcp { tunnel, flow })
 }
 
@@ -1415,6 +1416,7 @@ async fn routed_udp(
         carrier, cache, address, port, candidate, observed, snapshot, action, pinned,
     )
     .await?;
+    flow.check_pending()?;
     Ok(RoutedUdp { tunnel, flow })
 }
 
@@ -5394,6 +5396,10 @@ async fn handle(
     } else {
         client.open(address, port).await
     };
+    let opened = opened.and_then(|tunnel| {
+        tunnel.flow.check_pending()?;
+        Ok(tunnel)
+    });
     match opened {
         Ok(tunnel) => {
             if tunnel.open_code() == 0 {
