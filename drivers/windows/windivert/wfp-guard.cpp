@@ -29,7 +29,8 @@
 
 namespace {
 constexpr wchar_t name[] = L"Theia isolated persistent interface guard v1";
-constexpr UINT16 sub_weight = 0x8000;
+constexpr UINT16 sub_weight_base = 0x8000;
+constexpr UINT16 sub_weight_slots = 0x1000;
 constexpr UINT64 filter_weight = 0x8000000000000000ULL;
 
 struct Failure { DWORD code; };
@@ -63,6 +64,13 @@ struct Plan {
     bool boot=false;
     size_t count() const { return boot?4:2; }
 };
+// BFE assigns the closest free weight when the requested weight is occupied.
+// Derive a bounded preferred weight from the journal-pinned sublayer GUID.
+// Never accept a remapped weight: installation rolls back on collision and
+// later inspection/recovery still compare the exact original intent.
+UINT16 sub_weight(const GUID& sub) {
+    return static_cast<UINT16>(sub_weight_base+(sub.Data1&(sub_weight_slots-1)));
+}
 std::array<UINT8,16> marker(const GUID& id) {
     std::array<UINT8,16> out{};
     static_assert(sizeof(id)==16);
@@ -112,7 +120,7 @@ void validate_plans(const std::vector<Plan>& plans) {
         const auto& p=plans[i];
         for(size_t j=0;j<i;++j) {
             require(!eq(p.interface_key,plans[j].interface_key) && p.luid!=plans[j].luid);
-            require(p.marker!=plans[j].marker);
+            require(p.marker!=plans[j].marker && sub_weight(p.sub)!=sub_weight(plans[j].sub));
         }
         auto unique=[&keys](const GUID& key) {
             require(!eq(key,GUID{}));
@@ -231,10 +239,10 @@ const GUID& layer(size_t i) {
 bool same_sublayer(const FWPM_SUBLAYER0& s,const Plan& p) {
     if(fixture_diagnostics) std::fwprintf(stderr,L"BFE fixture sublayer: key=%d flags=0x%08lx expected-flags=0x%08lx provider=%d blob=%d weight=%u expected-weight=%u name=%d description=%d\n",
         eq(s.subLayerKey,p.sub)?1:0,static_cast<unsigned long>(s.flags),static_cast<unsigned long>(FWPM_SUBLAYER_FLAG_PERSISTENT),
-        s.providerKey?1:0,same_blob(s.providerData,p)?1:0,static_cast<unsigned>(s.weight),static_cast<unsigned>(sub_weight),
+        s.providerKey?1:0,same_blob(s.providerData,p)?1:0,static_cast<unsigned>(s.weight),static_cast<unsigned>(sub_weight(p.sub)),
         text_eq(s.displayData.name,name)?1:0,s.displayData.description?1:0);
     return eq(s.subLayerKey,p.sub) && s.flags==FWPM_SUBLAYER_FLAG_PERSISTENT &&
-        !s.providerKey && same_blob(s.providerData,p) && s.weight==sub_weight &&
+        !s.providerKey && same_blob(s.providerData,p) && s.weight==sub_weight(p.sub) &&
         text_eq(s.displayData.name,name) && !s.displayData.description;
 }
 const GUID& filter_sublayer(const Plan& p,size_t i) {
@@ -299,7 +307,7 @@ void install(HANDLE e,Plan& p) {
     s.displayData.name=const_cast<wchar_t*>(name);
     s.flags=FWPM_SUBLAYER_FLAG_PERSISTENT;
     s.providerData=blob(p);
-    s.weight=sub_weight;
+    s.weight=sub_weight(p.sub);
     check(FwpmSubLayerAdd0(e,&s,security.value));
     UINT64 weight=filter_weight;
     FWPM_FILTER_CONDITION0 condition{};
@@ -513,6 +521,40 @@ GUID fresh_guid() {
     require(CoCreateGuid(&result)==S_OK && !eq(result,GUID{}));
     return result;
 }
+// Allocate deterministic, currently unused test weights inside the same
+// transaction. This is only test setup; production intent remains immutable.
+GUID fixture_sublayer(HANDLE engine,const std::vector<Plan>& planned={}) {
+    struct EnumHandle {
+        HANDLE engine;
+        HANDLE value=nullptr;
+        ~EnumHandle(){if(value) FwpmSubLayerDestroyEnumHandle0(engine,value);}
+    } enumeration{engine};
+    check(FwpmSubLayerCreateEnumHandle0(engine,nullptr,&enumeration.value));
+    std::array<bool,sub_weight_slots> used{};
+    for(const auto& p:planned) used[sub_weight(p.sub)-sub_weight_base]=true;
+    bool complete=false;
+    for(unsigned page=0;page<256;++page) {
+        BfeObject<FWPM_SUBLAYER0*> entries;
+        UINT32 count=0;
+        check(FwpmSubLayerEnum0(engine,enumeration.value,256,&entries.value,&count));
+        require(count<=256 && (!count || entries.value));
+        for(UINT32 i=0;i<count;++i) {
+            require(entries.value[i]!=nullptr);
+            const auto weight=entries.value[i]->weight;
+            if(weight>=sub_weight_base && weight<sub_weight_base+sub_weight_slots)
+                used[weight-sub_weight_base]=true;
+        }
+        if(count<256) {complete=true;break;}
+    }
+    require(complete);
+    for(UINT32 i=0;i<sub_weight_slots;++i) {
+        if(used[i]) continue;
+        auto id=fresh_guid();
+        id.Data1=(id.Data1&~static_cast<UINT32>(sub_weight_slots-1))|i;
+        return id;
+    }
+    throw Failure{ERROR_NO_SYSTEM_RESOURCES};
+}
 // Exercise actual BFE API and canonical read-back, but NEVER commit
 // any of the test filters. Even a failed assertion aborts via RAII.
 void transaction_self_test() {
@@ -521,9 +563,18 @@ void transaction_self_test() {
     Engine engine;
     {
         Transaction tx(engine.value,false);
+        p.sub=fixture_sublayer(engine.value);
         require(inspect(engine.value,p)==State::absent);
         install(engine.value,p);
         require(inspect(engine.value,p)==State::exact);
+        {
+            BfeObject<FWPM_SUBLAYER0> observed;
+            check(FwpmSubLayerGetByKey0(engine.value,&p.sub,&observed.value));
+            require(observed.value && same_sublayer(*observed.value,p));
+            auto different=*observed.value;
+            different.weight^=1;
+            require(!same_sublayer(different,p));
+        }
         auto changed=p;
         changed.luid=2;
         require(inspect(engine.value,changed)==State::conflict);
@@ -546,16 +597,16 @@ void transaction_self_test() {
 }
 void multi_transaction_self_test(bool boot) {
     fixture_diagnostics=true;
+    Engine engine;
     std::vector<Plan> plans;
+    {
+    Transaction tx(engine.value,false);
     for(UINT64 luid:{UINT64{1},UINT64{2}}) {
-        Plan p{fresh_guid(),fresh_guid(),{fresh_guid(),fresh_guid(),GUID{},GUID{}},luid,marker(fresh_guid()),boot};
+        Plan p{fresh_guid(),fixture_sublayer(engine.value,plans),{fresh_guid(),fresh_guid(),GUID{},GUID{}},luid,marker(fresh_guid()),boot};
         if(boot) {p.filters[2]=fresh_guid();p.filters[3]=fresh_guid();}
         plans.push_back(p);
     }
-    validate_plans(plans);
-    Engine engine;
-    {
-        Transaction tx(engine.value,false);
+        validate_plans(plans);
         require(inspect_all(engine.value,plans)==State::absent);
         install(engine.value,plans[0]);
         require(inspect_all(engine.value,plans)==State::conflict);
