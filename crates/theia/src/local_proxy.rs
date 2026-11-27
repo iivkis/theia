@@ -2369,7 +2369,12 @@ impl NativeIngress {
         self.runtime.stop();
         self.client.routing_cache().dpi.retire();
         if let Ok(mut registrar) = self.registrar.lock() {
-            drop(registrar.take());
+            if let Some(registrar)=registrar.take() {
+                // Other tasks may still hold Arc clones and carrier
+                // drivers may still hold leases. Retire the shared
+                // backend explicitly before dropping our reference.
+                let _=registrar.retire();
+            }
         }
         #[cfg(target_os = "linux")]
         if let Ok(mut raw) = self.raw.lock() {
@@ -2384,10 +2389,9 @@ impl NativeIngress {
     fn registrar(
         &self,
     ) -> Result<Option<Arc<dyn crate::routing::carrier_socket::Registrar>>, ClientError> {
-        self.registrar
-            .lock()
-            .map(|r| r.clone())
-            .map_err(|_| ClientError::Configuration)
+        let slot=self.registrar.lock().map_err(|_|ClientError::Configuration)?;
+        self.ensure_running()?;
+        Ok(slot.clone())
     }
 
     fn ensure_running(&self) -> Result<(), ClientError> {

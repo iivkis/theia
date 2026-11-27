@@ -1266,6 +1266,12 @@ mod native {
             },registration_timestamp()?).ok_or(io::ErrorKind::PermissionDenied)?;
             Ok(crate::routing::carrier_socket::Lease::retain(lease))
         }
+        fn retire(&self)->io::Result<()> {
+            let mut state=self.state.lock().map_err(|_|io::ErrorKind::PermissionDenied)?;
+            state.retired=true;
+            for entry in state.entries.values_mut() { entry.live=false; }
+            Ok(())
+        }
     }
 
     struct WinsockLease;

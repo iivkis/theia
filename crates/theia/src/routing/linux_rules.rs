@@ -29,6 +29,7 @@ const ACK: u16 = 4;
 const CREATE_EXCLUSIVE: u16 = 0x600;
 const APPEND: u16 = 0x800;
 const MAX_CARRIERS: usize = 16;
+const MAX_CARRIER_EPOCH: usize = 65_536;
 const NESTED: u16 = 0x8000;
 const FAMILY_INET: u8 = 1;
 const NEW_TABLE: u16 = NFT;
@@ -553,8 +554,12 @@ pub struct LabRules {
     capture: Option<SocketCapture>,
     journal_path: PathBuf,
     admissions: std::collections::BTreeMap<u32, super::packet::FlowKey>,
+    dynamic: std::collections::BTreeMap<u32, Arc<LabCarrierSocket>>,
+    used_marks: std::collections::HashSet<u32>,
+    used_cookies: std::collections::HashSet<u64>,
     queue_number: u16,
     poisoned: bool,
+    carrier_retired: bool,
     // Drop socket exemptions before releasing ownership to recovery.
     _lock: UnixDatagram,
 }
@@ -769,8 +774,12 @@ impl LabRules {
             capture,
             journal_path: path.to_owned(),
             admissions,
+            dynamic: Default::default(),
+            used_marks: marks,
+            used_cookies: cookies,
             queue_number,
             poisoned: false,
+            carrier_retired: false,
         })
     }
     /// Replace only our output chain's rules in one generation-checked
@@ -808,16 +817,54 @@ impl LabRules {
         self.poisoned = false;
         Ok(())
     }
-    fn admit(&mut self, socket: &LabCarrierSocket) -> io::Result<()> {
-        if self.admissions.len() >= MAX_CARRIERS || self.admissions.contains_key(&socket.mark()) {
+    fn admit(&mut self, socket: Arc<LabCarrierSocket>) -> io::Result<()> {
+        if self.carrier_retired || self.poisoned || self.admissions.len() >= MAX_CARRIERS
+            || self.used_marks.len() >= MAX_CARRIER_EPOCH
+            || self.used_marks.contains(&socket.mark())
+            || self.used_cookies.contains(&socket.cookie())
+        {
             return Err(refused());
         }
         socket.verify()?;
+        let mark=socket.mark();
+        // Tombstones precede publication, including uncertain failure.
+        // Never allow an old rule to authorize a recycled random mark.
+        self.used_marks.insert(mark);
+        self.used_cookies.insert(socket.cookie());
         let mut next = self.admissions.clone();
-        next.insert(socket.mark(), socket.key());
-        self.replace_admissions(next)
+        next.insert(mark, socket.key());
+        self.replace_admissions(next)?;
+        self.dynamic.insert(mark,socket);
+        Ok(())
     }
+
+    /// Retire the entire carrier epoch while leaving the base DROP
+    /// chain and non-bypass NFQUEUE in place. Rule ownership and mark
+    /// reset failures are terminal; never restore or re-admit on error.
+    fn retire_carriers(&mut self) -> io::Result<()> {
+        self.carrier_retired=true;
+        let mut cleared=true;
+        for socket in self._carriers.iter().chain(self.dynamic.values().map(Arc::as_ref)) {
+            if socket.clear_mark().is_err() { cleared=false; }
+        }
+        let removed=if self.admissions.is_empty() {
+            Ok(())
+        } else {
+            self.replace_admissions(Default::default())
+        };
+        if removed.is_ok() { self.dynamic.clear(); }
+        if !cleared || removed.is_err() {
+            self.poisoned=true;
+            return Err(refused());
+        }
+        Ok(())
+    }
+
     fn revoke(&mut self, mark: u32) -> io::Result<()> {
+        if self.carrier_retired && !self.admissions.contains_key(&mark) {
+            self.dynamic.remove(&mark);
+            return Ok(());
+        }
         let mut next = self.admissions.clone();
         if next.remove(&mark).is_none() {
             return Err(refused());
@@ -828,8 +875,19 @@ impl LabRules {
         let result = self.replace_admissions(next);
         if result.is_err() {
             self.poisoned = true;
+        } else {
+            self.dynamic.remove(&mark);
         }
         result
+    }
+}
+
+impl Drop for LabRules {
+    fn drop(&mut self) {
+        // No implicit rule restoration. If the owner is dropped on a
+        // failed start or cancellation, disable retained descriptors
+        // before ownership is released. Explicit recovery owns deletion.
+        let _=self.retire_carriers();
     }
 }
 
@@ -891,7 +949,7 @@ fn replace_messages(
 }
 
 struct DynamicAdmission {
-    socket: Option<LabCarrierSocket>,
+    socket: Option<Arc<LabCarrierSocket>>,
     rules: Arc<Mutex<LabRules>>,
 }
 impl Drop for DynamicAdmission {
@@ -900,15 +958,19 @@ impl Drop for DynamicAdmission {
             let mark = socket.mark();
             // The original socket may still exist in a caller. Reset the
             // mark before freeing the kernel exemption and its slot.
-            let cleared = socket.clear_mark().is_ok();
-            drop(socket);
             if let Ok(mut rules) = self.rules.lock() {
+                let cleared = socket.clear_mark().is_ok();
                 let revoked = rules.revoke(mark).is_ok();
                 // Even if rule removal succeeds, do not issue new leases
                 // after an uncertain descriptor reset.
                 if !cleared || !revoked {
                     rules.poisoned = true;
+                    rules.carrier_retired=true;
+                    let _=rules.retire_carriers();
                 }
+            } else {
+                // A poisoned mutex must not prevent a mark reset.
+                let _=socket.clear_mark();
             }
         }
     }
@@ -924,7 +986,8 @@ impl LabRegistrar {
         Self { rules, host }
     }
     fn admit(&self, socket: LabCarrierSocket) -> io::Result<super::carrier_socket::Lease> {
-        self.rules.lock().map_err(|_| refused())?.admit(&socket)?;
+        let socket=Arc::new(socket);
+        self.rules.lock().map_err(|_| refused())?.admit(socket.clone())?;
         // Reset socket mark before releasing the rules ownership lock.
         Ok(super::carrier_socket::Lease::retain(DynamicAdmission {
             socket: Some(socket),
@@ -946,6 +1009,9 @@ impl super::carrier_socket::Registrar for LabRegistrar {
         peer: std::net::SocketAddr,
     ) -> io::Result<super::carrier_socket::Lease> {
         self.admit(LabCarrierSocket::pending_udp(socket, peer, &self.host)?)
+    }
+    fn retire(&self) -> io::Result<()> {
+        self.rules.lock().map_err(|_|refused())?.retire_carriers()
     }
 }
 
@@ -1403,6 +1469,9 @@ mod tests {
                     drop(lease);
                     assert!(rules.lock().unwrap().admissions.is_empty());
                     assert!(rules.lock().unwrap().current().unwrap());
+                    // The same live descriptor cannot receive a new lease
+                    // in the same epoch even after its original rule is gone.
+                    assert!(registrar.udp(&socket,peer).is_err());
                     socket.send(b"revoked").await.unwrap();
                     let packet = queue.receive().unwrap();
                     assert!(rules.lock().unwrap().owns_packet(&packet).unwrap());
@@ -1412,6 +1481,21 @@ mod tests {
                         super::super::PacketAction::Drop
                     );
                 }
+                // Owner retirement is stronger than dropping one lease:
+                // hold both the original socket and lease alive.
+                let socket=tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let held=registrar.udp(&socket,peer).unwrap();
+                socket.connect(peer).await.unwrap();
+                registrar.retire().unwrap();
+                assert!(rules.lock().unwrap().admissions.is_empty());
+                assert!(rules.lock().unwrap().current().unwrap());
+                assert!(registrar.udp(&socket,peer).is_err());
+                socket.send(b"retired").await.unwrap();
+                let packet=queue.receive().unwrap();
+                assert_eq!(packet.metadata().unwrap().flow.source,socket.local_addr().unwrap());
+                packet.finish(super::super::PacketAction::Drop).unwrap();
+                drop(held);
+                assert!(rules.lock().unwrap().current().unwrap());
             });
             assert!(
                 recover(&host, &path).is_err(),
