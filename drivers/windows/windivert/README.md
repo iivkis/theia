@@ -131,3 +131,18 @@ The explicit `client windivert --tcp-relay-lab` command requires a configured au
 ```powershell
 theia client windivert --tcp-relay-lab --config $Config --directory $Dir --dll-sha256 $DllHash --sys-sha256 $SysHash --target $AuthorizedTcpEcho --confirm
 ```
+
+### Native transactional persistent interface guard (isolated lab only)
+
+`build-wfp-guard-lab.ps1` compiles the user-mode Windows SDK helper. No kernel driver, default firewall policy, or permit is installed. `wfp-guard-lab.ps1` requires an administrator, a local console on an explicitly disposable machine, and separately provisioned administrator/SYSTEM-only directories for the executable and journal. **The selected interface loses all outbound IPv4 and IPv6, including unrelated protocols and remote management.** Do not use on a production or remotely administered host.
+
+Prepare pins the helper hash, machine, boot, interface GUID/LUID, random sublayer/filter keys and marker in a create-only flushed intent before BFE mutation. Record the emitted intent SHA-256 independently. BFE performs get-by-key/compare/add or get-by-key/compare/delete in one write transaction. Recovery deletes only both exactly matching filters and their unique sublayer, or accepts complete absence; partial/foreign state fails closed. A referenced sublayer cannot be removed, so unexpected foreign references abort the entire transaction. Explicit recovery requires the original pinned intent and confirmation; no journal is deleted. This validates object state, not actual enforcement, boot-time continuity, or arbitration with WinDivert. Persistent filters are loaded by BFE, not a proof of pre-BFE boot coverage. The lab installs no carrier exemptions and cannot publish capture readiness. Interface changes or a different LUID prevent Verify; exact old-object recovery remains possible.
+
+```powershell
+./drivers/windows/windivert/build-wfp-guard-lab.ps1 -OutputDirectory $ProtectedHelperDir
+./drivers/windows/windivert/wfp-guard-lab.ps1 -Mode Prepare -JournalDirectory $ProtectedJournal -Helper $PinnedExe -HelperSha256 $HelperHash -InterfaceGuid $IsolatedInterfaceGuid -IsolatedTestMachine
+./drivers/windows/windivert/wfp-guard-lab.ps1 -Mode Verify -JournalDirectory $ProtectedJournal -Helper $PinnedExe -HelperSha256 $HelperHash -IntentSha256 $IntentHash -IsolatedTestMachine -RequireDifferentBoot
+./drivers/windows/windivert/wfp-guard-lab.ps1 -Mode Recover -JournalDirectory $ProtectedJournal -Helper $PinnedExe -HelperSha256 $HelperHash -IntentSha256 $IntentHash -IsolatedTestMachine -ConfirmRecovery
+```
+
+Physical acceptance requires a distinct management interface/local console, independent packet capture on the selected interface, TCP/UDP/non-TCP/UDP IPv4/IPv6, existing connections, simultaneous process termination, reboot, interface LUID change and conflicting WFP objects. Do not equate transactional object recovery with production CAS across an active capture/carrier epoch.
