@@ -1,7 +1,7 @@
 //! Explicit loopback HTTP/SOCKS5 ingress, framing and association lifecycle.
 use super::{ProxyClient, RoutedUdp, NEGOTIATE_TIMEOUT, REPLY_TIMEOUT};
 use crate::{client::{ClientError, error_kind}, diagnostics::Value, protocol::{self, Address, ErrorCode, Frame}};
-use std::{net::{Ipv4Addr, Ipv6Addr, SocketAddr}, sync::{Arc, Mutex}};
+use std::{net::{Ipv4Addr, Ipv6Addr, SocketAddr}, sync::Arc};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, task::JoinSet, time::timeout};
 
 pub(super) const HEADER_LIMIT: usize = 8192;
