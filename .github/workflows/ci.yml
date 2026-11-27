@@ -678,7 +678,7 @@ jobs:
           if ($IsWindows) {
             # Same bounded main-thread stack reserve as the candidate's
             # binary, without modifying the immutable reference source.
-            cargo rustc --manifest-path .perf-baseline/Cargo.toml --locked --bin theia --target-dir target -- -C link-arg=/STACK:8388608
+            cargo rustc --manifest-path .perf-baseline/Cargo.toml --locked -p theia --bin theia --target-dir target -- -C link-arg=/STACK:8388608
           } else {
             cargo build --manifest-path .perf-baseline/Cargo.toml --locked --bin theia --target-dir target
           }
@@ -771,7 +771,7 @@ jobs:
           if ($IsWindows) {
             # Same bounded main-thread stack reserve as the candidate's
             # binary, without modifying the immutable reference source.
-            cargo rustc --manifest-path .f19-baseline/Cargo.toml --locked --bin theia --target-dir target -- -C link-arg=/STACK:8388608
+            cargo rustc --manifest-path .f19-baseline/Cargo.toml --locked -p theia --bin theia --target-dir target -- -C link-arg=/STACK:8388608
           } else {
             cargo build --manifest-path .f19-baseline/Cargo.toml --locked --bin theia --target-dir target
           }
