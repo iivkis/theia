@@ -81,16 +81,15 @@ impl Settings {
             (Some(directory), Some(manifest)) => {
                 let pair = geodata::Store::new(PathBuf::from(directory))?
                     .load_pinned(manifest, &self.rules)?;
-                Ok(snapshot::Snapshot::build_with_diagnostic_domains(
+                Ok(snapshot::Snapshot::build(
                     inbound_scope,
                     self.revision,
                     &self.rules,
                     pair.geosite(),
                     pair.geoip(),
-                    &self.diagnostic_domains,
                 )?)
             }
-            (None, None) => Ok(snapshot::Snapshot::build_with_diagnostic_domains(
+            (None, None) => Ok(snapshot::Snapshot::build(
                 inbound_scope,
                 self.revision,
                 &self.rules,

@@ -11,6 +11,27 @@ use std::{
     time::Duration,
 };
 
+pub(crate) const DIAGNOSTIC_HEADER: &str = "theia-diagnostic-domains";
+pub(crate) const DIAGNOSTIC_LIMIT: usize = 4096 + 64;
+const DIAGNOSTIC_MAGIC: &[u8; 8] = b"THEIAD01";
+
+pub(crate) fn decode_diagnostic_domains(bytes: &[u8], digest: [u8; 32]) -> Result<Vec<String>, ClientError> {
+    if bytes == unchanged_receipt(digest).as_slice() {
+        // Older authenticated servers ignore the request header.
+        return Ok(snapshot::default_diagnostic_domains());
+    }
+    if bytes.len() > DIAGNOSTIC_LIMIT || bytes.get(..8) != Some(DIAGNOSTIC_MAGIC.as_slice())
+        || bytes.get(8..40) != Some(digest.as_slice()) {
+        return Err(ClientError::Protocol);
+    }
+    let raw = std::str::from_utf8(&bytes[40..]).map_err(|_| ClientError::Protocol)?;
+    let domains: Vec<String> = raw.split('\n').map(str::to_owned).collect();
+    if !snapshot::validate_diagnostic_domains(&domains) {
+        return Err(ClientError::Protocol);
+    }
+    Ok(domains)
+}
+
 pub(crate) const DOMAIN_HEADER: &str = "theia-routing-domain";
 pub(crate) const DIGEST_HEADER: &str = "theia-routing-digest";
 pub(crate) const NATIVE_DNS_HEADER: &str = "theia-native-dns";
@@ -43,6 +64,7 @@ pub(crate) const TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
 pub(crate) struct Published {
     pub(crate) snapshot: snapshot::Snapshot,
     pub(crate) wire: Arc<[u8]>,
+    diagnostic_domains: Vec<String>,
 }
 
 impl Published {
@@ -72,6 +94,7 @@ impl Published {
         Ok(Self {
             snapshot,
             wire: wire.into(),
+            diagnostic_domains: policy.routing.as_ref().map(|settings| settings.diagnostic_domains.clone()).unwrap_or_else(snapshot::default_diagnostic_domains),
         })
     }
 }
@@ -145,7 +168,23 @@ pub(crate) async fn response_data(
     use http::StatusCode;
     let domain_count = headers.get_all(DOMAIN_HEADER).iter().count();
     let digest_count = headers.get_all(DIGEST_HEADER).iter().count();
+    let diagnostic_count = headers.get_all(DIAGNOSTIC_HEADER).iter().count();
     let native_count = headers.get_all(NATIVE_DNS_HEADER).iter().count();
+    if diagnostic_count != 0 {
+        if diagnostic_count != 1 || domain_count != 0 || native_count != 0 || digest_count != 1
+            || headers.get(DIAGNOSTIC_HEADER).map(|v| v.as_bytes()) != Some(b"1".as_slice()) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let digest = publication.snapshot.digest();
+        if headers.get(DIGEST_HEADER).and_then(|v| v.to_str().ok()) != Some(digest_text(digest).as_str()) {
+            return Err(StatusCode::CONFLICT);
+        }
+        let mut bytes = DIAGNOSTIC_MAGIC.to_vec();
+        bytes.extend_from_slice(&digest);
+        bytes.extend_from_slice(publication.diagnostic_domains.join("\n").as_bytes());
+        if bytes.len() > DIAGNOSTIC_LIMIT { return Err(StatusCode::INTERNAL_SERVER_ERROR); }
+        return Ok(Arc::from(bytes));
+    }
     let native = native_count == 1
         && headers
             .get(NATIVE_DNS_HEADER)
@@ -324,6 +363,24 @@ pub(crate) fn decode_ips(bytes: &[u8]) -> Result<Vec<IpAddr>, ClientError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn diagnostic_metadata_preserves_legacy_wire() {
+        let (snapshot, wire) = snapshot::Snapshot::build("scope", 2, &[], &[], &[]).unwrap();
+        let publication = Published { snapshot, wire: wire.into(), diagnostic_domains: vec!["discord.com".into()] };
+        let mut request = http::Request::new(());
+        let deadline = Duration::from_secs(2);
+        let digest = publication.snapshot.digest();
+        assert_eq!(response_data(&publication, request.headers(), false, deadline).await.unwrap(), publication.wire);
+        request_digest(&mut request, digest).unwrap();
+        request.headers_mut().insert(DIAGNOSTIC_HEADER, http::HeaderValue::from_static("1"));
+        let bytes = response_data(&publication, request.headers(), false, deadline).await.unwrap();
+        assert_eq!(decode_diagnostic_domains(&bytes, digest).unwrap(), vec!["discord.com"]);
+        assert!(decode_diagnostic_domains(&bytes, [0; 32]).is_err());
+        assert_eq!(decode_diagnostic_domains(&unchanged_receipt(digest), digest).unwrap(), snapshot::default_diagnostic_domains());
+        request_digest(&mut request, [0; 32]).unwrap();
+        assert_eq!(response_data(&publication, request.headers(), false, deadline).await.unwrap_err(), http::StatusCode::CONFLICT);
+    }
+
     #[test]
     fn dns_response_exact_encoding() {
         let ips = vec!["192.0.2.1".parse().unwrap(), "2001:db8::1".parse().unwrap()];
@@ -353,6 +410,7 @@ mod tests {
         let published = Published {
             snapshot,
             wire: wire.into(),
+            diagnostic_domains: snapshot::default_diagnostic_domains(),
         };
         let mut request = http::Request::new(());
         let deadline = Duration::from_secs(2);
@@ -397,6 +455,7 @@ mod tests {
         let empty = Published {
             snapshot,
             wire: wire.into(),
+            diagnostic_domains: snapshot::default_diagnostic_domains(),
         };
         request_domain(&mut request, "localhost", empty.snapshot.digest()).unwrap();
         assert_eq!(
@@ -433,6 +492,7 @@ mod tests {
             let published = Published {
                 snapshot,
                 wire: wire.into(),
+                diagnostic_domains: snapshot::default_diagnostic_domains(),
             };
             request_domain(&mut request, "localhost", published.snapshot.digest()).unwrap();
             assert_eq!(
@@ -485,6 +545,7 @@ mod tests {
         let published = Published {
             snapshot,
             wire: wire.into(),
+            diagnostic_domains: snapshot::default_diagnostic_domains(),
         };
         let mut request = http::Request::new(());
         let deadline = Duration::from_secs(2);
@@ -517,6 +578,7 @@ mod tests {
         let publication = Published {
             snapshot,
             wire: wire.into(),
+            diagnostic_domains: snapshot::default_diagnostic_domains(),
         };
         let mut request = http::Request::new(());
         let deadline = Duration::from_secs(1);
