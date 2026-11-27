@@ -42,26 +42,56 @@ def test_executable(path: Path) -> Path:
     return executable
 
 
+def verify_coverage(path: Path) -> None:
+    """Check execution evidence, not merely successful privileged exit codes."""
+    report = json.loads(path.read_text(encoding="utf-8"))
+    if report.get("platform") != "Linux":
+        raise SystemExit("F-15: expected Linux native coverage")
+    sentinels = (
+        ("crates/theia/src/routing/linux_rules.rs", "self.admissions = next_admissions;"),
+        ("crates/theia/src/routing/linux_carrier.rs", "set_mark(&lease.fd, mark)?;"),
+        ("crates/theia/src/routing/linux_rules.rs", "journal.restored = true;"),
+    )
+    for source, anchor in sentinels:
+        lines = Path(source).read_text(encoding="utf-8").splitlines()
+        hits = [str(index) for index, line in enumerate(lines, 1)
+                if line.strip() == anchor]
+        if len(hits) != 1 or report["files"].get(source, {}).get(hits[0]) != 1:
+            raise SystemExit(f"F-15: missing actual kernel coverage: {source}: {anchor}")
+    print("F-15: actual kernel execution present in normalized LLVM evidence", flush=True)
+
+
 def main() -> None:
-    if sys.platform != "linux" or (len(sys.argv) != 2 and
-                                      not (len(sys.argv) == 3 and sys.argv[2] == "--coverage")):
-        raise SystemExit("F-15: Linux CI and exact cargo JSON path required")
+    if sys.platform != "linux":
+        raise SystemExit("F-15: Linux CI required")
+    if len(sys.argv) == 3 and sys.argv[1] == "--verify-coverage":
+        verify_coverage(Path(sys.argv[2]))
+        return
+    if len(sys.argv) != 2 and not (len(sys.argv) == 3 and sys.argv[2] == "--coverage"):
+        raise SystemExit("F-15: exact cargo JSON path required")
     executable = test_executable(Path(sys.argv[1]))
     sudo = ["sudo", "-n"]
+    target = None
     if len(sys.argv) == 3:
-        # Preserve only the compiler runtime's profile destination, not
-        # arbitrary caller environment or loader configuration.
+        # The privileged binary and its profile must share the exact
+        # cargo-llvm-cov report directory, never the default Cargo target.
+        target = (Path.cwd().resolve() / "target" / "llvm-cov-target").resolve(strict=True)
         profile = os.environ.get("LLVM_PROFILE_FILE")
-        if not profile:
-            raise SystemExit("F-15: instrumented profile destination required")
-        destination = Path(profile)
-        if not destination.is_absolute() or not destination.is_relative_to(Path.cwd().resolve() / "target"):
-            raise SystemExit("F-15: profile destination must be inside the workspace target")
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        if not profile or Path(profile).parent.resolve() != target or not executable.is_relative_to(target):
+            raise SystemExit("F-15: binary/profile target does not match coverage report target")
         sudo.append("--preserve-env=LLVM_PROFILE_FILE")
-    for test in TESTS:
+    for index, test in enumerate(TESTS):
+        env = None
+        pattern = None
+        if target is not None:
+            prefix = f"theia-f15-{index}-"
+            pattern = f"{prefix}*.profraw"
+            if any(target.glob(pattern)):
+                raise SystemExit(f"F-15: stale profile evidence for {test}")
+            env = dict(os.environ, LLVM_PROFILE_FILE=str(target / f"{prefix}%p-%m.profraw"))
         run = subprocess.run(
             [*sudo, str(executable), "--ignored", "--exact", test, "--nocapture", "--test-threads=1"],
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             encoding="utf-8",
@@ -73,6 +103,9 @@ def main() -> None:
             r"(?m)^test result: ok\. 1 passed; 0 failed; 0 ignored;", run.stdout
         ):
             raise SystemExit(f"F-15 kernel acceptance failed or did not execute: {test}")
+        if target is not None and not any(p.is_file() and p.stat().st_size > 0
+                                         for p in target.glob(pattern)):
+            raise SystemExit(f"F-15: no fresh LLVM profile for {test}")
     print("F-15: all isolated kernel scenarios executed successfully", flush=True)
 
 
