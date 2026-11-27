@@ -920,7 +920,7 @@ impl AutoClient {
         self.h2.resolve_routing(name, digest).await
     }
 
-    #[cfg(target_os="linux")]
+    #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
     async fn resolve_native_dns(&self,name:&str,digest:[u8;32])->Result<Vec<IpAddr>,ClientError> {
         let (generation,cached)=self.prepare().await?;
         if !cached {
@@ -1095,7 +1095,7 @@ impl Carrier {
             Self::Auto(c) => c.resolve_routing(name, digest).await,
         }
     }
-    #[cfg(target_os="linux")]
+    #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
     async fn resolve_native_dns(&self,name:&str,digest:[u8;32])->Result<Vec<IpAddr>,ClientError> {
         match self {
             Self::H2(c)=>c.resolve_native_dns(name,digest).await,
@@ -1959,7 +1959,7 @@ impl ClientRuntime {
             windows_modify: Mutex::new(None),
             #[cfg(target_os = "linux")]
             raw: Mutex::new(std::collections::HashMap::new()),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
             dns_probe_hints: Mutex::new(crate::routing::native_dns::ProbeHints::default()),
             #[cfg(target_os="linux")]
             unified:std::sync::atomic::AtomicBool::new(false),
@@ -2249,7 +2249,7 @@ pub struct NativeIngress {
     windows_modify: Mutex<Option<Arc<crate::routing::windivert::CarrierRegistry>>>,
     #[cfg(target_os = "linux")]
     raw: Mutex<std::collections::HashMap<crate::routing::packet::FlowKey, RawLease>>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
     dns_probe_hints: Mutex<crate::routing::native_dns::ProbeHints>,
     #[cfg(target_os="linux")]
     unified:std::sync::atomic::AtomicBool,
@@ -2272,8 +2272,9 @@ pub struct LabStunPermit {
     failed: bool,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
 struct ProtectedDnsAnswer {
+    key:crate::routing::packet::FlowKey,
     wire:Vec<u8>,
     digest:[u8;32],
     // Diagnostic only; publish after a successful local response write.
@@ -2921,6 +2922,13 @@ impl NativeIngress {
         if !source.live() || subsequent.max_capacity()>crate::udp_relay::QUEUE {
             return Err(ClientError::Open(ErrorCode::PolicyDenied));
         }
+        if key.destination.port()==53 && self.native_modify_enabled()? {
+            return tokio::select! {
+                biased;
+                ()=self.stopped()=>Err(ClientError::Open(ErrorCode::PolicyDenied)),
+                result=self.relay_windows_scope_dns(first,subsequent,replies)=>result,
+            };
+        }
         tokio::select! {
             biased;
             ()=self.stopped()=>Err(ClientError::Open(ErrorCode::PolicyDenied)),
@@ -2970,13 +2978,42 @@ impl NativeIngress {
                         // Acknowledged by the sole packet worker only
                         // after exact reverse injection; no echo matching
                         // and no one-request/one-response assumption.
-                        replies.send(source.clone(),bytes).await.map_err(|_|ClientError::Io)?;
+                        replies.send(source.clone(),bytes,self.client.routing_cache().dpi.clone(),
+                            snapshot.digest()).await.map_err(|_|ClientError::Io)?;
                     }
                     Ok::<(),ClientError>(())
                 };
                 supervise_native_udp(relay,feed,reverse).await
             }=>result,
         }
+    }
+
+    /// DNS interception on the exact live WinDivert UDP reverse token.
+    /// The query's QNAME is known; its application provenance is not.
+    #[cfg(all(target_os="windows",target_arch="x86_64"))]
+    async fn relay_windows_scope_dns(&self,first:crate::routing::windivert::ScopeUdpPacket,
+        mut subsequent:tokio::sync::mpsc::Receiver<crate::routing::windivert::ScopeUdpPacket>,
+        replies:crate::routing::windivert::ScopeReplies)->Result<(),ClientError> {
+        let denied=||ClientError::Open(ErrorCode::PolicyDenied);
+        let source=first.flow.clone();
+        let key=source.key();
+        let (flow,digest)=self.begin_windows_dns(key).await?;
+        let mut current=first;
+        for _ in 0..64 {
+            if !source.live() || !Arc::ptr_eq(&current.flow,&source) {return Err(denied());}
+            let answer=self.protected_dns_answer(key,&current.payload,false,Some((&flow,digest))).await?;
+            self.check_native_modify(key,digest)?;
+            if !source.live() {return Err(denied());}
+            replies.send(source.clone(),answer.wire.clone(),self.client.routing_cache().dpi.clone(),
+                digest).await.map_err(|_|ClientError::Io)?;
+            if !source.live() {return Err(denied());}
+            self.record_dns_delivery(key,answer)?;
+            match timeout(Duration::from_secs(10),subsequent.recv()).await {
+                Ok(Some(next))=>current=next,
+                _=>return Ok(()),
+            }
+        }
+        Ok(())
     }
 
     /// Scoped real WinDivert TCP reflection into the existing XHTTP
@@ -3608,8 +3645,7 @@ impl NativeIngress {
         if key.transport != crate::routing::packet::Transport::Tcp {
             return Err(ClientError::Protocol);
         }
-        #[cfg(target_os="linux")]
-        if key.destination.port()==53 && self.unified.load(std::sync::atomic::Ordering::Acquire) {
+        if key.destination.port()==53 && self.native_modify_enabled()? {
             return tokio::select! {
                 ()=self.stopped()=>Err(ClientError::Open(ErrorCode::PolicyDenied)),
                 result=self.relay_native_dns_tcp(key,stream)=>result,
@@ -3997,7 +4033,6 @@ impl NativeIngress {
                 };
                 (name, Some(version))
             }
-            #[cfg(target_os="linux")]
             3478 if cache.dpi.stun_enabled() && crate::routing::dpi::udp::prepare_binding(
                 first, crate::routing::dpi::udp::BindingStrategy::Fingerprint)
                     .is_some_and(|bytes| bytes.as_ref() != first) => {
@@ -4051,7 +4086,6 @@ impl NativeIngress {
             return Err(denied());
         }
         self.check_native_modify(key, digest)?;
-        #[cfg(target_os="linux")]
         if version.is_none() && self.dns_probe_hints.lock().map_err(|_| denied())?
             .get(key.source.ip(), key.destination.ip(), digest).as_deref() != Some(name.as_str()) {
             return Err(denied());
@@ -4062,13 +4096,35 @@ impl NativeIngress {
         Ok(Some(verified))
     }
 
-    #[cfg(target_os="linux")]
-    async fn protected_dns_answer(&self,key:crate::routing::packet::FlowKey,query:&[u8],tcp:bool)
+    /// Reserve a single flow and policy generation before any protected
+    /// resolver exchange on Windows. The captured tuple is not a trusted
+    /// application identity, and this lease never grants physical egress.
+    #[cfg(all(target_os="windows",target_arch="x86_64"))]
+    async fn begin_windows_dns(&self,key:crate::routing::packet::FlowKey)
+        ->Result<(crate::routing::flow::FlowLease,[u8;32]),ClientError> {
+        let denied=||ClientError::Open(ErrorCode::PolicyDenied);
+        let registrar=self.registrar()?.ok_or_else(denied)?;
+        crate::routing::carrier_socket::scope(Some(registrar),async {
+            let (carrier,cache)=match &self.client {
+                ProxyClient::Direct(c)=>(c.carrier.clone(),&c.routing),
+                ProxyClient::Reality(c)=>(c.generation().await?.carrier.clone(),&c.routing),
+            };
+            let snapshot=cache.get(|known|carrier.fetch_routing(known)).await?;
+            let digest=snapshot.digest();
+            self.check_native_modify(key,digest)?;
+            let flow=cache.flows.begin_native(cache.dpi.clone(),key,digest,crate::routing::PacketAction::Redirect)?;
+            Ok((flow,digest))
+        }).await
+    }
+
+    #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
+    async fn protected_dns_answer(&self,key:crate::routing::packet::FlowKey,query:&[u8],tcp:bool,
+        session:Option<(&crate::routing::flow::FlowLease,[u8;32])>)
         ->Result<ProtectedDnsAnswer,ClientError> {
         use crate::routing::{Evidence,PacketAction,native_dns::Question};
         let denied=||ClientError::Open(ErrorCode::PolicyDenied);
         self.ensure_accepting()?;
-        let key=crate::routing::packet::FlowKey{interface:0,..key};
+        if key.destination.port()!=53 {return Err(denied());}
         let question=Question::parse(query).ok_or(ClientError::Protocol)?;
         let registrar=self.registrar()?.ok_or_else(denied)?;
         crate::routing::carrier_socket::scope(Some(registrar),async {
@@ -4078,19 +4134,21 @@ impl NativeIngress {
             };
             let snapshot=cache.get(|known|carrier.fetch_routing(known)).await?;
             let digest=snapshot.digest();
-            let failure=||ProtectedDnsAnswer{wire:question.failure(),digest,hint:None};
+            let failure=||ProtectedDnsAnswer{key,wire:question.failure(),digest,hint:None};
             let allowed=||->Result<(),ClientError>{
-                self.ensure_accepting()?;
-                cache.dpi.check_policy(digest)?;
-                if !self.raw.lock().map_err(|_|denied())?.get(&key).is_some_and(|entry|
-                    !entry.denied && entry.action==PacketAction::Redirect && entry.digest==digest) {return Err(denied());}
-                Ok(())
+                if let Some((flow,pinned))=session {
+                    if pinned!=digest {return Err(denied());}
+                    flow.check_native(key,digest,PacketAction::Redirect)?;
+                }
+                self.check_native_modify(key,digest)
             };
             allowed()?;
             if snapshot.policy().classify_with_application(Evidence::Known(question.name()),Evidence::Unknown,Evidence::Unknown)
                 .map_err(|_|denied())?.action()==Some(Action::Blocked) {
                 return Ok(failure());
             }
+            allowed()?;
+            if let Some((flow,_))=session {flow.commit(PacketAction::Redirect)?;}
             let ips=match carrier.resolve_native_dns(question.name(),digest).await {
                 Ok(ips)=>ips,
                 Err(_)=>{allowed()?;return Ok(failure());}
@@ -4110,14 +4168,15 @@ impl NativeIngress {
             let wire=question.answer(&ips,tcp);
             let hints=question.hint_ips(&wire,&ips);
             allowed()?;
-            Ok(ProtectedDnsAnswer{wire,digest,
+            Ok(ProtectedDnsAnswer{key,wire,digest,
                 hint:(!hints.is_empty()).then(||(question.name().to_owned(),hints))})
         }).await
     }
 
-    #[cfg(target_os="linux")]
+    #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
     fn record_dns_delivery(&self,key:crate::routing::packet::FlowKey,answer:ProtectedDnsAnswer)->Result<(),ClientError> {
-        self.check_unified_redirect(key,answer.digest)?;
+        if answer.key!=key {return Err(ClientError::Open(ErrorCode::PolicyDenied));}
+        self.check_native_modify(key,answer.digest)?;
         if let Some((name,ips))=answer.hint {
             self.dns_probe_hints.lock().map_err(|_|ClientError::Io)?
                 .record(key.source.ip(),answer.digest,&name,&ips);
@@ -4125,8 +4184,14 @@ impl NativeIngress {
         Ok(())
     }
 
-    #[cfg(target_os="linux")]
+    #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
     async fn relay_native_dns_tcp(&self,key:crate::routing::packet::FlowKey,mut stream:TcpStream)->Result<(),ClientError> {
+        #[cfg(all(target_os="windows",target_arch="x86_64"))]
+        let (flow,digest)=self.begin_windows_dns(key).await?;
+        #[cfg(all(target_os="windows",target_arch="x86_64"))]
+        let session=Some((&flow,digest));
+        #[cfg(target_os="linux")]
+        let session=None;
         for _ in 0..64 {
             let len=match timeout(NEGOTIATE_TIMEOUT,stream.read_u16()).await {
                 Ok(Ok(len))=>usize::from(len),
@@ -4137,8 +4202,8 @@ impl NativeIngress {
             if !(12..=crate::routing::native_dns::MAX_QUERY).contains(&len) {return Err(ClientError::Protocol);}
             let mut query=vec![0u8;len];
             timeout(NEGOTIATE_TIMEOUT,stream.read_exact(&mut query)).await.map_err(|_|ClientError::Timeout)?.map_err(|_|ClientError::Io)?;
-            let answer=self.protected_dns_answer(key,&query,true).await?;
-            self.check_unified_redirect(key,answer.digest)?;
+            let answer=self.protected_dns_answer(key,&query,true,session).await?;
+            self.check_native_modify(key,answer.digest)?;
             timeout(REPLY_TIMEOUT,async {
                 stream.write_u16(answer.wire.len() as u16).await?;
                 stream.write_all(&answer.wire).await
@@ -4158,7 +4223,7 @@ impl NativeIngress {
         let mut current=first;
         for _ in 0..64 {
             if current.key!=key {return Err(ClientError::Protocol);}
-            let answer=self.protected_dns_answer(key,&current.payload,false).await?;
+            let answer=self.protected_dns_answer(key,&current.payload,false,None).await?;
             self.check_unified_redirect(key,answer.digest)?;
             reply.send(&answer.wire).await.map_err(|_|ClientError::Io)?;
             self.record_dns_delivery(key,answer)?;

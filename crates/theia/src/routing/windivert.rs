@@ -456,7 +456,10 @@ impl CarrierRegistry {
         Some(CarrierLease {registry:self.clone(),endpoint,generation})
     }
     pub fn retire(&self) {
-        if let Ok(mut state)=self.state.lock() { state.retired=true; }
+        if let Ok(mut state)=self.state.lock() {
+            state.retired=true;
+            for entry in state.entries.values_mut() {entry.live=false;}
+        }
     }
     fn matches_event(entry:&CarrierEntry,event:&EndpointCandidate)->bool {
         entry.live && entry.pid==event.pid && event.timestamp>=entry.registered_at &&
@@ -1397,6 +1400,25 @@ mod native {
             }
             pinned.check()
         }
+
+        // Register only the actual exclusive non-inheritable socket.
+        // Re-read endpoint and options after pinning/registration. This
+        // does not associate an arbitrary NETWORK packet with this socket.
+        fn register_socket(&self,socket:&impl std::os::windows::io::AsRawSocket,
+            tuple:EndpointTuple)->io::Result<crate::routing::carrier_socket::Lease> {
+            verify_carrier_socket(socket)?;
+            let endpoint=socket_endpoint(socket)?;
+            self.pin_lab_carrier(socket,tuple.local,tuple.remote)?;
+            if socket_endpoint(socket)?!=endpoint {self.retire();return Err(io::ErrorKind::PermissionDenied.into());}
+            let lease=self.register(endpoint,std::process::id(),tuple,registration_timestamp()?)
+                .ok_or(io::ErrorKind::PermissionDenied)?;
+            let current=verify_carrier_socket(socket).and_then(|_|{
+                if socket_endpoint(socket)?!=endpoint {return Err(io::ErrorKind::PermissionDenied.into());}
+                self.current_interfaces().map(|_|())
+            });
+            if let Err(error)=current {self.retire();return Err(error);}
+            Ok(crate::routing::carrier_socket::Lease::retain(lease))
+        }
     }
     #[cfg(test)]
     #[test]
@@ -1426,20 +1448,14 @@ mod native {
     }
     impl crate::routing::carrier_socket::Registrar for CarrierRegistry {
         fn tcp(&self,socket:&tokio::net::TcpSocket,peer:std::net::SocketAddr)->io::Result<crate::routing::carrier_socket::Lease> {
-            verify_carrier_socket(socket)?;
-            self.pin_lab_carrier(socket,socket.local_addr()?,peer)?;
-            let lease=self.register(socket_endpoint(socket)?,std::process::id(),EndpointTuple {
+            self.register_socket(socket,EndpointTuple {
                 local:socket.local_addr()?,remote:peer,transport:super::super::packet::Transport::Tcp
-            },registration_timestamp()?).ok_or(io::ErrorKind::PermissionDenied)?;
-            Ok(crate::routing::carrier_socket::Lease::retain(lease))
+            })
         }
         fn udp(&self,socket:&tokio::net::UdpSocket,peer:std::net::SocketAddr)->io::Result<crate::routing::carrier_socket::Lease> {
-            verify_carrier_socket(socket)?;
-            self.pin_lab_carrier(socket,socket.local_addr()?,peer)?;
-            let lease=self.register(socket_endpoint(socket)?,std::process::id(),EndpointTuple {
+            self.register_socket(socket,EndpointTuple {
                 local:socket.local_addr()?,remote:peer,transport:super::super::packet::Transport::Udp
-            },registration_timestamp()?).ok_or(io::ErrorKind::PermissionDenied)?;
-            Ok(crate::routing::carrier_socket::Lease::retain(lease))
+            })
         }
         fn retire(&self)->io::Result<()> {
             let mut state=self.state.lock().map_err(|_|io::ErrorKind::PermissionDenied)?;
@@ -1594,17 +1610,20 @@ mod native {
     struct ScopeReply {
         flow:Arc<ScopeUdpFlow>,
         payload:Vec<u8>,
+        engine:Arc<crate::routing::dpi::Engine>,
+        digest:[u8;32],
         sent:oneshot::Sender<io::Result<()>>,
     }
     #[derive(Clone)]
     pub(crate) struct ScopeReplies(mpsc::Sender<ScopeReply>);
     impl ScopeReplies {
-        pub(crate) async fn send(&self,flow:Arc<ScopeUdpFlow>,payload:Vec<u8>)->io::Result<()> {
-            if !flow.live() || payload.len()>crate::protocol::MAX_DATAGRAM {
+        pub(crate) async fn send(&self,flow:Arc<ScopeUdpFlow>,payload:Vec<u8>,
+            engine:Arc<crate::routing::dpi::Engine>,digest:[u8;32])->io::Result<()> {
+            if !flow.live() || payload.len()>crate::protocol::MAX_DATAGRAM || engine.check_policy(digest).is_err() {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
             let (sent,ack)=oneshot::channel();
-            self.0.send(ScopeReply{flow,payload,sent}).await.map_err(|_|io::ErrorKind::BrokenPipe)?;
+            self.0.send(ScopeReply{flow,payload,engine,digest,sent}).await.map_err(|_|io::ErrorKind::BrokenPipe)?;
             ack.await.map_err(|_|io::ErrorKind::BrokenPipe)?
         }
     }
@@ -1806,8 +1825,9 @@ mod native {
                             Err(mpsc::error::TryRecvError::Empty)=>break,
                             Err(mpsc::error::TryRecvError::Disconnected)=>return Err(io::ErrorKind::BrokenPipe.into()),
                         };
-                        let ScopeReply{flow,payload,sent}=command;
-                        if sent.is_closed() || !udp.owns(&flow) {
+                        let ScopeReply{flow,payload,engine,digest,sent}=command;
+                        if sent.is_closed() || !udp.owns(&flow) || engine.check_policy(digest).is_err() {
+                            flow.close();
                             let _=sent.send(Err(io::ErrorKind::PermissionDenied.into()));
                             continue;
                         }
@@ -1818,7 +1838,9 @@ mod native {
                         // awaiting this ack. Cancel the actual overlapped
                         // operation when that flow is retired, not merely
                         // future enqueue attempts.
-                        if sent.is_closed() || signal.load(Ordering::Acquire) || !udp.owns(&flow) {
+                        if sent.is_closed() || signal.load(Ordering::Acquire) || !udp.owns(&flow)
+                            || engine.check_policy(digest).is_err() {
+                            flow.close();
                             let _=sent.send(Err(io::ErrorKind::PermissionDenied.into()));
                             continue;
                         }

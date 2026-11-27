@@ -4,7 +4,7 @@
 //! resolver event provenance and capture-side cookie binding remain open.
 use super::{linux_events::CorroboratedFlow, packet::FlowKey, RoutingError};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::IpAddr,
     time::{Duration, Instant},
 };
@@ -31,6 +31,9 @@ struct Entry {
 #[derive(Default)]
 pub struct DnsCandidates {
     entries: HashMap<FlowKey, Entry>,
+    // Request IDs survive flow retirement for the bounded collector epoch.
+    // A replay on a different socket cannot gain a fresh deadline.
+    used_requests: HashSet<[u8; 16]>,
 }
 impl DnsCandidates {
     /// Returns false for missing/ambiguous association, stale/different flow
@@ -122,7 +125,8 @@ impl DnsCandidates {
             entry.deadline = entry.deadline.min(observation_deadline);
             return Ok(!entry.ambiguous);
         }
-        if self.entries.len() >= MAX_ENTRIES {
+        if self.entries.len() >= MAX_ENTRIES || self.used_requests.len() >= MAX_ENTRIES
+            || !self.used_requests.insert(link.request_id) {
             return Ok(false);
         }
         self.entries.insert(
@@ -219,6 +223,16 @@ mod tests {
         assert!(table.candidate(flow, [1; 32]).is_none());
         table.forget(flow);
         assert!(table.candidate(flow, [1; 32]).is_none());
+        // Retiring the exact socket never re-arms a previously used ID.
+        link.domain = "example.org".into();
+        link.request_id = [3; 16];
+        assert!(!table.record(flow, &link, [1; 32], &ips, deadline).unwrap());
+        let mut other=flow;
+        other.key.source.set_port(1235);
+        other.cookie=9;
+        link.key=other.key;
+        link.cookie=other.cookie;
+        assert!(!table.record(other,&link,[1;32],&ips,deadline).unwrap());
     }
 
     #[test]

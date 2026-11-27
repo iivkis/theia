@@ -329,6 +329,79 @@ impl TcpSplitPlan {
         Some(self.acknowledged == self.payload.len())
     }
 }
+/// One-way execution state for a bounded, already policy-authorized raw
+/// TCP split. The caller must exclusively own the capture generation and
+/// packet sender, discard the held originals before the first send and
+/// bind ACK/retransmission observations to the same kernel socket. This
+/// type cannot establish any of those platform credentials by itself.
+///
+/// An unsuccessful send attempt (even of the first segment) is terminal.
+/// There is no API for replaying the initial batch or choosing fallback
+/// once the sender has been invoked.
+#[cfg(test)]
+pub(crate) struct TcpSplitExecution {
+    plan: TcpSplitPlan,
+    initial: Option<Vec<Vec<u8>>>,
+    state: SplitState,
+}
+#[cfg(test)]
+#[derive(Clone,Copy,PartialEq,Eq)]
+enum SplitState {
+    Pending,
+    Active,
+    Complete,
+    Failed,
+}
+#[cfg(test)]
+impl TcpSplitExecution {
+    pub(crate) fn prepare(packets:&[&[u8]],name:&str)->Option<Self> {
+        let (plan,initial)=TcpSplitPlan::begin_flight(packets,name)?;
+        Some(Self{plan,initial:Some(initial),state:SplitState::Pending})
+    }
+
+    /// The commit callback must irreversibly authorize Modify for the
+    /// exact native flow before the first writer invocation. A denial is
+    /// terminal for this execution (no original packet is returned).
+    pub(crate) fn emit_initial(
+        &mut self,
+        commit:impl FnOnce()->std::io::Result<()>,
+        mut emit:impl FnMut(&[u8])->std::io::Result<()>,
+    )->std::io::Result<()> {
+        if self.state!=SplitState::Pending {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
+        // Default to terminal before invoking any callback, including on
+        // panic or partial write. Active is published only on full return.
+        self.state=SplitState::Failed;
+        let initial=self.initial.take().ok_or(std::io::ErrorKind::InvalidData)?;
+        commit()?;
+        for part in &initial {emit(part)?;}
+        self.state=SplitState::Active;
+        Ok(())
+    }
+
+    pub(crate) fn emit_retransmission(
+        &mut self, packet:&[u8],
+        mut emit:impl FnMut(&[u8])->std::io::Result<()>,
+    )->std::io::Result<()> {
+        if self.state!=SplitState::Active {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
+        self.state=SplitState::Failed;
+        let outputs=self.plan.retransmission(packet).ok_or(std::io::ErrorKind::InvalidData)?;
+        for part in &outputs {emit(part)?;}
+        self.state=SplitState::Active;
+        Ok(())
+    }
+
+    pub(crate) fn acknowledge(&mut self,packet:&[u8])->Option<bool> {
+        if self.state!=SplitState::Active {return None;}
+        let complete=self.plan.acknowledge(packet)?;
+        if complete {self.state=SplitState::Complete;}
+        Some(complete)
+    }
+}
+
 fn tcp_checksum(packet: &[u8], off: usize) -> u16 {
     let len = (packet.len() - off) as u32;
     let pseudo = if off == 20 {
@@ -497,6 +570,23 @@ mod tests {
             assert!(TcpSplitPlan::begin_flight(&[&prefix, &last], "example.org").is_none());
             assert!(TcpSplitPlan::begin_flight(&[&prefix, &prefix, &middle, &last], "example.org").is_none());
             assert!(TcpSplitPlan::begin_flight(&[&prefix, &middle, &last], "wrong.invalid").is_none());
+            // A partial injection or commit denial permanently consumes
+            // the batch. Neither retry nor kernel retransmission is valid
+            // after the writer itself reports an ambiguous failure.
+            let mut execution=TcpSplitExecution::prepare(&[&prefix,&middle,&last],"example.org").unwrap();
+            let mut writes=0;
+            assert!(execution.emit_initial(||Ok(()),|_|{
+                writes+=1;
+                if writes==2 {Err(std::io::ErrorKind::BrokenPipe.into())} else {Ok(())}
+            }).is_err());
+            assert_eq!(writes,2);
+            assert!(execution.emit_initial(||panic!("must not recommit"),|_|panic!("must not replay")).is_err());
+            assert!(execution.emit_retransmission(&middle,|_|panic!("must not inject")).is_err());
+            let mut denied=TcpSplitExecution::prepare(&[&prefix,&middle,&last],"example.org").unwrap();
+            assert!(denied.emit_initial(||Err(std::io::ErrorKind::PermissionDenied.into()),
+                |_|panic!("commit denied")).is_err());
+            assert!(denied.emit_initial(||Ok(()),|_|panic!("must not replay")).is_err());
+
             let (mut plan, [a, b]) = TcpSplitPlan::begin(&original, "example.org").unwrap();
             assert!(TcpSplitPlan::begin_flight(&[&a, &b], "example.org").is_none());
             assert_eq!([&a[off + 20..], &b[off + 20..]].concat(), hello);
@@ -549,6 +639,13 @@ mod tests {
             fix_tcp_lengths_and_checksums(&mut ack, off).unwrap();
             assert_eq!(plan.acknowledge(&ack), Some(true));
             assert!(plan.retransmission(&original).is_none());
+            let mut active=TcpSplitExecution::prepare(&[&prefix,&middle,&last],"example.org").unwrap();
+            let mut written=Vec::new();
+            active.emit_initial(||Ok(()),|part|{written.push(part.to_vec());Ok(())}).unwrap();
+            assert_eq!(written,outputs);
+            assert!(active.emit_initial(||panic!("must not recommit"),|_|panic!("must not replay")).is_err());
+            assert_eq!(active.acknowledge(&ack),Some(true));
+            assert!(active.emit_retransmission(&middle,|_|panic!("already acknowledged")).is_err());
         }
     }
 
@@ -742,7 +839,7 @@ mod tests {
             client.write_all(&hello[..2]).unwrap();
             let deadline = Instant::now()+Duration::from_secs(12);
             let mut initial_packets = Vec::<Vec<u8>>::new();
-            let mut plan: Option<TcpSplitPlan> = None;
+            let mut plan: Option<TcpSplitExecution> = None;
             let mut retransmitted = false;
             let mut complete = false;
             while Instant::now() < deadline {
@@ -763,9 +860,9 @@ mod tests {
                 }
                 if meta.flow.source == client.local_addr().unwrap() && meta.payload_len != 0 {
                     packet.finish(PacketAction::Drop).unwrap();
-                    if let Some(plan) = &plan {
-                        let parts = plan.retransmission(&bytes).expect("native retransmission must match original sequence bytes");
-                        for part in &parts { emit(part); }
+                    if let Some(plan) = &mut plan {
+                        plan.emit_retransmission(&bytes,|part|{emit(part);Ok(())})
+                            .expect("native retransmission must match original sequence bytes");
                         retransmitted = true;
                     } else {
                         if initial_packets.is_empty() {
@@ -778,12 +875,18 @@ mod tests {
                         assert_eq!(meta.payload_len, hello.len() - 2);
                         initial_packets.push(bytes);
                         let inputs: Vec<&[u8]> = initial_packets.iter().map(Vec::as_slice).collect();
-                        let (new, outputs) = TcpSplitPlan::begin_flight(&inputs,"example.org").expect("real multi-packet TLS payload split");
-                        assert_eq!(outputs.len(), 3);
-                        // Preserve the initial prefix, emit the new split
-                        // boundary, intentionally lose the final segment.
-                        emit(&outputs[0]);
-                        emit(&outputs[1]);
+                        let mut new=TcpSplitExecution::prepare(&inputs,"example.org")
+                            .expect("real multi-packet TLS payload split");
+                        let mut count=0;
+                        // This isolated fixture already owns the exact socket
+                        // and raw sender. Simulate a network drop of the last
+                        // emitted segment, not a local sender error.
+                        new.emit_initial(||Ok(()),|part|{
+                            count+=1;
+                            if count<=2 {emit(part);}
+                            Ok(())
+                        }).unwrap();
+                        assert_eq!(count,3);
                         plan = Some(new);
                     }
                 } else {

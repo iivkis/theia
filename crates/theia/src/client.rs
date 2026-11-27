@@ -350,7 +350,7 @@ impl H2Client {
         crate::routing::exchange::decode_ips(&bytes)
     }
 
-    #[cfg(target_os="linux")]
+    #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
     pub(crate) async fn resolve_native_dns(&self,name:&str,digest:[u8;32])->Result<Vec<std::net::IpAddr>,ClientError> {
         let bytes=self.routing_resource(Some((name,digest,true)),None).await?;
         crate::routing::exchange::decode_ips(&bytes)

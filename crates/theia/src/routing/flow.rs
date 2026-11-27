@@ -199,6 +199,22 @@ pub(crate) struct FlowLease {
 }
 
 impl FlowLease {
+    /// Check a live native flow against its pinned policy and configured
+    /// action without committing payload. This is not a kernel identity.
+    #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
+    pub(crate) fn check_native(&self,mut key:FlowKey,digest:[u8;32],configured:PacketAction)->Result<(),ClientError> {
+        key.interface=0;
+        if self.identity.native!=Some(key) || self.identity.digest!=digest || self.identity.configured!=configured {
+            return Err(denied());
+        }
+        let state=self.table.state.lock().map_err(|_|denied())?;
+        if state.native.get(&key)!=Some(&self.id)
+            || !state.entries.get(&self.id).is_some_and(|entry|entry.identity==self.identity) {
+            return Err(denied());
+        }
+        self.engine.check_policy(digest)
+    }
+
     #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
     pub(crate) fn committed(&self, action: PacketAction) -> bool {
         self.table
@@ -363,6 +379,15 @@ mod tests {
             )
             .is_err());
         assert!(begin(&table, &engine, PacketAction::Pass).is_err());
+        #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
+        {
+            assert!(flow.check_native(key,[1;32],PacketAction::Redirect).is_ok());
+            assert!(flow.check_native(key,[2;32],PacketAction::Redirect).is_err());
+            assert!(flow.check_native(key,[1;32],PacketAction::Pass).is_err());
+            let mut wrong=key;
+            wrong.source.set_port(1235);
+            assert!(flow.check_native(wrong,[1;32],PacketAction::Redirect).is_err());
+        }
         flow.commit(PacketAction::Redirect).unwrap();
         assert!(flow.commit(PacketAction::Pass).is_err());
         drop(flow);

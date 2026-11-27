@@ -82,6 +82,20 @@ function Read-Pinned([IO.FileStream]$Stream,[string]$Expected) {
     if ($Stream.ReadByte() -ne -1 -or (Hash-Bytes $bytes) -cne $Expected) { throw 'Intent mismatch.' }
     return ([Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json)
 }
+# Windows CRT argument quoting; no shell, no interpolation of client paths.
+function Quote-NativeArgument([string]$Value) {
+    if ($Value -match '["\r\n\x00]') { throw 'Unsupported native argument.' }
+    return ('"' + [regex]::Replace($Value, '(\\+)$', '$1$1') + '"')
+}
+function Start-PinnedNative([string]$Exe,[string[]]$Arguments) {
+    $start=[Diagnostics.ProcessStartInfo]::new()
+    $start.FileName=$Exe
+    $start.UseShellExecute=$false
+    $start.Arguments=(@(foreach ($arg in $Arguments) { Quote-NativeArgument $arg }) -join ' ')
+    $process=[Diagnostics.Process]::Start($start)
+    if ($null -eq $process) { throw 'Pinned child failed to start.' }
+    return $process
+}
 function CanonicalGuid([string]$Value) {
     $g=[Guid]::Parse($Value)
     if ($g -eq [Guid]::Empty) { throw 'Empty GUID.' }
@@ -170,6 +184,7 @@ try {
             $null=Read-Pinned $intentLease $IntentSha256
             $captureObserved=$null
             $redirectCompleted=$false
+            $guardSamples=0
             if ($Mode -in @('CaptureVerify','RedirectVerify')) {
                 if (!$TheiaExe -or !$DriverDirectory -or !$CaptureInterfaceIndex -or
                     $TheiaSha256 -cnotmatch '^[a-f0-9]{64}$' -or
@@ -211,8 +226,35 @@ try {
                             $digest=[Security.Cryptography.SHA256]::Create()
                             try { $actual=[BitConverter]::ToString($digest.ComputeHash($configLease)).Replace('-','').ToLowerInvariant() } finally { $digest.Dispose() }
                             if ($actual -cne $ClientConfigSha256) { throw 'Client config hash mismatch.' }
-                            $null=(& $exe.FullName client windivert --interface-redirect-lab --config $config.FullName --directory $driverDir --dll-sha256 $DllSha256 --sys-sha256 $SysSha256 --capture-interface $CaptureInterfaceIndex --carrier-interface $CarrierInterfaceIndex --seconds $CaptureSeconds --confirm-isolated-two-interface)
-                            if ($LASTEXITCODE -ne 0) { throw 'Joint redirect command failed; retain guard.' }
+                            $argsForRedirect=@('client','windivert','--interface-redirect-lab','--config',$config.FullName,
+                                '--directory',$driverDir,'--dll-sha256',$DllSha256,'--sys-sha256',$SysSha256,
+                                '--capture-interface',[string]$CaptureInterfaceIndex,'--carrier-interface',[string]$CarrierInterfaceIndex,
+                                '--seconds',[string]$CaptureSeconds,'--confirm-isolated-two-interface')
+                            $child=Start-PinnedNative $exe.FullName $argsForRedirect
+                            try {
+                                $clock=[Diagnostics.Stopwatch]::StartNew()
+                                # Sampling is not a continuous kernel arbitration proof.
+                                # A conflict cancels the scoped child, never releases Guard.
+                                while (!$child.WaitForExit(500)) {
+                                    if ($clock.Elapsed.TotalSeconds -gt ($CaptureSeconds+30)) { throw 'Redirect exceeded bounded runtime.' }
+                                    $sample=(& $helperFile.FullName @native)
+                                    if ($LASTEXITCODE -ne 0 -or $sample -cne 'exact') { throw 'Guard conflict during redirect; retain journal.' }
+                                    $null=Read-Pinned $intentLease $IntentSha256
+                                    $current=@(Get-NetAdapter -IncludeHidden | Where-Object { $_.ifIndex -eq $CaptureInterfaceIndex })
+                                    if ($current.Count -ne 1 -or (CanonicalGuid ([string]$current[0].InterfaceGuid)) -cnotin $seenInterfaces) { throw 'Capture scope changed during redirect.' }
+                                    $current=@(Get-NetAdapter -IncludeHidden | Where-Object { $_.ifIndex -eq $CarrierInterfaceIndex })
+                                    if ($current.Count -ne 1 -or (CanonicalGuid ([string]$current[0].InterfaceGuid)) -cne $carrierGuid) { throw 'Carrier scope changed during redirect.' }
+                                    if (!$child.HasExited) { $guardSamples++ }
+                                }
+                                if ($child.ExitCode -ne 0 -or $guardSamples -eq 0) { throw 'Joint redirect command failed or no live guard samples; retain guard.' }
+                            } finally {
+                                try {
+                                    if (!$child.HasExited) {
+                                        $child.Kill()
+                                        if (!$child.WaitForExit(5000)) { throw 'Redirect child did not terminate; retain guard and review locally.' }
+                                    }
+                                } finally { $child.Dispose() }
+                            }
                             $carriers=@(Get-NetAdapter -IncludeHidden | Where-Object { $_.ifIndex -eq $CarrierInterfaceIndex })
                             if ($carriers.Count -ne 1 -or (CanonicalGuid ([string]$carriers[0].InterfaceGuid)) -cne $carrierGuid) {
                                 throw 'Carrier interface changed during redirect.'
@@ -238,7 +280,8 @@ try {
             }
             [pscustomobject]@{Version=$r.Version;IntentSha256=$IntentSha256;BootUtc=$boot;State=$state;
                 JointCaptureChecked=($Mode -eq 'CaptureVerify');CaptureObserved=$captureObserved;
-                JointRedirectCommandCompleted=$redirectCompleted;RedirectExchangeVerified=$false;
+                JointRedirectCommandCompleted=$redirectCompleted;LiveGuardSamples=$guardSamples;
+                ContinuousArbitrationVerified=$false;RedirectExchangeVerified=$false;
                 FullHostCarrierExclusionVerified=$false;
                 Interfaces=$seenInterfaces;TransactionalObjectCas=$true;PacketEnforcementVerified=$false;
                 BootTimeObjectsConfigured=($bootConfigured -and $state -ceq 'exact');
