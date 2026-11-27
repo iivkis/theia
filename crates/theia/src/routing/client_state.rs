@@ -445,7 +445,7 @@ pub(crate) async fn relay_direct(client: TcpStream, target: TcpStream) -> Result
 }
 
 pub(crate) async fn relay_direct_guarded(
-    client: TcpStream,
+    client: impl AsyncRead + AsyncWrite + Unpin,
     target: TcpStream,
     flow: Option<&super::flow::FlowLease>,
 ) -> Result<(), ClientError> {
@@ -463,7 +463,7 @@ pub(crate) async fn relay_direct_after_first(
 }
 
 async fn relay_direct_inner(
-    client: TcpStream,
+    client: impl AsyncRead + AsyncWrite + Unpin,
     target: TcpStream,
     upload: usize,
     download: usize,
@@ -476,7 +476,7 @@ async fn relay_direct_inner(
     let activity = crate::relay_liveness::Activity::new();
     let evidence = (upload != 0 && download != 0)
         .then(|| ExchangeEvidence(std::sync::atomic::AtomicU8::new(0)));
-    let (cr, cw) = client.into_split();
+    let (cr, cw) = tokio::io::split(client);
     let (tr, tw) = target.into_split();
     let result = activity
         .run(

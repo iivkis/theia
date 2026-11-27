@@ -1,4 +1,4 @@
-//! Local loopback-only CONNECT and SOCKS5 listeners for H2, H3 or conservative QUIC-first auto mode.
+//! Local loopback-only HTTP and SOCKS5 listeners for H2, H3 or conservative QUIC-first auto mode.
 //! Local direct destinations use bounded DNS only after explicit routing authorization.
 use crate::{
     client::{error_kind, ClientError, H2Client, Tunnel},
@@ -31,6 +31,7 @@ use tokio::{
 
 const LOCAL_LIMIT: usize = 64;
 const HEADER_LIMIT: usize = 8192;
+const HTTP_BODY_LIMIT: usize = 1024 * 1024;
 const NEGOTIATE_TIMEOUT: Duration = Duration::from_secs(10);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const CA_LIMIT: usize = 1024 * 1024;
@@ -380,9 +381,9 @@ impl RealityClient {
         self.changed.notify_one();
         Ok(next)
     }
-    async fn open(&self, address: Address, port: u16) -> Result<RoutedTcp, ClientError> {
+    async fn open(&self, address: Address, port: u16, allow_dpi: bool) -> Result<RoutedTcp, ClientError> {
         let generation = self.generation().await?;
-        let mut result = routed_open(&generation.carrier, &self.routing, address, port).await;
+        let mut result = routed_open(&generation.carrier, &self.routing, address, port, allow_dpi).await;
         if let Ok(tunnel) = &mut result {
             if let ProxyTunnel::Dpi(route) = &mut tunnel.tunnel {
                 route.observed = Some(generation.last_open.clone());
@@ -1040,6 +1041,20 @@ impl RoutedTcp {
     async fn relay(self, socket: TcpStream) -> Result<(), ClientError> {
         self.tunnel.relay_guarded(socket, Some(&self.flow)).await
     }
+
+    async fn relay_http(self, socket: TcpStream, request: Vec<u8>) -> Result<(), ClientError> {
+        // A single absolute-form request owns this stream. No subsequent
+        // request can reuse the selected destination or bypass policy.
+        let local = HttpOnce { socket, request: request.into() };
+        let flow = Some(&self.flow);
+        match self.tunnel {
+            ProxyTunnel::Direct(target) => client_state::relay_direct_guarded(local, target, flow).await,
+            ProxyTunnel::H2(tunnel) => tunnel.relay_guarded(local, flow).await,
+            ProxyTunnel::H3(tunnel) => tunnel.relay_guarded(local, flow).await,
+            // Plain HTTP is known not to be a TLS ClientHello before OPEN.
+            ProxyTunnel::Dpi(_) => Err(ClientError::Protocol),
+        }
+    }
 }
 
 struct RoutedUdp {
@@ -1263,6 +1278,7 @@ async fn routed_open(
     cache: &Cache,
     address: Address,
     port: u16,
+    allow_dpi: bool,
 ) -> Result<RoutedTcp, ClientError> {
     let (snapshot, action, pinned) = route_decision(carrier, cache, &address).await?;
     if action.packet_action() == crate::routing::PacketAction::Drop {
@@ -1278,10 +1294,11 @@ async fn routed_open(
         action.packet_action(),
     )?;
     let tunnel =
-        routed_open_selected(carrier, cache, address, port, snapshot, action, pinned).await?;
+        routed_open_selected(carrier, cache, address, port, snapshot, action, pinned, allow_dpi).await?;
     Ok(RoutedTcp { tunnel, flow })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn routed_open_selected(
     carrier: &Carrier,
     cache: &Cache,
@@ -1290,6 +1307,7 @@ async fn routed_open_selected(
     snapshot: Arc<Snapshot>,
     action: Action,
     pinned: Option<Vec<IpAddr>>,
+    allow_dpi: bool,
 ) -> Result<ProxyTunnel, ClientError> {
     let policy = snapshot.policy();
     let denied = || ClientError::Open(ErrorCode::PolicyDenied);
@@ -1307,7 +1325,7 @@ async fn routed_open_selected(
         crate::routing::PacketAction::Modify => {
             // Initial native backend supports domain HTTPS TCP only. Resolve
             // via the authenticated policy endpoint, never the local resolver.
-            if cache.dpi.enabled() && matches!(port, 443 | 8443) {
+            if allow_dpi && cache.dpi.enabled() && matches!(port, 443 | 8443) {
                 if let Address::Dns(name) = &address {
                     let ips = match pinned {
                         Some(ips) => ips,
@@ -1618,10 +1636,14 @@ impl ProxyClient {
     }
 
     async fn open(&self, address: Address, port: u16) -> Result<RoutedTcp, ClientError> {
+        self.open_for(address, port, true).await
+    }
+
+    async fn open_for(&self, address: Address, port: u16, allow_dpi: bool) -> Result<RoutedTcp, ClientError> {
         match self {
             Self::Direct(client) => {
                 let mut tunnel =
-                    routed_open(&client.carrier, &client.routing, address, port).await?;
+                    routed_open(&client.carrier, &client.routing, address, port, allow_dpi).await?;
                 if let ProxyTunnel::Dpi(route) = &mut tunnel.tunnel {
                     route.observed = Some(client.last_open.clone());
                 }
@@ -1632,7 +1654,7 @@ impl ProxyClient {
                 }
                 Ok(tunnel)
             }
-            Self::Reality(client) => client.open(address, port).await,
+            Self::Reality(client) => client.open(address, port, allow_dpi).await,
         }
     }
     async fn maintain(&self) -> Result<(), ClientError> {
@@ -2172,6 +2194,14 @@ async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result
     else {
         return Err(ClientError::Configuration);
     };
+    if enable_system_proxy {
+        #[cfg(not(windows))]
+        return Err(ClientError::SystemProxy);
+        #[cfg(windows)]
+        if document.client.proxy.system_proxy != config::SystemProxy::Manual {
+            return Err(ClientError::SystemProxy);
+        }
+    }
     let (http, socks, client) = Box::pin(prepare_proxy(&document, config_path)).await?;
     #[cfg(windows)]
     let http_bound = http.local_addr().map_err(|_| ClientError::Io)?;
@@ -2209,9 +2239,6 @@ async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result
     if enable_system_proxy {
         // A config declaration is insufficient by itself: this branch
         // requires the *additional CLI* --system-proxy --confirm.
-        if document.client.proxy.system_proxy != config::SystemProxy::Manual {
-            return Err(ClientError::SystemProxy);
-        }
         let mut lease = crate::windows_system_proxy::OwnedProxy::apply(http_bound)
             .map_err(|_| ClientError::SystemProxy)?;
         // Ctrl+C is the normal scoped exit. A killed process cannot execute
@@ -2225,10 +2252,6 @@ async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result
         };
         lease.restore().map_err(|_| ClientError::SystemProxy)?;
         return result;
-    }
-    #[cfg(not(windows))]
-    if enable_system_proxy {
-        return Err(ClientError::SystemProxy);
     }
     serving.await
 }
@@ -5000,7 +5023,161 @@ fn parse_authority(raw: &str) -> Result<(Address, u16), ClientError> {
     validate_target(address, port)
 }
 
-async fn http_target(socket: &mut TcpStream) -> Result<(Address, u16), &'static [u8]> {
+#[derive(Debug, PartialEq, Eq)]
+enum HttpRequest {
+    Connect(Address, u16),
+    Plain(Address, u16, Vec<u8>),
+}
+
+/// Never read application bytes beyond this request. The complete bounded
+/// body is buffered before opening any egress; the response remains streamed.
+struct HttpOnce {
+    socket: TcpStream,
+    request: bytes::Bytes,
+}
+impl tokio::io::AsyncRead for HttpOnce {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        out: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let n = out.remaining().min(self.request.len());
+        out.put_slice(&self.request.split_to(n));
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+impl tokio::io::AsyncWrite for HttpOnce {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        tokio::io::AsyncWrite::poll_write(std::pin::Pin::new(&mut self.socket), cx, data)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        tokio::io::AsyncWrite::poll_flush(std::pin::Pin::new(&mut self.socket), cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        tokio::io::AsyncWrite::poll_shutdown(std::pin::Pin::new(&mut self.socket), cx)
+    }
+}
+
+fn http_authority(raw: &str) -> Result<(Address, u16), &'static [u8]> {
+    if raw.contains('@') || raw.contains('%') {
+        return Err(HTTP_BAD);
+    }
+    let authority = raw.parse::<http::uri::Authority>().map_err(|_| HTTP_BAD)?;
+    let target = if authority.port().is_some() {
+        parse_authority(raw)
+    } else {
+        parse_authority(&format!("{raw}:80"))
+    };
+    let (mut address, port) = target.map_err(|_| HTTP_BAD)?;
+    if let Address::Dns(name) = &mut address {
+        name.make_ascii_lowercase();
+    }
+    Ok((address, port))
+}
+
+async fn plain_http<'a>(
+    socket: &mut TcpStream,
+    method: &str,
+    raw_uri: &str,
+    version: &str,
+    lines: impl Iterator<Item = &'a str>,
+) -> Result<HttpRequest, &'static [u8]> {
+    if !raw_uri.starts_with("http://") {
+        return Err(HTTP_METHOD);
+    }
+    if raw_uri.contains('#') || method.eq_ignore_ascii_case("CONNECT") {
+        return Err(HTTP_BAD);
+    }
+    http::Method::from_bytes(method.as_bytes()).map_err(|_| HTTP_BAD)?;
+    let uri: http::Uri = raw_uri.parse().map_err(|_| HTTP_BAD)?;
+    let authority = uri.authority().ok_or(HTTP_BAD)?.as_str();
+    let (address, port) = http_authority(authority)?;
+    let origin = uri.path_and_query().map_or("/", |path| path.as_str());
+    let origin = if origin.starts_with('?') {
+        format!("/{origin}")
+    } else {
+        origin.to_owned()
+    };
+    if !origin.starts_with('/') {
+        return Err(HTTP_BAD);
+    }
+
+    let mut headers = Vec::new();
+    let mut nominated = std::collections::HashSet::new();
+    let mut host_seen = false;
+    let mut length = None;
+    for line in lines {
+        let (raw_name, raw_value) = line.split_once(':').ok_or(HTTP_BAD)?;
+        let name = http::header::HeaderName::from_bytes(raw_name.as_bytes()).map_err(|_| HTTP_BAD)?;
+        let value = raw_value.trim_matches([' ', '\t']);
+        http::HeaderValue::from_str(value).map_err(|_| HTTP_BAD)?;
+        match name.as_str() {
+            "host" => {
+                if host_seen || http_authority(value)? != (address.clone(), port) {
+                    return Err(HTTP_BAD);
+                }
+                host_seen = true;
+            }
+            "content-length" => {
+                if length.is_some() || value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(HTTP_BAD);
+                }
+                let n = value.parse::<usize>().map_err(|_| HTTP_BAD)?;
+                if n > HTTP_BODY_LIMIT {
+                    return Err(HTTP_BAD);
+                }
+                length = Some(n);
+            }
+            // No ambiguous framing, upgrades or 100-continue handshake.
+            "transfer-encoding" | "upgrade" | "expect" | "trailer" => return Err(HTTP_BAD),
+            "connection" | "proxy-connection" => {
+                for token in value.split(',') {
+                    let token = token.trim_matches([' ', '\t']);
+                    let field = http::header::HeaderName::from_bytes(token.as_bytes()).map_err(|_| HTTP_BAD)?;
+                    if matches!(field.as_str(), "host" | "content-length" | "transfer-encoding" | "upgrade") {
+                        return Err(HTTP_BAD);
+                    }
+                    nominated.insert(field);
+                }
+            }
+            "proxy-authorization" | "proxy-authenticate" | "keep-alive" | "te" => {}
+            _ => headers.push((name, value)),
+        }
+    }
+    if version == "HTTP/1.1" && !host_seen {
+        return Err(HTTP_BAD);
+    }
+
+    let mut request = format!("{method} {origin} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n").into_bytes();
+    if let Some(n) = length {
+        request.extend_from_slice(format!("Content-Length: {n}\r\n").as_bytes());
+    }
+    for (name, value) in headers {
+        if !nominated.contains(&name) {
+            request.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+        }
+    }
+    request.extend_from_slice(b"\r\n");
+    if request.len() > HEADER_LIMIT {
+        return Err(HTTP_BAD);
+    }
+    let head_len = request.len();
+    request.resize(head_len + length.unwrap_or(0), 0);
+    socket.read_exact(&mut request[head_len..]).await.map_err(|_| HTTP_BAD)?;
+    Ok(HttpRequest::Plain(address, port, request))
+}
+
+async fn http_target(socket: &mut TcpStream) -> Result<HttpRequest, &'static [u8]> {
     // Read exactly through the header terminator without consuming the
     // first bytes of a pipelined TLS/application stream.
     let mut head = Vec::with_capacity(1024);
@@ -5024,7 +5201,7 @@ async fn http_target(socket: &mut TcpStream) -> Result<(Address, u16), &'static 
         return Err(HTTP_BAD);
     }
     if method != "CONNECT" {
-        return Err(HTTP_METHOD);
+        return plain_http(socket, method, authority, version, lines).await;
     }
     let target = parse_authority(authority).map_err(|_| HTTP_BAD)?;
     let mut host_seen = false;
@@ -5046,7 +5223,7 @@ async fn http_target(socket: &mut TcpStream) -> Result<(Address, u16), &'static 
     if version == "HTTP/1.1" && !host_seen {
         return Err(HTTP_BAD);
     }
-    Ok(target)
+    Ok(HttpRequest::Connect(target.0, target.1))
 }
 
 async fn socks_reply(socket: &mut TcpStream, code: u8) -> Result<(), ClientError> {
@@ -5163,9 +5340,17 @@ async fn handle(
         "negotiation_started",
         "session" = Value::Count(session_id)
     );
+    if !socket.peer_addr().map_err(|_| ClientError::Io)?.ip().is_loopback() {
+        return Err(ClientError::Open(ErrorCode::PolicyDenied));
+    }
+    let mut plain = None;
     let (address, port) = if is_http {
         match timeout(NEGOTIATE_TIMEOUT, http_target(&mut socket)).await {
-            Ok(Ok(target)) => target,
+            Ok(Ok(HttpRequest::Connect(address, port))) => (address, port),
+            Ok(Ok(HttpRequest::Plain(address, port, request))) => {
+                plain = Some(request);
+                (address, port)
+            },
             Ok(Err(reply)) => {
                 let _ = timeout(REPLY_TIMEOUT, socket.write_all(reply)).await;
                 crate::diag!(
@@ -5195,7 +5380,12 @@ async fn handle(
         "negotiation_validated",
         "session" = Value::Count(session_id)
     );
-    match client.open(address, port).await {
+    let opened = if plain.is_some() {
+        client.open_for(address, port, false).await
+    } else {
+        client.open(address, port).await
+    };
+    match opened {
         Ok(tunnel) => {
             if tunnel.open_code() == 0 {
                 crate::diag!(
@@ -5211,6 +5401,10 @@ async fn handle(
                     "remote_open_ok",
                     "session" = Value::Count(session_id)
                 );
+            }
+            // Plain HTTP receives the actual origin response, never a CONNECT 200.
+            if let Some(request) = plain {
+                return tunnel.relay_http(socket, request).await;
             }
             // A direct socket is already connected; proxied routes verified OPEN_OK.
             if is_http {
@@ -6639,7 +6833,7 @@ mod selector_tests {
             .unwrap();
         assert_eq!(
             http_target(&mut proxy).await.unwrap(),
-            (Address::V6(Ipv6Addr::LOCALHOST.octets()), 443)
+            HttpRequest::Connect(Address::V6(Ipv6Addr::LOCALHOST.octets()), 443)
         );
         let mut trailing = [0; 8];
         proxy.read_exact(&mut trailing).await.unwrap();
@@ -6668,6 +6862,61 @@ mod selector_tests {
         let (mut client, mut proxy) = paired().await;
         client.write_all(&[b'x'; HEADER_LIMIT]).await.unwrap();
         assert_eq!(http_target(&mut proxy).await, Err(HTTP_BAD));
+    }
+
+    #[tokio::test]
+    async fn absolute_http_rewrites_and_never_relays_a_second_request() {
+        let (mut app, mut proxy) = paired().await;
+        app.write_all(b"POST http://Example.org/a?q=1 HTTP/1.1\r\nHost: example.org:80\r\nProxy-Authorization: Basic secret\r\nConnection: X-Private, keep-alive\r\nX-Private: discard\r\nContent-Length: 3\r\nX-Test: yes\r\n\r\nabcGET http://other.org/ HTTP/1.1\r\nHost: other.org\r\n\r\n").await.unwrap();
+        let HttpRequest::Plain(address, port, request) = http_target(&mut proxy).await.unwrap() else {
+            panic!("expected plain HTTP");
+        };
+        assert_eq!((address, port), (Address::Dns("example.org".into()), 80));
+        let rewritten = std::str::from_utf8(&request).unwrap();
+        assert!(rewritten.starts_with("POST /a?q=1 HTTP/1.1\r\n"));
+        assert!(rewritten.to_ascii_lowercase().contains("\r\nhost: example.org\r\n"));
+        assert!(rewritten.contains("\r\nConnection: close\r\nContent-Length: 3\r\nx-test: yes\r\n\r\nabc"));
+        assert!(!rewritten.contains("secret"));
+        assert!(!rewritten.contains("discard"));
+        let mut once = HttpOnce { socket: proxy, request: request.clone().into() };
+        let mut relayed = Vec::new();
+        once.read_to_end(&mut relayed).await.unwrap();
+        assert_eq!(relayed, request);
+        once.write_all(b"response").await.unwrap();
+        let mut response = [0; 8];
+        app.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"response");
+        once.flush().await.unwrap();
+        once.shutdown().await.unwrap();
+        assert_eq!(app.read_u8().await.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn absolute_http_rejects_ambiguous_authority_and_framing() {
+        let cases = [
+            "GET http://example.org/ HTTP/1.1\r\nHost: other.org\r\n\r\n",
+            "GET http://example.org/ HTTP/1.1\r\n\r\n",
+            "GET http://user@example.org/ HTTP/1.1\r\nHost: example.org\r\n\r\n",
+            "GET http://example.org/#fragment HTTP/1.1\r\nHost: example.org\r\n\r\n",
+            "GET http://example.org:81/ HTTP/1.1\r\nHost: example.org\r\n\r\n",
+            "GET http://example.org/ HTTP/1.1\r\nHost: example.org\r\nHost: example.org\r\n\r\n",
+            "POST http://example.org/ HTTP/1.1\r\nHost: example.org\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\na",
+            "POST http://example.org/ HTTP/1.1\r\nHost: example.org\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "POST http://example.org/ HTTP/1.1\r\nHost: example.org\r\nContent-Length: 1048577\r\n\r\n",
+            "POST http://example.org/ HTTP/1.1\r\nHost: example.org\r\nContent-Length: 2\r\n\r\na",
+            "GET http://example.org/ HTTP/1.1\r\nHost: example.org\r\nConnection: host\r\n\r\n",
+            "GET http://example.org/ HTTP/1.1\r\nHost: example.org\r\nUpgrade: websocket\r\n\r\n",
+            "POST http://example.org/ HTTP/1.1\r\nHost: example.org\r\nExpect: 100-continue\r\n\r\n",
+        ];
+        for request in cases {
+            let (mut app, mut proxy) = paired().await;
+            app.write_all(request.as_bytes()).await.unwrap();
+            app.shutdown().await.unwrap();
+            assert_eq!(http_target(&mut proxy).await, Err(HTTP_BAD), "{request:?}");
+        }
+        let (mut app, mut proxy) = paired().await;
+        app.write_all(b"GET http://[::1]:8080/ HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n").await.unwrap();
+        assert!(matches!(http_target(&mut proxy).await.unwrap(), HttpRequest::Plain(Address::V6(_), 8080, _)));
     }
 
     #[tokio::test]
