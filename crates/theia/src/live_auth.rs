@@ -264,6 +264,21 @@ impl LiveAuthorization {
         Arc::clone(&self.shared)
     }
 
+    /// One immutable authorization snapshot; never return token digests.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    pub(crate) fn access_observation(&self, inbound: &str, user: &str) -> Result<(u64, u8), LiveAuthError> {
+        let snapshot = self.shared.load()?;
+        let state = match snapshot.grants.get(inbound) {
+            None => 0,
+            Some(grants) => match snapshot.users.iter().find(|entry| entry.id == user) {
+                Some(entry) if entry.disabled => 2,
+                Some(_) if grants.contains(user) => 3,
+                _ => 1,
+            },
+        };
+        Ok((snapshot.revision, state))
+    }
+
     pub fn revision(&self) -> Result<u64, LiveAuthError> {
         Ok(self.shared.load()?.revision)
     }

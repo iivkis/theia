@@ -494,6 +494,7 @@ fn page_actions_for(
             ('x', "Отключить пользователя"),
             ('G', "Изменить права доступа"),
             ('U', "Удалить пользователя"),
+            ('j', "Проверить доступ на сервере"),
         ],
         (Role::Server, 3) => &[
             ('s', "Запуск / остановка"),
@@ -569,6 +570,7 @@ fn page_actions_for(
                 (Role::Server, 'x' | 't') => can_rotate,
                 (_, 'l' | 'M') => has_record,
                 (Role::Server, 'U') => selected.is_some_and(|(id, _, _)| editor.user_deletable(id)),
+                (Role::Server, 'j') => selected.is_some() && !editor.write_uncertain(),
                 (Role::Server, 'S') => editor.dirty() && !editor.write_uncertain(),
                 (Role::Server, 'u' | 'b' | 't' | 'x' | 'U' | 'G' | 'V' | 'K' | 'M' | 'w' | 'l' | 'N' | 'D' | 'E' | 'Q') if editor.write_uncertain() => false,
                 _ => true,
@@ -1377,7 +1379,70 @@ impl RoutingObservation {
     }
 }
 
+struct AccessObservation {
+    digest: [u8; 32],
+    inbound: String,
+    user: String,
+    requested: std::time::Instant,
+    receiver: Option<mpsc::Receiver<Result<crate::management::StatusReply, crate::management::ManagementError>>>,
+    observed: Option<(u64, u8)>,
+}
+
+impl AccessObservation {
+    fn start(editor: &Editor, user: String, endpoint: Option<PathBuf>, owned: bool) -> Option<Self> {
+        if editor.write_uncertain() { return None; }
+        let inbound = editor.selected_record_id().to_owned();
+        if !crate::config::valid_id(&inbound) || !crate::config::valid_id(&user) { return None; }
+        let digest = editor.saved_sha256();
+        let mut inbound_bytes = [0; 64];
+        inbound_bytes[..inbound.len()].copy_from_slice(inbound.as_bytes());
+        let mut user_bytes = [0; 64];
+        user_bytes[..user.len()].copy_from_slice(user.as_bytes());
+        let command = crate::management::StatusCommand::AccessStatus { inbound: inbound_bytes, user: user_bytes, saved_sha256: digest };
+        let (tx, rx) = mpsc::channel();
+        let requested = std::time::Instant::now();
+        let _worker = std::thread::spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread().enable_all().build()
+                .map_err(|_| crate::management::ManagementError::Io)
+                .and_then(|rt| rt.block_on(async {
+                    if owned {
+                        match endpoint {
+                            Some(path) => crate::tui_runtime::query_endpoint(&path, command).await,
+                            None => Err(crate::management::ManagementError::NotConfigured),
+                        }
+                    } else { crate::management::query_environment(command).await }
+                }));
+            let _ = tx.send(result);
+        });
+        Some(Self { digest, inbound, user, requested, receiver: Some(rx), observed: None })
+    }
+
+    fn poll(&mut self) {
+        if let Some(rx) = &self.receiver {
+            match rx.try_recv() {
+                Ok(Ok(crate::management::StatusReply::AccessObserved { revision, state })) => {
+                    self.observed = Some((revision, state));
+                    self.receiver = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                _ => { self.receiver = None; }
+            }
+        }
+    }
+
+    fn label(&self, editor: &Editor, user: &str) -> Option<String> {
+        if editor.write_uncertain() || self.digest != editor.saved_sha256()
+            || self.inbound != editor.selected_record_id() || self.user != user
+            || self.requested.elapsed() > std::time::Duration::from_secs(10) { return None; }
+        if self.receiver.is_some() { return Some("Проверяется…".into()); }
+        let (revision, state) = self.observed?;
+        let label = match state { 1 => "Нет права", 2 => "Отключён", 3 => "Разрешён", _ => "Нет подключения" };
+        Some(format!("{label} · rev {revision}"))
+    }
+}
+
 struct Interaction {
+    access_observation: Option<AccessObservation>,
     workspace_page: usize,
     workspace_focus: WorkspaceFocus,
     workspace_action: usize,
@@ -1433,6 +1498,7 @@ impl Interaction {
     fn new(mut editor: Option<Editor>) -> Self {
         if let Some(editor) = editor.as_mut() { editor.set_compact_server_fields(true); }
         Self {
+            access_observation: None,
             workspace_page: usize::from(editor.is_some()),
             workspace_focus: WorkspaceFocus::Fields,
             workspace_action: 0,
@@ -1486,6 +1552,7 @@ impl Interaction {
     }
 
     fn start_save(&mut self) {
+        self.access_observation = None;
         let Some(mut editor) = self.editor.take() else {
             return;
         };
@@ -2006,6 +2073,7 @@ impl Interaction {
         }
     }
     fn open_config(&mut self, role: Role) {
+        self.access_observation = None;
         #[cfg(windows)]
         if self.proxy_background.as_ref().is_some_and(|p| p.running()) {
             self.system_proxy = self.proxy_background.take();
@@ -2051,6 +2119,7 @@ impl Interaction {
     }
 
     fn poll_navigation(&mut self, model: &mut Model) {
+        if let Some(observation) = self.access_observation.as_mut() { observation.poll(); }
         if let Some(panel) = self.routing_panel.as_mut() {
             panel.poll();
         }
@@ -2092,6 +2161,7 @@ impl Interaction {
         let previous_process_status = self.server_process.status();
         self.server_process.poll();
         if self.server_process.status() != previous_process_status {
+            self.access_observation = None;
             self.last_apply = None;
         }
         if let Some(monitor) = self.traffic_monitor.as_mut() {
@@ -3622,6 +3692,18 @@ impl Interaction {
                                 &mut self.workspace_action,
                                 key.code,
                             ) {
+                                if ch == 'j' && role == Role::Server && self.workspace_page == 2 {
+                                    if !self.access_observation.as_ref().is_some_and(|o| o.receiver.is_some()) {
+                                        if let Some(editor) = self.editor_for(role) {
+                                            let users = editor.workspace_users();
+                                            if let Some((id, _, _)) = users.get(self.workspace_user.min(users.len().saturating_sub(1))) {
+                                                self.access_observation = AccessObservation::start(editor, id.clone(),
+                                                    self.server_process.management_endpoint(), self.server_process.running());
+                                            }
+                                        }
+                                    }
+                                    return false;
+                                }
                                 if ch == 'j' && role == Role::Client && self.workspace_page == 6 {
                                     if let Some(observation) = self.routing_observation.as_mut() {
                                         observation.refresh();
@@ -4926,6 +5008,7 @@ impl Interaction {
             let apply_shortcut =
                 key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r');
             if editor.role() == Role::Server && (key.code == KeyCode::Char('v') || apply_shortcut) {
+                self.access_observation = None;
                 if apply_shortcut && editor.dirty() {
                     editor.error =
                         Some("Сначала Ctrl+S: нельзя применять несохранённый черновик.".into());
@@ -7555,7 +7638,8 @@ fn draw_page(
                     } else {
                         "Нет права"
                     }.into(),
-                    if *granted { "Выдано" } else { "Нет" }.into(),
+                    ui.and_then(|u| u.access_observation.as_ref())
+                        .and_then(|o| o.label(editor, id)).unwrap_or_else(|| "Не подтверждён".into()),
                 ])
                 .style(Style::default().fg(color).bg(if active {
                     FOCUS
@@ -7573,7 +7657,7 @@ fn draw_page(
                 ],
             )
             .header(
-                Row::new(["Пользователь", if editor.write_uncertain() { "Запись не подтверждена" } else if editor.dirty() { "Доступ в черновике" } else { "Доступ по файлу" }, "Право на подключение"])
+                Row::new(["Пользователь", if editor.write_uncertain() { "Запись не подтверждена" } else if editor.dirty() { "Доступ в черновике" } else { "Доступ по файлу" }, "На сервере (новые сеансы)"])
                     .style(Style::default().fg(MUTED)),
             )
             .block(tui_widgets::section(
@@ -7604,7 +7688,7 @@ fn draw_page(
             let hint = match users.get(selected) {
                 Some((_, true, true)) => "Пользователь отключён в настройках. Восстановление создаёт новый ключ.\nФактический доступ проверяется и применяется в разделе «Управление».",
                 Some((_, _, false)) => "У пользователя нет права на это подключение. Измените права доступа.\nУдаление возможно только без прав на всех подключениях.",
-                Some(_) => "Доступ указан по настройкам, не по работающему серверу.\nЗамена ключа действует после применения прав в «Управлении».",
+                Some(_) => "Проверка доступа показывает снимок новых сеансов (до 10 с).\nЗамена ключа действует после применения прав в «Управлении».",
                 None => "Добавьте пользователя и выдайте ему ключ.",
             };
             frame.render_widget(
