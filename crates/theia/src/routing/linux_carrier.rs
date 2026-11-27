@@ -42,7 +42,7 @@ fn check_scope(host: &File) -> io::Result<(u64,u64)> {
     let host_meta = host.metadata()?;
     let current = current_namespace()?;
     if current == (host_meta.dev(), host_meta.ino())
-        || unsafe { libc::ioctl(host.as_raw_fd(), 0xb703 as libc::c_ulong) } != libc::CLONE_NEWNET {
+        || unsafe { libc::ioctl(host.as_raw_fd(), 0xb703 as _) } != libc::CLONE_NEWNET {
         return Err(denied());
     }
     Ok(current)

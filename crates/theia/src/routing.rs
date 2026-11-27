@@ -10,6 +10,10 @@ pub mod packet_modify;
 pub mod linux_ingress;
 #[cfg(target_os = "linux")]
 pub mod linux_attribution;
+#[cfg(target_os = "linux")]
+pub mod linux_events;
+#[cfg(target_os = "linux")]
+pub mod dns_attribution;
 #[cfg(any(target_os = "windows", test))]
 mod wfp_context;
 #[cfg(target_os = "windows")]

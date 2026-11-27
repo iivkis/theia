@@ -52,7 +52,7 @@ impl Scope {
         if stat.f_type as u64 != 0x6e736673 { return Err(refused()); } // NSFS_MAGIC
         // NS_GET_NSTYPE rejects a mount/PID namespace presented as a host
         // network-namespace handle.
-        if unsafe { libc::ioctl(host_namespace.as_raw_fd(), 0xb703 as libc::c_ulong) } != libc::CLONE_NEWNET { return Err(refused()); }
+        if unsafe { libc::ioctl(host_namespace.as_raw_fd(), 0xb703 as _) } != libc::CLONE_NEWNET { return Err(refused()); }
         if own.dev() == host.dev() && own.ino() == host.ino() { return Err(refused()); }
         let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim().to_owned();
         if boot.len() != 36 || !boot.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') { return Err(invalid()); }
@@ -361,10 +361,11 @@ fn parse_journal(bytes: &[u8], scope: &Scope) -> io::Result<Journal> {
 /// A lab rule lease keeps the namespace ownership lock. Drop never deletes
 /// rules or restores open networking. Explicit reviewed recovery is needed.
 pub struct LabRules {
-    _lock: UnixDatagram,
     journal: Journal,
     queue_identity: [u8; 16],
     _carriers: Vec<LabCarrierSocket>,
+    // Drop socket exemptions before releasing ownership to recovery.
+    _lock: UnixDatagram,
 }
 impl LabRules {
     pub(crate) fn owns_packet(&self, packet: &super::nfqueue::Packet<'_>) -> io::Result<bool> {

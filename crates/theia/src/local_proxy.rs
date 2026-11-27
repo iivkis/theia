@@ -1987,6 +1987,34 @@ impl NativeIngress {
         }
     }
 
+    /// Correlate a laboratory resolver link with protected DNS from the
+    /// exact active policy generation. This does not grant routing
+    /// authorization: neither the BPF reader nor resolver event source
+    /// has yet been integrated into the production native backend.
+    #[cfg(target_os = "linux")]
+    pub async fn corroborate_dns_lab(
+        &self,
+        flow: crate::routing::linux_events::CorroboratedFlow,
+        link: &crate::routing::dns_attribution::ResolverLink,
+        candidates: &mut crate::routing::dns_attribution::DnsCandidates,
+    ) -> Result<bool, ClientError> {
+        self.ensure_running()?;
+        if flow.key() != link.key || flow.cookie() != link.cookie || flow.process_start() != link.process_start {
+            return Ok(false);
+        }
+        let (carrier, cache) = match &self.client {
+            ProxyClient::Direct(c) => (c.carrier.clone(), &c.routing),
+            ProxyClient::Reality(c) => (c.generation().await?.carrier.clone(), &c.routing),
+        };
+        let snapshot = cache.get(|known| carrier.fetch_routing(known)).await?;
+        let digest = snapshot.digest();
+        let name = crate::routing::domain_name(&link.domain).map_err(|_| ClientError::Protocol)?;
+        let ips = carrier.resolve_routing(&name, digest).await?;
+        cache.dpi.check_policy(digest)?;
+        self.ensure_running()?;
+        candidates.record(flow, link, digest, &ips).map_err(|_| ClientError::Protocol)
+    }
+
     /// Prepare a narrowly scoped laboratory Modify permit. The route must
     /// be conclusive even with unknown application/domain evidence; the
     /// supplied name is only an authenticated DNS/reachability probe hint,
