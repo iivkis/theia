@@ -24,7 +24,7 @@ def digest(path):
 
 
 def command(*args):
-    return subprocess.check_output(args, cwd=ROOT, text=True).strip()
+    return subprocess.check_output(args, cwd=ROOT, encoding="utf-8", errors="strict").strip()
 
 
 def require(condition, reason):

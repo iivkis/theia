@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 SOURCE = Path(__file__).resolve().parents[2] / "scripts" / "ci-boringssl.py"
 spec = importlib.util.spec_from_file_location("ci_boringssl", SOURCE)
@@ -49,6 +50,12 @@ class BoringSSLBundleTests(unittest.TestCase):
         bundle = self.root / name
         bssl.stage(path, bundle, self.expected)
         return bundle
+
+    def test_cargo_command_uses_strict_utf8_not_windows_ansi(self):
+        with patch.object(bssl.subprocess, "check_output", return_value='{"name":"日本語"}\n') as run:
+            self.assertEqual(bssl.command("cargo", "metadata"), '{"name":"日本語"}')
+            run.assert_called_once_with(("cargo", "metadata"), cwd=bssl.ROOT,
+                                        encoding="utf-8", errors="strict")
 
     def test_exact_native_bundle_round_trip(self):
         bundle = self.stage()

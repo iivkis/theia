@@ -581,8 +581,8 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         # All preceding operations use Own-TLS or local server management.
         # Do not enroll or connect REALITY before the real replay window ends.
         replay_wait_started = time.monotonic()
-        remaining = max(0.0, replay_deadline - replay_wait_started)
-        time.sleep(remaining)
+        while (remaining := replay_deadline - time.monotonic()) > 0:
+            time.sleep(remaining)
         assert time.monotonic() >= replay_deadline
         replay_wait = time.monotonic() - replay_wait_started
         revision(binary, 2)

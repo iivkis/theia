@@ -216,7 +216,7 @@ contains(tui, '#[ignore = "mandatory dedicated native coverage shard: real start
          'assert!(running.0.try_wait().unwrap().is_none())')
 driver = (ROOT / "scripts/tui-real-terminal-e2e.py").read_text(encoding="utf-8")
 contains(driver, "scenario_started = time.monotonic()", "replay_deadline = scenario_started + 121.0",
-         "remaining = max(0.0, replay_deadline - replay_wait_started)", "time.sleep(remaining)",
+         "while (remaining := replay_deadline - time.monotonic()) > 0:", "time.sleep(remaining)",
          "assert time.monotonic() >= replay_deadline",
          "assert time.monotonic() - scenario_started - replay_wait <= 50.0")
 require(driver.index("replay_deadline = scenario_started + 121.0")
