@@ -611,6 +611,8 @@ jobs:
         run: cargo test --workspace --locked --test independent_native_quic independent_aioquic_v1_v2_bidirectional_h3 -- --ignored --exact --nocapture
       - name: Independent aioquic authentication of v1/v2 Modify output (laboratory)
         run: cargo test --workspace --locked --lib routing::packet_modify::tests::independent_aioquic_initial_modify_v1_v2 -- --ignored --exact --nocapture
+      - name: Independent live QUIC v1/v2 TLS resumption and H3 after Modify
+        run: cargo test --workspace --locked --test independent_quic_modify independent_aioquic_live_modify_v1_v2 -- --ignored --exact --nocapture
       - name: Measure matched native and Quinn loopback samples (diagnostic)
         run: python tests/benchmark/run_native_quic_comparison.py --revision "${{ needs.specification.outputs.tested_sha }}" --output native-quic-comparison.json
       - uses: actions/upload-artifact@v4
