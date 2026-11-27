@@ -283,14 +283,12 @@ impl Queue {
         result
     }
 
-    /// Receives one bounded packet. A timeout is not a permission to pass;
-    /// malformed kernel messages or lost netlink data close the queue.
-    pub fn receive(&mut self) -> io::Result<Packet<'_>> {
+    fn receive_captured(&mut self) -> io::Result<Captured> {
         let fd = self.descriptor()?;
         let result = receive(fd, &mut self.buffer)
             .and_then(|n| decode(&self.buffer[..n], self.number));
         match result {
-            Ok(captured) => Ok(Packet { queue: self, captured, done: false }),
+            Ok(captured) => Ok(captured),
             Err(error) => {
                 if !matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted) {
                     drop(self.fd.take());
@@ -298,6 +296,42 @@ impl Queue {
                 Err(error)
             }
         }
+    }
+
+    /// Receives one bounded packet. Fatal errors close the queue.
+    pub fn receive(&mut self) -> io::Result<Packet<'_>> {
+        let captured = self.receive_captured()?;
+        Ok(Packet { queue: self, captured, done: false })
+    }
+
+    pub(crate) fn into_async(self) -> io::Result<AsyncQueue> {
+        let fd = self.descriptor()?;
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Keep readiness registration independent of Queue's fatal-close
+        // path. The whole AsyncQueue must be dropped on any fatal error.
+        let duplicate = self.fd.as_ref().ok_or_else(invalid)?.try_clone()?;
+        let ready = tokio::io::unix::AsyncFd::new(duplicate)?;
+        Ok(AsyncQueue { ready, queue: self })
+    }
+}
+
+pub(crate) struct AsyncQueue {
+    ready: tokio::io::unix::AsyncFd<OwnedFd>,
+    queue: Queue,
+}
+impl AsyncQueue {
+    pub(crate) async fn next(&mut self) -> io::Result<Packet<'_>> {
+        let captured = loop {
+            let mut ready = self.ready.readable().await?;
+            match ready.try_io(|_| self.queue.receive_captured()) {
+                Ok(result) => break result?,
+                Err(_) => continue,
+            }
+        };
+        Ok(Packet { queue: &mut self.queue, captured, done: false })
     }
 }
 

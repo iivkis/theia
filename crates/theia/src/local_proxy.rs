@@ -1595,6 +1595,8 @@ pub(crate) struct ClientRuntime {
     slot: tokio::sync::watch::Sender<Arc<ClientView>>,
     // Bound one staging operation per process, with no commit on cancellation.
     stage: tokio::sync::Mutex<()>,
+    native_attached: std::sync::atomic::AtomicBool,
+    stopped: tokio::sync::watch::Sender<bool>,
 }
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 impl ClientRuntime {
@@ -1610,12 +1612,51 @@ impl ClientRuntime {
             revision: 1,
             client,
         }));
+        let (stopped, _) = tokio::sync::watch::channel(false);
         Arc::new(Self {
             path,
             slot,
             stage: tokio::sync::Mutex::new(()),
+            native_attached: std::sync::atomic::AtomicBool::new(false),
+            stopped,
         })
     }
+    /// Pin exactly the published client generation for native capture.
+    /// A structural or profile update needs explicit stop/recovery until
+    /// carrier and rule changes can be committed in one platform transaction.
+    async fn attach_native(self: &Arc<Self>) -> Result<NativeIngress, ClientError> {
+        let _stage = self.stage.try_lock().map_err(|_| ClientError::Configuration)?;
+        if *self.stopped.borrow() || self.native_attached.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(ClientError::Configuration);
+        }
+        let view = self.slot.borrow().clone();
+        saved_client_bytes(&self.path, view.digest)?;
+        let owner = NativeOwner::acquire()?;
+        view.client.routing_policy().await?;
+        saved_client_bytes(&self.path, view.digest)?;
+        if *self.stopped.borrow() { return Err(ClientError::Configuration); }
+        self.native_attached.store(true, std::sync::atomic::Ordering::Release);
+        Ok(NativeIngress {
+            runtime: self.clone(),
+            client: view.client.clone(),
+            revision: view.revision,
+            verdict_gate: Mutex::new(()),
+            #[cfg(target_os = "linux")]
+            raw: Mutex::new(std::collections::HashMap::new()),
+            _owner: owner,
+        })
+    }
+
+    fn stop(&self) {
+        self.stopped.send_replace(true);
+        self.slot.borrow().client.routing_cache().dpi.retire();
+    }
+
+    async fn stopped(&self) {
+        let mut stop = self.stopped.subscribe();
+        if !*stop.borrow() { let _ = stop.wait_for(|stopped| *stopped).await; }
+    }
+
     pub(crate) async fn status(&self) -> (u64, [u8; 32], u64, u8, u8, bool, (u64, u8), [u64; 38], Option<[u16; 4]>) {
         let view = self.slot.borrow().clone();
         let (desc, observed, fallback) = match &view.client {
@@ -1731,6 +1772,9 @@ impl ClientRuntime {
             .stage
             .try_lock()
             .map_err(|_| ClientError::Configuration)?;
+        if *self.stopped.borrow() || self.native_attached.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(ClientError::Configuration);
+        }
         let previous = self.slot.borrow().clone();
         if previous.revision != expected || previous.digest == digest {
             return Err(ClientError::Configuration);
@@ -1742,6 +1786,7 @@ impl ClientRuntime {
         let revision = expected.checked_add(1).ok_or(ClientError::Configuration)?;
         // No await between final exact-byte recheck and publication.
         saved_client_bytes(&self.path, digest)?;
+        if *self.stopped.borrow() { return Err(ClientError::Configuration); }
         previous.client.routing_cache().dpi.retire();
         self.slot.send_replace(Arc::new(ClientView {
             document,
@@ -1757,6 +1802,8 @@ impl ClientRuntime {
             let view = changes.borrow_and_update().clone();
             let maintenance = async { view.client.maintain().await };
             tokio::select! {
+                biased;
+                ()=self.stopped()=>return Ok(()),
                 result=maintenance=>return result,
                 result=changes.changed()=>if result.is_err(){return Err(ClientError::Io);},
             }
@@ -1848,8 +1895,9 @@ async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result
 /// A production backend must own those operations before calling it.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub struct NativeIngress {
+    runtime: Arc<ClientRuntime>,
     client: ProxyClient,
-    stopped: tokio::sync::watch::Sender<bool>,
+    revision: u64,
     verdict_gate: Mutex<()>,
     #[cfg(target_os = "linux")]
     raw: Mutex<std::collections::HashMap<crate::routing::packet::FlowKey, RawLease>>,
@@ -1940,7 +1988,6 @@ impl NativeIngress {
     /// Preflight only; the caller owns an isolated network namespace/rule
     /// transaction. No new CLI or second system interception mode.
     pub async fn prepare(path: &Path) -> Result<Self, ClientError> {
-        let owner = NativeOwner::acquire()?;
         let raw = zeroize::Zeroizing::new(config::editor_bytes(path).map_err(|_| ClientError::Configuration)?);
         let Config::Client(document) = config::parse(std::str::from_utf8(&raw).map_err(|_| ClientError::Configuration)?)
             .map_err(|_| ClientError::Configuration)? else { return Err(ClientError::Configuration); };
@@ -1948,15 +1995,8 @@ impl NativeIngress {
         let digest: [u8; 32] = Sha256::digest(raw.as_slice()).into();
         let client = prepare_client(&document, path).await?;
         saved_client_bytes(path, digest)?;
-        let (stopped, _) = tokio::sync::watch::channel(false);
-        Ok(Self {
-            client,
-            stopped,
-            verdict_gate: Mutex::new(()),
-            #[cfg(target_os = "linux")]
-            raw: Mutex::new(std::collections::HashMap::new()),
-            _owner: owner,
-        })
+        let runtime = ClientRuntime::new(std::path::absolute(path).map_err(|_| ClientError::Configuration)?, document, digest, client);
+        runtime.attach_native().await
     }
 
     /// Cancels all native relay operations, retires the policy lease and
@@ -1964,26 +2004,55 @@ impl NativeIngress {
     /// owner must perform its own authenticated CAS restoration on explicit Stop.
     pub fn shutdown(&self) {
         let _gate = self.verdict_gate.lock();
+        self.runtime.stop();
         self.client.routing_cache().dpi.retire();
-        self.stopped.send_replace(true);
         #[cfg(target_os = "linux")]
         if let Ok(mut raw) = self.raw.lock() {
             raw.clear();
         }
     }
 
-    async fn stopped(&self) {
-        let mut stop = self.stopped.subscribe();
-        if !*stop.borrow() {
-            let _ = stop.wait_for(|stopped| *stopped).await;
-        }
-    }
+    async fn stopped(&self) { self.runtime.stopped().await; }
 
     fn ensure_running(&self) -> Result<(), ClientError> {
-        if *self.stopped.borrow() {
+        if *self.runtime.stopped.borrow() || self.runtime.slot.borrow().revision != self.revision {
             Err(ClientError::Open(ErrorCode::PolicyDenied))
         } else {
             Ok(())
+        }
+    }
+
+    /// Own the actual queue consumer and the current runtime's maintenance
+    /// for the entire isolated capture lifetime. No production activation:
+    /// rules and queue must have been provisioned in the same namespace.
+    /// Cancellation or any fatal error retires the runtime and closes the
+    /// queue; the journal remains for explicit CAS recovery.
+    #[cfg(target_os = "linux")]
+    pub async fn serve_linux_queue(
+        &self,
+        queue: crate::routing::nfqueue::Queue,
+        rules: crate::routing::linux_rules::LabRules,
+    ) -> Result<(), ClientError> {
+        struct StopOnDrop<'a>(&'a NativeIngress);
+        impl Drop for StopOnDrop<'_> { fn drop(&mut self) { self.0.shutdown(); } }
+        let _stop = StopOnDrop(self);
+        self.ensure_running()?;
+        if !rules.owns_queue(&queue).map_err(|_| ClientError::Io)? { return Err(ClientError::Configuration); }
+        let mut queue = queue.into_async().map_err(|_| ClientError::Io)?;
+        let consume = async {
+            loop {
+                let packet = queue.next().await.map_err(|_| ClientError::Io)?;
+                if !rules.owns_packet(&packet).map_err(|_| ClientError::Io)? {
+                    return Err(ClientError::Open(ErrorCode::PolicyDenied));
+                }
+                self.verdict(packet).await.map_err(|_| ClientError::Io)?;
+            }
+        };
+        tokio::select! {
+            biased;
+            ()=self.stopped()=>Ok(()),
+            result=self.runtime.maintain()=>result,
+            result=consume=>result,
         }
     }
 

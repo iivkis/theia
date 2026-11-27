@@ -368,12 +368,22 @@ pub struct LabRules {
     _lock: UnixDatagram,
 }
 impl LabRules {
-    pub(crate) fn owns_packet(&self, packet: &super::nfqueue::Packet<'_>) -> io::Result<bool> {
+    pub(crate) fn owns_queue(&self, queue: &Queue) -> io::Result<bool> {
+        queue.number()?;
+        if queue.identity() != self.queue_identity { return Ok(false); }
+        self.current()
+    }
+
+    fn current(&self) -> io::Result<bool> {
         let meta = fs::metadata("/proc/thread-self/ns/net")?;
-        if (meta.dev(), meta.ino()) != (self.journal.scope.dev, self.journal.scope.ino)
-            || packet.queue_identity() != self.queue_identity { return Ok(false); }
+        if (meta.dev(), meta.ino()) != (self.journal.scope.dev, self.journal.scope.ino) { return Ok(false); }
         let net = Netlink::open()?;
         Ok(net.generation()? == self.journal.installed && net.table(&self.journal)? && net.generation()? == self.journal.installed)
+    }
+
+    pub(crate) fn owns_packet(&self, packet: &super::nfqueue::Packet<'_>) -> io::Result<bool> {
+        if packet.queue_identity() != self.queue_identity { return Ok(false); }
+        self.current()
     }
 
     /// Blocking operation; run on a dedicated namespace worker, not a Tokio
