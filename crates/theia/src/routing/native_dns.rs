@@ -1,5 +1,52 @@
 //! Bounded DNS wire adapter. No DNSSEC assertion or flow attribution.
-use std::net::IpAddr;
+use std::{collections::HashMap, net::IpAddr, time::{Duration, Instant}};
+
+/// A bounded diagnostic hint for selecting a STUN probe. This is NOT a
+/// DNS cache, a request-to-application link, or trusted domain evidence.
+/// A fresh authenticated lookup and an independently conclusive Unknown
+/// policy are mandatory before any egress based on this hint.
+#[derive(Default)]
+pub(crate) struct ProbeHints {
+    entries: HashMap<(IpAddr, IpAddr, [u8; 32]), Hint>,
+}
+struct Hint {
+    name: String,
+    deadline: Instant,
+    ambiguous: bool,
+}
+impl ProbeHints {
+    const CAPACITY: usize = 4096;
+    const WINDOW: Duration = Duration::from_secs(5);
+
+    pub(crate) fn record(&mut self, source: IpAddr, digest: [u8; 32], name: &str, ips: &[IpAddr]) {
+        self.record_at(source, digest, name, ips, Instant::now());
+    }
+
+    fn record_at(&mut self, source: IpAddr, digest: [u8; 32], name: &str, ips: &[IpAddr], now: Instant) {
+        self.entries.retain(|_, entry| entry.deadline > now);
+        for &ip in ips {
+            let key = (source, ip, digest);
+            if let Some(entry) = self.entries.get_mut(&key) {
+                if entry.name != name { entry.ambiguous = true; }
+                // Do not renew an existing observation.
+            } else if self.entries.len() < Self::CAPACITY {
+                self.entries.insert(key, Hint {
+                    name: name.to_owned(), deadline: now + Self::WINDOW, ambiguous: false,
+                });
+            }
+        }
+    }
+
+    pub(crate) fn get(&self, source: IpAddr, ip: IpAddr, digest: [u8; 32]) -> Option<String> {
+        self.get_at(source, ip, digest, Instant::now())
+    }
+
+    fn get_at(&self, source: IpAddr, ip: IpAddr, digest: [u8; 32], now: Instant) -> Option<String> {
+        let entry = self.entries.get(&(source, ip, digest))?;
+        (!entry.ambiguous && entry.deadline > now).then(|| entry.name.clone())
+    }
+}
+
 pub(crate) const MAX_QUERY:usize=4096;
 const MAX_UDP:usize=1232;
 const MAX_TCP:usize=4096;
@@ -40,6 +87,14 @@ impl Question {
         Some(Self{id:bytes[..2].try_into().ok()?,rd:flags,name,wire:bytes[12..offset].to_vec(),kind,limit,edns})
     }
     pub(crate) fn name(&self)->&str {&self.name}
+    /// Only addresses actually present in a non-truncated answer can
+    /// be used as diagnostic hints. They carry no authoritative TTL.
+    pub(crate) fn hint_ips(&self, answer: &[u8], ips: &[IpAddr]) -> Vec<IpAddr> {
+        if word(answer,2).is_none_or(|flags| flags & 0x020f != 0) || word(answer,6)==Some(0) {
+            return Vec::new();
+        }
+        ips.iter().copied().filter(|ip| if self.kind==1 {ip.is_ipv4()} else {ip.is_ipv6()}).collect()
+    }
     fn header(&self,flags:u16,count:u16)->Vec<u8> {
         let mut out=Vec::with_capacity(512);
         out.extend_from_slice(&self.id);
@@ -84,6 +139,22 @@ mod tests {
     fn query()->Vec<u8>{
         let mut q=vec![0x12,0x34,1,0,0,1,0,0,0,0,0,0];
         q.extend_from_slice(b"\x07Example\x03org\x00\x00\x01\x00\x01");q
+    }
+    #[test]
+    fn probe_hint_is_scoped_ambiguous_and_nonrenewable() {
+        let source = "192.0.2.1".parse().unwrap();
+        let other = "192.0.2.2".parse().unwrap();
+        let ip = "198.51.100.1".parse().unwrap();
+        let now = Instant::now();
+        let mut hints = ProbeHints::default();
+        hints.record_at(source,[1;32],"one.example",&[ip],now);
+        assert_eq!(hints.get_at(source,ip,[1;32],now).as_deref(),Some("one.example"));
+        assert!(hints.get_at(other,ip,[1;32],now).is_none());
+        assert!(hints.get_at(source,ip,[2;32],now).is_none());
+        hints.record_at(source,[1;32],"one.example",&[ip],now+Duration::from_secs(4));
+        assert!(hints.get_at(source,ip,[1;32],now+Duration::from_secs(5)).is_none());
+        hints.record_at(source,[1;32],"two.example",&[ip],now+Duration::from_secs(4));
+        assert!(hints.get_at(source,ip,[1;32],now+Duration::from_secs(4)).is_none());
     }
     #[test]
     fn exact_question_zero_ttl_family_and_truncation() {

@@ -296,7 +296,7 @@ pub(super) async fn probe(
 ) -> Option<()> {
     let server_name = rustls::pki_types::ServerName::try_from(name.to_owned()).ok()?;
     let mut tls = rustls::ClientConnection::new(config, server_name).ok()?;
-    let mut socket = super::tcp::connect(address).await.ok()?;
+    let (mut socket, _admission) = super::tcp::connect(address).await.ok()?;
     if scope.is_some_and(|scope| {
         !socket
             .local_addr()

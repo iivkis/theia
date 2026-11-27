@@ -280,6 +280,36 @@ async fn relay_local(
     .await
 }
 
+/// The unified native lab commits a real transformation only. All other
+/// strategies are rejected; there is no fallback after this boundary.
+#[cfg(target_os = "linux")]
+pub(crate) async fn relay_native_modify_lab(
+    verified: &crate::routing::dpi::VerifiedUdp,
+    first: Vec<u8>,
+    upload: mpsc::Receiver<Vec<u8>>,
+    download: mpsc::Sender<Vec<u8>>,
+    flow: &crate::routing::flow::FlowLease,
+) -> Result<(), ClientError> {
+    use crate::routing::dpi::{UdpStrategy, udp::{BindingStrategy, prepare_binding}};
+    if !verified.admissible()? {
+        return Err(ClientError::Open(ErrorCode::PolicyDenied));
+    }
+    match verified.strategy {
+        UdpStrategy::Quic(_) => relay_quic_lab(verified, first, upload, download, flow).await,
+        UdpStrategy::StunBinding(BindingStrategy::Fingerprint) => {
+            if !prepare_binding(&first, BindingStrategy::Fingerprint)
+                .is_some_and(|bytes| bytes.as_ref() != first.as_slice()) {
+                return Err(ClientError::Open(ErrorCode::PolicyDenied));
+            }
+            let result = relay_stun(&verified.socket, BindingStrategy::Fingerprint,
+                first, upload, download, Some(flow)).await;
+            if matches!(&result, Err(LocalRelayError::Peer(_))) { verified.failed(); }
+            result.map_err(LocalRelayError::into_client)
+        }
+        _ => Err(ClientError::Open(ErrorCode::PolicyDenied)),
+    }
+}
+
 /// Explicit native lab only. Ordinary proxy relay still refuses
 /// reachability-only QUIC as Modify. The actual first datagram must split.
 #[cfg(target_os = "linux")]

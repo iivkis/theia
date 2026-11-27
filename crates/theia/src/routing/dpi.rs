@@ -100,6 +100,7 @@ pub(crate) struct VerifiedUdp {
     pub(crate) strategy: UdpStrategy,
     engine: Arc<Engine>,
     key: Key,
+    _admission: super::carrier_socket::Lease,
 }
 impl VerifiedUdp {
     pub(crate) fn check_policy(&self) -> Result<(), ClientError> {
@@ -149,6 +150,7 @@ impl VerifiedUdp {
         Self {
             socket,
             strategy: UdpStrategy::Quic(crate::quic_core::wire::Version::V1),
+            _admission: Default::default(),
             engine,
             key: Key {
                 name: "example.org".into(),
@@ -163,13 +165,14 @@ impl VerifiedUdp {
 async fn scoped_udp(
     address: SocketAddr,
     scope: network_scope::Scope,
-) -> Option<tokio::net::UdpSocket> {
-    let socket = tokio::net::UdpSocket::bind(scope.bind_address())
-        .await
-        .ok()?;
+) -> Option<(tokio::net::UdpSocket, super::carrier_socket::Lease)> {
+    let socket = super::carrier_socket::bind_udp(scope.bind_address()).await.ok()?;
+    // The local bind is concrete before registering the exact endpoint.
+    // No STUN probe or user datagram may precede the owned lease.
+    let admission = super::carrier_socket::udp(&socket, address).ok()?;
     socket.connect(address).await.ok()?;
     (socket.peer_addr().ok()? == address && scope.matches_local(socket.local_addr().ok()?))
-        .then_some(socket)
+        .then_some((socket, admission))
 }
 
 impl Default for Engine {
@@ -365,6 +368,7 @@ impl Engine {
                         return Some(VerifiedUdp {
                             socket,
                             strategy: UdpStrategy::Quic(version),
+                            _admission: Default::default(),
                             engine: self.clone(),
                             key,
                         });
@@ -432,7 +436,7 @@ impl Engine {
                     udp::BindingStrategy::Plain,
                 ] {
                     let good = timeout(Duration::from_millis(1200), async {
-                        let socket = scoped_udp(address, network).await?;
+                        let (socket, _admission) = scoped_udp(address, network).await?;
                         if !self.stun_enabled()
                             || !self.policy_current(policy)
                             || network_scope::observe(address) != Some(network)
@@ -467,7 +471,7 @@ impl Engine {
                 let Some(strategy) = selected else {
                     continue;
                 };
-                if let Some(socket) = scoped_udp(address, network).await {
+                if let Some((socket, admission)) = scoped_udp(address, network).await {
                     if self.stun_enabled()
                         && self.policy_current(policy)
                         && network_scope::observe(address) == Some(network)
@@ -475,6 +479,7 @@ impl Engine {
                         return Some(VerifiedUdp {
                             socket,
                             strategy: UdpStrategy::StunBinding(strategy),
+                            _admission: admission,
                             engine: self.clone(),
                             key,
                         });
@@ -555,11 +560,12 @@ impl Engine {
                     continue;
                 }
                 match timeout(ATTEMPT, tcp::connect(address)).await {
-                    Ok(Ok(target)) if self.enabled() && self.policy_current(policy)
+                    Ok(Ok((target, admission))) if self.enabled() && self.policy_current(policy)
                         && network_scope::observe(address) == Some(network)
                         && target.local_addr().is_ok_and(|local| network.matches_local(local)) => {
                         return Some(Tunnel {
                             target,
+                            _admission: admission,
                             strategy,
                             lease,
                             engine: self.clone(),
@@ -587,6 +593,7 @@ impl Engine {
 
 pub(crate) struct Tunnel {
     target: TcpStream,
+    _admission: super::carrier_socket::Lease,
     strategy: Strategy,
     lease: Lease,
     engine: Arc<Engine>,
@@ -615,6 +622,24 @@ impl FallbackPolicy {
     }
 }
 
+/// Consume only the bounded initial flight. The name is a probe hint,
+/// never authenticated domain evidence. Preserve partial bytes on timeout.
+pub(crate) async fn read_tcp_hint(client: &mut TcpStream) -> Result<(Vec<u8>, Option<String>), ClientError> {
+    let mut prefix = Vec::new();
+    let ready = match timeout(FIRST_FLIGHT, tcp::read_hello(client, &mut prefix)).await {
+        Ok(Ok(ready)) => ready,
+        Ok(Err(error)) => return Err(error),
+        Err(_) => false,
+    };
+    let name = if ready {
+        match tls::inspect(&prefix) {
+            tls::Flight::Complete { name, .. } => Some(name),
+            _ => None,
+        }
+    } else { None };
+    Ok((prefix, name))
+}
+
 impl Tunnel {
     pub(crate) fn fallback_policy(&self) -> FallbackPolicy {
         FallbackPolicy {
@@ -624,16 +649,27 @@ impl Tunnel {
     }
 
     pub(crate) async fn relay_guarded(
-        mut self,
+        self,
         mut client: TcpStream,
         flow: Option<&super::flow::FlowLease>,
     ) -> Result<RelayOutcome, ClientError> {
-        let mut prefix = Vec::new();
-        let ready = match timeout(FIRST_FLIGHT, tcp::read_hello(&mut client, &mut prefix)).await {
-            Ok(Ok(ready)) => ready,
-            Ok(Err(error)) => return Err(error),
-            Err(_) => false,
-        };
+        let (prefix, name) = read_tcp_hint(&mut client).await?;
+        self.relay_prefix(client, prefix, name.is_some(), flow).await
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn matches_native_target(&self, key: super::packet::FlowKey) -> bool {
+        self.target.peer_addr().ok() == Some(key.destination)
+            && self.target.local_addr().is_ok_and(|a| a.ip() == key.source.ip())
+    }
+
+    pub(crate) async fn relay_prefix(
+        mut self,
+        mut client: TcpStream,
+        prefix: Vec<u8>,
+        ready: bool,
+        flow: Option<&super::flow::FlowLease>,
+    ) -> Result<RelayOutcome, ClientError> {
         // A superseded/expired policy is not permission for VPS fallback.
         if !self.engine.policy_current(self.key.policy) {
             return Err(stale_policy());
@@ -733,6 +769,7 @@ impl Tunnel {
         engine.authorize_policy(Some(super::client_state::LocalPolicy::fixture([1; 32])));
         Self {
             target,
+            _admission: Default::default(),
             strategy: Strategy::Header,
             lease: Lease::new(),
             engine,
@@ -743,6 +780,57 @@ impl Tunnel {
                 network: network_scope::Scope::fixture(address, 0),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod native_admission_tests {
+    use super::*;
+    use crate::routing::carrier_socket::{self, Registrar};
+    use std::io;
+    use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpSocket, UdpSocket}};
+
+    struct Refuse;
+    impl Registrar for Refuse {
+        fn tcp(&self, _: &TcpSocket, _: SocketAddr) -> io::Result<carrier_socket::Lease> {
+            Err(io::ErrorKind::PermissionDenied.into())
+        }
+        fn udp(&self, _: &UdpSocket, _: SocketAddr) -> io::Result<carrier_socket::Lease> {
+            Err(io::ErrorKind::PermissionDenied.into())
+        }
+        fn retire(&self) -> io::Result<()> { Ok(()) }
+    }
+
+    #[tokio::test]
+    async fn native_probe_cannot_dial_without_admission() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        carrier_socket::scope(Some(Arc::new(Refuse)), async {
+            assert!(tcp::connect(target).await.is_err());
+            if let Some(scope) = network_scope::observe(target) {
+                assert!(scoped_udp(target, scope).await.is_none());
+            }
+        }).await;
+        assert!(timeout(Duration::from_millis(50), listener.accept()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn native_tcp_hint_preserves_exact_consumed_prefix() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (sender, receiver) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()), listener.accept()
+        );
+        let mut sender = sender.unwrap();
+        let (mut receiver, _) = receiver.unwrap();
+        let hello = tls::fixture("example.org");
+        sender.write_all(&hello).await.unwrap();
+        sender.write_all(b"following bytes").await.unwrap();
+        let (prefix, name) = read_tcp_hint(&mut receiver).await.unwrap();
+        assert_eq!(prefix, hello);
+        assert_eq!(name.as_deref(), Some("example.org"));
+        let mut following = [0; 15];
+        receiver.read_exact(&mut following).await.unwrap();
+        assert_eq!(&following, b"following bytes");
     }
 }
 
@@ -874,9 +962,10 @@ mod tests {
             policy,
             network,
         };
-        let socket = scoped_udp(address, network).await.unwrap();
+        let (socket, admission) = scoped_udp(address, network).await.unwrap();
         let verified = VerifiedUdp {
             socket,
+            _admission: admission,
             strategy: UdpStrategy::StunBinding(udp::BindingStrategy::Fingerprint),
             engine: engine.clone(),
             key: key.clone(),

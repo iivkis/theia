@@ -2,7 +2,7 @@
 # the selected interface (not only TCP/UDP). Do not run over remote access.
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory=$true)][ValidateSet('Prepare','Verify','Recover','CaptureVerify')][string]$Mode,
+    [Parameter(Mandatory=$true)][ValidateSet('Prepare','Verify','Recover','CaptureVerify','RedirectVerify')][string]$Mode,
     [Parameter(Mandatory=$true)][string]$JournalDirectory,
     [Parameter(Mandatory=$true)][string]$Helper,
     [Parameter(Mandatory=$true)][string]$HelperSha256,
@@ -18,6 +18,10 @@ param(
     [string]$DllSha256,
     [string]$SysSha256,
     [uint32]$CaptureInterfaceIndex,
+    [uint32]$CarrierInterfaceIndex,
+    [string]$ClientConfig,
+    [string]$ClientConfigSha256,
+    [switch]$ConfirmIsolatedTwoInterface,
     [ValidateRange(1,30)][int]$CaptureSeconds=10
 )
 $ErrorActionPreference='Stop'
@@ -129,7 +133,7 @@ try {
             $r=Read-Pinned $intentLease $IntentSha256
             if ($r.Version -notin @(1,2) -or $r.Machine -cne $machine -or $r.HelperSha256 -cne $hash) { throw 'Intent scope/version mismatch.' }
             if ($RequireDifferentBoot -and $r.BootUtc -eq $boot) { throw 'Reboot has not been observed.' }
-            $operation=switch($Mode) {'Prepare' {'install'} 'Verify' {'inspect'} 'CaptureVerify' {'inspect'} 'Recover' {'recover'}}
+            $operation=switch($Mode) {'Prepare' {'install'} 'Verify' {'inspect'} 'CaptureVerify' {'inspect'} 'RedirectVerify' {'inspect'} 'Recover' {'recover'}}
             if ($r.Version -eq 1) {
                 $plans=@($r)
                 $bootConfigured=$false
@@ -165,7 +169,8 @@ try {
             if ($state -cne $expected) { throw 'Unexpected committed WFP state; retain journal.' }
             $null=Read-Pinned $intentLease $IntentSha256
             $captureObserved=$null
-            if ($Mode -eq 'CaptureVerify') {
+            $redirectCompleted=$false
+            if ($Mode -in @('CaptureVerify','RedirectVerify')) {
                 if (!$TheiaExe -or !$DriverDirectory -or !$CaptureInterfaceIndex -or
                     $TheiaSha256 -cnotmatch '^[a-f0-9]{64}$' -or
                     $DllSha256 -cnotmatch '^[a-f0-9]{64}$' -or
@@ -174,6 +179,22 @@ try {
                 }
                 $adapters=@(Get-NetAdapter -IncludeHidden | Where-Object { $_.ifIndex -eq $CaptureInterfaceIndex })
                 if ($adapters.Count -ne 1 -or (CanonicalGuid ([string]$adapters[0].InterfaceGuid)) -cnotin $seenInterfaces) { throw 'Capture interface is not covered by the pinned guard.' }
+                $configLease=$null
+                if ($Mode -eq 'RedirectVerify') {
+                    if (!$ConfirmIsolatedTwoInterface -or !$CarrierInterfaceIndex -or
+                        $CarrierInterfaceIndex -eq $CaptureInterfaceIndex -or $CaptureSeconds -lt 5 -or
+                        !$ClientConfig -or $ClientConfigSha256 -cnotmatch '^[a-f0-9]{64}$') {
+                        throw 'Explicit pinned config and separate outside carrier interface required.'
+                    }
+                    $carriers=@(Get-NetAdapter -IncludeHidden | Where-Object { $_.ifIndex -eq $CarrierInterfaceIndex })
+                    if ($carriers.Count -ne 1 -or (CanonicalGuid ([string]$carriers[0].InterfaceGuid)) -cin $seenInterfaces) {
+                        throw 'Lab carrier interface must be outside the persistent guard scope.'
+                    }
+                    $carrierGuid=CanonicalGuid ([string]$carriers[0].InterfaceGuid)
+                    $config=Assert-Regular ([IO.Path]::GetFullPath($ClientConfig))
+                    $null=Assert-ProtectedDirectory $config.DirectoryName
+                    if ($config.Extension -ine '.toml') { throw 'Pinned client TOML required.' }
+                }
                 $exe=Assert-Regular ([IO.Path]::GetFullPath($TheiaExe))
                 $null=Assert-ProtectedDirectory $exe.DirectoryName
                 if ($exe.Extension -ine '.exe') { throw 'Executable required.' }
@@ -184,21 +205,41 @@ try {
                     try { $actual=[BitConverter]::ToString($digest.ComputeHash($exeLease)).Replace('-','').ToLowerInvariant() } finally { $digest.Dispose() }
                     if ($actual -cne $TheiaSha256) { throw 'Capture executable hash mismatch.' }
                     try {
-                        $captureOutput=(& $exe.FullName client windivert --scope-drop-lab --directory $driverDir --dll-sha256 $DllSha256 --sys-sha256 $SysSha256 --interface-index $CaptureInterfaceIndex --seconds $CaptureSeconds --confirm-block | Out-String)
-                        $captureExit=$LASTEXITCODE
-                        $observations=[regex]::Matches($captureOutput,'(?m)\bobserved=(\d+)\b')
-                        if ($captureExit -ne 0 -or $observations.Count -ne 1) { throw 'Capture verification failed.' }
-                        $captureObserved=[uint64]$observations[0].Groups[1].Value
-                        if ($captureObserved -eq 0) { throw 'No packets observed; joint capture evidence is inconclusive.' }
+                        if ($Mode -eq 'RedirectVerify') {
+                            $configLease=[IO.File]::Open($config.FullName,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+                            if ($configLease.Length -lt 1 -or $configLease.Length -gt 1048576) { throw 'Invalid client config length.' }
+                            $digest=[Security.Cryptography.SHA256]::Create()
+                            try { $actual=[BitConverter]::ToString($digest.ComputeHash($configLease)).Replace('-','').ToLowerInvariant() } finally { $digest.Dispose() }
+                            if ($actual -cne $ClientConfigSha256) { throw 'Client config hash mismatch.' }
+                            $null=(& $exe.FullName client windivert --interface-redirect-lab --config $config.FullName --directory $driverDir --dll-sha256 $DllSha256 --sys-sha256 $SysSha256 --capture-interface $CaptureInterfaceIndex --carrier-interface $CarrierInterfaceIndex --seconds $CaptureSeconds --confirm-isolated-two-interface)
+                            if ($LASTEXITCODE -ne 0) { throw 'Joint redirect command failed; retain guard.' }
+                            $carriers=@(Get-NetAdapter -IncludeHidden | Where-Object { $_.ifIndex -eq $CarrierInterfaceIndex })
+                            if ($carriers.Count -ne 1 -or (CanonicalGuid ([string]$carriers[0].InterfaceGuid)) -cne $carrierGuid) {
+                                throw 'Carrier interface changed during redirect.'
+                            }
+                            $redirectCompleted=$true
+                        } else {
+                            $captureOutput=(& $exe.FullName client windivert --scope-drop-lab --directory $driverDir --dll-sha256 $DllSha256 --sys-sha256 $SysSha256 --interface-index $CaptureInterfaceIndex --seconds $CaptureSeconds --confirm-block | Out-String)
+                            $captureExit=$LASTEXITCODE
+                            $observations=[regex]::Matches($captureOutput,'(?m)\bobserved=(\d+)\b')
+                            if ($captureExit -ne 0 -or $observations.Count -ne 1) { throw 'Capture verification failed.' }
+                            $captureObserved=[uint64]$observations[0].Groups[1].Value
+                            if ($captureObserved -eq 0) { throw 'No packets observed; joint capture evidence is inconclusive.' }
+                        }
                     } finally {
                         $state=(& $helperFile.FullName @native)
                         if ($LASTEXITCODE -ne 0 -or $state -cne 'exact') { throw 'Guard changed during capture; retain journal.' }
                         $null=Read-Pinned $intentLease $IntentSha256
                     }
-                } finally { $exeLease.Dispose() }
+                } finally {
+                    if ($null -ne $configLease) { $configLease.Dispose() }
+                    $exeLease.Dispose()
+                }
             }
             [pscustomobject]@{Version=$r.Version;IntentSha256=$IntentSha256;BootUtc=$boot;State=$state;
                 JointCaptureChecked=($Mode -eq 'CaptureVerify');CaptureObserved=$captureObserved;
+                JointRedirectCommandCompleted=$redirectCompleted;RedirectExchangeVerified=$false;
+                FullHostCarrierExclusionVerified=$false;
                 Interfaces=$seenInterfaces;TransactionalObjectCas=$true;PacketEnforcementVerified=$false;
                 BootTimeObjectsConfigured=($bootConfigured -and $state -ceq 'exact');
                 BootTimeCoverageVerified=$false;ProductionCaptureReady=$false} | ConvertTo-Json -Compress

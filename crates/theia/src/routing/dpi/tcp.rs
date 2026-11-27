@@ -7,13 +7,24 @@ use tokio::{
     net::TcpStream,
 };
 
-pub(super) async fn connect(address: SocketAddr) -> io::Result<TcpStream> {
-    let socket = TcpStream::connect(address).await?;
+pub(super) async fn connect(address: SocketAddr) -> io::Result<(TcpStream, crate::routing::carrier_socket::Lease)> {
+    use crate::routing::carrier_socket;
+    let (socket, admission) = if carrier_socket::active() {
+        let local = crate::local_proxy::route_source(address)
+            .ok_or(io::ErrorKind::PermissionDenied)?;
+        let socket = if address.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
+        carrier_socket::prepare_tcp(&socket)?;
+        socket.bind(SocketAddr::new(local.ip(), 0))?;
+        let admission = carrier_socket::tcp(&socket, address)?;
+        (socket.connect(address).await?, admission)
+    } else {
+        (TcpStream::connect(address).await?, Default::default())
+    };
     socket.set_nodelay(true)?;
     if socket.peer_addr()? != address || !socket.nodelay()? {
         return Err(io::Error::other("socket policy not confirmed"));
     }
-    Ok(socket)
+    Ok((socket, admission))
 }
 
 /// Cancellation-safe bounded read: every consumed byte stays in prefix,

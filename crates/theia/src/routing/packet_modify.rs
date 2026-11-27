@@ -380,17 +380,20 @@ pub fn quic_initial_datagrams(data: &[u8], expected_name: &str) -> Option<Vec<Ve
     (result.len() > 1).then_some(result)
 }
 
-/// An untrusted probe hint, never a domain identity. The unified Linux
-/// lab accepts only a complete v1 H3 Initial with a real transformation.
-/// v2 remains a separate acceptance boundary.
+/// An untrusted probe hint, never a domain identity. The lab accepts
+/// complete v1/v2 H3 Initials only if an actual transformation is possible.
+/// The caller must independently verify the exact version, not downgrade.
 #[cfg(target_os = "linux")]
-pub(crate) fn unified_quic_hint(data: &[u8]) -> Option<String> {
+pub(crate) fn unified_quic_hint(data: &[u8]) -> Option<(String, crate::quic_core::wire::Version)> {
     use super::dpi::udp::{Candidate, Observer};
-    let Candidate::QuicH3(name) = Observer::default().outgoing(data) else {
-        return None;
+    use crate::quic_core::wire::Version;
+    let (name, version) = match Observer::default().outgoing(data) {
+        Candidate::QuicH3(name) => (name, Version::V1),
+        Candidate::QuicV2H3(name) => (name, Version::V2),
+        _ => return None,
     };
     quic_initial_datagrams(data, &name)?;
-    Some(name)
+    Some((name, version))
 }
 
 #[cfg(test)]
@@ -835,8 +838,8 @@ mod tests {
             {
                 assert!(unified_quic_hint(&initial).is_none());
                 assert_eq!(
-                    unified_quic_hint(&data).as_deref(),
-                    (version == wire::V1).then_some("example.org")
+                    unified_quic_hint(&data),
+                    Some(("example.org".to_owned(), crate::quic_core::wire::Version::from_wire(version).unwrap()))
                 );
             }
             assert_eq!(split, vec![initial, tail]);

@@ -1957,6 +1957,8 @@ impl ClientRuntime {
             verdict_gate: Mutex::new(()),
             #[cfg(target_os = "linux")]
             raw: Mutex::new(std::collections::HashMap::new()),
+            #[cfg(target_os = "linux")]
+            dns_probe_hints: Mutex::new(crate::routing::native_dns::ProbeHints::default()),
             #[cfg(target_os="linux")]
             unified:std::sync::atomic::AtomicBool::new(false),
             #[cfg(target_os = "linux")]
@@ -2243,6 +2245,8 @@ pub struct NativeIngress {
     verdict_gate: Mutex<()>,
     #[cfg(target_os = "linux")]
     raw: Mutex<std::collections::HashMap<crate::routing::packet::FlowKey, RawLease>>,
+    #[cfg(target_os = "linux")]
+    dns_probe_hints: Mutex<crate::routing::native_dns::ProbeHints>,
     #[cfg(target_os="linux")]
     unified:std::sync::atomic::AtomicBool,
     #[cfg(target_os = "linux")]
@@ -3579,10 +3583,81 @@ impl NativeIngress {
             biased;
             () = self.stopped() => Err(ClientError::Open(ErrorCode::PolicyDenied)),
             result = async {
-                let (carrier, flow, address) = self.redirect(key).await?;
+                let (carrier, flow, address, snapshot, configured) = self.redirect_selection(key).await?;
+                #[cfg(target_os = "linux")]
+                if configured == crate::routing::PacketAction::Modify
+                    && self.unified.load(std::sync::atomic::Ordering::Acquire) {
+                    let registrar = self.registrar()?.ok_or(ClientError::Open(ErrorCode::PolicyDenied))?;
+                    return crate::routing::carrier_socket::scope(Some(registrar),
+                        self.relay_unified_tcp(key, stream, carrier, address, &snapshot, &flow)).await;
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = (snapshot, configured);
                 let tunnel = crate::routing::carrier_socket::scope(self.registrar()?, carrier.open(address, key.destination.port())).await?;
                 tunnel.relay_guarded(stream, Some(&flow)).await
             } => result,
+        }
+    }
+
+    /// TLS-record Modify for a terminated TCP flow in the unified Linux
+    /// lab. No raw TCP packet injection is claimed. Preserve exact prefix
+    /// and original literal target on unsupported pre-send traffic.
+    #[cfg(target_os = "linux")]
+    async fn relay_unified_tcp(
+        &self, key: crate::routing::packet::FlowKey, mut stream: TcpStream,
+        carrier: Carrier, address: Address, snapshot: &Snapshot,
+        flow: &crate::routing::flow::FlowLease,
+    ) -> Result<(), ClientError> {
+        use crate::routing::{dpi, Evidence};
+        let denied = || ClientError::Open(ErrorCode::PolicyDenied);
+        let digest = snapshot.digest();
+        let cache = self.client.routing_cache();
+        self.check_unified_redirect(key, digest)?;
+        let mut prefix = Vec::new();
+        if cache.dpi.enabled() && matches!(key.destination.port(), 443 | 8443)
+            && crate::server::allowed_destination(key.destination.ip(), false) {
+            let (bytes, hint) = dpi::read_tcp_hint(&mut stream).await?;
+            prefix = bytes;
+            self.check_unified_redirect(key, digest)?;
+            if let Some(name) = hint {
+                for evidence in [Evidence::Unknown, Evidence::Known(name.as_str())] {
+                    if snapshot.policy().classify_with_application(evidence,
+                        Evidence::Known(key.destination.ip()), Evidence::Unknown)
+                        .map_err(|_| denied())?.action() != Some(Action::DirectDpi) {
+                        return Err(denied());
+                    }
+                }
+                if !route_source(key.destination).is_some_and(|source| source.ip() == key.source.ip()) {
+                    return Err(denied());
+                }
+                match carrier.resolve_routing(&name, digest).await {
+                    Ok(ips) => {
+                        if !ips.contains(&key.destination.ip()) { return Err(denied()); }
+                        self.check_unified_redirect(key, digest)?;
+                        let tunnel = cache.dpi.open(&name, key.destination.port(),
+                            &[key.destination.ip()], digest).await.ok_or_else(denied)?;
+                        if !tunnel.matches_native_target(key) { return Err(denied()); }
+                        self.check_unified_redirect(key, digest)?;
+                        // Once local execution begins, even a pre-write scope
+                        // failure is a denial in this lab; no ambiguous fallback.
+                        return match tunnel.relay_prefix(stream, prefix, true, Some(flow)).await? {
+                            dpi::RelayOutcome::Finished => Ok(()),
+                            dpi::RelayOutcome::Fallback { .. } => Err(denied()),
+                        };
+                    }
+                    Err(ClientError::Rejected(502 | 504)) => (),
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        self.check_unified_redirect(key, digest)?;
+        let tunnel = carrier.open(address, key.destination.port()).await?;
+        self.check_unified_redirect(key, digest)?;
+        let stream = crate::reality_tcp::Prefixed::new(stream, prefix.into());
+        match tunnel {
+            ProxyTunnel::H2(tunnel) => tunnel.relay_guarded(stream, Some(flow)).await,
+            ProxyTunnel::H3(tunnel) => tunnel.relay_guarded(stream, Some(flow)).await,
+            _ => Err(denied()),
         }
     }
 
@@ -3769,7 +3844,7 @@ impl NativeIngress {
                 let local = if self.unified.load(std::sync::atomic::Ordering::Acquire)
                     && configured == PacketAction::Modify {
                     crate::routing::carrier_socket::scope(Some(registrar.clone()),
-                        self.prepare_unified_quic(key, &first.payload, &carrier, &snapshot, registrar.as_ref())).await?
+                        self.prepare_unified_udp(key, &first.payload, &carrier, &snapshot, registrar.as_ref())).await?
                 } else { None };
                 let actual = if local.is_some() { PacketAction::Modify } else { PacketAction::Redirect };
                 let reply = crate::routing::linux_ingress::UdpReply::open(&first).map_err(|_| ClientError::Io)?;
@@ -3789,7 +3864,7 @@ impl NativeIngress {
                     if let Some((verified, _local_admission)) = local {
                         // This consumes the first datagram exactly once. No
                         // branch back to Redirect after entering local relay.
-                        return crate::udp_relay::relay_quic_lab(&verified,
+                        return crate::udp_relay::relay_native_modify_lab(&verified,
                             first_payload.ok_or(ClientError::Protocol)?, up, down, &flow).await;
                     }
                     let tunnel = crate::routing::carrier_socket::scope(Some(registrar.clone()),
@@ -3820,12 +3895,12 @@ impl NativeIngress {
         }
     }
 
-    /// Select a real QUIC v1 datagram transformation for the unified Linux
-    /// lab. SNI is only a probe hint: unknown domain/application evidence
-    /// must already yield Modify, and the original IP is never replaced.
+    /// Select a real QUIC v1/v2 or credential-free STUN transformation.
+    /// SNI/protected DNS observations are only probe hints: unknown
+    /// domain/application evidence must already yield Modify.
     /// No local application bytes are sent during preparation.
     #[cfg(target_os = "linux")]
-    async fn prepare_unified_quic(
+    async fn prepare_unified_udp(
         &self,
         key: crate::routing::packet::FlowKey,
         first: &[u8],
@@ -3840,14 +3915,27 @@ impl NativeIngress {
         self.check_unified_redirect(key, digest)?;
         cache.dpi.check_policy(digest)?;
         if !cache.dpi.enabled() || key.transport != Transport::Udp
-            || key.destination.port() != 443
             || !crate::server::allowed_destination(key.destination.ip(), false)
         {
             return Ok(None);
         }
-        let Some(name) = crate::routing::packet_modify::unified_quic_hint(first) else {
-            // QUIC v2, incomplete flights and non-QUIC remain Redirect.
-            return Ok(None);
+        let (name, version) = match key.destination.port() {
+            443 => {
+                let Some((name, version)) = crate::routing::packet_modify::unified_quic_hint(first) else {
+                    return Ok(None);
+                };
+                (name, Some(version))
+            }
+            3478 if cache.dpi.stun_enabled() && crate::routing::dpi::udp::prepare_binding(
+                first, crate::routing::dpi::udp::BindingStrategy::Fingerprint)
+                    .is_some_and(|bytes| bytes.as_ref() != first) => {
+                let Some(name) = self.dns_probe_hints.lock().map_err(|_| denied())?
+                    .get(key.source.ip(), key.destination.ip(), digest) else {
+                    return Ok(None);
+                };
+                (name, None)
+            }
+            _ => return Ok(None),
         };
         for evidence in [Evidence::Unknown, Evidence::Known(name.as_str())] {
             if snapshot.policy().classify_with_application(evidence,
@@ -3874,17 +3962,35 @@ impl NativeIngress {
         // The probe API returns None for both transport and security
         // failures. Until it has a typed failure contract, do not treat
         // that ambiguity as permission to fall back.
-        let verified = cache.dpi.open_quic_udp(&name, 443, &[key.destination.ip()], digest)
-            .await.ok_or_else(denied)?;
-        if verified.quic_batch(first).is_none()
-            || verified.socket.peer_addr().ok() != Some(key.destination)
+        let verified = match version {
+            Some(version) => cache.dpi.open_quic_udp_version(&name, 443, &[key.destination.ip()], digest, version).await,
+            None => cache.dpi.open_stun_udp(&name, 3478, &[key.destination.ip()], digest).await,
+        }.ok_or_else(denied)?;
+        let modifies = match version {
+            Some(_) => verified.quic_batch(first).is_some(),
+            None => matches!(verified.strategy, crate::routing::dpi::UdpStrategy::StunBinding(
+                crate::routing::dpi::udp::BindingStrategy::Fingerprint))
+                && crate::routing::dpi::udp::prepare_binding(first, crate::routing::dpi::udp::BindingStrategy::Fingerprint)
+                    .is_some_and(|bytes| bytes.as_ref() != first),
+        };
+        if !modifies || verified.socket.peer_addr().ok() != Some(key.destination)
             || !verified.socket.local_addr().is_ok_and(|local| local.ip() == key.source.ip())
             || !verified.admissible()?
         {
             return Err(denied());
         }
         self.check_unified_redirect(key, digest)?;
-        let lease = registrar.udp(&verified.socket, key.destination).map_err(|_| denied())?;
+        if version.is_none() && self.dns_probe_hints.lock().map_err(|_| denied())?
+            .get(key.source.ip(), key.destination.ip(), digest).as_deref() != Some(name.as_str()) {
+            return Err(denied());
+        }
+        // STUN's owned socket was registered before connect by scoped_udp
+        // and retains its own lease. QUIC's application socket is distinct
+        // from the probe and must be registered here, before first send.
+        let lease = match version {
+            Some(_) => registrar.udp(&verified.socket, key.destination).map_err(|_| denied())?,
+            None => Default::default(),
+        };
         self.check_unified_redirect(key, digest)?;
         Ok(Some((verified, lease)))
     }
@@ -3933,7 +4039,12 @@ impl NativeIngress {
                 selected=Some(action);
             }
             allowed()?;
-            Ok(question.answer(&ips,tcp))
+            let answer = question.answer(&ips,tcp);
+            let hints = question.hint_ips(&answer,&ips);
+            self.dns_probe_hints.lock().map_err(|_|denied())?
+                .record(key.source.ip(),digest,question.name(),&hints);
+            allowed()?;
+            Ok(answer)
         }).await
     }
 
