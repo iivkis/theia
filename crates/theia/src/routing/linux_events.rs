@@ -257,6 +257,16 @@ mod tests {
         let event = KernelFlowEvent::parse(&wire).unwrap();
         assert_eq!(event.pid, 42);
         assert_eq!(event.destination, "192.0.2.1:443".parse().unwrap());
+        #[cfg(feature="linux-ebpf-lab")]
+        {
+            assert!(event.same_actor(&KernelFlowEvent{timestamp:2,..event}));
+            assert!(!event.same_actor(&KernelFlowEvent{pid:43,..event}));
+            assert!(!event.same_actor(&KernelFlowEvent{process_start:2,..event}));
+            assert!(!event.same_actor(&KernelFlowEvent{inode:2,..event}));
+            assert!(!event.same_actor(&KernelFlowEvent{cookie:2,..event}));
+            assert!(!event.same_actor(&KernelFlowEvent{destination:"192.0.2.1:444".parse().unwrap(),..event}));
+            assert_eq!(event.timestamp(),1);
+        }
         for i in 0..SIZE {
             assert!(KernelFlowEvent::parse(&wire[..i]).is_err());
         }

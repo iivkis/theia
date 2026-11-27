@@ -1,0 +1,11 @@
+# Linux pre-verdict attribution boundary
+
+The normal NFQUEUE consumer still classifies application and domain evidence as Unknown. The optional isolated tagged-socket consumer runs the same native verdict path with an additional mandatory kernel socket gate:
+
+- The kernel nftables LOCAL_OUT socket mark and complete TCP/UDP tuple select a separate non-bypass queue for an explicitly owned, connected socket.
+- The private queue identity, exact socket cookie, rule owner nonce and nftables generation must agree before the policy lookup and immediately before the actual NFQUEUE verdict. Carrier rule CAS transactions preserve the tagged rule. An unmarked packet with the reserved tuple on the ordinary queue is denied.
+- `serve_linux_collected_queues` additionally owns a live, pinned CO-RE cgroup connect/sendmsg collector on the namespace's current-thread executor. A `VerdictCollector` is created from that collector, the live tagged descriptor and the original process FD number. Its private ring is drained before and after policy work, with loss checks, process birth, socket cookie, executable inode/dev and SHA-256 corroboration. Missing, stale, conflicting or revoked observations deny the tagged packet, and the raw flow latch cannot be reused under a different cookie.
+- `cgroup_skb/egress` is downstream of LOCAL_OUT: its observations are not used to approve the held NFQUEUE packet.
+- This is a one-tagged-socket lab and not an application hash authorization source. A connect/sendmsg observation plus a live descriptor does not identify every sender using a shared or inherited socket. Expiry is intentionally conservative (two seconds); persistent traffic without fresh corroboration is denied. No arbitrary-application acquisition, production host capture, loaded-image attestation or transparent application-based routing is claimed.
+
+The existing privileged tagged-queue fixture now exercises actual kernel queue selection, owned rules CAS, a stale generation, a cleared mark on the same tuple and a different ordinary socket. Native raw verdict regressions cover cookie replacement and attempts to reuse a denied flow. The optional collector still requires verifier and physical integration acceptance. Do not equate fixture source or static code inspection with test execution.

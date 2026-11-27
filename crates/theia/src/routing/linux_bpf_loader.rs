@@ -415,11 +415,13 @@ impl Collector {
     /// Loss is terminal for the entire session, not just for one event.
     pub fn poll(&mut self,timeout_ms:u32)->io::Result<Option<CollectedEvent>> {
         let mut wait=timeout_ms;
-        while let Some(record)=self.poll_record(wait)? {
+        for _ in 0..MAX_BUFFER {
+            let Some(record)=self.poll_record(wait)? else {return Ok(None);};
             if record.event.fresh().is_ok() {return Ok(Some(record));}
             wait=0;
         }
-        Ok(None)
+        self.buffer.poison();
+        Err(denied())
     }
 
     /// Keep stale records for the verdict collector's ambiguity
@@ -477,6 +479,19 @@ impl VerdictCollector {
         Ok(())
     }
 
+    fn drain(&mut self)->io::Result<()> {
+        if self.retired {return Err(denied());}
+        for _ in 0..MAX_BUFFER {
+            match self.collector.poll_record(0) {
+                Ok(Some(record))=>self.observe(record)?,
+                Ok(None)=>return Ok(()),
+                Err(error)=>{self.retired=true;return Err(error);}
+            }
+        }
+        self.retired=true;
+        Err(denied())
+    }
+
     /// Called while the packet is held in NFQUEUE, both before and after
     /// policy evaluation. Drain the actual private ring, never the
     /// downstream cgroup_skb egress observations. A busy/overflowed or
@@ -485,21 +500,23 @@ impl VerdictCollector {
         packet:&super::nfqueue::Packet<'_>,proof:super::linux_rules::CapturedSocket)
         ->io::Result<CorroboratedFlow> {
         if self.retired || proof.cookie()!=self.expected_cookie {return Err(denied());}
-        for _ in 0..MAX_BUFFER {
-            match self.collector.poll_record(0) {
-                Ok(Some(record))=>self.observe(record)?,
-                Ok(None)=>{
-                    let candidate=self.candidate.as_ref().ok_or_else(denied)?;
-                    let observed=candidate.corroborate_packet(rules,packet,self.fd)?;
-                    if observed.cookie()!=proof.cookie() || observed.key()!=proof.key() ||
-                        rules.captured_socket(packet)?!=proof {return Err(denied());}
-                    return Ok(observed);
-                },
-                Err(error)=>{self.retired=true;return Err(error);}
-            }
+        self.drain()?;
+        let candidate=self.candidate.as_ref().ok_or_else(denied)?;
+        let actor=candidate.event;
+        let observed=candidate.corroborate_packet(rules,packet,self.fd)?;
+        // Hashing /proc/PID/exe may take time. Consume newly arrived
+        // competing events before allowing this diagnostic gate to
+        // succeed. The final kernel verdict remains separately guarded.
+        self.drain()?;
+        let current=self.candidate.as_ref().ok_or_else(denied)?;
+        current.loss.check()?;
+        current.event.fresh()?;
+        if !current.event.same_actor(&actor) || observed.cookie()!=proof.cookie() ||
+            observed.key()!=proof.key() || rules.captured_socket(packet)?!=proof {
+            self.retired=true;
+            return Err(denied());
         }
-        self.retired=true;
-        Err(denied())
+        Ok(observed)
     }
 }
 
