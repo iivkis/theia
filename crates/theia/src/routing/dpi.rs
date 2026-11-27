@@ -1270,4 +1270,131 @@ mod tests {
         .await
         .unwrap();
     }
+    /// The peer is an independent Python/OpenSSL TLS implementation with a
+    /// deliberately narrow synthetic record filter. This exercises the
+    /// actual Rust probe AND actual proxy relay, not the transform helper
+    /// in isolation. No real network or public-IP exception is required.
+    #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
+    #[tokio::test]
+    async fn independent_openssl_record_filter_and_application_exchange() {
+        use std::{io::{BufRead, BufReader}, process::{Child, Command, Stdio}};
+        use tokio::io::AsyncReadExt;
+        const PING: &[u8] = b"theia-dpi-ping";
+        const PONG: &[u8] = b"theia-dpi-pong";
+        struct ChildGuard(Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        struct FixtureDir(std::path::PathBuf);
+        impl Drop for FixtureDir {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        use ring::rand::{SecureRandom, SystemRandom};
+        let mut random = [0; 16];
+        SystemRandom::new().fill(&mut random).unwrap();
+        let unique: String = random.iter().map(|b| format!("{b:02x}")).collect();
+        let directory = FixtureDir(std::env::temp_dir().join(format!("theia-dpi-{unique}")));
+        std::fs::create_dir(&directory.0).unwrap();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_path = directory.0.join("cert.pem");
+        let key_path = directory.0.join("key.pem");
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let config = tls::tls_config(roots).unwrap();
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/anti-dpi-tls-peer.py");
+        let python = std::env::var_os("THEIA_DPI_PYTHON").unwrap_or_else(||
+            if cfg!(windows) { "python".into() } else { "python3".into() });
+        let mut peer = ChildGuard(Command::new(python).arg(script)
+            .arg("--cert").arg(&cert_path).arg("--key").arg(&key_path)
+            .stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn().unwrap());
+        let stdout = peer.0.stdout.take().unwrap();
+        let (events, incoming) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if events.send(line).is_err() { break; }
+            }
+        });
+        let ready = incoming.recv_timeout(Duration::from_secs(10)).unwrap();
+        let port: u16 = ready.strip_prefix("READY ").unwrap().parse().unwrap();
+        let address: SocketAddr = ([127, 0, 0, 1], port).into();
+
+        async fn application(
+            socket: TcpStream, config: Arc<rustls::ClientConfig>,
+        ) -> std::io::Result<()> {
+            let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+            let mut tls = tokio_rustls::TlsConnector::from(config).connect(name, socket).await?;
+            tls.write_all(PING).await?;
+            let mut reply = [0; PONG.len()];
+            tls.read_exact(&mut reply).await?;
+            assert_eq!(reply.as_slice(), PONG);
+            tls.shutdown().await?;
+            let mut tail = Vec::new();
+            tls.read_to_end(&mut tail).await?;
+            assert!(tail.is_empty());
+            Ok(())
+        }
+
+        // Ordinary TLS reaches the peer without the filter, and the same
+        // ordinary TLS fails once the synthetic filter is enabled.
+        timeout(Duration::from_secs(10), application(TcpStream::connect(address).await.unwrap(), config.clone()))
+            .await.unwrap().unwrap();
+        let blocked = timeout(Duration::from_secs(10), application(TcpStream::connect(address).await.unwrap(), config.clone()))
+            .await.unwrap();
+        assert!(blocked.is_err(), "unmodified control must fail");
+
+        for strategy in Strategy::ALL {
+            let verdict = tls::probe_guarded("localhost", address, None, strategy, config.clone(),
+                ATTEMPT, || true).await;
+            assert_eq!(verdict, tls::ProbeVerdict::Verified);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (app, accepted) = tokio::join!(TcpStream::connect(listener.local_addr().unwrap()), listener.accept());
+            let app = app.unwrap();
+            let local = accepted.unwrap().0;
+            let target = TcpStream::connect(address).await.unwrap();
+            let mut tunnel = Tunnel::fixture(target, "localhost");
+            tunnel.strategy = strategy;
+            tunnel.key.network = (0..16).find_map(|_| network_scope::observe(address)).unwrap();
+            tunnel.engine.set_enabled(true);
+            tunnel.lease = tunnel.engine.cache.remember(&tunnel.key, Verdict::Verified(strategy)).unwrap();
+            let flow = super::super::flow::FlowTable::shared().begin(
+                tunnel.engine.clone(), super::super::flow::Protocol::Tcp,
+                crate::protocol::Address::Dns("localhost".into()), port, tunnel.key.policy,
+                super::super::PacketAction::Modify,
+            ).unwrap();
+            let (relay, application_result) = timeout(Duration::from_secs(10), async {
+                tokio::join!(tunnel.relay_guarded(local, Some(&flow)), application(app, config.clone()))
+            }).await.unwrap();
+            assert!(matches!(relay, Ok(RelayOutcome::Finished)));
+            application_result.unwrap();
+            assert!(flow.committed(super::super::PacketAction::Modify));
+        }
+
+        for expected in [
+            "PASS baseline records=1 handshake=1 exchange=1",
+            "PASS blocked records=1 handshake=0 exchange=0",
+            "PASS header-probe records=2 handshake=1 exchange=0",
+            "PASS header records=2 handshake=1 exchange=1",
+            "PASS middle-probe records=2 handshake=1 exchange=0",
+            "PASS middle records=2 handshake=1 exchange=1",
+            "PASS balanced-probe records=4 handshake=1 exchange=0",
+            "PASS balanced records=4 handshake=1 exchange=1",
+        ] {
+            let actual = incoming.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(actual, expected);
+            println!("{actual}");
+        }
+        let version = incoming.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(version.starts_with("OPENSSL "));
+        println!("{version}");
+        assert!(peer.0.wait().unwrap().success());
+        reader.join().unwrap();
+    }
+
 }
