@@ -357,7 +357,7 @@ impl Collector {
         // The flow-only collector has no packet ring consumer.
         // Never attach or load the optional egress program here.
         let egress = unsafe {
-            bpf_object__find_program_by_name(object.0.as_ptr(), b"theia_egress\0".as_ptr().cast())
+            bpf_object__find_program_by_name(object.0.as_ptr(), c"theia_egress".as_ptr())
         };
         if egress.is_null() {
             return Err(denied());
@@ -682,7 +682,7 @@ impl PacketCollector {
             result(unsafe { bpf_program__set_autoload(program, false) })?;
         }
         let program = unsafe {
-            bpf_object__find_program_by_name(object.0.as_ptr(), b"theia_egress\0".as_ptr().cast())
+            bpf_object__find_program_by_name(object.0.as_ptr(), c"theia_egress".as_ptr())
         };
         if program.is_null() {
             return Err(denied());
