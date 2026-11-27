@@ -146,3 +146,7 @@ Prepare pins the helper hash, machine, boot, interface GUID/LUID, random sublaye
 ```
 
 Physical acceptance requires a distinct management interface/local console, independent packet capture on the selected interface, TCP/UDP/non-TCP/UDP IPv4/IPv6, existing connections, simultaneous process termination, reboot, interface LUID change and conflicting WFP objects. Do not equate transactional object recovery with production CAS across an active capture/carrier epoch.
+
+### Generic scoped capture/drop laboratory
+
+With the official WinDivert package already installed and pinned, an explicitly authorized local-console operator on a disposable machine can run `theia client windivert --scope-drop-lab --directory DIR --dll-sha256 HEX --sys-sha256 HEX --interface-index N --seconds 1..30 --confirm-block`. This opens a bounded NETWORK consumer and an independent lower DROP handle on the exact interface, without process or target filtering. It discards all captured packets, including unsupported traffic; the only output is aggregate TCP/UDP v4/v6, unsupported and distinct-tuple counts. No app attribution, user payload export, redirect, carrier exemption or production readiness is asserted. The WinDivert handles are temporary; an independently installed and verified persistent WFP fixture is a separate experiment, not automatically combined with capture. Never run this on a remotely managed or production interface.

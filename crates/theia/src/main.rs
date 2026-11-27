@@ -86,6 +86,19 @@ async fn run() {
             tokio::time::sleep(std::time::Duration::from_secs(20)).await;
             Ok("WinDivert handle holder exited".to_owned())
         }
+        Ok(Command::ClientWinDivertScopeDropLab { directory,dll_sha256,sys_sha256,interface,seconds }) => {
+            #[cfg(all(windows,target_arch="x86_64"))]
+            {
+                theia::routing::windivert::scope_drop_acceptance(directory.into(),dll_sha256,sys_sha256,interface,seconds).await
+                    .map(|s|format!("WinDivert scope drop lab finished; observed={} tcp4={} tcp6={} udp4={} udp6={} unsupported_or_malformed={} distinct_tuples={}; all captured packets discarded; no persistent protection or application identity asserted",s.observed(),s.tcp_v4,s.tcp_v6,s.udp_v4,s.udp_v6,s.unsupported_or_malformed,s.distinct_tuples))
+                    .map_err(|_|CliError::Client(theia::client::ClientError::Io))
+            }
+            #[cfg(not(all(windows,target_arch="x86_64")))]
+            {
+                let _=(directory,dll_sha256,sys_sha256,interface,seconds);
+                Err(CliError::NotImplemented("WinDivert x64 Windows backend"))
+            }
+        }
         Ok(Command::ClientWinDivertTcpRelayLab { config,directory,dll_sha256,sys_sha256,target }) => {
             #[cfg(all(windows,target_arch="x86_64"))]
             {

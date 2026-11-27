@@ -3,7 +3,10 @@
 // machine and a specifically reviewed non-loopback interface.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#include <winsock2.h>
 #include <windows.h>
+#include <rpc.h>
+#include <initguid.h>
 #include <fwpmu.h>
 #include <iphlpapi.h>
 #include <netioapi.h>
@@ -20,6 +23,7 @@
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "uuid.lib")
 
 namespace {
 constexpr wchar_t name[] = L"Theia isolated persistent interface guard v1";

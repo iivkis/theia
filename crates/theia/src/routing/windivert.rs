@@ -106,6 +106,75 @@ impl Address {
     }
 }
 
+/// A bounded, interface-scoped capture experiment. All packets in this
+/// experiment are dropped, even if a known tuple is seen. No application
+/// hash, endpoint candidate, or carrier lease can authorize reinjection.
+/// Counters are the only externally observable output.
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
+const MAX_SCOPE_PACKETS: usize = 16_384;
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ScopeCaptureStats {
+    pub tcp_v4: usize,
+    pub tcp_v6: usize,
+    pub udp_v4: usize,
+    pub udp_v6: usize,
+    pub unsupported_or_malformed: usize,
+    pub distinct_tuples: usize,
+}
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
+impl ScopeCaptureStats {
+    pub fn observed(&self) -> usize {
+        self.tcp_v4+self.tcp_v6+self.udp_v4+self.udp_v6+self.unsupported_or_malformed
+    }
+}
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
+struct ScopeCaptureLedger {
+    interface:u32,
+    stats:ScopeCaptureStats,
+    tuples:std::collections::HashSet<super::packet::FlowKey>,
+}
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
+impl ScopeCaptureLedger {
+    fn new(interface:u32)->Option<Self> {
+        (interface!=0).then(||Self{interface,stats:ScopeCaptureStats::default(),tuples:Default::default()})
+    }
+    fn observe(&mut self,address:&Address,packet:&[u8])->Result<(),ParseError> {
+        use super::packet::Transport;
+        if self.stats.observed()>=MAX_SCOPE_PACKETS {
+            return Err(ParseError::Invalid);
+        }
+        // Check the ownership of the capture scope even for packets whose
+        // L3/L4 format is unsupported. Inconsistent metadata ends the
+        // experiment, rather than silently accepting a different scope.
+        if address.timestamp<=0 || address.flags&0xffff!=0 ||
+            address.flags&(1<<17)==0 || address.flags&((1<<16)|(1<<18))!=0 ||
+            address.flags>>24!=0 || address.reserved!=0 ||
+            u32::from_le_bytes(address.data[..4].try_into().unwrap())!=self.interface {
+            return Err(ParseError::Invalid);
+        }
+        let observation=match address.network(packet) {
+            Ok(observation)=>observation,
+            Err(_)=>{
+                self.stats.unsupported_or_malformed+=1;
+                return Ok(());
+            }
+        };
+        let key=observation.meta.flow;
+        match (key.transport,key.source.is_ipv6()) {
+            (Transport::Tcp,false)=>self.stats.tcp_v4+=1,
+            (Transport::Tcp,true)=>self.stats.tcp_v6+=1,
+            (Transport::Udp,false)=>self.stats.udp_v4+=1,
+            (Transport::Udp,true)=>self.stats.udp_v6+=1,
+        }
+        // The entire capture epoch is bounded. Never reuse a tuple as
+        // socket identity, never retain payload, never emit target data.
+        self.tuples.insert(key);
+        self.stats.distinct_tuples=self.tuples.len();
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EndpointCandidate {
     pub endpoint: u64,
@@ -1700,6 +1769,71 @@ mod native {
         api.retire(handle)
     }
 
+    fn interface_identity(index:u32)->io::Result<(u64,u32,u16,u16,[u8;8])> {
+        use windows_sys::Win32::NetworkManagement::IpHelper::{GetIfEntry2,MIB_IF_ROW2};
+        if index==0 { return Err(io::ErrorKind::InvalidInput.into()); }
+        let mut row:MIB_IF_ROW2=unsafe {std::mem::zeroed()};
+        row.InterfaceIndex=index;
+        let status=unsafe {GetIfEntry2(&mut row)};
+        if status!=0 { return Err(io::Error::from_raw_os_error(status as i32)); }
+        let luid=unsafe {row.InterfaceLuid.Value};
+        // IF_TYPE_SOFTWARE_LOOPBACK == 24.
+        if row.InterfaceIndex!=index || row.Type==24 || luid==0 {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        let id=row.InterfaceGuid;
+        Ok((luid,id.data1,id.data2,id.data3,id.data4))
+    }
+
+    /// Real diverted packets from arbitrary processes on one explicitly
+    /// selected disposable-machine interface. No SOCKS, echo socket or
+    /// application-specific filter. All captured packets are dropped; the
+    /// lower DROP handle protects overflow while these handles live.
+    /// This does not install persistent protection or prove attribution.
+    pub async fn scope_drop_acceptance(directory:std::path::PathBuf,dll:[u8;32],sys:[u8;32],
+        interface:u32,seconds:u32)->io::Result<ScopeCaptureStats> {
+        if !(1..=30).contains(&seconds) || interface==0 { return Err(io::ErrorKind::InvalidInput.into()); }
+        let cancel=Cancel(Arc::new(AtomicBool::new(false)));
+        let signal=cancel.0.clone();
+        let result=tokio::task::spawn_blocking(move || {
+            let identity=interface_identity(interface)?;
+            let api=load(&directory,dll,sys)?;
+            let filter=std::ffi::CString::new(format!("outbound and !loopback and ifIdx == {interface}"))
+                .map_err(|_|io::ErrorKind::InvalidInput)?;
+            let guard=api.open_priority(&filter,0,-100,0x12)?;
+            let capture=api.open_priority(&filter,0,100,0x14)?;
+            api.bounded(&capture)?;
+            let mut ledger=ScopeCaptureLedger::new(interface).ok_or(io::ErrorKind::InvalidInput)?;
+            let deadline=Instant::now()+Duration::from_secs(u64::from(seconds));
+            let result=(||->io::Result<ScopeCaptureStats> {
+                while Instant::now()<deadline && ledger.stats.observed()<MAX_SCOPE_PACKETS {
+                    if signal.load(Ordering::Acquire) { return Err(io::ErrorKind::Interrupted.into()); }
+                    if interface_identity(interface)?!=identity { return Err(io::ErrorKind::PermissionDenied.into()); }
+                    let receive_until=std::cmp::min(deadline,Instant::now()+Duration::from_millis(100));
+                    match api.receive(&capture,&signal,receive_until) {
+                        Ok((packet,address))=>{
+                            ledger.observe(&address,&packet).map_err(|_|io::ErrorKind::InvalidData)?;
+                        },
+                        Err(error) if error.kind()==io::ErrorKind::TimedOut=>{},
+                        Err(error)=>return Err(error),
+                    }
+                }
+                if interface_identity(interface)?!=identity { return Err(io::ErrorKind::PermissionDenied.into()); }
+                Ok(ledger.stats)
+            })();
+            // The capture handle is retired before the lower drop handle.
+            // There is no injector and no path that forwards payload.
+            let retired=api.retire(capture);
+            let released=guard.close();
+            let stats=result?;
+            retired?;
+            released?;
+            Ok(stats)
+        }).await.map_err(|_|io::Error::other("WinDivert scope worker failed"))?;
+        drop(cancel);
+        result
+    }
+
     /// The async owner never runs driver IO on an executor thread.
     /// Dropping the future requests cancellation, and the worker retains
     /// the DLL, handles and operation buffers until completion.
@@ -1722,7 +1856,7 @@ mod native {
     }
 }
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-pub use native::{loopback_acceptance, probe};
+pub use native::{loopback_acceptance, probe, scope_drop_acceptance};
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub(crate) use native::{begin_udp_relay_lab, run_tcp_relay_lab, RelayLab, UDP_LAB_DATAGRAMS};
 
@@ -1761,6 +1895,48 @@ mod tests {
             assert!(Address::from_bytes(&bad).network(&udp).is_err());
         }
         for i in 0..udp.len() { assert!(addr.network(&udp[..i]).is_err()); }
+    }
+    #[test]
+    fn scope_drop_observes_arbitrary_tuples_without_authorizing_them() {
+        let mut raw=[0u8;80];
+        raw[..8].copy_from_slice(&1i64.to_le_bytes());
+        raw[8..12].copy_from_slice(&(1u32<<17).to_le_bytes());
+        raw[16..20].copy_from_slice(&7u32.to_le_bytes());
+        let addr=Address::from_bytes(&raw);
+        let mut udp=[0u8;28];
+        udp[0]=0x45;udp[2..4].copy_from_slice(&28u16.to_be_bytes());udp[9]=17;
+        udp[12..16].copy_from_slice(&[192,0,2,1]);udp[16..20].copy_from_slice(&[198,51,100,2]);
+        udp[20..22].copy_from_slice(&1000u16.to_be_bytes());
+        udp[22..24].copy_from_slice(&443u16.to_be_bytes());udp[24..26].copy_from_slice(&8u16.to_be_bytes());
+        let mut ledger=ScopeCaptureLedger::new(7).unwrap();
+        ledger.observe(&addr,&udp).unwrap();
+        ledger.observe(&addr,&udp).unwrap();
+        udp[20..22].copy_from_slice(&1001u16.to_be_bytes());
+        ledger.observe(&addr,&udp).unwrap();
+        let mut tcp=[0u8;40];
+        tcp[..20].copy_from_slice(&udp[..20]);tcp[2..4].copy_from_slice(&40u16.to_be_bytes());tcp[9]=6;
+        tcp[20..24].copy_from_slice(&udp[20..24]);tcp[32]=0x50;tcp[33]=2;
+        ledger.observe(&addr,&tcp).unwrap();
+        let mut v6=[0u8;48];
+        v6[0]=0x60;v6[4..6].copy_from_slice(&8u16.to_be_bytes());v6[6]=17;
+        v6[8..24].copy_from_slice(&"2001:db8::1".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        v6[24..40].copy_from_slice(&"2001:db8::2".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        v6[40..48].copy_from_slice(&udp[20..28]);
+        raw[8..12].copy_from_slice(&((1u32<<17)|(1<<20)).to_le_bytes());
+        ledger.observe(&Address::from_bytes(&raw),&v6).unwrap();
+        assert_eq!(ledger.stats.udp_v4,3);
+        assert_eq!(ledger.stats.tcp_v4,1);
+        assert_eq!(ledger.stats.udp_v6,1);
+        assert_eq!(ledger.stats.distinct_tuples,4);
+        ledger.observe(&addr,&[0]).unwrap();
+        assert_eq!(ledger.stats.unsupported_or_malformed,1);
+        raw[16..20].copy_from_slice(&8u32.to_le_bytes());
+        assert!(ledger.observe(&Address::from_bytes(&raw),&v6).is_err());
+        assert!(ScopeCaptureLedger::new(0).is_none());
+        let mut sniffed=addr;
+        sniffed.flags|=1<<16;
+        assert!(ledger.observe(&sniffed,&udp).is_err());
+        assert_eq!(ledger.stats.observed(),6);
     }
     #[test]
     fn reverse_datagrams_preserve_original_peer_and_checksums() {
