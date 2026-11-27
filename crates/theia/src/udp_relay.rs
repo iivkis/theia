@@ -282,7 +282,7 @@ async fn relay_local(
 
 /// The unified native lab commits a real transformation only. All other
 /// strategies are rejected; there is no fallback after this boundary.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
 pub(crate) async fn relay_native_modify_lab(
     verified: &crate::routing::dpi::VerifiedUdp,
     first: Vec<u8>,
@@ -312,7 +312,7 @@ pub(crate) async fn relay_native_modify_lab(
 
 /// Explicit native lab only. Ordinary proxy relay still refuses
 /// reachability-only QUIC as Modify. The actual first datagram must split.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
 pub(crate) async fn relay_quic_lab(
     verified: &crate::routing::dpi::VerifiedUdp,
     first: Vec<u8>,

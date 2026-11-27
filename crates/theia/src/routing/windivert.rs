@@ -392,7 +392,18 @@ struct CarrierState {
     next:u64,
     lab_blocked_ips:Vec<std::net::IpAddr>,
     #[cfg(all(target_os="windows",target_arch="x86_64"))]
-    lab_interfaces:Option<(u32,u32)>,
+    lab_interfaces:Option<LabInterfaces>,
+}
+#[cfg(all(target_os="windows",target_arch="x86_64"))]
+type InterfaceIdentity = (u64,u32,u16,u16,[u8;8]);
+#[cfg(all(target_os="windows",target_arch="x86_64"))]
+#[derive(Clone,Copy)]
+struct LabInterfaces {
+    capture:u32,
+    carrier:u32,
+    capture_identity:InterfaceIdentity,
+    carrier_identity:InterfaceIdentity,
+    epoch:u64,
 }
 #[derive(Clone,Copy)]
 struct CarrierEntry {
@@ -1319,18 +1330,51 @@ mod native {
     impl CarrierRegistry {
         pub(crate) fn for_interface_lab(capture:u32,carrier:u32)->io::Result<Self> {
             if capture==carrier {return Err(io::ErrorKind::InvalidInput.into());}
-            interface_identity(capture)?;
-            interface_identity(carrier)?;
+            let epoch=crate::network_scope::generation().ok_or(io::ErrorKind::PermissionDenied)?;
+            let pinned=LabInterfaces{capture,carrier,capture_identity:interface_identity(capture)?,
+                carrier_identity:interface_identity(carrier)?,epoch};
+            pinned.check()?;
             Ok(Self{state:Arc::new(Mutex::new(CarrierState {
-                lab_interfaces:Some((capture,carrier)),..CarrierState::default()
+                lab_interfaces:Some(pinned),..CarrierState::default()
             }))})
         }
+
+        fn current_interfaces(&self)->io::Result<Option<LabInterfaces>> {
+            let mut state=self.state.lock().map_err(|_|io::ErrorKind::PermissionDenied)?;
+            if state.retired {return Err(io::ErrorKind::PermissionDenied.into());}
+            if let Some(pinned)=state.lab_interfaces {
+                if let Err(error)=pinned.check() {
+                    state.retired=true;
+                    for entry in state.entries.values_mut() {entry.live=false;}
+                    return Err(error);
+                }
+            }
+            Ok(state.lab_interfaces)
+        }
+
+        /// Only the isolated two-interface lab can request local Modify.
+        /// This does not associate the NETWORK packet with an endpoint.
+        pub(crate) fn check_modify_scope(&self,key:super::super::packet::FlowKey)->io::Result<()> {
+            let pinned=self.current_interfaces()?.ok_or(io::ErrorKind::PermissionDenied)?;
+            if key.interface!=pinned.capture {return Err(io::ErrorKind::PermissionDenied.into());}
+            Ok(())
+        }
+
+        pub(crate) fn modify_source(&self,key:super::super::packet::FlowKey)->io::Result<std::net::IpAddr> {
+            self.check_modify_scope(key)?;
+            let pinned=self.current_interfaces()?.ok_or(io::ErrorKind::PermissionDenied)?;
+            let (source,index)=crate::local_proxy::windows_route_binding(key.destination).ok_or(io::ErrorKind::PermissionDenied)?;
+            pinned.check()?;
+            if index!=pinned.carrier || source.ip()==key.source.ip() {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            Ok(source.ip())
+        }
+
         fn pin_lab_carrier(&self,socket:&impl std::os::windows::io::AsRawSocket,
             local:std::net::SocketAddr,peer:std::net::SocketAddr)->io::Result<()> {
-            let pair=self.state.lock().map_err(|_|io::ErrorKind::PermissionDenied)?.lab_interfaces;
-            let Some((capture,carrier))=pair else {return Ok(());};
-            interface_identity(capture)?;
-            interface_identity(carrier)?;
+            let Some(pinned)=self.current_interfaces()? else {return Ok(());};
+            let carrier=pinned.carrier;
             let (source,index)=crate::local_proxy::windows_route_binding(peer).ok_or(io::ErrorKind::PermissionDenied)?;
             if index!=carrier || source.ip()!=local.ip() {return Err(io::ErrorKind::PermissionDenied.into());}
             // IP_UNICAST_IF uses network order for IPv4, host order for
@@ -1349,6 +1393,32 @@ mod native {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
             if crate::local_proxy::windows_route_binding(peer)!=Some((source,index)) {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            pinned.check()
+        }
+    }
+    #[cfg(test)]
+    #[test]
+    fn native_modify_without_two_interface_owner_is_denied() {
+        let registry=CarrierRegistry::default();
+        let key=super::super::packet::FlowKey {
+            source:"192.0.2.1:12345".parse().unwrap(),
+            destination:"198.51.100.1:443".parse().unwrap(),
+            transport:super::super::packet::Transport::Tcp,
+            interface:3,
+        };
+        assert!(registry.check_modify_scope(key).is_err());
+        assert!(registry.modify_source(key).is_err());
+        registry.retire();
+        assert!(registry.current_interfaces().is_err());
+    }
+    impl LabInterfaces {
+        fn check(self)->io::Result<()> {
+            if crate::network_scope::generation()!=Some(self.epoch)
+                || interface_identity(self.capture)?!=self.capture_identity
+                || interface_identity(self.carrier)?!=self.carrier_identity
+                || crate::network_scope::generation()!=Some(self.epoch) {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
             Ok(())

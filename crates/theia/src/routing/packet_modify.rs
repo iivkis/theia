@@ -383,7 +383,7 @@ pub fn quic_initial_datagrams(data: &[u8], expected_name: &str) -> Option<Vec<Ve
 /// An untrusted probe hint, never a domain identity. The lab accepts
 /// complete v1/v2 H3 Initials only if an actual transformation is possible.
 /// The caller must independently verify the exact version, not downgrade.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
 pub(crate) fn unified_quic_hint(data: &[u8]) -> Option<(String, crate::quic_core::wire::Version)> {
     use super::dpi::udp::{Candidate, Observer};
     use crate::quic_core::wire::Version;
@@ -846,7 +846,7 @@ mod tests {
             assert_eq!(split.concat(), data);
             data[100] ^= 1;
             assert!(quic_initial_datagrams(&data, "example.org").is_none());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
             assert!(unified_quic_hint(&data).is_none());
         }
     }

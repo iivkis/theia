@@ -126,7 +126,7 @@ impl VerifiedUdp {
                 .is_ok_and(|local| self.key.network.matches_local(local))
             && self.engine.cached_udp(&self.key, self.strategy.probe()) == Some(true))
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
     pub(crate) fn quic_batch(&self, first: &[u8]) -> Option<Vec<Vec<u8>>> {
         let UdpStrategy::Quic(version) = self.strategy else {
             return None;
@@ -357,7 +357,7 @@ impl Engine {
                 {
                     continue;
                 }
-                if let Ok(socket) = crate::udp_relay::connect(address).await {
+                if let Some((socket, admission)) = scoped_udp(address, network).await {
                     if self.enabled()
                         && self.policy_current(policy)
                         && network_scope::observe(address) == Some(network)
@@ -368,7 +368,7 @@ impl Engine {
                         return Some(VerifiedUdp {
                             socket,
                             strategy: UdpStrategy::Quic(version),
-                            _admission: Default::default(),
+                            _admission: admission,
                             engine: self.clone(),
                             key,
                         });
@@ -657,10 +657,10 @@ impl Tunnel {
         self.relay_prefix(client, prefix, name.is_some(), flow).await
     }
 
-    #[cfg(target_os = "linux")]
-    pub(crate) fn matches_native_target(&self, key: super::packet::FlowKey) -> bool {
+    #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
+    pub(crate) fn matches_native_target(&self, key: super::packet::FlowKey, source: IpAddr) -> bool {
         self.target.peer_addr().ok() == Some(key.destination)
-            && self.target.local_addr().is_ok_and(|a| a.ip() == key.source.ip())
+            && self.target.local_addr().is_ok_and(|a| a.ip() == source)
     }
 
     pub(crate) async fn relay_prefix(
@@ -812,6 +812,45 @@ mod native_admission_tests {
             }
         }).await;
         assert!(timeout(Duration::from_millis(50), listener.accept()).await.is_err());
+    }
+
+    #[cfg(any(target_os="linux",all(target_os="windows",target_arch="x86_64")))]
+    #[tokio::test]
+    async fn native_udp_socket_retains_exact_preconnect_lease() {
+        use std::sync::atomic::{AtomicUsize,Ordering as AtomicOrdering};
+        struct Count(Arc<AtomicUsize>);
+        impl Drop for Count {
+            fn drop(&mut self) {self.0.fetch_sub(1,AtomicOrdering::SeqCst);}
+        }
+        struct Admit {
+            count:Arc<AtomicUsize>,
+            peer:SocketAddr,
+        }
+        impl Registrar for Admit {
+            fn tcp(&self,_:&TcpSocket,_:SocketAddr)->io::Result<carrier_socket::Lease> {
+                Err(io::ErrorKind::PermissionDenied.into())
+            }
+            fn udp(&self,socket:&UdpSocket,peer:SocketAddr)->io::Result<carrier_socket::Lease> {
+                assert_eq!(peer,self.peer);
+                assert!(socket.peer_addr().is_err());
+                assert_eq!(socket.local_addr().unwrap().ip(),peer.ip());
+                assert_ne!(socket.local_addr().unwrap().port(),0);
+                self.count.fetch_add(1,AtomicOrdering::SeqCst);
+                Ok(carrier_socket::Lease::retain(Count(self.count.clone())))
+            }
+            fn retire(&self)->io::Result<()> {Ok(())}
+        }
+        let receiver=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer=receiver.local_addr().unwrap();
+        let network=network_scope::Scope::fixture(peer,0);
+        let count=Arc::new(AtomicUsize::new(0));
+        let owner=Arc::new(Admit{count:count.clone(),peer});
+        let (socket,lease)=carrier_socket::scope(Some(owner),scoped_udp(peer,network)).await.unwrap();
+        assert_eq!(socket.peer_addr().unwrap(),peer);
+        assert_eq!(count.load(AtomicOrdering::SeqCst),1);
+        drop(socket);
+        drop(lease);
+        assert_eq!(count.load(AtomicOrdering::SeqCst),0);
     }
 
     #[tokio::test]
