@@ -5438,27 +5438,6 @@ mod selector_tests {
                 datasets: None,
                 rules: vec![
                     crate::routing::Rule {
-                        name: "native test pass".into(),
-                        action: Action::Direct,
-                        domains: vec![],
-                        ips: vec!["192.0.2.0/24".into()],
-                        applications: vec![],
-                    },
-                    crate::routing::Rule {
-                        name: "native test redirect".into(),
-                        action: Action::Allowed,
-                        domains: vec![],
-                        ips: vec!["198.51.100.0/24".into()],
-                        applications: vec![],
-                    },
-                    crate::routing::Rule {
-                        name: "native test drop".into(),
-                        action: Action::Blocked,
-                        domains: vec![],
-                        ips: vec!["203.0.113.0/24".into()],
-                        applications: vec![],
-                    },
-                    crate::routing::Rule {
                         name: "local direct".into(),
                         action: Action::Direct,
                         domains: vec!["full:localhost".into()],
@@ -5486,7 +5465,7 @@ mod selector_tests {
             max_connections_total: 8,
             connect_timeout_ms: 1500,
         };
-        let context = Arc::new(ServerContext::new(&inbound, &[user], &policy));
+        let context = Arc::new(ServerContext::new(&inbound, std::slice::from_ref(&user), &policy));
         let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -5503,7 +5482,7 @@ mod selector_tests {
         let tcp_addr = tcp.local_addr().unwrap();
         let h2 = tokio::spawn(crate::server::serve(
             tcp,
-            tokio_rustls::TlsAcceptor::from(Arc::new(tls)),
+            tokio_rustls::TlsAcceptor::from(Arc::new(tls.clone())),
             context.clone(),
         ));
         let quic = crate::quic_transport::server_endpoint(
@@ -5524,10 +5503,10 @@ mod selector_tests {
                 profile.transport = transport;
                 profile.server = remote.to_string();
                 let proxy_client = load_client(&profile).await.unwrap();
-                let policy = proxy_client.routing_policy().await.unwrap();
-                assert_eq!(policy.manifest().revision, 2);
+                let snapshot = proxy_client.routing_policy().await.unwrap();
+                assert_eq!(snapshot.manifest().revision, 2);
                 assert_eq!(
-                    policy
+                    snapshot
                         .policy()
                         .matching_action(None, Some("127.0.0.1".parse().unwrap()))
                         .unwrap(),
@@ -5607,10 +5586,48 @@ mod selector_tests {
                         packet::{FlowKey, Transport as PacketTransport},
                         PacketAction,
                     };
+                    // Native packets have unknown domain evidence. Use an
+                    // independent authenticated policy, not earlier IP rules
+                    // that would prevent the ordinary proxy's domain decision
+                    // before DNS resolution, or earlier domain rules that
+                    // would prevent native IP-only authorization.
+                    let mut native_policy = policy.clone();
+                    native_policy.routing.as_mut().unwrap().rules = vec![
+                    crate::routing::Rule {
+                        name: "native test pass".into(),
+                        action: Action::Direct,
+                        domains: vec![],
+                        ips: vec!["192.0.2.0/24".into()],
+                        applications: vec![],
+                    },
+                    crate::routing::Rule {
+                        name: "native test redirect".into(),
+                        action: Action::Allowed,
+                        domains: vec![],
+                        ips: vec!["198.51.100.0/24".into()],
+                        applications: vec![],
+                    },
+                    crate::routing::Rule {
+                        name: "native test drop".into(),
+                        action: Action::Blocked,
+                        domains: vec![],
+                        ips: vec!["203.0.113.0/24".into()],
+                        applications: vec![],
+                    },
+                    ];
+                    let native_context = Arc::new(ServerContext::new(
+                        &inbound, std::slice::from_ref(&user), &native_policy
+                    ));
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let native_remote = listener.local_addr().unwrap();
+                    let native_server = tokio::spawn(crate::server::serve(
+                        listener, tokio_rustls::TlsAcceptor::from(Arc::new(tls.clone())), native_context
+                    ));
                     let path = directory.join("native.toml");
                     let mut native = doc.clone();
                     native.client.active_profile = profile.id.clone();
                     native.client.profiles = vec![profile.clone()];
+                    native.client.profiles[0].server = native_remote.to_string();
                     config::atomic_write(&path, &Config::Client(native)).unwrap();
                     let ingress = NativeIngress::prepare(&path).await.unwrap();
                     assert_eq!(ingress.runtime.capture_state.reported(), 1);
@@ -5741,6 +5758,7 @@ mod selector_tests {
                         .is_err());
                     let owner = NativeOwner::acquire().unwrap();
                     drop(owner);
+                    native_server.abort();
                 }
                 udp_prewrite_fallback_fixture(&proxy_client).await;
                 udp_revoked_fallback_fixture(&proxy_client).await;
