@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   capture:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
@@ -31,14 +31,65 @@ jobs:
           path: source
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+      - name: Check preinstalled native and rendering tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Hosted Ubuntu already ships most of these tools. Do not fetch
+          # unversioned apt metapackages just to replace working installations.
+          find_libclang() {
+            python3 - <<'PY'
+          import ctypes, glob, os
+          paths = sorted(glob.glob("/usr/lib/llvm-*/lib/libclang.so*") +
+                         glob.glob("/usr/lib/x86_64-linux-gnu/libclang-*.so*"),
+                         reverse=True)
+          for path in paths:
+              try:
+                  ctypes.CDLL(path)
+              except OSError:
+                  continue
+              print(os.path.dirname(path))
+              break
+          else:
+              raise SystemExit(1)
+          PY
+          }
+          missing=()
+          command -v cmake >/dev/null || missing+=(cmake)
+          command -v clang >/dev/null || missing+=(clang)
+          command -v pkg-config >/dev/null || missing+=(pkg-config)
+          find_libclang >/dev/null || missing+=(libclang-dev)
+          for font in DejaVuSansMono{,-Bold,-Oblique,-BoldOblique}.ttf; do
+            if [[ ! -r "/usr/share/fonts/truetype/dejavu/$font" ]]; then
+              missing+=(fonts-dejavu-core)
+              break
+            fi
+          done
+          # linux-ebpf-lab is not enabled in the locked default-feature review.
+          if (( ${#missing[@]} )); then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends "${missing[@]}"
+          fi
+          libclang="$(find_libclang)"
+          echo "LIBCLANG_PATH=$libclang" >> "$GITHUB_ENV"
+          cmake --version
+          clang --version
+          pkg-config --version
+          # Use a fixed Pillow version without apt's native dependency downloads.
+          if python3 -c 'import PIL; assert PIL.__version__ == "12.1.1"' 2>/dev/null; then
+            review_python="$(command -v python3)"
+          else
+            python3 -m venv "$RUNNER_TEMP/tui-review-python"
+            review_python="$RUNNER_TEMP/tui-review-python/bin/python"
+            "$review_python" -m pip --disable-pip-version-check install --only-binary=:all: Pillow==12.1.1
+          fi
+          "$review_python" -c 'from PIL import Image, ImageFont; ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 16)'
+          echo "REVIEW_PYTHON=$review_python" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: 'source -> target'
-          key: tui-review-linux
-      - name: Install native build and rendering tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y cmake clang libclang-dev pkg-config fonts-dejavu-core python3-pil libbpf-dev
+          key: tui-review-linux-24.04-v2
+          cache-workspace-crates: 'false'
       - name: Capture the real TUI renderer
         shell: bash
         run: |
@@ -67,8 +118,33 @@ jobs:
           PY
           cd source
           source_sha="$(git rev-parse HEAD)"
+          # Build the exact locked lib-test harness once. Keep each test in its
+          # own process as before; no shared global state or parallel port races.
+          build_json="$RUNNER_TEMP/tui-review-build.jsonl"
+          if ! time cargo test --locked -p theia --lib --no-run --message-format=json > "$build_json"; then
+            cat "$build_json"
+            exit 1
+          fi
+          test_bin="$("$REVIEW_PYTHON" - "$build_json" <<'PY'
+          import json, pathlib, sys
+          candidates = []
+          for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
+              item = json.loads(line)
+              if (item.get("reason") == "compiler-artifact" and
+                  item.get("target", {}).get("name") == "theia" and
+                  "lib" in item["target"]["kind"] and
+                  item.get("profile", {}).get("test") and item.get("executable")):
+                  candidates.append(item["executable"])
+          assert len(candidates) == 1, f"expected one lib-test harness, got {candidates}"
+          print(candidates[0])
+          PY
+          )"
+          test -x "$test_bin"
+          inventory="$RUNNER_TEMP/tui-review-tests.txt"
+          "$test_bin" --list --format terse > "$inventory"
           # Report every independent regression in one CI run; never publish on failure.
           failed=0
+          test_started=$SECONDS
           for test in \
             first_key_import_creates_active_profile_and_opens_connection_panel \
             common_import_dispatches_reality_key_to_masked_review_and_cancels_without_writes \
@@ -132,7 +208,11 @@ jobs:
           do
             echo "::group::$test"
             log="$RUNNER_TEMP/theia-review-$test.log"
-            if ! cargo test --locked -p theia --lib "$test" -- --nocapture --test-threads=1 2>&1 | tee "$log"; then
+            mapfile -t matches < <(awk -v filter="$test" '/: test$/ { sub(/: test$/, ""); if (index($0, filter)) print }' "$inventory")
+            if (( ${#matches[@]} != 1 )); then
+              echo "::error::Expected exactly one registered test for $test"
+              failed=1
+            elif ! "$test_bin" "${matches[0]}" --exact --nocapture --test-threads=1 2>&1 | tee "$log"; then
               failed=1
             elif ! grep -Eq 'test result: ok\. 1 passed; 0 failed' "$log"; then
               echo "::error::Expected exactly one passing test: $test"
@@ -141,13 +221,15 @@ jobs:
             echo "::endgroup::"
           done
           test "$failed" -eq 0
-          /usr/bin/python3 ../review/tools/tui-review/render.py "$THEIA_REVIEW_CELLS" "$RUNNER_TEMP/tui-gallery" --source-sha "$source_sha"
+          echo "Selected test execution: $((SECONDS - test_started)) seconds"
+          time "$REVIEW_PYTHON" ../review/tools/tui-review/render.py "$THEIA_REVIEW_CELLS" "$RUNNER_TEMP/tui-gallery" --source-sha "$source_sha"
       - uses: actions/upload-artifact@v4
         with:
           name: tui-review-linux
           path: ${{ runner.temp }}/tui-gallery
           if-no-files-found: error
           retention-days: 14
+          compression-level: 0
 
   publish:
     needs: capture

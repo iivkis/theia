@@ -85,14 +85,14 @@ def main():
     required.update(["state-reality-step4-tls-expanded","state-reality-step3-dns-progress","state-reality-step5-ranked-expanded","state-reality-step5-long-report","state-reality-step5-no-eligible-expanded","state-reality-step6-save-inspection","state-reality-step6-success","state-reality-step2-extra-sources","state-reality-step1-grant-picker"])
     required.update(["state-reality-step2-domain-editor","state-reality-step5-long-report-scrolled","state-reality-step6-key-handoff"])
     required.update(["server-page-overview","server-page-connections","server-page-users","server-page-users-disabled","server-page-management","server-page-traffic","server-page-settings","server-page-diagnostics","client-page-overview","client-page-profiles","client-page-import","client-page-proxy","client-page-traffic","client-page-settings","server-overview-next-step","client-overview-next-step","server-sections-focus","client-sections-focus","client-action-invitation-import","server-action-recover-user"])
-    obsolete = set(["server-page-invitations","client-page-diagnostics","client-action-reality-import","server-command-menu","client-command-menu","server-focus-actions","client-focus-actions"])
+    obsolete = set(["server-page-invitations","client-page-diagnostics","client-action-reality-import","server-command-menu","client-command-menu","server-focus-actions","client-focus-actions","server-action-apply-rights","server-action-restart-preflight","server-traffic-monitor-idle","server-action-server-process"])
     actual = {e["scenario"] for e in entries}
     assert not obsolete & actual, f"obsolete duplicate screens: {sorted(obsolete & actual)}"
     required.update(["server-page-advanced","client-page-advanced","client-page-import-masked","server-page-users-ungranted","server-action-delete-user-confirm"])
     missing = required - actual
     assert not missing, f"missing required screens: {sorted(missing)}"
     hashes = {e["scenario"]: e["sha256"] for e in entries}
-    assert hashes["server-action-server-process"] != hashes["server-page-connections"], "server process screenshot duplicates connections"
+    assert hashes["server-page-management"] != hashes["server-page-connections"], "management screenshot duplicates connections"
     assert len(entries) >= 50, f"unexpectedly incomplete gallery: {len(entries)}"
     manifest = {"schema_version":1,"source_sha":args.source_sha,"platform":"linux","columns":120,"rows":40,
                 "pixel_width":1200,"pixel_height":840,"renderer":"Ratatui TestBackend + DejaVu Sans Mono",
