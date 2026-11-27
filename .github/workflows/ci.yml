@@ -185,6 +185,14 @@ jobs:
           cache-workspace-crates: false
           cache-bin: false
           save-if: false
+      - name: Verify native product graph has no Quinn packages
+        shell: bash
+        run: |
+          cargo tree --locked -p theia -e normal,build --all-features --prefix none > normal-dependencies.txt
+          if grep -E '^(quinn|quinn-proto|quinn-udp|h3-quinn) v' normal-dependencies.txt; then
+            echo "::error::Quinn leaked into product dependencies"
+            exit 1
+          fi
       - name: Build genuine Linux server for Windows cross-OS F-14 E2E
         if: runner.os == 'Linux'
         run: cargo build --workspace --locked --bin theia
@@ -403,8 +411,17 @@ jobs:
           python-version: '3.12'
       - name: Install pinned CI-only VT screen driver for real Linux PTY
         run: python -m pip install pyte==0.8.2
+      - name: Install native eBPF linker and isolated kernel test dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libbpf-dev nftables iproute2
       - name: Native Linux tests
         run: cargo nextest run --workspace --all-targets --locked --no-fail-fast
+      - name: F-15 isolated kernel capture and hard-kill recovery (mandatory)
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n unshare -n true
+          cargo test --locked -p theia --lib --no-run --message-format=json > f15-test-build.json
+          python3 scripts/f15-kernel-tests.py f15-test-build.json
       - name: Lints
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       # Optional release-profile compilation uses the same post-merge CI.
@@ -592,6 +609,10 @@ jobs:
         run: cargo test --workspace --locked --test independent_native_tls native_clients_require_pki_and_exact_alpn -- --ignored --exact --nocapture
       - name: Independent aioquic v1/v2 against native QUIC core (laboratory)
         run: cargo test --workspace --locked --test independent_native_quic independent_aioquic_v1_v2_bidirectional_h3 -- --ignored --exact --nocapture
+      - name: Independent aioquic authentication of v1/v2 Modify output (laboratory)
+        run: cargo test --workspace --locked --lib routing::packet_modify::tests::independent_aioquic_initial_modify_v1_v2 -- --ignored --exact --nocapture
+      - name: Independent live QUIC v1/v2 TLS resumption and H3 after Modify
+        run: cargo test --workspace --locked --test independent_quic_modify independent_aioquic_live_modify_v1_v2 -- --ignored --exact --nocapture
       - name: Measure matched native and Quinn loopback samples (diagnostic)
         run: python tests/benchmark/run_native_quic_comparison.py --revision "${{ needs.specification.outputs.tested_sha }}" --output native-quic-comparison.json
       - uses: actions/upload-artifact@v4
@@ -908,6 +929,9 @@ jobs:
       - name: Install pinned Windows ConPTY test dependency
         if: runner.os == 'Windows'
         run: python -m pip install pywinpty==3.0.5
+      - name: Install native eBPF linker dependency (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libbpf-dev
       - name: Purge any restored profile counters before instrumenting this SHA
         run: cargo llvm-cov clean --profraw-only
       - name: Instrument full native workspace tests
@@ -983,9 +1007,67 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  f15-driver-build:
+    name: F-15 native driver build (${{ matrix.os }})
+    needs: specification
+    if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025-vs2026]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.specification.outputs.tested_sha }}
+          persist-credentials: false
+      - name: Compile the CO-RE collector against the runner kernel BTF
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm libbpf-dev linux-tools-generic
+          test -r /sys/kernel/btf/vmlinux
+          bpftool_path="$(find /usr/lib/linux-tools -type f -name bpftool -print | sort -V | tail -n 1)"
+          test -x "$bpftool_path"
+          make -C drivers/linux CLANG=/usr/bin/clang BPFTOOL="$bpftool_path"
+          llvm-objdump -h drivers/linux/theia_flow_events.bpf.o
+          mkdir f15-build-evidence
+          cp drivers/linux/theia_flow_events.bpf.o f15-build-evidence/
+          sha256sum f15-build-evidence/theia_flow_events.bpf.o
+      - name: Restore pinned Microsoft SDK and WDK packages
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          nuget restore drivers/windows/packages.config -PackagesDirectory drivers/windows/packages -Source https://api.nuget.org/v3/index.json -NonInteractive
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned WDK restore failed' }
+      - name: Compile WDK callout and BFE controller (unsigned, no install)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$vs) { throw 'Visual Studio C++ toolchain unavailable' }
+          & (Join-Path $vs 'Common7\Tools\Launch-VsDevShell.ps1') -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          & ./drivers/windows/build-lab.ps1 -OutputDirectory (Join-Path $PWD 'f15-build-evidence')
+      - name: Publish exact-source unsigned driver build evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: f15-driver-build-${{ runner.os }}-${{ needs.specification.outputs.tested_sha }}
+          path: |
+            f15-build-evidence/*.sys
+            f15-build-evidence/*.exe
+            f15-build-evidence/*.o
+            f15-build-evidence/hashes.json
+          if-no-files-found: error
+          retention-days: 3
+
   ci-gate:
     name: ci-gate
-    needs: [specification, m0-1-api-spike, m0-1-windows-spike, rust-tests, windows-smoke, f14-cross-host, f14-build, browser-e2e, native-performance, f19-performance, m3-4-btls-spike, m3-4e-btls-production-feature, coverage-native, coverage-gate]
+    needs: [specification, m0-1-api-spike, m0-1-windows-spike, rust-tests, windows-smoke, f14-cross-host, f14-build, browser-e2e, native-performance, f19-performance, m3-4-btls-spike, m3-4e-btls-production-feature, coverage-native, coverage-gate, f15-driver-build]
     if: ${{ always() && github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'dev' && github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1003,7 +1085,7 @@ jobs:
           import re
 
           results = json.loads(os.environ["JOB_RESULTS"])
-          expected = {"specification", "m0-1-api-spike", "m0-1-windows-spike", "rust-tests", "windows-smoke", "f14-cross-host", "f14-build", "browser-e2e", "native-performance", "f19-performance", "m3-4-btls-spike", "m3-4e-btls-production-feature", "coverage-native", "coverage-gate"}
+          expected = {"specification", "m0-1-api-spike", "m0-1-windows-spike", "rust-tests", "windows-smoke", "f14-cross-host", "f14-build", "browser-e2e", "native-performance", "f19-performance", "m3-4-btls-spike", "m3-4e-btls-production-feature", "coverage-native", "coverage-gate", "f15-driver-build"}
           native = os.environ["NATIVE_REQUIRED"]
           if native != "true":
               raise SystemExit("Every merge requires full native CI; fail closed")

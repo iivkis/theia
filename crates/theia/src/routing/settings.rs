@@ -124,6 +124,7 @@ mod tests {
                 action: Action::Direct,
                 domains: vec!["example.org".into()],
                 ips: vec![],
+                applications: vec![],
             }],
         }
     }

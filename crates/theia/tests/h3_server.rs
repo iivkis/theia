@@ -1,4 +1,7 @@
 //! Real native CI H3 server regression, using a raw verified H3 client fixture.
+#[path = "support/quinn_reference.rs"]
+mod quinn_reference;
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bytes::{Buf, Bytes};
 use http::{Request, StatusCode};
@@ -11,7 +14,6 @@ use theia::{
     h3_client::H3Client,
     h3_server,
     protocol::{self, Address, Decoder, ErrorCode, Frame},
-    quic_transport,
     server::ServerContext,
 };
 use tokio::{
@@ -39,11 +41,11 @@ fn fixture_with_roots(private: bool) -> (quinn::Endpoint, SocketAddr, ServerTask
     let der = cert.cert.der().clone();
     let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
     let bind = "127.0.0.1:0".parse().unwrap();
-    let endpoint = quic_transport::server_endpoint(bind, vec![der.clone()], key.into()).unwrap();
+    let endpoint = theia::quic_transport::server_endpoint(bind, vec![der.clone()], key.into()).unwrap();
     let remote = endpoint.local_addr().unwrap();
     let mut roots = RootCertStore::empty();
     roots.add(der).unwrap();
-    let client = quic_transport::client_endpoint(bind, roots.clone()).unwrap();
+    let client = quinn_reference::client_endpoint(bind, roots.clone()).unwrap();
     let server = tokio::spawn(h3_server::serve(endpoint, context(private)));
     (client, remote, server, roots)
 }
@@ -198,7 +200,7 @@ async fn authenticated_h3_server_relays_tcp_before_request_fin_and_after_half_cl
             tcp.write_all(&rest).await.unwrap();
             tcp.shutdown().await.unwrap();
         });
-        let conn = quic_transport::connect(&endpoint, remote, "localhost")
+        let conn = quinn_reference::connect(&endpoint, remote, "localhost")
             .await
             .unwrap();
         let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(conn))
@@ -250,7 +252,7 @@ async fn h3_rejects_missing_wrong_and_ungranted_bearers_and_denied_tcp() {
         let (endpoint, remote, server) = fixture(false);
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = target.local_addr().unwrap().port();
-        let conn = quic_transport::connect(&endpoint, remote, "localhost")
+        let conn = quinn_reference::connect(&endpoint, remote, "localhost")
             .await
             .unwrap();
         let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(conn))
@@ -470,7 +472,7 @@ fn production_h3_client_rejects_invalid_configuration() {
 async fn f18_current_h3_active_probe_sees_unauthorized_response_but_no_tunnel() {
     timeout(Duration::from_secs(15), async {
         let (endpoint, remote, server) = fixture(false);
-        let conn = quic_transport::connect(&endpoint, remote, "localhost")
+        let conn = quinn_reference::connect(&endpoint, remote, "localhost")
             .await
             .expect("standard QUIC handshake is permitted without bearer");
         let mut exporter = [0u8; 32];
@@ -532,7 +534,7 @@ async fn h3_rejects_unnegotiated_padding_before_target_dial() {
         let (endpoint, remote, server) = fixture(true);
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = target.local_addr().unwrap().port();
-        let conn = quic_transport::connect(&endpoint, remote, "localhost")
+        let conn = quinn_reference::connect(&endpoint, remote, "localhost")
             .await
             .unwrap();
         let (mut driver, mut sender) = h3::client::new(h3_quinn::Connection::new(conn))
@@ -841,8 +843,8 @@ async fn native_version_specific_probe_rejects_bad_trust_and_unapproved_endpoint
 /// Run in release mode on a quiet machine; independent network/CPU/RSS
 /// measurements remain separate acceptance requirements.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "manual comparative loopback benchmark"]
-async fn quinn_native_xhttp_comparison_samples() {
+#[ignore = "manual native version loopback benchmark; Quinn baseline remains native_quic_network"]
+async fn native_xhttp_version_comparison_samples() {
     use theia::quic_core::wire::Version;
     timeout(Duration::from_secs(240), async {
         let (_endpoint, qaddr, qserver, qroots) = fixture_with_roots(true);
@@ -852,7 +854,7 @@ async fn quinn_native_xhttp_comparison_samples() {
         for split in [false, true] {
             for sample in 0..5 {
                 for (label, version) in [
-                    ("quinn", None),
+                    ("native-default", None),
                     ("native-v1", Some(Version::V1)),
                     ("native-v2", Some(Version::V2)),
                 ] {

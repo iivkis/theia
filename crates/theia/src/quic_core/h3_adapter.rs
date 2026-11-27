@@ -1,6 +1,5 @@
-//! Experimental h3 0.0.8 transport bridge, using only the TLS-established
-//! native loopback session. Not a product carrier: no external
-//! interoperability, independent admission or acceptance.
+//! h3 0.0.8 transport bridge, using only TLS-established native sessions.
+//! Runtime admission remains at the common H3 application boundary.
 //! The worker serializes all packet/stream state. Synchronous trait calls
 //! never hold the state mutex across UDP I/O. Each direction has one bounded
 //! handoff slot and one waker. There is no task per stream or per datagram.
@@ -28,7 +27,7 @@ use tokio::sync::{oneshot, watch, Notify};
 
 // Include HTTP/3 framing overhead for a 64 KiB application write.
 const SLOT_LIMIT: usize = 128 * 1024;
-const OPEN_LIMIT: usize = 16;
+const OPEN_LIMIT: usize = crate::transport_policy::MAX_BIDI_STREAMS as usize + crate::transport_policy::MAX_QUIC_UNI_STREAMS as usize;
 const MAX_BURST: usize = 32;
 const IDLE_WAIT: Duration = Duration::from_secs(60);
 const CANCEL: u64 = 0x10c;
@@ -113,6 +112,9 @@ impl StreamState {
     }
 }
 
+#[cfg(test)]
+type RebindRequest = (tokio::net::UdpSocket, oneshot::Sender<Result<(), NativeError>>);
+
 #[derive(Default)]
 struct State {
     streams: BTreeMap<u64, StreamState>,
@@ -124,6 +126,8 @@ struct State {
     error: Option<CE>,
     close: Option<u64>,
     cursor: Option<u64>,
+    #[cfg(test)]
+    rebind: Option<RebindRequest>,
 }
 
 fn wake(slot: &mut Option<Waker>, wakes: &mut Vec<Waker>) {
@@ -143,6 +147,10 @@ impl State {
             return;
         }
         self.error = Some(error.clone());
+        #[cfg(test)]
+        if let Some((_, reply)) = self.rebind.take() {
+            let _ = reply.send(Err(NativeError::Scope));
+        }
         for request in self.open.drain(..) {
             let _ = request.result.send(Err(error.clone()));
         }
@@ -334,6 +342,18 @@ fn fail(weak: &Weak<Bridge>, error: CE) {
 async fn drive(mut session: LabSession, weak: Weak<Bridge>, ready: Arc<Notify>) {
     let mut burst = 0;
     loop {
+        #[cfg(test)]
+        {
+            // The test command runs on the sole session owner, never while
+            // the frontend state mutex is held across asynchronous UDP I/O.
+            let request = weak.upgrade().and_then(|shared| {
+                shared.lock().expect("bridge mutex").rebind.take()
+            });
+            if let Some((socket, reply)) = request {
+                let result = session.rebind(socket, Instant::now()).await;
+                let _ = reply.send(result);
+            }
+        }
         let mut wakes = Vec::new();
         let phase = session.shutdown_phase();
         let result = if let Some(shared) = weak.upgrade() {
@@ -406,12 +426,23 @@ async fn drive(mut session: LabSession, weak: Weak<Bridge>, ready: Arc<Notify>) 
 pub struct NativeConnection {
     opener: Opener,
     closed: watch::Receiver<()>,
+    driver: tokio::task::AbortHandle,
+}
+
+/// Server generation owns this guard even after H3 consumes the connection.
+/// Cancellation of a generation cannot leave a detached UDP session alive.
+pub(crate) struct DriverGuard(tokio::task::AbortHandle);
+
+impl Drop for DriverGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl NativeConnection {
     /// Returns exporter material separately so admission remains the
     /// existing caller's responsibility. The raw fixed-key fixture cannot
-    /// enter this API. This is intentionally not selectable in product config.
+    /// enter this API. The caller retains the existing admission policy.
     pub fn start(mut session: LabSession) -> Result<(Self, zeroize::Zeroizing<[u8; 32]>), CE> {
         let key = session.take_channel_binding().ok_or_else(internal)?;
         session.enable_auto_cids();
@@ -422,17 +453,27 @@ impl NativeConnection {
         });
         let (done, closed) = watch::channel(());
         let weak = Arc::downgrade(&shared);
-        tokio::spawn(async move {
+        let driver = tokio::spawn(async move {
             drive(session, weak, ready).await;
             drop(done);
-        });
+        }).abort_handle();
         Ok((
             Self {
                 opener: Opener::new(shared),
                 closed,
+                driver,
             },
             key,
         ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_opener(&self) -> Opener {
+        self.opener.clone()
+    }
+
+    pub(crate) fn driver_guard(&self) -> DriverGuard {
+        DriverGuard(self.driver.clone())
     }
 
     pub(crate) fn closed_signal(&self) -> watch::Receiver<()> {
@@ -503,6 +544,21 @@ impl Drop for Opener {
 }
 
 impl Opener {
+    #[cfg(test)]
+    pub(crate) async fn rebind_for_test(&self, socket: std::net::UdpSocket) -> Result<(), NativeError> {
+        let socket = tokio::net::UdpSocket::from_std(socket).map_err(NativeError::Io)?;
+        let (reply, result) = oneshot::channel();
+        {
+            let mut state = self.shared.lock().expect("bridge mutex");
+            if state.error.is_some() || state.close.is_some() || state.rebind.is_some() {
+                return Err(NativeError::Scope);
+            }
+            state.rebind = Some((socket, reply));
+        }
+        self.shared.ready.notify_one();
+        result.await.map_err(|_| NativeError::Scope)?
+    }
+
     fn new(shared: Shared) -> Self {
         Self {
             shared,

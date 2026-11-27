@@ -1,5 +1,8 @@
 //! Native real TLS/QUIC pinned identity and mutually exclusive HTTP routes.
 //! No third-party endpoints; each peer uses isolated loopback certificates.
+#[path = "support/quinn_reference.rs"]
+mod quinn_reference;
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bytes::Bytes;
 use http::{HeaderValue, Request, StatusCode};
@@ -622,14 +625,14 @@ async fn h2_exporter_proof_replay_is_refused_on_same_and_fresh_connection() {
 async fn h3_exporter_proof_replay_is_refused_on_same_and_fresh_connection() {
     timeout(Duration::from_secs(20), async {
         let fixture = Fixture::start(SecurityMode::PinnedCertV1).await;
-        let endpoint = theia::quic_transport::client_endpoint(
+        let endpoint = quinn_reference::client_endpoint(
             "127.0.0.1:0".parse().unwrap(),
             fixture.roots.clone(),
         )
         .unwrap();
         let mut old = None;
         for _ in 0..2 {
-            let connection = theia::quic_transport::connect(&endpoint, fixture.h3, "localhost")
+            let connection = quinn_reference::connect(&endpoint, fixture.h3, "localhost")
                 .await
                 .unwrap();
             let mut key = zeroize::Zeroizing::new([0u8; 32]);

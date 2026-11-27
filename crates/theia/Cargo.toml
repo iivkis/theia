@@ -9,6 +9,8 @@ publish = false
 # The product config does not expose a selectable browser security mode.
 default = ["experimental-btls-h2"]
 experimental-btls-h2 = ["dep:btls", "dep:tokio-btls"]
+# Explicit laboratory build; requires system libbpf development/runtime files.
+linux-ebpf-lab = []
 
 [dependencies]
 btls = { version = "=0.5.6", optional = true }
@@ -27,8 +29,6 @@ base64 = "=0.22.1"
 bytes = "=1.10.1"
 h2 = "=0.4.19"
 h3 = "=0.0.8"
-h3-quinn = "=0.0.10"
-quinn = "=0.11.12"
 http = "=1.3.1"
 rustls = { version = "=0.23.46", features = ["ring"] }
 rustls-pemfile = "=2.2.0"
@@ -45,6 +45,9 @@ tokio = { version = "=1.52.1", features = ["rt-multi-thread", "macros", "net", "
 tokio-rustls = "=0.26.6"
 
 [dev-dependencies]
+# Independent reference baseline only; not included in the product graph.
+h3-quinn = "=0.0.10"
+quinn = "=0.11.12"
 # Deterministic liveness deadlines; no new package or production feature.
 tokio = { version = "=1.52.1", features = ["test-util"] }
 

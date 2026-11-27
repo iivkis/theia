@@ -47,3 +47,9 @@ venv/
 # Local Rust instrumentation profiles
 *.profraw
 *.profdata
+
+# Local driver builds and restored WDK dependencies
+/drivers/windows/packages/
+/drivers/linux/vmlinux.h
+/drivers/linux/*.bpf.o
+/f15-build-evidence/

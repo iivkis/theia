@@ -1,5 +1,9 @@
 //! Native CI dual-transport witness on the same exact IP, name and port.
 //! Deliberately does not probe any external or unapproved Internet address.
+#[path = "support/quinn_reference.rs"]
+mod quinn_reference;
+
+use quinn_reference as quic_transport;
 use rcgen::generate_simple_self_signed;
 use rustls::{pki_types::PrivatePkcs8KeyDer, RootCertStore};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
@@ -9,7 +13,6 @@ use theia::{
     camouflage_interfaces::NativeInterfaces,
     camouflage_probe::{ProbeApproval, ProbeError, ProbeRequest},
     camouflage_workflow::{build_preview, DiscoveryPreview, PreviewScope},
-    quic_transport,
 };
 use tokio::{net::TcpListener, time::timeout};
 use tokio_rustls::TlsAcceptor;

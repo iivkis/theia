@@ -37,8 +37,7 @@ const CHUNK: usize = 900;
 const MAX_RETRY_TOKEN: usize = 512;
 const DEADLINE: Duration = Duration::from_secs(8);
 const CID_LEN: usize = 8;
-const CREDIT: u64 = 64 * 1024;
-const STREAMS: u64 = 8;
+use crate::transport_policy as policy;
 
 #[derive(Debug)]
 pub enum Error {
@@ -122,12 +121,12 @@ fn params(
     for (id, value) in [
         (0x01, 30_000),
         (0x03, super::mtu::MAX_UDP_PAYLOAD as u64),
-        (0x04, CREDIT),
-        (0x05, CREDIT),
-        (0x06, CREDIT),
-        (0x07, CREDIT),
-        (0x08, STREAMS),
-        (0x09, STREAMS),
+        (0x04, u64::from(policy::QUIC_CONNECTION_RECEIVE_BYTES)),
+        (0x05, u64::from(policy::QUIC_STREAM_RECEIVE_BYTES)),
+        (0x06, u64::from(policy::QUIC_STREAM_RECEIVE_BYTES)),
+        (0x07, u64::from(policy::QUIC_STREAM_RECEIVE_BYTES)),
+        (0x08, u64::from(policy::MAX_BIDI_STREAMS)),
+        (0x09, u64::from(policy::MAX_QUIC_UNI_STREAMS)),
     ] {
         let mut scratch = [0; 8];
         let value = encode_varint(value, &mut scratch).ok_or(Error::Protocol)?;
@@ -191,7 +190,7 @@ fn header(
 fn parse_header(
     packet: &[u8],
     version: Version,
-    local: &[u8; CID_LEN],
+    local: &[u8],
     remote: &[u8],
     expected_token: &[u8],
 ) -> Option<(usize, usize)> {
@@ -203,15 +202,16 @@ fn parse_header(
     } else {
         return None;
     };
+    let end = 6 + local.len();
     if packet.get(1..5)? != version.wire().to_be_bytes()
-        || *packet.get(5)? != CID_LEN as u8
-        || packet.get(6..14)? != local
-        || usize::from(*packet.get(14)?) != remote.len()
-        || packet.get(15..15 + remote.len())? != remote
+        || usize::from(*packet.get(5)?) != local.len()
+        || packet.get(6..end)? != local
+        || usize::from(*packet.get(end)?) != remote.len()
+        || packet.get(end + 1..end + 1 + remote.len())? != remote
     {
         return None;
     }
-    let mut at = 15 + remote.len();
+    let mut at = end + 1 + remote.len();
     if index == 0 {
         let len = usize::try_from(varint(packet, &mut at)?).ok()?;
         let end = at.checked_add(len)?;
@@ -769,10 +769,16 @@ impl Handshake {
             None
         };
         let remote = proposed.unwrap_or(self.remote.as_slice());
-        let Some((index, at)) = parse_header(packet, self.version, &self.local, remote, token)
-        else {
-            return Ok(());
-        };
+        let header = parse_header(packet, self.version, &self.local, remote, token)
+            .or_else(|| {
+                // REALITY preadmission does not validate the path and does
+                // not issue Retry. Original DCID is an Initial-only alias.
+                if self.server && self.retry.is_none() {
+                    parse_header(packet, self.version, &self.original, remote, token)
+                        .filter(|(index, _)| *index == 0)
+                } else { None }
+            });
+        let Some((index, at)) = header else { return Ok(()); };
         let Some(epoch) = self.epochs[index].as_mut() else {
             return Ok(());
         };
@@ -889,6 +895,7 @@ pub async fn establish(
         },
         config,
         Congestion::Bbr,
+        None,
     )
     .await
 }
@@ -965,12 +972,44 @@ pub async fn connect_versions_scoped_with_congestion(
     scope: super::scope::NetworkScope,
     congestion: Congestion,
 ) -> Result<(Version, LabSession), Error> {
+    connect_scoped(local, peer, versions, tls, name, scope, (congestion, None)).await
+}
+
+/// Keep the same observation across version negotiation and the caller's deadline.
+pub(crate) async fn connect_versions_observed(
+    local: SocketAddr,
+    peer: SocketAddr,
+    versions: VersionPolicy,
+    tls: Arc<ClientConfig>,
+    name: ServerName<'static>,
+    scope: super::scope::NetworkScope,
+    observation: &super::dial::Observation,
+) -> Result<(Version, LabSession), Error> {
+    connect_scoped(local, peer, versions, tls, name, scope, (Congestion::Bbr, Some(observation))).await
+}
+
+async fn connect_scoped(
+    local: SocketAddr,
+    peer: SocketAddr,
+    versions: VersionPolicy,
+    tls: Arc<ClientConfig>,
+    name: ServerName<'static>,
+    scope: super::scope::NetworkScope,
+    options: (Congestion, Option<&super::dial::Observation>),
+) -> Result<(Version, LabSession), Error> {
+    let (congestion, observation) = options;
     let mut version = versions.preferred();
     for restarted in [false, true] {
         let socket = UdpSocket::bind(local).await.map_err(Error::Io)?;
         if !scope.permits(socket.local_addr().map_err(Error::Io)?, peer) {
             return Err(Error::Scope);
         }
+        let carrier_lease = crate::routing::carrier_socket::udp(&socket, peer).map_err(|_| Error::Scope)?;
+        let pinned = if crate::routing::carrier_socket::active() {
+            socket.connect(peer).await.map_err(|_| Error::Scope)?;
+            if socket.peer_addr().ok() != Some(peer) { return Err(Error::Scope); }
+            Some(peer)
+        } else { None };
         let cid = super::negotiation::random_cid().map_err(|_| Error::Protocol)?;
         let original = super::negotiation::random_cid().map_err(|_| Error::Protocol)?;
         if cid == original || cid == [0; CID_LEN] || original == [0; CID_LEN] {
@@ -988,7 +1027,7 @@ pub async fn connect_versions_scoped_with_congestion(
             restarted,
         };
         match establish_inner(
-            SessionIo::direct(socket, scope),
+            SessionIo::direct_carrier(socket, scope, carrier_lease, pinned),
             peer,
             route,
             Config::Client {
@@ -996,6 +1035,7 @@ pub async fn connect_versions_scoped_with_congestion(
                 name: name.clone(),
             },
             congestion,
+            observation,
         )
         .await
         {
@@ -1022,7 +1062,7 @@ pub async fn accept_with_congestion(
     tls: Arc<ServerConfig>,
     congestion: Congestion,
 ) -> Result<LabSession, Error> {
-    let (socket, peer, binding, token, initial_reset, versions) = candidate.into_parts();
+    let (socket, peer, binding, token, initial_reset, versions, retry_validated) = candidate.into_parts();
     let original = binding.original;
     let remote = binding.client;
     if !(8..=20).contains(&original.len())
@@ -1042,7 +1082,7 @@ pub async fn accept_with_congestion(
             local: binding.retry,
             remote,
             original,
-            retry: Some(binding.retry.to_vec()),
+            retry: retry_validated.then(|| binding.retry.to_vec()),
             initial_reset: Some(initial_reset),
             token,
             versions,
@@ -1050,6 +1090,7 @@ pub async fn accept_with_congestion(
         },
         Config::Server(tls),
         congestion,
+        None,
     )
     .await
 }
@@ -1088,6 +1129,7 @@ async fn establish_inner(
     route: InitialRoute,
     config: Config,
     congestion: Congestion,
+    observation: Option<&super::dial::Observation>,
 ) -> Result<LabSession, Error> {
     let InitialRoute {
         version,
@@ -1132,7 +1174,8 @@ async fn establish_inner(
         Congestion::Bbr => Scheduler::with_bbr(Instant::now()),
         Congestion::Cubic => Scheduler::default(),
     };
-    let application_schedule = initial.fork_space();
+    let mut application_schedule = initial.fork_space();
+    application_schedule.enable_application_buffer();
     let mut handshake = Handshake {
         driver: Driver::new(connection),
         epochs: [Some(Epoch::with_schedule(keys, initial)), None],
@@ -1162,7 +1205,21 @@ async fn establish_inner(
         let mut buffer = [0; super::mtu::MAX_UDP_PAYLOAD + 1];
         loop {
             handshake.collect()?;
-            let sent = handshake.flush(&socket, peer).await?;
+            let sent = match handshake.flush(&socket, peer).await {
+                Ok(sent) => {
+                    if let Some(observation) = observation.filter(|_| sent) {
+                        observation.sent();
+                    }
+                    sent
+                }
+                Err(error) => {
+                    if let (Some(observation), Error::Io(io)) = (observation, &error) {
+                        // flush's only I/O is send_to the exact peer.
+                        observation.send_error(io.kind());
+                    }
+                    return Err(error);
+                }
+            };
             if handshake.done() {
                 break;
             }
@@ -1171,13 +1228,22 @@ async fn establish_inner(
                 tokio::task::yield_now().await;
             }
             match tokio::time::timeout(wait, socket.recv_from(&mut buffer)).await {
-                Ok(Ok((n, source, _mark)))
-                    if source == peer && n <= super::mtu::MAX_UDP_PAYLOAD =>
-                {
-                    handshake.receive_datagram(&buffer[..n])?
+                Ok(Ok((n, source, _mark))) => {
+                    // Even malformed, oversized or wrong-source UDP is
+                    // evidence against a no-response fallback on this socket.
+                    if let Some(observation) = observation {
+                        observation.received();
+                    }
+                    if source == peer && n <= super::mtu::MAX_UDP_PAYLOAD {
+                        handshake.receive_datagram(&buffer[..n])?;
+                    }
                 }
-                Ok(Ok(_)) | Err(_) => {}
-                Ok(Err(e)) if super::mtu::message_too_large(&e) => {}
+                Err(_) => {}
+                Ok(Err(e)) if super::mtu::message_too_large(&e) => {
+                    if let Some(observation) = observation {
+                        observation.received();
+                    }
+                }
                 Ok(Err(e)) => return Err(Error::Io(e)),
             }
         }
@@ -1220,6 +1286,7 @@ async fn establish_inner(
         .get(0x02)
         .and_then(|token| token.try_into().ok());
     let binding = handshake.driver.channel_binding().map_err(Error::Driver)?;
+    let peer_leaf = handshake.driver.peer_leaf();
     let tail = if server {
         None
     } else {
@@ -1248,6 +1315,7 @@ async fn establish_inner(
             secrets,
             idle_timeout,
             binding,
+            peer_leaf,
             peer_limits: limits,
             peer_reset_token,
             peer_disable_migration: peer_params.get(0x0c).is_some(),

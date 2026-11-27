@@ -273,6 +273,7 @@ mod tests {
             action: Action::Direct,
             domains: vec!["geosite:TEST".into()],
             ips: vec![],
+            applications: vec![],
         }
     }
 
@@ -314,9 +315,9 @@ mod tests {
         let mut dpi = rule();
         dpi.action = Action::DirectDpi;
         let text = toml::to_string(&dpi).unwrap();
-        assert!(text.contains("direct_dpi"));
+        assert!(text.contains("direct_via_client_anti_dpi"));
         assert_eq!(toml::from_str::<Rule>(&text).unwrap(), dpi);
-        assert!(toml::from_str::<Rule>(&text.replace("direct_dpi", "directdpi")).is_err());
+        assert!(toml::from_str::<Rule>(&text.replace("direct_via_client_anti_dpi", "direct_dpi")).is_err());
         let (server, wire) = Snapshot::build("inbound", 2, &[dpi], &data, &[]).unwrap();
         let client = Snapshot::decode(&wire, "inbound").unwrap();
         assert_eq!(server.digest(), client.digest());

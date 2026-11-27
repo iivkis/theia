@@ -2,6 +2,9 @@
 //! loopback fixtures, not evidence for the public REALITY admission relay.
 #![forbid(unsafe_code)]
 
+#[path = "support/quinn_reference.rs"]
+mod quinn_reference;
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use sha2::{Digest, Sha256};
 use std::{
@@ -600,23 +603,22 @@ async fn native_admission_callbacks_complete_full_tls_and_quic_before_applicatio
         server.await.unwrap();
 
         let server = quinn::Endpoint::server(
-            identity_tls::checked_quic_server(&identity, &v, secret.clone(), guard.clone())
-                .unwrap(),
+            quinn_reference::server_from_tls(identity_tls::checked_server_tls(&identity, &v, Branch::H3, secret.clone(), guard.clone()).unwrap()).unwrap(),
             remote,
         )
         .unwrap();
         let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         let cases = [
             (
-                identity_tls::quic_client(&scope, identity.public_key()).unwrap(),
+                quinn_reference::client_from_tls(identity_tls::client_tls(&scope, identity.public_key(), Branch::H3).unwrap()).unwrap(),
                 false,
             ),
             (
-                identity_tls::admitted_quic_client(&v, wrong).unwrap(),
+                quinn_reference::client_from_tls(identity_tls::admitted_client_tls(&v, Branch::H3, wrong).unwrap()).unwrap(),
                 false,
             ),
             (
-                identity_tls::admitted_quic_client(&v, secret).unwrap(),
+                quinn_reference::client_from_tls(identity_tls::admitted_client_tls(&v, Branch::H3, secret).unwrap()).unwrap(),
                 true,
             ),
         ];

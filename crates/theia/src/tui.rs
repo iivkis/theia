@@ -745,7 +745,7 @@ fn invitation_actions(flow: &IssueFlow) -> Vec<ActionItem> {
 struct RoutingPanel {
     settings: crate::routing::Settings,
     selected: usize,
-    fields: Option<(Option<usize>, [String; 4], usize)>,
+    fields: Option<(Option<usize>, [String; 5], usize)>,
     message: String,
     directory: PathBuf,
     download: Option<mpsc::Receiver<Result<(String, crate::routing::geodata::Manifest), String>>>,
@@ -783,20 +783,15 @@ impl RoutingPanel {
         }
     }
     fn action_name(action: crate::routing::Action) -> &'static str {
-        match action {
-            crate::routing::Action::Direct => "direct",
-            crate::routing::Action::DirectDpi => "direct_dpi",
-            crate::routing::Action::Blocked => "blocked",
-            crate::routing::Action::Allowed => "allowed",
-        }
+        action.name()
     }
     fn action_label(value: &str) -> &str {
-        match value {
-            "direct" => "Напрямую",
-            "direct_dpi" => "Anti-DPI / резерв VPS",
-            "blocked" => "Блокировать",
-            "allowed" => "Через сервер",
-            _ => value,
+        match crate::routing::Action::from_name(value) {
+            Some(crate::routing::Action::Direct) => "Напрямую",
+            Some(crate::routing::Action::DirectDpi) => "Anti-DPI / резерв VPS",
+            Some(crate::routing::Action::Blocked) => "Блокировать",
+            Some(crate::routing::Action::Allowed) => "Через сервер",
+            None => value,
         }
     }
     fn edit(&mut self, index: Option<usize>) {
@@ -808,12 +803,14 @@ impl RoutingPanel {
                     Self::action_name(r.action).into(),
                     r.domains.join(", "),
                     r.ips.join(", "),
+                    r.applications.join(", "),
                 ]
             })
             .unwrap_or_else(|| {
                 [
                     String::new(),
-                    "allowed".into(),
+                    crate::routing::Action::Allowed.name().into(),
+                    String::new(),
                     String::new(),
                     String::new(),
                 ]
@@ -913,12 +910,12 @@ impl RoutingPanel {
                     self.fields = None;
                 }
                 KeyCode::Up | KeyCode::BackTab => *focus = focus.saturating_sub(1),
-                KeyCode::Down | KeyCode::Tab => *focus = (*focus + 1).min(3),
+                KeyCode::Down | KeyCode::Tab => *focus = (*focus + 1).min(4),
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     fields[*focus].clear()
                 }
                 KeyCode::Left | KeyCode::Right if *focus == 1 => {
-                    let options = ["allowed", "direct", "blocked", "direct_dpi"];
+                    let options = crate::routing::Action::ALL.map(crate::routing::Action::name);
                     let index = options.iter().position(|a| *a == fields[1]).unwrap_or(0);
                     let next = if key.code == KeyCode::Right {
                         (index + 1) % options.len()
@@ -940,15 +937,9 @@ impl RoutingPanel {
                     fields[*focus].push(c)
                 }
                 KeyCode::Enter => {
-                    let action = match fields[1].trim() {
-                        "direct" => crate::routing::Action::Direct,
-                        "direct_dpi" => crate::routing::Action::DirectDpi,
-                        "blocked" => crate::routing::Action::Blocked,
-                        "allowed" => crate::routing::Action::Allowed,
-                        _ => {
-                            self.message = "Выберите действие стрелками влево или вправо.".into();
-                            return true;
-                        }
+                    let Some(action) = crate::routing::Action::from_name(fields[1].trim()) else {
+                        self.message = "Выберите действие стрелками влево или вправо.".into();
+                        return true;
                     };
                     let split = |s: &str| {
                         s.split(|c: char| c == ',' || c.is_whitespace())
@@ -961,6 +952,7 @@ impl RoutingPanel {
                         action,
                         domains: split(&fields[2]),
                         ips: split(&fields[3]),
+                        applications: split(&fields[4]),
                     };
                     if crate::routing::Policy::validate_rules(std::slice::from_ref(&rule)).is_err()
                     {
@@ -1019,7 +1011,7 @@ impl RoutingPanel {
     fn body(&self) -> String {
         let mut body = String::new();
         if let Some((_, fields, focus)) = &self.fields {
-            for (i, (label, value)) in ["Имя", "Действие", "Домены / GeoSite", "IP / CIDR / GeoIP"]
+            for (i, (label, value)) in ["Имя", "Действие", "Домены / GeoSite", "IP / CIDR / GeoIP", "Приложения"]
                 .iter()
                 .zip(fields)
                 .enumerate()
@@ -1034,7 +1026,7 @@ impl RoutingPanel {
                     if i == *focus { "›" } else { " " }
                 ));
             }
-            body.push_str("\nПримеры: domain:example.org, geosite:google\nIP: 192.0.2.0/24, geoip:private · через запятую\nGeoIP Lite: in-ru, in-cn, in-ir — региональные наборы, не геолокация\n\n↑↓ / Tab: поле · ←→: действие · Ctrl+U: очистить\nEnter: принять правило · Esc: отменить");
+            body.push_str("\nПримеры: domain:example.org, geosite:google\nIP: 192.0.2.0/24, geoip:private · через запятую\nПриложение: sha256: + 64 строчных hex-символа\nGeoIP Lite: in-ru, in-cn, in-ir — региональные наборы, не геолокация\n\n↑↓ / Tab: поле · ←→: действие · Ctrl+U: очистить\nEnter: принять правило · Esc: отменить");
         } else {
             body.push_str(&format!(
                 "GeoData: {} (GeoSite Standard + GeoIP Lite)\nПравила проверяются сверху вниз. Без совпадения — через сервер.\n",
@@ -1111,6 +1103,8 @@ impl RoutingObservation {
                     routing_revision,
                     routing_state,
                     routing_totals,
+                    flow_counts,
+                    capture_state,
                     ..
                 })) if config_sha256 == self.digest => {
                     let status = match routing_state {
@@ -1119,7 +1113,13 @@ impl RoutingObservation {
                         3 => "Синхронизация выполняется".into(),
                         _ => "Правила ещё не подтверждены".into(),
                     };
-                    self.report = format!("Источник: защищённый IPC фонового клиента\n{status}\n{}\nСчётчики всего процесса, не отдельного профиля; полезные TCP/UDP-байты.", crate::traffic::routing_summary_from(*routing_totals));
+                    let capture = match capture_state {
+                        0 => "не активирован",
+                        1 => "подготовка",
+                        2 => "изолированный тестовый захват (не production)",
+                        _ => "остановлен или ошибка; требуется проверка восстановления",
+                    };
+                    self.report = format!("Источник: защищённый IPC фонового клиента\n{status}\nСистемный перехват: {capture}\n{}\n{}\nСчётчики всего процесса, не отдельного профиля; полезные TCP/UDP-байты.", crate::routing::flow::summary(flow_counts), crate::traffic::routing_summary_from(*routing_totals));
                     self.observed = Some(std::time::Instant::now());
                 }
                 Err(TryRecvError::Empty) => return,
@@ -9036,12 +9036,15 @@ mod tests {
                 10, 20, 30, 40, 2, 1, 1, 3, 4, 5, 10, 20, 30, 40, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
                 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             ]),
+            flow_counts: Some([1, 2, 3, 4]),
+            capture_state: 2,
         }))
         .unwrap();
         observation.poll();
         client.routing_observation = Some(observation);
         let screen = rendered_interaction(120, 40, &Model::new(Some(Role::Client)), &client);
         assert!(screen.contains("ревизия 5"));
+        assert!(screen.contains("изолированный тестовый захват"));
         assert!(screen.contains("IPC"));
         assert!(screen.contains("Anti-DPI"));
         assert!(screen.contains("резерв VPS"));
@@ -9070,8 +9073,9 @@ mod tests {
         let (_, fields, _) = panel.fields.as_mut().unwrap();
         *fields = [
             "local".into(),
-            "direct".into(),
+            "direct_via_client".into(),
             "full:localhost".into(),
+            String::new(),
             String::new(),
         ];
         assert!(panel.key(press(KeyCode::Enter), Some(&mut editor)));
@@ -9084,8 +9088,9 @@ mod tests {
         let (_, fields, _) = panel.fields.as_mut().unwrap();
         *fields = [
             "DPI".into(),
-            "direct_dpi".into(),
+            "direct_via_client_anti_dpi".into(),
             "example.org".into(),
+            String::new(),
             String::new(),
         ];
         assert!(panel.key(press(KeyCode::Enter), Some(&mut editor)));

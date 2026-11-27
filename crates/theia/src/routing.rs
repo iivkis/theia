@@ -3,6 +3,32 @@
 pub(crate) mod client_state;
 pub(crate) mod dpi;
 pub(crate) mod exchange;
+pub(crate) mod flow;
+pub mod packet;
+pub(crate) mod carrier_socket;
+pub mod packet_modify;
+#[cfg(target_os = "linux")]
+pub mod linux_ingress;
+#[cfg(target_os = "linux")]
+pub mod linux_attribution;
+#[cfg(target_os = "linux")]
+pub mod linux_events;
+#[cfg(all(target_os = "linux", feature = "linux-ebpf-lab"))]
+pub mod linux_bpf_loader;
+#[cfg(target_os = "linux")]
+pub mod dns_attribution;
+#[cfg(any(target_os = "windows", test))]
+mod wfp_context;
+#[cfg(target_os = "windows")]
+pub mod wfp_ingress;
+#[cfg(target_os = "windows")]
+pub mod wfp_udp;
+#[cfg(target_os = "linux")]
+pub mod nfqueue;
+#[cfg(target_os = "linux")]
+pub mod linux_rules;
+#[cfg(target_os = "linux")]
+pub mod linux_carrier;
 pub mod geodata;
 mod settings;
 pub mod snapshot;
@@ -26,17 +52,78 @@ const MAX_ENTRIES: usize = 2_000_000;
 const MAX_REGEXES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 pub enum Action {
+    #[serde(rename = "direct_via_client")]
     Direct,
+    #[serde(rename = "blackhole")]
     Blocked,
+    #[serde(rename = "proxy_via_server")]
     Allowed,
-    /// Prefer an explicitly authorized proxy-based DPI strategy; otherwise use the VPS.
-    #[serde(rename = "direct_dpi")]
+    #[serde(rename = "direct_via_client_anti_dpi")]
     DirectDpi,
 }
 
+/// Actual engine action, independent of the configured rule name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketAction {
+    Pass,
+    Modify,
+    Redirect,
+    Drop,
+}
+
+/// Missing evidence is not the same as a proven absent attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Evidence<T> {
+    Known(T),
+    Absent,
+    Unknown,
+}
+
+/// The ordered policy may need more evidence before any egress is authorized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Classification {
+    Matched(Action),
+    Default,
+    Unresolved,
+}
+
+impl Classification {
+    pub fn action(self) -> Option<Action> {
+        match self {
+            Self::Matched(action) => Some(action),
+            Self::Default => Some(Action::Allowed),
+            Self::Unresolved => None,
+        }
+    }
+}
+
 impl Action {
+    /// Canonical v1 routing names shared by config, snapshots and UI.
+    pub const ALL: [Self; 4] = [Self::Allowed, Self::Direct, Self::Blocked, Self::DirectDpi];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Direct => "direct_via_client",
+            Self::Blocked => "blackhole",
+            Self::Allowed => "proxy_via_server",
+            Self::DirectDpi => "direct_via_client_anti_dpi",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|action| action.name() == name)
+    }
+
+    pub fn packet_action(self) -> PacketAction {
+        match self {
+            Self::Direct => PacketAction::Pass,
+            Self::DirectDpi => PacketAction::Modify,
+            Self::Allowed => PacketAction::Redirect,
+            Self::Blocked => PacketAction::Drop,
+        }
+    }
+
     /// Server fallback is allowed only for a route that explicitly permits it.
     pub(crate) fn permits_server_egress(self) -> bool {
         matches!(self, Self::Allowed | Self::DirectDpi)
@@ -52,6 +139,8 @@ pub struct Rule {
     pub domains: Vec<String>,
     #[serde(default)]
     pub ips: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applications: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +148,7 @@ pub enum RoutingError {
     InvalidRule,
     InvalidDomain,
     InvalidIp,
+    InvalidApplication,
     InvalidCategory,
     MissingCategory,
     InvalidDat,
@@ -432,11 +522,37 @@ enum IpSelector {
     Literal(Cidr),
     Category(String),
 }
+/// Exact executable content identity. The OS backend must obtain the digest
+/// from a verified process/file handle; a PID, filename or reported hash is
+/// not trusted application evidence on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ApplicationId([u8; 32]);
+
+impl ApplicationId {
+    pub fn from_sha256(hash: [u8; 32]) -> Self {
+        Self(hash)
+    }
+
+    pub fn parse(selector: &str) -> Result<Self, RoutingError> {
+        let hash = selector.strip_prefix("sha256:").ok_or(RoutingError::InvalidApplication)?;
+        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            return Err(RoutingError::InvalidApplication);
+        }
+        let mut bytes = [0; 32];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hash[i * 2..i * 2 + 2], 16)
+                .map_err(|_| RoutingError::InvalidApplication)?;
+        }
+        Ok(Self::from_sha256(bytes))
+    }
+}
+
 #[derive(Debug)]
 struct CompiledRule {
     action: Action,
     domains: Vec<DomainSelector>,
     ips: Vec<IpSelector>,
+    applications: HashSet<ApplicationId>,
 }
 
 /// Validated immutable rules and only the referenced geodata categories.
@@ -462,13 +578,14 @@ fn compile_selectors(rules: &[Rule]) -> Result<Selectors, RoutingError> {
         if rule.name.trim().is_empty()
             || rule.name.len() > 128
             || rule.name.chars().any(char::is_control)
-            || (rule.domains.is_empty() && rule.ips.is_empty())
+            || (rule.domains.is_empty() && rule.ips.is_empty() && rule.applications.is_empty())
         {
             return Err(RoutingError::InvalidRule);
         }
         selectors = selectors
             .saturating_add(rule.domains.len())
-            .saturating_add(rule.ips.len());
+            .saturating_add(rule.ips.len())
+            .saturating_add(rule.applications.len());
         if selectors > MAX_SELECTORS {
             return Err(RoutingError::Limit);
         }
@@ -495,10 +612,14 @@ fn compile_selectors(rules: &[Rule]) -> Result<Selectors, RoutingError> {
                 IpSelector::Literal(Cidr::parse(selector)?)
             });
         }
+        let applications = rule.applications.iter()
+            .map(|selector| ApplicationId::parse(selector))
+            .collect::<Result<HashSet<_>, _>>()?;
         compiled.push(CompiledRule {
             action: rule.action,
             domains,
             ips,
+            applications,
         });
     }
 
@@ -598,57 +719,87 @@ impl Policy {
         })
     }
 
-    /// First matching rule, with OR between all selectors in a rule.
-    /// An absent result is not an authorization: the transport still needs ACL.
-    /// A DNS name may be evaluated without resolving it; a caller can supply
-    /// an independently pinned IP in a second evaluation.
-    /// A DNS name is not enough to choose a route if an earlier rule can
-    /// match a resolved IP. Never assume that an unknown IP is a non-match.
-    pub fn domain_decision(&self, domain: &str) -> Result<Option<Action>, RoutingError> {
-        let host = domain_name(domain)?;
-        for rule in &self.rules {
-            let matched = rule.domains.iter().any(|selector| match selector {
-                DomainSelector::Literal(pattern) => pattern.matches(&host),
-                DomainSelector::Category(code) => self.sites[code].matches(&host),
-            });
-            if matched {
-                return Ok(Some(rule.action));
-            }
-            if !rule.ips.is_empty() {
-                return Ok(None);
-            }
-        }
-        Ok(Some(Action::Allowed))
+    /// One ordered classifier. A known OR match wins within a rule, but an
+    /// earlier unresolved rule cannot be skipped in favor of a later rule.
+    pub fn classify(
+        &self,
+        domain: Evidence<&str>,
+        ip: Evidence<IpAddr>,
+    ) -> Result<Classification, RoutingError> {
+        self.classify_with_application(domain, ip, Evidence::Unknown)
     }
 
+    pub fn classify_with_application(
+        &self,
+        domain: Evidence<&str>,
+        ip: Evidence<IpAddr>,
+        application: Evidence<ApplicationId>,
+    ) -> Result<Classification, RoutingError> {
+        let domain = match domain {
+            Evidence::Known(host) => Evidence::Known(domain_name(host)?),
+            Evidence::Absent => Evidence::Absent,
+            Evidence::Unknown => Evidence::Unknown,
+        };
+        let ip = match ip {
+            Evidence::Known(IpAddr::V6(v6)) => Evidence::Known(
+                v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+            ),
+            other => other,
+        };
+        for rule in &self.rules {
+            let domain_match = match &domain {
+                Evidence::Known(host) => rule.domains.iter().any(|selector| match selector {
+                    DomainSelector::Literal(pattern) => pattern.matches(host),
+                    DomainSelector::Category(code) => self.sites[code].matches(host),
+                }),
+                Evidence::Absent | Evidence::Unknown => false,
+            };
+            let ip_match = match ip {
+                Evidence::Known(ip) => rule.ips.iter().any(|selector| match selector {
+                    IpSelector::Literal(cidr) => cidr.matches(ip),
+                    IpSelector::Category(code) => self.ips[code].matches(ip),
+                }),
+                Evidence::Absent | Evidence::Unknown => false,
+            };
+            let application_match = match application {
+                Evidence::Known(id) => rule.applications.contains(&id),
+                Evidence::Absent | Evidence::Unknown => false,
+            };
+            if domain_match || ip_match || application_match {
+                return Ok(Classification::Matched(rule.action));
+            }
+            if (matches!(domain, Evidence::Unknown) && !rule.domains.is_empty())
+                || (matches!(ip, Evidence::Unknown) && !rule.ips.is_empty())
+                || (matches!(application, Evidence::Unknown) && !rule.applications.is_empty())
+            {
+                return Ok(Classification::Unresolved);
+            }
+        }
+        Ok(Classification::Default)
+    }
+
+    /// Server-side destination projection. The server independently checks
+    /// known domain/IP restrictions and cannot authenticate a client process.
+    /// Client routing must use classify_with_application (or classify for
+    /// an unknown process), never this projection.
+    pub fn domain_decision(&self, domain: &str) -> Result<Option<Action>, RoutingError> {
+        Ok(self.classify_with_application(Evidence::Known(domain), Evidence::Unknown, Evidence::Absent)?.action())
+    }
+
+    /// Server-side destination projection for explicitly supplied attributes.
     pub fn matching_action(
         &self,
         domain: Option<&str>,
         ip: Option<IpAddr>,
     ) -> Result<Option<Action>, RoutingError> {
-        let domain = domain.map(domain_name).transpose()?;
-        let ip = ip.map(|ip| match ip {
-            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
-            _ => ip,
-        });
-        for rule in &self.rules {
-            let domain_match = domain.as_ref().is_some_and(|host| {
-                rule.domains.iter().any(|selector| match selector {
-                    DomainSelector::Literal(pattern) => pattern.matches(host),
-                    DomainSelector::Category(code) => self.sites[code].matches(host),
-                })
-            });
-            let ip_match = ip.is_some_and(|ip| {
-                rule.ips.iter().any(|selector| match selector {
-                    IpSelector::Literal(cidr) => cidr.matches(ip),
-                    IpSelector::Category(code) => self.ips[code].matches(ip),
-                })
-            });
-            if domain_match || ip_match {
-                return Ok(Some(rule.action));
-            }
+        match self.classify_with_application(
+            domain.map_or(Evidence::Absent, Evidence::Known),
+            ip.map_or(Evidence::Absent, Evidence::Known),
+            Evidence::Absent,
+        )? {
+            Classification::Matched(action) => Ok(Some(action)),
+            Classification::Default | Classification::Unresolved => Ok(None),
         }
-        Ok(None)
     }
 }
 
@@ -662,6 +813,7 @@ mod tests {
             action,
             domains: domains.iter().map(|s| (*s).into()).collect(),
             ips: ips.iter().map(|s| (*s).into()).collect(),
+            applications: vec![],
         }
     }
     fn field(tag: u8, value: &[u8]) -> Vec<u8> {
@@ -686,6 +838,72 @@ mod tests {
             entry.extend([24, 1]);
         }
         field(1, &entry)
+    }
+
+    #[test]
+    fn unknown_earlier_rule_blocks_later_egress_but_known_or_match_wins() {
+        let ip = "192.0.2.1".parse().unwrap();
+        let p = Policy::compile(
+            &[
+                rule(Action::Blocked, &["blocked.example"], &[]),
+                rule(Action::Direct, &[], &["192.0.2.0/24"]),
+            ],
+            &[],
+            &[],
+        ).unwrap();
+        assert_eq!(p.classify(Evidence::Unknown, Evidence::Known(ip)).unwrap(), Classification::Unresolved);
+        assert_eq!(p.classify(Evidence::Absent, Evidence::Known(ip)).unwrap(), Classification::Matched(Action::Direct));
+        assert_eq!(p.classify(Evidence::Known("blocked.example"), Evidence::Unknown).unwrap(), Classification::Matched(Action::Blocked));
+        assert_eq!(p.classify(Evidence::Known("other.example"), Evidence::Unknown).unwrap(), Classification::Unresolved);
+        let or = Policy::compile(
+            &[rule(Action::DirectDpi, &["example.com"], &["192.0.2.0/24"])],
+            &[], &[],
+        ).unwrap();
+        assert_eq!(or.classify(Evidence::Unknown, Evidence::Known(ip)).unwrap().action(), Some(Action::DirectDpi));
+        assert_eq!(or.classify(Evidence::Absent, Evidence::Absent).unwrap(), Classification::Default);
+        assert_eq!(Classification::Default.action(), Some(Action::Allowed));
+        assert_eq!(Classification::Unresolved.action(), None);
+        assert_eq!(Action::Direct.packet_action(), PacketAction::Pass);
+        assert_eq!(Action::DirectDpi.packet_action(), PacketAction::Modify);
+        assert_eq!(Action::Allowed.packet_action(), PacketAction::Redirect);
+        assert_eq!(Action::Blocked.packet_action(), PacketAction::Drop);
+    }
+
+    #[test]
+    fn application_evidence_is_exact_and_unknown_cannot_bypass() {
+        let digest = "sha256:".to_owned() + &"ab".repeat(32);
+        let id = ApplicationId::parse(&digest).unwrap();
+        let mut first = rule(Action::Blocked, &[], &[]);
+        first.applications.push(digest.clone());
+        let later = rule(Action::Direct, &[], &["192.0.2.0/24"]);
+        let p = Policy::compile(&[first.clone(), later.clone()], &[], &[]).unwrap();
+        let ip = Evidence::Known("192.0.2.10".parse().unwrap());
+        assert_eq!(p.classify(Evidence::Absent, ip).unwrap(), Classification::Unresolved);
+        assert_eq!(p.classify_with_application(Evidence::Absent, ip, Evidence::Known(id)).unwrap(), Classification::Matched(Action::Blocked));
+        assert_eq!(p.classify_with_application(Evidence::Absent, ip, Evidence::Known(ApplicationId::from_sha256([0; 32]))).unwrap(), Classification::Matched(Action::Direct));
+        assert_eq!(p.matching_action(None, Some("192.0.2.10".parse().unwrap())).unwrap(), Some(Action::Direct));
+        first.domains.push("example.org".into());
+        let p = Policy::compile(&[first.clone(), later], &[], &[]).unwrap();
+        assert_eq!(p.classify(Evidence::Known("example.org"), ip).unwrap(), Classification::Matched(Action::Blocked));
+        assert!(ApplicationId::parse("chrome.exe").is_err());
+        assert!(ApplicationId::parse(&digest.to_uppercase()).is_err());
+        first.applications = vec!["pid:10".into()];
+        assert_eq!(Policy::validate_rules(&[first]), Err(RoutingError::InvalidApplication));
+    }
+
+    #[test]
+    fn canonical_action_names_reject_legacy_in_v1() {
+        for action in Action::ALL {
+            let rule = rule(action, &["example.org"], &[]);
+            let wire = toml::to_string(&rule).unwrap();
+            assert!(wire.contains(action.name()));
+            assert_eq!(Action::from_name(action.name()), Some(action));
+            assert_eq!(toml::from_str::<Rule>(&wire).unwrap(), rule);
+            for old in ["direct", "allowed", "blocked", "direct_dpi"] {
+                assert!(Action::from_name(old).is_none());
+                assert!(toml::from_str::<Rule>(&wire.replace(action.name(), old)).is_err());
+            }
+        }
     }
 
     #[test]

@@ -115,6 +115,7 @@ pub(crate) struct Cache {
     checkpoint: Option<PathBuf>,
     state: tokio::sync::Mutex<State>,
     pub(crate) dpi: Arc<super::dpi::Engine>,
+    pub(crate) flows: Arc<super::flow::FlowTable>,
 }
 
 fn floor_bytes(path: &Path) -> Result<Option<Vec<u8>>, ClientError> {
@@ -142,6 +143,7 @@ impl Cache {
             scope,
             checkpoint,
             dpi: Arc::new(super::dpi::Engine::default()),
+            flows: super::flow::FlowTable::shared(),
             state: tokio::sync::Mutex::new(State {
                 snapshot: None,
                 expires: None,
@@ -201,6 +203,9 @@ impl Cache {
         Fut: Future<Output = Result<Vec<u8>, ClientError>>,
     {
         let mut state = self.state.lock().await;
+        if self.dpi.retired() {
+            return Err(super::dpi::stale_policy());
+        }
         let now = Instant::now();
         if let (Some(deadline), Some(snapshot)) = (
             state.expires.filter(|until| now < *until),
@@ -248,15 +253,36 @@ impl Cache {
                     .map_err(|_| ClientError::Protocol)?,
             )
         };
+        if self.dpi.retired() {
+            return Err(super::dpi::stale_policy());
+        }
         // The durable floor is checked even for an unchanged receipt.
         self.persist(&snapshot, state.snapshot.as_deref())?;
         state.snapshot = Some(snapshot.clone());
         let deadline = Instant::now() + TTL;
         state.expires = Some(deadline);
         self.authorize_local(&snapshot, deadline);
+        if self.dpi.retired() {
+            return Err(super::dpi::stale_policy());
+        }
         state.retry = None;
         Ok(snapshot)
     }
+    /// Exact current policy lease for a diagnostic observation. Do not
+    /// start a new refresh here: an in-flight DNS request must not inherit
+    /// a later deadline merely because the same digest was republished.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn observation_deadline(&self, digest: [u8; 32]) -> Result<Instant, ClientError> {
+        let state = self.state.try_lock().map_err(|_| super::dpi::stale_policy())?;
+        let deadline = state.expires.filter(|deadline| *deadline > Instant::now())
+            .ok_or_else(super::dpi::stale_policy)?;
+        if !state.snapshot.as_ref().is_some_and(|snapshot| snapshot.digest() == digest) {
+            return Err(super::dpi::stale_policy());
+        }
+        self.dpi.check_policy(digest)?;
+        Ok(deadline)
+    }
+
     /// (revision, state): 0 unknown, 1 fresh, 2 expired, 3 synchronizing.
     pub(crate) fn observation(&self) -> (u64, u8) {
         let Ok(state) = self.state.try_lock() else {
@@ -362,7 +388,9 @@ async fn copy_direction(
     meter: &crate::traffic::Relay<'_>,
     upload: bool,
     evidence: Option<&ExchangeEvidence>,
+    flow: Option<&super::flow::FlowLease>,
 ) -> Result<(), DirectRelayError> {
+    let mut first_send = super::flow::FirstSend::new(flow, super::PacketAction::Pass);
     let mut bytes = [0u8; 16 * 1024];
     loop {
         let count = input
@@ -376,6 +404,9 @@ async fn copy_direction(
                 .map_err(|_| DirectRelayError::io(upload))?;
             activity.half_closed();
             return Ok(());
+        }
+        if upload {
+            first_send.attempt().map_err(|error| DirectRelayError { error, peer: false })?;
         }
         output
             .write_all(&bytes[..count])
@@ -393,8 +424,13 @@ async fn copy_direction(
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn relay_direct(client: TcpStream, target: TcpStream) -> Result<(), ClientError> {
-    relay_direct_after_first(client, target, 0, 0).await.0
+    relay_direct_guarded(client, target, None).await
+}
+
+pub(crate) async fn relay_direct_guarded(client: TcpStream, target: TcpStream, flow: Option<&super::flow::FlowLease>) -> Result<(), ClientError> {
+    relay_direct_inner(client, target, 0, 0, flow).await.0
 }
 
 pub(crate) async fn relay_direct_after_first(
@@ -402,6 +438,16 @@ pub(crate) async fn relay_direct_after_first(
     target: TcpStream,
     upload: usize,
     download: usize,
+) -> (Result<(), ClientError>, bool, bool) {
+    relay_direct_inner(client, target, upload, download, None).await
+}
+
+async fn relay_direct_inner(
+    client: TcpStream,
+    target: TcpStream,
+    upload: usize,
+    download: usize,
+    flow: Option<&super::flow::FlowLease>,
 ) -> (Result<(), ClientError>, bool, bool) {
     let meter = crate::traffic::enter_direct();
     meter.upload(upload);
@@ -413,8 +459,8 @@ pub(crate) async fn relay_direct_after_first(
     let (tr, tw) = target.into_split();
     let result = activity
         .run(
-            copy_direction(cr, tw, &activity, &meter, true, evidence.as_ref()),
-            copy_direction(tr, cw, &activity, &meter, false, evidence.as_ref()),
+            copy_direction(cr, tw, &activity, &meter, true, evidence.as_ref(), flow),
+            copy_direction(tr, cw, &activity, &meter, false, evidence.as_ref(), None),
             DirectRelayError {
                 error: ClientError::Timeout,
                 peer: false,
@@ -452,6 +498,28 @@ mod tests {
             floor: None,
         };
         assert!(!expired.valid(second.digest()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn diagnostic_deadline_rejects_wrong_digest_refresh_and_retirement() {
+        let cache = Cache::new("scope".into(), None);
+        let (_, wire) = Snapshot::build("scope", 1, &[], &[], &[]).unwrap();
+        let snapshot = cache.get(|_| async { Ok(wire) }).await.unwrap();
+        let digest = snapshot.digest();
+        let original = cache.observation_deadline(digest).unwrap();
+        assert!(original > Instant::now());
+        assert!(cache.observation_deadline([0; 32]).is_err());
+        {
+            let mut state = cache.state.lock().await;
+            assert!(cache.observation_deadline(digest).is_err());
+            state.expires = Some(Instant::now());
+        }
+        assert!(cache.observation_deadline(digest).is_err());
+        cache.get(|_| async { Ok(super::super::exchange::unchanged_receipt(digest).to_vec()) }).await.unwrap();
+        assert!(cache.observation_deadline(digest).unwrap() >= original);
+        cache.dpi.retire();
+        assert!(cache.observation_deadline(digest).is_err());
     }
 
     #[tokio::test]

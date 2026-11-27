@@ -2064,7 +2064,7 @@ impl CapturedTls {
             // not simply that two arbitrary private files could be hashed.
             let material = tls_material_from_bytes(inbound, &cert, &key)?;
             let _h2 = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
-            let _h3 = crate::quic_transport::server_config(material.certs, material.key)
+            let _h3 = crate::h3_server::OwnTlsConfig::new(material.certs, material.key)
                 .map_err(|_| ServerError::Tls)?;
             let id = inbound.id.as_bytes();
             for chunk in [id, cert.as_slice(), key.as_slice()] {
@@ -2210,9 +2210,9 @@ enum ReadyListener {
     Plain(
         TcpListener,
         TlsAcceptor,
-        quinn::Endpoint,
+        crate::h3_server::OwnTlsEndpoint,
         Arc<ServerContext>,
-        quinn::ServerConfig,
+        crate::h3_server::OwnTlsConfig,
     ),
     Reality(
         crate::reality_tcp::PreparedTcp,
@@ -2374,10 +2374,10 @@ async fn prepare_selected_listeners_inner(
             crate::tcp_bbr::Error::Network => ServerError::Io,
             crate::tcp_bbr::Error::Unavailable => ServerError::TcpControllerUnavailable,
         })?;
-        let h3_config = crate::quic_transport::server_config(material.certs, material.key)
+        let h3_config = crate::h3_server::OwnTlsConfig::new(material.certs, material.key)
             .map_err(|_| ServerError::Tls)?;
         let endpoint =
-            crate::quic_transport::server_endpoint_with_config(udp_addr, h3_config.clone())
+            crate::h3_server::OwnTlsEndpoint::bind(udp_addr, h3_config.clone())
                 .map_err(|_| ServerError::Io)?;
         let mut context = ServerContext::with_limits(
             inbound,
@@ -2412,7 +2412,7 @@ async fn prepare_selected_listeners_inner(
 struct HotIdentity {
     id: String,
     h2: Arc<RwLock<TlsAcceptor>>,
-    h3: quinn::Endpoint,
+    h3: crate::h3_server::OwnTlsEndpoint,
 }
 
 /// TLS-only candidate fully staged *before* touching either bound socket.
@@ -2421,7 +2421,7 @@ struct HotIdentity {
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 struct PreparedSamePortTls {
     h2: Vec<TlsAcceptor>,
-    h3: Vec<quinn::ServerConfig>,
+    h3: Vec<crate::h3_server::OwnTlsConfig>,
     identities: Vec<crate::reload_preflight::IdentityHash>,
 }
 
@@ -2441,7 +2441,7 @@ fn prepare_same_port_tls(
         }
         let material = captured.material(inbound, index)?;
         let h2_acceptor = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
-        let h3_config = crate::quic_transport::server_config(material.certs, material.key)
+        let h3_config = crate::h3_server::OwnTlsConfig::new(material.certs, material.key)
             .map_err(|_| ServerError::Tls)?;
         h2.push(h2_acceptor);
         h3.push(h3_config);
@@ -2465,7 +2465,7 @@ struct StructuralRollbackSlot {
 struct RollbackSlot {
     expires: Instant,
     h2: Vec<TlsAcceptor>,
-    h3: Vec<quinn::ServerConfig>,
+    h3: Vec<crate::h3_server::OwnTlsConfig>,
     identities: Vec<crate::reload_preflight::IdentityHash>,
     refs: Vec<(String, String)>,
 }
@@ -2489,7 +2489,7 @@ struct RunningGeneration {
     identities: Vec<HotIdentity>,
     // Exact QUIC configs installed on the endpoints. Saved previous configs
     // support a one-shot TLS undo without reading external PEM files again.
-    active_h3: Vec<quinn::ServerConfig>,
+    active_h3: Vec<crate::h3_server::OwnTlsConfig>,
     reality: Vec<HotReality>,
 }
 
@@ -2531,11 +2531,7 @@ impl RunningGeneration {
                         context.clone(),
                         receiver.clone(),
                     ));
-                    tasks.spawn(crate::h3_server::serve_generation(
-                        udp,
-                        context,
-                        receiver.clone(),
-                    ));
+                    tasks.spawn(udp.serve_generation(context, receiver.clone()));
                 }
                 ReadyListener::Reality(tcp, quic, silent, manager, carrier) => {
                     let root = manager.root_fingerprint();
@@ -3045,7 +3041,7 @@ fn commit_same_port_tls(
                     **guard = acceptor;
                 }
                 for (handle, config) in running.identities.iter().zip(h3) {
-                    handle.h3.set_server_config(Some(config));
+                    handle.h3.set_server_config(config);
                 }
             },
         )
@@ -3142,7 +3138,7 @@ fn commit_tls_rollback(
                 **guard = acceptor;
             }
             for (handle, config) in running.identities.iter().zip(h3) {
-                handle.h3.set_server_config(Some(config));
+                handle.h3.set_server_config(config);
             }
         })
         .map_err(|_| ())?;
@@ -3748,7 +3744,7 @@ async fn run_reality_document_inner(
         Plain(
             TcpListener,
             TlsAcceptor,
-            quinn::Endpoint,
+            crate::h3_server::OwnTlsEndpoint,
             Arc<ServerContext>,
         ),
         Reality(
@@ -3855,7 +3851,8 @@ async fn run_reality_document_inner(
             loaded_identities.push(material.identity.clone());
             let acceptor = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
             let endpoint =
-                crate::quic_transport::server_endpoint(udp_addr, material.certs, material.key)
+                crate::h3_server::OwnTlsConfig::new(material.certs, material.key)
+                    .and_then(|tls| crate::h3_server::OwnTlsEndpoint::bind(udp_addr, tls))
                     .map_err(|_| ServerError::Tls)?;
             ready.push(Ready::Plain(
                 listener,
@@ -3910,7 +3907,7 @@ async fn run_reality_document_inner(
         match item {
             Ready::Plain(listener, acceptor, endpoint, context) => {
                 tasks.spawn(serve(listener, acceptor, context.clone()));
-                tasks.spawn(crate::h3_server::serve(endpoint, context));
+                tasks.spawn(endpoint.serve(context));
             }
             Ready::Reality(tcp, quic, silent, manager, live_generation) => {
                 tasks.spawn(async move {
@@ -4021,7 +4018,8 @@ async fn run_document_with_config(
             crate::tcp_bbr::Error::Unavailable => ServerError::TcpControllerUnavailable,
         })?;
         let endpoint =
-            crate::quic_transport::server_endpoint(udp_addr, material.certs, material.key)
+            crate::h3_server::OwnTlsConfig::new(material.certs, material.key)
+                    .and_then(|tls| crate::h3_server::OwnTlsEndpoint::bind(udp_addr, tls))
                 .map_err(|error| match error {
                     crate::quic_transport::QuicError::Bind => ServerError::Io,
                     _ => ServerError::Tls,
@@ -4079,7 +4077,7 @@ async fn run_document_with_config(
     let mut tasks = JoinSet::new();
     for (listener, acceptor, endpoint, context) in prepared {
         tasks.spawn(serve(listener, acceptor, context.clone()));
-        tasks.spawn(crate::h3_server::serve(endpoint, context));
+        tasks.spawn(endpoint.serve(context));
     }
     #[cfg(target_os = "linux")]
     if let Some(management) = management {
@@ -4398,7 +4396,7 @@ mod hardening_tests {
             let remote = endpoint.local_addr().unwrap();
             (
                 remote,
-                tokio::spawn(crate::h3_server::serve_generation(endpoint, context, phase)),
+                tokio::spawn(endpoint.serve_generation(context, phase)),
             )
         } else {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

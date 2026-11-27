@@ -60,6 +60,7 @@ pub(crate) struct Established {
     pub secrets: Secrets,
     pub idle_timeout: Duration,
     pub binding: zeroize::Zeroizing<[u8; 32]>,
+    pub peer_leaf: Option<rustls::pki_types::CertificateDer<'static>>,
     pub peer_limits: super::parameters::Limits,
     pub peer_reset_token: Option<[u8; 16]>,
     pub peer_disable_migration: bool,
@@ -91,6 +92,7 @@ pub struct LabSession {
     confirmed: bool,
     idle: Idle,
     binding: Option<zeroize::Zeroizing<[u8; 32]>>,
+    peer_leaf: Option<rustls::pki_types::CertificateDer<'static>>,
     peer_application_close: Option<u64>,
 }
 
@@ -136,6 +138,7 @@ impl LabSession {
             secrets,
             idle_timeout,
             binding,
+            peer_leaf,
             peer_limits,
             peer_reset_token,
             peer_disable_migration,
@@ -161,8 +164,14 @@ impl LabSession {
             PeerIds::with_initial(remote_cid, peer_reset_token, 2).map_err(|_| Error::Protocol)?;
         session.peer_cid_limit = peer_limits.active_cid_limit.min(8) as usize;
         session.peer_disable_migration = peer_disable_migration;
-        session.send =
-            SendFlow::from_peer(server, peer_limits, MAX_STREAMS).map_err(Error::Send)?;
+        use crate::transport_policy as policy;
+        let bidi = u64::from(policy::MAX_BIDI_STREAMS);
+        let uni = u64::from(policy::MAX_QUIC_UNI_STREAMS);
+        let window = u64::from(policy::QUIC_STREAM_RECEIVE_BYTES);
+        session.send = SendFlow::from_peer(server, peer_limits, bidi).map_err(Error::Send)?;
+        session.receive = ReceiveFlow::new(server, bidi, uni, window, window as usize,
+            u64::from(policy::QUIC_CONNECTION_RECEIVE_BYTES)).map_err(Error::Receive)?;
+        session.receive.enable_local_bidi(bidi).map_err(Error::Receive)?;
         session.receive.enable_autotune().map_err(Error::Receive)?;
         session.scheduler = scheduler;
         let options = session.socket.options();
@@ -179,6 +188,7 @@ impl LabSession {
         );
         session.idle = Idle::new(Instant::now(), idle_timeout);
         session.binding = Some(binding);
+        session.peer_leaf = peer_leaf;
         session.handshake_tail = tail;
         session.early_application = early_application.into();
         if server {
@@ -251,8 +261,13 @@ impl LabSession {
             confirmed,
             idle: Idle::new(Instant::now(), Duration::from_secs(30)),
             binding: None,
+            peer_leaf: None,
             peer_application_close: None,
         })
+    }
+
+    pub(crate) fn peer_leaf(&self) -> Option<&[u8]> {
+        self.peer_leaf.as_ref().map(AsRef::as_ref)
     }
 
     pub fn handshake_confirmed(&self) -> bool {

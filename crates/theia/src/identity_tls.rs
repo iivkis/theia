@@ -348,15 +348,7 @@ impl Identity {
         Ok(config)
     }
 
-    pub fn quic_server(&self, name: &str) -> Result<quinn::ServerConfig, Error> {
-        let tls = self.server_tls(name, Branch::H3)?;
-        let crypto =
-            quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(|_| Error::Tls)?;
-        let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-        config.transport_config(crate::quic_transport::transport_config());
-        config.migration(false);
-        Ok(config)
-    }
+
 }
 
 /// Cache a short-lived leaf per immutable identity, name and branch.
@@ -629,42 +621,6 @@ pub(crate) fn checked_server_tls_for_reference(
     Ok(tls)
 }
 
-pub fn admitted_quic_client(
-    value: &descriptor::Verified,
-    secret: Arc<crate::reality_admission::Secret>,
-) -> Result<quinn::ClientConfig, Error> {
-    let tls = admitted_client_tls(value, Branch::H3, secret)?;
-    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(|_| Error::Tls)?;
-    let mut config = quinn::ClientConfig::new(Arc::new(crypto));
-    config.transport_config(crate::quic_transport::transport_config());
-    Ok(config)
-}
-
-/// Controlled QUIC counterpart of checked_server_tls. It must not be
-/// exposed as a production external inbound until datagram admission
-/// and reference relay occur before endpoint acceptance.
-pub fn checked_quic_server(
-    identity: &Identity,
-    value: &descriptor::Verified,
-    secret: Arc<crate::reality_admission::Secret>,
-    guard: Arc<crate::reality_admission::ReplayGuard>,
-) -> Result<quinn::ServerConfig, Error> {
-    let tls = checked_server_tls(identity, value, Branch::H3, secret, guard)?;
-    let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(|_| Error::Tls)?;
-    let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-    config.transport_config(crate::quic_transport::transport_config());
-    config.migration(true);
-    Ok(config)
-}
-
-pub fn quic_client(scope: &Scope, public: [u8; 32]) -> Result<quinn::ClientConfig, Error> {
-    let tls = client_tls(scope, public, Branch::H3)?;
-    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(|_| Error::Tls)?;
-    let mut config = quinn::ClientConfig::new(Arc::new(crypto));
-    config.transport_config(crate::quic_transport::transport_config());
-    Ok(config)
-}
-
 fn storage_error(error: WriteFailure) -> Error {
     match error {
         WriteFailure::BeforeReplace(_) => Error::Storage,
@@ -810,38 +766,38 @@ mod tests {
             let identity = Identity::generate(scope()).unwrap();
             let wrong = Identity::generate(scope()).unwrap();
             let endpoint = quinn::Endpoint::server(
-                identity.quic_server("edge.example.org").unwrap(),
+                crate::quinn_reference::server_from_tls(identity.server_tls("edge.example.org", Branch::H3).unwrap()).unwrap(),
                 "127.0.0.1:0".parse().unwrap(),
             )
             .unwrap();
             let remote = endpoint.local_addr().unwrap();
             let worker = tokio::spawn(async move {
                 let incoming = endpoint.accept().await.unwrap();
-                let connection = crate::quic_transport::accept(incoming).await.unwrap();
+                let connection = crate::quinn_reference::accept(incoming).await.unwrap();
                 let _ = connection.closed().await;
             });
             let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-            client.set_default_client_config(quic_client(&scope(), identity.public_key()).unwrap());
-            let connection = crate::quic_transport::connect(&client, remote, "edge.example.org")
+            client.set_default_client_config(crate::quinn_reference::client_from_tls(client_tls(&scope(), identity.public_key(), Branch::H3).unwrap()).unwrap());
+            let connection = crate::quinn_reference::connect(&client, remote, "edge.example.org")
                 .await
                 .unwrap();
             connection.close(0u32.into(), b"test done");
             worker.await.unwrap();
 
             let endpoint = quinn::Endpoint::server(
-                identity.quic_server("edge.example.org").unwrap(),
+                crate::quinn_reference::server_from_tls(identity.server_tls("edge.example.org", Branch::H3).unwrap()).unwrap(),
                 "127.0.0.1:0".parse().unwrap(),
             )
             .unwrap();
             let remote = endpoint.local_addr().unwrap();
             let worker = tokio::spawn(async move {
                 let incoming = endpoint.accept().await.unwrap();
-                assert!(crate::quic_transport::accept(incoming).await.is_err());
+                assert!(crate::quinn_reference::accept(incoming).await.is_err());
             });
             let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-            client.set_default_client_config(quic_client(&scope(), wrong.public_key()).unwrap());
+            client.set_default_client_config(crate::quinn_reference::client_from_tls(client_tls(&scope(), wrong.public_key(), Branch::H3).unwrap()).unwrap());
             assert!(
-                crate::quic_transport::connect(&client, remote, "edge.example.org")
+                crate::quinn_reference::connect(&client, remote, "edge.example.org")
                     .await
                     .is_err()
             );

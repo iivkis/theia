@@ -730,7 +730,7 @@ impl H2Client {
     }
 
     async fn connect_verified(&self, operation: u64) -> Result<H2Connection, ClientError> {
-        let (socket, controller) = crate::tcp_bbr::connect(self.endpoint.as_str())
+        let (socket, controller, carrier_lease) = crate::tcp_bbr::connect_carrier(self.endpoint.as_str())
             .await
             .map_err(|error| match error {
                 crate::tcp_bbr::Error::Network => ClientError::Io,
@@ -779,7 +779,7 @@ impl H2Client {
                 } else {
                     None
                 };
-                let (sender, driver) = start_h2(tls, self.wire_shape).await?;
+                let (sender, driver) = start_h2(tls, self.wire_shape, carrier_lease).await?;
                 (sender, driver, binding)
             }
             #[cfg(feature = "experimental-btls-h2")]
@@ -788,7 +788,7 @@ impl H2Client {
                 trusted_ca_pem,
             } => {
                 let tls = crate::h2_btls::connect(socket, server_name, trusted_ca_pem).await?;
-                let (sender, driver) = start_h2(tls, self.wire_shape).await?;
+                let (sender, driver) = start_h2(tls, self.wire_shape, carrier_lease).await?;
                 (sender, driver, None)
             }
         };
@@ -1048,6 +1048,7 @@ impl H2Client {
 async fn start_h2<S>(
     tls: S,
     wire_shape: H2WireShape,
+    carrier_lease: crate::routing::carrier_socket::Lease,
 ) -> Result<(h2::client::SendRequest<Bytes>, Driver), ClientError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1067,6 +1068,7 @@ where
         .await
         .map_err(|_| ClientError::Http2)?;
     let driver = Driver(tokio::spawn(async move {
+        let _carrier = carrier_lease;
         let _ = connection.await;
     }));
     Ok((sender, driver))
@@ -1104,6 +1106,7 @@ impl Tunnel {
         mut first: Option<Vec<u8>>,
         mut upload: tokio::sync::mpsc::Receiver<Vec<u8>>,
         download: tokio::sync::mpsc::Sender<Vec<u8>>,
+        flow: Option<&crate::routing::flow::FlowLease>,
     ) -> Result<(), ClientError> {
         if !self.state.udp() {
             return Err(ClientError::Protocol);
@@ -1117,12 +1120,14 @@ impl Tunnel {
         let activity = crate::udp_relay::Activity::new();
         let writing = std::sync::atomic::AtomicBool::new(false);
         let send_loop = async {
+            let mut first_send = crate::routing::flow::FirstSend::new(flow, crate::routing::PacketAction::Redirect);
             while let Some(data) = crate::udp_relay::next_datagram(&mut first, &mut upload).await {
                 let size = data.len();
                 let frame = Frame::Datagram(data);
                 tx_state
                     .apply(Direction::Send, &frame)
                     .map_err(|_| ClientError::Protocol)?;
+                first_send.attempt()?;
                 writing.store(true, std::sync::atomic::Ordering::Relaxed);
                 timeout(IO_TIMEOUT, send_frame(outgoing, &frame, false))
                     .await
@@ -1176,7 +1181,14 @@ impl Tunnel {
 
     /// Relay a local duplex byte stream after OPEN_OK. Each direction has
     /// independent flow control, one bounded frame buffer and FIN state.
-    pub async fn relay<S>(mut self, local: S) -> Result<(), ClientError>
+    pub async fn relay<S>(self, local: S) -> Result<(), ClientError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        self.relay_guarded(local, None).await
+    }
+
+    pub(crate) async fn relay_guarded<S>(mut self, local: S, flow: Option<&crate::routing::flow::FlowLease>) -> Result<(), ClientError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -1202,6 +1214,7 @@ impl Tunnel {
         let upload = async {
             let mut buffer = [0; crate::relay_batch::MAX_BATCH];
             let mut batch = crate::relay_batch::ReadyBatch::default();
+            let mut first_send = crate::routing::flow::FirstSend::new(flow, crate::routing::PacketAction::Redirect);
             loop {
                 let size = batch
                     .read(&mut read, &mut buffer)
@@ -1223,6 +1236,7 @@ impl Tunnel {
                 upload_state
                     .apply(Direction::Send, &frame)
                     .map_err(|_| ClientError::Protocol)?;
+                if size != 0 { first_send.attempt()?; }
                 timeout(IO_TIMEOUT, send_frame(outgoing, &frame, size == 0))
                     .await
                     .map_err(|_| ClientError::Timeout)??;

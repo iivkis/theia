@@ -7,6 +7,7 @@ pub mod ack_tx;
 pub mod bbr;
 pub mod congestion;
 pub mod datagram;
+pub(crate) mod dial;
 pub mod ecn;
 pub mod endpoint;
 pub mod flow;

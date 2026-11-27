@@ -67,6 +67,13 @@ impl Driver {
         }
     }
 
+    pub(crate) fn peer_leaf(&self) -> Option<rustls::pki_types::CertificateDer<'static>> {
+        if !self.tls_complete() {
+            return None;
+        }
+        self.tls.peer_certificates()?.first().cloned()
+    }
+
     pub(crate) fn channel_binding(&self) -> Result<zeroize::Zeroizing<[u8; 32]>, Error> {
         if !self.tls_complete() {
             return Err(Error::Failed);

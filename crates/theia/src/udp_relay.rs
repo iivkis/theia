@@ -158,10 +158,20 @@ impl Tunnel {
         );
     }
 
+    #[cfg(test)]
     pub(crate) async fn relay(
+        self,
+        upload: mpsc::Receiver<Vec<u8>>,
+        download: mpsc::Sender<Vec<u8>>,
+    ) -> Result<(), ClientError> {
+        self.relay_guarded(upload, download, None).await
+    }
+
+    pub(crate) async fn relay_guarded(
         self,
         mut upload: mpsc::Receiver<Vec<u8>>,
         download: mpsc::Sender<Vec<u8>>,
+        flow: Option<&crate::routing::flow::FlowLease>,
     ) -> Result<(), ClientError> {
         match self {
             Self::VerifiedLocal(verified, fallback) => {
@@ -170,9 +180,14 @@ impl Tunnel {
                 };
                 let stun = match verified.strategy {
                     crate::routing::dpi::UdpStrategy::StunBinding(strategy) => Some(strategy),
-                    crate::routing::dpi::UdpStrategy::QuicV1 => None,
+                    crate::routing::dpi::UdpStrategy::Quic(_) => None,
                 };
+                let unmodified = flow.is_some() && stun.is_none_or(|strategy| {
+                    crate::routing::dpi::udp::prepare_binding(&first, strategy)
+                        .is_none_or(|bytes| bytes.as_ref() == first.as_slice())
+                });
                 if !verified.admissible()?
+                    || unmodified
                     || stun.is_some_and(|strategy| {
                         crate::routing::dpi::udp::prepare_binding(&first, strategy).is_none()
                     })
@@ -185,13 +200,13 @@ impl Tunnel {
                     if !matches!(tunnel, Self::H2(_) | Self::H3(_)) {
                         return Err(ClientError::Protocol);
                     }
-                    return tunnel.relay_selected(Some(first), upload, download).await;
+                    return tunnel.relay_selected(Some(first), upload, download, flow).await;
                 }
                 // Once a send is attempted no fallback or replay is legal.
                 drop(fallback);
                 verified.check_policy()?;
                 let result = if let Some(strategy) = stun {
-                    relay_stun(&verified.socket, strategy, first, upload, download).await
+                    relay_stun(&verified.socket, strategy, first, upload, download, flow).await
                 } else {
                     relay_local(
                         &verified.socket,
@@ -199,6 +214,7 @@ impl Tunnel {
                         Some(first),
                         upload,
                         download,
+                        flow,
                     )
                     .await
                 };
@@ -208,7 +224,7 @@ impl Tunnel {
                 }
                 result.map_err(LocalRelayError::into_client)
             }
-            other => other.relay_selected(None, upload, download).await,
+            other => other.relay_selected(None, upload, download, flow).await,
         }
     }
 
@@ -217,11 +233,12 @@ impl Tunnel {
         first: Option<Vec<u8>>,
         upload: mpsc::Receiver<Vec<u8>>,
         download: mpsc::Sender<Vec<u8>>,
+        flow: Option<&crate::routing::flow::FlowLease>,
     ) -> Result<(), ClientError> {
         match self {
-            Self::H2(t) => t.relay_udp(first, upload, download).await,
-            Self::H3(t) => t.relay_udp(first, upload, download).await,
-            Self::Direct(socket) => relay_local(&socket, None, first, upload, download)
+            Self::H2(t) => t.relay_udp(first, upload, download, flow).await,
+            Self::H3(t) => t.relay_udp(first, upload, download, flow).await,
+            Self::Direct(socket) => relay_local(&socket, None, first, upload, download, flow)
                 .await
                 .map_err(LocalRelayError::into_client),
             Self::VerifiedLocal(..) => Err(ClientError::Protocol),
@@ -243,10 +260,45 @@ pub(crate) async fn next_datagram(
 async fn relay_local(
     socket: &UdpSocket,
     verification_deadline: Option<Duration>,
+    first: Option<Vec<u8>>,
+    upload: mpsc::Receiver<Vec<u8>>,
+    download: mpsc::Sender<Vec<u8>>,
+    flow: Option<&crate::routing::flow::FlowLease>,
+) -> Result<(), LocalRelayError> {
+    relay_local_batch(socket, verification_deadline, first, None, upload, download, flow).await
+}
+
+/// Explicit native lab only. Ordinary proxy relay still refuses
+/// reachability-only QUIC as Modify. The actual first datagram must split.
+#[cfg(target_os = "linux")]
+pub(crate) async fn relay_quic_lab(
+    verified: &crate::routing::dpi::VerifiedUdp,
+    first: Vec<u8>,
+    upload: mpsc::Receiver<Vec<u8>>,
+    download: mpsc::Sender<Vec<u8>>,
+    flow: &crate::routing::flow::FlowLease,
+) -> Result<(), ClientError> {
+    if !verified.admissible()? {
+        return Err(ClientError::Open(ErrorCode::PolicyDenied));
+    }
+    let parts = verified.quic_batch(&first).ok_or(ClientError::Open(ErrorCode::PolicyDenied))?;
+    let result = relay_local_batch(&verified.socket, Some(FIRST_RESPONSE), Some(first), Some(parts), upload, download, Some(flow)).await;
+    if matches!(&result, Err(LocalRelayError::Peer(_))) { verified.failed(); }
+    result.map_err(LocalRelayError::into_client)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn relay_local_batch(
+    socket: &UdpSocket,
+    verification_deadline: Option<Duration>,
     mut first: Option<Vec<u8>>,
+    first_batch: Option<Vec<Vec<u8>>>,
     mut upload: mpsc::Receiver<Vec<u8>>,
     download: mpsc::Sender<Vec<u8>>,
+    flow: Option<&crate::routing::flow::FlowLease>,
 ) -> Result<(), LocalRelayError> {
+    use crate::routing::{flow::FirstSend, PacketAction};
+    let mut first_send = FirstSend::new(flow, if verification_deadline.is_some() { PacketAction::Modify } else { PacketAction::Pass });
     let traffic = crate::traffic::enter_udp(crate::Role::Client, false, true);
     let activity = Activity::new();
     // For verified QUIC, start the receive deadline only after a successful
@@ -255,8 +307,23 @@ async fn relay_local(
         let data = first
             .take()
             .ok_or(LocalRelayError::Application(ClientError::Protocol))?;
-        timeout(deadline, send_datagram(socket, &data))
-            .await
+        let parts = match first_batch {
+            Some(parts) => {
+                if parts.len() < 2 || parts.len() > 3 || parts.iter().any(|p| p.is_empty() || p.len() > protocol::MAX_DATAGRAM)
+                    || parts.concat() != data {
+                    return Err(LocalRelayError::Application(ClientError::Protocol));
+                }
+                parts
+            }
+            None => vec![data.clone()],
+        };
+        first_send.attempt().map_err(LocalRelayError::Application)?;
+        // One deadline for the entire actual emission. Failure/cancellation
+        // after any attempt is terminal; no replay of the original flight.
+        timeout(deadline, async {
+            for part in &parts { send_datagram(socket, part).await?; }
+            Ok::<(), io::Error>(())
+        }).await
             .map_err(|_| LocalRelayError::Peer(ClientError::Timeout))?
             .map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
         traffic.upload(data.len());
@@ -265,6 +332,7 @@ async fn relay_local(
     }
     let send = async {
         while let Some(data) = next_datagram(&mut first, &mut upload).await {
+            first_send.attempt().map_err(LocalRelayError::Application)?;
             send_datagram(socket, &data)
                 .await
                 .map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
@@ -310,6 +378,7 @@ async fn relay_stun(
     first: Vec<u8>,
     mut upload: mpsc::Receiver<Vec<u8>>,
     download: mpsc::Sender<Vec<u8>>,
+    flow: Option<&crate::routing::flow::FlowLease>,
 ) -> Result<(), LocalRelayError> {
     use crate::routing::dpi::udp::{prepare_binding, BindingTransactions};
     let traffic = crate::traffic::enter_udp(crate::Role::Client, false, true);
@@ -324,6 +393,9 @@ async fn relay_stun(
     }
     let packet = prepare_binding(&first, strategy)
         .ok_or(LocalRelayError::Application(ClientError::Protocol))?;
+    if let Some(flow) = flow {
+        flow.commit(crate::routing::PacketAction::Modify).map_err(LocalRelayError::Application)?;
+    }
     timeout(FIRST_RESPONSE, send_datagram(socket, &packet))
         .await
         .map_err(|_| LocalRelayError::Peer(ClientError::Timeout))?
@@ -576,6 +648,7 @@ mod tests {
                 Some(b"first".to_vec()),
                 rx,
                 down,
+                None,
             )
             .await
         });
@@ -604,6 +677,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multipacket_first_emission_preserves_order_and_datagram_boundaries() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = connect(peer.local_addr().unwrap()).await.unwrap();
+        let (up_tx, up_rx) = mpsc::channel(QUEUE);
+        let (down_tx, _down_rx) = mpsc::channel(QUEUE);
+        let relay = tokio::spawn(async move {
+            relay_local_batch(&socket, Some(Duration::from_secs(2)), Some(b"abcdef".to_vec()),
+                Some(vec![b"abc".to_vec(), b"def".to_vec()]), up_rx, down_tx, None).await
+        });
+        let mut bytes = [0;16];
+        for expected in [b"abc",b"def"] {
+            let (n, _) = timeout(Duration::from_secs(2),peer.recv_from(&mut bytes)).await.unwrap().unwrap();
+            assert_eq!(&bytes[..n],expected);
+        }
+        drop(up_tx);
+        relay.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn verified_first_response_timeout_does_not_repeat_datagram() {
         let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let socket = connect(target.local_addr().unwrap()).await.unwrap();
@@ -616,6 +708,7 @@ mod tests {
                 Some(b"first".to_vec()),
                 rx,
                 down,
+                None,
             )
             .await
         });
@@ -649,7 +742,7 @@ mod tests {
             .unwrap()
             .into_owned();
         let task = tokio::spawn(async move {
-            relay_stun(&socket, BindingStrategy::Fingerprint, first, rx, down).await
+            relay_stun(&socket, BindingStrategy::Fingerprint, first, rx, down, None).await
         });
         let mut buf = [0; 512];
         let (n, peer) = timeout(Duration::from_secs(2), target.recv_from(&mut buf))

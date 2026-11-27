@@ -379,11 +379,11 @@ impl RealityClient {
         self.changed.notify_one();
         Ok(next)
     }
-    async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
+    async fn open(&self, address: Address, port: u16) -> Result<RoutedTcp, ClientError> {
         let generation = self.generation().await?;
         let mut result = routed_open(&generation.carrier, &self.routing, address, port).await;
         if let Ok(tunnel) = &mut result {
-            if let ProxyTunnel::Dpi(route) = tunnel {
+            if let ProxyTunnel::Dpi(route) = &mut tunnel.tunnel {
                 route.observed = Some(generation.last_open.clone());
             }
             if tunnel.open_code() != 0 {
@@ -538,6 +538,10 @@ impl RealityClient {
 /// Preserve IPv6 scope, discard the ephemeral local port. A failed observation
 /// must never authorize reuse of an earlier negative cache entry.
 pub(crate) fn route_source(remote: SocketAddr) -> Option<SocketAddr> {
+    #[cfg(target_os = "windows")]
+    if crate::routing::carrier_socket::active() {
+        return windows_route_source(remote);
+    }
     let bind = if remote.is_ipv4() {
         SocketAddr::from(([0, 0, 0, 0], 0))
     } else {
@@ -551,6 +555,42 @@ pub(crate) fn route_source(remote: SocketAddr) -> Option<SocketAddr> {
     }
     local.set_port(0);
     Some(local)
+}
+
+// Read-only route query, not a throwaway UDP connect (which would itself
+// require WFP ALE permission while capture is active).
+#[cfg(target_os = "windows")]
+fn windows_route_source(remote: SocketAddr) -> Option<SocketAddr> {
+    use std::{mem, ptr};
+    use windows_sys::Win32::{NetworkManagement::IpHelper::{GetBestInterfaceEx, GetBestRoute2, MIB_IPFORWARD_ROW2}, Networking::WinSock::{SOCKADDR_INET, AF_INET, AF_INET6}};
+    if remote.ip().is_unspecified() || remote.ip().is_multicast() { return None; }
+    let mut dst: SOCKADDR_INET = unsafe { mem::zeroed() };
+    let mut source: SOCKADDR_INET = unsafe { mem::zeroed() };
+    if mem::size_of::<SOCKADDR_INET>() != 28 { return None; }
+    let raw = unsafe { std::slice::from_raw_parts_mut((&mut dst as *mut SOCKADDR_INET).cast::<u8>(),28) };
+    match remote {
+        SocketAddr::V4(v4) => {
+            raw[..2].copy_from_slice(&AF_INET.to_ne_bytes());
+            raw[4..8].copy_from_slice(&v4.ip().octets());
+        }
+        SocketAddr::V6(v6) => {
+            if v6.scope_id() != 0 || v6.ip().to_ipv4_mapped().is_some() { return None; }
+            raw[..2].copy_from_slice(&AF_INET6.to_ne_bytes());
+            raw[8..24].copy_from_slice(&v6.ip().octets());
+        }
+    }
+    let mut interface = 0u32;
+    if unsafe { GetBestInterfaceEx((&mut dst as *mut SOCKADDR_INET).cast(), &mut interface) } != 0 || interface == 0 { return None; }
+    let mut route: MIB_IPFORWARD_ROW2 = unsafe { mem::zeroed() };
+    if unsafe { GetBestRoute2(ptr::null(), interface, ptr::null(), &dst, 0, &mut route, &mut source) } != 0 { return None; }
+    let raw = unsafe { std::slice::from_raw_parts((&source as *const SOCKADDR_INET).cast::<u8>(),28) };
+    let family = u16::from_ne_bytes(raw[..2].try_into().ok()?);
+    let ip = match (remote, family) {
+        (SocketAddr::V4(_), AF_INET) => IpAddr::V4(Ipv4Addr::from(<[u8;4]>::try_from(&raw[4..8]).ok()?)),
+        (SocketAddr::V6(_), AF_INET6) if raw[24..28] == [0;4] => IpAddr::V6(Ipv6Addr::from(<[u8;16]>::try_from(&raw[8..24]).ok()?)),
+        _ => return None,
+    };
+    (!ip.is_unspecified() && !ip.is_multicast()).then_some(SocketAddr::new(ip,0))
 }
 
 #[derive(Default)]
@@ -936,6 +976,30 @@ enum ProxyTunnel {
     H3(Box<H3Tunnel>),
 }
 
+struct RoutedTcp {
+    tunnel: ProxyTunnel,
+    flow: crate::routing::flow::FlowLease,
+}
+impl RoutedTcp {
+    fn open_code(&self) -> u8 { self.tunnel.open_code() }
+    async fn relay(self, socket: TcpStream) -> Result<(), ClientError> {
+        self.tunnel.relay_guarded(socket, Some(&self.flow)).await
+    }
+}
+
+struct RoutedUdp {
+    tunnel: crate::udp_relay::Tunnel,
+    flow: crate::routing::flow::FlowLease,
+}
+impl RoutedUdp {
+    fn record_transport(&self, observed: &std::sync::atomic::AtomicU8) {
+        self.tunnel.record_transport(observed);
+    }
+    async fn relay(self, upload: tokio::sync::mpsc::Receiver<Vec<u8>>, download: tokio::sync::mpsc::Sender<Vec<u8>>) -> Result<(), ClientError> {
+        self.tunnel.relay_guarded(upload, download, Some(&self.flow)).await
+    }
+}
+
 struct DpiRoute {
     tunnel: crate::routing::dpi::Tunnel,
     observed: Option<Arc<std::sync::atomic::AtomicU8>>,
@@ -1069,17 +1133,16 @@ async fn route_decision(
     let snapshot = cache.get(|known| carrier.fetch_routing(known)).await?;
     let policy = snapshot.policy();
     let denied = || ClientError::Open(ErrorCode::PolicyDenied);
+    use crate::routing::Evidence;
     let mut pinned = None;
     let action = match address {
         Address::V4(ip) => policy
-            .matching_action(None, Some(IpAddr::V4(Ipv4Addr::from(*ip))))
-            .map_err(|_| denied())?
-            .unwrap_or(Action::Allowed),
+            .classify(Evidence::Absent, Evidence::Known(IpAddr::V4(Ipv4Addr::from(*ip))))
+            .map_err(|_| denied())?.action().ok_or_else(denied)?,
         Address::V6(ip) => policy
-            .matching_action(None, Some(IpAddr::V6(Ipv6Addr::from(*ip))))
-            .map_err(|_| denied())?
-            .unwrap_or(Action::Allowed),
-        Address::Dns(name) => match policy.domain_decision(name).map_err(|_| denied())? {
+            .classify(Evidence::Absent, Evidence::Known(IpAddr::V6(Ipv6Addr::from(*ip))))
+            .map_err(|_| denied())?.action().ok_or_else(denied)?,
+        Address::Dns(name) => match policy.classify(Evidence::Known(name), Evidence::Unknown).map_err(|_| denied())?.action() {
             Some(action) => action,
             None => {
                 // Resolve only over the verified control channel when an IP
@@ -1089,9 +1152,8 @@ async fn route_decision(
                 let mut action = None;
                 for ip in &ips {
                     let selected = policy
-                        .matching_action(Some(name), Some(*ip))
-                        .map_err(|_| denied())?
-                        .unwrap_or(Action::Allowed);
+                        .classify(Evidence::Known(name), Evidence::Known(*ip))
+                        .map_err(|_| denied())?.action().ok_or_else(denied)?;
                     if action.is_some_and(|old| old != selected) {
                         // Mixed route decisions are ambiguous; do not silently
                         // downgrade to direct or proxy one of the blocked IPs.
@@ -1105,6 +1167,9 @@ async fn route_decision(
             }
         },
     };
+    // DNS preflight may have awaited network I/O; never return a superseded
+    // policy as authorization to initiate an egress.
+    cache.dpi.check_policy(snapshot.digest())?;
     Ok((snapshot, action, pinned))
 }
 
@@ -1113,17 +1178,40 @@ async fn routed_open(
     cache: &Cache,
     address: Address,
     port: u16,
-) -> Result<ProxyTunnel, ClientError> {
+) -> Result<RoutedTcp, ClientError> {
     let (snapshot, action, pinned) = route_decision(carrier, cache, &address).await?;
+    if action.packet_action() == crate::routing::PacketAction::Drop {
+        crate::traffic::blocked();
+        return Err(ClientError::Open(ErrorCode::PolicyDenied));
+    }
+    let flow = cache.flows.begin(cache.dpi.clone(), crate::routing::flow::Protocol::Tcp, address.clone(), port, snapshot.digest(), action.packet_action())?;
+    let tunnel = routed_open_selected(carrier, cache, address, port, snapshot, action, pinned).await?;
+    Ok(RoutedTcp { tunnel, flow })
+}
+
+async fn routed_open_selected(
+    carrier: &Carrier,
+    cache: &Cache,
+    address: Address,
+    port: u16,
+    snapshot: Arc<Snapshot>,
+    action: Action,
+    pinned: Option<Vec<IpAddr>>,
+) -> Result<ProxyTunnel, ClientError> {
     let policy = snapshot.policy();
     let denied = || ClientError::Open(ErrorCode::PolicyDenied);
-    match action {
-        Action::Blocked => {
+    match action.packet_action() {
+        crate::routing::PacketAction::Drop => {
             crate::traffic::blocked();
             Err(denied())
         }
-        Action::Allowed => carrier.open(address, port).await,
-        Action::DirectDpi => {
+        crate::routing::PacketAction::Redirect => {
+            cache.dpi.check_policy(snapshot.digest())?;
+            let tunnel = carrier.open(address, port).await?;
+            cache.dpi.check_policy(snapshot.digest())?;
+            Ok(tunnel)
+        }
+        crate::routing::PacketAction::Modify => {
             // Initial native backend supports domain HTTPS TCP only. Resolve
             // via the authenticated policy endpoint, never the local resolver.
             if cache.dpi.enabled() && matches!(port, 443 | 8443) {
@@ -1141,9 +1229,12 @@ async fn routed_open(
                     };
                     let permitted = !ips.is_empty()
                         && ips.iter().all(|ip| {
-                            policy.matching_action(Some(name), Some(*ip))
-                                == Ok(Some(Action::DirectDpi))
+                            policy.classify(crate::routing::Evidence::Known(name), crate::routing::Evidence::Known(*ip))
+                                == Ok(crate::routing::Classification::Matched(Action::DirectDpi))
                         });
+                    if !ips.is_empty() && !permitted {
+                        return Err(denied());
+                    }
                     if permitted {
                         if let Some(tunnel) =
                             cache.dpi.open(name, port, &ips, snapshot.digest()).await
@@ -1170,9 +1261,12 @@ async fn routed_open(
             crate::traffic::dpi_fallback_open();
             Ok(tunnel)
         }
-        Action::Direct => client_state::dial_direct(address, port, pinned)
-            .await
-            .map(ProxyTunnel::Direct),
+        crate::routing::PacketAction::Pass => {
+            cache.dpi.check_policy(snapshot.digest())?;
+            let target = client_state::dial_direct(address, port, pinned).await?;
+            cache.dpi.check_policy(snapshot.digest())?;
+            Ok(ProxyTunnel::Direct(target))
+        }
     }
 }
 
@@ -1183,18 +1277,47 @@ async fn routed_udp(
     port: u16,
     candidate: &crate::routing::dpi::udp::Candidate,
     observed: &Arc<std::sync::atomic::AtomicU8>,
-) -> Result<crate::udp_relay::Tunnel, ClientError> {
+) -> Result<RoutedUdp, ClientError> {
     let (snapshot, action, pinned) = route_decision(carrier, cache, &address).await?;
-    match action {
-        Action::Blocked => {
+    if action.packet_action() == crate::routing::PacketAction::Drop {
+        crate::traffic::blocked();
+        return Err(ClientError::Open(ErrorCode::PolicyDenied));
+    }
+    let flow = cache.flows.begin(cache.dpi.clone(), crate::routing::flow::Protocol::Udp, address.clone(), port, snapshot.digest(), action.packet_action())?;
+    let tunnel = routed_udp_selected(carrier, cache, address, port, candidate, observed, snapshot, action, pinned).await?;
+    Ok(RoutedUdp { tunnel, flow })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn routed_udp_selected(
+    carrier: &Carrier,
+    cache: &Cache,
+    address: Address,
+    port: u16,
+    candidate: &crate::routing::dpi::udp::Candidate,
+    observed: &Arc<std::sync::atomic::AtomicU8>,
+    snapshot: Arc<Snapshot>,
+    action: Action,
+    pinned: Option<Vec<IpAddr>>,
+) -> Result<crate::udp_relay::Tunnel, ClientError> {
+    match action.packet_action() {
+        crate::routing::PacketAction::Drop => {
             crate::traffic::blocked();
             Err(ClientError::Open(ErrorCode::PolicyDenied))
         }
-        Action::Direct => crate::udp_relay::direct(address, port, pinned)
-            .await
-            .map(crate::udp_relay::Tunnel::Direct),
-        Action::Allowed => carrier.open_udp(address, port).await,
-        Action::DirectDpi => {
+        crate::routing::PacketAction::Pass => {
+            cache.dpi.check_policy(snapshot.digest())?;
+            let target = crate::udp_relay::direct(address, port, pinned).await?;
+            cache.dpi.check_policy(snapshot.digest())?;
+            Ok(crate::udp_relay::Tunnel::Direct(target))
+        }
+        crate::routing::PacketAction::Redirect => {
+            cache.dpi.check_policy(snapshot.digest())?;
+            let tunnel = carrier.open_udp(address, port).await?;
+            cache.dpi.check_policy(snapshot.digest())?;
+            Ok(tunnel)
+        }
+        crate::routing::PacketAction::Modify => {
             use crate::routing::dpi::udp::Candidate;
             // The locked Quinn backend cannot authenticate QUIC v2.
             // Never treat a v1 handshake as evidence for v2.
@@ -1222,12 +1345,14 @@ async fn routed_udp(
                             Err(error) => return Err(error),
                         },
                     };
-                    if !ips.is_empty()
-                        && ips.iter().all(|ip| {
-                            snapshot.policy().matching_action(Some(name), Some(*ip))
-                                == Ok(Some(Action::DirectDpi))
-                        })
-                    {
+                    let permitted = ips.iter().all(|ip| {
+                        snapshot.policy().classify(crate::routing::Evidence::Known(name), crate::routing::Evidence::Known(*ip))
+                            == Ok(crate::routing::Classification::Matched(Action::DirectDpi))
+                    });
+                    if !permitted {
+                        return Err(ClientError::Open(ErrorCode::PolicyDenied));
+                    }
+                    if !ips.is_empty() {
                         let verified = if stun {
                             cache
                                 .dpi
@@ -1311,7 +1436,8 @@ impl ProxyClient {
             }
         };
         format!(
-            "{report}\n{}\nЛокальный Anti-DPI: {}\n{}",
+            "{report}\nСистемный перехват: не активирован (backend не готов)\n{}\n{}\nЛокальный Anti-DPI: {}\n{}",
+            crate::routing::flow::summary(self.routing_cache().flows.counts()),
             self.routing_cache().report(),
             if self.routing_cache().dpi.enabled() {
                 "разрешён (экспериментальный TCP/TLS)"
@@ -1345,7 +1471,7 @@ impl ProxyClient {
         address: Address,
         port: u16,
         candidate: &crate::routing::dpi::udp::Candidate,
-    ) -> Result<crate::udp_relay::Tunnel, ClientError> {
+    ) -> Result<RoutedUdp, ClientError> {
         match self {
             Self::Direct(c) => {
                 let tunnel = routed_udp(
@@ -1384,12 +1510,12 @@ impl ProxyClient {
         }
     }
 
-    async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
+    async fn open(&self, address: Address, port: u16) -> Result<RoutedTcp, ClientError> {
         match self {
             Self::Direct(client) => {
                 let mut tunnel =
                     routed_open(&client.carrier, &client.routing, address, port).await?;
-                if let ProxyTunnel::Dpi(route) = &mut tunnel {
+                if let ProxyTunnel::Dpi(route) = &mut tunnel.tunnel {
                     route.observed = Some(client.last_open.clone());
                 }
                 if tunnel.open_code() != 0 {
@@ -1437,9 +1563,14 @@ impl ProxyTunnel {
         (transport << 2) | if up { 2 } else { 1 }
     }
 
+    #[cfg(test)]
     async fn relay(self, socket: TcpStream) -> Result<(), ClientError> {
+        self.relay_guarded(socket, None).await
+    }
+
+    async fn relay_guarded(self, socket: TcpStream, flow: Option<&crate::routing::flow::FlowLease>) -> Result<(), ClientError> {
         match self {
-            Self::Direct(target) => client_state::relay_direct(socket, target).await,
+            Self::Direct(target) => client_state::relay_direct_guarded(socket, target, flow).await,
             Self::Dpi(route) => {
                 let DpiRoute {
                     tunnel,
@@ -1449,7 +1580,7 @@ impl ProxyTunnel {
                     port,
                 } = *route;
                 let authorization = tunnel.fallback_policy();
-                match tunnel.relay(socket).await? {
+                match tunnel.relay_guarded(socket, flow).await? {
                     crate::routing::dpi::RelayOutcome::Finished => Ok(()),
                     crate::routing::dpi::RelayOutcome::Fallback { client, prefix } => {
                         // The origin received no application bytes. The carrier
@@ -1464,15 +1595,15 @@ impl ProxyTunnel {
                         let local = crate::reality_tcp::Prefixed::new(client, prefix.into());
                         crate::traffic::dpi_fallback_open();
                         match tunnel {
-                            Self::H2(tunnel) => tunnel.relay(local).await,
-                            Self::H3(tunnel) => tunnel.relay(local).await,
+                            Self::H2(tunnel) => tunnel.relay_guarded(local, flow).await,
+                            Self::H3(tunnel) => tunnel.relay_guarded(local, flow).await,
                             _ => Err(ClientError::Protocol),
                         }
                     }
                 }
             }
-            Self::H2(tunnel) => tunnel.relay(socket).await,
-            Self::H3(tunnel) => tunnel.relay(socket).await,
+            Self::H2(tunnel) => tunnel.relay_guarded(socket, flow).await,
+            Self::H3(tunnel) => tunnel.relay_guarded(socket, flow).await,
         }
     }
 }
@@ -1498,12 +1629,151 @@ struct ClientView {
     revision: u64,
     client: ProxyClient,
 }
+// One atomic lifecycle: a concurrent Stop must never be overwritten by
+// preparation or a backend's final readiness publication. State 4 is an
+// internal terminal state for runtimes that never owned native capture.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[derive(Default)]
+struct CaptureLifecycle(std::sync::atomic::AtomicU8);
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl CaptureLifecycle {
+    fn idle(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire) == 0
+    }
+
+    fn running(&self) -> bool {
+        matches!(self.0.load(std::sync::atomic::Ordering::Acquire), 1 | 2)
+    }
+
+    fn begin(&self) -> Result<(), ClientError> {
+        self.transition(0, 1)
+    }
+
+    fn ready(&self) -> Result<(), ClientError> {
+        self.transition(1, 2)
+    }
+
+    fn transition(&self, from: u8, to: u8) -> Result<(), ClientError> {
+        use std::sync::atomic::Ordering;
+        self.0.compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| ClientError::Configuration)
+    }
+
+    fn stop(&self) {
+        use std::sync::atomic::Ordering;
+        let _ = self.0.fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            match state {
+                0 => Some(4),
+                1 | 2 => Some(3),
+                _ => None,
+            }
+        });
+    }
+
+    fn reported(&self) -> u8 {
+        match self.0.load(std::sync::atomic::Ordering::Acquire) {
+            4 => 0,
+            state => state,
+        }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
+mod capture_lifecycle_tests {
+    use super::CaptureLifecycle;
+
+    #[test]
+    fn stopped_before_preparation_cannot_publish_capture() {
+        let state = CaptureLifecycle::default();
+        assert!(state.idle());
+        state.stop();
+        assert_eq!(state.reported(), 0);
+        assert!(!state.idle());
+        assert!(!state.running());
+        assert!(state.begin().is_err());
+        assert!(state.ready().is_err());
+        state.stop();
+        assert_eq!(state.reported(), 0);
+    }
+
+    #[test]
+    fn interrupted_preparation_is_recovery_required() {
+        let state = CaptureLifecycle::default();
+        assert!(state.ready().is_err());
+        state.begin().unwrap();
+        assert_eq!(state.reported(), 1);
+        assert!(state.running());
+        assert!(state.begin().is_err());
+        state.stop();
+        assert_eq!(state.reported(), 3);
+        assert!(state.ready().is_err());
+        assert!(state.begin().is_err());
+        assert!(!state.running());
+        state.stop();
+        assert_eq!(state.reported(), 3);
+    }
+
+    #[test]
+    fn ready_then_stop_is_terminal() {
+        let state = CaptureLifecycle::default();
+        state.begin().unwrap();
+        state.ready().unwrap();
+        assert_eq!(state.reported(), 2);
+        assert!(state.ready().is_err());
+        assert!(state.running());
+        state.stop();
+        assert_eq!(state.reported(), 3);
+        assert!(!state.running());
+        assert!(state.ready().is_err());
+    }
+
+    #[test]
+    fn concurrent_ready_and_stop_cannot_resurrect_capture() {
+        let state = CaptureLifecycle::default();
+        state.begin().unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                let _ = state.ready();
+            });
+            barrier.wait();
+            state.stop();
+        });
+        assert_eq!(state.reported(), 3);
+        assert!(!state.running());
+        assert!(state.ready().is_err());
+    }
+
+    #[test]
+    fn concurrent_prepare_and_stop_never_leaves_a_live_state() {
+        let state = CaptureLifecycle::default();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                let _ = state.begin();
+            });
+            barrier.wait();
+            state.stop();
+        });
+        assert!(matches!(state.reported(), 0 | 3));
+        assert!(!state.running());
+        assert!(!state.idle());
+        assert!(state.begin().is_err());
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) struct ClientRuntime {
     path: std::path::PathBuf,
     slot: tokio::sync::watch::Sender<Arc<ClientView>>,
     // Bound one staging operation per process, with no commit on cancellation.
     stage: tokio::sync::Mutex<()>,
+    capture_state: CaptureLifecycle,
+    stopped: tokio::sync::watch::Sender<bool>,
 }
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 impl ClientRuntime {
@@ -1519,13 +1789,55 @@ impl ClientRuntime {
             revision: 1,
             client,
         }));
+        let (stopped, _) = tokio::sync::watch::channel(false);
         Arc::new(Self {
             path,
             slot,
             stage: tokio::sync::Mutex::new(()),
+            capture_state: CaptureLifecycle::default(),
+            stopped,
         })
     }
-    pub(crate) async fn status(&self) -> (u64, [u8; 32], u64, u8, u8, bool, (u64, u8), [u64; 38]) {
+    /// Pin exactly the published client generation for native capture.
+    /// A structural or profile update needs explicit stop/recovery until
+    /// carrier and rule changes can be committed in one platform transaction.
+    async fn attach_native(self: &Arc<Self>, owner: Arc<NativeOwner>, registrar: Option<Arc<dyn crate::routing::carrier_socket::Registrar>>) -> Result<NativeIngress, ClientError> {
+        let _stage = self.stage.try_lock().map_err(|_| ClientError::Configuration)?;
+        if *self.stopped.borrow() || !self.capture_state.idle() {
+            return Err(ClientError::Configuration);
+        }
+        let view = self.slot.borrow().clone();
+        saved_client_bytes(&self.path, view.digest)?;
+        crate::routing::carrier_socket::scope(registrar.clone(), view.client.routing_policy()).await?;
+        saved_client_bytes(&self.path, view.digest)?;
+        if *self.stopped.borrow() { return Err(ClientError::Configuration); }
+        self.capture_state.begin()?;
+        Ok(NativeIngress {
+            runtime: self.clone(),
+            client: view.client.clone(),
+            revision: view.revision,
+            registrar: Mutex::new(registrar),
+            verdict_gate: Mutex::new(()),
+            #[cfg(target_os = "linux")]
+            raw: Mutex::new(std::collections::HashMap::new()),
+            _owner: owner,
+        })
+    }
+
+    fn stop(&self) {
+        // Capture rules may remain after the queue stops. Never publish
+        // inactive/connected until the owner has finished recovery.
+        self.capture_state.stop();
+        self.stopped.send_replace(true);
+        self.slot.borrow().client.routing_cache().dpi.retire();
+    }
+
+    async fn stopped(&self) {
+        let mut stop = self.stopped.subscribe();
+        if !*stop.borrow() { let _ = stop.wait_for(|stopped| *stopped).await; }
+    }
+
+    pub(crate) async fn status(&self) -> (u64, [u8; 32], u64, u8, u8, bool, (u64, u8), [u64; 38], Option<[u16; 4]>, u8) {
         let view = self.slot.borrow().clone();
         let (desc, observed, fallback) = match &view.client {
             ProxyClient::Reality(r) => {
@@ -1559,6 +1871,8 @@ impl ClientRuntime {
             fallback,
             view.client.routing_cache().observation(),
             crate::traffic::routing_totals(),
+            view.client.routing_cache().flows.counts(),
+            self.capture_state.reported(),
         )
     }
     async fn candidate(
@@ -1639,6 +1953,9 @@ impl ClientRuntime {
             .stage
             .try_lock()
             .map_err(|_| ClientError::Configuration)?;
+        if *self.stopped.borrow() || !self.capture_state.idle() {
+            return Err(ClientError::Configuration);
+        }
         let previous = self.slot.borrow().clone();
         if previous.revision != expected || previous.digest == digest {
             return Err(ClientError::Configuration);
@@ -1650,6 +1967,8 @@ impl ClientRuntime {
         let revision = expected.checked_add(1).ok_or(ClientError::Configuration)?;
         // No await between final exact-byte recheck and publication.
         saved_client_bytes(&self.path, digest)?;
+        if *self.stopped.borrow() { return Err(ClientError::Configuration); }
+        previous.client.routing_cache().dpi.retire();
         self.slot.send_replace(Arc::new(ClientView {
             document,
             digest,
@@ -1664,6 +1983,8 @@ impl ClientRuntime {
             let view = changes.borrow_and_update().clone();
             let maintenance = async { view.client.maintain().await };
             tokio::select! {
+                biased;
+                ()=self.stopped()=>return Ok(()),
                 result=maintenance=>return result,
                 result=changes.changed()=>if result.is_err(){return Err(ClientError::Io);},
             }
@@ -1748,12 +2069,853 @@ async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result
     serving.await
 }
 
+/// Experimental native-ingress adapter for an already isolated platform
+/// harness. It uses the same authenticated client, classifier, shared flow
+/// table and H2/H3 carrier as explicit proxy ingress. It does NOT install
+/// system rules, assert capture readiness, or provide an egress exemption.
+/// A production backend must own those operations before calling it.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub struct NativeIngress {
+    runtime: Arc<ClientRuntime>,
+    client: ProxyClient,
+    revision: u64,
+    registrar: Mutex<Option<Arc<dyn crate::routing::carrier_socket::Registrar>>>,
+    verdict_gate: Mutex<()>,
+    #[cfg(target_os = "linux")]
+    raw: Mutex<std::collections::HashMap<crate::routing::packet::FlowKey, RawLease>>,
+    _owner: Arc<NativeOwner>,
+}
+
+/// A single experimental packet strategy bound to a specific native flow.
+/// The caller must prepare it before activating isolated queue rules.
+/// It is not a DNS/application attribution credential.
+#[cfg(target_os = "linux")]
+pub struct LabStunPermit {
+    key: crate::routing::packet::FlowKey,
+    flow: crate::routing::flow::FlowLease,
+    engine: Arc<crate::routing::dpi::Engine>,
+    verified: crate::routing::dpi::VerifiedUdp,
+    failed: bool,
+}
+
+#[cfg(target_os = "linux")]
+struct RawLease {
+    flow: crate::routing::flow::FlowLease,
+    digest: [u8; 32],
+    last: Instant,
+    denied: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+static NATIVE_OWNER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+struct NativeOwner {
+    #[cfg(target_os = "linux")]
+    _scope: std::os::unix::net::UnixDatagram,
+    #[cfg(target_os = "windows")]
+    _scope: std::os::windows::io::OwnedHandle,
+}
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl NativeOwner {
+    fn acquire() -> Result<Self, ClientError> {
+        NATIVE_OWNER.compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire)
+            .map_err(|_| ClientError::Configuration)?;
+        match Self::scope() {
+            Ok(owner) => Ok(owner),
+            Err(error) => {
+                NATIVE_OWNER.store(false, std::sync::atomic::Ordering::Release);
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn scope() -> Result<Self, ClientError> {
+        use std::os::linux::net::SocketAddrExt;
+        // Abstract Unix socket names are scoped to the network namespace.
+        // Kernel closes the ownership handle on crash; no stale PID file.
+        let address = std::os::unix::net::SocketAddr::from_abstract_name(b"theia-native-ingress-v1")
+            .map_err(|_| ClientError::Configuration)?;
+        let socket = std::os::unix::net::UnixDatagram::bind_addr(&address)
+            .map_err(|_| ClientError::Configuration)?;
+        Ok(Self { _scope: socket })
+    }
+
+    #[cfg(target_os = "windows")]
+    fn scope() -> Result<Self, ClientError> {
+        use std::{os::windows::io::{FromRawHandle, OwnedHandle}, ptr};
+        use windows_sys::Win32::{Foundation::{GetLastError, ERROR_ALREADY_EXISTS}, System::Threading::CreateEventW};
+        // An event is a lifetime handle, not a thread-affine mutex. We
+        // reject an existing object instead of sharing or stealing it.
+        let name: Vec<u16> = "Global\\Theia.NativeIngress.v1".encode_utf16().chain([0]).collect();
+        let raw = unsafe { CreateEventW(ptr::null(), 1, 0, name.as_ptr()) };
+        if raw.is_null() { return Err(ClientError::Configuration); }
+        let existed = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+        // SAFETY: CreateEventW returned one owned non-null kernel handle.
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
+        if existed { return Err(ClientError::Configuration); }
+        Ok(Self { _scope: handle })
+    }
+}
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl Drop for NativeOwner {
+    fn drop(&mut self) {
+        NATIVE_OWNER.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl NativeIngress {
+    /// Preflight only; the caller owns an isolated network namespace/rule
+    /// transaction. No new CLI or second system interception mode.
+    pub async fn prepare(path: &Path) -> Result<Self, ClientError> {
+        let owner = Arc::new(NativeOwner::acquire()?);
+        let raw = zeroize::Zeroizing::new(config::editor_bytes(path).map_err(|_| ClientError::Configuration)?);
+        let Config::Client(document) = config::parse(std::str::from_utf8(&raw).map_err(|_| ClientError::Configuration)?)
+            .map_err(|_| ClientError::Configuration)? else { return Err(ClientError::Configuration); };
+        use sha2::{Digest, Sha256};
+        let digest: [u8; 32] = Sha256::digest(raw.as_slice()).into();
+        let client = prepare_client(&document, path).await?;
+        saved_client_bytes(path, digest)?;
+        let runtime = ClientRuntime::new(std::path::absolute(path).map_err(|_| ClientError::Configuration)?, document, digest, client);
+        runtime.attach_native(owner, None).await
+    }
+
+    /// Cancels all native relay operations, retires the policy lease and
+    /// leaves the externally owned OS capture rules untouched. The platform
+    /// owner must perform its own authenticated CAS restoration on explicit Stop.
+    pub fn shutdown(&self) {
+        let _gate = self.verdict_gate.lock();
+        self.runtime.stop();
+        self.client.routing_cache().dpi.retire();
+        if let Ok(mut registrar) = self.registrar.lock() { drop(registrar.take()); }
+        #[cfg(target_os = "linux")]
+        if let Ok(mut raw) = self.raw.lock() {
+            raw.clear();
+        }
+    }
+
+    async fn stopped(&self) { self.runtime.stopped().await; }
+
+    fn registrar(&self) -> Result<Option<Arc<dyn crate::routing::carrier_socket::Registrar>>, ClientError> {
+        self.registrar.lock().map(|r| r.clone()).map_err(|_| ClientError::Configuration)
+    }
+
+    fn ensure_running(&self) -> Result<(), ClientError> {
+        if !self.runtime.capture_state.running()
+            || *self.runtime.stopped.borrow()
+            || self.runtime.slot.borrow().revision != self.revision
+        {
+            Err(ClientError::Open(ErrorCode::PolicyDenied))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Own the actual queue consumer and the current runtime's maintenance
+    /// for the entire isolated capture lifetime. No production activation:
+    /// rules and queue must have been provisioned in the same namespace.
+    /// Cancellation or any fatal error retires the runtime and closes the
+    /// queue; the journal remains for explicit CAS recovery.
+    #[cfg(target_os = "linux")]
+    pub async fn serve_linux_queue(
+        &self,
+        queue: crate::routing::nfqueue::Queue,
+        rules: crate::routing::linux_rules::LabRules,
+        host_namespace: std::fs::File,
+    ) -> Result<(), ClientError> {
+        self.ensure_running()?;
+        if !rules.owns_queue(&queue).map_err(|_| ClientError::Io)? { return Err(ClientError::Configuration); }
+        let rules = Arc::new(Mutex::new(rules));
+        let registrar: Arc<dyn crate::routing::carrier_socket::Registrar> = Arc::new(crate::routing::linux_rules::LabRegistrar::new(rules.clone(), host_namespace));
+        {
+            let mut slot = self.registrar.lock().map_err(|_| ClientError::Configuration)?;
+            if slot.is_some() { return Err(ClientError::Configuration); }
+            *slot = Some(registrar.clone());
+        }
+        self.serve_linux_shared(queue, rules, registrar).await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn serve_linux_shared(
+        &self,
+        queue: crate::routing::nfqueue::Queue,
+        rules: Arc<Mutex<crate::routing::linux_rules::LabRules>>,
+        registrar: Arc<dyn crate::routing::carrier_socket::Registrar>,
+    ) -> Result<(), ClientError> {
+        struct StopOnDrop<'a>(&'a NativeIngress);
+        impl Drop for StopOnDrop<'_> { fn drop(&mut self) { self.0.shutdown(); } }
+        let _stop = StopOnDrop(self);
+        self.ensure_running()?;
+        if !rules.lock().map_err(|_| ClientError::Configuration)?.owns_queue(&queue).map_err(|_| ClientError::Io)? { return Err(ClientError::Configuration); }
+        let mut queue = queue.into_async().map_err(|_| ClientError::Io)?;
+        self.runtime.capture_state.ready()?;
+        let consume = async {
+            let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                let packet = tokio::select! {
+                    biased;
+                    _ = heartbeat.tick() => {
+                        if !rules.lock().map_err(|_| ClientError::Configuration)?.current().map_err(|_| ClientError::Io)? {
+                            return Err(ClientError::Open(ErrorCode::PolicyDenied));
+                        }
+                        continue;
+                    }
+                    packet=queue.next()=>packet.map_err(|_| ClientError::Io)?,
+                };
+                if !rules.lock().map_err(|_| ClientError::Configuration)?.owns_packet(&packet).map_err(|_| ClientError::Io)? {
+                    return Err(ClientError::Open(ErrorCode::PolicyDenied));
+                }
+                self.verdict(&rules, packet).await.map_err(|_| ClientError::Io)?;
+            }
+        };
+        tokio::select! {
+            biased;
+            result=crate::routing::carrier_socket::scope(Some(registrar.clone()), consume)=>result,
+            result=crate::routing::carrier_socket::scope(Some(registrar), self.runtime.maintain())=>result,
+            ()=self.stopped()=>Ok(()),
+        }
+    }
+
+    /// End-to-end managed startup for a dedicated Linux laboratory
+    /// namespace. This is intentionally not exposed as the product's
+    /// Connect action: transparent Redirect and attribution are incomplete.
+    /// No preflight carrier is opened before the registrar is in scope.
+    /// A failed or cancelled run leaves the fail-closed table and durable
+    /// journal intact. Only an explicit successful Stop may restore rules.
+    #[cfg(target_os = "linux")]
+    pub async fn run_linux_lab(
+        path: &Path,
+        host_namespace: std::fs::File,
+        journal: &Path,
+        queue_number: u16,
+        stop: impl std::future::Future<Output = std::io::Result<()>>,
+    ) -> Result<(), ClientError> {
+        use crate::routing::{carrier_socket, linux_rules::{self, LabRegistrar, LabRules}, nfqueue::Queue};
+        use sha2::{Digest, Sha256};
+        // Namespace ownership must not move between executor threads.
+        if tokio::runtime::Handle::current().runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread {
+            return Err(ClientError::Configuration);
+        }
+        let owner = Arc::new(NativeOwner::acquire()?);
+        let path = std::path::absolute(path).map_err(|_| ClientError::Configuration)?;
+        let raw = zeroize::Zeroizing::new(config::editor_bytes(&path).map_err(|_| ClientError::Configuration)?);
+        let Config::Client(document) = config::parse(std::str::from_utf8(&raw).map_err(|_| ClientError::Configuration)?)
+            .map_err(|_| ClientError::Configuration)? else { return Err(ClientError::Configuration); };
+        let digest: [u8;32] = Sha256::digest(raw.as_slice()).into();
+        saved_client_bytes(&path, digest)?;
+        let queue = Queue::bind(queue_number, 256).map_err(|_| ClientError::Io)?;
+        let rules = Arc::new(Mutex::new(LabRules::install(&queue, &host_namespace, journal).map_err(|_| ClientError::Io)?));
+        let registrar: Arc<dyn carrier_socket::Registrar> = Arc::new(LabRegistrar::new(rules.clone(), host_namespace.try_clone().map_err(|_| ClientError::Io)?));
+        let client = carrier_socket::scope(Some(registrar.clone()), prepare_client(&document,&path)).await?;
+        saved_client_bytes(&path,digest)?;
+        let runtime = ClientRuntime::new(path,document,digest,client);
+        // Keep the process/namespace owner alive across the entire explicit
+        // recovery transaction, not just across the packet consumer.
+        let ingress = runtime.attach_native(owner.clone(),Some(registrar.clone())).await?;
+        let control = crate::management::client_server(runtime.clone()).map_err(|_| ClientError::Configuration)?;
+        let management = async move {
+            match control {
+                Some(server) => server.serve().await.map_err(|_| ClientError::Io),
+                None => std::future::pending::<Result<(),ClientError>>().await,
+            }
+        };
+        let explicit = tokio::select! {
+            biased;
+            result=ingress.serve_linux_shared(queue,rules.clone(),registrar.clone())=>{
+                result?;
+                Err(ClientError::Io) // unexpected consumer exit, never auto restore
+            },
+            result=management=>{ result?; Err(ClientError::Io) },
+            // When a failure and explicit stop are already ready together,
+            // do not reinterpret a failed consumer as a clean shutdown.
+            result=stop=>result.map_err(|_| ClientError::Io),
+        };
+        ingress.shutdown();
+        drop(ingress);
+        drop(runtime);
+        drop(registrar);
+        explicit?;
+        // Connection drivers may release their socket leases asynchronously
+        // after abort. Never restore while a live carrier retains our rules.
+        timeout(Duration::from_secs(3), async {
+            while Arc::strong_count(&rules) != 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.map_err(|_| ClientError::Timeout)?;
+        drop(rules);
+        let recovered = linux_rules::recover(&host_namespace,journal).map_err(|_| ClientError::Io);
+        drop(owner);
+        recovered
+    }
+
+    /// Managed Windows TCP Redirect laboratory. Requires a disposable
+    /// non-default compartment, signed installed driver and already-owned
+    /// BFE filters, provisioned outside this process. No production Connect,
+    /// user UDP or auto recovery is enabled by this entry point.
+    #[cfg(target_os = "windows")]
+    pub async fn run_windows_lab(
+        path: &Path,
+        compartment: u32,
+        port: u16,
+        controller: &Path,
+        controller_sha256: [u8;32],
+        stop: impl std::future::Future<Output = std::io::Result<()>>,
+    ) -> Result<(), ClientError> {
+        use crate::routing::{carrier_socket, wfp_ingress::{BfeInspector, WfpLabSession, bind_tcp_listeners}};
+        use sha2::{Digest,Sha256};
+        if tokio::runtime::Handle::current().runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread {
+            return Err(ClientError::Configuration);
+        }
+        let owner = Arc::new(NativeOwner::acquire()?);
+        let path = std::path::absolute(path).map_err(|_| ClientError::Configuration)?;
+        let raw = zeroize::Zeroizing::new(config::editor_bytes(&path).map_err(|_| ClientError::Configuration)?);
+        let Config::Client(document) = config::parse(std::str::from_utf8(&raw).map_err(|_| ClientError::Configuration)?)
+            .map_err(|_| ClientError::Configuration)? else { return Err(ClientError::Configuration); };
+        let digest: [u8;32] = Sha256::digest(raw.as_slice()).into();
+        saved_client_bytes(&path, digest)?;
+        let proof = Arc::new(BfeInspector::open(controller, controller_sha256, compartment).map_err(|_| ClientError::Configuration)?);
+        proof.inspect().await.map_err(|_| ClientError::Configuration)?;
+        let [v4,v6] = bind_tcp_listeners(compartment,port).map_err(|_| ClientError::Io)?;
+        let session = Arc::new(WfpLabSession::open(compartment,port).map_err(|_| ClientError::Io)?);
+        // Even if preflight or the owning future is cancelled, retire the
+        // kernel session before releasing listeners. Persistent filters stay.
+        struct StopDriver(Arc<WfpLabSession>);
+        impl Drop for StopDriver {
+            fn drop(&mut self) { let _ = self.0.deactivate(); }
+        }
+        let _stop_driver = StopDriver(session.clone());
+        let registrar: Arc<dyn carrier_socket::Registrar> = session.clone();
+        let client = carrier_socket::scope(Some(registrar.clone()), prepare_client(&document,&path)).await?;
+        saved_client_bytes(&path,digest)?;
+        let runtime = ClientRuntime::new(path,document,digest,client);
+        let ingress = Arc::new(runtime.attach_native(owner.clone(),Some(registrar.clone())).await?);
+        let control = crate::management::client_server(runtime.clone()).map_err(|_| ClientError::Configuration)?;
+        let management = async move {
+            match control {
+                Some(server) => server.serve().await.map_err(|_| ClientError::Io),
+                None => std::future::pending::<Result<(),ClientError>>().await,
+            }
+        };
+        proof.inspect().await.map_err(|_| ClientError::Configuration)?;
+        session.check().map_err(|_| ClientError::Io)?;
+        ingress.runtime.capture_state.ready()?;
+        let mut relays = JoinSet::new();
+        let result = {
+            let consume = async {
+                let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
+                heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    let stream = tokio::select! {
+                        biased;
+                        _ = heartbeat.tick() => {
+                            session.check().map_err(|_| ClientError::Io)?;
+                            proof.inspect().await.map_err(|_| ClientError::Io)?;
+                            session.check().map_err(|_| ClientError::Io)?;
+                            continue;
+                        }
+                        finished = relays.join_next(), if !relays.is_empty() => {
+                            // Individual denial/transport failure closes that
+                            // flow; a panicked relay is a supervisor failure.
+                            if finished.is_some_and(|r| r.is_err()) { return Err(ClientError::Io); }
+                            continue;
+                        }
+                        result = v4.accept() => result.map_err(|_| ClientError::Io)?.0,
+                        result = v6.accept() => result.map_err(|_| ClientError::Io)?.0,
+                    };
+                    session.check().map_err(|_| ClientError::Io)?;
+                    if relays.len() >= LOCAL_LIMIT { drop(stream); continue; }
+                    let ingress = ingress.clone();
+                    let session = session.clone();
+                    // The current-thread runtime keeps these socket operations
+                    // in the verified compartment; no detached worker owns a
+                    // listener or receives a process-wide exemption.
+                    relays.spawn(async move { ingress.relay_windows_tcp(stream,session).await });
+                }
+            };
+            tokio::select! {
+                biased;
+                result = consume => result,
+                result = carrier_socket::scope(Some(registrar.clone()),runtime.maintain()) => {
+                    result?;
+                    Err(ClientError::Io)
+                },
+                result = management => { result?; Err(ClientError::Io) },
+                result = stop => result.map_err(|_| ClientError::Io),
+            }
+        };
+        let retired = session.deactivate();
+        ingress.shutdown();
+        relays.shutdown().await;
+        drop(v4);
+        drop(v6);
+        drop(ingress);
+        drop(runtime);
+        drop(registrar);
+        result?;
+        retired.map_err(|_| ClientError::Io)?;
+        // A successful explicit stop proves driver retirement, not BFE
+        // restoration. Require the persistent filters to still be exact;
+        // the administrator must unload/recover them using signed tooling.
+        proof.inspect().await.map_err(|_| ClientError::Io)?;
+        drop(owner);
+        Ok(())
+    }
+
+    /// Correlate a laboratory resolver link with protected DNS from the
+    /// exact active policy generation. This does not grant routing
+    /// authorization: neither the BPF reader nor resolver event source
+    /// has yet been integrated into the production native backend.
+    #[cfg(target_os = "linux")]
+    pub async fn corroborate_dns_lab(
+        &self,
+        flow: crate::routing::linux_events::CorroboratedFlow,
+        link: &crate::routing::dns_attribution::ResolverLink,
+        candidates: &mut crate::routing::dns_attribution::DnsCandidates,
+    ) -> Result<bool, ClientError> {
+        self.ensure_running()?;
+        if flow.key() != link.key || flow.cookie() != link.cookie || flow.process_start() != link.process_start {
+            return Ok(false);
+        }
+        let registrar = self.registrar()?.ok_or(ClientError::Open(ErrorCode::PolicyDenied))?;
+        crate::routing::carrier_socket::scope(Some(registrar), async {
+            let (carrier, cache) = match &self.client {
+                ProxyClient::Direct(c) => (c.carrier.clone(), &c.routing),
+                ProxyClient::Reality(c) => (c.generation().await?.carrier.clone(), &c.routing),
+            };
+            let snapshot = cache.get(|known| carrier.fetch_routing(known)).await?;
+            let digest = snapshot.digest();
+            let name = crate::routing::domain_name(&link.domain).map_err(|_| ClientError::Protocol)?;
+            // The current wire response contains addresses, not authoritative
+            // DNS TTLs. Bound this diagnostic to the original policy lease and
+            // a short window beginning BEFORE the authenticated request.
+            let original_deadline = cache.observation_deadline(digest)?;
+            let requested = Instant::now();
+            let ips = carrier.resolve_routing(&name, digest).await?;
+            let deadline = original_deadline.min(cache.observation_deadline(digest)?)
+                .min(requested + Duration::from_secs(30));
+            self.ensure_running()?;
+            candidates.record(flow, link, digest, &ips, deadline).map_err(|_| ClientError::Protocol)
+        }).await
+    }
+
+    /// Prepare a narrowly scoped laboratory Modify permit. The route must
+    /// be conclusive even with unknown application/domain evidence; the
+    /// supplied name is only an authenticated DNS/reachability probe hint,
+    /// never evidence of which name the application actually requested.
+    /// No probe is run on the captured application socket or packet.
+    #[cfg(target_os = "linux")]
+    pub async fn prepare_stun_lab(
+        &self,
+        key: crate::routing::packet::FlowKey,
+        domain: &str,
+    ) -> Result<LabStunPermit, ClientError> {
+        use crate::routing::{Evidence, PacketAction, packet::Transport, dpi::{UdpStrategy, udp::BindingStrategy}};
+        let denied = || ClientError::Open(ErrorCode::PolicyDenied);
+        self.ensure_running()?;
+        if key.transport != Transport::Udp || key.destination.port() != 3478 || key.source.port() == 0
+            || key.source.is_ipv4() != key.destination.is_ipv4()
+            || !crate::server::allowed_destination(key.destination.ip(), false) {
+            return Err(denied());
+        }
+        let (carrier, cache) = match &self.client {
+            ProxyClient::Direct(c) => (c.carrier.clone(), &c.routing),
+            ProxyClient::Reality(c) => (c.generation().await?.carrier.clone(), &c.routing),
+        };
+        let snapshot = cache.get(|known| carrier.fetch_routing(known)).await?;
+        let digest = snapshot.digest();
+        let name = crate::routing::domain_name(domain).map_err(|_| denied())?;
+        let policy = snapshot.policy();
+        for evidence in [Evidence::Unknown, Evidence::Known(name.as_str())] {
+            if policy.classify_with_application(evidence, Evidence::Known(key.destination.ip()), Evidence::Unknown)
+                .map_err(|_| denied())?.action() != Some(Action::DirectDpi) {
+                return Err(denied());
+            }
+        }
+        if !cache.dpi.stun_enabled() { return Err(denied()); }
+        let ips = carrier.resolve_routing(&name, digest).await?;
+        if !ips.contains(&key.destination.ip()) { return Err(denied()); }
+        let verified = cache.dpi.open_stun_udp(&name, 3478, &[key.destination.ip()], digest).await.ok_or_else(denied)?;
+        if verified.strategy != UdpStrategy::StunBinding(BindingStrategy::Fingerprint)
+            || verified.socket.peer_addr().ok() != Some(key.destination)
+            || !verified.socket.local_addr().is_ok_and(|a| a.ip() == key.source.ip())
+            || !verified.admissible()? {
+            return Err(denied());
+        }
+        self.ensure_running()?;
+        let flow = cache.flows.begin_native(cache.dpi.clone(), key, digest, PacketAction::Modify)?;
+        Ok(LabStunPermit { key, flow, engine: cache.dpi.clone(), verified, failed: false })
+    }
+
+    /// The actual NFQUEUE replacement is available only under an owned
+    /// isolated lab rules lease. Unsupported packets, stale evidence,
+    /// shutdown and all mismatches are terminal for this permit.
+    #[cfg(target_os = "linux")]
+    pub fn verdict_stun_lab(
+        &self,
+        rules: &crate::routing::linux_rules::LabRules,
+        permit: &mut LabStunPermit,
+        packet: crate::routing::nfqueue::Packet<'_>,
+    ) -> std::io::Result<crate::routing::PacketAction> {
+        use crate::routing::PacketAction;
+        let gate = self.verdict_gate.lock();
+        let acceptable = gate.is_ok() && !permit.failed && self.ensure_running().is_ok()
+            && Arc::ptr_eq(&permit.engine, &self.client.routing_cache().dpi)
+            && packet.local_output() && !packet.checksum_pending()
+            && packet.metadata().is_some_and(|meta| meta.flow == permit.key)
+            && rules.owns_packet(&packet).unwrap_or(false)
+            && permit.verified.admissible().unwrap_or(false);
+        if acceptable {
+            if let Some(changed) = crate::routing::packet_modify::stun_fingerprint(packet.bytes()) {
+                // Commit before the kernel verdict, never retry another egress.
+                if permit.flow.commit(PacketAction::Modify).is_ok() {
+                    let result = packet.finish_stun_lab(&changed);
+                    if !matches!(&result, Ok(PacketAction::Modify)) { permit.failed = true; }
+                    return result;
+                }
+            }
+        }
+        permit.failed = true;
+        packet.finish(PacketAction::Drop)
+    }
+
+    /// Deliver only a conclusive early Pass to NFQUEUE. Unknown domain/app,
+    /// Modify, Redirect and all errors fail closed on raw packet ingress.
+    /// No raw TCP connection is moved to the carrier after its SYN.
+    #[cfg(target_os = "linux")]
+    pub async fn verdict(
+        &self,
+        rules: &Mutex<crate::routing::linux_rules::LabRules>,
+        packet: crate::routing::nfqueue::Packet<'_>,
+    ) -> std::io::Result<crate::routing::PacketAction> {
+        use crate::routing::PacketAction;
+        // Check before doing any async policy work; a standalone queue
+        // without the exact owned rule set must not authorize native Pass.
+        if !rules.lock().map_err(|_| std::io::ErrorKind::PermissionDenied)?.owns_packet(&packet)? {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
+        let meta = packet.metadata();
+        let action = if packet.local_output() {
+            match meta {
+                Some(meta) => self.raw_verdict(meta).await,
+                None => PacketAction::Drop,
+            }
+        } else {
+            PacketAction::Drop
+        };
+        let gate = self.verdict_gate.lock();
+        // Recheck AFTER the asynchronous policy fetch. Hold the rule mutex
+        // through the actual verdict so our own dynamic lease transaction
+        // cannot race this check. A foreign change is a terminal error.
+        let owned = rules.lock().map_err(|_| std::io::ErrorKind::PermissionDenied)?;
+        if !owned.owns_packet(&packet)? {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
+        let mut action = if gate.is_ok() && self.ensure_running().is_ok() { action } else { PacketAction::Drop };
+        if action == PacketAction::Pass {
+            let current = meta.and_then(|m| {
+                let key = crate::routing::packet::FlowKey { interface: 0, ..m.flow };
+                let mut raw = self.raw.lock().ok()?;
+                let entry = raw.get_mut(&key)?;
+                if self.client.routing_cache().dpi.check_policy(entry.digest).is_err() { entry.denied = true; }
+                Some(!entry.denied)
+            }).unwrap_or(false);
+            if !current { action = PacketAction::Drop; }
+        }
+        let result = packet.finish(action);
+        drop(owned);
+        result
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn raw_verdict(&self, mut meta: crate::routing::packet::PacketMeta) -> crate::routing::PacketAction {
+        use crate::routing::{Evidence, PacketAction, packet::Transport};
+        meta.flow.interface = 0;
+        if [meta.flow.source.ip(), meta.flow.destination.ip()].iter().any(|ip| ip.is_unspecified() || ip.is_multicast() || matches!(ip, IpAddr::V6(v6) if v6.is_unicast_link_local() || v6.to_ipv4_mapped().is_some())) {
+            return PacketAction::Drop;
+        }
+        if self.ensure_running().is_err() { return PacketAction::Drop; }
+        let snapshot = match timeout(Duration::from_millis(250), self.client.routing_policy()).await {
+            Ok(Ok(snapshot)) => snapshot,
+            _ => {
+                if let Ok(mut raw) = self.raw.lock() {
+                    if let Some(entry) = raw.get_mut(&meta.flow) { entry.denied = true; entry.last = Instant::now(); }
+                }
+                return PacketAction::Drop;
+            }
+        };
+        let cache = self.client.routing_cache();
+        let digest = snapshot.digest();
+        let matched = meta.classify(snapshot.policy(), Evidence::Unknown, Evidence::Unknown)
+            .ok().and_then(|c| c.action()).map(Action::packet_action);
+        let Ok(mut raw) = self.raw.lock() else { return PacketAction::Drop; };
+        if self.ensure_running().is_err() { return PacketAction::Drop; }
+        let now = Instant::now();
+        raw.retain(|_, entry| now.duration_since(entry.last) < Duration::from_secs(60));
+        let current = matched == Some(PacketAction::Pass) && cache.dpi.check_policy(digest).is_ok();
+        if let Some(entry) = raw.get_mut(&meta.flow) {
+            entry.last = now;
+            if !current || entry.digest != digest { entry.denied = true; }
+            return if !entry.denied && entry.flow.commit(PacketAction::Pass).is_ok() { PacketAction::Pass } else { PacketAction::Drop };
+        }
+        // TCP must start from a SYN without ACK/RST/FIN. A lost or expired
+        // flow is never silently recreated from a middle-of-stream packet.
+        if !current || (meta.flow.transport == Transport::Tcp && !meta.tcp_flags.is_some_and(|f| f & 0x17 == 0x02)) {
+            return PacketAction::Drop;
+        }
+        let Ok(flow) = cache.flows.begin_native(cache.dpi.clone(), meta.flow, digest, PacketAction::Pass) else { return PacketAction::Drop; };
+        if flow.commit(PacketAction::Pass).is_err() { return PacketAction::Drop; }
+        raw.insert(meta.flow, RawLease { flow, digest, last: now, denied: false });
+        PacketAction::Pass
+    }
+
+    /// Terminate an already redirected TCP connection using the original
+    /// target from conntrack. Native domain/application are Unknown.
+    /// Only carrier Redirect (or legal pre-payload Modify fallback) is
+    /// supported here: local Pass must use a separate proven egress path.
+    #[cfg(target_os = "linux")]
+    pub async fn relay_linux_tcp(&self, stream: TcpStream) -> Result<(), ClientError> {
+        let key = crate::routing::linux_ingress::original_tcp(&stream).map_err(|_| ClientError::Open(ErrorCode::PolicyDenied))?;
+        self.relay_terminated_tcp(key, stream).await
+    }
+
+    /// WFP companion driver must supply the original target in a context
+    /// bound to the current private driver/service session. This entry
+    /// point does not install callouts or trust a client-supplied header.
+    #[cfg(target_os = "windows")]
+    pub async fn relay_windows_tcp(&self, stream: TcpStream, session: Arc<crate::routing::wfp_ingress::WfpLabSession>) -> Result<(), ClientError> {
+        self.ensure_running()?;
+        let expected = self.registrar()?.ok_or(ClientError::Open(ErrorCode::PolicyDenied))?;
+        let registrar: Arc<dyn crate::routing::carrier_socket::Registrar> = session.clone();
+        if !Arc::ptr_eq(&expected, &registrar) {
+            return Err(ClientError::Open(ErrorCode::PolicyDenied));
+        }
+        let key = session.original_tcp(&stream)
+            .map_err(|_| ClientError::Open(ErrorCode::PolicyDenied))?;
+        crate::routing::carrier_socket::scope(Some(registrar), self.relay_terminated_tcp(key, stream)).await
+    }
+
+    async fn relay_terminated_tcp(&self, key: crate::routing::packet::FlowKey, stream: TcpStream) -> Result<(), ClientError> {
+        if key.transport != crate::routing::packet::Transport::Tcp { return Err(ClientError::Protocol); }
+        tokio::select! {
+            biased;
+            () = self.stopped() => Err(ClientError::Open(ErrorCode::PolicyDenied)),
+            result = async {
+                let (carrier, flow, address) = self.redirect(key).await?;
+                let tunnel = crate::routing::carrier_socket::scope(self.registrar()?, carrier.open(address, key.destination.port())).await?;
+                tunnel.relay_guarded(stream, Some(&flow)).await
+            } => result,
+        }
+    }
+
+    /// One terminated Linux UDP flow from UdpCapture. The platform owner
+    /// demultiplexes subsequent captured datagrams by the exact key. The
+    /// connected reply socket uses the original remote address as source
+    /// and refuses nonlocal peers. Requires isolated, correctly provisioned
+    /// reverse-path routing; does not exempt sockets from system capture.
+    #[cfg(target_os = "linux")]
+    pub async fn relay_linux_udp(
+        &self,
+        first: crate::routing::linux_ingress::CapturedDatagram,
+        mut subsequent: tokio::sync::mpsc::Receiver<crate::routing::linux_ingress::CapturedDatagram>,
+    ) -> Result<(), ClientError> {
+        use crate::routing::PacketAction;
+        let key = first.key;
+        if subsequent.max_capacity() > crate::udp_relay::QUEUE { return Err(ClientError::Protocol); }
+        tokio::select! {
+            biased;
+            () = self.stopped() => Err(ClientError::Open(ErrorCode::PolicyDenied)),
+            result = async {
+                let (carrier, flow, address) = self.redirect(key).await?;
+                let tunnel = crate::routing::carrier_socket::scope(self.registrar()?, carrier.open_udp(address, key.destination.port())).await?;
+                let reply = crate::routing::linux_ingress::UdpReply::open(&first).map_err(|_| ClientError::Io)?;
+                let _reply_admission = self.registrar()?.map(|r| reply.admit_reply(r.as_ref())).transpose().map_err(|_| ClientError::Io)?;
+                let (tx, up) = tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
+                let (down, mut rx) = tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
+                tx.send(first.payload).await.map_err(|_| ClientError::Io)?;
+                let relay = tunnel.relay_guarded(up, down, Some(&flow));
+                let feed = async move {
+                    while let Some(datagram) = subsequent.recv().await {
+                        if datagram.key != key || datagram.payload.len() > crate::protocol::MAX_DATAGRAM {
+                            return Err(ClientError::Protocol);
+                        }
+                        tx.send(datagram.payload).await.map_err(|_| ClientError::Io)?;
+                    }
+                    Ok::<(), ClientError>(())
+                };
+                let replies = async {
+                    while let Some(bytes) = rx.recv().await {
+                        if !flow.committed(PacketAction::Redirect) {
+                            return Err(ClientError::Open(ErrorCode::PolicyDenied));
+                        }
+                        reply.send(&bytes).await.map_err(|_| ClientError::Io)?;
+                    }
+                    Ok::<(), ClientError>(())
+                };
+                tokio::select! {
+                    result = relay => result,
+                    result = async { tokio::try_join!(feed, replies).map(|_| ()) } => result,
+                }
+            } => result,
+        }
+    }
+
+    /// Actual multi-datagram QUIC Modify in the isolated Linux lab.
+    /// The caller supplies only kernel-captured UDP and an untrusted
+    /// probe-name hint. Domain and application evidence remain Unknown;
+    /// the authenticated policy must conclusively authorize Modify without
+    /// that hint. No ordinary proxy or production native activation.
+    #[cfg(target_os = "linux")]
+    pub async fn relay_linux_quic_lab(
+        &self,
+        first: crate::routing::linux_ingress::CapturedDatagram,
+        mut subsequent: tokio::sync::mpsc::Receiver<crate::routing::linux_ingress::CapturedDatagram>,
+        domain: &str,
+    ) -> Result<(), ClientError> {
+        use crate::routing::{Evidence, PacketAction, packet::Transport, carrier_socket};
+        let denied = || ClientError::Open(ErrorCode::PolicyDenied);
+        let key = first.key;
+        if key.transport != Transport::Udp || key.destination.port() != 443
+            || subsequent.max_capacity() > crate::udp_relay::QUEUE
+            || !crate::server::allowed_destination(key.destination.ip(), false) { return Err(denied()); }
+        let registrar = self.registrar()?.ok_or_else(denied)?;
+        tokio::select! {
+            biased;
+            () = self.stopped() => Err(denied()),
+            result = carrier_socket::scope(Some(registrar.clone()), async {
+                self.ensure_running()?;
+                let name = crate::routing::domain_name(domain).map_err(|_| denied())?;
+                if crate::routing::packet_modify::quic_initial_datagrams(&first.payload, &name).is_none() {
+                    return Err(denied());
+                }
+                let (carrier, cache) = match &self.client {
+                    ProxyClient::Direct(c) => (c.carrier.clone(), &c.routing),
+                    ProxyClient::Reality(c) => (c.generation().await?.carrier.clone(), &c.routing),
+                };
+                let snapshot = cache.get(|known| carrier.fetch_routing(known)).await?;
+                let digest = snapshot.digest();
+                for evidence in [Evidence::Unknown, Evidence::Known(name.as_str())] {
+                    if snapshot.policy().classify_with_application(evidence,Evidence::Known(key.destination.ip()),Evidence::Unknown)
+                        .map_err(|_| denied())?.action() != Some(Action::DirectDpi) { return Err(denied()); }
+                }
+                let ips = carrier.resolve_routing(&name,digest).await?;
+                if !ips.contains(&key.destination.ip()) { return Err(denied()); }
+                let version = crate::reality_quic_wire::long(&first.payload)
+                    .and_then(|header| crate::quic_core::wire::Version::from_wire(header.version))
+                    .ok_or_else(denied)?;
+                let verified = cache.dpi.open_quic_udp_version(&name,443,&[key.destination.ip()],digest,version).await.ok_or_else(denied)?;
+                if verified.quic_batch(&first.payload).is_none() || verified.socket.peer_addr().ok() != Some(key.destination)
+                    || !verified.socket.local_addr().is_ok_and(|a| a.ip() == key.source.ip())
+                    || !verified.admissible()? { return Err(denied()); }
+                let flow = cache.flows.begin_native(cache.dpi.clone(),key,digest,PacketAction::Modify)?;
+                let _local_admission = registrar.udp(&verified.socket,key.destination).map_err(|_| denied())?;
+                let reply = crate::routing::linux_ingress::UdpReply::open(&first).map_err(|_| ClientError::Io)?;
+                let _reply_admission = reply.admit_reply(registrar.as_ref()).map_err(|_| denied())?;
+                let (tx,up) = tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
+                let (down,mut rx) = tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
+                let relay = crate::udp_relay::relay_quic_lab(&verified,first.payload,up,down,&flow);
+                let feed = async move {
+                    while let Some(datagram) = subsequent.recv().await {
+                        if datagram.key != key || datagram.payload.len() > crate::protocol::MAX_DATAGRAM {
+                            return Err(ClientError::Protocol);
+                        }
+                        tx.send(datagram.payload).await.map_err(|_| ClientError::Io)?;
+                    }
+                    Ok::<(),ClientError>(())
+                };
+                let replies = async {
+                    while let Some(bytes) = rx.recv().await {
+                        if !flow.committed(PacketAction::Modify) { return Err(denied()); }
+                        reply.send(&bytes).await.map_err(|_| ClientError::Io)?;
+                    }
+                    Ok::<(),ClientError>(())
+                };
+                tokio::select! {
+                    result=relay=>result,
+                    result=async { tokio::try_join!(feed,replies).map(|_| ()) }=>result,
+                }
+            }) => result,
+        }
+    }
+
+    /// Common UDP handoff for a trusted platform adapter with a terminated
+    /// datagram flow. The OS-specific receiver/response routing is owned
+    /// by the platform adapter; use relay_linux_udp on Linux.
+    pub async fn relay_terminated_udp(
+        &self,
+        key: crate::routing::packet::FlowKey,
+        upload: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        download: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) -> Result<(), ClientError> {
+        if key.transport != crate::routing::packet::Transport::Udp
+            || upload.max_capacity() > crate::udp_relay::QUEUE
+            || download.max_capacity() > crate::udp_relay::QUEUE {
+            return Err(ClientError::Protocol);
+        }
+        tokio::select! {
+            biased;
+            () = self.stopped() => Err(ClientError::Open(ErrorCode::PolicyDenied)),
+            result = async {
+                let (carrier, flow, address) = self.redirect(key).await?;
+                let tunnel = crate::routing::carrier_socket::scope(self.registrar()?, carrier.open_udp(address, key.destination.port())).await?;
+                tunnel.relay_guarded(upload, download, Some(&flow)).await
+            } => result,
+        }
+    }
+
+    async fn redirect(&self, key: crate::routing::packet::FlowKey) -> Result<(Carrier, crate::routing::flow::FlowLease, Address), ClientError> {
+        use crate::routing::{Evidence, PacketAction};
+        self.ensure_running()?;
+        let denied = || ClientError::Open(ErrorCode::PolicyDenied);
+        if key.destination.port() == 0 || key.source.port() == 0
+            || key.destination.ip().is_loopback() || key.destination.ip().is_unspecified()
+            || key.destination.ip().is_multicast() || key.destination == key.source
+            || matches!(key.destination, SocketAddr::V6(v6) if v6.scope_id() != 0 || v6.ip().is_unicast_link_local() || v6.ip().to_ipv4_mapped().is_some()) {
+            return Err(denied());
+        }
+        let (carrier, cache) = match &self.client {
+            ProxyClient::Direct(c) => (c.carrier.clone(), &c.routing),
+            ProxyClient::Reality(c) => (c.generation().await?.carrier.clone(), &c.routing),
+        };
+        let snapshot = crate::routing::carrier_socket::scope(self.registrar()?, cache.get(|known| carrier.fetch_routing(known))).await?;
+        let configured = snapshot.policy().classify_with_application(
+            Evidence::Unknown, Evidence::Known(key.destination.ip()), Evidence::Unknown
+        ).map_err(|_| denied())?.action().ok_or_else(denied)?.packet_action();
+        if !matches!(configured, PacketAction::Redirect | PacketAction::Modify) {
+            return Err(denied());
+        }
+        self.ensure_running()?;
+        let flow = cache.flows.begin_native(cache.dpi.clone(), key, snapshot.digest(), configured)?;
+        let address = match key.destination.ip() {
+            IpAddr::V4(ip) => Address::V4(ip.octets()),
+            IpAddr::V6(ip) => Address::V6(ip.octets()),
+        };
+        Ok((carrier, flow, address))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl Drop for NativeIngress {
+    fn drop(&mut self) { self.shutdown(); }
+}
+
 /// Shared startup preflight: never changes the OS proxy or claims an
 /// authenticated remote tunnel merely because the listeners bind.
 async fn prepare_proxy(
     document: &config::ClientDocument,
     path: &Path,
 ) -> Result<(TcpListener, TcpListener, ProxyClient), ClientError> {
+    let client = prepare_client(document, path).await?;
+    // All startup validation and both binds must succeed before accepting.
+    let http = TcpListener::bind(&document.client.proxy.http_listen).await.map_err(|_| ClientError::Io)?;
+    let socks = TcpListener::bind(&document.client.proxy.socks5_listen).await.map_err(|_| ClientError::Io)?;
+    crate::diag!(Info, "client.proxy", "listeners_bound", "count" = Value::Count(2));
+    Ok((http, socks, client))
+}
+
+async fn prepare_client(document: &config::ClientDocument, path: &Path) -> Result<ProxyClient, ClientError> {
     let profile = document
         .client
         .profiles
@@ -1782,20 +2944,7 @@ async fn prepare_proxy(
         .set_stun_enabled(document.client.proxy.direct_dpi_stun.unwrap_or(false));
     client.routing_policy().await?;
     crate::diag!(Info, "client.proxy", "transport_preflight_passed");
-    // All startup validation and both binds must succeed before accepting.
-    let http = TcpListener::bind(&document.client.proxy.http_listen)
-        .await
-        .map_err(|_| ClientError::Io)?;
-    let socks = TcpListener::bind(&document.client.proxy.socks5_listen)
-        .await
-        .map_err(|_| ClientError::Io)?;
-    crate::diag!(
-        Info,
-        "client.proxy",
-        "listeners_bound",
-        "count" = Value::Count(2)
-    );
-    Ok((http, socks, client))
+    Ok(client)
 }
 
 /// A Windows TUI starts the local client independently of OS proxy consent.
@@ -2653,7 +3802,7 @@ async fn udp_quic_fixture(app: tokio::net::UdpSocket, relay: SocketAddr) {
     let der = cert.cert.der().clone();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(der.clone()).unwrap();
-    let origin = crate::quic_transport::server_endpoint(
+    let origin = crate::quinn_reference::server_endpoint(
         "127.0.0.1:0".parse().unwrap(),
         vec![der],
         rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
@@ -2661,7 +3810,7 @@ async fn udp_quic_fixture(app: tokio::net::UdpSocket, relay: SocketAddr) {
     .unwrap();
     let origin_port = origin.local_addr().unwrap().port();
     let endpoint =
-        crate::quic_transport::client_endpoint("127.0.0.1:0".parse().unwrap(), roots).unwrap();
+        crate::quinn_reference::client_endpoint("127.0.0.1:0".parse().unwrap(), roots).unwrap();
     let client_addr = endpoint.local_addr().unwrap();
     let bridge_addr = app.local_addr().unwrap();
     let bridge = tokio::spawn(async move {
@@ -2684,7 +3833,7 @@ async fn udp_quic_fixture(app: tokio::net::UdpSocket, relay: SocketAddr) {
         }
     });
     let server = async {
-        let connection = crate::quic_transport::accept(origin.accept().await.unwrap())
+        let connection = crate::quinn_reference::accept(origin.accept().await.unwrap())
             .await
             .unwrap();
         let (mut tx, mut rx) = connection.accept_bi().await.unwrap();
@@ -2695,7 +3844,7 @@ async fn udp_quic_fixture(app: tokio::net::UdpSocket, relay: SocketAddr) {
         connection
     };
     let client = async {
-        let connection = crate::quic_transport::connect(&endpoint, bridge_addr, "localhost")
+        let connection = crate::quinn_reference::connect(&endpoint, bridge_addr, "localhost")
             .await
             .unwrap();
         let (mut tx, mut rx) = connection.open_bi().await.unwrap();
@@ -3057,7 +4206,7 @@ mod selector_tests {
                     let (mut local, remote) = tokio::io::duplex(4096);
                     let rebind = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
                     rebind.set_nonblocking(true).unwrap();
-                    tunnel.rebind_for_test(rebind).unwrap();
+                    tunnel.rebind_for_test(rebind).await.unwrap();
                     let task = tokio::spawn(tunnel.relay(remote));
                     local.write_all(b"move").await.unwrap();
                     let mut bytes = [0; 4];
@@ -3539,7 +4688,7 @@ mod selector_tests {
         let mut roots = RootCertStore::empty();
         roots.add(cert.cert.der().clone()).unwrap();
         let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-        let server = crate::quic_transport::server_endpoint(
+        let server = crate::quinn_reference::server_endpoint(
             "127.0.0.1:0".parse().unwrap(),
             vec![cert.cert.der().clone()],
             key.into(),
@@ -3846,18 +4995,21 @@ mod selector_tests {
                         action: Action::Direct,
                         domains: vec!["full:localhost".into()],
                         ips: vec![],
+                        applications: vec![],
                     },
                     crate::routing::Rule {
                         name: "blocked".into(),
                         action: Action::Blocked,
                         domains: vec!["full:blocked.invalid".into()],
                         ips: vec![],
+                        applications: vec![],
                     },
                     crate::routing::Rule {
                         name: "dpi fallback".into(),
                         action: Action::DirectDpi,
                         domains: vec![],
                         ips: vec!["127.0.0.1/32".into()],
+                        applications: vec![],
                     },
                 ],
             }),
@@ -3920,7 +5072,7 @@ mod selector_tests {
                     .await
                     .unwrap();
                 assert!(matches!(
-                    dpi_tunnel,
+                    dpi_tunnel.tunnel,
                     ProxyTunnel::H2(_) | ProxyTunnel::H3(_)
                 ));
                 let _dpi_accepted = dpi_listener.accept().await.unwrap();
@@ -3970,7 +5122,7 @@ mod selector_tests {
                     .open(Address::Dns("localhost".into()), direct_port)
                     .await
                     .unwrap();
-                assert!(matches!(tunnel, ProxyTunnel::Direct(_)));
+                assert!(matches!(tunnel.tunnel, ProxyTunnel::Direct(_)));
                 let _accepted = direct_listener.accept().await.unwrap();
                 if let ProxyClient::Direct(client) = &proxy_client {
                     assert!(matches!(

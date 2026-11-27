@@ -1,5 +1,9 @@
 //! M4.5f native Linux/Windows: bounded source-aware H2+H3 candidate checks.
 //! Only loopback UDP/TCP traffic, no live catalogue-domain or CIDR scans.
+#[path = "support/quinn_reference.rs"]
+mod quinn_reference;
+
+use quinn_reference as quic_transport;
 use rcgen::generate_simple_self_signed;
 use rustls::{pki_types::PrivatePkcs8KeyDer, RootCertStore};
 use std::{
@@ -13,7 +17,6 @@ use theia::{
     camouflage_interfaces::NativeInterfaces,
     camouflage_probe::{ProbeApproval, ProbeRequest},
     camouflage_workflow::{build_preview, PreviewScope},
-    quic_transport,
 };
 use tokio::{net::TcpListener, time::timeout};
 use tokio_rustls::TlsAcceptor;

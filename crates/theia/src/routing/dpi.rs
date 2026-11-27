@@ -6,6 +6,30 @@ mod tcp;
 mod tls;
 pub(crate) mod udp;
 
+pub(super) fn complete_packet_hello(bytes: &[u8], expected: &str) -> bool {
+    matches!(tls::inspect(bytes), tls::Flight::Complete { consumed, name, .. } if consumed == bytes.len() && name == expected)
+}
+pub(super) fn packet_quic_hello(message: &[u8], expected: &str) -> bool {
+    tls::hello_metadata(message).is_some_and(|(name, h3)| h3 && name == expected)
+}
+#[cfg(test)]
+pub(super) fn packet_test_hello(name: &str) -> Vec<u8> { tls::fixture(name) }
+#[cfg(test)]
+pub(super) fn packet_test_quic_hello(name: &str) -> Vec<u8> {
+    let mut record = tls::fixture(name);
+    // Fixture has no session ID, one cipher and one compression method.
+    // Append ALPN h3 and update the extension/handshake/record lengths.
+    let extension_len = u16::from_be_bytes(record[50..52].try_into().unwrap());
+    record.extend([0,16,0,5,0,3,2,b'h',b'3']);
+    record[50..52].copy_from_slice(&(extension_len+9).to_be_bytes());
+    let body_len = (record.len()-9) as u32;
+    record[6..9].copy_from_slice(&body_len.to_be_bytes()[1..]);
+    let record_len = (record.len()-5) as u16;
+    record[3..5].copy_from_slice(&record_len.to_be_bytes());
+    assert!(packet_quic_hello(&record[5..],name));
+    record[5..].to_vec()
+}
+
 use crate::{client::ClientError, network_scope};
 use std::{
     net::{IpAddr, SocketAddr},
@@ -31,6 +55,7 @@ pub(crate) fn stale_policy() -> ClientError {
 /// Consent is local configuration, not a command in the server snapshot.
 pub(crate) struct Engine {
     enabled: AtomicBool,
+    retired: AtomicBool,
     stun_enabled: AtomicBool,
     policy: std::sync::Mutex<Option<super::client_state::LocalPolicy>>,
     cache: strategy::Cache,
@@ -42,14 +67,27 @@ pub(crate) struct Engine {
 
 struct UdpEvidence {
     key: Key,
+    probe: UdpProbe,
     good: bool,
     expiry: std::time::Instant,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+enum UdpProbe {
+    Quic(crate::quic_core::wire::Version),
+    Stun,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UdpStrategy {
-    QuicV1,
+    Quic(crate::quic_core::wire::Version),
     StunBinding(udp::BindingStrategy),
+}
+
+impl UdpStrategy {
+    fn probe(self) -> UdpProbe {
+        match self { Self::Quic(version) => UdpProbe::Quic(version), Self::StunBinding(_) => UdpProbe::Stun }
+    }
 }
 
 pub(crate) struct VerifiedUdp {
@@ -80,10 +118,17 @@ impl VerifiedUdp {
                 .socket
                 .local_addr()
                 .is_ok_and(|local| self.key.network.matches_local(local))
-            && self.engine.cached_udp(&self.key) == Some(true))
+            && self.engine.cached_udp(&self.key, self.strategy.probe()) == Some(true))
     }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn quic_batch(&self, first: &[u8]) -> Option<Vec<Vec<u8>>> {
+        let UdpStrategy::Quic(version) = self.strategy else { return None; };
+        if crate::reality_quic_wire::long(first)?.version != version.wire() { return None; }
+        super::packet_modify::quic_initial_datagrams(first, &self.key.name)
+    }
+
     pub(crate) fn failed(&self) {
-        self.engine.remember_udp(self.key.clone(), false);
+        self.engine.remember_udp(self.key.clone(), self.strategy.probe(), false);
     }
 
     #[cfg(test)]
@@ -93,7 +138,7 @@ impl VerifiedUdp {
         engine.authorize_policy(Some(super::client_state::LocalPolicy::fixture([1; 32])));
         Self {
             socket,
-            strategy: UdpStrategy::QuicV1,
+            strategy: UdpStrategy::Quic(crate::quic_core::wire::Version::V1),
             engine,
             key: Key {
                 name: "example.org".into(),
@@ -121,6 +166,7 @@ impl Default for Engine {
     fn default() -> Self {
         Self {
             enabled: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
             stun_enabled: AtomicBool::new(false),
             policy: std::sync::Mutex::new(None),
             cache: strategy::Cache::default(),
@@ -146,15 +192,26 @@ impl Engine {
 
     pub(super) fn authorize_policy(&self, lease: Option<super::client_state::LocalPolicy>) {
         if let Ok(mut policy) = self.policy.lock() {
-            *policy = lease;
+            *policy = if self.retired() { None } else { lease };
         }
+    }
+
+    pub(crate) fn retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
+    }
+
+    /// Retired runtime generations may drain committed flows, but cannot
+    /// authorize a new first send or refresh their old policy lease.
+    pub(crate) fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+        self.authorize_policy(None);
     }
 
     pub(crate) fn policy_current(&self, digest: [u8; 32]) -> bool {
         self.policy
             .lock()
             .ok()
-            .is_some_and(|policy| policy.as_ref().is_some_and(|lease| lease.valid(digest)))
+            .is_some_and(|policy| !self.retired() && policy.as_ref().is_some_and(|lease| lease.valid(digest)))
     }
 
     pub(crate) fn check_policy(&self, digest: [u8; 32]) -> Result<(), ClientError> {
@@ -176,26 +233,27 @@ impl Engine {
         (hash.finish() as usize) % self.probe_slots.len()
     }
 
-    fn cached_udp(&self, key: &Key) -> Option<bool> {
+    fn cached_udp(&self, key: &Key, probe: UdpProbe) -> Option<bool> {
         let mut cache = self.udp_cache.lock().ok()?;
         cache.retain(|entry| entry.expiry > std::time::Instant::now());
         cache
             .iter()
-            .find(|entry| &entry.key == key)
+            .find(|entry| &entry.key == key && entry.probe == probe)
             .map(|entry| entry.good)
     }
 
-    fn remember_udp(&self, key: Key, good: bool) {
+    fn remember_udp(&self, key: Key, probe: UdpProbe, good: bool) {
         if network_scope::observe(key.address) != Some(key.network) {
             return;
         }
         if let Ok(mut cache) = self.udp_cache.lock() {
-            cache.retain(|entry| entry.key != key && entry.expiry > std::time::Instant::now());
+            cache.retain(|entry| (entry.key != key || entry.probe != probe) && entry.expiry > std::time::Instant::now());
             if cache.len() >= 128 {
                 cache.pop_front();
             }
             cache.push_back(UdpEvidence {
                 key,
+                probe,
                 good,
                 expiry: std::time::Instant::now() + Duration::from_secs(if good { 60 } else { 20 }),
             });
@@ -211,6 +269,18 @@ impl Engine {
         ips: &[IpAddr],
         policy: [u8; 32],
     ) -> Option<VerifiedUdp> {
+        self.open_quic_udp_version(name, port, ips, policy, crate::quic_core::wire::Version::V1).await
+    }
+
+    pub(crate) async fn open_quic_udp_version(
+        self: &Arc<Self>,
+        name: &str,
+        port: u16,
+        ips: &[IpAddr],
+        policy: [u8;32],
+        version: crate::quic_core::wire::Version,
+    ) -> Option<VerifiedUdp> {
+        let probe = UdpProbe::Quic(version);
         if !self.enabled()
             || !self.policy_current(policy)
             || port != 443
@@ -243,7 +313,7 @@ impl Engine {
                 {
                     continue;
                 }
-                let good = if let Some(good) = self.cached_udp(&key) {
+                let good = if let Some(good) = self.cached_udp(&key, probe) {
                     crate::traffic::dpi_cache_hit();
                     good
                 } else {
@@ -253,14 +323,14 @@ impl Engine {
                         .ok()??;
                     let good = timeout(
                         ATTEMPT,
-                        udp::probe_quic(&name, address, Some(network), config),
+                        udp::probe_quic(&name, address, Some(network), config, version),
                     )
                     .await
                     .ok()
                     .flatten()
                     .is_some();
                     crate::traffic::dpi_probe(good);
-                    self.remember_udp(key.clone(), good);
+                    self.remember_udp(key.clone(), probe, good);
                     good
                 };
                 drop(guard);
@@ -281,13 +351,13 @@ impl Engine {
                     {
                         return Some(VerifiedUdp {
                             socket,
-                            strategy: UdpStrategy::QuicV1,
+                            strategy: UdpStrategy::Quic(version),
                             engine: self.clone(),
                             key,
                         });
                     }
                 }
-                self.remember_udp(key, false);
+                self.remember_udp(key, probe, false);
             }
             None
         })
@@ -339,7 +409,7 @@ impl Engine {
                 {
                     continue;
                 }
-                if self.cached_udp(&key) == Some(false) {
+                if self.cached_udp(&key, UdpProbe::Stun) == Some(false) {
                     continue;
                 }
                 let _permit = self.probes.try_acquire().ok()?;
@@ -380,7 +450,7 @@ impl Engine {
                 {
                     continue;
                 }
-                self.remember_udp(key.clone(), selected.is_some());
+                self.remember_udp(key.clone(), UdpProbe::Stun, selected.is_some());
                 let Some(strategy) = selected else {
                     continue;
                 };
@@ -533,9 +603,10 @@ impl Tunnel {
         }
     }
 
-    pub(crate) async fn relay(
+    pub(crate) async fn relay_guarded(
         mut self,
         mut client: TcpStream,
+        flow: Option<&super::flow::FlowLease>,
     ) -> Result<RelayOutcome, ClientError> {
         let mut prefix = Vec::new();
         let ready = match timeout(FIRST_FLIGHT, tcp::read_hello(&mut client, &mut prefix)).await {
@@ -552,7 +623,7 @@ impl Tunnel {
         } else {
             None
         };
-        let Some(transformed) = transformed else {
+        let Some(transformed) = transformed.filter(|bytes| bytes != &prefix) else {
             // Unsupported protocol, ECH, SNI mismatch, partial input or
             // timeout: no origin application bytes have left this process.
             return Ok(RelayOutcome::Fallback { client, prefix });
@@ -568,6 +639,9 @@ impl Tunnel {
             return Ok(RelayOutcome::Fallback { client, prefix });
         }
         self.engine.check_policy(self.key.policy)?;
+        if let Some(flow) = flow {
+            flow.commit(super::PacketAction::Modify)?;
+        }
         // From the first attempted write onward, even a partial write or
         // timeout is terminal for this stream. Never replay it over the VPS.
         let started = std::time::Instant::now();
@@ -677,6 +751,26 @@ mod tests {
         assert!(authorization.check().is_err());
         engine.authorize_policy(None);
         assert!(authorization.check().is_err());
+    }
+
+    #[test]
+    fn udp_evidence_does_not_cross_protocol_versions() {
+        use crate::quic_core::wire::Version;
+        let engine = Engine::default();
+        let address = "192.0.2.1:443".parse().unwrap();
+        let key = Key { name: "example.org".into(), address, policy: [1;32], network: network_scope::Scope::fixture(address, 1) };
+        let expiry = std::time::Instant::now() + Duration::from_secs(60);
+        engine.udp_cache.lock().unwrap().push_back(UdpEvidence {
+            key: key.clone(), probe: UdpProbe::Quic(Version::V1), good: true, expiry,
+        });
+        assert_eq!(engine.cached_udp(&key, UdpProbe::Quic(Version::V1)), Some(true));
+        assert_eq!(engine.cached_udp(&key, UdpProbe::Quic(Version::V2)), None);
+        assert_eq!(engine.cached_udp(&key, UdpProbe::Stun), None);
+        engine.udp_cache.lock().unwrap().push_back(UdpEvidence {
+            key: key.clone(), probe: UdpProbe::Quic(Version::V2), good: false, expiry,
+        });
+        assert_eq!(engine.cached_udp(&key, UdpProbe::Quic(Version::V2)), Some(false));
+        assert_eq!(engine.cached_udp(&key, UdpProbe::Quic(Version::V1)), Some(true));
     }
 
     #[tokio::test]

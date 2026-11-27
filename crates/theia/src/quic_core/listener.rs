@@ -43,16 +43,19 @@ pub(crate) enum RouteCommand {
 const MTU: usize = super::mtu::MAX_UDP_PAYLOAD;
 const MAX_CONNECTIONS: usize = 128;
 const MAILBOX: usize = 16;
-type Datagram = (Vec<u8>, SocketAddr, Mark);
+pub(crate) type Datagram = (Vec<u8>, SocketAddr, Mark);
 
 pub(crate) enum SessionIo {
     Direct {
         socket: UdpSocket,
         scope: NetworkScope,
         options: Options,
+        _carrier: crate::routing::carrier_socket::Lease,
+        pinned: Option<SocketAddr>,
     },
     Routed {
         socket: Arc<UdpSocket>,
+        local: SocketAddr,
         scope: NetworkScope,
         options: Options,
         incoming: mpsc::Receiver<Datagram>,
@@ -69,11 +72,17 @@ impl From<UdpSocket> for SessionIo {
 
 impl SessionIo {
     pub(crate) fn direct(socket: UdpSocket, scope: NetworkScope) -> Self {
+        Self::direct_carrier(socket, scope, Default::default(), None)
+    }
+
+    pub(crate) fn direct_carrier(socket: UdpSocket, scope: NetworkScope, carrier: crate::routing::carrier_socket::Lease, pinned: Option<SocketAddr>) -> Self {
         let options = Options::configure(&socket);
         Self::Direct {
             socket,
             scope,
             options,
+            _carrier: carrier,
+            pinned,
         }
     }
 
@@ -92,7 +101,7 @@ impl SessionIo {
     pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
         match self {
             Self::Direct { socket: s, .. } => s.local_addr(),
-            Self::Routed { socket, .. } => socket.local_addr(),
+            Self::Routed { local, .. } => Ok(*local),
         }
     }
 
@@ -151,14 +160,18 @@ impl SessionIo {
 
     pub(crate) async fn send_to(&self, bytes: &[u8], peer: SocketAddr) -> io::Result<usize> {
         match self {
+            Self::Direct { socket: s, pinned: Some(target), .. } => {
+                if peer != *target || s.peer_addr()? != *target { return Err(io::ErrorKind::PermissionDenied.into()); }
+                s.send(bytes).await
+            }
             Self::Direct { socket: s, .. } => s.send_to(bytes, peer).await,
             Self::Routed {
-                socket, incoming, ..
+                socket, incoming, local, options, ..
             } => {
                 if incoming.is_closed() {
                     return Err(io::Error::from(io::ErrorKind::BrokenPipe));
                 }
-                socket.send_to(bytes, peer).await
+                options.send_from(socket, bytes, peer, *local, false).await.map(|(n, _)| n)
             }
         }
     }
@@ -170,6 +183,12 @@ impl SessionIo {
         ect: bool,
     ) -> io::Result<(usize, Mark)> {
         match self {
+            Self::Direct { socket, pinned: Some(target), .. } => {
+                if peer != *target || socket.peer_addr()? != *target { return Err(io::ErrorKind::PermissionDenied.into()); }
+                // Connected scoped sockets never send ancillary destination
+                // overrides. ECN is not claimed for these lab emissions.
+                Ok((socket.send(bytes).await?, Mark::NotEct))
+            }
             Self::Direct {
                 socket, options, ..
             } => options.send(socket, bytes, peer, ect).await,
@@ -177,12 +196,13 @@ impl SessionIo {
                 socket,
                 options,
                 incoming,
+                local,
                 ..
             } => {
                 if incoming.is_closed() {
                     return Err(io::ErrorKind::BrokenPipe.into());
                 }
-                options.send(socket, bytes, peer, ect).await
+                options.send_from(socket, bytes, peer, *local, ect).await
             }
         }
     }
@@ -214,9 +234,17 @@ pub struct Candidate {
     token: Vec<u8>,
     initial_reset: [u8; 16],
     versions: VersionPolicy,
+    retry_validated: bool,
 }
 
 impl Candidate {
+    pub(crate) fn admitted(
+        io: SessionIo, peer: SocketAddr, binding: Binding,
+        initial_reset: [u8; 16], versions: VersionPolicy,
+    ) -> Self {
+        Self { io, peer, binding, token: Vec::new(), initial_reset, versions, retry_validated: false }
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -226,6 +254,7 @@ impl Candidate {
         Vec<u8>,
         [u8; 16],
         VersionPolicy,
+        bool,
     ) {
         (
             self.io,
@@ -234,6 +263,7 @@ impl Candidate {
             self.token,
             self.initial_reset,
             self.versions,
+            self.retry_validated,
         )
     }
 }
@@ -265,11 +295,15 @@ impl Listener {
         scope: NetworkScope,
     ) -> io::Result<Self> {
         let local = socket.local_addr()?;
-        if !scope.allows_local(local.ip())
+        if !scope.allows_bind(local.ip())
             || socket.peer_addr().is_ok()
             || !(1..=MAX_CONNECTIONS).contains(&limit)
         {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        let options = Options::configure(&socket);
+        if local.ip().is_unspecified() && !options.pktinfo {
+            return Err(io::ErrorKind::Unsupported.into());
         }
         let mut ingress = Ingress::for_listener(limit, versions.clone())
             .map_err(|_| io::ErrorKind::InvalidInput)?;
@@ -331,17 +365,16 @@ async fn run(
     mut requests: mpsc::Receiver<RouteCommand>,
     scope: NetworkScope,
 ) -> io::Result<()> {
-    let local = socket.local_addr()?;
     let options = Options::configure(&socket);
     let clock = Instant::now();
-    let mut routes: BTreeMap<u64, mpsc::Sender<Datagram>> = BTreeMap::new();
+    let mut routes: BTreeMap<u64, (SocketAddr, mpsc::Sender<Datagram>)> = BTreeMap::new();
     let mut buffer = [0; MTU + 1];
     let mut sweep = tokio::time::interval(Duration::from_millis(100));
     loop {
         tokio::select! {
             _ = accepts.closed() => return Ok(()),
             _ = sweep.tick() => {
-                let expired: Vec<_> = routes.iter().filter_map(|(&id, tx)| tx.is_closed().then_some(id)).collect();
+                let expired: Vec<_> = routes.iter().filter_map(|(&id, (_, tx))| tx.is_closed().then_some(id)).collect();
                 for owner in expired {
                     routes.remove(&owner);
                     ingress.close(owner, clock.elapsed().as_secs()).map_err(|_| io::ErrorKind::InvalidData)?;
@@ -368,12 +401,12 @@ async fn run(
                     }
                 }
             }
-            received = options.receive(&socket, &mut buffer) => {
-                let (n, peer, mark) = match received {
+            received = options.receive_to(&socket, &mut buffer) => {
+                let (n, peer, local, mark) = match received {
                     Ok(value) => value,
                     // Windows can surface ICMP Port Unreachable on an
                     // unconnected UDP socket. It is not a listener failure.
-                    Err(e) if matches!(e.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused) || super::mtu::message_too_large(&e) => continue,
+                    Err(e) if matches!(e.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused | io::ErrorKind::InvalidData) || super::mtu::message_too_large(&e) => continue,
                     Err(e) => return Err(e),
                 };
                 if !scope.permits(local, peer) || n > MTU { continue; }
@@ -390,8 +423,8 @@ async fn run(
                     Action::Drop => {}
                     Action::Reply(reply) => {
                         if reply.len() <= n {
-                            match socket.send_to(&reply, peer).await {
-                                Ok(written) if written == reply.len() => {},
+                            match options.send_from(&socket, &reply, peer, local, false).await {
+                                Ok((written, _)) if written == reply.len() => {},
                                 Ok(_) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
                                 Err(e) if matches!(e.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused | io::ErrorKind::NetworkUnreachable | io::ErrorKind::HostUnreachable) || super::mtu::message_too_large(&e) => {},
                                 Err(e) => return Err(e),
@@ -399,7 +432,8 @@ async fn run(
                         }
                     }
                     Action::Existing(owner) => {
-                        if let Some(tx) = routes.get(&owner) {
+                        if let Some((destination, tx)) = routes.get(&owner).filter(|(destination, _)| *destination == local) {
+                            debug_assert_eq!(*destination, local);
                             // Drop on mailbox saturation; never block unrelated CIDs.
                             if let Ok(permit) = tx.try_reserve() { permit.send((bytes.to_vec(), peer, mark)); }
                         }
@@ -410,15 +444,71 @@ async fn run(
                             let (tx, incoming) = mpsc::channel(MAILBOX);
                             tx.try_send((bytes.to_vec(), peer, mark)).map_err(|_| io::ErrorKind::InvalidData)?;
                             let initial_reset = ingress.initial_reset(owner, binding.retry).map_err(|_| io::ErrorKind::InvalidData)?;
-                            routes.insert(owner, tx);
-                            permit.send(Candidate { io: SessionIo::Routed { socket: socket.clone(), scope, options, incoming, owner, commands: commands.clone() },
-                                peer, binding, token, initial_reset, versions: versions.clone() });
+                            routes.insert(owner, (local, tx));
+                            permit.send(Candidate { io: SessionIo::Routed { socket: socket.clone(), local, scope, options, incoming, owner, commands: commands.clone() },
+                                peer, binding, token, initial_reset, versions: versions.clone(), retry_validated: true });
                         } else {
                             ingress.close(owner, now).map_err(|_| io::ErrorKind::InvalidData)?;
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
+mod wildcard_tests {
+    use super::*;
+    use crate::quic_core::{dial, handshake_udp, wire::Version};
+    use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
+
+    #[tokio::test]
+    async fn native_wildcard_handshake_pins_received_destination_and_replies_from_it() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let der = cert.cert.der().clone();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(der.clone()).unwrap();
+        let client_tls = Arc::new(crate::transport_policy::Carrier::H3.client_tls(roots).unwrap());
+        let mut server_tls = crate::transport_policy::Carrier::H3.server_tls(
+            vec![der], PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into()).unwrap();
+        server_tls.send_tls13_tickets = 0;
+        let server_tls = Arc::new(server_tls);
+        for (bind, target) in [
+            #[cfg(target_os = "linux")]
+            ("0.0.0.0:0", "127.0.0.2:0"),
+            #[cfg(target_os = "windows")]
+            ("0.0.0.0:0", "127.0.0.1:0"),
+            ("[::]:0", "[::1]:0"),
+        ] {
+            let socket = UdpSocket::bind(bind).await.unwrap();
+            let local = socket.local_addr().unwrap();
+            let mut peer: SocketAddr = target.parse().unwrap();
+            peer.set_port(local.port());
+            let mut listener = Listener::with_scope(socket, 4, VersionPolicy::both(),
+                NetworkScope::listener(local.ip()).unwrap()).unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let server = async {
+                    let candidate = listener.accept().await.unwrap();
+                    assert_eq!(candidate.io.local_addr().unwrap(), peer);
+                    let mut session = handshake_udp::accept(candidate, server_tls.clone()).await.unwrap();
+                    while session.shutdown_phase() == super::super::lifecycle::ShutdownPhase::Open {
+                        session.flush(Instant::now()).await.unwrap();
+                        session.recv(Duration::from_millis(10)).await.unwrap();
+                    }
+                };
+                let client = async {
+                    let (_, session) = dial::connect(peer, ServerName::try_from("localhost").unwrap(),
+                        client_tls.clone(), None, VersionPolicy::exact(Version::V1), Duration::from_secs(5)).await.unwrap();
+                    assert!(session.handshake_confirmed());
+                    dial::close_probe(session).await.unwrap();
+                };
+                // The verified client may close while the server is draining.
+                tokio::select! {
+                    _ = server => panic!("server closed before client verified"),
+                    _ = client => {}
+                }
+            }).await.unwrap();
         }
     }
 }
