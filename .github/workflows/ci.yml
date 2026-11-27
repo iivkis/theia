@@ -977,7 +977,9 @@ jobs:
         run: |
           set -euo pipefail
           sudo -n unshare -n true
-          source <(cargo llvm-cov show-env --export-prefix)
+          export CARGO_TARGET_DIR="$PWD/target/llvm-cov-target"
+          export CARGO_LLVM_COV_TARGET_DIR="$CARGO_TARGET_DIR"
+          source <(cargo llvm-cov show-env --sh)
           cargo test --locked -p theia --all-features --lib --no-run --message-format=json > f15-coverage-build.json
           python3 scripts/f15-kernel-tests.py f15-coverage-build.json --coverage
       - name: Instrument independent protocol and browser interoperability
@@ -1004,6 +1006,9 @@ jobs:
         run: cargo llvm-cov report --json --include-build-script --output-path coverage-segments.json
       - name: Normalize exact-SHA native line evidence
         run: python scripts/ci-coverage.py collect --lcov coverage.lcov --llvm-json coverage-segments.json --platform "${{ runner.os }}" --sha "${{ needs.specification.outputs.tested_sha }}" --output coverage.json
+      - name: Require actual privileged kernel coverage in normalized report
+        if: runner.os == 'Linux'
+        run: python scripts/f15-kernel-tests.py --verify-coverage coverage.json
       - uses: actions/upload-artifact@v4
         with:
           name: coverage-${{ runner.os }}

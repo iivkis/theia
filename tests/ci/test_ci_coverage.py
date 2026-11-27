@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Regression tests for the merge-only coverage evidence gate."""
 import importlib.util
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -24,6 +25,39 @@ def report(platform, files, sha=SHA):
 
 
 class CoverageTests(unittest.TestCase):
+    def test_kernel_coverage_verifier_rejects_missing_or_zero_actual_counts(self):
+        kernel_spec = importlib.util.spec_from_file_location(
+            "f15_kernel_tests", ROOT / "scripts/f15-kernel-tests.py")
+        kernel = importlib.util.module_from_spec(kernel_spec)
+        kernel_spec.loader.exec_module(kernel)
+        anchors = [
+            ("crates/theia/src/routing/linux_rules.rs", "self.admissions = next_admissions;"),
+            ("crates/theia/src/routing/linux_carrier.rs", "set_mark(&lease.fd, mark)?;"),
+            ("crates/theia/src/routing/linux_rules.rs", "journal.restored = true;"),
+        ]
+        evidence = {"platform": "Linux", "files": {}}
+        locations = []
+        for source, anchor in anchors:
+            lines = (ROOT / source).read_text(encoding="utf-8").splitlines()
+            numbers = [str(n) for n, line in enumerate(lines, 1) if line.strip() == anchor]
+            self.assertEqual(len(numbers), 1)
+            evidence["files"].setdefault(source, {})[numbers[0]] = 1
+            locations.append((source, numbers[0]))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "coverage.json"
+            path.write_text(json.dumps(evidence), encoding="utf-8")
+            kernel.verify_coverage(path)
+            for source, line in locations:
+                for value in (0, None):
+                    if value is None:
+                        evidence["files"][source].pop(line)
+                    else:
+                        evidence["files"][source][line] = value
+                    path.write_text(json.dumps(evidence), encoding="utf-8")
+                    with self.assertRaises(SystemExit):
+                        kernel.verify_coverage(path)
+                    evidence["files"][source][line] = 1
+
     def test_union_not_average_and_exact_threshold(self):
         linux = report("Linux", {A: {"1": 1, "2": 0, "3": 1, "6": 1}})
         windows = report("Windows", {A: {"1": 0, "2": 1, "3": 0}, B: {"1": 1, "2": 0}})

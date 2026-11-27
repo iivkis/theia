@@ -367,7 +367,13 @@ for case in ("Instrument actual F-15 isolated kernel tests",
             < coverage_native.index("Export LCOV once after all native instrumented tests"),
             f"{case} must contribute real profiles before export")
 require("scripts/f15-kernel-tests.py f15-coverage-build.json --coverage" in coverage_native
-        and "cargo llvm-cov show-env --export-prefix" in coverage_native
+        and "cargo llvm-cov show-env --sh" in coverage_native
+        and 'export CARGO_TARGET_DIR="$PWD/target/llvm-cov-target"' in coverage_native
+        and 'export CARGO_LLVM_COV_TARGET_DIR="$CARGO_TARGET_DIR"' in coverage_native
+        and "scripts/f15-kernel-tests.py --verify-coverage coverage.json" in coverage_native
+        and coverage_native.index("Normalize exact-SHA native line evidence")
+        < coverage_native.index("Require actual privileged kernel coverage in normalized report")
+        < coverage_native.index("name: coverage-${{ runner.os }}")
         and "native_clients_require_pki_and_exact_alpn" in coverage_native
         and "independent_aioquic_live_modify_v1_v2" in coverage_native
         and "independent_external_reference_through_registered_reality_dispatchers" in coverage_native,
