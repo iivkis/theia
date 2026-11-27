@@ -886,7 +886,7 @@ mod tests {
                             if count<=2 {emit(part);}
                             Ok(())
                         }).unwrap();
-                        assert_eq!(count,3);
+                        assert_eq!(count, 3);
                         plan = Some(new);
                     }
                 } else {

@@ -53,7 +53,7 @@ def verify_coverage(path: Path) -> None:
         ("crates/theia/src/routing/linux_carrier.rs", "set_mark(&lease.fd, mark)?;"),
         ("crates/theia/src/routing/linux_rules.rs", "journal.restored = true;"),
         ("crates/theia/src/routing/linux_rules.rs", "journal.restored = true; // old-boot absence reconciliation"),
-        ("crates/theia/src/routing/packet_modify.rs", "assert_eq!(outputs.len(), 3);"),
+        ("crates/theia/src/routing/packet_modify.rs", "assert_eq!(count, 3);"),
         ("crates/theia/src/routing/linux_ingress.rs", "Ok(TransparentTcp { stream, key })"),
     )
     root = Path(__file__).resolve().parents[1]

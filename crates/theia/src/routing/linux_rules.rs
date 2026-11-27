@@ -1516,7 +1516,7 @@ pub(crate) fn recover_mode(host_namespace:&File,path:&Path,host_mode:bool)->io::
     if net.generation()? != expected || net.table(&journal)? || net.generation()? != expected {
         return Err(refused());
     }
-    journal.restored=true;
+    journal.restored = true;
     journal.boot_rearmed=false;
     store(path,&journal,Some(&raw))?;
     Ok(())
