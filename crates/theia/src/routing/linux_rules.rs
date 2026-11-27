@@ -1913,6 +1913,84 @@ mod tests {
         }
     }
     #[test]
+    fn journal_refuses_unsafe_paths_and_cas_overwrites() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let mut random = [0; 16];
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut random).unwrap();
+        let name: String = random.iter().map(|n| format!("{n:02x}")).collect();
+        let dir = std::env::temp_dir().join(format!("theia-nft-journal-{name}"));
+        fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        let path = dir.join("journal.toml");
+        assert!(check_parent(&path).is_ok());
+        assert!(host_path(&path).is_err());
+        assert!(check_parent(Path::new("relative.toml")).is_err());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(check_parent(&path).is_err());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(journal_bytes(&path).unwrap().is_none());
+        let mut j = journal();
+        let old = store(&path, &j, None).unwrap();
+        assert_eq!(parse_journal(&old, &j.scope).unwrap(), j);
+        j.restored = true;
+        assert!(store(&path, &j, None).is_err());
+        let next = store(&path, &j, Some(&old)).unwrap();
+        assert!(store(&path, &j, Some(&old)).is_err());
+        let hard = dir.join("hard");
+        fs::hard_link(&path, &hard).unwrap();
+        assert!(journal_bytes(&path).is_err());
+        fs::remove_file(hard).unwrap();
+        assert_eq!(journal_bytes(&path).unwrap(), Some(next));
+        let alias = dir.join("alias");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        assert!(journal_bytes(&alias).is_err());
+        assert!(Scope::current(&File::open(&path).unwrap()).is_err());
+        assert!(Scope::current(&File::open("/proc/thread-self/ns/net").unwrap()).is_err());
+        assert!(Scope::current(&File::open("/proc/thread-self/ns/mnt").unwrap()).is_err());
+    }
+
+    #[test]
+    fn netlink_ack_parser_and_journal_host_invariants_fail_closed() {
+        assert!(ack_error(&[0; 19]).is_err());
+        let mut ack = [0; 20];
+        assert!(ack_error(&ack).unwrap().is_none());
+        ack[..4].copy_from_slice(&(-libc::EPERM).to_ne_bytes());
+        assert_eq!(ack_error(&ack).unwrap().unwrap().raw_os_error(), Some(libc::EPERM));
+        for code in [1, i32::MIN] {
+            ack[..4].copy_from_slice(&code.to_ne_bytes());
+            assert!(ack_error(&ack).is_err());
+        }
+        let mut j = journal();
+        for variant in 0..5 {
+            let mut invalid = j.clone();
+            match variant {
+                0 => invalid.version = 2,
+                1 => invalid.nonce = [0; 16],
+                2 => invalid.before = 0,
+                3 => invalid.before = u32::MAX,
+                _ => invalid.redirect = Some(RedirectScope { port: 0, loopback: 1, policy_queue: None }),
+            }
+            assert!(invalid.validate(&j.scope).is_err());
+        }
+        j.scope.machine = Some("a".repeat(32));
+        assert!(j.validate(&j.scope).is_err());
+        j.redirect = Some(RedirectScope { port: 1080, loopback: 1, policy_queue: Some(12) });
+        j.boot_rearmed = true;
+        assert!(j.validate(&j.scope).is_ok());
+        j.previous_present = true;
+        assert!(j.validate(&j.scope).is_err());
+        j.previous_present = false;
+        j.restored = true;
+        assert!(j.validate(&j.scope).is_err());
+    }
+
+    #[test]
     fn exact_generation_and_scope_required() {
         let j = journal();
         assert!(j.validate(&j.scope).is_ok());
