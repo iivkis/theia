@@ -2727,6 +2727,33 @@ impl NativeIngress {
         Ok(())
     }
 
+    /// Correlate an actual private collector/queue observation with
+    /// authenticated DNS, rechecking it before publication. The resolver
+    /// link is still a claimed link, not trusted evidence of the original
+    /// application request. No native route is authorized by this API.
+    #[cfg(all(target_os = "linux", feature = "linux-ebpf-lab"))]
+    pub async fn corroborate_dns_captured_lab(
+        &self,
+        observation: &crate::routing::linux_bpf_loader::CapturedObservation<'_, '_>,
+        link: &crate::routing::dns_attribution::ResolverLink,
+        candidates: &mut crate::routing::dns_attribution::DnsCandidates,
+    ) -> Result<bool, ClientError> {
+        self.ensure_accepting()?;
+        let denied = || ClientError::Open(ErrorCode::PolicyDenied);
+        let flow = observation.revalidate().map_err(|_| denied())?;
+        // Never allow an older, already published candidate to survive
+        // a failed attempt to revalidate its source.
+        let result = self.corroborate_dns_inner(flow, link, candidates, || {
+            self.ensure_accepting()?;
+            observation.revalidate().map_err(|_| denied())?;
+            Ok(())
+        }).await;
+        if !matches!(&result, Ok(true)) {
+            candidates.forget(flow);
+        }
+        result
+    }
+
     /// Correlate a laboratory resolver link with protected DNS from the
     /// exact active policy generation. This does not grant routing
     /// authorization: neither the BPF reader nor resolver event source
@@ -2737,6 +2764,17 @@ impl NativeIngress {
         flow: crate::routing::linux_events::CorroboratedFlow,
         link: &crate::routing::dns_attribution::ResolverLink,
         candidates: &mut crate::routing::dns_attribution::DnsCandidates,
+    ) -> Result<bool, ClientError> {
+        self.corroborate_dns_inner(flow, link, candidates, || Ok(())).await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn corroborate_dns_inner(
+        &self,
+        flow: crate::routing::linux_events::CorroboratedFlow,
+        link: &crate::routing::dns_attribution::ResolverLink,
+        candidates: &mut crate::routing::dns_attribution::DnsCandidates,
+        validate_source: impl FnOnce() -> Result<(), ClientError>,
     ) -> Result<bool, ClientError> {
         self.ensure_running()?;
         if flow.key() != link.key
@@ -2767,6 +2805,8 @@ impl NativeIngress {
                 .min(cache.observation_deadline(digest)?)
                 .min(requested + Duration::from_secs(30));
             self.ensure_running()?;
+            validate_source()?;
+            cache.dpi.check_policy(digest)?;
             candidates
                 .record(flow, link, digest, &ips, deadline)
                 .map_err(|_| ClientError::Protocol)

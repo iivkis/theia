@@ -721,8 +721,11 @@ mod tests {
             }
             assert!(nft.wait().unwrap().success());
             let hello = super::super::dpi::packet_test_hello("example.org");
-            client.write_all(&hello).unwrap();
+            // Force two distinct native sends by waiting for the first
+            // kernel capture before submitting the remaining bytes.
+            client.write_all(&hello[..2]).unwrap();
             let deadline = Instant::now()+Duration::from_secs(12);
+            let mut initial_packets = Vec::<Vec<u8>>::new();
             let mut plan: Option<TcpSplitPlan> = None;
             let mut retransmitted = false;
             let mut complete = false;
@@ -749,8 +752,22 @@ mod tests {
                         for part in &parts { emit(part); }
                         retransmitted = true;
                     } else {
-                        let (new,[first,_lost]) = TcpSplitPlan::begin(&bytes,"example.org").expect("real TLS payload split");
-                        emit(&first); // intentionally lose second segment
+                        if initial_packets.is_empty() {
+                            assert_eq!(meta.payload_len, 2);
+                            initial_packets.push(bytes);
+                            client.write_all(&hello[2..]).unwrap();
+                            continue;
+                        }
+                        assert_eq!(initial_packets.len(), 1);
+                        assert_eq!(meta.payload_len, hello.len() - 2);
+                        initial_packets.push(bytes);
+                        let inputs: Vec<&[u8]> = initial_packets.iter().map(Vec::as_slice).collect();
+                        let (new, outputs) = TcpSplitPlan::begin_flight(&inputs,"example.org").expect("real multi-packet TLS payload split");
+                        assert_eq!(outputs.len(), 3);
+                        // Preserve the initial prefix, emit the new split
+                        // boundary, intentionally lose the final segment.
+                        emit(&outputs[0]);
+                        emit(&outputs[1]);
                         plan = Some(new);
                     }
                 } else {
@@ -763,6 +780,7 @@ mod tests {
                     if complete { break; }
                 }
             }
+            assert_eq!(initial_packets.len(), 2, "must observe multiple original kernel packets");
             assert!(retransmitted,"native TCP did not retransmit the lost sequence range");
             assert!(complete,"peer did not acknowledge the entire split payload");
             let mut received = vec![0;hello.len()];

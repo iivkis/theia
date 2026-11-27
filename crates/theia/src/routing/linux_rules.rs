@@ -974,7 +974,7 @@ pub fn reconcile_after_reboot(host_namespace: &File, path: &Path) -> io::Result<
     // Never call net.batch on an old-boot journal. Reconciliation is only
     // evidence of absence; installation remains a separate fresh intent.
     journal.scope = scope;
-    journal.restored = true;
+    journal.restored = true; // old-boot absence reconciliation
     store(path, &journal, Some(&raw))?;
     if net.generation()? != generation || net.table(&journal)? {
         return Err(refused());

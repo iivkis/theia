@@ -51,6 +51,8 @@ def verify_coverage(path: Path) -> None:
         ("crates/theia/src/routing/linux_rules.rs", "self.admissions = next_admissions;"),
         ("crates/theia/src/routing/linux_carrier.rs", "set_mark(&lease.fd, mark)?;"),
         ("crates/theia/src/routing/linux_rules.rs", "journal.restored = true;"),
+        ("crates/theia/src/routing/linux_rules.rs", "journal.restored = true; // old-boot absence reconciliation"),
+        ("crates/theia/src/routing/packet_modify.rs", "assert_eq!(outputs.len(), 3);"),
     )
     root = Path(__file__).resolve().parents[1]
     for source, anchor in sentinels:

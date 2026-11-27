@@ -241,7 +241,44 @@ pub struct CollectedEvent {
     event: KernelFlowEvent,
     loss: Arc<LossMonitor>,
 }
+/// A diagnostic capture proof borrows the actual queue packet and its
+/// live collector event. It cannot be constructed from public parsed bytes,
+/// copied into a later packet, or kept after the kernel verdict.
+pub struct CapturedObservation<'a, 'queue> {
+    event: &'a CollectedEvent,
+    rules: &'a super::linux_rules::LabRules,
+    packet: &'a super::nfqueue::Packet<'queue>,
+    fd: i32,
+    flow: CorroboratedFlow,
+}
+
+impl CapturedObservation<'_, '_> {
+    pub fn flow(&self) -> CorroboratedFlow {
+        self.flow
+    }
+
+    /// Revalidate the live socket, private ring and queue identity, and
+    /// event age after any awaited work. Never upgrades sender attribution.
+    pub fn revalidate(&self) -> io::Result<CorroboratedFlow> {
+        let observed = self.event.corroborate_packet(self.rules, self.packet, self.fd)?;
+        if observed != self.flow {
+            return Err(denied());
+        }
+        Ok(observed)
+    }
+}
+
 impl CollectedEvent {
+    pub fn capture_observation<'a, 'queue>(
+        &'a self,
+        rules: &'a super::linux_rules::LabRules,
+        packet: &'a super::nfqueue::Packet<'queue>,
+        fd: i32,
+    ) -> io::Result<CapturedObservation<'a, 'queue>> {
+        let flow = self.corroborate_packet(rules, packet, fd)?;
+        Ok(CapturedObservation { event: self, rules, packet, fd, flow })
+    }
+
     /// Correlate a live collector event with an actual packet selected
     /// by the dedicated kernel socket rule. A matching tuple alone is
     /// insufficient: the private queue proof and kernel cookie must agree.
