@@ -31,6 +31,7 @@ const GET_TABLE: u16 = NFT | 1;
 const DEL_TABLE: u16 = NFT | 2;
 const NEW_CHAIN: u16 = NFT | 3;
 const NEW_RULE: u16 = NFT | 6;
+const DEL_RULE: u16 = NFT | 8;
 const NEW_GEN: u16 = NFT | 15;
 const GET_GEN: u16 = NFT | 16;
 
@@ -366,7 +367,8 @@ pub struct LabRules {
     queue_identity: [u8; 16],
     _carriers: Vec<LabCarrierSocket>,
     journal_path: PathBuf,
-    used_marks: std::collections::HashSet<u32>,
+    admissions: std::collections::BTreeMap<u32, super::packet::FlowKey>,
+    queue_number: u16,
     poisoned: bool,
     // Drop socket exemptions before releasing ownership to recovery.
     _lock: UnixDatagram,
@@ -427,7 +429,9 @@ impl LabRules {
         SystemRandom::new().fill(&mut nonce).map_err(|_| refused())?;
         let journal = Journal { version: 1, scope, nonce, before, installed, restored: false };
         if net.table(&journal)? { return Err(refused()); }
-        let operations = install_messages(&journal, queue.number()?, &carriers);
+        let queue_number = queue.number()?;
+        let operations = install_messages(&journal, queue_number, &carriers);
+        let admissions = carriers.iter().map(|socket| (socket.mark(), socket.key())).collect();
         // Durable intent before changing any OS state, with create-only/CAS
         // publication. All uncertain failures leave the journal intact.
         store(path, &journal, old.as_deref())?;
@@ -436,41 +440,87 @@ impl LabRules {
             return Err(refused());
         }
         Ok(Self { _lock: lock, journal, queue_identity: queue.identity(), _carriers: carriers,
-            journal_path: path.to_owned(), used_marks: marks, poisoned: false })
+            journal_path: path.to_owned(), admissions, queue_number, poisoned: false })
     }
-    /// Insert a new exact carrier rule ahead of the catch-all queue, with
-    /// durable generation CAS. The mark is never reused in this lab run.
-    /// Rules stay bounded even when sockets close; a new session is required
-    /// after MAX_CARRIERS total admissions. This is intentionally not an
-    /// unbounded production connection rotation mechanism.
-    fn admit(&mut self, socket: &LabCarrierSocket) -> io::Result<()> {
-        if self.used_marks.len() >= MAX_CARRIERS || self.used_marks.contains(&socket.mark())
-            || !self.current()? { return Err(refused()); }
-        socket.verify()?;
+    /// Replace only our output chain's rules in one generation-checked
+    /// transaction. The base chain (DROP policy) is never removed. All
+    /// exact active exemptions precede the same non-bypass queue rule.
+    fn replace_admissions(&mut self, next_admissions: std::collections::BTreeMap<u32, super::packet::FlowKey>) -> io::Result<()> {
+        if next_admissions.len() > MAX_CARRIERS || !self.current()? { return Err(refused()); }
         let raw = journal_bytes(&self.journal_path)?.ok_or_else(refused)?;
         if parse_journal(&raw, &self.journal.scope)? != self.journal { return Err(refused()); }
         let generation = self.journal.installed;
         let mut next = self.journal.clone();
         next.before = generation;
         next.installed = generation.checked_add(1).ok_or_else(refused)?;
-        let mut attrs = Vec::new();
-        name_attr(&mut attrs, 1, &next.name());
-        name_attr(&mut attrs, 2, "output");
-        attr(&mut attrs, 4 | NESTED, &carrier_expressions(socket.key(), socket.mark()));
-        let op = nft_message(NEW_RULE, REQUEST | ACK | CREATE_EXCLUSIVE, 2, &attrs);
-        // From here any ambiguous outcome poisons the live lease. Recovery
-        // uses the durable intent; do not continue on a guessed generation.
+        let operations = replace_messages(&next, self.queue_number, &next_admissions);
         self.poisoned = true;
         store(&self.journal_path, &next, Some(&raw))?;
         let net = Netlink::open()?;
-        net.batch(generation, &[op])?;
+        net.batch(generation, &operations)?;
         if net.generation()? != next.installed || !net.table(&next)? || net.generation()? != next.installed {
             return Err(refused());
         }
         self.journal = next;
-        self.used_marks.insert(socket.mark());
+        self.admissions = next_admissions;
         self.poisoned = false;
         Ok(())
+    }
+    fn admit(&mut self, socket: &LabCarrierSocket) -> io::Result<()> {
+        if self.admissions.len() >= MAX_CARRIERS || self.admissions.contains_key(&socket.mark()) { return Err(refused()); }
+        socket.verify()?;
+        let mut next = self.admissions.clone();
+        next.insert(socket.mark(), socket.key());
+        self.replace_admissions(next)
+    }
+    fn revoke(&mut self, mark: u32) -> io::Result<()> {
+        let mut next = self.admissions.clone();
+        if next.remove(&mark).is_none() { return Err(refused()); }
+        // Any failed retirement must prevent later admissions. The socket
+        // lease clears its mark before this call, so a stale rule is not a
+        // license to send more traffic through the retired descriptor.
+        let result = self.replace_admissions(next);
+        if result.is_err() { self.poisoned = true; }
+        result
+    }
+}
+
+fn replace_messages(journal: &Journal, queue: u16, admissions: &std::collections::BTreeMap<u32, super::packet::FlowKey>) -> Vec<Vec<u8>> {
+    let name = journal.name();
+    let mut flush = Vec::new();
+    name_attr(&mut flush, 1, &name);
+    name_attr(&mut flush, 2, "output");
+    // DELRULE without HANDLE, scoped by TABLE and CHAIN, flushes only
+    // that chain. The transaction recreates every rule before publication.
+    let mut messages = vec![nft_message(DEL_RULE, REQUEST | ACK, 2, &flush)];
+    for (&mark, &key) in admissions {
+        let mut attrs = Vec::new();
+        name_attr(&mut attrs, 1, &name);
+        name_attr(&mut attrs, 2, "output");
+        attr(&mut attrs, 4 | NESTED, &carrier_expressions(key, mark));
+        messages.push(nft_message(NEW_RULE, REQUEST | ACK | CREATE_EXCLUSIVE | APPEND, messages.len() as u32 + 2, &attrs));
+    }
+    let mut queue_rule = install_messages(journal, queue, &[]).pop().expect("queue rule");
+    queue_rule[8..12].copy_from_slice(&(messages.len() as u32 + 2).to_ne_bytes());
+    messages.push(queue_rule);
+    messages
+}
+
+struct DynamicAdmission {
+    socket: Option<LabCarrierSocket>,
+    rules: Arc<Mutex<LabRules>>,
+}
+impl Drop for DynamicAdmission {
+    fn drop(&mut self) {
+        if let Some(socket) = self.socket.take() {
+            let mark = socket.mark();
+            // The original socket may still exist in a caller. Reset the
+            // mark before freeing the kernel exemption and its slot.
+            drop(socket);
+            if let Ok(mut rules) = self.rules.lock() {
+                let _ = rules.revoke(mark);
+            }
+        }
     }
 }
 
@@ -484,7 +534,7 @@ impl LabRegistrar {
     fn admit(&self, socket: LabCarrierSocket) -> io::Result<super::carrier_socket::Lease> {
         self.rules.lock().map_err(|_| refused())?.admit(&socket)?;
         // Reset socket mark before releasing the rules ownership lock.
-        Ok(super::carrier_socket::Lease::retain((socket, self.rules.clone())))
+        Ok(super::carrier_socket::Lease::retain(DynamicAdmission { socket: Some(socket), rules: self.rules.clone() }))
     }
 }
 impl super::carrier_socket::Registrar for LabRegistrar {
@@ -585,6 +635,38 @@ mod tests {
         assert!(encoded.windows(4).any(|w| w == [192,0,2,1]));
         assert!(encoded.windows(4).any(|w| w == [198,51,100,2]));
         assert!(encoded.windows(4).any(|w| w == [4,210,1,187]));
+    }
+
+    #[test]
+    fn replacement_flushes_only_owned_chain_and_keeps_queue_last() {
+        let journal = journal();
+        let key = super::super::packet::FlowKey {
+            source: "192.0.2.1:1234".parse().unwrap(),
+            destination: "198.51.100.2:443".parse().unwrap(),
+            transport: super::super::packet::Transport::Tcp,
+            interface: 0,
+        };
+        let mut admissions = std::collections::BTreeMap::new();
+        for mark in 1..=MAX_CARRIERS as u32 { admissions.insert(mark, key); }
+        let full = replace_messages(&journal, 42, &admissions);
+        assert_eq!(full.len(), MAX_CARRIERS+2);
+        let (kind, seq, body) = checked_header(&full[0]).unwrap();
+        assert_eq!((kind,seq),(DEL_RULE,2));
+        let mut attrs = &body[4..];
+        let name = journal.name()+"\0";
+        assert_eq!(next_attr(&mut attrs).unwrap().unwrap(),(1,name.as_bytes()));
+        assert_eq!(next_attr(&mut attrs).unwrap().unwrap(),(2,b"output\0".as_slice()));
+        assert!(next_attr(&mut attrs).unwrap().is_none());
+        for _ in 0..64 {
+            admissions.remove(&1);
+            let reduced = replace_messages(&journal,42,&admissions);
+            assert_eq!(reduced.len(),MAX_CARRIERS+1);
+            admissions.insert(1,key);
+        }
+        let empty = replace_messages(&journal,42,&Default::default());
+        assert_eq!(empty.len(),2);
+        let (kind,seq,_) = checked_header(&empty[1]).unwrap();
+        assert_eq!((kind,seq),(NEW_RULE,3));
     }
 
     #[test]
