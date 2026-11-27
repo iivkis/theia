@@ -347,7 +347,7 @@ mod tests {
         assert!(cache.current(&key, Strategy::Header, &tcp));
         assert!(cache.udp_evidence(&key, v1).unwrap().1.same(&fresh));
         assert!(!cache.udp_evidence(&key, v1).unwrap().1.same(&old));
-        assert_eq!(cache.udp_evidence(&key, v2).unwrap().0, false);
+        assert!(!cache.udp_evidence(&key, v2).unwrap().0);
         assert!(cache.udp_evidence(&key, UdpProbe::Stun).is_none());
         cache.sample_index(&key, v1.index(), false, Duration::ZERO);
         cache.sample_index(&key, v2.index(), true, Duration::from_millis(50));

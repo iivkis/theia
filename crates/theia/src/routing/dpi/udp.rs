@@ -464,19 +464,15 @@ mod tests {
         .await
         .unwrap()
         .is_some());
-        assert!(tokio::time::timeout(
-            deadline,
-            probe_quic(
-                "wrong.invalid",
-                addr,
-                None,
-                config,
-                crate::quic_core::wire::Version::V1
-            )
-        )
-        .await
-        .unwrap()
-        .is_none());
+        // A wrong hostname is a typed protective refusal, not an
+        // unavailable-network outcome that would allow VPS fallback.
+        assert!(matches!(
+            probe_quic_checked(
+                "wrong.invalid", addr, None, config,
+                crate::quic_core::wire::Version::V1, deadline,
+            ).await,
+            Err(crate::client::ClientError::Tls)
+        ));
         serving.abort();
     }
 

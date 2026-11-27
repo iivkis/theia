@@ -320,8 +320,8 @@ pub(crate) async fn relay_native_modify_lab(
     }
 }
 
-/// Explicit native lab only. Ordinary proxy relay still refuses
-/// reachability-only QUIC as Modify. The actual first datagram must split.
+/// Native lab entrypoint. The shared relay also requires the actual
+/// first datagram to split; reachability alone is never Modify.
 #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
 pub(crate) async fn relay_quic_lab(
     verified: &crate::routing::dpi::VerifiedUdp,
@@ -767,8 +767,8 @@ mod tests {
         );
         let flow = Arc::new(flow);
         let relay_flow = flow.clone();
-        let (up, upload) = mpsc::channel(QUEUE);
-        let (download, mut down) = mpsc::channel(QUEUE);
+        let (up, upload) = mpsc::channel::<Vec<u8>>(QUEUE);
+        let (download, mut down) = mpsc::channel::<Vec<u8>>(QUEUE);
         let fallback: Fallback = Box::pin(async {
             panic!("a committed active strategy must never invoke fallback")
         });

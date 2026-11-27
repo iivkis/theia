@@ -92,7 +92,7 @@ impl UdpStrategy {
     /// only after independent, exact-revision F-15 acceptance.
     pub(crate) fn accepted_for_proxy(self) -> bool {
         const ACCEPTED: &[UdpStrategy] = &[];
-        ACCEPTED.contains(&self)
+        !matches!(self, Self::StunBinding(udp::BindingStrategy::Plain)) && ACCEPTED.contains(&self)
     }
 
     pub(crate) fn capability_summary() -> String {
@@ -462,7 +462,17 @@ impl Engine {
                                 // A shorter outer budget must not mask a
                                 // received but unauthenticated QUIC handshake.
                                 if deadline.saturating_duration_since(tokio::time::Instant::now()) < budget + ATTEMPT { break; }
-                                udp::probe_quic_checked(&name, address, Some(key.network), config, version, budget).await?
+                                let revoked = async {
+                                    loop {
+                                        if !live() { return Err(stale_policy()); }
+                                        tokio::time::sleep(Duration::from_millis(50)).await;
+                                    }
+                                };
+                                tokio::select! {
+                                    biased;
+                                    result = revoked => result?,
+                                    result = udp::probe_quic_checked(&name, address, Some(key.network), config, version, budget) => result?,
+                                }
                             }
                             UdpStrategy::StunBinding(binding) => {
                                 let Some((socket, _admission)) = scoped_udp_checked(address, key.network).await? else { continue };
@@ -1105,6 +1115,11 @@ mod tests {
             Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied))));
         let public: IpAddr = "8.8.8.8".parse().unwrap();
         let local: IpAddr = "127.0.0.1".parse().unwrap();
+        let v2 = UdpStrategy::Quic(crate::quic_core::wire::Version::V2);
+        assert!(matches!(engine.open_udp_checked("example.org", 443, &[local], policy, v2).await,
+            Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied))));
+        assert!(matches!(engine.open_udp_checked("example.org", 80, &[public], policy, v2).await, Ok(None)));
+        assert!(!UdpStrategy::StunBinding(udp::BindingStrategy::Plain).accepted_for_proxy());
         for (name, ips) in [
             ("invalid/name", vec![public]),
             ("example.org", vec![]),
@@ -1134,6 +1149,8 @@ mod tests {
             .await
             .is_none());
         engine.retire();
+        assert!(matches!(engine.open_udp_checked("example.org", 443, &[public], policy, v2).await,
+            Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied))));
         assert!(engine
             .open_stun_udp("example.org", 3478, &[public], policy)
             .await
