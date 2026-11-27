@@ -616,7 +616,10 @@ mod tests {
         data[HEADER + 1] = 1;
         assert!(decode(&data, 9).is_err());
         for flags in [2, 8, 16, u32::MAX] {
-            assert!(decode(&packet(&udp4(), flags, 28), 9).unwrap().meta.is_none());
+            assert!(decode(&packet(&udp4(), flags, 28), 9)
+                .unwrap()
+                .meta
+                .is_none());
         }
         assert!(decode(&packet(&udp4(), 4, 28), 9).unwrap().checksum_pending);
         let mut header_only = Vec::new();

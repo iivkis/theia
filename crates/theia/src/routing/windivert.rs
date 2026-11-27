@@ -2195,7 +2195,10 @@ mod native {
         let sys_hash: [u8; 32] = Sha256::digest(&sys_data).into();
         assert!(pinned(&dll, dll_hash).is_err());
         std::fs::write(&dll, [0; 64]).unwrap();
-        assert_eq!(pinned(&dll, dll_hash).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            pinned(&dll, dll_hash).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
         std::fs::write(&dll, &dll_data).unwrap();
         assert!(pinned(&dll, sys_hash).is_err());
         let held = pinned(&dll, dll_hash).unwrap();
@@ -2223,18 +2226,37 @@ mod native {
             assert_ne!(bound.port(), 0);
             assert!(bind_carrier_udp(bound).is_err());
             let peer = tokio::net::UdpSocket::bind(local).await.unwrap();
-            udp.send_to(b"fixture", peer.local_addr().unwrap()).await.unwrap();
+            udp.send_to(b"fixture", peer.local_addr().unwrap())
+                .await
+                .unwrap();
             let mut bytes = [0; 16];
-            let (n, from) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut bytes)).await.unwrap().unwrap();
+            let (n, from) =
+                tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut bytes))
+                    .await
+                    .unwrap()
+                    .unwrap();
             assert_eq!(&bytes[..n], b"fixture");
             assert_eq!(from, bound);
-            let tcp = if local.is_ipv4() { tokio::net::TcpSocket::new_v4() } else { tokio::net::TcpSocket::new_v6() }.unwrap();
+            let tcp = if local.is_ipv4() {
+                tokio::net::TcpSocket::new_v4()
+            } else {
+                tokio::net::TcpSocket::new_v6()
+            }
+            .unwrap();
             prepare_carrier_tcp(&tcp).unwrap();
             tcp.bind(local).unwrap();
             verify_carrier_socket(&tcp).unwrap();
         }
-        let scoped = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(std::net::Ipv6Addr::LOCALHOST, 0, 0, 1));
-        assert_eq!(bind_udp(scoped).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        let scoped = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+            std::net::Ipv6Addr::LOCALHOST,
+            0,
+            0,
+            1,
+        ));
+        assert_eq!(
+            bind_udp(scoped).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
         assert!(loopback_udp("not-an-address").is_err());
     }
 

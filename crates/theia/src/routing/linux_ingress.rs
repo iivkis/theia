@@ -1005,15 +1005,26 @@ mod tests {
             // The real socket is not transparent. Do not grant capture or
             // turn an ordinary datagram into a redirected original flow.
             assert!(UdpCapture::from_bound_socket(socket.try_clone().unwrap()).is_err());
-            assert!(matches!(receive_udp(&socket), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+            assert!(
+                matches!(receive_udp(&socket), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+            );
             peer.send_to(b"ordinary", local).unwrap();
             // Use a bounded readiness wait instead of a scheduling assumption.
             socket.set_nonblocking(true).unwrap();
             let socket = tokio::io::unix::AsyncFd::new(socket).unwrap();
-            let mut ready = tokio::time::timeout(std::time::Duration::from_secs(2), socket.readable()).await.unwrap().unwrap();
-            assert!(matches!(ready.try_io(|inner| receive_udp(inner.get_ref())), Ok(Err(_))));
+            let mut ready =
+                tokio::time::timeout(std::time::Duration::from_secs(2), socket.readable())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(matches!(
+                ready.try_io(|inner| receive_udp(inner.get_ref())),
+                Ok(Err(_))
+            ));
             let listener = TcpListener::bind(address).await.unwrap();
-            let peer = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let peer = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
             let (accepted, _) = listener.accept().await.unwrap();
             assert!(original_tcp(&accepted).is_err());
             drop(peer);
@@ -1037,7 +1048,10 @@ mod tests {
         address.sin6_addr.s6_addr = "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets();
         unsafe {
             std::ptr::write_unaligned(bytes.as_mut_ptr().cast::<libc::cmsghdr>(), cmsg);
-            std::ptr::write_unaligned(bytes.as_mut_ptr().add(header).cast::<libc::sockaddr_in6>(), address);
+            std::ptr::write_unaligned(
+                bytes.as_mut_ptr().add(header).cast::<libc::sockaddr_in6>(),
+                address,
+            );
         }
         let target = "[2001:db8::1]:443".parse().unwrap();
         assert_eq!(original_ancillary(&bytes, false).unwrap(), target);
@@ -1047,8 +1061,19 @@ mod tests {
         assert!(align_cmsg(usize::MAX).is_none());
         let local = "[::1]:10000".parse().unwrap();
         let source = "[::1]:20000".parse().unwrap();
-        assert_eq!(validate_redirect(local, source, target).unwrap().destination, target);
-        for bad in ["[::]:443", "[ff02::1]:443", "[fe80::1]:443", "[::ffff:192.0.2.1]:443", "[2001:db8::1]:0"] {
+        assert_eq!(
+            validate_redirect(local, source, target)
+                .unwrap()
+                .destination,
+            target
+        );
+        for bad in [
+            "[::]:443",
+            "[ff02::1]:443",
+            "[fe80::1]:443",
+            "[::ffff:192.0.2.1]:443",
+            "[2001:db8::1]:0",
+        ] {
             assert!(validate_redirect(local, source, bad.parse().unwrap()).is_err());
         }
     }

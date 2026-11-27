@@ -522,7 +522,10 @@ mod tests {
         };
         assert!(read_intent(&path, &scope).unwrap().is_none());
         let initial = write_intent(&path, &intent, None).unwrap();
-        assert_eq!(read_intent(&path, &scope).unwrap(), Some((intent.clone(), initial.clone())));
+        assert_eq!(
+            read_intent(&path, &scope).unwrap(),
+            Some((intent.clone(), initial.clone()))
+        );
         intent.confirmed.push(expected(NEW_RULE, FAMILIES[1], 1));
         assert!(write_intent(&path, &intent, None).is_err());
         let second = write_intent(&path, &intent, Some(&initial)).unwrap();
@@ -530,7 +533,10 @@ mod tests {
         let mut reboot = scope.clone();
         reboot.boot = "00000000-0000-0000-0000-000000000002".into();
         assert!(read_intent(&path, &reboot).is_err());
-        assert_eq!(read_intent_mode(&path, &reboot, true).unwrap(), Some((intent.clone(), second.clone())));
+        assert_eq!(
+            read_intent_mode(&path, &reboot, true).unwrap(),
+            Some((intent.clone(), second.clone()))
+        );
         reboot.machine = Some("b".repeat(32));
         assert!(read_intent_mode(&path, &reboot, true).is_err());
         reboot.machine = None;
@@ -555,9 +561,17 @@ mod tests {
 
     #[test]
     fn route_inventory_rejects_foreign_marks_and_malformed_attributes() {
-        let foreign = Object { kind: NEW_RULE, body: vec![0; 12] };
+        let foreign = Object {
+            kind: NEW_RULE,
+            body: vec![0; 12],
+        };
         assert!(!relevant(&foreign).unwrap());
-        for (key, value) in [(6, PRIORITY), (10, REDIRECT_MARK), (10, super::super::PASS_MARK), (15, TABLE)] {
+        for (key, value) in [
+            (6, PRIORITY),
+            (10, REDIRECT_MARK),
+            (10, super::super::PASS_MARK),
+            (15, TABLE),
+        ] {
             let mut object = foreign.clone();
             attr(&mut object.body, key, &value.to_ne_bytes());
             assert!(relevant(&object).unwrap());
@@ -574,8 +588,20 @@ mod tests {
         attr(&mut malformed.body, 15, &[1, 2]);
         assert!(relevant(&malformed).is_err());
         assert!(attrs(&[0; 11]).is_err());
-        assert!(!exact(&Object { kind: NEW_ROUTE, body: vec![] }, 1));
-        assert!(!exact(&Object { kind: 255, body: vec![FAMILIES[0]; 12] }, 1));
+        assert!(!exact(
+            &Object {
+                kind: NEW_ROUTE,
+                body: vec![]
+            },
+            1
+        ));
+        assert!(!exact(
+            &Object {
+                kind: 255,
+                body: vec![FAMILIES[0]; 12]
+            },
+            1
+        ));
         let mut rule = expected(NEW_RULE, FAMILIES[0], 1);
         attr(&mut rule.body, 14, &u32::MAX.to_ne_bytes());
         assert!(exact(&rule, 1));
@@ -583,7 +609,10 @@ mod tests {
         attr(&mut route.body, 20, &[0]);
         attr(&mut route.body, 12, &[0; 32]);
         assert!(exact(&route, 1));
-        assert!(same(&[route.clone(), rule.clone()], &[rule.clone(), route.clone()]));
+        assert!(same(
+            &[route.clone(), rule.clone()],
+            &[rule.clone(), route.clone()]
+        ));
         assert!(!same(&[route], &[rule]));
     }
 

@@ -1961,7 +1961,10 @@ mod tests {
         let mut ack = [0; 20];
         assert!(ack_error(&ack).unwrap().is_none());
         ack[..4].copy_from_slice(&(-libc::EPERM).to_ne_bytes());
-        assert_eq!(ack_error(&ack).unwrap().unwrap().raw_os_error(), Some(libc::EPERM));
+        assert_eq!(
+            ack_error(&ack).unwrap().unwrap().raw_os_error(),
+            Some(libc::EPERM)
+        );
         for code in [1, i32::MIN] {
             ack[..4].copy_from_slice(&code.to_ne_bytes());
             assert!(ack_error(&ack).is_err());
@@ -1974,13 +1977,23 @@ mod tests {
                 1 => invalid.nonce = [0; 16],
                 2 => invalid.before = 0,
                 3 => invalid.before = u32::MAX,
-                _ => invalid.redirect = Some(RedirectScope { port: 0, loopback: 1, policy_queue: None }),
+                _ => {
+                    invalid.redirect = Some(RedirectScope {
+                        port: 0,
+                        loopback: 1,
+                        policy_queue: None,
+                    })
+                }
             }
             assert!(invalid.validate(&j.scope).is_err());
         }
         j.scope.machine = Some("a".repeat(32));
         assert!(j.validate(&j.scope).is_err());
-        j.redirect = Some(RedirectScope { port: 1080, loopback: 1, policy_queue: Some(12) });
+        j.redirect = Some(RedirectScope {
+            port: 1080,
+            loopback: 1,
+            policy_queue: Some(12),
+        });
         j.boot_rearmed = true;
         assert!(j.validate(&j.scope).is_ok());
         j.previous_present = true;
