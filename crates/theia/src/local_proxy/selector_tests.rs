@@ -268,15 +268,38 @@ async fn udp_quic_fixture(app: tokio::net::UdpSocket, relay: SocketAddr) {
 // The public-address reference evidence is synthetic and deliberately
 // not used by the admitted test branch. All application I/O is loopback;
 // this does not assert external reference parity.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn registered_reality_live_rotation_keeps_native_connect_and_socks5_open() {
-    registered_reality_scenario(false).await;
+// Match the production runtime's bounded stack reserve for the large
+// multi-carrier integration fixtures, including the thread doing block_on.
+fn run_proxy_fixture<F, Fut>(make: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()>,
+{
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .thread_stack_size(8 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(Box::pin(make()));
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn registered_reality_live_rotation_keeps_native_connect_and_socks5_open() {
+    run_proxy_fixture(|| registered_reality_scenario(false));
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn registered_reality_production_drain_preserves_h2_h3_both_xhttp_modes() {
-    registered_reality_scenario(true).await;
+#[test]
+fn registered_reality_production_drain_preserves_h2_h3_both_xhttp_modes() {
+    run_proxy_fixture(|| registered_reality_scenario(true));
 }
 
 async fn registered_reality_scenario(drain_only: bool) {
@@ -1401,8 +1424,12 @@ async fn socks_connect_rejects_bad_methods_addresses_commands_and_truncation() {
     }
 }
 
-#[tokio::test]
-async fn real_local_proxy_modes_validate_credentials_and_relay_over_both_transports() {
+#[test]
+fn real_local_proxy_modes_validate_credentials_and_relay_over_both_transports() {
+    run_proxy_fixture(real_local_proxy_modes_fixture);
+}
+
+async fn real_local_proxy_modes_fixture() {
     use crate::{
         config::{Inbound, ServerPolicy, User},
         server::ServerContext,

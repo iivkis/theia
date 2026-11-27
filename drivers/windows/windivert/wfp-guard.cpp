@@ -34,7 +34,14 @@ constexpr UINT64 filter_weight = 0x8000000000000000ULL;
 
 struct Failure { DWORD code; };
 void check(DWORD code) { if (code != ERROR_SUCCESS) throw Failure{code}; }
-void require(bool condition) { if (!condition) throw Failure{ERROR_INVALID_DATA}; }
+bool fixture_diagnostics=false;
+void require_at(bool condition,int line) {
+    if (!condition) {
+        if(fixture_diagnostics) std::fwprintf(stderr,L"BFE fixture assertion failed at line %d\n",line);
+        throw Failure{ERROR_INVALID_DATA};
+    }
+}
+#define require(...) require_at((__VA_ARGS__),__LINE__)
 bool eq(const GUID& a, const GUID& b) { return InlineIsEqualGUID(a,b) != 0; }
 
 GUID guid(const wchar_t* text) {
@@ -168,6 +175,28 @@ bool exact_security(HANDLE e,const GUID& key,bool sublayer) {
         ? FwpmSubLayerGetSecurityInfoByKey0(e,&key,info,&owner,&group,&dacl,nullptr,&descriptor.value)
         : FwpmFilterGetSecurityInfoByKey0(e,&key,info,&owner,&group,&dacl,nullptr,&descriptor.value);
     check(status);
+    if(fixture_diagnostics) {
+        SECURITY_DESCRIPTOR_CONTROL observed{};
+        DWORD version=0;
+        const bool got_control=descriptor.value &&
+            GetSecurityDescriptorControl(descriptor.value,&observed,&version)!=0;
+        std::fwprintf(stderr,L"BFE fixture security: sublayer=%d owner-admin=%d group-admin=%d acl-valid=%d protected=%d count=%u\n",
+            sublayer?1:0,owner && IsWellKnownSid(owner,WinBuiltinAdministratorsSid)?1:0,
+            group && IsWellKnownSid(group,WinBuiltinAdministratorsSid)?1:0,
+            dacl && IsValidAcl(dacl)?1:0,got_control && (observed&SE_DACL_PROTECTED)?1:0,
+            dacl?static_cast<unsigned>(dacl->AceCount):0u);
+        if(dacl && IsValidAcl(dacl)) for(DWORD i=0;i<dacl->AceCount;++i) {
+            void* raw=nullptr;
+            if(GetAce(dacl,i,&raw) && raw) {
+                const auto* ace=static_cast<const ACE_HEADER*>(raw);
+                const auto mask=ace->AceType==ACCESS_ALLOWED_ACE_TYPE
+                    ?static_cast<const ACCESS_ALLOWED_ACE*>(raw)->Mask:0u;
+                std::fwprintf(stderr,L"BFE fixture ACE %lu: type=%u flags=%u mask=0x%08lx\n",
+                    static_cast<unsigned long>(i),static_cast<unsigned>(ace->AceType),
+                    static_cast<unsigned>(ace->AceFlags),static_cast<unsigned long>(mask));
+            }
+        }
+    }
     if(!descriptor.value || !owner || !group || !dacl ||
         !IsWellKnownSid(owner,WinBuiltinAdministratorsSid) ||
         !IsWellKnownSid(group,WinBuiltinAdministratorsSid) || !IsValidAcl(dacl)) return false;
@@ -252,7 +281,9 @@ State inspect(HANDLE e,const Plan& p) {
         if(status==static_cast<DWORD>(FWP_E_FILTER_NOT_FOUND)) continue;
         check(status); require(f.value!=nullptr);
         present[i]=true;
-        exact[i]=same_filter(*f.value,p,i) && exact_security(e,p.filters[i],false);
+        const bool object_exact=same_filter(*f.value,p,i);
+        if(fixture_diagnostics) std::fwprintf(stderr,L"BFE fixture filter %zu object-exact=%d flags=0x%08lx\n",i,object_exact?1:0,static_cast<unsigned long>(f.value->flags));
+        exact[i]=object_exact && exact_security(e,p.filters[i],false);
     }
     return classify(sub_present,sub_present && same_sublayer(*s.value,p) &&
         exact_security(e,p.sub,true),present,exact,p.count());
@@ -481,6 +512,7 @@ GUID fresh_guid() {
 // Exercise actual BFE API and canonical read-back, but NEVER commit
 // any of the test filters. Even a failed assertion aborts via RAII.
 void transaction_self_test() {
+    fixture_diagnostics=true;
     Plan p{GUID{},fresh_guid(),{fresh_guid(),fresh_guid()},1,marker(fresh_guid())};
     Engine engine;
     {
@@ -509,6 +541,7 @@ void transaction_self_test() {
     std::wprintf(L"BFE add/read/compare/delete/abort passed; no committed test filters\n");
 }
 void multi_transaction_self_test(bool boot) {
+    fixture_diagnostics=true;
     std::vector<Plan> plans;
     for(UINT64 luid:{UINT64{1},UINT64{2}}) {
         Plan p{fresh_guid(),fresh_guid(),{fresh_guid(),fresh_guid(),GUID{},GUID{}},luid,marker(fresh_guid()),boot};

@@ -38,30 +38,44 @@ async fn fixture(both: bool) -> Loopback {
     .unwrap();
     tls.alpn_protocols = vec![b"h2".to_vec()];
     let acceptor = TlsAcceptor::from(Arc::new(tls));
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
+    // Reserve both protocols before publishing the shared port. Another
+    // test may already own the corresponding UDP ephemeral port.
+    let mut pair = None;
+    for _ in 0..64 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let udp = if both {
+            match quic_transport::server_endpoint(address, vec![cert.clone()], key.clone_key().into()) {
+                Ok(endpoint) => Ok((Some(endpoint), None)),
+                Err(theia::quic_transport::QuicError::Bind) => continue,
+                Err(other) => Err(format!("QUIC fixture configuration: {other:?}")),
+            }
+        } else {
+            match tokio::net::UdpSocket::bind(address).await {
+                Ok(socket) => Ok((None, Some(socket))),
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(error) => Err(error.to_string()),
+            }
+        }.unwrap();
+        pair = Some((listener, address, udp));
+        break;
+    }
+    let (listener, address, (endpoint, socket)) = pair.expect("shared TCP/UDP loopback port");
     let tcp_task = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
         let _ = acceptor.accept(tcp).await;
     });
-
     let mut roots = RootCertStore::empty();
-    roots.add(cert.clone()).unwrap();
-    let udp_task = if both {
-        let endpoint = quic_transport::server_endpoint(address, vec![cert], key.into()).unwrap();
+    roots.add(cert).unwrap();
+    let udp_task = if let Some(endpoint) = endpoint {
         tokio::spawn(async move {
             let incoming = endpoint.accept().await.unwrap();
-            let Ok(conn) = quic_transport::accept(incoming).await else {
-                // Client intentionally rejects the certificate in the negative
-                // PKI fixture; server authentication must fail closed too.
-                return;
-            };
+            let Ok(conn) = quic_transport::accept(incoming).await else { return; };
             tokio::time::sleep(Duration::from_millis(120)).await;
             drop(conn);
         })
     } else {
-        // Bound but nonresponsive UDP: H2 can pass, H3 must not be guessed.
-        let socket = tokio::net::UdpSocket::bind(address).await.unwrap();
+        let socket = socket.unwrap();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(2)).await;
             drop(socket);
