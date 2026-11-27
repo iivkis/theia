@@ -449,7 +449,7 @@ mod tests {
                 let candidate = listener.accept().await.unwrap();
                 let mut session = handshake_udp::accept(candidate,server_tls).await.unwrap();
                 while session.shutdown_phase() == ShutdownPhase::Open {
-                    session.flush(tokio::time::Instant::now()).await.unwrap();
+                    session.flush(Instant::now()).await.unwrap();
                     session.recv(Duration::from_millis(10)).await.unwrap();
                 }
             };

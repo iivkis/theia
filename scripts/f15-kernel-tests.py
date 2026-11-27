@@ -14,6 +14,7 @@ TESTS = (
     "routing::linux_rules::tests::kernel_install_and_recovery_in_new_namespace",
     "routing::linux_rules::tests::kernel_hard_kill_keeps_capture_fail_closed_until_explicit_recovery",
     "routing::linux_rules::tests::kernel_socket_queue_proves_descriptor_not_just_destination",
+    "routing::packet_modify::tests::kernel_tcp_split_emits_two_real_ipv4_packets",
 )
 
 
@@ -56,7 +57,7 @@ def main() -> None:
             r"(?m)^test result: ok\. 1 passed; 0 failed; 0 ignored;", run.stdout
         ):
             raise SystemExit(f"F-15 kernel acceptance failed or did not execute: {test}")
-    print("F-15: all three isolated kernel scenarios executed successfully", flush=True)
+    print("F-15: all isolated kernel scenarios executed successfully", flush=True)
 
 
 if __name__ == "__main__":

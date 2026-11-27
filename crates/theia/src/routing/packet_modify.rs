@@ -220,6 +220,82 @@ mod tests {
         }
     }
 
+    /// Actual kernel emission and reception of the two transformed IPv4
+    /// packets, on disposable loopback only. No raw egress API is exported
+    /// to the product. This proves packet boundaries, not live TCP state,
+    /// retransmission, NFQUEUE reinjection or independent DPI effectiveness.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires isolated Linux network namespace, CAP_NET_RAW and iproute2"]
+    fn kernel_tcp_split_emits_two_real_ipv4_packets() {
+        std::thread::spawn(|| {
+            use std::{io,mem,os::fd::{AsRawFd,FromRawFd,OwnedFd},os::unix::fs::MetadataExt,process::Command};
+            let before = std::fs::metadata("/proc/thread-self/ns/net").unwrap();
+            assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) },0);
+            let after = std::fs::metadata("/proc/thread-self/ns/net").unwrap();
+            assert_ne!((before.dev(),before.ino()),(after.dev(),after.ino()));
+            assert!(Command::new("ip").args(["link","set","lo","up"]).status().unwrap().success());
+            fn raw(protocol: libc::c_int) -> OwnedFd {
+                let fd = unsafe { libc::socket(libc::AF_INET,libc::SOCK_RAW | libc::SOCK_CLOEXEC,protocol) };
+                assert!(fd >= 0,"raw socket: {}",io::Error::last_os_error());
+                unsafe { OwnedFd::from_raw_fd(fd) }
+            }
+            fn addr(ip: [u8;4]) -> libc::sockaddr_in {
+                assert_eq!(ip[0],127); // strictly isolated local fixture
+                let mut a: libc::sockaddr_in = unsafe { mem::zeroed() };
+                a.sin_family = libc::AF_INET as libc::sa_family_t;
+                a.sin_addr.s_addr = u32::from_ne_bytes(ip);
+                a
+            }
+            let target = addr([127,0,0,2]);
+            let source = addr([127,0,0,1]);
+            let receiver = raw(libc::IPPROTO_TCP);
+            let sender = raw(libc::IPPROTO_RAW); // IP_HDRINCL, send-only
+            for (fd, address) in [(&receiver,&target),(&sender,&source)] {
+                assert_eq!(unsafe { libc::bind(fd.as_raw_fd(),(address as *const libc::sockaddr_in).cast(),mem::size_of_val(address) as libc::socklen_t) },0);
+            }
+            let wait = libc::timeval { tv_sec: 1, tv_usec: 0 };
+            assert_eq!(unsafe { libc::setsockopt(receiver.as_raw_fd(),libc::SOL_SOCKET,libc::SO_RCVTIMEO,(&wait as *const libc::timeval).cast(),mem::size_of_val(&wait) as libc::socklen_t) },0);
+            let hello = super::super::dpi::packet_test_hello("example.org");
+            let mut original = vec![0u8;40];
+            original[0] = 0x45;
+            original[2..4].copy_from_slice(&((40+hello.len()) as u16).to_be_bytes());
+            original[4..6].copy_from_slice(&0x1234u16.to_be_bytes());
+            original[6..8].copy_from_slice(&[0x40,0]);
+            original[8] = 64;
+            original[9] = 6;
+            original[12..16].copy_from_slice(&[127,0,0,1]);
+            original[16..20].copy_from_slice(&[127,0,0,2]);
+            let sum = checksum(words(&original[..20]));
+            original[10..12].copy_from_slice(&sum.to_be_bytes());
+            original[20..22].copy_from_slice(&1234u16.to_be_bytes());
+            original[22..24].copy_from_slice(&443u16.to_be_bytes());
+            original[24..28].copy_from_slice(&100u32.to_be_bytes());
+            original[32] = 0x50;
+            original[33] = 0x18;
+            original.extend_from_slice(&hello);
+            let sum = tcp_checksum(&original,20);
+            original[36..38].copy_from_slice(&sum.to_be_bytes());
+            let pair = tcp_tls_segments(&original,"example.org").unwrap();
+            for part in &pair {
+                let written = unsafe { libc::sendto(sender.as_raw_fd(),part.as_ptr().cast(),part.len(),0,
+                    (&target as *const libc::sockaddr_in).cast(),mem::size_of_val(&target) as libc::socklen_t) };
+                assert_eq!(written,part.len() as isize,"raw send: {}",io::Error::last_os_error());
+            }
+            let mut seen = Vec::new();
+            for expected in &pair {
+                let mut bytes = vec![0u8;65535];
+                let read = unsafe { libc::recv(receiver.as_raw_fd(),bytes.as_mut_ptr().cast(),bytes.len(),0) };
+                assert!(read >= 40,"raw receive: {}",io::Error::last_os_error());
+                bytes.truncate(read as usize);
+                assert_eq!(bytes,*expected);
+                assert_eq!(tcp_checksum(&bytes,20),0);
+                seen.extend_from_slice(&bytes[40..]);
+            }
+            assert_eq!(seen,hello);
+        }).join().unwrap();
+    }
+
     #[test]
     fn quic_candidate_never_splits_unauthenticated_or_short_initial() {
         use crate::reality_quic_wire as wire;
