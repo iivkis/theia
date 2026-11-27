@@ -515,7 +515,7 @@ fn page_actions_for(
         (Role::Server, 6) => &[
             ('i', "Узнать внешний IP"),
             ('r', "Посмотреть области поиска"),
-            ('t', "Проверить назначенный IP"),
+            ('T', "Проверить назначенный IP"),
         ],
         (Role::Server, 7) => &[],
         (Role::Client, 1) => &[
@@ -569,6 +569,11 @@ fn page_actions_for(
         .iter()
         .filter_map(|&(key, label)| {
             let available = match (role, key) {
+                (
+                    Role::Server,
+                    'u' | 'b' | 't' | 'x' | 'U' | 'G' | 'V' | 'K' | 'M' | 'w' | 'l' | 'N' | 'D'
+                    | 'E' | 'Q',
+                ) if editor.write_uncertain() => false,
                 (Role::Client, 'T') => has_record && !editor.dirty() && !editor.write_uncertain(),
                 (_, 'l' | 'M' | 'w' | 'K') if !advanced => false,
                 (Role::Server, 'V' | 'K') | (Role::Client, 'K') => has_record && reality,
@@ -583,11 +588,6 @@ fn page_actions_for(
                 (Role::Server, 'U') => selected.is_some_and(|(id, _, _)| editor.user_deletable(id)),
                 (Role::Server, 'j') => selected.is_some() && !editor.write_uncertain(),
                 (Role::Server, 'S') => editor.dirty() && !editor.write_uncertain(),
-                (
-                    Role::Server,
-                    'u' | 'b' | 't' | 'x' | 'U' | 'G' | 'V' | 'K' | 'M' | 'w' | 'l' | 'N' | 'D'
-                    | 'E' | 'Q',
-                ) if editor.write_uncertain() => false,
                 _ => true,
             };
             let label = match (role, key) {
@@ -4201,13 +4201,14 @@ impl Interaction {
                             ) {
                                 if role == Role::Server
                                     && self.workspace_page == 6
-                                    && matches!(ch, 'i' | 'r' | 't')
+                                    && matches!(ch, 'i' | 'r' | 'T')
                                 {
                                     self.discovery = Some(DiscoveryPanel::new());
                                     self.modal_action = 0;
+                                    let discovery_key = if ch == 'T' { 't' } else { ch };
                                     self.update(
                                         model,
-                                        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                                        KeyEvent::new(KeyCode::Char(discovery_key), KeyModifiers::NONE),
                                     );
                                     return false;
                                 }
@@ -7579,7 +7580,7 @@ fn draw_revocation(
         ),
         DisableFlow::Done => (
             "Отключение сохранено",
-            "Настройки сохранены. Работающий сервер ещё не изменён.\n\nСледующий шаг: перейдите в «Управление», проверьте состояние сервера, затем подтвердите применение прав доступа. Уже открытые туннели продолжатся.\n\nEnter: перейти к управлению · Esc: вернуться к пользователям.".into(),
+            "Настройки сохранены. Работающий сервер ещё не изменён.\n\nСледующий шаг: перейдите в «Управление», проверьте состояние сервера и выберите «Применить права доступа». Уже открытые туннели продолжатся.\n\nEnter: перейти к управлению · Esc: вернуться к пользователям.".into(),
         ),
     };
     let body = if let DisableFlow::Input(id) = flow {
@@ -10368,6 +10369,8 @@ mod tests {
             assert!(!page_has_records(role, 4));
             assert!(!page_has_records(role, 5));
         }
+        assert!(page_actions(Role::Server, 6, None).iter().any(|a| a.key == 'T'));
+        assert!(!page_actions(Role::Server, 6, None).iter().any(|a| a.key == 't'));
         assert_eq!(recommendation_page(Role::Server, 'b'), (2, 'b'));
         assert_eq!(recommendation_page(Role::Server, 'G'), (2, 'G'));
         let imports = page_actions(Role::Client, 2, None);
