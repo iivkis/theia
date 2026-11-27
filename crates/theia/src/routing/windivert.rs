@@ -702,8 +702,8 @@ mod native {
     fn udp_lab(api: &Api, v6: bool, cancelled: &AtomicBool) -> io::Result<()> {
         use ring::rand::{SecureRandom,SystemRandom};
         let loopback = if v6 { "[::1]:0" } else { "127.0.0.1:0" };
-        let client = UdpSocket::bind(loopback)?;
-        let peer = UdpSocket::bind(loopback)?;
+        let client = loopback_udp(loopback)?;
+        let peer = loopback_udp(loopback)?;
         let src = client.local_addr()?;
         let dst = peer.local_addr()?;
         client.connect(dst)?;
@@ -877,11 +877,168 @@ mod native {
         }
     }
 
+    struct WinsockLease;
+    impl WinsockLease {
+        fn start()->io::Result<Self> {
+            use windows_sys::Win32::Networking::WinSock::{WSAStartup,WSADATA};
+            let mut data:WSADATA=unsafe { std::mem::zeroed() };
+            let status=unsafe { WSAStartup(0x0202,&mut data) };
+            if status!=0 { return Err(io::Error::from_raw_os_error(status)); }
+            Ok(Self)
+        }
+    }
+    impl Drop for WinsockLease {
+        fn drop(&mut self) { unsafe { windows_sys::Win32::Networking::WinSock::WSACleanup(); } }
+    }
+
+    fn exclusive(socket:&impl std::os::windows::io::AsRawSocket)->io::Result<()> {
+        use windows_sys::Win32::Networking::WinSock::{setsockopt,WSAGetLastError,SOL_SOCKET,SO_EXCLUSIVEADDRUSE};
+        let on=1i32;
+        let rc=unsafe { setsockopt(socket.as_raw_socket() as usize,SOL_SOCKET,SO_EXCLUSIVEADDRUSE,
+            (&on as *const i32).cast(),4) };
+        if rc!=0 { return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() })); }
+        Ok(())
+    }
+    fn bind_udp(address:std::net::SocketAddr)->io::Result<UdpSocket> {
+        use std::os::windows::io::{AsRawSocket,FromRawSocket};
+        use windows_sys::Win32::Networking::WinSock::{
+            socket,bind,WSAGetLastError,AF_INET,AF_INET6,SOCK_DGRAM,IPPROTO_UDP,INVALID_SOCKET,SOCKADDR_INET,
+        };
+        let family=if address.is_ipv4(){AF_INET}else{AF_INET6};
+        let raw=unsafe { socket(i32::from(family),SOCK_DGRAM,IPPROTO_UDP) };
+        if raw==INVALID_SOCKET { return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() })); }
+        let socket=unsafe { UdpSocket::from_raw_socket(raw as _) };
+        exclusive(&socket)?;
+        let mut addr:SOCKADDR_INET=unsafe { std::mem::zeroed() };
+        let bytes=unsafe { std::slice::from_raw_parts_mut((&mut addr as *mut SOCKADDR_INET).cast::<u8>(),std::mem::size_of::<SOCKADDR_INET>()) };
+        if bytes.len()!=28 { return Err(io::ErrorKind::InvalidData.into()); }
+        bytes[..2].copy_from_slice(&family.to_ne_bytes());
+        bytes[2..4].copy_from_slice(&address.port().to_be_bytes());
+        let length=match address {
+            std::net::SocketAddr::V4(v4)=>{bytes[4..8].copy_from_slice(&v4.ip().octets());16},
+            std::net::SocketAddr::V6(v6)=>{
+                if v6.scope_id()!=0 || v6.flowinfo()!=0 { return Err(io::ErrorKind::InvalidInput.into()); }
+                bytes[8..24].copy_from_slice(&v6.ip().octets());28
+            }
+        };
+        let rc=unsafe { bind(socket.as_raw_socket() as usize,(&addr as *const SOCKADDR_INET).cast(),length) };
+        if rc!=0 { return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() })); }
+        Ok(socket)
+    }
+    fn loopback_udp(address:&str)->io::Result<UdpSocket> {
+        bind_udp(address.parse().map_err(|_|io::ErrorKind::InvalidInput)?)
+    }
+
+    struct Cancel(Arc<AtomicBool>);
+    impl Drop for Cancel { fn drop(&mut self) { self.0.store(true,Ordering::Release); } }
+
+    /// One explicitly authorized non-loopback echo flow, never a generic
+    /// application capture or an externally supplied packet/injection key.
+    pub(crate) struct RelayLab {
+        pub(crate) key:super::super::packet::FlowKey,
+        pub(crate) payload:Vec<u8>,
+        reply:Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
+        worker:tokio::task::JoinHandle<io::Result<()>>,
+        _cancel:Cancel,
+    }
+    impl RelayLab {
+        pub(crate) async fn finish(mut self,payload:Vec<u8>)->io::Result<()> {
+            self.reply.take().ok_or(io::ErrorKind::BrokenPipe)?.send(payload)
+                .map_err(|_|io::ErrorKind::BrokenPipe)?;
+            (&mut self.worker).await.map_err(|_|io::Error::other("WinDivert relay lab worker failed"))?
+        }
+    }
+
+    pub(crate) async fn begin_udp_relay_lab(directory:std::path::PathBuf,dll:[u8;32],sys:[u8;32],
+        target:std::net::SocketAddr)->io::Result<RelayLab> {
+        use tokio::sync::oneshot;
+        let cancel=Cancel(Arc::new(AtomicBool::new(false)));
+        let signal=cancel.0.clone();
+        let (ready_tx,ready_rx)=oneshot::channel();
+        let (reply_tx,mut reply_rx)=oneshot::channel::<Vec<u8>>();
+        let mut worker=tokio::task::spawn_blocking(move || {
+            use ring::rand::{SecureRandom,SystemRandom};
+            if target.port()==0 || target.ip().is_loopback() || target.ip().is_unspecified() || target.ip().is_multicast()
+                || matches!(target,std::net::SocketAddr::V4(v) if v.ip().octets()[0]>=224 || v.ip().octets()[0]==0)
+                || matches!(target,std::net::SocketAddr::V6(v) if v.scope_id()!=0 || v.flowinfo()!=0 || v.ip().to_ipv4_mapped().is_some() || v.ip().is_unicast_link_local())
+            { return Err(io::ErrorKind::InvalidInput.into()); }
+            let _winsock=WinsockLease::start()?;
+            let api=load(&directory,dll,sys)?;
+            // Read-only route observation before sending any application data.
+            let scope=crate::network_scope::observe(target).ok_or(io::ErrorKind::PermissionDenied)?;
+            let socket=bind_udp(scope.bind_address())?;
+            let local=socket.local_addr()?;
+            if !scope.matches_local(local) || local.ip()==target.ip() { return Err(io::ErrorKind::InvalidInput.into()); }
+            socket.connect(target)?;
+            socket.set_read_timeout(Some(Duration::from_secs(3)))?;
+            socket.set_write_timeout(Some(Duration::from_secs(3)))?;
+            let endpoint=socket_endpoint(&socket)?;
+            let field=if local.is_ipv4() {"ip"}else{"ipv6"};
+            let filter=std::ffi::CString::new(format!(
+                "outbound and !loopback and !impostor and udp and {field}.SrcAddr == {} and {field}.DstAddr == {} and udp.SrcPort == {} and udp.DstPort == {}",
+                local.ip(),target.ip(),local.port(),target.port()
+            )).map_err(|_|io::ErrorKind::InvalidInput)?;
+            let guard=api.open_priority(&filter,0,-100,0x12)?;
+            let capture=api.open_priority(&filter,0,100,0x10)?;
+            api.bounded(&capture)?;
+            let injector=api.open_priority(c"false",0,-200,0x18)?;
+            let mut nonce=vec![0u8;32];
+            SystemRandom::new().fill(&mut nonce).map_err(|_|io::Error::other("entropy unavailable"))?;
+            if signal.load(Ordering::Acquire) || crate::network_scope::observe(target)!=Some(scope) {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            if socket.send(&nonce)?!=nonce.len() { return Err(io::ErrorKind::WriteZero.into()); }
+            let (packet,address)=api.receive(&capture,&signal,Instant::now()+Duration::from_secs(3))?;
+            let observation=address.network(&packet).map_err(|_|io::ErrorKind::InvalidData)?;
+            if observation.meta.flow.source!=local || observation.meta.flow.destination!=target
+                || observation.meta.payload_len!=nonce.len() || !packet.ends_with(&nonce)
+                || socket_endpoint(&socket)?!=endpoint { return Err(io::ErrorKind::PermissionDenied.into()); }
+            let plan=UdpReversePlan::from_diverted_packet(&address,&packet).ok_or(io::ErrorKind::PermissionDenied)?;
+            // The original packet is never sent. Only the authenticated
+            // XHTTP relay gets its payload; the lower DROP handle stays live.
+            ready_tx.send((plan.original_flow(),nonce.clone())).map_err(|_|io::ErrorKind::BrokenPipe)?;
+            let deadline=Instant::now()+Duration::from_secs(25);
+            let payload=loop {
+                if signal.load(Ordering::Acquire) || Instant::now()>=deadline { return Err(io::ErrorKind::Interrupted.into()); }
+                match reply_rx.try_recv() {
+                    Ok(bytes)=>break bytes,
+                    Err(oneshot::error::TryRecvError::Empty)=>std::thread::sleep(Duration::from_millis(20)),
+                    Err(oneshot::error::TryRecvError::Closed)=>return Err(io::ErrorKind::BrokenPipe.into()),
+                }
+            };
+            if payload!=nonce || socket_endpoint(&socket)?!=endpoint || socket.local_addr()?!=local
+                || socket.peer_addr()?!=target || crate::network_scope::observe(target)!=Some(scope) {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            let reverse=plan.build(&payload).ok_or(io::ErrorKind::InvalidData)?;
+            let mut incoming=address;
+            // Non-loopback replies must be injected inbound with the
+            // captured interface/subinterface, not the outbound direction.
+            incoming.flags=(1<<23) | if target.is_ipv6(){1<<20}else{1<<21};
+            api.send(&injector,&reverse.packet,&incoming,&signal,Instant::now()+Duration::from_secs(3))?;
+            let mut data=[0u8;33];
+            let (n,from)=socket.recv_from(&mut data)?;
+            if from!=target || &data[..n]!=nonce { return Err(io::ErrorKind::InvalidData.into()); }
+            api.retire(capture)?;
+            api.retire(injector)?;
+            drop(socket);
+            guard.close()
+        });
+        let (key,payload)=match ready_rx.await {
+            Ok(data)=>data,
+            Err(_)=>{
+                (&mut worker).await.map_err(|_|io::Error::other("WinDivert relay lab worker failed"))??;
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+        };
+        Ok(RelayLab { key,payload,reply:Some(reply_tx),worker,_cancel:cancel })
+    }
+
     fn guarded_lab(api:&Api,cancelled:&AtomicBool)->io::Result<()> {
         use std::os::windows::io::AsRawHandle;
         use std::process::{Child,Command,Stdio};
-        let client=UdpSocket::bind("127.0.0.1:0")?;
-        let peer=UdpSocket::bind("127.0.0.1:0")?;
+        let client=loopback_udp("127.0.0.1:0")?;
+        let peer=loopback_udp("127.0.0.1:0")?;
         let src=client.local_addr()?;
         let dst=peer.local_addr()?;
         client.connect(dst)?;
@@ -953,8 +1110,8 @@ mod native {
         // Only capture events belonging to the current process. The
         // socket is held open until the observed connect and close.
         let pid=std::process::id();
-        let receiver=UdpSocket::bind("127.0.0.1:0")?;
-        let sender=UdpSocket::bind("127.0.0.1:0")?;
+        let receiver=loopback_udp("127.0.0.1:0")?;
+        let sender=loopback_udp("127.0.0.1:0")?;
         let src=sender.local_addr()?;
         let dst=receiver.local_addr()?;
         let filter=std::ffi::CString::new(format!("processId == {pid} and protocol == 17 and localPort == {}",src.port()))
@@ -1021,11 +1178,10 @@ mod native {
     /// Dropping the future requests cancellation, and the worker retains
     /// the DLL, handles and operation buffers until completion.
     pub async fn loopback_acceptance(directory: std::path::PathBuf, dll:[u8;32], sys:[u8;32]) -> io::Result<()> {
-        struct Cancel(Arc<AtomicBool>);
-        impl Drop for Cancel { fn drop(&mut self) { self.0.store(true,Ordering::Release); } }
         let cancel = Cancel(Arc::new(AtomicBool::new(false)));
         let signal = cancel.0.clone();
         let result = tokio::task::spawn_blocking(move || {
+            let _winsock=WinsockLease::start()?;
             let api=load(&directory,dll,sys)?;
             udp_lab(&api,false,&signal)?;
             udp_lab(&api,true,&signal)?;
@@ -1041,6 +1197,8 @@ mod native {
 }
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub use native::{loopback_acceptance, probe};
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub(crate) use native::begin_udp_relay_lab;
 
 #[cfg(test)]
 mod tests {

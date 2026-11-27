@@ -2585,6 +2585,55 @@ impl NativeIngress {
         recovered
     }
 
+    /// Explicit authorized echo acceptance, never a product Connect.
+    /// The backend captures one exclusively owned socket/target tuple.
+    /// No generic WinDivert filter or caller-supplied injection key is
+    /// accepted. All payload goes through the normal authenticated router.
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    pub async fn run_windows_udp_relay_lab(
+        path:&Path, directory:std::path::PathBuf, dll:[u8;32], sys:[u8;32], target:SocketAddr,
+    )->Result<(),ClientError> {
+        use crate::routing::PacketAction;
+        let ingress=Self::prepare(path).await?;
+        struct Stop<'a>(&'a NativeIngress);
+        impl Drop for Stop<'_> { fn drop(&mut self) { self.0.shutdown(); } }
+        let _stop=Stop(&ingress);
+        let lab=crate::routing::windivert::begin_udp_relay_lab(directory,dll,sys,target).await
+            .map_err(|_|ClientError::Io)?;
+        // The worker has captured the actual datagram and installed its
+        // narrow guard. No other application's traffic is admitted here.
+        ingress.runtime.capture_state.ready()?;
+        let key=lab.key;
+        let (carrier,flow,address)=ingress.redirect(key).await?;
+        let tunnel=carrier.open_udp(address,key.destination.port()).await?;
+        let (tx,up)=tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
+        let (down,mut rx)=tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
+        tx.send(lab.payload.clone()).await.map_err(|_|ClientError::Io)?;
+        let relay=tunnel.relay_guarded(up,down,Some(&flow));
+        tokio::pin!(relay);
+        let response=tokio::select! {
+            biased;
+            ()=ingress.stopped()=>return Err(ClientError::Open(ErrorCode::PolicyDenied)),
+            result=&mut relay=>{result?;return Err(ClientError::Io)},
+            data=timeout(Duration::from_secs(15),rx.recv())=>data.map_err(|_|ClientError::Timeout)?.ok_or(ClientError::Io)?,
+        };
+        ingress.ensure_accepting()?;
+        if !flow.committed(PacketAction::Redirect) { return Err(ClientError::Open(ErrorCode::PolicyDenied)); }
+        // Retain the flow lease and live carrier while the exact owned
+        // socket receives the reverse packet. No retry on unknown outcome.
+        tokio::select! {
+            biased;
+            ()=ingress.stopped()=>return Err(ClientError::Open(ErrorCode::PolicyDenied)),
+            result=&mut relay=>{result?;return Err(ClientError::Io)},
+            result=lab.finish(response)=>result.map_err(|_|ClientError::Io)?,
+        }
+        drop(tx);
+        // Explicit stop: no further application datagram is accepted.
+        // A terminal relay error still fails the acceptance scenario.
+        timeout(Duration::from_secs(3),&mut relay).await.map_err(|_|ClientError::Timeout)??;
+        Ok(())
+    }
+
     /// Correlate an actual private collector/queue observation with
     /// authenticated DNS, rechecking it before publication. The resolver
     /// link is still a claimed link, not trusted evidence of the original

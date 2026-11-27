@@ -48,6 +48,23 @@ The test requires no delivery after that death, followed by delivery after
 explicit guard removal. This is not a system-wide kill switch: the parent
 still owns the guard and no reboot guarantee is provided.
 
+## Authenticated UDP relay acceptance
+
+On an authorized disposable Windows machine with an independently controlled
+UDP echo origin and a configured authenticated Theia server:
+
+    theia client windivert --udp-relay-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --target IP:PORT --confirm
+
+Use a concrete non-loopback echo target which the configured policy routes
+via authenticated VPS Redirect (or its permitted pre-payload Modify fallback).
+The original application socket is created with SO_EXCLUSIVEADDRUSE and bound
+to the observed source. Only its exact tuple is intercepted and guarded.
+The captured nonce is relayed using NativeIngress, FlowLease and H2/H3 XHTTP;
+only its exact authenticated echoed response is injected inbound while
+the flow lease is held. A denial, route change, timeout or unknown outcome
+fails the test without direct fallback. Independent server/egress captures
+are still required. This is not general application capture or Connect.
+
 ## Offline UDP reverse candidate
 
 The Rust backend builds complete IPv4/IPv6 reverse UDP packets from parsed,

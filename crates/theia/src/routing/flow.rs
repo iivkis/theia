@@ -199,7 +199,7 @@ pub(crate) struct FlowLease {
 }
 
 impl FlowLease {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
     pub(crate) fn committed(&self, action: PacketAction) -> bool {
         self.table
             .state

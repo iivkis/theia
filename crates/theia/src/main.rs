@@ -86,6 +86,19 @@ async fn run() {
             tokio::time::sleep(std::time::Duration::from_secs(20)).await;
             Ok("WinDivert handle holder exited".to_owned())
         }
+        Ok(Command::ClientWinDivertUdpRelayLab { config,directory,dll_sha256,sys_sha256,target }) => {
+            #[cfg(all(windows,target_arch="x86_64"))]
+            {
+                local_proxy::NativeIngress::run_windows_udp_relay_lab(Path::new(&config),directory.into(),dll_sha256,sys_sha256,target).await
+                    .map(|_|"WinDivert authorized UDP echo through the configured authenticated carrier verified; capture inactive".to_owned())
+                    .map_err(CliError::Client)
+            }
+            #[cfg(not(all(windows,target_arch="x86_64")))]
+            {
+                let _=(config,directory,dll_sha256,sys_sha256,target);
+                Err(CliError::NotImplemented("WinDivert x64 Windows backend"))
+            }
+        }
         Ok(Command::ClientWinDivertLoopback { directory, dll_sha256, sys_sha256 }) => {
             #[cfg(all(windows, target_arch = "x86_64"))]
             {
