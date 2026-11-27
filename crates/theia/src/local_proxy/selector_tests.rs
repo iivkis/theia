@@ -1489,13 +1489,18 @@ async fn blocked_diagnostic_fixture(
                 match event {
                     Event::Check(check) => {
                         if check.domain.is_some() {
-                            assert!(consent && !changed && domains_seen, "target check without live consent");
+                            assert!(
+                                consent && !changed && domains_seen,
+                                "target check without live consent"
+                            );
                             assert_eq!(check.domain.as_deref(), Some("blocked.invalid"));
                         }
                         match (check.kind, check.outcome) {
                             (CheckKind::Carrier(_), Outcome::Verified(_)) => verified = true,
                             (CheckKind::Policy, Outcome::Route(Action::Blocked)) => blocked = true,
-                            (CheckKind::Https("штатный"), Outcome::Skipped(_)) => skipped = true,
+                            (CheckKind::Https("штатный"), Outcome::Skipped(_)) => {
+                                skipped = true
+                            }
                             (_, Outcome::Failure(error)) => panic!("unexpected failure: {error}"),
                             _ => {}
                         }
