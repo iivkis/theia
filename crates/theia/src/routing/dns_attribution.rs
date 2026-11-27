@@ -3,7 +3,11 @@
 //! produces a candidate observation, NOT Evidence::Known: the production
 //! resolver event provenance and capture-side cookie binding remain open.
 use super::{linux_events::CorroboratedFlow, packet::FlowKey, RoutingError};
-use std::{collections::HashMap, net::IpAddr, time::{Duration, Instant}};
+use std::{
+    collections::HashMap,
+    net::IpAddr,
+    time::{Duration, Instant},
+};
 
 const MAX_ENTRIES: usize = 4096;
 const TTL: Duration = Duration::from_secs(30);
@@ -13,13 +17,13 @@ pub struct ResolverLink {
     pub key: FlowKey,
     pub cookie: u64,
     pub process_start: u64,
-    pub request_id: [u8;16],
+    pub request_id: [u8; 16],
     pub domain: String,
 }
 struct Entry {
     flow: CorroboratedFlow,
-    digest: [u8;32],
-    request_id: [u8;16],
+    digest: [u8; 32],
+    request_id: [u8; 16],
     domain: String,
     deadline: Instant,
     ambiguous: bool,
@@ -35,23 +39,54 @@ impl DnsCandidates {
     /// A caller-provided monotonic observation deadline is mandatory.
     /// The current protected DNS wire format carries no authoritative TTL;
     /// this limit is not proof of DNS freshness or sender identity.
-    pub fn record(&mut self, flow: CorroboratedFlow, link: &ResolverLink,
-        digest: [u8;32], protected_ips: &[IpAddr], observation_deadline: Instant) -> Result<bool, RoutingError> {
-        self.record_at(flow, link, digest, protected_ips, observation_deadline, Instant::now())
+    pub fn record(
+        &mut self,
+        flow: CorroboratedFlow,
+        link: &ResolverLink,
+        digest: [u8; 32],
+        protected_ips: &[IpAddr],
+        observation_deadline: Instant,
+    ) -> Result<bool, RoutingError> {
+        self.record_at(
+            flow,
+            link,
+            digest,
+            protected_ips,
+            observation_deadline,
+            Instant::now(),
+        )
     }
 
-    fn record_at(&mut self, flow: CorroboratedFlow, link: &ResolverLink,
-        digest: [u8;32], protected_ips: &[IpAddr], observation_deadline: Instant, now: Instant) -> Result<bool, RoutingError> {
+    fn record_at(
+        &mut self,
+        flow: CorroboratedFlow,
+        link: &ResolverLink,
+        digest: [u8; 32],
+        protected_ips: &[IpAddr],
+        observation_deadline: Instant,
+        now: Instant,
+    ) -> Result<bool, RoutingError> {
         self.entries.retain(|_, entry| entry.deadline > now);
         let name = super::domain_name(&link.domain)?;
-        if link.key != flow.key || link.cookie != flow.cookie || link.process_start != flow.process_start
-            || flow.cookie == 0 || flow.process_start == 0 || observation_deadline <= now
-            || link.request_id == [0;16] || digest == [0;32] || protected_ips.len() > 64
-            || !protected_ips.contains(&flow.key.destination.ip()) {
+        if link.key != flow.key
+            || link.cookie != flow.cookie
+            || link.process_start != flow.process_start
+            || flow.cookie == 0
+            || flow.process_start == 0
+            || observation_deadline <= now
+            || link.request_id == [0; 16]
+            || digest == [0; 32]
+            || protected_ips.len() > 64
+            || !protected_ips.contains(&flow.key.destination.ip())
+        {
             return Ok(false);
         }
         if let Some(entry) = self.entries.get_mut(&flow.key) {
-            if entry.flow != flow || entry.digest != digest || entry.domain != name || entry.request_id != link.request_id {
+            if entry.flow != flow
+                || entry.digest != digest
+                || entry.domain != name
+                || entry.request_id != link.request_id
+            {
                 entry.ambiguous = true;
             }
             // Re-observation must not extend an existing candidate or
@@ -59,27 +94,43 @@ impl DnsCandidates {
             entry.deadline = entry.deadline.min(observation_deadline);
             return Ok(!entry.ambiguous);
         }
-        if self.entries.len() >= MAX_ENTRIES { return Ok(false); }
-        self.entries.insert(flow.key, Entry {
-            flow, digest, request_id: link.request_id, domain: name,
-            deadline: now.checked_add(TTL).unwrap_or(now).min(observation_deadline), ambiguous: false,
-        });
+        if self.entries.len() >= MAX_ENTRIES {
+            return Ok(false);
+        }
+        self.entries.insert(
+            flow.key,
+            Entry {
+                flow,
+                digest,
+                request_id: link.request_id,
+                domain: name,
+                deadline: now
+                    .checked_add(TTL)
+                    .unwrap_or(now)
+                    .min(observation_deadline),
+                ambiguous: false,
+            },
+        );
         Ok(true)
     }
 
     /// The exact flow observation and policy generation are mandatory.
     /// No reverse DNS, destination-only lookup or ambiguous fallback.
-    pub fn candidate(&self, flow: CorroboratedFlow, digest: [u8;32]) -> Option<&str> {
+    pub fn candidate(&self, flow: CorroboratedFlow, digest: [u8; 32]) -> Option<&str> {
         self.candidate_at(flow, digest, Instant::now())
     }
 
-    fn candidate_at(&self, flow: CorroboratedFlow, digest: [u8;32], now: Instant) -> Option<&str> {
+    fn candidate_at(&self, flow: CorroboratedFlow, digest: [u8; 32], now: Instant) -> Option<&str> {
         let entry = self.entries.get(&flow.key)?;
         (entry.flow == flow && entry.digest == digest && !entry.ambiguous && entry.deadline > now)
             .then_some(entry.domain.as_str())
     }
     pub fn forget(&mut self, flow: CorroboratedFlow) {
-        if self.entries.get(&flow.key).is_some_and(|entry| entry.flow == flow) {
+        if self
+            .entries
+            .get(&flow.key)
+            .is_some_and(|entry| entry.flow == flow)
+        {
             self.entries.remove(&flow.key);
         }
     }
@@ -88,46 +139,92 @@ impl DnsCandidates {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routing::{ApplicationId, packet::Transport};
+    use crate::routing::{packet::Transport, ApplicationId};
     #[test]
     fn dns_link_never_crosses_socket_generation_or_ambiguous_request() {
         let flow = CorroboratedFlow {
-            key: FlowKey { source: "192.0.2.2:1234".parse().unwrap(), destination: "198.51.100.1:443".parse().unwrap(), transport: Transport::Tcp, interface: 0 },
-            cookie: 7, process_start: 8, application: ApplicationId::from_sha256([1;32]),
+            key: FlowKey {
+                source: "192.0.2.2:1234".parse().unwrap(),
+                destination: "198.51.100.1:443".parse().unwrap(),
+                transport: Transport::Tcp,
+                interface: 0,
+            },
+            cookie: 7,
+            process_start: 8,
+            application: ApplicationId::from_sha256([1; 32]),
         };
-        let mut link = ResolverLink { key: flow.key, cookie: 7, process_start: 8, request_id: [3;16], domain: "example.org".into() };
+        let mut link = ResolverLink {
+            key: flow.key,
+            cookie: 7,
+            process_start: 8,
+            request_id: [3; 16],
+            domain: "example.org".into(),
+        };
         let mut table = DnsCandidates::default();
         let deadline = Instant::now() + TTL;
-        assert!(!table.record(flow, &link, [1;32], &[], deadline).unwrap());
+        assert!(!table.record(flow, &link, [1; 32], &[], deadline).unwrap());
         let ips = [flow.key.destination.ip()];
-        assert!(table.record(flow, &link, [1;32], &ips, deadline).unwrap());
-        assert_eq!(table.candidate(flow,[1;32]), Some("example.org"));
-        assert!(table.candidate(flow,[2;32]).is_none());
-        assert!(table.candidate(CorroboratedFlow { cookie: 9, ..flow },[1;32]).is_none());
+        assert!(table.record(flow, &link, [1; 32], &ips, deadline).unwrap());
+        assert_eq!(table.candidate(flow, [1; 32]), Some("example.org"));
+        assert!(table.candidate(flow, [2; 32]).is_none());
+        assert!(table
+            .candidate(CorroboratedFlow { cookie: 9, ..flow }, [1; 32])
+            .is_none());
         link.domain = "other.example".into();
-        link.request_id = [4;16];
-        assert!(!table.record(flow, &link,[1;32], &ips, deadline).unwrap());
-        assert!(table.candidate(flow,[1;32]).is_none());
+        link.request_id = [4; 16];
+        assert!(!table.record(flow, &link, [1; 32], &ips, deadline).unwrap());
+        assert!(table.candidate(flow, [1; 32]).is_none());
         table.forget(flow);
-        assert!(table.candidate(flow,[1;32]).is_none());
+        assert!(table.candidate(flow, [1; 32]).is_none());
     }
 
     #[test]
     fn candidate_never_outlives_observation_or_refreshes_by_replay() {
         let flow = CorroboratedFlow {
-            key: FlowKey { source: "192.0.2.2:1234".parse().unwrap(), destination: "198.51.100.1:443".parse().unwrap(), transport: Transport::Udp, interface: 0 },
-            cookie: 7, process_start: 8, application: ApplicationId::from_sha256([1;32]),
+            key: FlowKey {
+                source: "192.0.2.2:1234".parse().unwrap(),
+                destination: "198.51.100.1:443".parse().unwrap(),
+                transport: Transport::Udp,
+                interface: 0,
+            },
+            cookie: 7,
+            process_start: 8,
+            application: ApplicationId::from_sha256([1; 32]),
         };
-        let link = ResolverLink { key: flow.key, cookie: 7, process_start: 8, request_id: [3;16], domain: "example.org".into() };
+        let link = ResolverLink {
+            key: flow.key,
+            cookie: 7,
+            process_start: 8,
+            request_id: [3; 16],
+            domain: "example.org".into(),
+        };
         let ips = [flow.key.destination.ip()];
         let now = Instant::now();
         let deadline = now + Duration::from_secs(5);
         let mut table = DnsCandidates::default();
-        assert!(!table.record_at(flow, &link, [1;32], &ips, now, now).unwrap());
-        assert!(table.record_at(flow, &link, [1;32], &ips, deadline, now).unwrap());
-        assert!(table.record_at(flow, &link, [1;32], &ips, now + TTL, now + Duration::from_secs(1)).unwrap());
-        assert_eq!(table.candidate_at(flow, [1;32], now + Duration::from_secs(4)), Some("example.org"));
-        assert!(table.candidate_at(flow, [1;32], deadline).is_none());
-        assert!(!table.record_at(flow, &link, [1;32], &ips, deadline, deadline).unwrap());
+        assert!(!table
+            .record_at(flow, &link, [1; 32], &ips, now, now)
+            .unwrap());
+        assert!(table
+            .record_at(flow, &link, [1; 32], &ips, deadline, now)
+            .unwrap());
+        assert!(table
+            .record_at(
+                flow,
+                &link,
+                [1; 32],
+                &ips,
+                now + TTL,
+                now + Duration::from_secs(1)
+            )
+            .unwrap());
+        assert_eq!(
+            table.candidate_at(flow, [1; 32], now + Duration::from_secs(4)),
+            Some("example.org")
+        );
+        assert!(table.candidate_at(flow, [1; 32], deadline).is_none());
+        assert!(!table
+            .record_at(flow, &link, [1; 32], &ips, deadline, deadline)
+            .unwrap());
     }
 }

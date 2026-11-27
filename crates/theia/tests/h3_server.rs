@@ -41,7 +41,8 @@ fn fixture_with_roots(private: bool) -> (quinn::Endpoint, SocketAddr, ServerTask
     let der = cert.cert.der().clone();
     let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
     let bind = "127.0.0.1:0".parse().unwrap();
-    let endpoint = theia::quic_transport::server_endpoint(bind, vec![der.clone()], key.into()).unwrap();
+    let endpoint =
+        theia::quic_transport::server_endpoint(bind, vec![der.clone()], key.into()).unwrap();
     let remote = endpoint.local_addr().unwrap();
     let mut roots = RootCertStore::empty();
     roots.add(der).unwrap();

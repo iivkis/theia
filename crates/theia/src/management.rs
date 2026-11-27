@@ -1033,7 +1033,10 @@ where
             flow_counts,
             capture_state,
         ) = client.status().await;
-        let flows = flow_counts.map_or_else(|| "unknown".to_owned(), |counts| counts.map(|n| n.to_string()).join(","));
+        let flows = flow_counts.map_or_else(
+            || "unknown".to_owned(),
+            |counts| counts.map(|n| n.to_string()).join(","),
+        );
         let totals = totals
             .iter()
             .map(u64::to_string)
@@ -1295,13 +1298,20 @@ where
                     for count in &mut counts {
                         *count = u16::try_from(unsigned(parts.next()?)?).ok()?;
                     }
-                    if parts.next().is_some() || counts.iter().map(|n| usize::from(*n)).sum::<usize>() > crate::routing::flow::MAX_FLOWS {
+                    if parts.next().is_some()
+                        || counts.iter().map(|n| usize::from(*n)).sum::<usize>()
+                            > crate::routing::flow::MAX_FLOWS
+                    {
                         return None;
                     }
                     Some(counts)
                 };
                 let capture_state = match fields.next()?.strip_prefix("cap=")? {
-                    "0" => 0, "1" => 1, "2" => 2, "3" => 3, _ => return None,
+                    "0" => 0,
+                    "1" => 1,
+                    "2" => 2,
+                    "3" => 3,
+                    _ => return None,
                 };
                 if counters.next().is_some()
                     || fields.next().is_some()

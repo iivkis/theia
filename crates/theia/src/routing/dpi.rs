@@ -13,20 +13,22 @@ pub(super) fn packet_quic_hello(message: &[u8], expected: &str) -> bool {
     tls::hello_metadata(message).is_some_and(|(name, h3)| h3 && name == expected)
 }
 #[cfg(test)]
-pub(super) fn packet_test_hello(name: &str) -> Vec<u8> { tls::fixture(name) }
+pub(super) fn packet_test_hello(name: &str) -> Vec<u8> {
+    tls::fixture(name)
+}
 #[cfg(test)]
 pub(super) fn packet_test_quic_hello(name: &str) -> Vec<u8> {
     let mut record = tls::fixture(name);
     // Fixture has no session ID, one cipher and one compression method.
     // Append ALPN h3 and update the extension/handshake/record lengths.
     let extension_len = u16::from_be_bytes(record[50..52].try_into().unwrap());
-    record.extend([0,16,0,5,0,3,2,b'h',b'3']);
-    record[50..52].copy_from_slice(&(extension_len+9).to_be_bytes());
-    let body_len = (record.len()-9) as u32;
+    record.extend([0, 16, 0, 5, 0, 3, 2, b'h', b'3']);
+    record[50..52].copy_from_slice(&(extension_len + 9).to_be_bytes());
+    let body_len = (record.len() - 9) as u32;
     record[6..9].copy_from_slice(&body_len.to_be_bytes()[1..]);
-    let record_len = (record.len()-5) as u16;
+    let record_len = (record.len() - 5) as u16;
     record[3..5].copy_from_slice(&record_len.to_be_bytes());
-    assert!(packet_quic_hello(&record[5..],name));
+    assert!(packet_quic_hello(&record[5..], name));
     record[5..].to_vec()
 }
 
@@ -86,7 +88,10 @@ pub(crate) enum UdpStrategy {
 
 impl UdpStrategy {
     fn probe(self) -> UdpProbe {
-        match self { Self::Quic(version) => UdpProbe::Quic(version), Self::StunBinding(_) => UdpProbe::Stun }
+        match self {
+            Self::Quic(version) => UdpProbe::Quic(version),
+            Self::StunBinding(_) => UdpProbe::Stun,
+        }
     }
 }
 
@@ -122,13 +127,18 @@ impl VerifiedUdp {
     }
     #[cfg(target_os = "linux")]
     pub(crate) fn quic_batch(&self, first: &[u8]) -> Option<Vec<Vec<u8>>> {
-        let UdpStrategy::Quic(version) = self.strategy else { return None; };
-        if crate::reality_quic_wire::long(first)?.version != version.wire() { return None; }
+        let UdpStrategy::Quic(version) = self.strategy else {
+            return None;
+        };
+        if crate::reality_quic_wire::long(first)?.version != version.wire() {
+            return None;
+        }
         super::packet_modify::quic_initial_datagrams(first, &self.key.name)
     }
 
     pub(crate) fn failed(&self) {
-        self.engine.remember_udp(self.key.clone(), self.strategy.probe(), false);
+        self.engine
+            .remember_udp(self.key.clone(), self.strategy.probe(), false);
     }
 
     #[cfg(test)]
@@ -208,10 +218,9 @@ impl Engine {
     }
 
     pub(crate) fn policy_current(&self, digest: [u8; 32]) -> bool {
-        self.policy
-            .lock()
-            .ok()
-            .is_some_and(|policy| !self.retired() && policy.as_ref().is_some_and(|lease| lease.valid(digest)))
+        self.policy.lock().ok().is_some_and(|policy| {
+            !self.retired() && policy.as_ref().is_some_and(|lease| lease.valid(digest))
+        })
     }
 
     pub(crate) fn check_policy(&self, digest: [u8; 32]) -> Result<(), ClientError> {
@@ -247,7 +256,10 @@ impl Engine {
             return;
         }
         if let Ok(mut cache) = self.udp_cache.lock() {
-            cache.retain(|entry| (entry.key != key || entry.probe != probe) && entry.expiry > std::time::Instant::now());
+            cache.retain(|entry| {
+                (entry.key != key || entry.probe != probe)
+                    && entry.expiry > std::time::Instant::now()
+            });
             if cache.len() >= 128 {
                 cache.pop_front();
             }
@@ -269,7 +281,8 @@ impl Engine {
         ips: &[IpAddr],
         policy: [u8; 32],
     ) -> Option<VerifiedUdp> {
-        self.open_quic_udp_version(name, port, ips, policy, crate::quic_core::wire::Version::V1).await
+        self.open_quic_udp_version(name, port, ips, policy, crate::quic_core::wire::Version::V1)
+            .await
     }
 
     pub(crate) async fn open_quic_udp_version(
@@ -277,7 +290,7 @@ impl Engine {
         name: &str,
         port: u16,
         ips: &[IpAddr],
-        policy: [u8;32],
+        policy: [u8; 32],
         version: crate::quic_core::wire::Version,
     ) -> Option<VerifiedUdp> {
         let probe = UdpProbe::Quic(version);
@@ -758,19 +771,39 @@ mod tests {
         use crate::quic_core::wire::Version;
         let engine = Engine::default();
         let address = "192.0.2.1:443".parse().unwrap();
-        let key = Key { name: "example.org".into(), address, policy: [1;32], network: network_scope::Scope::fixture(address, 1) };
+        let key = Key {
+            name: "example.org".into(),
+            address,
+            policy: [1; 32],
+            network: network_scope::Scope::fixture(address, 1),
+        };
         let expiry = std::time::Instant::now() + Duration::from_secs(60);
         engine.udp_cache.lock().unwrap().push_back(UdpEvidence {
-            key: key.clone(), probe: UdpProbe::Quic(Version::V1), good: true, expiry,
+            key: key.clone(),
+            probe: UdpProbe::Quic(Version::V1),
+            good: true,
+            expiry,
         });
-        assert_eq!(engine.cached_udp(&key, UdpProbe::Quic(Version::V1)), Some(true));
+        assert_eq!(
+            engine.cached_udp(&key, UdpProbe::Quic(Version::V1)),
+            Some(true)
+        );
         assert_eq!(engine.cached_udp(&key, UdpProbe::Quic(Version::V2)), None);
         assert_eq!(engine.cached_udp(&key, UdpProbe::Stun), None);
         engine.udp_cache.lock().unwrap().push_back(UdpEvidence {
-            key: key.clone(), probe: UdpProbe::Quic(Version::V2), good: false, expiry,
+            key: key.clone(),
+            probe: UdpProbe::Quic(Version::V2),
+            good: false,
+            expiry,
         });
-        assert_eq!(engine.cached_udp(&key, UdpProbe::Quic(Version::V2)), Some(false));
-        assert_eq!(engine.cached_udp(&key, UdpProbe::Quic(Version::V1)), Some(true));
+        assert_eq!(
+            engine.cached_udp(&key, UdpProbe::Quic(Version::V2)),
+            Some(false)
+        );
+        assert_eq!(
+            engine.cached_udp(&key, UdpProbe::Quic(Version::V1)),
+            Some(true)
+        );
     }
 
     #[tokio::test]

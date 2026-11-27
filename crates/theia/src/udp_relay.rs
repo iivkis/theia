@@ -182,10 +182,11 @@ impl Tunnel {
                     crate::routing::dpi::UdpStrategy::StunBinding(strategy) => Some(strategy),
                     crate::routing::dpi::UdpStrategy::Quic(_) => None,
                 };
-                let unmodified = flow.is_some() && stun.is_none_or(|strategy| {
-                    crate::routing::dpi::udp::prepare_binding(&first, strategy)
-                        .is_none_or(|bytes| bytes.as_ref() == first.as_slice())
-                });
+                let unmodified = flow.is_some()
+                    && stun.is_none_or(|strategy| {
+                        crate::routing::dpi::udp::prepare_binding(&first, strategy)
+                            .is_none_or(|bytes| bytes.as_ref() == first.as_slice())
+                    });
                 if !verified.admissible()?
                     || unmodified
                     || stun.is_some_and(|strategy| {
@@ -200,7 +201,9 @@ impl Tunnel {
                     if !matches!(tunnel, Self::H2(_) | Self::H3(_)) {
                         return Err(ClientError::Protocol);
                     }
-                    return tunnel.relay_selected(Some(first), upload, download, flow).await;
+                    return tunnel
+                        .relay_selected(Some(first), upload, download, flow)
+                        .await;
                 }
                 // Once a send is attempted no fallback or replay is legal.
                 drop(fallback);
@@ -265,7 +268,16 @@ async fn relay_local(
     download: mpsc::Sender<Vec<u8>>,
     flow: Option<&crate::routing::flow::FlowLease>,
 ) -> Result<(), LocalRelayError> {
-    relay_local_batch(socket, verification_deadline, first, None, upload, download, flow).await
+    relay_local_batch(
+        socket,
+        verification_deadline,
+        first,
+        None,
+        upload,
+        download,
+        flow,
+    )
+    .await
 }
 
 /// Explicit native lab only. Ordinary proxy relay still refuses
@@ -281,9 +293,22 @@ pub(crate) async fn relay_quic_lab(
     if !verified.admissible()? {
         return Err(ClientError::Open(ErrorCode::PolicyDenied));
     }
-    let parts = verified.quic_batch(&first).ok_or(ClientError::Open(ErrorCode::PolicyDenied))?;
-    let result = relay_local_batch(&verified.socket, Some(FIRST_RESPONSE), Some(first), Some(parts), upload, download, Some(flow)).await;
-    if matches!(&result, Err(LocalRelayError::Peer(_))) { verified.failed(); }
+    let parts = verified
+        .quic_batch(&first)
+        .ok_or(ClientError::Open(ErrorCode::PolicyDenied))?;
+    let result = relay_local_batch(
+        &verified.socket,
+        Some(FIRST_RESPONSE),
+        Some(first),
+        Some(parts),
+        upload,
+        download,
+        Some(flow),
+    )
+    .await;
+    if matches!(&result, Err(LocalRelayError::Peer(_))) {
+        verified.failed();
+    }
     result.map_err(LocalRelayError::into_client)
 }
 
@@ -298,7 +323,14 @@ async fn relay_local_batch(
     flow: Option<&crate::routing::flow::FlowLease>,
 ) -> Result<(), LocalRelayError> {
     use crate::routing::{flow::FirstSend, PacketAction};
-    let mut first_send = FirstSend::new(flow, if verification_deadline.is_some() { PacketAction::Modify } else { PacketAction::Pass });
+    let mut first_send = FirstSend::new(
+        flow,
+        if verification_deadline.is_some() {
+            PacketAction::Modify
+        } else {
+            PacketAction::Pass
+        },
+    );
     let traffic = crate::traffic::enter_udp(crate::Role::Client, false, true);
     let activity = Activity::new();
     // For verified QUIC, start the receive deadline only after a successful
@@ -309,8 +341,13 @@ async fn relay_local_batch(
             .ok_or(LocalRelayError::Application(ClientError::Protocol))?;
         let parts = match first_batch {
             Some(parts) => {
-                if parts.len() < 2 || parts.len() > 3 || parts.iter().any(|p| p.is_empty() || p.len() > protocol::MAX_DATAGRAM)
-                    || parts.concat() != data {
+                if parts.len() < 2
+                    || parts.len() > 3
+                    || parts
+                        .iter()
+                        .any(|p| p.is_empty() || p.len() > protocol::MAX_DATAGRAM)
+                    || parts.concat() != data
+                {
                     return Err(LocalRelayError::Application(ClientError::Protocol));
                 }
                 parts
@@ -321,11 +358,14 @@ async fn relay_local_batch(
         // One deadline for the entire actual emission. Failure/cancellation
         // after any attempt is terminal; no replay of the original flight.
         timeout(deadline, async {
-            for part in &parts { send_datagram(socket, part).await?; }
+            for part in &parts {
+                send_datagram(socket, part).await?;
+            }
             Ok::<(), io::Error>(())
-        }).await
-            .map_err(|_| LocalRelayError::Peer(ClientError::Timeout))?
-            .map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
+        })
+        .await
+        .map_err(|_| LocalRelayError::Peer(ClientError::Timeout))?
+        .map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
         traffic.upload(data.len());
         crate::traffic::udp_verified_local();
         activity.touch();
@@ -394,7 +434,8 @@ async fn relay_stun(
     let packet = prepare_binding(&first, strategy)
         .ok_or(LocalRelayError::Application(ClientError::Protocol))?;
     if let Some(flow) = flow {
-        flow.commit(crate::routing::PacketAction::Modify).map_err(LocalRelayError::Application)?;
+        flow.commit(crate::routing::PacketAction::Modify)
+            .map_err(LocalRelayError::Application)?;
     }
     timeout(FIRST_RESPONSE, send_datagram(socket, &packet))
         .await
@@ -683,13 +724,24 @@ mod tests {
         let (up_tx, up_rx) = mpsc::channel(QUEUE);
         let (down_tx, _down_rx) = mpsc::channel(QUEUE);
         let relay = tokio::spawn(async move {
-            relay_local_batch(&socket, Some(Duration::from_secs(2)), Some(b"abcdef".to_vec()),
-                Some(vec![b"abc".to_vec(), b"def".to_vec()]), up_rx, down_tx, None).await
+            relay_local_batch(
+                &socket,
+                Some(Duration::from_secs(2)),
+                Some(b"abcdef".to_vec()),
+                Some(vec![b"abc".to_vec(), b"def".to_vec()]),
+                up_rx,
+                down_tx,
+                None,
+            )
+            .await
         });
-        let mut bytes = [0;16];
-        for expected in [b"abc",b"def"] {
-            let (n, _) = timeout(Duration::from_secs(2),peer.recv_from(&mut bytes)).await.unwrap().unwrap();
-            assert_eq!(&bytes[..n],expected);
+        let mut bytes = [0; 16];
+        for expected in [b"abc", b"def"] {
+            let (n, _) = timeout(Duration::from_secs(2), peer.recv_from(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&bytes[..n], expected);
         }
         drop(up_tx);
         relay.await.unwrap().unwrap();

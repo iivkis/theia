@@ -347,8 +347,6 @@ impl Identity {
         config.send_tls13_tickets = 0;
         Ok(config)
     }
-
-
 }
 
 /// Cache a short-lived leaf per immutable identity, name and branch.
@@ -766,7 +764,10 @@ mod tests {
             let identity = Identity::generate(scope()).unwrap();
             let wrong = Identity::generate(scope()).unwrap();
             let endpoint = quinn::Endpoint::server(
-                crate::quinn_reference::server_from_tls(identity.server_tls("edge.example.org", Branch::H3).unwrap()).unwrap(),
+                crate::quinn_reference::server_from_tls(
+                    identity.server_tls("edge.example.org", Branch::H3).unwrap(),
+                )
+                .unwrap(),
                 "127.0.0.1:0".parse().unwrap(),
             )
             .unwrap();
@@ -777,7 +778,12 @@ mod tests {
                 let _ = connection.closed().await;
             });
             let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-            client.set_default_client_config(crate::quinn_reference::client_from_tls(client_tls(&scope(), identity.public_key(), Branch::H3).unwrap()).unwrap());
+            client.set_default_client_config(
+                crate::quinn_reference::client_from_tls(
+                    client_tls(&scope(), identity.public_key(), Branch::H3).unwrap(),
+                )
+                .unwrap(),
+            );
             let connection = crate::quinn_reference::connect(&client, remote, "edge.example.org")
                 .await
                 .unwrap();
@@ -785,7 +791,10 @@ mod tests {
             worker.await.unwrap();
 
             let endpoint = quinn::Endpoint::server(
-                crate::quinn_reference::server_from_tls(identity.server_tls("edge.example.org", Branch::H3).unwrap()).unwrap(),
+                crate::quinn_reference::server_from_tls(
+                    identity.server_tls("edge.example.org", Branch::H3).unwrap(),
+                )
+                .unwrap(),
                 "127.0.0.1:0".parse().unwrap(),
             )
             .unwrap();
@@ -795,7 +804,12 @@ mod tests {
                 assert!(crate::quinn_reference::accept(incoming).await.is_err());
             });
             let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-            client.set_default_client_config(crate::quinn_reference::client_from_tls(client_tls(&scope(), wrong.public_key(), Branch::H3).unwrap()).unwrap());
+            client.set_default_client_config(
+                crate::quinn_reference::client_from_tls(
+                    client_tls(&scope(), wrong.public_key(), Branch::H3).unwrap(),
+                )
+                .unwrap(),
+            );
             assert!(
                 crate::quinn_reference::connect(&client, remote, "edge.example.org")
                     .await

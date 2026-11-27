@@ -72,7 +72,8 @@ impl Options {
         peer: SocketAddr,
         ect: bool,
     ) -> io::Result<(usize, Mark)> {
-        self.send_from(socket, data, peer, socket.local_addr()?, ect).await
+        self.send_from(socket, data, peer, socket.local_addr()?, ect)
+            .await
     }
 
     pub(crate) async fn send_from(
@@ -85,8 +86,12 @@ impl Options {
     ) -> io::Result<(usize, Mark)> {
         let bound = socket.local_addr()?;
         let source = if bound.ip().is_unspecified() {
-            if !self.pktinfo || local.ip().is_unspecified() || local.port() != bound.port()
-                || local.is_ipv4() != bound.is_ipv4() || local.is_ipv4() != peer.is_ipv4() {
+            if !self.pktinfo
+                || local.ip().is_unspecified()
+                || local.port() != bound.port()
+                || local.is_ipv4() != bound.is_ipv4()
+                || local.is_ipv4() != peer.is_ipv4()
+            {
                 return Err(io::ErrorKind::InvalidInput.into());
             }
             Some(local.ip())
@@ -101,10 +106,17 @@ impl Options {
         if ect || source.is_some() {
             match linux::send(socket, data, peer, source, ect).await {
                 Ok(n) => return Ok((n, if ect { Mark::Ect0 } else { Mark::NotEct })),
-                Err(e) if ect && matches!(e.raw_os_error(),
-                    Some(libc::EINVAL | libc::ENOPROTOOPT | libc::EOPNOTSUPP)) => {
+                Err(e)
+                    if ect
+                        && matches!(
+                            e.raw_os_error(),
+                            Some(libc::EINVAL | libc::ENOPROTOOPT | libc::EOPNOTSUPP)
+                        ) =>
+                {
                     if source.is_some() {
-                        return linux::send(socket, data, peer, source, false).await.map(|n| (n, Mark::NotEct));
+                        return linux::send(socket, data, peer, source, false)
+                            .await
+                            .map(|n| (n, Mark::NotEct));
                     }
                 }
                 Err(e) => return Err(e),
@@ -116,7 +128,9 @@ impl Options {
                 Ok(n) => return Ok((n, if ect { Mark::Ect0 } else { Mark::NotEct })),
                 Err(e) if ect && matches!(e.raw_os_error(), Some(10022 | 10042 | 10045)) => {
                     if source.is_some() {
-                        return windows::send(socket, data, peer, source, false).await.map(|n| (n, Mark::NotEct));
+                        return windows::send(socket, data, peer, source, false)
+                            .await
+                            .map(|n| (n, Mark::NotEct));
                     }
                 }
                 Err(e) => return Err(e),
@@ -131,7 +145,10 @@ impl Options {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn local_destination(bound: SocketAddr, destination: Option<std::net::IpAddr>) -> io::Result<SocketAddr> {
+fn local_destination(
+    bound: SocketAddr,
+    destination: Option<std::net::IpAddr>,
+) -> io::Result<SocketAddr> {
     if !bound.ip().is_unspecified() {
         return Ok(bound);
     }
@@ -140,7 +157,6 @@ fn local_destination(bound: SocketAddr, destination: Option<std::net::IpAddr>) -
         return Err(io::ErrorKind::InvalidData.into());
     }
     Ok(SocketAddr::new(ip, bound.port()))
-
 }
 
 #[cfg(target_os = "linux")]
@@ -211,7 +227,10 @@ mod linux {
         }
     }
 
-    fn receive_now(socket: &UdpSocket, out: &mut [u8]) -> io::Result<(usize, SocketAddr, Option<std::net::IpAddr>, Mark)> {
+    fn receive_now(
+        socket: &UdpSocket,
+        out: &mut [u8],
+    ) -> io::Result<(usize, SocketAddr, Option<std::net::IpAddr>, Mark)> {
         // SAFETY: zero is a valid initial representation for these C structs.
         // The aligned control buffer, address and iovec remain live for recvmsg.
         let mut addr: libc::sockaddr_storage = unsafe { mem::zeroed() };
@@ -293,12 +312,18 @@ mod linux {
                 {
                     ecn = mark(ptr::read_unaligned(data.cast::<libc::c_int>()) as u8);
                 }
-                if header.cmsg_level == libc::IPPROTO_IP && header.cmsg_type == libc::IP_PKTINFO
-                    && header.cmsg_len >= libc::CMSG_LEN(size_of::<libc::in_pktinfo>() as u32) as usize {
+                if header.cmsg_level == libc::IPPROTO_IP
+                    && header.cmsg_type == libc::IP_PKTINFO
+                    && header.cmsg_len
+                        >= libc::CMSG_LEN(size_of::<libc::in_pktinfo>() as u32) as usize
+                {
                     let info = ptr::read_unaligned(data.cast::<libc::in_pktinfo>());
                     destination = Some(Ipv4Addr::from(info.ipi_addr.s_addr.to_ne_bytes()).into());
-                } else if header.cmsg_level == libc::IPPROTO_IPV6 && header.cmsg_type == libc::IPV6_PKTINFO
-                    && header.cmsg_len >= libc::CMSG_LEN(size_of::<libc::in6_pktinfo>() as u32) as usize {
+                } else if header.cmsg_level == libc::IPPROTO_IPV6
+                    && header.cmsg_type == libc::IPV6_PKTINFO
+                    && header.cmsg_len
+                        >= libc::CMSG_LEN(size_of::<libc::in6_pktinfo>() as u32) as usize
+                {
                     let info = ptr::read_unaligned(data.cast::<libc::in6_pktinfo>());
                     destination = Some(Ipv6Addr::from(info.ipi6_addr.s6_addr).into());
                 }
@@ -325,7 +350,13 @@ mod linux {
         }
     }
 
-    fn send_now(socket: &UdpSocket, data: &[u8], peer: SocketAddr, source: Option<std::net::IpAddr>, ect: bool) -> io::Result<usize> {
+    fn send_now(
+        socket: &UdpSocket,
+        data: &[u8],
+        peer: SocketAddr,
+        source: Option<std::net::IpAddr>,
+        ect: bool,
+    ) -> io::Result<usize> {
         let mut v4: libc::sockaddr_in = unsafe { mem::zeroed() };
         let mut v6: libc::sockaddr_in6 = unsafe { mem::zeroed() };
         let (addr, len, level, kind) = match peer {
@@ -375,7 +406,11 @@ mod linux {
                 if used + space > mem::size_of_val(&control) {
                     return Err(io::Error::from(io::ErrorKind::InvalidInput));
                 }
-                let c = control.as_mut_ptr().cast::<u8>().add(used).cast::<libc::cmsghdr>();
+                let c = control
+                    .as_mut_ptr()
+                    .cast::<u8>()
+                    .add(used)
+                    .cast::<libc::cmsghdr>();
                 (*c).cmsg_len = libc::CMSG_LEN(len as u32) as usize;
                 (*c).cmsg_level = level;
                 (*c).cmsg_type = kind;
@@ -387,18 +422,33 @@ mod linux {
                 Some(std::net::IpAddr::V4(ip)) => {
                     let mut info: libc::in_pktinfo = mem::zeroed();
                     info.ipi_spec_dst.s_addr = u32::from_ne_bytes(ip.octets());
-                    append(libc::IPPROTO_IP, libc::IP_PKTINFO, (&info as *const libc::in_pktinfo).cast(), size_of::<libc::in_pktinfo>())?;
+                    append(
+                        libc::IPPROTO_IP,
+                        libc::IP_PKTINFO,
+                        (&info as *const libc::in_pktinfo).cast(),
+                        size_of::<libc::in_pktinfo>(),
+                    )?;
                 }
                 Some(std::net::IpAddr::V6(ip)) => {
                     let mut info: libc::in6_pktinfo = mem::zeroed();
                     info.ipi6_addr.s6_addr = ip.octets();
-                    append(libc::IPPROTO_IPV6, libc::IPV6_PKTINFO, (&info as *const libc::in6_pktinfo).cast(), size_of::<libc::in6_pktinfo>())?;
+                    append(
+                        libc::IPPROTO_IPV6,
+                        libc::IPV6_PKTINFO,
+                        (&info as *const libc::in6_pktinfo).cast(),
+                        size_of::<libc::in6_pktinfo>(),
+                    )?;
                 }
                 None => {}
             }
             if ect {
                 let value = 2 as libc::c_int;
-                append(level, kind, (&value as *const libc::c_int).cast(), size_of::<libc::c_int>())?;
+                append(
+                    level,
+                    kind,
+                    (&value as *const libc::c_int).cast(),
+                    size_of::<libc::c_int>(),
+                )?;
             }
             msg.msg_controllen = used;
             let n = libc::sendmsg(socket.as_raw_fd(), &msg, libc::MSG_DONTWAIT);
@@ -419,7 +469,9 @@ mod linux {
     ) -> io::Result<usize> {
         loop {
             socket.writable().await?;
-            match socket.try_io(Interest::WRITABLE, || send_now(socket, data, peer, source, ect)) {
+            match socket.try_io(Interest::WRITABLE, || {
+                send_now(socket, data, peer, source, ect)
+            }) {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                 result => return result,
             }
@@ -439,8 +491,8 @@ mod windows {
     use tokio::io::Interest;
     use windows_sys::Win32::Networking::WinSock::{
         getsockopt, setsockopt, WSAGetLastError, WSAIoctl, WSASendMsg, AF_INET, AF_INET6,
-        IPPROTO_IP, IPPROTO_IPV6, IPV6_ECN, IPV6_MTU_DISCOVER, IPV6_RECVECN, IP_ECN,
-        IP_MTU_DISCOVER, IP_PMTUDISC_DO, IP_RECVECN, LPFN_WSARECVMSG, IP_PKTINFO, IPV6_PKTINFO,
+        IPPROTO_IP, IPPROTO_IPV6, IPV6_ECN, IPV6_MTU_DISCOVER, IPV6_PKTINFO, IPV6_RECVECN, IP_ECN,
+        IP_MTU_DISCOVER, IP_PKTINFO, IP_PMTUDISC_DO, IP_RECVECN, LPFN_WSARECVMSG,
         SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR, SOCKET, WSABUF, WSAID_WSARECVMSG, WSAMSG,
     };
 
@@ -512,9 +564,20 @@ mod windows {
                 None,
             )
         };
-        let available = result == 0 && written as usize == size_of::<LPFN_WSARECVMSG>() && recvmsg.is_some();
+        let available =
+            result == 0 && written as usize == size_of::<LPFN_WSARECVMSG>() && recvmsg.is_some();
         let enabled = available && set_verified(socket, level, ecn, 1);
-        let pktinfo = available && set_verified(socket, level, if local.is_ipv4() { IP_PKTINFO } else { IPV6_PKTINFO }, 1);
+        let pktinfo = available
+            && set_verified(
+                socket,
+                level,
+                if local.is_ipv4() {
+                    IP_PKTINFO
+                } else {
+                    IPV6_PKTINFO
+                },
+                1,
+            );
         Options {
             df,
             ecn: enabled,
@@ -572,7 +635,10 @@ mod windows {
         io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
     }
 
-    fn decode_control(control: &[usize], length: usize) -> io::Result<(Option<std::net::IpAddr>, Mark)> {
+    fn decode_control(
+        control: &[usize],
+        length: usize,
+    ) -> io::Result<(Option<std::net::IpAddr>, Mark)> {
         if length > size_of_val(control) {
             return Err(io::ErrorKind::InvalidData.into());
         }
@@ -599,10 +665,16 @@ mod windows {
                     3 => Mark::Ce,
                     _ => return Err(io::ErrorKind::InvalidData.into()),
                 };
-            } else if header.level == IPPROTO_IP && header.kind == IP_PKTINFO && header.len >= HEAD + 8 {
+            } else if header.level == IPPROTO_IP
+                && header.kind == IP_PKTINFO
+                && header.len >= HEAD + 8
+            {
                 let address = unsafe { ptr::read_unaligned(p.add(HEAD).cast::<[u8; 4]>()) };
                 destination = Some(Ipv4Addr::from(address).into());
-            } else if header.level == IPPROTO_IPV6 && header.kind == IPV6_PKTINFO && header.len >= HEAD + 20 {
+            } else if header.level == IPPROTO_IPV6
+                && header.kind == IPV6_PKTINFO
+                && header.len >= HEAD + 20
+            {
                 let address = unsafe { ptr::read_unaligned(p.add(HEAD).cast::<[u8; 16]>()) };
                 destination = Some(Ipv6Addr::from(address).into());
             }
@@ -661,7 +733,13 @@ mod windows {
         }
     }
 
-    fn send_now(socket: &UdpSocket, data: &[u8], peer: SocketAddr, source: Option<std::net::IpAddr>, ect: bool) -> io::Result<usize> {
+    fn send_now(
+        socket: &UdpSocket,
+        data: &[u8],
+        peer: SocketAddr,
+        source: Option<std::net::IpAddr>,
+        ect: bool,
+    ) -> io::Result<usize> {
         let (mut addr, len, level, kind) = Address::from_peer(peer);
         let mut control = [0usize; 16];
         let mut used = 0usize;
@@ -729,7 +807,9 @@ mod windows {
     ) -> io::Result<usize> {
         loop {
             socket.writable().await?;
-            match socket.try_io(Interest::WRITABLE, || send_now(socket, data, peer, source, ect)) {
+            match socket.try_io(Interest::WRITABLE, || {
+                send_now(socket, data, peer, source, ect)
+            }) {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                 result => return result,
             }
@@ -758,10 +838,23 @@ mod tests {
             target.set_port(server.local_addr().unwrap().port());
             client.send_to(b"request", target).await.unwrap();
             let mut buffer = [0; 32];
-            let (n, peer, local, _) = tokio::time::timeout(Duration::from_secs(2), options.receive_to(&server, &mut buffer)).await.unwrap().unwrap();
+            let (n, peer, local, _) = tokio::time::timeout(
+                Duration::from_secs(2),
+                options.receive_to(&server, &mut buffer),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert_eq!((n, local), (7, target));
-            options.send_from(&server, b"reply", peer, local, false).await.unwrap();
-            let (n, from) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer)).await.unwrap().unwrap();
+            options
+                .send_from(&server, b"reply", peer, local, false)
+                .await
+                .unwrap();
+            let (n, from) =
+                tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+                    .await
+                    .unwrap()
+                    .unwrap();
             assert_eq!((n, from), (5, target));
         }
     }

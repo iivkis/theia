@@ -1011,10 +1011,16 @@ impl RoutingPanel {
     fn body(&self) -> String {
         let mut body = String::new();
         if let Some((_, fields, focus)) = &self.fields {
-            for (i, (label, value)) in ["Имя", "Действие", "Домены / GeoSite", "IP / CIDR / GeoIP", "Приложения"]
-                .iter()
-                .zip(fields)
-                .enumerate()
+            for (i, (label, value)) in [
+                "Имя",
+                "Действие",
+                "Домены / GeoSite",
+                "IP / CIDR / GeoIP",
+                "Приложения",
+            ]
+            .iter()
+            .zip(fields)
+            .enumerate()
             {
                 let value = if i == 1 {
                     Self::action_label(value)

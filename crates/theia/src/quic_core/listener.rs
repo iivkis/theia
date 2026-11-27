@@ -75,7 +75,12 @@ impl SessionIo {
         Self::direct_carrier(socket, scope, Default::default(), None)
     }
 
-    pub(crate) fn direct_carrier(socket: UdpSocket, scope: NetworkScope, carrier: crate::routing::carrier_socket::Lease, pinned: Option<SocketAddr>) -> Self {
+    pub(crate) fn direct_carrier(
+        socket: UdpSocket,
+        scope: NetworkScope,
+        carrier: crate::routing::carrier_socket::Lease,
+        pinned: Option<SocketAddr>,
+    ) -> Self {
         let options = Options::configure(&socket);
         Self::Direct {
             socket,
@@ -160,18 +165,31 @@ impl SessionIo {
 
     pub(crate) async fn send_to(&self, bytes: &[u8], peer: SocketAddr) -> io::Result<usize> {
         match self {
-            Self::Direct { socket: s, pinned: Some(target), .. } => {
-                if peer != *target || s.peer_addr()? != *target { return Err(io::ErrorKind::PermissionDenied.into()); }
+            Self::Direct {
+                socket: s,
+                pinned: Some(target),
+                ..
+            } => {
+                if peer != *target || s.peer_addr()? != *target {
+                    return Err(io::ErrorKind::PermissionDenied.into());
+                }
                 s.send(bytes).await
             }
             Self::Direct { socket: s, .. } => s.send_to(bytes, peer).await,
             Self::Routed {
-                socket, incoming, local, options, ..
+                socket,
+                incoming,
+                local,
+                options,
+                ..
             } => {
                 if incoming.is_closed() {
                     return Err(io::Error::from(io::ErrorKind::BrokenPipe));
                 }
-                options.send_from(socket, bytes, peer, *local, false).await.map(|(n, _)| n)
+                options
+                    .send_from(socket, bytes, peer, *local, false)
+                    .await
+                    .map(|(n, _)| n)
             }
         }
     }
@@ -183,8 +201,14 @@ impl SessionIo {
         ect: bool,
     ) -> io::Result<(usize, Mark)> {
         match self {
-            Self::Direct { socket, pinned: Some(target), .. } => {
-                if peer != *target || socket.peer_addr()? != *target { return Err(io::ErrorKind::PermissionDenied.into()); }
+            Self::Direct {
+                socket,
+                pinned: Some(target),
+                ..
+            } => {
+                if peer != *target || socket.peer_addr()? != *target {
+                    return Err(io::ErrorKind::PermissionDenied.into());
+                }
                 // Connected scoped sockets never send ancillary destination
                 // overrides. ECN is not claimed for these lab emissions.
                 Ok((socket.send(bytes).await?, Mark::NotEct))
@@ -239,10 +263,21 @@ pub struct Candidate {
 
 impl Candidate {
     pub(crate) fn admitted(
-        io: SessionIo, peer: SocketAddr, binding: Binding,
-        initial_reset: [u8; 16], versions: VersionPolicy,
+        io: SessionIo,
+        peer: SocketAddr,
+        binding: Binding,
+        initial_reset: [u8; 16],
+        versions: VersionPolicy,
     ) -> Self {
-        Self { io, peer, binding, token: Vec::new(), initial_reset, versions, retry_validated: false }
+        Self {
+            io,
+            peer,
+            binding,
+            token: Vec::new(),
+            initial_reset,
+            versions,
+            retry_validated: false,
+        }
     }
 
     pub(crate) fn into_parts(
@@ -469,9 +504,17 @@ mod wildcard_tests {
         let der = cert.cert.der().clone();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(der.clone()).unwrap();
-        let client_tls = Arc::new(crate::transport_policy::Carrier::H3.client_tls(roots).unwrap());
-        let mut server_tls = crate::transport_policy::Carrier::H3.server_tls(
-            vec![der], PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into()).unwrap();
+        let client_tls = Arc::new(
+            crate::transport_policy::Carrier::H3
+                .client_tls(roots)
+                .unwrap(),
+        );
+        let mut server_tls = crate::transport_policy::Carrier::H3
+            .server_tls(
+                vec![der],
+                PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
+            )
+            .unwrap();
         server_tls.send_tls13_tickets = 0;
         let server_tls = Arc::new(server_tls);
         for (bind, target) in [
@@ -485,21 +528,36 @@ mod wildcard_tests {
             let local = socket.local_addr().unwrap();
             let mut peer: SocketAddr = target.parse().unwrap();
             peer.set_port(local.port());
-            let mut listener = Listener::with_scope(socket, 4, VersionPolicy::both(),
-                NetworkScope::listener(local.ip()).unwrap()).unwrap();
+            let mut listener = Listener::with_scope(
+                socket,
+                4,
+                VersionPolicy::both(),
+                NetworkScope::listener(local.ip()).unwrap(),
+            )
+            .unwrap();
             tokio::time::timeout(Duration::from_secs(10), async {
                 let server = async {
                     let candidate = listener.accept().await.unwrap();
                     assert_eq!(candidate.io.local_addr().unwrap(), peer);
-                    let mut session = handshake_udp::accept(candidate, server_tls.clone()).await.unwrap();
+                    let mut session = handshake_udp::accept(candidate, server_tls.clone())
+                        .await
+                        .unwrap();
                     while session.shutdown_phase() == super::super::lifecycle::ShutdownPhase::Open {
                         session.flush(Instant::now()).await.unwrap();
                         session.recv(Duration::from_millis(10)).await.unwrap();
                     }
                 };
                 let client = async {
-                    let (_, session) = dial::connect(peer, ServerName::try_from("localhost").unwrap(),
-                        client_tls.clone(), None, VersionPolicy::exact(Version::V1), Duration::from_secs(5)).await.unwrap();
+                    let (_, session) = dial::connect(
+                        peer,
+                        ServerName::try_from("localhost").unwrap(),
+                        client_tls.clone(),
+                        None,
+                        VersionPolicy::exact(Version::V1),
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .unwrap();
                     assert!(session.handshake_confirmed());
                     dial::close_probe(session).await.unwrap();
                 };
@@ -508,7 +566,9 @@ mod wildcard_tests {
                     _ = server => panic!("server closed before client verified"),
                     _ = client => {}
                 }
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
         }
     }
 }

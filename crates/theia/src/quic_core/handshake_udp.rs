@@ -769,16 +769,19 @@ impl Handshake {
             None
         };
         let remote = proposed.unwrap_or(self.remote.as_slice());
-        let header = parse_header(packet, self.version, &self.local, remote, token)
-            .or_else(|| {
-                // REALITY preadmission does not validate the path and does
-                // not issue Retry. Original DCID is an Initial-only alias.
-                if self.server && self.retry.is_none() {
-                    parse_header(packet, self.version, &self.original, remote, token)
-                        .filter(|(index, _)| *index == 0)
-                } else { None }
-            });
-        let Some((index, at)) = header else { return Ok(()); };
+        let header = parse_header(packet, self.version, &self.local, remote, token).or_else(|| {
+            // REALITY preadmission does not validate the path and does
+            // not issue Retry. Original DCID is an Initial-only alias.
+            if self.server && self.retry.is_none() {
+                parse_header(packet, self.version, &self.original, remote, token)
+                    .filter(|(index, _)| *index == 0)
+            } else {
+                None
+            }
+        });
+        let Some((index, at)) = header else {
+            return Ok(());
+        };
         let Some(epoch) = self.epochs[index].as_mut() else {
             return Ok(());
         };
@@ -985,7 +988,16 @@ pub(crate) async fn connect_versions_observed(
     scope: super::scope::NetworkScope,
     observation: &super::dial::Observation,
 ) -> Result<(Version, LabSession), Error> {
-    connect_scoped(local, peer, versions, tls, name, scope, (Congestion::Bbr, Some(observation))).await
+    connect_scoped(
+        local,
+        peer,
+        versions,
+        tls,
+        name,
+        scope,
+        (Congestion::Bbr, Some(observation)),
+    )
+    .await
 }
 
 async fn connect_scoped(
@@ -1004,12 +1016,17 @@ async fn connect_scoped(
         if !scope.permits(socket.local_addr().map_err(Error::Io)?, peer) {
             return Err(Error::Scope);
         }
-        let carrier_lease = crate::routing::carrier_socket::udp(&socket, peer).map_err(|_| Error::Scope)?;
+        let carrier_lease =
+            crate::routing::carrier_socket::udp(&socket, peer).map_err(|_| Error::Scope)?;
         let pinned = if crate::routing::carrier_socket::active() {
             socket.connect(peer).await.map_err(|_| Error::Scope)?;
-            if socket.peer_addr().ok() != Some(peer) { return Err(Error::Scope); }
+            if socket.peer_addr().ok() != Some(peer) {
+                return Err(Error::Scope);
+            }
             Some(peer)
-        } else { None };
+        } else {
+            None
+        };
         let cid = super::negotiation::random_cid().map_err(|_| Error::Protocol)?;
         let original = super::negotiation::random_cid().map_err(|_| Error::Protocol)?;
         if cid == original || cid == [0; CID_LEN] || original == [0; CID_LEN] {
@@ -1062,7 +1079,8 @@ pub async fn accept_with_congestion(
     tls: Arc<ServerConfig>,
     congestion: Congestion,
 ) -> Result<LabSession, Error> {
-    let (socket, peer, binding, token, initial_reset, versions, retry_validated) = candidate.into_parts();
+    let (socket, peer, binding, token, initial_reset, versions, retry_validated) =
+        candidate.into_parts();
     let original = binding.original;
     let remote = binding.client;
     if !(8..=20).contains(&original.len())

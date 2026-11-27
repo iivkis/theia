@@ -730,12 +730,13 @@ impl H2Client {
     }
 
     async fn connect_verified(&self, operation: u64) -> Result<H2Connection, ClientError> {
-        let (socket, controller, carrier_lease) = crate::tcp_bbr::connect_carrier(self.endpoint.as_str())
-            .await
-            .map_err(|error| match error {
-                crate::tcp_bbr::Error::Network => ClientError::Io,
-                crate::tcp_bbr::Error::Unavailable => ClientError::TcpControllerUnavailable,
-            })?;
+        let (socket, controller, carrier_lease) =
+            crate::tcp_bbr::connect_carrier(self.endpoint.as_str())
+                .await
+                .map_err(|error| match error {
+                    crate::tcp_bbr::Error::Network => ClientError::Io,
+                    crate::tcp_bbr::Error::Unavailable => ClientError::TcpControllerUnavailable,
+                })?;
         crate::diag!(
             Trace,
             "client.h2",
@@ -1120,7 +1121,8 @@ impl Tunnel {
         let activity = crate::udp_relay::Activity::new();
         let writing = std::sync::atomic::AtomicBool::new(false);
         let send_loop = async {
-            let mut first_send = crate::routing::flow::FirstSend::new(flow, crate::routing::PacketAction::Redirect);
+            let mut first_send =
+                crate::routing::flow::FirstSend::new(flow, crate::routing::PacketAction::Redirect);
             while let Some(data) = crate::udp_relay::next_datagram(&mut first, &mut upload).await {
                 let size = data.len();
                 let frame = Frame::Datagram(data);
@@ -1188,7 +1190,11 @@ impl Tunnel {
         self.relay_guarded(local, None).await
     }
 
-    pub(crate) async fn relay_guarded<S>(mut self, local: S, flow: Option<&crate::routing::flow::FlowLease>) -> Result<(), ClientError>
+    pub(crate) async fn relay_guarded<S>(
+        mut self,
+        local: S,
+        flow: Option<&crate::routing::flow::FlowLease>,
+    ) -> Result<(), ClientError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -1214,7 +1220,8 @@ impl Tunnel {
         let upload = async {
             let mut buffer = [0; crate::relay_batch::MAX_BATCH];
             let mut batch = crate::relay_batch::ReadyBatch::default();
-            let mut first_send = crate::routing::flow::FirstSend::new(flow, crate::routing::PacketAction::Redirect);
+            let mut first_send =
+                crate::routing::flow::FirstSend::new(flow, crate::routing::PacketAction::Redirect);
             loop {
                 let size = batch
                     .read(&mut read, &mut buffer)
@@ -1236,7 +1243,9 @@ impl Tunnel {
                 upload_state
                     .apply(Direction::Send, &frame)
                     .map_err(|_| ClientError::Protocol)?;
-                if size != 0 { first_send.attempt()?; }
+                if size != 0 {
+                    first_send.attempt()?;
+                }
                 timeout(IO_TIMEOUT, send_frame(outgoing, &frame, size == 0))
                     .await
                     .map_err(|_| ClientError::Timeout)??;

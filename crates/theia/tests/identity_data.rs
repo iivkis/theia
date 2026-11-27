@@ -603,22 +603,41 @@ async fn native_admission_callbacks_complete_full_tls_and_quic_before_applicatio
         server.await.unwrap();
 
         let server = quinn::Endpoint::server(
-            quinn_reference::server_from_tls(identity_tls::checked_server_tls(&identity, &v, Branch::H3, secret.clone(), guard.clone()).unwrap()).unwrap(),
+            quinn_reference::server_from_tls(
+                identity_tls::checked_server_tls(
+                    &identity,
+                    &v,
+                    Branch::H3,
+                    secret.clone(),
+                    guard.clone(),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
             remote,
         )
         .unwrap();
         let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         let cases = [
             (
-                quinn_reference::client_from_tls(identity_tls::client_tls(&scope, identity.public_key(), Branch::H3).unwrap()).unwrap(),
+                quinn_reference::client_from_tls(
+                    identity_tls::client_tls(&scope, identity.public_key(), Branch::H3).unwrap(),
+                )
+                .unwrap(),
                 false,
             ),
             (
-                quinn_reference::client_from_tls(identity_tls::admitted_client_tls(&v, Branch::H3, wrong).unwrap()).unwrap(),
+                quinn_reference::client_from_tls(
+                    identity_tls::admitted_client_tls(&v, Branch::H3, wrong).unwrap(),
+                )
+                .unwrap(),
                 false,
             ),
             (
-                quinn_reference::client_from_tls(identity_tls::admitted_client_tls(&v, Branch::H3, secret).unwrap()).unwrap(),
+                quinn_reference::client_from_tls(
+                    identity_tls::admitted_client_tls(&v, Branch::H3, secret).unwrap(),
+                )
+                .unwrap(),
                 true,
             ),
         ];

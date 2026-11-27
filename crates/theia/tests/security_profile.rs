@@ -625,11 +625,9 @@ async fn h2_exporter_proof_replay_is_refused_on_same_and_fresh_connection() {
 async fn h3_exporter_proof_replay_is_refused_on_same_and_fresh_connection() {
     timeout(Duration::from_secs(20), async {
         let fixture = Fixture::start(SecurityMode::PinnedCertV1).await;
-        let endpoint = quinn_reference::client_endpoint(
-            "127.0.0.1:0".parse().unwrap(),
-            fixture.roots.clone(),
-        )
-        .unwrap();
+        let endpoint =
+            quinn_reference::client_endpoint("127.0.0.1:0".parse().unwrap(), fixture.roots.clone())
+                .unwrap();
         let mut old = None;
         for _ in 0..2 {
             let connection = quinn_reference::connect(&endpoint, fixture.h3, "localhost")

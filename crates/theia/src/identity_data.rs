@@ -180,17 +180,19 @@ impl PreparedFixture {
             Some(
                 crate::h3_server::OwnTlsEndpoint::bind(
                     local,
-                    crate::h3_server::OwnTlsConfig::from_native(match &admission {
-                        Some((secret, guard)) => crate::identity_tls::checked_server_tls(
-                            identity,
-                            &value,
-                            Branch::H3,
-                            secret.clone(),
-                            guard.clone(),
-                        ),
-                        None => identity.server_tls("localhost", Branch::H3),
-                    }
-                    .map_err(|_| ServerError::Tls)?),
+                    crate::h3_server::OwnTlsConfig::from_native(
+                        match &admission {
+                            Some((secret, guard)) => crate::identity_tls::checked_server_tls(
+                                identity,
+                                &value,
+                                Branch::H3,
+                                secret.clone(),
+                                guard.clone(),
+                            ),
+                            None => identity.server_tls("localhost", Branch::H3),
+                        }
+                        .map_err(|_| ServerError::Tls)?,
+                    ),
                 )
                 .map_err(|_| ServerError::Io)?,
             )

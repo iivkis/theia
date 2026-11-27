@@ -169,9 +169,19 @@ impl LabSession {
         let uni = u64::from(policy::MAX_QUIC_UNI_STREAMS);
         let window = u64::from(policy::QUIC_STREAM_RECEIVE_BYTES);
         session.send = SendFlow::from_peer(server, peer_limits, bidi).map_err(Error::Send)?;
-        session.receive = ReceiveFlow::new(server, bidi, uni, window, window as usize,
-            u64::from(policy::QUIC_CONNECTION_RECEIVE_BYTES)).map_err(Error::Receive)?;
-        session.receive.enable_local_bidi(bidi).map_err(Error::Receive)?;
+        session.receive = ReceiveFlow::new(
+            server,
+            bidi,
+            uni,
+            window,
+            window as usize,
+            u64::from(policy::QUIC_CONNECTION_RECEIVE_BYTES),
+        )
+        .map_err(Error::Receive)?;
+        session
+            .receive
+            .enable_local_bidi(bidi)
+            .map_err(Error::Receive)?;
         session.receive.enable_autotune().map_err(Error::Receive)?;
         session.scheduler = scheduler;
         let options = session.socket.options();

@@ -400,20 +400,27 @@ mod tests {
         let bidi = u64::from(policy::MAX_BIDI_STREAMS);
         let uni = u64::from(policy::MAX_QUIC_UNI_STREAMS);
         let window = u64::from(policy::QUIC_STREAM_RECEIVE_BYTES);
-        let mut f = ReceiveFlow::new(true, bidi, uni, window, window as usize,
-            u64::from(policy::QUIC_CONNECTION_RECEIVE_BYTES)).unwrap();
+        let mut f = ReceiveFlow::new(
+            true,
+            bidi,
+            uni,
+            window,
+            window as usize,
+            u64::from(policy::QUIC_CONNECTION_RECEIVE_BYTES),
+        )
+        .unwrap();
         f.enable_local_bidi(bidi).unwrap();
         f.enable_autotune().unwrap();
         for n in 0..bidi {
-            f.register_local_bidi(4*n+1).unwrap();
-            f.insert(4*n, 0, b"x", false).unwrap();
+            f.register_local_bidi(4 * n + 1).unwrap();
+            f.insert(4 * n, 0, b"x", false).unwrap();
         }
         for n in 0..uni {
-            f.insert(4*n+2, 0, b"x", false).unwrap();
+            f.insert(4 * n + 2, 0, b"x", false).unwrap();
         }
         assert!(!f.can_open_local_bidi());
-        assert_eq!(f.insert(4*bidi, 0, b"x", false), Err(Error::StreamId));
-        assert_eq!(f.streams.len(), (2*bidi+uni) as usize);
+        assert_eq!(f.insert(4 * bidi, 0, b"x", false), Err(Error::StreamId));
+        assert_eq!(f.streams.len(), (2 * bidi + uni) as usize);
     }
 
     #[test]

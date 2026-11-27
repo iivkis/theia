@@ -370,13 +370,19 @@ pub(super) async fn probe_quic(
     tls.enable_early_data = false;
     let name = rustls::pki_types::ServerName::try_from(name.to_owned()).ok()?;
     let (negotiated, session) = dial::connect(
-        address, name, std::sync::Arc::new(tls),
-        scope.map(|scope| scope.bind_address()), VersionPolicy::exact(version),
+        address,
+        name,
+        std::sync::Arc::new(tls),
+        scope.map(|scope| scope.bind_address()),
+        VersionPolicy::exact(version),
         Duration::from_secs(5),
-    ).await.ok()?;
-    if negotiated != version { return None; }
+    )
+    .await
+    .ok()?;
+    if negotiated != version {
+        return None;
+    }
     dial::close_probe(session).await.ok()
-
 }
 
 #[cfg(test)]
@@ -412,24 +418,39 @@ mod tests {
         let deadline = std::time::Duration::from_secs(5);
         assert!(tokio::time::timeout(
             deadline,
-            probe_quic("localhost", addr, None, config.clone(), crate::quic_core::wire::Version::V1)
+            probe_quic(
+                "localhost",
+                addr,
+                None,
+                config.clone(),
+                crate::quic_core::wire::Version::V1
+            )
         )
         .await
         .unwrap()
         .is_some());
-        assert!(
-            tokio::time::timeout(deadline, probe_quic("wrong.invalid", addr, None, config, crate::quic_core::wire::Version::V1))
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(tokio::time::timeout(
+            deadline,
+            probe_quic(
+                "wrong.invalid",
+                addr,
+                None,
+                config,
+                crate::quic_core::wire::Version::V1
+            )
+        )
+        .await
+        .unwrap()
+        .is_none());
         serving.abort();
     }
 
     #[tokio::test]
     async fn independent_v2_only_probe_never_negotiates_v1_or_reuses_v1_evidence() {
-        use crate::quic_core::{listener::Listener, negotiation::VersionPolicy, handshake_udp, wire::Version};
         use crate::quic_core::lifecycle::ShutdownPhase;
+        use crate::quic_core::{
+            handshake_udp, listener::Listener, negotiation::VersionPolicy, wire::Version,
+        };
         use rustls::pki_types::PrivatePkcs8KeyDer;
         use std::sync::Arc;
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -437,17 +458,22 @@ mod tests {
         let mut roots = rustls::RootCertStore::empty();
         roots.add(der.clone()).unwrap();
         let client_tls = super::super::tls::tls_config(roots).unwrap();
-        let mut server_tls = crate::transport_policy::Carrier::H3.server_tls(
-            vec![der], PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into()).unwrap();
+        let mut server_tls = crate::transport_policy::Carrier::H3
+            .server_tls(
+                vec![der],
+                PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
+            )
+            .unwrap();
         server_tls.send_tls13_tickets = 0;
         let server_tls = Arc::new(server_tls);
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = socket.local_addr().unwrap();
-        let mut listener = Listener::with_versions(socket,4,VersionPolicy::exact(Version::V2)).unwrap();
+        let mut listener =
+            Listener::with_versions(socket, 4, VersionPolicy::exact(Version::V2)).unwrap();
         tokio::time::timeout(Duration::from_secs(12), async {
             let server = async {
                 let candidate = listener.accept().await.unwrap();
-                let mut session = handshake_udp::accept(candidate,server_tls).await.unwrap();
+                let mut session = handshake_udp::accept(candidate, server_tls).await.unwrap();
                 while session.shutdown_phase() == ShutdownPhase::Open {
                     session.flush(Instant::now()).await.unwrap();
                     session.recv(Duration::from_millis(10)).await.unwrap();
@@ -455,14 +481,22 @@ mod tests {
             };
             let client = async {
                 // A v2-only server may return VN; exact-v1 must still fail.
-                assert!(probe_quic("localhost",addr,None,client_tls.clone(),Version::V1).await.is_none());
-                assert!(probe_quic("localhost",addr,None,client_tls,Version::V2).await.is_some());
+                assert!(
+                    probe_quic("localhost", addr, None, client_tls.clone(), Version::V1)
+                        .await
+                        .is_none()
+                );
+                assert!(probe_quic("localhost", addr, None, client_tls, Version::V2)
+                    .await
+                    .is_some());
             };
             tokio::select! {
                 _ = server => panic!("server closed before verified v2 probe completed"),
                 () = client => {}
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     fn h3_hello() -> Vec<u8> {

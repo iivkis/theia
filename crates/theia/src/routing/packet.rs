@@ -56,9 +56,16 @@ impl PacketMeta {
                 if ihl != 20 {
                     return Err(ParseError::Unsupported);
                 }
-                (IpAddr::V4(Ipv4Addr::new(header[12], header[13], header[14], header[15])),
-                 IpAddr::V4(Ipv4Addr::new(header[16], header[17], header[18], header[19])),
-                 header[9], ihl)
+                (
+                    IpAddr::V4(Ipv4Addr::new(
+                        header[12], header[13], header[14], header[15],
+                    )),
+                    IpAddr::V4(Ipv4Addr::new(
+                        header[16], header[17], header[18], header[19],
+                    )),
+                    header[9],
+                    ihl,
+                )
             }
             6 => {
                 let header = bytes.get(..40).ok_or(ParseError::Truncated)?;
@@ -66,9 +73,16 @@ impl PacketMeta {
                 if len == 0 || 40 + len != bytes.len() {
                     return Err(ParseError::Invalid);
                 }
-                let source = <[u8; 16]>::try_from(&header[8..24]).map_err(|_| ParseError::Invalid)?;
-                let destination = <[u8; 16]>::try_from(&header[24..40]).map_err(|_| ParseError::Invalid)?;
-                (IpAddr::V6(Ipv6Addr::from(source)), IpAddr::V6(Ipv6Addr::from(destination)), header[6], 40)
+                let source =
+                    <[u8; 16]>::try_from(&header[8..24]).map_err(|_| ParseError::Invalid)?;
+                let destination =
+                    <[u8; 16]>::try_from(&header[24..40]).map_err(|_| ParseError::Invalid)?;
+                (
+                    IpAddr::V6(Ipv6Addr::from(source)),
+                    IpAddr::V6(Ipv6Addr::from(destination)),
+                    header[6],
+                    40,
+                )
             }
             _ => return Err(ParseError::Unsupported),
         };
@@ -105,7 +119,11 @@ impl PacketMeta {
                 if len < 20 || len > transport.len() || header[12] & 0x0e != 0 {
                     return Err(ParseError::Invalid);
                 }
-                (Transport::Tcp, len, Some((u16::from(header[12] & 1) << 8) | u16::from(header[13])))
+                (
+                    Transport::Tcp,
+                    len,
+                    Some((u16::from(header[12] & 1) << 8) | u16::from(header[13])),
+                )
             }
             17 => {
                 let header = transport.get(..8).ok_or(ParseError::Truncated)?;
@@ -138,7 +156,11 @@ impl PacketMeta {
         domain: Evidence<&str>,
         application: Evidence<ApplicationId>,
     ) -> Result<Classification, RoutingError> {
-        policy.classify_with_application(domain, Evidence::Known(self.flow.destination.ip()), application)
+        policy.classify_with_application(
+            domain,
+            Evidence::Known(self.flow.destination.ip()),
+            application,
+        )
     }
 }
 
@@ -170,12 +192,37 @@ mod tests {
         assert_eq!(p.flow.interface, 7);
         assert_eq!(p.payload_len, 3);
         assert_eq!(p.tcp_flags, Some(2));
-        let policy = Policy::compile(&[
-            Rule { name: "blocked".into(), action: Action::Blocked, domains: vec!["blocked.example".into()], ips: vec![], applications: vec![] },
-            Rule { name: "ip".into(), action: Action::Direct, domains: vec![], ips: vec!["198.51.100.0/24".into()], applications: vec![] },
-        ], &[], &[]).unwrap();
-        assert_eq!(p.classify(&policy, Evidence::Unknown, Evidence::Unknown).unwrap(), Classification::Unresolved);
-        assert_eq!(p.classify(&policy, Evidence::Absent, Evidence::Unknown).unwrap(), Classification::Matched(Action::Direct));
+        let policy = Policy::compile(
+            &[
+                Rule {
+                    name: "blocked".into(),
+                    action: Action::Blocked,
+                    domains: vec!["blocked.example".into()],
+                    ips: vec![],
+                    applications: vec![],
+                },
+                Rule {
+                    name: "ip".into(),
+                    action: Action::Direct,
+                    domains: vec![],
+                    ips: vec!["198.51.100.0/24".into()],
+                    applications: vec![],
+                },
+            ],
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            p.classify(&policy, Evidence::Unknown, Evidence::Unknown)
+                .unwrap(),
+            Classification::Unresolved
+        );
+        assert_eq!(
+            p.classify(&policy, Evidence::Absent, Evidence::Unknown)
+                .unwrap(),
+            Classification::Matched(Action::Direct)
+        );
     }
 
     #[test]

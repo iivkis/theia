@@ -45,7 +45,10 @@ impl NetworkScope {
     /// by the kernel on receive. It never authorizes an unspecified source.
     pub(crate) fn listener(bind: IpAddr) -> Option<Self> {
         if bind.is_unspecified() {
-            Some(Self { pins: None, server: Some(bind) })
+            Some(Self {
+                pins: None,
+                server: Some(bind),
+            })
         } else {
             Self::external_server(bind)
         }

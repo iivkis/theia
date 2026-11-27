@@ -273,10 +273,19 @@ impl Cache {
     /// a later deadline merely because the same digest was republished.
     #[cfg(target_os = "linux")]
     pub(crate) fn observation_deadline(&self, digest: [u8; 32]) -> Result<Instant, ClientError> {
-        let state = self.state.try_lock().map_err(|_| super::dpi::stale_policy())?;
-        let deadline = state.expires.filter(|deadline| *deadline > Instant::now())
+        let state = self
+            .state
+            .try_lock()
+            .map_err(|_| super::dpi::stale_policy())?;
+        let deadline = state
+            .expires
+            .filter(|deadline| *deadline > Instant::now())
             .ok_or_else(super::dpi::stale_policy)?;
-        if !state.snapshot.as_ref().is_some_and(|snapshot| snapshot.digest() == digest) {
+        if !state
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.digest() == digest)
+        {
             return Err(super::dpi::stale_policy());
         }
         self.dpi.check_policy(digest)?;
@@ -406,7 +415,9 @@ async fn copy_direction(
             return Ok(());
         }
         if upload {
-            first_send.attempt().map_err(|error| DirectRelayError { error, peer: false })?;
+            first_send
+                .attempt()
+                .map_err(|error| DirectRelayError { error, peer: false })?;
         }
         output
             .write_all(&bytes[..count])
@@ -429,7 +440,11 @@ pub(crate) async fn relay_direct(client: TcpStream, target: TcpStream) -> Result
     relay_direct_guarded(client, target, None).await
 }
 
-pub(crate) async fn relay_direct_guarded(client: TcpStream, target: TcpStream, flow: Option<&super::flow::FlowLease>) -> Result<(), ClientError> {
+pub(crate) async fn relay_direct_guarded(
+    client: TcpStream,
+    target: TcpStream,
+    flow: Option<&super::flow::FlowLease>,
+) -> Result<(), ClientError> {
     relay_direct_inner(client, target, 0, 0, flow).await.0
 }
 
@@ -516,7 +531,10 @@ mod tests {
             state.expires = Some(Instant::now());
         }
         assert!(cache.observation_deadline(digest).is_err());
-        cache.get(|_| async { Ok(super::super::exchange::unchanged_receipt(digest).to_vec()) }).await.unwrap();
+        cache
+            .get(|_| async { Ok(super::super::exchange::unchanged_receipt(digest).to_vec()) })
+            .await
+            .unwrap();
         assert!(cache.observation_deadline(digest).unwrap() >= original);
         cache.dpi.retire();
         assert!(cache.observation_deadline(digest).is_err());

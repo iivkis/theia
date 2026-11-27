@@ -5,8 +5,7 @@
 //! externally owned non-bypass queue rules fail-closed.
 use super::{packet::PacketMeta, PacketAction};
 use std::{
-    io,
-    mem,
+    io, mem,
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
 };
 
@@ -96,7 +95,8 @@ fn decode(data: &[u8], queue: u16) -> io::Result<Captured> {
         return Err(invalid());
     }
     let mut rest = &body[NFGEN..];
-    let (mut id, mut payload, mut captured_len, mut skb, mut input, mut output) = (None, None, None, None, None, None);
+    let (mut id, mut payload, mut captured_len, mut skb, mut input, mut output) =
+        (None, None, None, None, None, None);
     let mut ethertype = 0;
     let mut local_output = false;
     while let Some((kind, value)) = next_attr(&mut rest)? {
@@ -109,7 +109,9 @@ fn decode(data: &[u8], queue: u16) -> io::Result<Captured> {
             5 if input.is_none() && value.len() == 4 => input = Some(be32(value)),
             6 if output.is_none() && value.len() == 4 => output = Some(be32(value)),
             10 if payload.is_none() => payload = Some(value),
-            13 if captured_len.is_none() && value.len() == 4 => captured_len = Some(be32(value) as usize),
+            13 if captured_len.is_none() && value.len() == 4 => {
+                captured_len = Some(be32(value) as usize)
+            }
             14 if skb.is_none() && value.len() == 4 => skb = Some(be32(value)),
             1 | 5 | 6 | 10 | 13 | 14 => return Err(invalid()),
             _ => {}
@@ -118,8 +120,10 @@ fn decode(data: &[u8], queue: u16) -> io::Result<Captured> {
     let id = id.ok_or_else(invalid)?;
     let bytes = payload.unwrap_or_default();
     let skb = skb.unwrap_or(0);
-    let family_ok = matches!((nfgen[0], ethertype, bytes.first().map(|b| b >> 4)),
-        (2, 0x0800, Some(4)) | (10, 0x86dd, Some(6)));
+    let family_ok = matches!(
+        (nfgen[0], ethertype, bytes.first().map(|b| b >> 4)),
+        (2, 0x0800, Some(4)) | (10, 0x86dd, Some(6))
+    );
     let complete = captured_len.is_none_or(|len| len == bytes.len());
     let meta = if family_ok && complete && skb & 2 == 0 && skb & !7 == 0 {
         PacketMeta::parse(bytes, output.or(input).unwrap_or(0)).ok()
@@ -144,9 +148,14 @@ pub(super) fn kernel_address() -> libc::sockaddr_nl {
 pub(super) fn send(fd: RawFd, bytes: &[u8]) -> io::Result<()> {
     let kernel = kernel_address();
     let sent = unsafe {
-        libc::sendto(fd, bytes.as_ptr().cast(), bytes.len(), 0,
+        libc::sendto(
+            fd,
+            bytes.as_ptr().cast(),
+            bytes.len(),
+            0,
             (&kernel as *const libc::sockaddr_nl).cast(),
-            mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t)
+            mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        )
     };
     if sent < 0 {
         return Err(io::Error::last_os_error());
@@ -160,14 +169,25 @@ pub(super) fn receive(fd: RawFd, buffer: &mut [u8]) -> io::Result<usize> {
     let mut sender = kernel_address();
     let mut len = mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
     let read = unsafe {
-        libc::recvfrom(fd, buffer.as_mut_ptr().cast(), buffer.len(), libc::MSG_TRUNC,
-            (&mut sender as *mut libc::sockaddr_nl).cast(), &mut len)
+        libc::recvfrom(
+            fd,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            libc::MSG_TRUNC,
+            (&mut sender as *mut libc::sockaddr_nl).cast(),
+            &mut len,
+        )
     };
     if read < 0 {
         return Err(io::Error::last_os_error());
     }
-    if read == 0 || read as usize > buffer.len() || len as usize != mem::size_of::<libc::sockaddr_nl>()
-        || sender.nl_family != libc::AF_NETLINK as libc::sa_family_t || sender.nl_pid != 0 || sender.nl_groups != 0 {
+    if read == 0
+        || read as usize > buffer.len()
+        || len as usize != mem::size_of::<libc::sockaddr_nl>()
+        || sender.nl_family != libc::AF_NETLINK as libc::sa_family_t
+        || sender.nl_pid != 0
+        || sender.nl_groups != 0
+    {
         return Err(invalid());
     }
     Ok(read as usize)
@@ -203,7 +223,13 @@ impl Queue {
         if !(1..=4096).contains(&max_pending) {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
-        let raw = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::NETLINK_NETFILTER) };
+        let raw = unsafe {
+            libc::socket(
+                libc::AF_NETLINK,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                libc::NETLINK_NETFILTER,
+            )
+        };
         if raw < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -211,17 +237,28 @@ impl Queue {
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
         let local = kernel_address();
         let result = unsafe {
-            libc::bind(raw, (&local as *const libc::sockaddr_nl).cast(),
-                mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t)
+            libc::bind(
+                raw,
+                (&local as *const libc::sockaddr_nl).cast(),
+                mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+            )
         };
         if result < 0 {
             return Err(io::Error::last_os_error());
         }
-        let timeout = libc::timeval { tv_sec: 0, tv_usec: 250_000 };
+        let timeout = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 250_000,
+        };
         for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
             let result = unsafe {
-                libc::setsockopt(raw, libc::SOL_SOCKET, option, (&timeout as *const libc::timeval).cast(),
-                    mem::size_of::<libc::timeval>() as libc::socklen_t)
+                libc::setsockopt(
+                    raw,
+                    libc::SOL_SOCKET,
+                    option,
+                    (&timeout as *const libc::timeval).cast(),
+                    mem::size_of::<libc::timeval>() as libc::socklen_t,
+                )
             };
             if result < 0 {
                 return Err(io::Error::last_os_error());
@@ -241,8 +278,16 @@ impl Queue {
         configure(raw, number, 2, &attrs, &mut buffer)?;
         use ring::rand::{SecureRandom, SystemRandom};
         let mut identity = [0u8; 16];
-        SystemRandom::new().fill(&mut identity).map_err(|_| invalid())?;
-        Ok(Self { fd: Some(fd), number, namespace: Self::namespace()?, identity, buffer })
+        SystemRandom::new()
+            .fill(&mut identity)
+            .map_err(|_| invalid())?;
+        Ok(Self {
+            fd: Some(fd),
+            number,
+            namespace: Self::namespace()?,
+            identity,
+            buffer,
+        })
     }
 
     fn namespace() -> io::Result<(u64, u64)> {
@@ -253,14 +298,21 @@ impl Queue {
 
     pub(super) fn number(&self) -> io::Result<u16> {
         self.descriptor()?;
-        if self.namespace != Self::namespace()? { return Err(io::Error::from(io::ErrorKind::PermissionDenied)); }
+        if self.namespace != Self::namespace()? {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
         Ok(self.number)
     }
 
-    pub(super) fn identity(&self) -> [u8; 16] { self.identity }
+    pub(super) fn identity(&self) -> [u8; 16] {
+        self.identity
+    }
 
     fn descriptor(&self) -> io::Result<RawFd> {
-        self.fd.as_ref().map(AsRawFd::as_raw_fd).ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))
+        self.fd
+            .as_ref()
+            .map(AsRawFd::as_raw_fd)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))
     }
 
     fn verdict(&mut self, id: u32, accept: bool) -> io::Result<()> {
@@ -268,14 +320,18 @@ impl Queue {
     }
 
     fn verdict_payload(&mut self, id: u32, accept: bool, payload: Option<&[u8]>) -> io::Result<()> {
-        if payload.is_some_and(|p| !accept || p.len() > 65_531) { return Err(invalid()); }
+        if payload.is_some_and(|p| !accept || p.len() > 65_531) {
+            return Err(invalid());
+        }
         let fd = self.descriptor()?;
         let mut data = Vec::with_capacity(8);
         data.extend_from_slice(&u32::from(accept).to_be_bytes()); // NF_DROP=0, NF_ACCEPT=1
         data.extend_from_slice(&id.to_be_bytes());
         let mut attrs = Vec::with_capacity(12);
         attr(&mut attrs, 2, &data);
-        if let Some(payload) = payload { attr(&mut attrs, 10, payload); } // NFQA_PAYLOAD
+        if let Some(payload) = payload {
+            attr(&mut attrs, 10, payload);
+        } // NFQA_PAYLOAD
         let result = send(fd, &message(VERDICT, REQUEST, 0, self.number, &attrs));
         if result.is_err() {
             drop(self.fd.take());
@@ -285,12 +341,17 @@ impl Queue {
 
     fn receive_captured(&mut self) -> io::Result<Captured> {
         let fd = self.descriptor()?;
-        let result = receive(fd, &mut self.buffer)
-            .and_then(|n| decode(&self.buffer[..n], self.number));
+        let result =
+            receive(fd, &mut self.buffer).and_then(|n| decode(&self.buffer[..n], self.number));
         match result {
             Ok(captured) => Ok(captured),
             Err(error) => {
-                if !matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted) {
+                if !matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) {
                     drop(self.fd.take());
                 }
                 Err(error)
@@ -301,7 +362,11 @@ impl Queue {
     /// Receives one bounded packet. Fatal errors close the queue.
     pub fn receive(&mut self) -> io::Result<Packet<'_>> {
         let captured = self.receive_captured()?;
-        Ok(Packet { queue: self, captured, done: false })
+        Ok(Packet {
+            queue: self,
+            captured,
+            done: false,
+        })
     }
 
     pub(crate) fn into_async(self) -> io::Result<AsyncQueue> {
@@ -332,7 +397,11 @@ impl AsyncQueue {
                 Err(_) => continue,
             }
         };
-        Ok(Packet { queue: &mut self.queue, captured, done: false })
+        Ok(Packet {
+            queue: &mut self.queue,
+            captured,
+            done: false,
+        })
     }
 }
 
@@ -343,23 +412,38 @@ pub struct Packet<'a> {
     done: bool,
 }
 impl Packet<'_> {
-    pub fn metadata(&self) -> Option<PacketMeta> { self.captured.meta }
-    pub fn bytes(&self) -> &[u8] { &self.captured.bytes }
-    pub fn checksum_pending(&self) -> bool { self.captured.checksum_pending }
-    pub fn local_output(&self) -> bool { self.captured.local_output }
-    pub(super) fn queue_identity(&self) -> [u8; 16] { self.queue.identity() }
+    pub fn metadata(&self) -> Option<PacketMeta> {
+        self.captured.meta
+    }
+    pub fn bytes(&self) -> &[u8] {
+        &self.captured.bytes
+    }
+    pub fn checksum_pending(&self) -> bool {
+        self.captured.checksum_pending
+    }
+    pub fn local_output(&self) -> bool {
+        self.captured.local_output
+    }
+    pub(super) fn queue_identity(&self) -> [u8; 16] {
+        self.queue.identity()
+    }
 
     /// Only the checked laboratory strategy may provide a replacement.
     /// Reject inconsistent or unmodified output, rather than accepting the
     /// original bytes. The flow lease must already be committed to Modify.
     pub(crate) fn finish_stun_lab(mut self, changed: &[u8]) -> io::Result<PacketAction> {
-        let expected = if self.local_output() && !self.checksum_pending() && self.metadata().is_some() {
-            super::packet_modify::stun_fingerprint(self.bytes())
-        } else { None };
+        let expected =
+            if self.local_output() && !self.checksum_pending() && self.metadata().is_some() {
+                super::packet_modify::stun_fingerprint(self.bytes())
+            } else {
+                None
+            };
         if expected.as_deref() != Some(changed) {
             return self.finish(PacketAction::Drop);
         }
-        let result = self.queue.verdict_payload(self.captured.id, true, Some(changed));
+        let result = self
+            .queue
+            .verdict_payload(self.captured.id, true, Some(changed));
         self.done = true;
         result.map(|()| PacketAction::Modify)
     }
@@ -368,10 +452,18 @@ impl Packet<'_> {
     /// modification adapter owns the payload, those actions are Drop.
     /// Returns the actual disposition, not the requested action.
     pub fn finish(mut self, action: PacketAction) -> io::Result<PacketAction> {
-        let accept = action == PacketAction::Pass && self.captured.local_output && self.captured.meta.is_some();
+        let accept = action == PacketAction::Pass
+            && self.captured.local_output
+            && self.captured.meta.is_some();
         let result = self.queue.verdict(self.captured.id, accept);
         self.done = true;
-        result.map(|()| if accept { PacketAction::Pass } else { PacketAction::Drop })
+        result.map(|()| {
+            if accept {
+                PacketAction::Pass
+            } else {
+                PacketAction::Drop
+            }
+        })
     }
 }
 impl Drop for Packet<'_> {

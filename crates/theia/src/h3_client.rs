@@ -97,8 +97,12 @@ impl H3Client {
         {
             return Err(ClientError::Configuration);
         }
-        let quic = crate::identity_tls::client_tls(&d.scope, value.signer(), crate::identity_tls::Branch::H3)
-            .map_err(|_| ClientError::Tls)?;
+        let quic = crate::identity_tls::client_tls(
+            &d.scope,
+            value.signer(),
+            crate::identity_tls::Branch::H3,
+        )
+        .map_err(|_| ClientError::Tls)?;
         Self::identity_carrier(remote, "localhost", token, value, quic)
     }
 
@@ -120,8 +124,12 @@ impl H3Client {
             .get(usize::from(d.active_reference))
             .ok_or(ClientError::Configuration)?
             .server_name;
-        let quic = crate::identity_tls::admitted_client_tls(value, crate::identity_tls::Branch::H3, secret)
-            .map_err(|_| ClientError::Tls)?;
+        let quic = crate::identity_tls::admitted_client_tls(
+            value,
+            crate::identity_tls::Branch::H3,
+            secret,
+        )
+        .map_err(|_| ClientError::Tls)?;
         Self::identity_carrier(remote, name, token, value, quic)
     }
 
@@ -140,8 +148,12 @@ impl H3Client {
             .get(usize::from(d.active_reference))
             .ok_or(ClientError::Configuration)?
             .server_name;
-        let quic = crate::identity_tls::admitted_client_tls(value, crate::identity_tls::Branch::H3, secret)
-            .map_err(|_| ClientError::Tls)?;
+        let quic = crate::identity_tls::admitted_client_tls(
+            value,
+            crate::identity_tls::Branch::H3,
+            secret,
+        )
+        .map_err(|_| ClientError::Tls)?;
         Self::identity_carrier(remote, name, token, value, quic)
     }
 
@@ -564,10 +576,14 @@ impl H3Client {
         Box::pin(async move {
             let tls = match &self.identity_quic {
                 Some(config) => config.clone(),
-                None => Arc::new(crate::transport_policy::Carrier::H3
-                    .client_tls(self.roots.clone()).map_err(|_| ClientError::Tls)?),
+                None => Arc::new(
+                    crate::transport_policy::Carrier::H3
+                        .client_tls(self.roots.clone())
+                        .map_err(|_| ClientError::Tls)?,
+                ),
             };
-            let name = ServerName::try_from(self.name.clone()).map_err(|_| ClientError::Configuration)?;
+            let name =
+                ServerName::try_from(self.name.clone()).map_err(|_| ClientError::Configuration)?;
             let session = if let Some(version) = self.native_lab {
                 // Keep explicit test scopes; never broaden a caller's pinned
                 // addresses or bypass an identity/pin using the lab selectors.
@@ -576,16 +592,34 @@ impl H3Client {
                 }
                 timeout(self.connect_timeout, async {
                     let (_, mut session) = match self.native_pins {
-                        Some((local, scope)) => handshake_udp::connect_versions_scoped(
-                            local, self.remote, VersionPolicy::exact(version), tls, name, scope,
-                        ).await,
-                        None => handshake_udp::connect_versions(
-                            SocketAddr::new(self.remote.ip(), 0), self.remote, VersionPolicy::exact(version), tls, name,
-                        ).await,
-                    }.map_err(|_| ClientError::Tls)?;
+                        Some((local, scope)) => {
+                            handshake_udp::connect_versions_scoped(
+                                local,
+                                self.remote,
+                                VersionPolicy::exact(version),
+                                tls,
+                                name,
+                                scope,
+                            )
+                            .await
+                        }
+                        None => {
+                            handshake_udp::connect_versions(
+                                SocketAddr::new(self.remote.ip(), 0),
+                                self.remote,
+                                VersionPolicy::exact(version),
+                                tls,
+                                name,
+                            )
+                            .await
+                        }
+                    }
+                    .map_err(|_| ClientError::Tls)?;
                     dial::confirm(&mut session).await.map_err(dial_error)?;
                     Ok::<_, ClientError>(session)
-                }).await.map_err(|_| ClientError::Timeout)??
+                })
+                .await
+                .map_err(|_| ClientError::Timeout)??
             } else {
                 // Keep v1 for the still-compatible REALITY server. A version
                 // restart for plain TLS must authenticate version_information.
@@ -595,7 +629,9 @@ impl H3Client {
                     VersionPolicy::both()
                 };
                 dial::connect(self.remote, name, tls, None, policy, self.connect_timeout)
-                    .await.map_err(dial_error)?.1
+                    .await
+                    .map_err(dial_error)?
+                    .1
             };
             if let Some(pin) = self.certificate_pin {
                 pin.verify(session.peer_leaf().ok_or(ClientError::Tls)?)?;
@@ -668,8 +704,8 @@ impl H3Client {
 
     async fn connect_verified(&self, operation: u64) -> Result<H3Connection, ClientError> {
         let session = self.native_connection().await?;
-        let (transport, key) = h3_adapter::NativeConnection::start(session)
-            .map_err(|_| ClientError::Tls)?;
+        let (transport, key) =
+            h3_adapter::NativeConnection::start(session).map_err(|_| ClientError::Tls)?;
         let binding = self.certificate_pin.map(|_| key);
         #[cfg(test)]
         let test_opener = transport.test_opener();
@@ -983,7 +1019,8 @@ impl H3Tunnel {
         let activity = crate::udp_relay::Activity::new();
         let writing = std::sync::atomic::AtomicBool::new(false);
         let send_loop = async {
-            let mut first_send = crate::routing::flow::FirstSend::new(flow, crate::routing::PacketAction::Redirect);
+            let mut first_send =
+                crate::routing::flow::FirstSend::new(flow, crate::routing::PacketAction::Redirect);
             while let Some(data) = crate::udp_relay::next_datagram(&mut first, &mut upload).await {
                 let size = data.len();
                 let frame = Frame::Datagram(data);
@@ -1037,8 +1074,15 @@ impl H3Tunnel {
         self.stream_up
     }
     #[cfg(test)]
-    pub(crate) async fn rebind_for_test(&self, socket: std::net::UdpSocket) -> Result<(), ClientError> {
-        self._lease.connection().test_opener.rebind_for_test(socket).await
+    pub(crate) async fn rebind_for_test(
+        &self,
+        socket: std::net::UdpSocket,
+    ) -> Result<(), ClientError> {
+        self._lease
+            .connection()
+            .test_opener
+            .rebind_for_test(socket)
+            .await
             .map_err(|_| ClientError::Io)
     }
 
@@ -1055,7 +1099,11 @@ impl H3Tunnel {
         self.relay_guarded(local, None).await
     }
 
-    pub(crate) async fn relay_guarded<S>(mut self, local: S, flow: Option<&crate::routing::flow::FlowLease>) -> Result<(), ClientError>
+    pub(crate) async fn relay_guarded<S>(
+        mut self,
+        local: S,
+        flow: Option<&crate::routing::flow::FlowLease>,
+    ) -> Result<(), ClientError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -1081,7 +1129,8 @@ impl H3Tunnel {
         let upload = async {
             let mut buffer = [0; crate::relay_batch::MAX_BATCH];
             let mut batch = crate::relay_batch::ReadyBatch::default();
-            let mut first_send = crate::routing::flow::FirstSend::new(flow, crate::routing::PacketAction::Redirect);
+            let mut first_send =
+                crate::routing::flow::FirstSend::new(flow, crate::routing::PacketAction::Redirect);
             loop {
                 let n = batch
                     .read(&mut read, &mut buffer)
@@ -1103,7 +1152,9 @@ impl H3Tunnel {
                 upload_state
                     .apply(Direction::Send, &frame)
                     .map_err(|_| ClientError::Protocol)?;
-                if n != 0 { first_send.attempt()?; }
+                if n != 0 {
+                    first_send.attempt()?;
+                }
                 send(tx, &frame).await?;
                 if n == 0 {
                     timeout(IO_TIMEOUT, tx.finish())

@@ -147,7 +147,9 @@ pub(crate) async fn connect(endpoint: &str) -> Result<(TcpStream, Controller), E
 /// Product H2 socket factory. The optional scope admits exactly the
 /// concrete socket and target before the first SYN. Its lease is retained
 /// by the H2 driver task until that connection is destroyed.
-pub(crate) async fn connect_carrier(endpoint: &str) -> Result<(TcpStream, Controller, crate::routing::carrier_socket::Lease), Error> {
+pub(crate) async fn connect_carrier(
+    endpoint: &str,
+) -> Result<(TcpStream, Controller, crate::routing::carrier_socket::Lease), Error> {
     use crate::routing::carrier_socket;
     if carrier_socket::active() && endpoint.parse::<SocketAddr>().is_err() {
         // The native capture scope cannot silently send local DNS.

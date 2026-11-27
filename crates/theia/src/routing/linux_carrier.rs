@@ -2,47 +2,92 @@
 //! the exact connected descriptor, and nftables also matches its complete
 //! TCP/UDP tuple. The caller must own the socket and trust other privileged
 //! processes in the isolated network namespace. No blanket process bypass.
-use super::{linux_attribution::socket_cookie, packet::{FlowKey, Transport}};
+use super::{
+    linux_attribution::socket_cookie,
+    packet::{FlowKey, Transport},
+};
 use ring::rand::{SecureRandom, SystemRandom};
 use std::{
     fs::File,
     io, mem,
     net::{SocketAddr, TcpStream, UdpSocket},
-    os::{fd::{AsRawFd, FromRawFd, OwnedFd}, unix::fs::MetadataExt},
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::fs::MetadataExt,
+    },
 };
 
-fn denied() -> io::Error { io::Error::from(io::ErrorKind::PermissionDenied) }
+fn denied() -> io::Error {
+    io::Error::from(io::ErrorKind::PermissionDenied)
+}
 fn opt_u64(fd: &impl AsRawFd, option: libc::c_int) -> io::Result<u64> {
     let mut value = 0u64;
     let mut len = mem::size_of_val(&value) as libc::socklen_t;
-    let rc = unsafe { libc::getsockopt(fd.as_raw_fd(), libc::SOL_SOCKET, option, (&mut value as *mut u64).cast(), &mut len) };
-    if rc != 0 { return Err(io::Error::last_os_error()); }
-    if len as usize != mem::size_of_val(&value) || value == 0 { return Err(denied()); }
+    let rc = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            option,
+            (&mut value as *mut u64).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if len as usize != mem::size_of_val(&value) || value == 0 {
+        return Err(denied());
+    }
     Ok(value)
 }
 fn get_mark(fd: &OwnedFd) -> io::Result<u32> {
     let mut value = 0u32;
     let mut len = mem::size_of_val(&value) as libc::socklen_t;
-    let rc = unsafe { libc::getsockopt(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_MARK, (&mut value as *mut u32).cast(), &mut len) };
-    if rc != 0 { return Err(io::Error::last_os_error()); }
-    if len as usize != mem::size_of_val(&value) { return Err(denied()); }
+    let rc = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_MARK,
+            (&mut value as *mut u32).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if len as usize != mem::size_of_val(&value) {
+        return Err(denied());
+    }
     Ok(value)
 }
 fn set_mark(fd: &OwnedFd, value: u32) -> io::Result<()> {
-    let rc = unsafe { libc::setsockopt(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_MARK, (&value as *const u32).cast(), mem::size_of_val(&value) as libc::socklen_t) };
-    if rc != 0 { return Err(io::Error::last_os_error()); }
-    if get_mark(fd)? != value { return Err(denied()); }
+    let rc = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_MARK,
+            (&value as *const u32).cast(),
+            mem::size_of_val(&value) as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if get_mark(fd)? != value {
+        return Err(denied());
+    }
     Ok(())
 }
-fn current_namespace() -> io::Result<(u64,u64)> {
+fn current_namespace() -> io::Result<(u64, u64)> {
     let meta = std::fs::metadata("/proc/thread-self/ns/net")?;
     Ok((meta.dev(), meta.ino()))
 }
-fn check_scope(host: &File) -> io::Result<(u64,u64)> {
+fn check_scope(host: &File) -> io::Result<(u64, u64)> {
     let host_meta = host.metadata()?;
     let current = current_namespace()?;
     if current == (host_meta.dev(), host_meta.ino())
-        || unsafe { libc::ioctl(host.as_raw_fd(), 0xb703 as _) } != libc::CLONE_NEWNET {
+        || unsafe { libc::ioctl(host.as_raw_fd(), 0xb703 as _) } != libc::CLONE_NEWNET
+    {
         return Err(denied());
     }
     Ok(current)
@@ -58,7 +103,7 @@ pub struct LabCarrierSocket {
     key: FlowKey,
     cookie: u64,
     mark: u32,
-    namespace: (u64,u64),
+    namespace: (u64, u64),
     pending: bool,
 }
 impl LabCarrierSocket {
@@ -66,43 +111,96 @@ impl LabCarrierSocket {
     /// owned exclusively by the trusted service. The FD is duplicated to
     /// retain the kernel object until the rules lease is dropped.
     pub fn tcp(socket: &TcpStream, host_namespace: &File) -> io::Result<Self> {
-        let key = FlowKey { source: socket.local_addr()?, destination: socket.peer_addr()?, transport: Transport::Tcp, interface: 0 };
+        let key = FlowKey {
+            source: socket.local_addr()?,
+            destination: socket.peer_addr()?,
+            transport: Transport::Tcp,
+            interface: 0,
+        };
         Self::claim(socket.try_clone()?.into(), key, host_namespace, false)
     }
     pub fn udp(socket: &UdpSocket, host_namespace: &File) -> io::Result<Self> {
-        let key = FlowKey { source: socket.local_addr()?, destination: socket.peer_addr()?, transport: Transport::Udp, interface: 0 };
+        let key = FlowKey {
+            source: socket.local_addr()?,
+            destination: socket.peer_addr()?,
+            transport: Transport::Udp,
+            interface: 0,
+        };
         Self::claim(socket.try_clone()?.into(), key, host_namespace, false)
     }
-    pub(super) fn pending_tcp(socket: &tokio::net::TcpSocket, peer: SocketAddr, host: &File) -> io::Result<Self> {
+    pub(super) fn pending_tcp(
+        socket: &tokio::net::TcpSocket,
+        peer: SocketAddr,
+        host: &File,
+    ) -> io::Result<Self> {
         Self::pending(socket, socket.local_addr()?, peer, Transport::Tcp, host)
     }
-    pub(super) fn pending_udp(socket: &tokio::net::UdpSocket, peer: SocketAddr, host: &File) -> io::Result<Self> {
+    pub(super) fn pending_udp(
+        socket: &tokio::net::UdpSocket,
+        peer: SocketAddr,
+        host: &File,
+    ) -> io::Result<Self> {
         Self::pending(socket, socket.local_addr()?, peer, Transport::Udp, host)
     }
-    fn pending(socket: &impl AsRawFd, source: SocketAddr, destination: SocketAddr, transport: Transport, host: &File) -> io::Result<Self> {
+    fn pending(
+        socket: &impl AsRawFd,
+        source: SocketAddr,
+        destination: SocketAddr,
+        transport: Transport,
+        host: &File,
+    ) -> io::Result<Self> {
         let fd = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-        if fd < 0 { return Err(io::Error::last_os_error()); }
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        Self::claim(fd, FlowKey { source, destination, transport, interface: 0 }, host, true)
+        Self::claim(
+            fd,
+            FlowKey {
+                source,
+                destination,
+                transport,
+                interface: 0,
+            },
+            host,
+            true,
+        )
     }
     fn claim(fd: OwnedFd, key: FlowKey, host_namespace: &File, pending: bool) -> io::Result<Self> {
         let namespace = check_scope(host_namespace)?;
-        if !valid(key) || get_mark(&fd)? != 0 { return Err(denied()); }
+        if !valid(key) || get_mark(&fd)? != 0 {
+            return Err(denied());
+        }
         let probe = UdpSocket::bind("0.0.0.0:0")?;
-        if opt_u64(&fd, 71)? != opt_u64(&probe, 71)? { return Err(denied()); } // SO_NETNS_COOKIE
+        if opt_u64(&fd, 71)? != opt_u64(&probe, 71)? {
+            return Err(denied());
+        } // SO_NETNS_COOKIE
         let cookie = socket_cookie(&fd)?;
-        let mut bytes = [0u8;4];
+        let mut bytes = [0u8; 4];
         SystemRandom::new().fill(&mut bytes).map_err(|_| denied())?;
         let mark = u32::from_ne_bytes(bytes);
-        if mark == 0 { return Err(denied()); }
-        let lease = Self { fd, key, cookie, mark, namespace, pending };
+        if mark == 0 {
+            return Err(denied());
+        }
+        let lease = Self {
+            fd,
+            key,
+            cookie,
+            mark,
+            namespace,
+            pending,
+        };
         set_mark(&lease.fd, mark)?;
         lease.verify()?;
         Ok(lease)
     }
     pub(super) fn verify(&self) -> io::Result<()> {
-        if current_namespace()? != self.namespace || socket_cookie(&self.fd)? != self.cookie
-            || get_mark(&self.fd)? != self.mark { return Err(denied()); }
+        if current_namespace()? != self.namespace
+            || socket_cookie(&self.fd)? != self.cookie
+            || get_mark(&self.fd)? != self.mark
+        {
+            return Err(denied());
+        }
         // Verify current connected tuple through a fresh duplicate of the
         // actual kernel socket. UDP reconnects must not inherit permission.
         let fd = self.fd.try_clone()?;
@@ -116,7 +214,9 @@ impl LabCarrierSocket {
                 (s.local_addr()?, s.peer_addr())
             }
         };
-        if source != self.key.source { return Err(denied()); }
+        if source != self.key.source {
+            return Err(denied());
+        }
         match destination {
             Ok(peer) if peer == self.key.destination => (),
             Err(error) if self.pending && error.kind() == io::ErrorKind::NotConnected => (),
@@ -125,22 +225,32 @@ impl LabCarrierSocket {
         Ok(())
     }
     pub(super) fn clear_mark(&self) -> io::Result<()> {
-        if socket_cookie(&self.fd)? != self.cookie { return Err(denied()); }
+        if socket_cookie(&self.fd)? != self.cookie {
+            return Err(denied());
+        }
         match get_mark(&self.fd)? {
             0 => Ok(()),
             mark if mark == self.mark => set_mark(&self.fd, 0),
             _ => Err(denied()),
         }
     }
-    pub(super) fn key(&self) -> FlowKey { self.key }
-    pub(super) fn cookie(&self) -> u64 { self.cookie }
-    pub(super) fn mark(&self) -> u32 { self.mark }
+    pub(super) fn key(&self) -> FlowKey {
+        self.key
+    }
+    pub(super) fn cookie(&self) -> u64 {
+        self.cookie
+    }
+    pub(super) fn mark(&self) -> u32 {
+        self.mark
+    }
 }
 impl Drop for LabCarrierSocket {
     fn drop(&mut self) {
         // Only our descriptor, and only if its mark is still ours. A
         // failed reset is not a permission to remove the capture rules.
-        if socket_cookie(&self.fd).ok() == Some(self.cookie) && get_mark(&self.fd).ok() == Some(self.mark) {
+        if socket_cookie(&self.fd).ok() == Some(self.cookie)
+            && get_mark(&self.fd).ok() == Some(self.mark)
+        {
             let _ = set_mark(&self.fd, 0);
         }
     }

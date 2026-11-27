@@ -2,7 +2,10 @@
 //! Compatibility ingress uses synthetic IDs; native backends must bind their
 //! platform flow identities to this same table before forwarding any payload.
 use super::{dpi::Engine, packet::FlowKey, PacketAction};
-use crate::{client::ClientError, protocol::{Address, ErrorCode}};
+use crate::{
+    client::ClientError,
+    protocol::{Address, ErrorCode},
+};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, OnceLock},
@@ -47,7 +50,10 @@ pub(crate) struct FlowTable {
 
 impl FlowTable {
     fn new(capacity: usize) -> Self {
-        Self { state: Mutex::new(State::default()), capacity }
+        Self {
+            state: Mutex::new(State::default()),
+            capacity,
+        }
     }
 
     pub(crate) fn shared() -> Arc<Self> {
@@ -106,7 +112,15 @@ impl FlowTable {
             std::net::IpAddr::V4(ip) => Address::V4(ip.octets()),
             std::net::IpAddr::V6(ip) => Address::V6(ip.octets()),
         };
-        self.begin_inner(engine, protocol, target, key.destination.port(), digest, configured, Some(key))
+        self.begin_inner(
+            engine,
+            protocol,
+            target,
+            key.destination.port(),
+            digest,
+            configured,
+            Some(key),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -124,7 +138,14 @@ impl FlowTable {
             return Err(denied());
         }
         engine.check_policy(digest)?;
-        let identity = Identity { protocol, target, port, digest, configured, native };
+        let identity = Identity {
+            protocol,
+            target,
+            port,
+            digest,
+            configured,
+            native,
+        };
         let mut state = self.state.lock().map_err(|_| denied())?;
         if state.entries.len() >= self.capacity {
             return Err(ClientError::Open(ErrorCode::ResourceLimit));
@@ -132,17 +153,35 @@ impl FlowTable {
         if native.is_some_and(|key| state.native.contains_key(&key)) {
             return Err(denied());
         }
-        let id = state.next.checked_add(1).ok_or(ClientError::Open(ErrorCode::ResourceLimit))?;
+        let id = state
+            .next
+            .checked_add(1)
+            .ok_or(ClientError::Open(ErrorCode::ResourceLimit))?;
         state.next = id;
-        state.entries.insert(id, Entry { identity: identity.clone(), committed: None });
-        if let Some(key) = native { state.native.insert(key, id); }
-        Ok(FlowLease { table: self.clone(), id, identity, engine })
+        state.entries.insert(
+            id,
+            Entry {
+                identity: identity.clone(),
+                committed: None,
+            },
+        );
+        if let Some(key) = native {
+            state.native.insert(key, id);
+        }
+        Ok(FlowLease {
+            table: self.clone(),
+            id,
+            identity,
+            engine,
+        })
     }
 }
 
 pub(crate) fn summary(counts: Option<[u16; 4]>) -> String {
     match counts {
-        Some([pending, pass, modify, redirect]) => format!("Потоки: ожидают {pending} · Pass {pass} · Modify {modify} · Redirect {redirect}"),
+        Some([pending, pass, modify, redirect]) => format!(
+            "Потоки: ожидают {pending} · Pass {pass} · Modify {modify} · Redirect {redirect}"
+        ),
         None => "Состояние потоков не подтверждено".into(),
     }
 }
@@ -162,7 +201,17 @@ pub(crate) struct FlowLease {
 impl FlowLease {
     #[cfg(target_os = "linux")]
     pub(crate) fn committed(&self, action: PacketAction) -> bool {
-        self.table.state.lock().ok().and_then(|state| state.entries.get(&self.id).map(|entry| entry.identity == self.identity && entry.committed == Some(action))).unwrap_or(false)
+        self.table
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| {
+                state
+                    .entries
+                    .get(&self.id)
+                    .map(|entry| entry.identity == self.identity && entry.committed == Some(action))
+            })
+            .unwrap_or(false)
     }
 
     /// Called immediately before the first attempted payload write, not
@@ -174,11 +223,16 @@ impl FlowLease {
             return Err(denied());
         }
         if let Some(committed) = entry.committed {
-            return if committed == action { Ok(()) } else { Err(denied()) };
+            return if committed == action {
+                Ok(())
+            } else {
+                Err(denied())
+            };
         }
         if action == PacketAction::Drop
             || (action != self.identity.configured
-                && !(self.identity.configured == PacketAction::Modify && action == PacketAction::Redirect))
+                && !(self.identity.configured == PacketAction::Modify
+                    && action == PacketAction::Redirect))
         {
             return Err(denied());
         }
@@ -196,7 +250,9 @@ impl Drop for FlowLease {
         if let Ok(mut state) = self.table.state.lock() {
             state.entries.remove(&self.id);
             if let Some(key) = self.identity.native {
-                if state.native.get(&key) == Some(&self.id) { state.native.remove(&key); }
+                if state.native.get(&key) == Some(&self.id) {
+                    state.native.remove(&key);
+                }
             }
         }
     }
@@ -211,7 +267,11 @@ pub(crate) struct FirstSend<'a> {
 }
 impl<'a> FirstSend<'a> {
     pub(crate) fn new(flow: Option<&'a FlowLease>, action: PacketAction) -> Self {
-        Self { flow, action, started: false }
+        Self {
+            flow,
+            action,
+            started: false,
+        }
     }
     pub(crate) fn attempt(&mut self) -> Result<(), ClientError> {
         if !self.started {
@@ -231,20 +291,36 @@ mod tests {
     fn setup() -> (Arc<FlowTable>, Arc<Engine>) {
         let table = Arc::new(FlowTable::new(1));
         let engine = Arc::new(Engine::default());
-        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture([1; 32])));
+        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(
+            [1; 32],
+        )));
         engine.set_enabled(true);
         (table, engine)
     }
 
-    fn begin(table: &Arc<FlowTable>, engine: &Arc<Engine>, action: PacketAction) -> Result<FlowLease, ClientError> {
-        table.begin(engine.clone(), Protocol::Tcp, Address::V4([192, 0, 2, 1]), 443, [1; 32], action)
+    fn begin(
+        table: &Arc<FlowTable>,
+        engine: &Arc<Engine>,
+        action: PacketAction,
+    ) -> Result<FlowLease, ClientError> {
+        table.begin(
+            engine.clone(),
+            Protocol::Tcp,
+            Address::V4([192, 0, 2, 1]),
+            443,
+            [1; 32],
+            action,
+        )
     }
 
     #[test]
     fn bounded_table_and_irreversible_commit() {
         let (table, engine) = setup();
         let flow = begin(&table, &engine, PacketAction::Modify).unwrap();
-        assert!(matches!(begin(&table, &engine, PacketAction::Pass), Err(ClientError::Open(ErrorCode::ResourceLimit))));
+        assert!(matches!(
+            begin(&table, &engine, PacketAction::Pass),
+            Err(ClientError::Open(ErrorCode::ResourceLimit))
+        ));
         assert_eq!(table.counts(), Some([1, 0, 0, 0]));
         assert!(flow.commit(PacketAction::Pass).is_err());
         flow.commit(PacketAction::Modify).unwrap();
@@ -255,7 +331,9 @@ mod tests {
         drop(flow);
         assert_eq!(table.counts(), Some([0, 0, 0, 0]));
         assert!(begin(&table, &engine, PacketAction::Pass).is_err());
-        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture([1; 32])));
+        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(
+            [1; 32],
+        )));
         let flow = begin(&table, &engine, PacketAction::Modify).unwrap();
         flow.commit(PacketAction::Redirect).unwrap();
         assert!(flow.commit(PacketAction::Modify).is_err());
@@ -270,13 +348,27 @@ mod tests {
             transport: super::super::packet::Transport::Tcp,
             interface: 1,
         };
-        let flow = table.begin_native(engine.clone(), key, [1; 32], PacketAction::Redirect).unwrap();
-        assert!(table.begin_native(engine.clone(), FlowKey { interface: 99, ..key }, [1; 32], PacketAction::Pass).is_err());
+        let flow = table
+            .begin_native(engine.clone(), key, [1; 32], PacketAction::Redirect)
+            .unwrap();
+        assert!(table
+            .begin_native(
+                engine.clone(),
+                FlowKey {
+                    interface: 99,
+                    ..key
+                },
+                [1; 32],
+                PacketAction::Pass
+            )
+            .is_err());
         assert!(begin(&table, &engine, PacketAction::Pass).is_err());
         flow.commit(PacketAction::Redirect).unwrap();
         assert!(flow.commit(PacketAction::Pass).is_err());
         drop(flow);
-        assert!(table.begin_native(engine, key, [1; 32], PacketAction::Redirect).is_ok());
+        assert!(table
+            .begin_native(engine, key, [1; 32], PacketAction::Redirect)
+            .is_ok());
     }
 
     #[test]
@@ -285,7 +377,9 @@ mod tests {
         let flow = begin(&table, &engine, PacketAction::Redirect).unwrap();
         let mut send = FirstSend::new(Some(&flow), PacketAction::Redirect);
         engine.retire();
-        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture([1; 32])));
+        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(
+            [1; 32],
+        )));
         assert_eq!(send.attempt(), Err(denied()));
         assert!(begin(&table, &engine, PacketAction::Pass).is_err());
     }

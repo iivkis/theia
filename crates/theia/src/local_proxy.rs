@@ -562,35 +562,68 @@ pub(crate) fn route_source(remote: SocketAddr) -> Option<SocketAddr> {
 #[cfg(target_os = "windows")]
 fn windows_route_source(remote: SocketAddr) -> Option<SocketAddr> {
     use std::{mem, ptr};
-    use windows_sys::Win32::{NetworkManagement::IpHelper::{GetBestInterfaceEx, GetBestRoute2, MIB_IPFORWARD_ROW2}, Networking::WinSock::{SOCKADDR_INET, AF_INET, AF_INET6}};
-    if remote.ip().is_unspecified() || remote.ip().is_multicast() { return None; }
+    use windows_sys::Win32::{
+        NetworkManagement::IpHelper::{GetBestInterfaceEx, GetBestRoute2, MIB_IPFORWARD_ROW2},
+        Networking::WinSock::{AF_INET, AF_INET6, SOCKADDR_INET},
+    };
+    if remote.ip().is_unspecified() || remote.ip().is_multicast() {
+        return None;
+    }
     let mut dst: SOCKADDR_INET = unsafe { mem::zeroed() };
     let mut source: SOCKADDR_INET = unsafe { mem::zeroed() };
-    if mem::size_of::<SOCKADDR_INET>() != 28 { return None; }
-    let raw = unsafe { std::slice::from_raw_parts_mut((&mut dst as *mut SOCKADDR_INET).cast::<u8>(),28) };
+    if mem::size_of::<SOCKADDR_INET>() != 28 {
+        return None;
+    }
+    let raw = unsafe {
+        std::slice::from_raw_parts_mut((&mut dst as *mut SOCKADDR_INET).cast::<u8>(), 28)
+    };
     match remote {
         SocketAddr::V4(v4) => {
             raw[..2].copy_from_slice(&AF_INET.to_ne_bytes());
             raw[4..8].copy_from_slice(&v4.ip().octets());
         }
         SocketAddr::V6(v6) => {
-            if v6.scope_id() != 0 || v6.ip().to_ipv4_mapped().is_some() { return None; }
+            if v6.scope_id() != 0 || v6.ip().to_ipv4_mapped().is_some() {
+                return None;
+            }
             raw[..2].copy_from_slice(&AF_INET6.to_ne_bytes());
             raw[8..24].copy_from_slice(&v6.ip().octets());
         }
     }
     let mut interface = 0u32;
-    if unsafe { GetBestInterfaceEx((&mut dst as *mut SOCKADDR_INET).cast(), &mut interface) } != 0 || interface == 0 { return None; }
+    if unsafe { GetBestInterfaceEx((&mut dst as *mut SOCKADDR_INET).cast(), &mut interface) } != 0
+        || interface == 0
+    {
+        return None;
+    }
     let mut route: MIB_IPFORWARD_ROW2 = unsafe { mem::zeroed() };
-    if unsafe { GetBestRoute2(ptr::null(), interface, ptr::null(), &dst, 0, &mut route, &mut source) } != 0 { return None; }
-    let raw = unsafe { std::slice::from_raw_parts((&source as *const SOCKADDR_INET).cast::<u8>(),28) };
+    if unsafe {
+        GetBestRoute2(
+            ptr::null(),
+            interface,
+            ptr::null(),
+            &dst,
+            0,
+            &mut route,
+            &mut source,
+        )
+    } != 0
+    {
+        return None;
+    }
+    let raw =
+        unsafe { std::slice::from_raw_parts((&source as *const SOCKADDR_INET).cast::<u8>(), 28) };
     let family = u16::from_ne_bytes(raw[..2].try_into().ok()?);
     let ip = match (remote, family) {
-        (SocketAddr::V4(_), AF_INET) => IpAddr::V4(Ipv4Addr::from(<[u8;4]>::try_from(&raw[4..8]).ok()?)),
-        (SocketAddr::V6(_), AF_INET6) if raw[24..28] == [0;4] => IpAddr::V6(Ipv6Addr::from(<[u8;16]>::try_from(&raw[8..24]).ok()?)),
+        (SocketAddr::V4(_), AF_INET) => {
+            IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(&raw[4..8]).ok()?))
+        }
+        (SocketAddr::V6(_), AF_INET6) if raw[24..28] == [0; 4] => {
+            IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&raw[8..24]).ok()?))
+        }
         _ => return None,
     };
-    (!ip.is_unspecified() && !ip.is_multicast()).then_some(SocketAddr::new(ip,0))
+    (!ip.is_unspecified() && !ip.is_multicast()).then_some(SocketAddr::new(ip, 0))
 }
 
 #[derive(Default)]
@@ -981,7 +1014,9 @@ struct RoutedTcp {
     flow: crate::routing::flow::FlowLease,
 }
 impl RoutedTcp {
-    fn open_code(&self) -> u8 { self.tunnel.open_code() }
+    fn open_code(&self) -> u8 {
+        self.tunnel.open_code()
+    }
     async fn relay(self, socket: TcpStream) -> Result<(), ClientError> {
         self.tunnel.relay_guarded(socket, Some(&self.flow)).await
     }
@@ -995,8 +1030,14 @@ impl RoutedUdp {
     fn record_transport(&self, observed: &std::sync::atomic::AtomicU8) {
         self.tunnel.record_transport(observed);
     }
-    async fn relay(self, upload: tokio::sync::mpsc::Receiver<Vec<u8>>, download: tokio::sync::mpsc::Sender<Vec<u8>>) -> Result<(), ClientError> {
-        self.tunnel.relay_guarded(upload, download, Some(&self.flow)).await
+    async fn relay(
+        self,
+        upload: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        download: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) -> Result<(), ClientError> {
+        self.tunnel
+            .relay_guarded(upload, download, Some(&self.flow))
+            .await
     }
 }
 
@@ -1137,12 +1178,26 @@ async fn route_decision(
     let mut pinned = None;
     let action = match address {
         Address::V4(ip) => policy
-            .classify(Evidence::Absent, Evidence::Known(IpAddr::V4(Ipv4Addr::from(*ip))))
-            .map_err(|_| denied())?.action().ok_or_else(denied)?,
+            .classify(
+                Evidence::Absent,
+                Evidence::Known(IpAddr::V4(Ipv4Addr::from(*ip))),
+            )
+            .map_err(|_| denied())?
+            .action()
+            .ok_or_else(denied)?,
         Address::V6(ip) => policy
-            .classify(Evidence::Absent, Evidence::Known(IpAddr::V6(Ipv6Addr::from(*ip))))
-            .map_err(|_| denied())?.action().ok_or_else(denied)?,
-        Address::Dns(name) => match policy.classify(Evidence::Known(name), Evidence::Unknown).map_err(|_| denied())?.action() {
+            .classify(
+                Evidence::Absent,
+                Evidence::Known(IpAddr::V6(Ipv6Addr::from(*ip))),
+            )
+            .map_err(|_| denied())?
+            .action()
+            .ok_or_else(denied)?,
+        Address::Dns(name) => match policy
+            .classify(Evidence::Known(name), Evidence::Unknown)
+            .map_err(|_| denied())?
+            .action()
+        {
             Some(action) => action,
             None => {
                 // Resolve only over the verified control channel when an IP
@@ -1153,7 +1208,9 @@ async fn route_decision(
                 for ip in &ips {
                     let selected = policy
                         .classify(Evidence::Known(name), Evidence::Known(*ip))
-                        .map_err(|_| denied())?.action().ok_or_else(denied)?;
+                        .map_err(|_| denied())?
+                        .action()
+                        .ok_or_else(denied)?;
                     if action.is_some_and(|old| old != selected) {
                         // Mixed route decisions are ambiguous; do not silently
                         // downgrade to direct or proxy one of the blocked IPs.
@@ -1184,8 +1241,16 @@ async fn routed_open(
         crate::traffic::blocked();
         return Err(ClientError::Open(ErrorCode::PolicyDenied));
     }
-    let flow = cache.flows.begin(cache.dpi.clone(), crate::routing::flow::Protocol::Tcp, address.clone(), port, snapshot.digest(), action.packet_action())?;
-    let tunnel = routed_open_selected(carrier, cache, address, port, snapshot, action, pinned).await?;
+    let flow = cache.flows.begin(
+        cache.dpi.clone(),
+        crate::routing::flow::Protocol::Tcp,
+        address.clone(),
+        port,
+        snapshot.digest(),
+        action.packet_action(),
+    )?;
+    let tunnel =
+        routed_open_selected(carrier, cache, address, port, snapshot, action, pinned).await?;
     Ok(RoutedTcp { tunnel, flow })
 }
 
@@ -1229,8 +1294,10 @@ async fn routed_open_selected(
                     };
                     let permitted = !ips.is_empty()
                         && ips.iter().all(|ip| {
-                            policy.classify(crate::routing::Evidence::Known(name), crate::routing::Evidence::Known(*ip))
-                                == Ok(crate::routing::Classification::Matched(Action::DirectDpi))
+                            policy.classify(
+                                crate::routing::Evidence::Known(name),
+                                crate::routing::Evidence::Known(*ip),
+                            ) == Ok(crate::routing::Classification::Matched(Action::DirectDpi))
                         });
                     if !ips.is_empty() && !permitted {
                         return Err(denied());
@@ -1283,8 +1350,18 @@ async fn routed_udp(
         crate::traffic::blocked();
         return Err(ClientError::Open(ErrorCode::PolicyDenied));
     }
-    let flow = cache.flows.begin(cache.dpi.clone(), crate::routing::flow::Protocol::Udp, address.clone(), port, snapshot.digest(), action.packet_action())?;
-    let tunnel = routed_udp_selected(carrier, cache, address, port, candidate, observed, snapshot, action, pinned).await?;
+    let flow = cache.flows.begin(
+        cache.dpi.clone(),
+        crate::routing::flow::Protocol::Udp,
+        address.clone(),
+        port,
+        snapshot.digest(),
+        action.packet_action(),
+    )?;
+    let tunnel = routed_udp_selected(
+        carrier, cache, address, port, candidate, observed, snapshot, action, pinned,
+    )
+    .await?;
     Ok(RoutedUdp { tunnel, flow })
 }
 
@@ -1346,8 +1423,10 @@ async fn routed_udp_selected(
                         },
                     };
                     let permitted = ips.iter().all(|ip| {
-                        snapshot.policy().classify(crate::routing::Evidence::Known(name), crate::routing::Evidence::Known(*ip))
-                            == Ok(crate::routing::Classification::Matched(Action::DirectDpi))
+                        snapshot.policy().classify(
+                            crate::routing::Evidence::Known(name),
+                            crate::routing::Evidence::Known(*ip),
+                        ) == Ok(crate::routing::Classification::Matched(Action::DirectDpi))
                     });
                     if !permitted {
                         return Err(ClientError::Open(ErrorCode::PolicyDenied));
@@ -1568,7 +1647,11 @@ impl ProxyTunnel {
         self.relay_guarded(socket, None).await
     }
 
-    async fn relay_guarded(self, socket: TcpStream, flow: Option<&crate::routing::flow::FlowLease>) -> Result<(), ClientError> {
+    async fn relay_guarded(
+        self,
+        socket: TcpStream,
+        flow: Option<&crate::routing::flow::FlowLease>,
+    ) -> Result<(), ClientError> {
         match self {
             Self::Direct(target) => client_state::relay_direct_guarded(socket, target, flow).await,
             Self::Dpi(route) => {
@@ -1656,20 +1739,21 @@ impl CaptureLifecycle {
 
     fn transition(&self, from: u8, to: u8) -> Result<(), ClientError> {
         use std::sync::atomic::Ordering;
-        self.0.compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire)
+        self.0
+            .compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire)
             .map(|_| ())
             .map_err(|_| ClientError::Configuration)
     }
 
     fn stop(&self) {
         use std::sync::atomic::Ordering;
-        let _ = self.0.fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-            match state {
+        let _ = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| match state {
                 0 => Some(4),
                 1 | 2 => Some(3),
                 _ => None,
-            }
-        });
+            });
     }
 
     fn reported(&self) -> u8 {
@@ -1801,16 +1885,26 @@ impl ClientRuntime {
     /// Pin exactly the published client generation for native capture.
     /// A structural or profile update needs explicit stop/recovery until
     /// carrier and rule changes can be committed in one platform transaction.
-    async fn attach_native(self: &Arc<Self>, owner: Arc<NativeOwner>, registrar: Option<Arc<dyn crate::routing::carrier_socket::Registrar>>) -> Result<NativeIngress, ClientError> {
-        let _stage = self.stage.try_lock().map_err(|_| ClientError::Configuration)?;
+    async fn attach_native(
+        self: &Arc<Self>,
+        owner: Arc<NativeOwner>,
+        registrar: Option<Arc<dyn crate::routing::carrier_socket::Registrar>>,
+    ) -> Result<NativeIngress, ClientError> {
+        let _stage = self
+            .stage
+            .try_lock()
+            .map_err(|_| ClientError::Configuration)?;
         if *self.stopped.borrow() || !self.capture_state.idle() {
             return Err(ClientError::Configuration);
         }
         let view = self.slot.borrow().clone();
         saved_client_bytes(&self.path, view.digest)?;
-        crate::routing::carrier_socket::scope(registrar.clone(), view.client.routing_policy()).await?;
+        crate::routing::carrier_socket::scope(registrar.clone(), view.client.routing_policy())
+            .await?;
         saved_client_bytes(&self.path, view.digest)?;
-        if *self.stopped.borrow() { return Err(ClientError::Configuration); }
+        if *self.stopped.borrow() {
+            return Err(ClientError::Configuration);
+        }
         self.capture_state.begin()?;
         Ok(NativeIngress {
             runtime: self.clone(),
@@ -1834,10 +1928,25 @@ impl ClientRuntime {
 
     async fn stopped(&self) {
         let mut stop = self.stopped.subscribe();
-        if !*stop.borrow() { let _ = stop.wait_for(|stopped| *stopped).await; }
+        if !*stop.borrow() {
+            let _ = stop.wait_for(|stopped| *stopped).await;
+        }
     }
 
-    pub(crate) async fn status(&self) -> (u64, [u8; 32], u64, u8, u8, bool, (u64, u8), [u64; 38], Option<[u16; 4]>, u8) {
+    pub(crate) async fn status(
+        &self,
+    ) -> (
+        u64,
+        [u8; 32],
+        u64,
+        u8,
+        u8,
+        bool,
+        (u64, u8),
+        [u64; 38],
+        Option<[u16; 4]>,
+        u8,
+    ) {
         let view = self.slot.borrow().clone();
         let (desc, observed, fallback) = match &view.client {
             ProxyClient::Reality(r) => {
@@ -1967,7 +2076,9 @@ impl ClientRuntime {
         let revision = expected.checked_add(1).ok_or(ClientError::Configuration)?;
         // No await between final exact-byte recheck and publication.
         saved_client_bytes(&self.path, digest)?;
-        if *self.stopped.borrow() { return Err(ClientError::Configuration); }
+        if *self.stopped.borrow() {
+            return Err(ClientError::Configuration);
+        }
         previous.client.routing_cache().dpi.retire();
         self.slot.send_replace(Arc::new(ClientView {
             document,
@@ -2119,7 +2230,13 @@ struct NativeOwner {
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 impl NativeOwner {
     fn acquire() -> Result<Self, ClientError> {
-        NATIVE_OWNER.compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire)
+        NATIVE_OWNER
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
             .map_err(|_| ClientError::Configuration)?;
         match Self::scope() {
             Ok(owner) => Ok(owner),
@@ -2135,8 +2252,9 @@ impl NativeOwner {
         use std::os::linux::net::SocketAddrExt;
         // Abstract Unix socket names are scoped to the network namespace.
         // Kernel closes the ownership handle on crash; no stale PID file.
-        let address = std::os::unix::net::SocketAddr::from_abstract_name(b"theia-native-ingress-v1")
-            .map_err(|_| ClientError::Configuration)?;
+        let address =
+            std::os::unix::net::SocketAddr::from_abstract_name(b"theia-native-ingress-v1")
+                .map_err(|_| ClientError::Configuration)?;
         let socket = std::os::unix::net::UnixDatagram::bind_addr(&address)
             .map_err(|_| ClientError::Configuration)?;
         Ok(Self { _scope: socket })
@@ -2144,17 +2262,30 @@ impl NativeOwner {
 
     #[cfg(target_os = "windows")]
     fn scope() -> Result<Self, ClientError> {
-        use std::{os::windows::io::{FromRawHandle, OwnedHandle}, ptr};
-        use windows_sys::Win32::{Foundation::{GetLastError, ERROR_ALREADY_EXISTS}, System::Threading::CreateEventW};
+        use std::{
+            os::windows::io::{FromRawHandle, OwnedHandle},
+            ptr,
+        };
+        use windows_sys::Win32::{
+            Foundation::{GetLastError, ERROR_ALREADY_EXISTS},
+            System::Threading::CreateEventW,
+        };
         // An event is a lifetime handle, not a thread-affine mutex. We
         // reject an existing object instead of sharing or stealing it.
-        let name: Vec<u16> = "Global\\Theia.NativeIngress.v1".encode_utf16().chain([0]).collect();
+        let name: Vec<u16> = "Global\\Theia.NativeIngress.v1"
+            .encode_utf16()
+            .chain([0])
+            .collect();
         let raw = unsafe { CreateEventW(ptr::null(), 1, 0, name.as_ptr()) };
-        if raw.is_null() { return Err(ClientError::Configuration); }
+        if raw.is_null() {
+            return Err(ClientError::Configuration);
+        }
         let existed = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
         // SAFETY: CreateEventW returned one owned non-null kernel handle.
         let handle = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
-        if existed { return Err(ClientError::Configuration); }
+        if existed {
+            return Err(ClientError::Configuration);
+        }
         Ok(Self { _scope: handle })
     }
 }
@@ -2171,14 +2302,25 @@ impl NativeIngress {
     /// transaction. No new CLI or second system interception mode.
     pub async fn prepare(path: &Path) -> Result<Self, ClientError> {
         let owner = Arc::new(NativeOwner::acquire()?);
-        let raw = zeroize::Zeroizing::new(config::editor_bytes(path).map_err(|_| ClientError::Configuration)?);
-        let Config::Client(document) = config::parse(std::str::from_utf8(&raw).map_err(|_| ClientError::Configuration)?)
-            .map_err(|_| ClientError::Configuration)? else { return Err(ClientError::Configuration); };
+        let raw = zeroize::Zeroizing::new(
+            config::editor_bytes(path).map_err(|_| ClientError::Configuration)?,
+        );
+        let Config::Client(document) =
+            config::parse(std::str::from_utf8(&raw).map_err(|_| ClientError::Configuration)?)
+                .map_err(|_| ClientError::Configuration)?
+        else {
+            return Err(ClientError::Configuration);
+        };
         use sha2::{Digest, Sha256};
         let digest: [u8; 32] = Sha256::digest(raw.as_slice()).into();
         let client = prepare_client(&document, path).await?;
         saved_client_bytes(path, digest)?;
-        let runtime = ClientRuntime::new(std::path::absolute(path).map_err(|_| ClientError::Configuration)?, document, digest, client);
+        let runtime = ClientRuntime::new(
+            std::path::absolute(path).map_err(|_| ClientError::Configuration)?,
+            document,
+            digest,
+            client,
+        );
         runtime.attach_native(owner, None).await
     }
 
@@ -2189,17 +2331,26 @@ impl NativeIngress {
         let _gate = self.verdict_gate.lock();
         self.runtime.stop();
         self.client.routing_cache().dpi.retire();
-        if let Ok(mut registrar) = self.registrar.lock() { drop(registrar.take()); }
+        if let Ok(mut registrar) = self.registrar.lock() {
+            drop(registrar.take());
+        }
         #[cfg(target_os = "linux")]
         if let Ok(mut raw) = self.raw.lock() {
             raw.clear();
         }
     }
 
-    async fn stopped(&self) { self.runtime.stopped().await; }
+    async fn stopped(&self) {
+        self.runtime.stopped().await;
+    }
 
-    fn registrar(&self) -> Result<Option<Arc<dyn crate::routing::carrier_socket::Registrar>>, ClientError> {
-        self.registrar.lock().map(|r| r.clone()).map_err(|_| ClientError::Configuration)
+    fn registrar(
+        &self,
+    ) -> Result<Option<Arc<dyn crate::routing::carrier_socket::Registrar>>, ClientError> {
+        self.registrar
+            .lock()
+            .map(|r| r.clone())
+            .map_err(|_| ClientError::Configuration)
     }
 
     fn ensure_running(&self) -> Result<(), ClientError> {
@@ -2226,12 +2377,21 @@ impl NativeIngress {
         host_namespace: std::fs::File,
     ) -> Result<(), ClientError> {
         self.ensure_running()?;
-        if !rules.owns_queue(&queue).map_err(|_| ClientError::Io)? { return Err(ClientError::Configuration); }
+        if !rules.owns_queue(&queue).map_err(|_| ClientError::Io)? {
+            return Err(ClientError::Configuration);
+        }
         let rules = Arc::new(Mutex::new(rules));
-        let registrar: Arc<dyn crate::routing::carrier_socket::Registrar> = Arc::new(crate::routing::linux_rules::LabRegistrar::new(rules.clone(), host_namespace));
+        let registrar: Arc<dyn crate::routing::carrier_socket::Registrar> = Arc::new(
+            crate::routing::linux_rules::LabRegistrar::new(rules.clone(), host_namespace),
+        );
         {
-            let mut slot = self.registrar.lock().map_err(|_| ClientError::Configuration)?;
-            if slot.is_some() { return Err(ClientError::Configuration); }
+            let mut slot = self
+                .registrar
+                .lock()
+                .map_err(|_| ClientError::Configuration)?;
+            if slot.is_some() {
+                return Err(ClientError::Configuration);
+            }
             *slot = Some(registrar.clone());
         }
         self.serve_linux_shared(queue, rules, registrar).await
@@ -2245,10 +2405,21 @@ impl NativeIngress {
         registrar: Arc<dyn crate::routing::carrier_socket::Registrar>,
     ) -> Result<(), ClientError> {
         struct StopOnDrop<'a>(&'a NativeIngress);
-        impl Drop for StopOnDrop<'_> { fn drop(&mut self) { self.0.shutdown(); } }
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.shutdown();
+            }
+        }
         let _stop = StopOnDrop(self);
         self.ensure_running()?;
-        if !rules.lock().map_err(|_| ClientError::Configuration)?.owns_queue(&queue).map_err(|_| ClientError::Io)? { return Err(ClientError::Configuration); }
+        if !rules
+            .lock()
+            .map_err(|_| ClientError::Configuration)?
+            .owns_queue(&queue)
+            .map_err(|_| ClientError::Io)?
+        {
+            return Err(ClientError::Configuration);
+        }
         let mut queue = queue.into_async().map_err(|_| ClientError::Io)?;
         self.runtime.capture_state.ready()?;
         let consume = async {
@@ -2265,10 +2436,17 @@ impl NativeIngress {
                     }
                     packet=queue.next()=>packet.map_err(|_| ClientError::Io)?,
                 };
-                if !rules.lock().map_err(|_| ClientError::Configuration)?.owns_packet(&packet).map_err(|_| ClientError::Io)? {
+                if !rules
+                    .lock()
+                    .map_err(|_| ClientError::Configuration)?
+                    .owns_packet(&packet)
+                    .map_err(|_| ClientError::Io)?
+                {
                     return Err(ClientError::Open(ErrorCode::PolicyDenied));
                 }
-                self.verdict(&rules, packet).await.map_err(|_| ClientError::Io)?;
+                self.verdict(&rules, packet)
+                    .await
+                    .map_err(|_| ClientError::Io)?;
             }
         };
         tokio::select! {
@@ -2293,33 +2471,55 @@ impl NativeIngress {
         queue_number: u16,
         stop: impl std::future::Future<Output = std::io::Result<()>>,
     ) -> Result<(), ClientError> {
-        use crate::routing::{carrier_socket, linux_rules::{self, LabRegistrar, LabRules}, nfqueue::Queue};
+        use crate::routing::{
+            carrier_socket,
+            linux_rules::{self, LabRegistrar, LabRules},
+            nfqueue::Queue,
+        };
         use sha2::{Digest, Sha256};
         // Namespace ownership must not move between executor threads.
-        if tokio::runtime::Handle::current().runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread {
+        if tokio::runtime::Handle::current().runtime_flavor()
+            != tokio::runtime::RuntimeFlavor::CurrentThread
+        {
             return Err(ClientError::Configuration);
         }
         let owner = Arc::new(NativeOwner::acquire()?);
         let path = std::path::absolute(path).map_err(|_| ClientError::Configuration)?;
-        let raw = zeroize::Zeroizing::new(config::editor_bytes(&path).map_err(|_| ClientError::Configuration)?);
-        let Config::Client(document) = config::parse(std::str::from_utf8(&raw).map_err(|_| ClientError::Configuration)?)
-            .map_err(|_| ClientError::Configuration)? else { return Err(ClientError::Configuration); };
-        let digest: [u8;32] = Sha256::digest(raw.as_slice()).into();
+        let raw = zeroize::Zeroizing::new(
+            config::editor_bytes(&path).map_err(|_| ClientError::Configuration)?,
+        );
+        let Config::Client(document) =
+            config::parse(std::str::from_utf8(&raw).map_err(|_| ClientError::Configuration)?)
+                .map_err(|_| ClientError::Configuration)?
+        else {
+            return Err(ClientError::Configuration);
+        };
+        let digest: [u8; 32] = Sha256::digest(raw.as_slice()).into();
         saved_client_bytes(&path, digest)?;
         let queue = Queue::bind(queue_number, 256).map_err(|_| ClientError::Io)?;
-        let rules = Arc::new(Mutex::new(LabRules::install(&queue, &host_namespace, journal).map_err(|_| ClientError::Io)?));
-        let registrar: Arc<dyn carrier_socket::Registrar> = Arc::new(LabRegistrar::new(rules.clone(), host_namespace.try_clone().map_err(|_| ClientError::Io)?));
-        let client = carrier_socket::scope(Some(registrar.clone()), prepare_client(&document,&path)).await?;
-        saved_client_bytes(&path,digest)?;
-        let runtime = ClientRuntime::new(path,document,digest,client);
+        let rules = Arc::new(Mutex::new(
+            LabRules::install(&queue, &host_namespace, journal).map_err(|_| ClientError::Io)?,
+        ));
+        let registrar: Arc<dyn carrier_socket::Registrar> = Arc::new(LabRegistrar::new(
+            rules.clone(),
+            host_namespace.try_clone().map_err(|_| ClientError::Io)?,
+        ));
+        let client =
+            carrier_socket::scope(Some(registrar.clone()), prepare_client(&document, &path))
+                .await?;
+        saved_client_bytes(&path, digest)?;
+        let runtime = ClientRuntime::new(path, document, digest, client);
         // Keep the process/namespace owner alive across the entire explicit
         // recovery transaction, not just across the packet consumer.
-        let ingress = runtime.attach_native(owner.clone(),Some(registrar.clone())).await?;
-        let control = crate::management::client_server(runtime.clone()).map_err(|_| ClientError::Configuration)?;
+        let ingress = runtime
+            .attach_native(owner.clone(), Some(registrar.clone()))
+            .await?;
+        let control = crate::management::client_server(runtime.clone())
+            .map_err(|_| ClientError::Configuration)?;
         let management = async move {
             match control {
                 Some(server) => server.serve().await.map_err(|_| ClientError::Io),
-                None => std::future::pending::<Result<(),ClientError>>().await,
+                None => std::future::pending::<Result<(), ClientError>>().await,
             }
         };
         let explicit = tokio::select! {
@@ -2344,9 +2544,11 @@ impl NativeIngress {
             while Arc::strong_count(&rules) != 1 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }).await.map_err(|_| ClientError::Timeout)?;
+        })
+        .await
+        .map_err(|_| ClientError::Timeout)?;
         drop(rules);
-        let recovered = linux_rules::recover(&host_namespace,journal).map_err(|_| ClientError::Io);
+        let recovered = linux_rules::recover(&host_namespace, journal).map_err(|_| ClientError::Io);
         drop(owner);
         recovered
     }
@@ -2361,45 +2563,75 @@ impl NativeIngress {
         compartment: u32,
         port: u16,
         controller: &Path,
-        controller_sha256: [u8;32],
+        controller_sha256: [u8; 32],
         stop: impl std::future::Future<Output = std::io::Result<()>>,
     ) -> Result<(), ClientError> {
-        use crate::routing::{carrier_socket, wfp_ingress::{BfeInspector, WfpLabSession, bind_tcp_listeners}};
-        use sha2::{Digest,Sha256};
-        if tokio::runtime::Handle::current().runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread {
+        use crate::routing::{
+            carrier_socket,
+            wfp_ingress::{bind_tcp_listeners, BfeInspector, WfpLabSession},
+        };
+        use sha2::{Digest, Sha256};
+        if tokio::runtime::Handle::current().runtime_flavor()
+            != tokio::runtime::RuntimeFlavor::CurrentThread
+        {
             return Err(ClientError::Configuration);
         }
         let owner = Arc::new(NativeOwner::acquire()?);
         let path = std::path::absolute(path).map_err(|_| ClientError::Configuration)?;
-        let raw = zeroize::Zeroizing::new(config::editor_bytes(&path).map_err(|_| ClientError::Configuration)?);
-        let Config::Client(document) = config::parse(std::str::from_utf8(&raw).map_err(|_| ClientError::Configuration)?)
-            .map_err(|_| ClientError::Configuration)? else { return Err(ClientError::Configuration); };
-        let digest: [u8;32] = Sha256::digest(raw.as_slice()).into();
+        let raw = zeroize::Zeroizing::new(
+            config::editor_bytes(&path).map_err(|_| ClientError::Configuration)?,
+        );
+        let Config::Client(document) =
+            config::parse(std::str::from_utf8(&raw).map_err(|_| ClientError::Configuration)?)
+                .map_err(|_| ClientError::Configuration)?
+        else {
+            return Err(ClientError::Configuration);
+        };
+        let digest: [u8; 32] = Sha256::digest(raw.as_slice()).into();
         saved_client_bytes(&path, digest)?;
-        let proof = Arc::new(BfeInspector::open(controller, controller_sha256, compartment).map_err(|_| ClientError::Configuration)?);
-        proof.inspect().await.map_err(|_| ClientError::Configuration)?;
-        let [v4,v6] = bind_tcp_listeners(compartment,port).map_err(|_| ClientError::Io)?;
-        let session = Arc::new(WfpLabSession::open(compartment,port).map_err(|_| ClientError::Io)?);
+        let proof = Arc::new(
+            BfeInspector::open(controller, controller_sha256, compartment)
+                .map_err(|_| ClientError::Configuration)?,
+        );
+        proof
+            .inspect()
+            .await
+            .map_err(|_| ClientError::Configuration)?;
+        let [v4, v6] = bind_tcp_listeners(compartment, port).map_err(|_| ClientError::Io)?;
+        let session =
+            Arc::new(WfpLabSession::open(compartment, port).map_err(|_| ClientError::Io)?);
         // Even if preflight or the owning future is cancelled, retire the
         // kernel session before releasing listeners. Persistent filters stay.
         struct StopDriver(Arc<WfpLabSession>);
         impl Drop for StopDriver {
-            fn drop(&mut self) { let _ = self.0.deactivate(); }
+            fn drop(&mut self) {
+                let _ = self.0.deactivate();
+            }
         }
         let _stop_driver = StopDriver(session.clone());
         let registrar: Arc<dyn carrier_socket::Registrar> = session.clone();
-        let client = carrier_socket::scope(Some(registrar.clone()), prepare_client(&document,&path)).await?;
-        saved_client_bytes(&path,digest)?;
-        let runtime = ClientRuntime::new(path,document,digest,client);
-        let ingress = Arc::new(runtime.attach_native(owner.clone(),Some(registrar.clone())).await?);
-        let control = crate::management::client_server(runtime.clone()).map_err(|_| ClientError::Configuration)?;
+        let client =
+            carrier_socket::scope(Some(registrar.clone()), prepare_client(&document, &path))
+                .await?;
+        saved_client_bytes(&path, digest)?;
+        let runtime = ClientRuntime::new(path, document, digest, client);
+        let ingress = Arc::new(
+            runtime
+                .attach_native(owner.clone(), Some(registrar.clone()))
+                .await?,
+        );
+        let control = crate::management::client_server(runtime.clone())
+            .map_err(|_| ClientError::Configuration)?;
         let management = async move {
             match control {
                 Some(server) => server.serve().await.map_err(|_| ClientError::Io),
-                None => std::future::pending::<Result<(),ClientError>>().await,
+                None => std::future::pending::<Result<(), ClientError>>().await,
             }
         };
-        proof.inspect().await.map_err(|_| ClientError::Configuration)?;
+        proof
+            .inspect()
+            .await
+            .map_err(|_| ClientError::Configuration)?;
         session.check().map_err(|_| ClientError::Io)?;
         ingress.runtime.capture_state.ready()?;
         let mut relays = JoinSet::new();
@@ -2426,13 +2658,16 @@ impl NativeIngress {
                         result = v6.accept() => result.map_err(|_| ClientError::Io)?.0,
                     };
                     session.check().map_err(|_| ClientError::Io)?;
-                    if relays.len() >= LOCAL_LIMIT { drop(stream); continue; }
+                    if relays.len() >= LOCAL_LIMIT {
+                        drop(stream);
+                        continue;
+                    }
                     let ingress = ingress.clone();
                     let session = session.clone();
                     // The current-thread runtime keeps these socket operations
                     // in the verified compartment; no detached worker owns a
                     // listener or receives a process-wide exemption.
-                    relays.spawn(async move { ingress.relay_windows_tcp(stream,session).await });
+                    relays.spawn(async move { ingress.relay_windows_tcp(stream, session).await });
                 }
             };
             tokio::select! {
@@ -2476,10 +2711,15 @@ impl NativeIngress {
         candidates: &mut crate::routing::dns_attribution::DnsCandidates,
     ) -> Result<bool, ClientError> {
         self.ensure_running()?;
-        if flow.key() != link.key || flow.cookie() != link.cookie || flow.process_start() != link.process_start {
+        if flow.key() != link.key
+            || flow.cookie() != link.cookie
+            || flow.process_start() != link.process_start
+        {
             return Ok(false);
         }
-        let registrar = self.registrar()?.ok_or(ClientError::Open(ErrorCode::PolicyDenied))?;
+        let registrar = self
+            .registrar()?
+            .ok_or(ClientError::Open(ErrorCode::PolicyDenied))?;
         crate::routing::carrier_socket::scope(Some(registrar), async {
             let (carrier, cache) = match &self.client {
                 ProxyClient::Direct(c) => (c.carrier.clone(), &c.routing),
@@ -2487,18 +2727,23 @@ impl NativeIngress {
             };
             let snapshot = cache.get(|known| carrier.fetch_routing(known)).await?;
             let digest = snapshot.digest();
-            let name = crate::routing::domain_name(&link.domain).map_err(|_| ClientError::Protocol)?;
+            let name =
+                crate::routing::domain_name(&link.domain).map_err(|_| ClientError::Protocol)?;
             // The current wire response contains addresses, not authoritative
             // DNS TTLs. Bound this diagnostic to the original policy lease and
             // a short window beginning BEFORE the authenticated request.
             let original_deadline = cache.observation_deadline(digest)?;
             let requested = Instant::now();
             let ips = carrier.resolve_routing(&name, digest).await?;
-            let deadline = original_deadline.min(cache.observation_deadline(digest)?)
+            let deadline = original_deadline
+                .min(cache.observation_deadline(digest)?)
                 .min(requested + Duration::from_secs(30));
             self.ensure_running()?;
-            candidates.record(flow, link, digest, &ips, deadline).map_err(|_| ClientError::Protocol)
-        }).await
+            candidates
+                .record(flow, link, digest, &ips, deadline)
+                .map_err(|_| ClientError::Protocol)
+        })
+        .await
     }
 
     /// Prepare a narrowly scoped laboratory Modify permit. The route must
@@ -2512,12 +2757,19 @@ impl NativeIngress {
         key: crate::routing::packet::FlowKey,
         domain: &str,
     ) -> Result<LabStunPermit, ClientError> {
-        use crate::routing::{Evidence, PacketAction, packet::Transport, dpi::{UdpStrategy, udp::BindingStrategy}};
+        use crate::routing::{
+            dpi::{udp::BindingStrategy, UdpStrategy},
+            packet::Transport,
+            Evidence, PacketAction,
+        };
         let denied = || ClientError::Open(ErrorCode::PolicyDenied);
         self.ensure_running()?;
-        if key.transport != Transport::Udp || key.destination.port() != 3478 || key.source.port() == 0
+        if key.transport != Transport::Udp
+            || key.destination.port() != 3478
+            || key.source.port() == 0
             || key.source.is_ipv4() != key.destination.is_ipv4()
-            || !crate::server::allowed_destination(key.destination.ip(), false) {
+            || !crate::server::allowed_destination(key.destination.ip(), false)
+        {
             return Err(denied());
         }
         let (carrier, cache) = match &self.client {
@@ -2529,24 +2781,53 @@ impl NativeIngress {
         let name = crate::routing::domain_name(domain).map_err(|_| denied())?;
         let policy = snapshot.policy();
         for evidence in [Evidence::Unknown, Evidence::Known(name.as_str())] {
-            if policy.classify_with_application(evidence, Evidence::Known(key.destination.ip()), Evidence::Unknown)
-                .map_err(|_| denied())?.action() != Some(Action::DirectDpi) {
+            if policy
+                .classify_with_application(
+                    evidence,
+                    Evidence::Known(key.destination.ip()),
+                    Evidence::Unknown,
+                )
+                .map_err(|_| denied())?
+                .action()
+                != Some(Action::DirectDpi)
+            {
                 return Err(denied());
             }
         }
-        if !cache.dpi.stun_enabled() { return Err(denied()); }
+        if !cache.dpi.stun_enabled() {
+            return Err(denied());
+        }
         let ips = carrier.resolve_routing(&name, digest).await?;
-        if !ips.contains(&key.destination.ip()) { return Err(denied()); }
-        let verified = cache.dpi.open_stun_udp(&name, 3478, &[key.destination.ip()], digest).await.ok_or_else(denied)?;
+        if !ips.contains(&key.destination.ip()) {
+            return Err(denied());
+        }
+        let verified = cache
+            .dpi
+            .open_stun_udp(&name, 3478, &[key.destination.ip()], digest)
+            .await
+            .ok_or_else(denied)?;
         if verified.strategy != UdpStrategy::StunBinding(BindingStrategy::Fingerprint)
             || verified.socket.peer_addr().ok() != Some(key.destination)
-            || !verified.socket.local_addr().is_ok_and(|a| a.ip() == key.source.ip())
-            || !verified.admissible()? {
+            || !verified
+                .socket
+                .local_addr()
+                .is_ok_and(|a| a.ip() == key.source.ip())
+            || !verified.admissible()?
+        {
             return Err(denied());
         }
         self.ensure_running()?;
-        let flow = cache.flows.begin_native(cache.dpi.clone(), key, digest, PacketAction::Modify)?;
-        Ok(LabStunPermit { key, flow, engine: cache.dpi.clone(), verified, failed: false })
+        let flow =
+            cache
+                .flows
+                .begin_native(cache.dpi.clone(), key, digest, PacketAction::Modify)?;
+        Ok(LabStunPermit {
+            key,
+            flow,
+            engine: cache.dpi.clone(),
+            verified,
+            failed: false,
+        })
     }
 
     /// The actual NFQUEUE replacement is available only under an owned
@@ -2561,10 +2842,15 @@ impl NativeIngress {
     ) -> std::io::Result<crate::routing::PacketAction> {
         use crate::routing::PacketAction;
         let gate = self.verdict_gate.lock();
-        let acceptable = gate.is_ok() && !permit.failed && self.ensure_running().is_ok()
+        let acceptable = gate.is_ok()
+            && !permit.failed
+            && self.ensure_running().is_ok()
             && Arc::ptr_eq(&permit.engine, &self.client.routing_cache().dpi)
-            && packet.local_output() && !packet.checksum_pending()
-            && packet.metadata().is_some_and(|meta| meta.flow == permit.key)
+            && packet.local_output()
+            && !packet.checksum_pending()
+            && packet
+                .metadata()
+                .is_some_and(|meta| meta.flow == permit.key)
             && rules.owns_packet(&packet).unwrap_or(false)
             && permit.verified.admissible().unwrap_or(false);
         if acceptable {
@@ -2572,7 +2858,9 @@ impl NativeIngress {
                 // Commit before the kernel verdict, never retry another egress.
                 if permit.flow.commit(PacketAction::Modify).is_ok() {
                     let result = packet.finish_stun_lab(&changed);
-                    if !matches!(&result, Ok(PacketAction::Modify)) { permit.failed = true; }
+                    if !matches!(&result, Ok(PacketAction::Modify)) {
+                        permit.failed = true;
+                    }
                     return result;
                 }
             }
@@ -2593,7 +2881,11 @@ impl NativeIngress {
         use crate::routing::PacketAction;
         // Check before doing any async policy work; a standalone queue
         // without the exact owned rule set must not authorize native Pass.
-        if !rules.lock().map_err(|_| std::io::ErrorKind::PermissionDenied)?.owns_packet(&packet)? {
+        if !rules
+            .lock()
+            .map_err(|_| std::io::ErrorKind::PermissionDenied)?
+            .owns_packet(&packet)?
+        {
             return Err(std::io::ErrorKind::PermissionDenied.into());
         }
         let meta = packet.metadata();
@@ -2609,20 +2901,41 @@ impl NativeIngress {
         // Recheck AFTER the asynchronous policy fetch. Hold the rule mutex
         // through the actual verdict so our own dynamic lease transaction
         // cannot race this check. A foreign change is a terminal error.
-        let owned = rules.lock().map_err(|_| std::io::ErrorKind::PermissionDenied)?;
+        let owned = rules
+            .lock()
+            .map_err(|_| std::io::ErrorKind::PermissionDenied)?;
         if !owned.owns_packet(&packet)? {
             return Err(std::io::ErrorKind::PermissionDenied.into());
         }
-        let mut action = if gate.is_ok() && self.ensure_running().is_ok() { action } else { PacketAction::Drop };
+        let mut action = if gate.is_ok() && self.ensure_running().is_ok() {
+            action
+        } else {
+            PacketAction::Drop
+        };
         if action == PacketAction::Pass {
-            let current = meta.and_then(|m| {
-                let key = crate::routing::packet::FlowKey { interface: 0, ..m.flow };
-                let mut raw = self.raw.lock().ok()?;
-                let entry = raw.get_mut(&key)?;
-                if self.client.routing_cache().dpi.check_policy(entry.digest).is_err() { entry.denied = true; }
-                Some(!entry.denied)
-            }).unwrap_or(false);
-            if !current { action = PacketAction::Drop; }
+            let current = meta
+                .and_then(|m| {
+                    let key = crate::routing::packet::FlowKey {
+                        interface: 0,
+                        ..m.flow
+                    };
+                    let mut raw = self.raw.lock().ok()?;
+                    let entry = raw.get_mut(&key)?;
+                    if self
+                        .client
+                        .routing_cache()
+                        .dpi
+                        .check_policy(entry.digest)
+                        .is_err()
+                    {
+                        entry.denied = true;
+                    }
+                    Some(!entry.denied)
+                })
+                .unwrap_or(false);
+            if !current {
+                action = PacketAction::Drop;
+            }
         }
         let result = packet.finish(action);
         drop(owned);
@@ -2630,44 +2943,85 @@ impl NativeIngress {
     }
 
     #[cfg(target_os = "linux")]
-    async fn raw_verdict(&self, mut meta: crate::routing::packet::PacketMeta) -> crate::routing::PacketAction {
-        use crate::routing::{Evidence, PacketAction, packet::Transport};
+    async fn raw_verdict(
+        &self,
+        mut meta: crate::routing::packet::PacketMeta,
+    ) -> crate::routing::PacketAction {
+        use crate::routing::{packet::Transport, Evidence, PacketAction};
         meta.flow.interface = 0;
         if [meta.flow.source.ip(), meta.flow.destination.ip()].iter().any(|ip| ip.is_unspecified() || ip.is_multicast() || matches!(ip, IpAddr::V6(v6) if v6.is_unicast_link_local() || v6.to_ipv4_mapped().is_some())) {
             return PacketAction::Drop;
         }
-        if self.ensure_running().is_err() { return PacketAction::Drop; }
-        let snapshot = match timeout(Duration::from_millis(250), self.client.routing_policy()).await {
+        if self.ensure_running().is_err() {
+            return PacketAction::Drop;
+        }
+        let snapshot = match timeout(Duration::from_millis(250), self.client.routing_policy()).await
+        {
             Ok(Ok(snapshot)) => snapshot,
             _ => {
                 if let Ok(mut raw) = self.raw.lock() {
-                    if let Some(entry) = raw.get_mut(&meta.flow) { entry.denied = true; entry.last = Instant::now(); }
+                    if let Some(entry) = raw.get_mut(&meta.flow) {
+                        entry.denied = true;
+                        entry.last = Instant::now();
+                    }
                 }
                 return PacketAction::Drop;
             }
         };
         let cache = self.client.routing_cache();
         let digest = snapshot.digest();
-        let matched = meta.classify(snapshot.policy(), Evidence::Unknown, Evidence::Unknown)
-            .ok().and_then(|c| c.action()).map(Action::packet_action);
-        let Ok(mut raw) = self.raw.lock() else { return PacketAction::Drop; };
-        if self.ensure_running().is_err() { return PacketAction::Drop; }
+        let matched = meta
+            .classify(snapshot.policy(), Evidence::Unknown, Evidence::Unknown)
+            .ok()
+            .and_then(|c| c.action())
+            .map(Action::packet_action);
+        let Ok(mut raw) = self.raw.lock() else {
+            return PacketAction::Drop;
+        };
+        if self.ensure_running().is_err() {
+            return PacketAction::Drop;
+        }
         let now = Instant::now();
         raw.retain(|_, entry| now.duration_since(entry.last) < Duration::from_secs(60));
         let current = matched == Some(PacketAction::Pass) && cache.dpi.check_policy(digest).is_ok();
         if let Some(entry) = raw.get_mut(&meta.flow) {
             entry.last = now;
-            if !current || entry.digest != digest { entry.denied = true; }
-            return if !entry.denied && entry.flow.commit(PacketAction::Pass).is_ok() { PacketAction::Pass } else { PacketAction::Drop };
+            if !current || entry.digest != digest {
+                entry.denied = true;
+            }
+            return if !entry.denied && entry.flow.commit(PacketAction::Pass).is_ok() {
+                PacketAction::Pass
+            } else {
+                PacketAction::Drop
+            };
         }
         // TCP must start from a SYN without ACK/RST/FIN. A lost or expired
         // flow is never silently recreated from a middle-of-stream packet.
-        if !current || (meta.flow.transport == Transport::Tcp && !meta.tcp_flags.is_some_and(|f| f & 0x17 == 0x02)) {
+        if !current
+            || (meta.flow.transport == Transport::Tcp
+                && !meta.tcp_flags.is_some_and(|f| f & 0x17 == 0x02))
+        {
             return PacketAction::Drop;
         }
-        let Ok(flow) = cache.flows.begin_native(cache.dpi.clone(), meta.flow, digest, PacketAction::Pass) else { return PacketAction::Drop; };
-        if flow.commit(PacketAction::Pass).is_err() { return PacketAction::Drop; }
-        raw.insert(meta.flow, RawLease { flow, digest, last: now, denied: false });
+        let Ok(flow) =
+            cache
+                .flows
+                .begin_native(cache.dpi.clone(), meta.flow, digest, PacketAction::Pass)
+        else {
+            return PacketAction::Drop;
+        };
+        if flow.commit(PacketAction::Pass).is_err() {
+            return PacketAction::Drop;
+        }
+        raw.insert(
+            meta.flow,
+            RawLease {
+                flow,
+                digest,
+                last: now,
+                denied: false,
+            },
+        );
         PacketAction::Pass
     }
 
@@ -2677,7 +3031,8 @@ impl NativeIngress {
     /// supported here: local Pass must use a separate proven egress path.
     #[cfg(target_os = "linux")]
     pub async fn relay_linux_tcp(&self, stream: TcpStream) -> Result<(), ClientError> {
-        let key = crate::routing::linux_ingress::original_tcp(&stream).map_err(|_| ClientError::Open(ErrorCode::PolicyDenied))?;
+        let key = crate::routing::linux_ingress::original_tcp(&stream)
+            .map_err(|_| ClientError::Open(ErrorCode::PolicyDenied))?;
         self.relay_terminated_tcp(key, stream).await
     }
 
@@ -2685,20 +3040,37 @@ impl NativeIngress {
     /// bound to the current private driver/service session. This entry
     /// point does not install callouts or trust a client-supplied header.
     #[cfg(target_os = "windows")]
-    pub async fn relay_windows_tcp(&self, stream: TcpStream, session: Arc<crate::routing::wfp_ingress::WfpLabSession>) -> Result<(), ClientError> {
+    pub async fn relay_windows_tcp(
+        &self,
+        stream: TcpStream,
+        session: Arc<crate::routing::wfp_ingress::WfpLabSession>,
+    ) -> Result<(), ClientError> {
         self.ensure_running()?;
-        let expected = self.registrar()?.ok_or(ClientError::Open(ErrorCode::PolicyDenied))?;
+        let expected = self
+            .registrar()?
+            .ok_or(ClientError::Open(ErrorCode::PolicyDenied))?;
         let registrar: Arc<dyn crate::routing::carrier_socket::Registrar> = session.clone();
         if !Arc::ptr_eq(&expected, &registrar) {
             return Err(ClientError::Open(ErrorCode::PolicyDenied));
         }
-        let key = session.original_tcp(&stream)
+        let key = session
+            .original_tcp(&stream)
             .map_err(|_| ClientError::Open(ErrorCode::PolicyDenied))?;
-        crate::routing::carrier_socket::scope(Some(registrar), self.relay_terminated_tcp(key, stream)).await
+        crate::routing::carrier_socket::scope(
+            Some(registrar),
+            self.relay_terminated_tcp(key, stream),
+        )
+        .await
     }
 
-    async fn relay_terminated_tcp(&self, key: crate::routing::packet::FlowKey, stream: TcpStream) -> Result<(), ClientError> {
-        if key.transport != crate::routing::packet::Transport::Tcp { return Err(ClientError::Protocol); }
+    async fn relay_terminated_tcp(
+        &self,
+        key: crate::routing::packet::FlowKey,
+        stream: TcpStream,
+    ) -> Result<(), ClientError> {
+        if key.transport != crate::routing::packet::Transport::Tcp {
+            return Err(ClientError::Protocol);
+        }
         tokio::select! {
             biased;
             () = self.stopped() => Err(ClientError::Open(ErrorCode::PolicyDenied)),
@@ -2719,11 +3091,15 @@ impl NativeIngress {
     pub async fn relay_linux_udp(
         &self,
         first: crate::routing::linux_ingress::CapturedDatagram,
-        mut subsequent: tokio::sync::mpsc::Receiver<crate::routing::linux_ingress::CapturedDatagram>,
+        mut subsequent: tokio::sync::mpsc::Receiver<
+            crate::routing::linux_ingress::CapturedDatagram,
+        >,
     ) -> Result<(), ClientError> {
         use crate::routing::PacketAction;
         let key = first.key;
-        if subsequent.max_capacity() > crate::udp_relay::QUEUE { return Err(ClientError::Protocol); }
+        if subsequent.max_capacity() > crate::udp_relay::QUEUE {
+            return Err(ClientError::Protocol);
+        }
         tokio::select! {
             biased;
             () = self.stopped() => Err(ClientError::Open(ErrorCode::PolicyDenied)),
@@ -2771,15 +3147,21 @@ impl NativeIngress {
     pub async fn relay_linux_quic_lab(
         &self,
         first: crate::routing::linux_ingress::CapturedDatagram,
-        mut subsequent: tokio::sync::mpsc::Receiver<crate::routing::linux_ingress::CapturedDatagram>,
+        mut subsequent: tokio::sync::mpsc::Receiver<
+            crate::routing::linux_ingress::CapturedDatagram,
+        >,
         domain: &str,
     ) -> Result<(), ClientError> {
-        use crate::routing::{Evidence, PacketAction, packet::Transport, carrier_socket};
+        use crate::routing::{carrier_socket, packet::Transport, Evidence, PacketAction};
         let denied = || ClientError::Open(ErrorCode::PolicyDenied);
         let key = first.key;
-        if key.transport != Transport::Udp || key.destination.port() != 443
+        if key.transport != Transport::Udp
+            || key.destination.port() != 443
             || subsequent.max_capacity() > crate::udp_relay::QUEUE
-            || !crate::server::allowed_destination(key.destination.ip(), false) { return Err(denied()); }
+            || !crate::server::allowed_destination(key.destination.ip(), false)
+        {
+            return Err(denied());
+        }
         let registrar = self.registrar()?.ok_or_else(denied)?;
         tokio::select! {
             biased;
@@ -2851,7 +3233,8 @@ impl NativeIngress {
     ) -> Result<(), ClientError> {
         if key.transport != crate::routing::packet::Transport::Udp
             || upload.max_capacity() > crate::udp_relay::QUEUE
-            || download.max_capacity() > crate::udp_relay::QUEUE {
+            || download.max_capacity() > crate::udp_relay::QUEUE
+        {
             return Err(ClientError::Protocol);
         }
         tokio::select! {
@@ -2865,29 +3248,51 @@ impl NativeIngress {
         }
     }
 
-    async fn redirect(&self, key: crate::routing::packet::FlowKey) -> Result<(Carrier, crate::routing::flow::FlowLease, Address), ClientError> {
+    async fn redirect(
+        &self,
+        key: crate::routing::packet::FlowKey,
+    ) -> Result<(Carrier, crate::routing::flow::FlowLease, Address), ClientError> {
         use crate::routing::{Evidence, PacketAction};
         self.ensure_running()?;
         let denied = || ClientError::Open(ErrorCode::PolicyDenied);
-        if key.destination.port() == 0 || key.source.port() == 0
-            || key.destination.ip().is_loopback() || key.destination.ip().is_unspecified()
-            || key.destination.ip().is_multicast() || key.destination == key.source
-            || matches!(key.destination, SocketAddr::V6(v6) if v6.scope_id() != 0 || v6.ip().is_unicast_link_local() || v6.ip().to_ipv4_mapped().is_some()) {
+        if key.destination.port() == 0
+            || key.source.port() == 0
+            || key.destination.ip().is_loopback()
+            || key.destination.ip().is_unspecified()
+            || key.destination.ip().is_multicast()
+            || key.destination == key.source
+            || matches!(key.destination, SocketAddr::V6(v6) if v6.scope_id() != 0 || v6.ip().is_unicast_link_local() || v6.ip().to_ipv4_mapped().is_some())
+        {
             return Err(denied());
         }
         let (carrier, cache) = match &self.client {
             ProxyClient::Direct(c) => (c.carrier.clone(), &c.routing),
             ProxyClient::Reality(c) => (c.generation().await?.carrier.clone(), &c.routing),
         };
-        let snapshot = crate::routing::carrier_socket::scope(self.registrar()?, cache.get(|known| carrier.fetch_routing(known))).await?;
-        let configured = snapshot.policy().classify_with_application(
-            Evidence::Unknown, Evidence::Known(key.destination.ip()), Evidence::Unknown
-        ).map_err(|_| denied())?.action().ok_or_else(denied)?.packet_action();
+        let snapshot = crate::routing::carrier_socket::scope(
+            self.registrar()?,
+            cache.get(|known| carrier.fetch_routing(known)),
+        )
+        .await?;
+        let configured = snapshot
+            .policy()
+            .classify_with_application(
+                Evidence::Unknown,
+                Evidence::Known(key.destination.ip()),
+                Evidence::Unknown,
+            )
+            .map_err(|_| denied())?
+            .action()
+            .ok_or_else(denied)?
+            .packet_action();
         if !matches!(configured, PacketAction::Redirect | PacketAction::Modify) {
             return Err(denied());
         }
         self.ensure_running()?;
-        let flow = cache.flows.begin_native(cache.dpi.clone(), key, snapshot.digest(), configured)?;
+        let flow =
+            cache
+                .flows
+                .begin_native(cache.dpi.clone(), key, snapshot.digest(), configured)?;
         let address = match key.destination.ip() {
             IpAddr::V4(ip) => Address::V4(ip.octets()),
             IpAddr::V6(ip) => Address::V6(ip.octets()),
@@ -2898,7 +3303,9 @@ impl NativeIngress {
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 impl Drop for NativeIngress {
-    fn drop(&mut self) { self.shutdown(); }
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 /// Shared startup preflight: never changes the OS proxy or claims an
@@ -2909,13 +3316,25 @@ async fn prepare_proxy(
 ) -> Result<(TcpListener, TcpListener, ProxyClient), ClientError> {
     let client = prepare_client(document, path).await?;
     // All startup validation and both binds must succeed before accepting.
-    let http = TcpListener::bind(&document.client.proxy.http_listen).await.map_err(|_| ClientError::Io)?;
-    let socks = TcpListener::bind(&document.client.proxy.socks5_listen).await.map_err(|_| ClientError::Io)?;
-    crate::diag!(Info, "client.proxy", "listeners_bound", "count" = Value::Count(2));
+    let http = TcpListener::bind(&document.client.proxy.http_listen)
+        .await
+        .map_err(|_| ClientError::Io)?;
+    let socks = TcpListener::bind(&document.client.proxy.socks5_listen)
+        .await
+        .map_err(|_| ClientError::Io)?;
+    crate::diag!(
+        Info,
+        "client.proxy",
+        "listeners_bound",
+        "count" = Value::Count(2)
+    );
     Ok((http, socks, client))
 }
 
-async fn prepare_client(document: &config::ClientDocument, path: &Path) -> Result<ProxyClient, ClientError> {
+async fn prepare_client(
+    document: &config::ClientDocument,
+    path: &Path,
+) -> Result<ProxyClient, ClientError> {
     let profile = document
         .client
         .profiles

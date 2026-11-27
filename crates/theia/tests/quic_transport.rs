@@ -4,14 +4,12 @@ use bytes::{Buf, Bytes};
 mod quinn_reference;
 
 use quinn::Endpoint;
+use quinn_reference::{accept, client_endpoint, connect, server_endpoint};
 use rustls::{pki_types::PrivatePkcs8KeyDer, RootCertStore};
 use std::{net::SocketAddr, time::Duration};
-use theia::{
-    protocol::{self, Decoder, Direction, Frame, Role, Session, VERSION},
-};
-use tokio::time::timeout;
-use quinn_reference::{accept, client_endpoint, connect, server_endpoint};
+use theia::protocol::{self, Decoder, Direction, Frame, Role, Session, VERSION};
 use theia::quic_transport::QuicError;
+use tokio::time::timeout;
 
 fn endpoints() -> (Endpoint, Endpoint, SocketAddr) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();

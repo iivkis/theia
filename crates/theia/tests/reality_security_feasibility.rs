@@ -22,7 +22,9 @@ use theia::{
 #[path = "support/quinn_reference.rs"]
 mod quinn_reference;
 
-use quinn_reference::{accept as accept_quic, client_endpoint, connect as connect_quic, server_endpoint};
+use quinn_reference::{
+    accept as accept_quic, client_endpoint, connect as connect_quic, server_endpoint,
+};
 use tokio::{
     net::{TcpListener, TcpStream},
     time::timeout,

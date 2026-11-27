@@ -2,12 +2,18 @@
 //! any received UDP, or a definitive error on the exact destination send,
 //! can be considered unavailable. PKI, protocol, receive and local errors
 //! never authorize a transport downgrade.
-use super::{endpoint::LabSession, handshake_udp, negotiation::VersionPolicy, scope::NetworkScope, wire::Version};
+use super::{
+    endpoint::LabSession, handshake_udp, negotiation::VersionPolicy, scope::NetworkScope,
+    wire::Version,
+};
 use rustls::{pki_types::ServerName, ClientConfig};
 use std::{
     io,
     net::SocketAddr,
-    sync::{atomic::{AtomicBool, Ordering}, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -38,7 +44,12 @@ impl Observation {
     }
 
     pub(crate) fn send_error(&self, kind: io::ErrorKind) {
-        if matches!(kind, io::ErrorKind::NetworkUnreachable | io::ErrorKind::HostUnreachable | io::ErrorKind::ConnectionRefused) {
+        if matches!(
+            kind,
+            io::ErrorKind::NetworkUnreachable
+                | io::ErrorKind::HostUnreachable
+                | io::ErrorKind::ConnectionRefused
+        ) {
             self.refused.store(true, Ordering::SeqCst);
         }
     }
@@ -52,13 +63,20 @@ impl Observation {
                 return Error::Unreachable;
             }
         }
-        if timeout { Error::Timeout } else { Error::Handshake }
+        if timeout {
+            Error::Timeout
+        } else {
+            Error::Handshake
+        }
     }
 }
 
 /// A source is selected by the OS without sending any datagram or resolving
 /// DNS. An explicit source (e.g. a protected routing lease) is never replaced.
-pub(crate) fn bind_source(peer: SocketAddr, local: Option<SocketAddr>) -> Result<SocketAddr, Error> {
+pub(crate) fn bind_source(
+    peer: SocketAddr,
+    local: Option<SocketAddr>,
+) -> Result<SocketAddr, Error> {
     if peer.port() == 0 || peer.ip().is_unspecified() {
         return Err(Error::Configuration);
     }
@@ -89,10 +107,19 @@ pub(crate) async fn connect(
     let observation = Observation::default();
     let result = tokio::time::timeout(deadline, async {
         let local = bind_source(peer, local)?;
-        let scope = NetworkScope::pinned([local.ip(); 2], [peer.ip(); 2]).ok_or(Error::Configuration)?;
+        let scope =
+            NetworkScope::pinned([local.ip(); 2], [peer.ip(); 2]).ok_or(Error::Configuration)?;
         let (version, mut session) = handshake_udp::connect_versions_observed(
-            local, peer, versions, tls, name, scope, &observation,
-        ).await.map_err(|error| match error {
+            local,
+            peer,
+            versions,
+            tls,
+            name,
+            scope,
+            &observation,
+        )
+        .await
+        .map_err(|error| match error {
             handshake_udp::Error::Timeout => observation.failure(true),
             handshake_udp::Error::Io(_) => observation.failure(false),
             handshake_udp::Error::Scope => Error::Configuration,
@@ -102,7 +129,8 @@ pub(crate) async fn connect(
         // No HTTP streams, bearer or user data have been created.
         confirm(&mut session).await?;
         Ok((version, session))
-    }).await;
+    })
+    .await;
     result.unwrap_or_else(|_| Err(observation.failure(true)))
 }
 
@@ -111,9 +139,13 @@ pub(crate) async fn confirm(session: &mut LabSession) -> Result<(), Error> {
         if session.shutdown_phase() != super::lifecycle::ShutdownPhase::Open {
             return Err(Error::Handshake);
         }
-        session.flush(Instant::now()).await.map_err(|_| Error::Handshake)?;
+        session
+            .flush(Instant::now())
+            .await
+            .map_err(|_| Error::Handshake)?;
         let wait = session.deadline().map_or(Duration::from_millis(100), |at| {
-            at.saturating_duration_since(Instant::now()).min(Duration::from_millis(100))
+            at.saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(100))
         });
         session.recv(wait).await.map_err(|_| Error::Handshake)?;
     }
@@ -121,8 +153,13 @@ pub(crate) async fn confirm(session: &mut LabSession) -> Result<(), Error> {
 }
 
 pub(crate) async fn close_probe(mut session: LabSession) -> Result<(), Error> {
-    session.close(0x100, Instant::now()).map_err(|_| Error::Handshake)?;
-    session.flush(Instant::now()).await.map_err(|_| Error::Handshake)?;
+    session
+        .close(0x100, Instant::now())
+        .map_err(|_| Error::Handshake)?;
+    session
+        .flush(Instant::now())
+        .await
+        .map_err(|_| Error::Handshake)?;
     Ok(())
 }
 
@@ -134,8 +171,17 @@ mod tests {
         let observation = Observation::default();
         assert_eq!(observation.failure(true), Error::Timeout);
         use io::ErrorKind::*;
-        for error in [PermissionDenied, AddrNotAvailable, WouldBlock, Interrupted,
-            OutOfMemory, ConnectionReset, TimedOut, Other, InvalidInput] {
+        for error in [
+            PermissionDenied,
+            AddrNotAvailable,
+            WouldBlock,
+            Interrupted,
+            OutOfMemory,
+            ConnectionReset,
+            TimedOut,
+            Other,
+            InvalidInput,
+        ] {
             observation.send_error(error);
             assert_eq!(observation.failure(false), Error::Handshake);
         }
@@ -163,9 +209,18 @@ mod tests {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert.cert.der().clone()).unwrap();
-        let tls = crate::transport_policy::Carrier::H3.client_tls(roots).unwrap();
+        let tls = crate::transport_policy::Carrier::H3
+            .client_tls(roots)
+            .unwrap();
         let (result, ()) = tokio::join!(
-            connect(address, ServerName::try_from("localhost").unwrap(), Arc::new(tls), None, VersionPolicy::exact(Version::V1), Duration::from_millis(300)),
+            connect(
+                address,
+                ServerName::try_from("localhost").unwrap(),
+                Arc::new(tls),
+                None,
+                VersionPolicy::exact(Version::V1),
+                Duration::from_millis(300)
+            ),
             async {
                 let mut initial = [0; 1500];
                 let (_, from) = peer.recv_from(&mut initial).await.unwrap();

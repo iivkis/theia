@@ -274,7 +274,8 @@ impl Scheduler {
     }
 
     pub fn can_queue_n(&self, n: usize) -> bool {
-        n <= self.frame_limit.saturating_sub(self.frames.len()) && (n as u64) <= u64::MAX - self.next_id
+        n <= self.frame_limit.saturating_sub(self.frames.len())
+            && (n as u64) <= u64::MAX - self.next_id
     }
 
     pub fn enqueue(&mut self, bytes: Vec<u8>) -> Result<(), Error> {

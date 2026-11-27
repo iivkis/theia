@@ -1,37 +1,37 @@
 //! Shared route matching primitives for server and client.
 //! No DNS, transport, file I/O or implicit bypass occurs in this module.
+pub(crate) mod carrier_socket;
 pub(crate) mod client_state;
+#[cfg(target_os = "linux")]
+pub mod dns_attribution;
 pub(crate) mod dpi;
 pub(crate) mod exchange;
 pub(crate) mod flow;
-pub mod packet;
-pub(crate) mod carrier_socket;
-pub mod packet_modify;
-#[cfg(target_os = "linux")]
-pub mod linux_ingress;
+pub mod geodata;
 #[cfg(target_os = "linux")]
 pub mod linux_attribution;
-#[cfg(target_os = "linux")]
-pub mod linux_events;
 #[cfg(all(target_os = "linux", feature = "linux-ebpf-lab"))]
 pub mod linux_bpf_loader;
 #[cfg(target_os = "linux")]
-pub mod dns_attribution;
+pub mod linux_carrier;
+#[cfg(target_os = "linux")]
+pub mod linux_events;
+#[cfg(target_os = "linux")]
+pub mod linux_ingress;
+#[cfg(target_os = "linux")]
+pub mod linux_rules;
+#[cfg(target_os = "linux")]
+pub mod nfqueue;
+pub mod packet;
+pub mod packet_modify;
+mod settings;
+pub mod snapshot;
 #[cfg(any(target_os = "windows", test))]
 mod wfp_context;
 #[cfg(target_os = "windows")]
 pub mod wfp_ingress;
 #[cfg(target_os = "windows")]
 pub mod wfp_udp;
-#[cfg(target_os = "linux")]
-pub mod nfqueue;
-#[cfg(target_os = "linux")]
-pub mod linux_rules;
-#[cfg(target_os = "linux")]
-pub mod linux_carrier;
-pub mod geodata;
-mod settings;
-pub mod snapshot;
 pub use settings::Settings;
 
 use regex::{Regex, RegexBuilder};
@@ -534,8 +534,14 @@ impl ApplicationId {
     }
 
     pub fn parse(selector: &str) -> Result<Self, RoutingError> {
-        let hash = selector.strip_prefix("sha256:").ok_or(RoutingError::InvalidApplication)?;
-        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        let hash = selector
+            .strip_prefix("sha256:")
+            .ok_or(RoutingError::InvalidApplication)?;
+        if hash.len() != 64
+            || !hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
             return Err(RoutingError::InvalidApplication);
         }
         let mut bytes = [0; 32];
@@ -612,7 +618,9 @@ fn compile_selectors(rules: &[Rule]) -> Result<Selectors, RoutingError> {
                 IpSelector::Literal(Cidr::parse(selector)?)
             });
         }
-        let applications = rule.applications.iter()
+        let applications = rule
+            .applications
+            .iter()
             .map(|selector| ApplicationId::parse(selector))
             .collect::<Result<HashSet<_>, _>>()?;
         compiled.push(CompiledRule {
@@ -741,9 +749,9 @@ impl Policy {
             Evidence::Unknown => Evidence::Unknown,
         };
         let ip = match ip {
-            Evidence::Known(IpAddr::V6(v6)) => Evidence::Known(
-                v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
-            ),
+            Evidence::Known(IpAddr::V6(v6)) => {
+                Evidence::Known(v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4))
+            }
             other => other,
         };
         for rule in &self.rules {
@@ -783,7 +791,13 @@ impl Policy {
     /// Client routing must use classify_with_application (or classify for
     /// an unknown process), never this projection.
     pub fn domain_decision(&self, domain: &str) -> Result<Option<Action>, RoutingError> {
-        Ok(self.classify_with_application(Evidence::Known(domain), Evidence::Unknown, Evidence::Absent)?.action())
+        Ok(self
+            .classify_with_application(
+                Evidence::Known(domain),
+                Evidence::Unknown,
+                Evidence::Absent,
+            )?
+            .action())
     }
 
     /// Server-side destination projection for explicitly supplied attributes.
@@ -850,17 +864,42 @@ mod tests {
             ],
             &[],
             &[],
-        ).unwrap();
-        assert_eq!(p.classify(Evidence::Unknown, Evidence::Known(ip)).unwrap(), Classification::Unresolved);
-        assert_eq!(p.classify(Evidence::Absent, Evidence::Known(ip)).unwrap(), Classification::Matched(Action::Direct));
-        assert_eq!(p.classify(Evidence::Known("blocked.example"), Evidence::Unknown).unwrap(), Classification::Matched(Action::Blocked));
-        assert_eq!(p.classify(Evidence::Known("other.example"), Evidence::Unknown).unwrap(), Classification::Unresolved);
+        )
+        .unwrap();
+        assert_eq!(
+            p.classify(Evidence::Unknown, Evidence::Known(ip)).unwrap(),
+            Classification::Unresolved
+        );
+        assert_eq!(
+            p.classify(Evidence::Absent, Evidence::Known(ip)).unwrap(),
+            Classification::Matched(Action::Direct)
+        );
+        assert_eq!(
+            p.classify(Evidence::Known("blocked.example"), Evidence::Unknown)
+                .unwrap(),
+            Classification::Matched(Action::Blocked)
+        );
+        assert_eq!(
+            p.classify(Evidence::Known("other.example"), Evidence::Unknown)
+                .unwrap(),
+            Classification::Unresolved
+        );
         let or = Policy::compile(
             &[rule(Action::DirectDpi, &["example.com"], &["192.0.2.0/24"])],
-            &[], &[],
-        ).unwrap();
-        assert_eq!(or.classify(Evidence::Unknown, Evidence::Known(ip)).unwrap().action(), Some(Action::DirectDpi));
-        assert_eq!(or.classify(Evidence::Absent, Evidence::Absent).unwrap(), Classification::Default);
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            or.classify(Evidence::Unknown, Evidence::Known(ip))
+                .unwrap()
+                .action(),
+            Some(Action::DirectDpi)
+        );
+        assert_eq!(
+            or.classify(Evidence::Absent, Evidence::Absent).unwrap(),
+            Classification::Default
+        );
         assert_eq!(Classification::Default.action(), Some(Action::Allowed));
         assert_eq!(Classification::Unresolved.action(), None);
         assert_eq!(Action::Direct.packet_action(), PacketAction::Pass);
@@ -878,17 +917,42 @@ mod tests {
         let later = rule(Action::Direct, &[], &["192.0.2.0/24"]);
         let p = Policy::compile(&[first.clone(), later.clone()], &[], &[]).unwrap();
         let ip = Evidence::Known("192.0.2.10".parse().unwrap());
-        assert_eq!(p.classify(Evidence::Absent, ip).unwrap(), Classification::Unresolved);
-        assert_eq!(p.classify_with_application(Evidence::Absent, ip, Evidence::Known(id)).unwrap(), Classification::Matched(Action::Blocked));
-        assert_eq!(p.classify_with_application(Evidence::Absent, ip, Evidence::Known(ApplicationId::from_sha256([0; 32]))).unwrap(), Classification::Matched(Action::Direct));
-        assert_eq!(p.matching_action(None, Some("192.0.2.10".parse().unwrap())).unwrap(), Some(Action::Direct));
+        assert_eq!(
+            p.classify(Evidence::Absent, ip).unwrap(),
+            Classification::Unresolved
+        );
+        assert_eq!(
+            p.classify_with_application(Evidence::Absent, ip, Evidence::Known(id))
+                .unwrap(),
+            Classification::Matched(Action::Blocked)
+        );
+        assert_eq!(
+            p.classify_with_application(
+                Evidence::Absent,
+                ip,
+                Evidence::Known(ApplicationId::from_sha256([0; 32]))
+            )
+            .unwrap(),
+            Classification::Matched(Action::Direct)
+        );
+        assert_eq!(
+            p.matching_action(None, Some("192.0.2.10".parse().unwrap()))
+                .unwrap(),
+            Some(Action::Direct)
+        );
         first.domains.push("example.org".into());
         let p = Policy::compile(&[first.clone(), later], &[], &[]).unwrap();
-        assert_eq!(p.classify(Evidence::Known("example.org"), ip).unwrap(), Classification::Matched(Action::Blocked));
+        assert_eq!(
+            p.classify(Evidence::Known("example.org"), ip).unwrap(),
+            Classification::Matched(Action::Blocked)
+        );
         assert!(ApplicationId::parse("chrome.exe").is_err());
         assert!(ApplicationId::parse(&digest.to_uppercase()).is_err());
         first.applications = vec!["pid:10".into()];
-        assert_eq!(Policy::validate_rules(&[first]), Err(RoutingError::InvalidApplication));
+        assert_eq!(
+            Policy::validate_rules(&[first]),
+            Err(RoutingError::InvalidApplication)
+        );
     }
 
     #[test]

@@ -27,7 +27,8 @@ use tokio::sync::{oneshot, watch, Notify};
 
 // Include HTTP/3 framing overhead for a 64 KiB application write.
 const SLOT_LIMIT: usize = 128 * 1024;
-const OPEN_LIMIT: usize = crate::transport_policy::MAX_BIDI_STREAMS as usize + crate::transport_policy::MAX_QUIC_UNI_STREAMS as usize;
+const OPEN_LIMIT: usize = crate::transport_policy::MAX_BIDI_STREAMS as usize
+    + crate::transport_policy::MAX_QUIC_UNI_STREAMS as usize;
 const MAX_BURST: usize = 32;
 const IDLE_WAIT: Duration = Duration::from_secs(60);
 const CANCEL: u64 = 0x10c;
@@ -113,7 +114,10 @@ impl StreamState {
 }
 
 #[cfg(test)]
-type RebindRequest = (tokio::net::UdpSocket, oneshot::Sender<Result<(), NativeError>>);
+type RebindRequest = (
+    tokio::net::UdpSocket,
+    oneshot::Sender<Result<(), NativeError>>,
+);
 
 #[derive(Default)]
 struct State {
@@ -346,9 +350,9 @@ async fn drive(mut session: LabSession, weak: Weak<Bridge>, ready: Arc<Notify>) 
         {
             // The test command runs on the sole session owner, never while
             // the frontend state mutex is held across asynchronous UDP I/O.
-            let request = weak.upgrade().and_then(|shared| {
-                shared.lock().expect("bridge mutex").rebind.take()
-            });
+            let request = weak
+                .upgrade()
+                .and_then(|shared| shared.lock().expect("bridge mutex").rebind.take());
             if let Some((socket, reply)) = request {
                 let result = session.rebind(socket, Instant::now()).await;
                 let _ = reply.send(result);
@@ -456,7 +460,8 @@ impl NativeConnection {
         let driver = tokio::spawn(async move {
             drive(session, weak, ready).await;
             drop(done);
-        }).abort_handle();
+        })
+        .abort_handle();
         Ok((
             Self {
                 opener: Opener::new(shared),
@@ -545,7 +550,10 @@ impl Drop for Opener {
 
 impl Opener {
     #[cfg(test)]
-    pub(crate) async fn rebind_for_test(&self, socket: std::net::UdpSocket) -> Result<(), NativeError> {
+    pub(crate) async fn rebind_for_test(
+        &self,
+        socket: std::net::UdpSocket,
+    ) -> Result<(), NativeError> {
         let socket = tokio::net::UdpSocket::from_std(socket).map_err(NativeError::Io)?;
         let (reply, result) = oneshot::channel();
         {

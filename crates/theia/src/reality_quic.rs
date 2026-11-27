@@ -8,8 +8,6 @@
 use crate::{
     config::Config,
     identity_tls::Branch,
-    reality_generation::{Lease, Manager},
-    reality_live::Live,
     quic_core::{
         datagram::CID_LEN,
         handshake_udp,
@@ -19,9 +17,11 @@ use crate::{
         scope::NetworkScope,
         wire::Version,
     },
-    udp_metadata::Options,
+    reality_generation::{Lease, Manager},
+    reality_live::Live,
     reality_quic_wire::{self as wire, Cid, Flight, Inspection, Kind},
     server::{self, ServerContext, ServerError},
+    udp_metadata::Options,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -581,7 +581,9 @@ impl PreparedQuic {
     }
 
     pub(crate) fn from_live(socket: UdpSocket, live: Arc<Live>) -> Result<Self, ServerError> {
-        live.current().and_then(|g| g.default_quic()).ok_or(ServerError::Config)?;
+        live.current()
+            .and_then(|g| g.default_quic())
+            .ok_or(ServerError::Config)?;
         let local = socket.local_addr().map_err(|_| ServerError::Io)?;
         let scope = NetworkScope::listener(local.ip()).ok_or(ServerError::Config)?;
         let options = Options::configure(&socket);
@@ -663,7 +665,8 @@ impl PreparedQuic {
         // Initials, even from an already admitted tuple, must be classified.
         let mut admitted: HashMap<(SocketAddr, Cid), Admitted> = HashMap::new();
         let versions = VersionPolicy::both();
-        let mut ingress = Ingress::for_listener(SESSIONS, versions.clone()).map_err(|_| ServerError::Io)?;
+        let mut ingress =
+            Ingress::for_listener(SESSIONS, versions.clone()).map_err(|_| ServerError::Io)?;
         ingress.set_source_limit(16);
         let mut native: HashMap<u64, (SocketAddr, mpsc::Sender<Datagram>)> = HashMap::new();
         let (commands, mut requests) = mpsc::channel(SESSIONS);
@@ -1082,7 +1085,9 @@ mod tests {
     #[test]
     fn native_admission_cids_are_owner_bound_and_quarantined_on_close() {
         let mut ingress = Ingress::for_listener(4, VersionPolicy::both()).unwrap();
-        let (owner, binding) = ingress.admit_initial(peer(1), Version::V1, &[1; 16], &[2; 8], 1).unwrap();
+        let (owner, binding) = ingress
+            .admit_initial(peer(1), Version::V1, &[1; 16], &[2; 8], 1)
+            .unwrap();
         assert!(ingress.known(&binding.retry));
         assert!(!ingress.known(&binding.original));
         let other = ingress.issue_local_cid(owner, 1).unwrap();

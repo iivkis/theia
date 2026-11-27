@@ -2376,9 +2376,8 @@ async fn prepare_selected_listeners_inner(
         })?;
         let h3_config = crate::h3_server::OwnTlsConfig::new(material.certs, material.key)
             .map_err(|_| ServerError::Tls)?;
-        let endpoint =
-            crate::h3_server::OwnTlsEndpoint::bind(udp_addr, h3_config.clone())
-                .map_err(|_| ServerError::Io)?;
+        let endpoint = crate::h3_server::OwnTlsEndpoint::bind(udp_addr, h3_config.clone())
+            .map_err(|_| ServerError::Io)?;
         let mut context = ServerContext::with_limits(
             inbound,
             &document.server.policy,
@@ -3850,10 +3849,9 @@ async fn run_reality_document_inner(
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             loaded_identities.push(material.identity.clone());
             let acceptor = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
-            let endpoint =
-                crate::h3_server::OwnTlsConfig::new(material.certs, material.key)
-                    .and_then(|tls| crate::h3_server::OwnTlsEndpoint::bind(udp_addr, tls))
-                    .map_err(|_| ServerError::Tls)?;
+            let endpoint = crate::h3_server::OwnTlsConfig::new(material.certs, material.key)
+                .and_then(|tls| crate::h3_server::OwnTlsEndpoint::bind(udp_addr, tls))
+                .map_err(|_| ServerError::Tls)?;
             ready.push(Ready::Plain(
                 listener,
                 acceptor,
@@ -4017,13 +4015,12 @@ async fn run_document_with_config(
             crate::tcp_bbr::Error::Network => ServerError::Io,
             crate::tcp_bbr::Error::Unavailable => ServerError::TcpControllerUnavailable,
         })?;
-        let endpoint =
-            crate::h3_server::OwnTlsConfig::new(material.certs, material.key)
-                    .and_then(|tls| crate::h3_server::OwnTlsEndpoint::bind(udp_addr, tls))
-                .map_err(|error| match error {
-                    crate::quic_transport::QuicError::Bind => ServerError::Io,
-                    _ => ServerError::Tls,
-                })?;
+        let endpoint = crate::h3_server::OwnTlsConfig::new(material.certs, material.key)
+            .and_then(|tls| crate::h3_server::OwnTlsEndpoint::bind(udp_addr, tls))
+            .map_err(|error| match error {
+                crate::quic_transport::QuicError::Bind => ServerError::Io,
+                _ => ServerError::Tls,
+            })?;
         let mut context = ServerContext::with_limits(
             inbound,
             &policy,

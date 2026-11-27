@@ -11,7 +11,9 @@ pub(crate) struct Lease {
 impl Lease {
     #[cfg(target_os = "linux")]
     pub(crate) fn retain<T: Send + Sync + 'static>(resource: T) -> Self {
-        Self { _resource: Some(Box::new(resource)) }
+        Self {
+            _resource: Some(Box::new(resource)),
+        }
     }
 }
 
@@ -22,18 +24,27 @@ pub(crate) trait Registrar: Send + Sync {
 
 tokio::task_local! { static CURRENT: Arc<dyn Registrar>; }
 
-pub(crate) async fn scope<T>(registrar: Option<Arc<dyn Registrar>>, future: impl Future<Output = T>) -> T {
+pub(crate) async fn scope<T>(
+    registrar: Option<Arc<dyn Registrar>>,
+    future: impl Future<Output = T>,
+) -> T {
     match registrar {
         Some(registrar) => CURRENT.scope(registrar, future).await,
         None => future.await,
     }
 }
-pub(crate) fn active() -> bool { CURRENT.try_with(|_| ()).is_ok() }
+pub(crate) fn active() -> bool {
+    CURRENT.try_with(|_| ()).is_ok()
+}
 pub(crate) fn tcp(socket: &TcpSocket, peer: SocketAddr) -> io::Result<Lease> {
-    CURRENT.try_with(|r| r.tcp(socket, peer)).unwrap_or_else(|_| Ok(Lease::default()))
+    CURRENT
+        .try_with(|r| r.tcp(socket, peer))
+        .unwrap_or_else(|_| Ok(Lease::default()))
 }
 pub(crate) fn udp(socket: &UdpSocket, peer: SocketAddr) -> io::Result<Lease> {
-    CURRENT.try_with(|r| r.udp(socket, peer)).unwrap_or_else(|_| Ok(Lease::default()))
+    CURRENT
+        .try_with(|r| r.udp(socket, peer))
+        .unwrap_or_else(|_| Ok(Lease::default()))
 }
 
 #[cfg(test)]
@@ -41,8 +52,12 @@ mod tests {
     use super::*;
     struct Refuse;
     impl Registrar for Refuse {
-        fn tcp(&self, _: &TcpSocket, _: SocketAddr) -> io::Result<Lease> { Err(io::ErrorKind::PermissionDenied.into()) }
-        fn udp(&self, _: &UdpSocket, _: SocketAddr) -> io::Result<Lease> { Err(io::ErrorKind::PermissionDenied.into()) }
+        fn tcp(&self, _: &TcpSocket, _: SocketAddr) -> io::Result<Lease> {
+            Err(io::ErrorKind::PermissionDenied.into())
+        }
+        fn udp(&self, _: &UdpSocket, _: SocketAddr) -> io::Result<Lease> {
+            Err(io::ErrorKind::PermissionDenied.into())
+        }
     }
     #[tokio::test]
     async fn scoped_denial_never_leaks_to_other_tasks() {
@@ -53,7 +68,8 @@ mod tests {
             assert!(active());
             assert!(tcp(&socket, peer).is_err());
             assert!(!tokio::spawn(async { active() }).await.unwrap());
-        }).await;
+        })
+        .await;
         assert!(!active());
         assert!(tcp(&socket, peer).is_ok());
     }

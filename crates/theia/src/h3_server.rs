@@ -40,7 +40,9 @@ pub(crate) struct OwnTlsConfig {
 impl OwnTlsConfig {
     pub(crate) fn from_native(mut native: rustls::ServerConfig) -> Self {
         native.send_tls13_tickets = 0;
-        Self { native: Arc::new(native) }
+        Self {
+            native: Arc::new(native),
+        }
     }
 
     pub(crate) fn new(
@@ -104,10 +106,7 @@ impl OwnTlsEndpoint {
         }
     }
 
-    pub(crate) async fn serve(
-        self,
-        context: Arc<ServerContext>,
-    ) -> Result<(), ServerError> {
+    pub(crate) async fn serve(self, context: Arc<ServerContext>) -> Result<(), ServerError> {
         let (_owner, phase) = watch::channel(GenerationPhase::Active);
         self.serve_generation(context, phase).await
     }
@@ -118,7 +117,12 @@ impl OwnTlsEndpoint {
         mut phase: watch::Receiver<GenerationPhase>,
     ) -> Result<(), ServerError> {
         match self {
-            Self::Native { socket, config, scope, local } => {
+            Self::Native {
+                socket,
+                config,
+                scope,
+                local,
+            } => {
                 if !server::await_generation_activation(&mut phase).await {
                     return Ok(());
                 }
@@ -127,7 +131,8 @@ impl OwnTlsEndpoint {
                     .map_err(|_| ServerError::Io)?
                     .take()
                     .ok_or(ServerError::Io)?;
-                let socket = tokio::net::UdpSocket::from_std(socket).map_err(|_| ServerError::Io)?;
+                let socket =
+                    tokio::net::UdpSocket::from_std(socket).map_err(|_| ServerError::Io)?;
                 if socket.local_addr().map_err(|_| ServerError::Io)? != local {
                     return Err(ServerError::Io);
                 }
@@ -135,7 +140,6 @@ impl OwnTlsEndpoint {
             }
         }
     }
-
 }
 
 async fn serve_native_generation(
@@ -185,7 +189,10 @@ async fn serve_native_generation(
             }
         }
     }
-    listener.stop_accepting().await.map_err(|_| ServerError::Io)?;
+    listener
+        .stop_accepting()
+        .await
+        .map_err(|_| ServerError::Io)?;
     crate::diag!(Info, "server.h3", "generation_draining");
     let _ = timeout(server::GENERATION_DRAIN, async {
         while !connections.is_empty() {
@@ -196,7 +203,8 @@ async fn serve_native_generation(
                 }
             }
         }
-    }).await;
+    })
+    .await;
     connections.abort_all();
     while connections.join_next().await.is_some() {}
     Ok(())
@@ -210,7 +218,8 @@ mod endpoint_tests {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
         let config = OwnTlsConfig::new(vec![cert.cert.der().clone()], key.into()).unwrap();
-        let endpoint = OwnTlsEndpoint::bind("127.0.0.1:0".parse().unwrap(), config.clone()).unwrap();
+        let endpoint =
+            OwnTlsEndpoint::bind("127.0.0.1:0".parse().unwrap(), config.clone()).unwrap();
         let OwnTlsEndpoint::Native { local, socket, .. } = &endpoint;
         let address = *local;
         assert!(std::net::UdpSocket::bind(address).is_err());
@@ -225,7 +234,10 @@ mod endpoint_tests {
 }
 
 /// Start the native server on a previously prepared UDP bind.
-pub async fn serve(endpoint: OwnTlsEndpoint, context: Arc<ServerContext>) -> Result<(), ServerError> {
+pub async fn serve(
+    endpoint: OwnTlsEndpoint,
+    context: Arc<ServerContext>,
+) -> Result<(), ServerError> {
     endpoint.serve(context).await
 }
 

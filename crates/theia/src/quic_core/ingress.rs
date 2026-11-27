@@ -250,27 +250,48 @@ impl Ingress {
     /// must still pass the outer REALITY classifier; never issue Retry/VN
     /// on the passive reference branch.
     pub(crate) fn known(&self, cid: &[u8]) -> bool {
-        <Cid>::try_from(cid).ok().is_some_and(|id| !self.available(id))
+        <Cid>::try_from(cid)
+            .ok()
+            .is_some_and(|id| !self.available(id))
     }
 
     /// The immutable TLS route was selected by the outer admission guard.
     /// This allocates an unvalidated path, not a Retry proof. The handshake
     /// retains its anti-amplification budget until protected Handshake data.
-    pub(crate) fn admit_initial(&mut self, peer: SocketAddr, version: Version,
-        original: &[u8], client: &[u8], now: u64) -> Result<(u64, Binding), Error> {
+    pub(crate) fn admit_initial(
+        &mut self,
+        peer: SocketAddr,
+        version: Version,
+        original: &[u8],
+        client: &[u8],
+        now: u64,
+    ) -> Result<(u64, Binding), Error> {
         self.tick(now)?;
-        if !self.accepting || !self.versions.supports(version)
-            || peer.port() == 0 || !(8..=20).contains(&original.len())
-            || client.is_empty() || client.len() > 20
-            || original.iter().all(|&b| b == 0) || client.iter().all(|&b| b == 0)
-            || self.known(original) || self.occupied >= self.limit
+        if !self.accepting
+            || !self.versions.supports(version)
+            || peer.port() == 0
+            || !(8..=20).contains(&original.len())
+            || client.is_empty()
+            || client.len() > 20
+            || original.iter().all(|&b| b == 0)
+            || client.iter().all(|&b| b == 0)
+            || self.known(original)
+            || self.occupied >= self.limit
             || self.owners.len() >= self.connection_limit
-            || self.source_limit.is_some_and(|limit| self.owner_sources.values().filter(|&&ip| ip == peer.ip()).count() >= limit)
+            || self.source_limit.is_some_and(|limit| {
+                self.owner_sources
+                    .values()
+                    .filter(|&&ip| ip == peer.ip())
+                    .count()
+                    >= limit
+            })
         {
             return Err(Error::Limit);
         }
         let cid = self.fresh_cid(original)?;
-        if cid.as_slice() == client { return Err(Error::Limit); }
+        if cid.as_slice() == client {
+            return Err(Error::Limit);
+        }
         let owner = self.next_owner;
         let next = owner.checked_add(1).ok_or(Error::Limit)?;
         self.routes.register(cid, owner).map_err(|_| Error::Limit)?;
@@ -278,22 +299,46 @@ impl Ingress {
         self.owner_sources.insert(owner, peer.ip());
         self.next_owner = next;
         self.occupied += 1;
-        Ok((owner, Binding { version, original: original.to_vec(), retry: cid, client: client.to_vec() }))
+        Ok((
+            owner,
+            Binding {
+                version,
+                original: original.to_vec(),
+                retry: cid,
+                client: client.to_vec(),
+            },
+        ))
     }
 
-    pub(crate) fn existing(&mut self, data: &[u8], peer: SocketAddr, now: u64) -> Result<Action, Error> {
+    pub(crate) fn existing(
+        &mut self,
+        data: &[u8],
+        peer: SocketAddr,
+        now: u64,
+    ) -> Result<Action, Error> {
         self.tick(now)?;
-        let Ok(packets) = datagram::split(data) else { return Ok(Action::Drop); };
-        let Some(head) = packets.first() else { return Ok(Action::Drop); };
-        if matches!(head.kind, PacketKind::Retry | PacketKind::VersionNegotiation) {
+        let Ok(packets) = datagram::split(data) else {
+            return Ok(Action::Drop);
+        };
+        let Some(head) = packets.first() else {
+            return Ok(Action::Drop);
+        };
+        if matches!(
+            head.kind,
+            PacketKind::Retry | PacketKind::VersionNegotiation
+        ) {
             return Ok(Action::Drop);
         }
-        let Ok(cid) = <Cid>::try_from(head.destination) else { return Ok(Action::Drop); };
+        let Ok(cid) = <Cid>::try_from(head.destination) else {
+            return Ok(Action::Drop);
+        };
         if let Some(owner) = self.routes.owner(cid) {
             return Ok(Action::Existing(owner));
         }
-        if head.kind == PacketKind::Application && self.retired.contains_key(&cid)
-            && self.reply_budget.permit(peer.ip(), now) {
+        if head.kind == PacketKind::Application
+            && self.retired.contains_key(&cid)
+            && self.reply_budget.permit(peer.ip(), now)
+        {
             return self.retired_reset(cid, data.len());
         }
         Ok(Action::Drop)

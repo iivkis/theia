@@ -54,9 +54,14 @@ pub(crate) fn server_config(
     certificates: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<quinn::ServerConfig, QuicError> {
-    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_protocol_versions(&[&rustls::version::TLS13]).map_err(|_| QuicError::Configuration)?
-        .with_no_client_auth().with_single_cert(certificates, key).map_err(|_| QuicError::Configuration)?;
+    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .map_err(|_| QuicError::Configuration)?
+    .with_no_client_auth()
+    .with_single_cert(certificates, key)
+    .map_err(|_| QuicError::Configuration)?;
     tls.alpn_protocols = vec![b"h3".to_vec()];
     server_from_tls(tls)
 }
@@ -72,9 +77,13 @@ fn client_config(roots: RootCertStore) -> Result<quinn::ClientConfig, QuicError>
     if roots.is_empty() {
         return Err(QuicError::Configuration);
     }
-    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_protocol_versions(&[&rustls::version::TLS13]).map_err(|_| QuicError::Configuration)?
-        .with_root_certificates(roots).with_no_client_auth();
+    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .map_err(|_| QuicError::Configuration)?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
     tls.alpn_protocols = vec![b"h3".to_vec()];
     client_from_tls(tls)
 }

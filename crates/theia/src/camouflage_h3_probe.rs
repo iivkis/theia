@@ -44,7 +44,9 @@ pub struct H3ProbeReport {
 fn map_error(error: dial::Error) -> H3ProbeError {
     match error {
         dial::Error::Bind => H3ProbeError::BindFailed,
-        dial::Error::Unreachable | dial::Error::EndpointNetworkRefused => H3ProbeError::UdpUnavailable,
+        dial::Error::Unreachable | dial::Error::EndpointNetworkRefused => {
+            H3ProbeError::UdpUnavailable
+        }
         dial::Error::Timeout => H3ProbeError::TimedOut,
         dial::Error::Configuration | dial::Error::Handshake => H3ProbeError::HandshakeRejected,
     }
@@ -86,12 +88,19 @@ pub async fn probe_quic_h3(
             .map_err(|_| H3ProbeError::BindFailed)?;
         let name = ServerName::try_from(request.server_name)
             .map_err(|_| H3ProbeError::InvalidServerName)?;
-        let tls = crate::transport_policy::Carrier::H3.client_tls(roots)
+        let tls = crate::transport_policy::Carrier::H3
+            .client_tls(roots)
             .map_err(|_| H3ProbeError::HandshakeRejected)?;
         let (_, session) = dial::connect(
-            request.address, name, std::sync::Arc::new(tls), None,
-            VersionPolicy::exact(Version::V1), deadline,
-        ).await.map_err(map_error)?;
+            request.address,
+            name,
+            std::sync::Arc::new(tls),
+            None,
+            VersionPolicy::exact(Version::V1),
+            deadline,
+        )
+        .await
+        .map_err(map_error)?;
         if session.peer_addr() != request.address {
             return Err(H3ProbeError::WrongPeer);
         }
@@ -136,7 +145,7 @@ pub async fn probe_quic_h3_native(
     source: IpAddr,
     version: crate::quic_core::wire::Version,
 ) -> Result<NativeH3ProbeReport, H3ProbeError> {
-     if !approval.allows(request.address) {
+    if !approval.allows(request.address) {
         return Err(H3ProbeError::NotApproved);
     }
     if request.deadline.is_zero() {
@@ -160,9 +169,15 @@ pub async fn probe_quic_h3_native(
             .client_tls(roots)
             .map_err(|_| H3ProbeError::HandshakeRejected)?;
         let (actual, session) = dial::connect(
-            request.address, name, std::sync::Arc::new(tls), Some(SocketAddr::new(source, 0)),
-            VersionPolicy::exact(version), request.deadline.min(MAX_HANDSHAKE_DEADLINE),
-        ).await.map_err(map_error)?;
+            request.address,
+            name,
+            std::sync::Arc::new(tls),
+            Some(SocketAddr::new(source, 0)),
+            VersionPolicy::exact(version),
+            request.deadline.min(MAX_HANDSHAKE_DEADLINE),
+        )
+        .await
+        .map_err(map_error)?;
         if actual != version || session.peer_addr() != request.address {
             return Err(H3ProbeError::WrongPeer);
         }
