@@ -742,7 +742,7 @@ impl Engine {
     /// Explicit, bounded diagnostic only. No strategy cache publication or policy override.
     pub(crate) async fn diagnostic_tcp_strategies(
         &self, name: &str, ips: &[IpAddr], pin: &PolicyLease,
-    ) -> Result<Vec<(String, &'static str, u128)>, ClientError> {
+    ) -> Result<Vec<(String, crate::net::error::ProbeVerdict, u128)>, ClientError> {
         pin.check_owner(&self.policy)?;
         if !self.enabled() || ips.is_empty() { return Ok(Vec::new()); }
         if ips.len() > 64 || !ips.iter().all(|ip| crate::server::allowed_destination(*ip, false)) {
@@ -770,14 +770,12 @@ impl Engine {
             pin.check()?;
             if !self.key_live(&key) { return Err(stale_policy()); }
             use tls::ProbeVerdict::*;
-            let status = match verdict {
-                Verified => "TLS подтверждён",
-                StrategyFailed => "не сработала",
-                Unavailable => "недоступно",
+            match verdict {
                 IdentityRejected => return Err(ClientError::Tls),
                 Denied => return Err(stale_policy()),
-            };
-            results.push((format!("{strategy:?} {}", if ip.is_ipv4() { "IPv4" } else { "IPv6" }), status, started.elapsed().as_millis()));
+                Verified | StrategyFailed | Unavailable => {}
+            }
+            results.push((format!("{strategy:?} {}", if ip.is_ipv4() { "IPv4" } else { "IPv6" }), verdict, started.elapsed().as_millis()));
         }
         }
         Ok(results)

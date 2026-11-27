@@ -1113,8 +1113,8 @@ pub(crate) async fn connect_diagnostic_socket(
     name: ServerName<'static>,
     version: Version,
 ) -> Result<LabSession, Error> {
-    let local = socket.local_addr()?;
-    if !super::loopback_pair(local, peer) || socket.peer_addr()? != peer {
+    let local = socket.local_addr().map_err(Error::Io)?;
+    if !super::loopback_pair(local, peer) || socket.peer_addr().map_err(Error::Io)? != peer {
         return Err(Error::Scope);
     }
     let cid = super::negotiation::random_cid().map_err(|_| Error::Protocol)?;

@@ -766,6 +766,7 @@ struct RoutingPanel {
     settings: crate::routing::Settings,
     original: crate::routing::Settings,
     search: Option<String>,
+    diagnostic_input: Option<String>,
     geodata_mode: bool,
     selected: usize,
     fields: Option<(Option<usize>, [String; 5], usize)>,
@@ -802,6 +803,7 @@ impl RoutingPanel {
             original: settings.clone(),
             settings,
             search: None,
+            diagnostic_input: None,
             geodata_mode: false,
             selected: 0,
             fields: None,
@@ -848,6 +850,12 @@ impl RoutingPanel {
         self.message.clear();
     }
     fn paste(&mut self, input: &str) {
+        if let Some(value) = &mut self.diagnostic_input {
+            if value.len().saturating_add(input.len()) <= 4096 && input.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b',' | b' ' | b'\n' | b'\r' | b'\t')) {
+                value.push_str(input);
+            }
+            return;
+        }
         if let Some((_, fields, focus)) = &mut self.fields {
             let input = input.trim_end_matches(['\r', '\n']);
             if !input.chars().any(char::is_control)
@@ -955,6 +963,7 @@ impl RoutingPanel {
             items.push(ActionItem { key: 'D', label: "Удалить правило из черновика" });
         }
         items.push(ActionItem { key: 'B', label: "Управление базами GeoData" });
+        items.push(ActionItem { key: 'G', label: "Домены диагностики клиентов" });
         if count > 1 {
             items.push(ActionItem { key: '/', label: "Найти правило" });
         }
@@ -994,6 +1003,10 @@ impl RoutingPanel {
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, active: bool) {
+        if let Some(value) = &self.diagnostic_input {
+            panel(frame, area, "Домены диагностики клиентов", &format!("1–16 доменов через запятую.\n{value}▏\nCtrl+U очистить · Enter принять в черновик · Esc отменить\n{}", self.message), true);
+            return;
+        }
         if let Some(form) = self.form() {
             form.render(frame, area, "Редактирование правила");
             return;
@@ -1081,6 +1094,23 @@ impl RoutingPanel {
     // true keeps the draft open; false returns to the workspace.
     fn key(&mut self, mut key: KeyEvent, editor: Option<&mut Editor>) -> bool {
         if self.download.is_some() {
+            return true;
+        }
+        if let Some(mut value) = self.diagnostic_input.take() {
+            match key.code {
+                KeyCode::Esc => { self.message.clear(); }
+                KeyCode::Enter => {
+                    if let Some(domains) = crate::tui_profile_diagnostics::parse_domains(&value) {
+                        self.settings.diagnostic_domains = domains;
+                        self.message = "Домены изменены в черновике. Сохраните изменения.".into();
+                    } else { self.message = "Некорректный список доменов.".into(); self.diagnostic_input = Some(value); }
+                }
+                KeyCode::Backspace => { value.pop(); self.diagnostic_input = Some(value); }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => self.diagnostic_input = Some(String::new()),
+                KeyCode::Char(c) if c.is_ascii() && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) && value.len() < 4096
+                    && (c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ',' | ' ')) => { value.push(c); self.diagnostic_input = Some(value); }
+                _ => self.diagnostic_input = Some(value),
+            }
             return true;
         }
         if let Some(mut query) = self.search.take() {
@@ -1216,6 +1246,7 @@ impl RoutingPanel {
         }
         match key.code {
             KeyCode::Char('B') => { self.geodata_mode = true; self.action_focus = Some(0); }
+            KeyCode::Char('G') => { self.diagnostic_input = Some(self.settings.diagnostic_domains.join(", ")); self.message.clear(); }
             KeyCode::Esc => return false,
             KeyCode::Up => self.selected = self.selected.saturating_sub(1),
             KeyCode::Down => self.selected = (self.selected + 1).min(len.saturating_sub(1)),
@@ -3068,7 +3099,7 @@ impl Interaction {
         }
         if let Some(mut panel) = self.routing_panel.take() {
             if key.code == KeyCode::Char('s') && key.modifiers == KeyModifiers::CONTROL
-                && panel.fields.is_none() && panel.search.is_none() {
+                && panel.fields.is_none() && panel.search.is_none() && panel.diagnostic_input.is_none() {
                 key = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
             }
             if panel.key(key, self.editor.as_mut()) {
@@ -5985,12 +6016,12 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         _ if interaction.is_some_and(|ui| ui.saving.is_some()) => "Файл: сохранение…",
         Some(e) if e.write_uncertain() => "Файл: запись не подтверждена",
         Some(_) if interaction.is_some_and(|ui| ui.routing_panel.as_ref().is_some_and(|p| p.settings != p.original)) => "Файл: есть несохранённые правила",
-        Some(_) if interaction.is_some_and(|ui| ui.routing_panel.as_ref().is_some_and(|p| p.fields.is_some())) => "Файл: редактируется правило",
+        Some(_) if interaction.is_some_and(|ui| ui.routing_panel.as_ref().is_some_and(|p| p.fields.is_some() || p.diagnostic_input.is_some())) => "Файл: редактируется маршрутизация",
         Some(e) if e.dirty() => "Файл: не сохранён · Ctrl+S сохранить",
         Some(_) => "Файл: сохранён",
         None => "Файл: не открыт",
     };
-    let applied = if model.screen == Screen::Server && !interaction.is_some_and(|ui| ui.routing_panel.as_ref().is_some_and(|p| p.settings != p.original || p.fields.is_some())) {
+    let applied = if model.screen == Screen::Server && !interaction.is_some_and(|ui| ui.routing_panel.as_ref().is_some_and(|p| p.settings != p.original || p.fields.is_some() || p.diagnostic_input.is_some())) {
         interaction
             .and_then(|ui| ui.last_apply)
             .and_then(|(digest, kind, revision)| {
@@ -6481,8 +6512,8 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             interaction.map_or(0, |u| u.modal_action),
             viewport,
         );
-    } else if let Some(panel) = interaction.and_then(|ui| ui.profile_diagnostics.as_ref()) {
-        panel.render(frame, parts[1]);
+    } else if interaction.is_some_and(|ui| ui.profile_diagnostics.is_some()) {
+        draw_workspace(frame, parts[1], Role::Client, interaction.and_then(|ui| ui.editor.as_ref()), 0, interaction);
     } else if let Some(probe) = interaction.and_then(|ui| ui.probe.as_ref()) {
         diagnostic_report(
             frame,
@@ -7519,6 +7550,7 @@ fn draw_page(
         }
     }
     if role == Role::Client && page == 7 {
+        if let Some(panel) = ui.and_then(|u| u.profile_diagnostics.as_ref()) { panel.render(frame, area); return; }
         let body = format!("Профиль: {}\nПроверка сервера, H2/H3, TCP Anti-DPI и XHTTP. Системный прокси не изменяется. Выберите профиль и запустите проверку.", editor.selected_record_id());
         if let Some([report, controls]) = page_layout_for(area, role, page, Some(editor), 0, false) {
             panel(frame, report, "Диагностика профиля", &body, false);

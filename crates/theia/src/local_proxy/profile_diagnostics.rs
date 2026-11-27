@@ -13,11 +13,22 @@ pub(crate) enum CheckKind {
 #[derive(Clone, Debug)]
 pub(crate) enum Outcome {
     Verified(u128), Failure(ClientError), Skipped(&'static str), Route(Action),
-    Tls(&'static str, u128), Http(u16, ActualRoute, u128), Udp(u16, u128), Proxy(u8, bool, u8),
+    Tls(crate::net::error::ProbeVerdict, u128), Http(u16, ActualRoute, u128), Udp(u16, u128), Proxy(u8, bool, u8),
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum FallbackCause { BeforeFirstSend, Disabled, NoLocalRoute }
+impl std::fmt::Display for FallbackCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::BeforeFirstSend => "до первой отправки",
+            Self::Disabled => "Anti-DPI отключён",
+            Self::NoLocalRoute => "локальный маршрут не выбран",
+        })
+    }
 }
 #[derive(Clone, Debug)]
 pub(crate) enum ActualRoute {
-    Direct, AntiDpi(&'static str), Xhttp { carrier: &'static str, mode: &'static str, fallback: Option<&'static str> },
+    Direct, AntiDpi(&'static str), Xhttp { carrier: &'static str, mode: &'static str, fallback: Option<FallbackCause> },
     SystemProxy,
 }
 impl std::fmt::Display for ActualRoute {
@@ -55,7 +66,13 @@ impl Check {
             Outcome::Failure(error) => format!("ошибка: {error}"),
             Outcome::Skipped(reason) => format!("не проверен: {reason}"),
             Outcome::Route(action) => action.name().to_owned(),
-            Outcome::Tls(status, ms) => format!("{status}, {ms} мс"),
+            Outcome::Tls(status, ms) => format!("{}, {ms} мс", match status {
+                crate::net::error::ProbeVerdict::Verified => "TLS подтверждён",
+                crate::net::error::ProbeVerdict::StrategyFailed => "стратегия не сработала",
+                crate::net::error::ProbeVerdict::Unavailable => "проба недоступна",
+                crate::net::error::ProbeVerdict::IdentityRejected => "идентичность отклонена",
+                crate::net::error::ProbeVerdict::Denied => "запрещено",
+            }),
             Outcome::Http(status, route, ms) => format!("HTTP {status}, {route}, {ms} мс"),
             Outcome::Udp(status, ms) => format!("QUIC v1 + HTTP/3 {status}, {ms} мс"),
             Outcome::Proxy(phase, ready, applied) => format!("фаза {phase}, listeners {}, настройки {}", if *ready { "готовы" } else { "не готовы" }, match applied { 1 => "подтверждены", 0 => "не применены", _ => "не подтверждены" }),
@@ -69,7 +86,7 @@ impl Check {
     }
     pub(crate) fn failed(&self) -> bool {
         matches!(self.outcome, Outcome::Failure(_) | Outcome::Http(400..=599, _, _) | Outcome::Udp(400..=599, _))
-            || matches!(&self.outcome, Outcome::Tls(status, _) if *status != "TLS подтверждён")
+            || matches!(&self.outcome, Outcome::Tls(status, _) if *status != crate::net::error::ProbeVerdict::Verified)
     }
 }
 pub(crate) enum Event { Line(String), Check(Check), Domains(Vec<String>), DomainDone(String), Done(Result<(), ClientError>) }
@@ -233,12 +250,12 @@ async fn session(
         if action == Action::DirectDpi {
             match cache.dpi.diagnostic_tcp_strategies(&domain, &ips, &pin).await {
                 Ok(results) => {
-                    if results.is_empty() { emit(tx, "TCP Anti-DPI: нет разрешённых/доступных проб")?; }
+                    if results.is_empty() { record(tx, Some(&domain), CheckKind::Strategy("TCP Anti-DPI".into()), Outcome::Skipped("нет разрешённых/доступных проб"))?; }
                     for (strategy, status, ms) in results { record(tx, Some(&domain), CheckKind::Strategy(strategy), Outcome::Tls(status, ms))?; }
                 }
                 Err(e) => { record(tx, Some(&domain), CheckKind::Strategy("TCP Anti-DPI".into()), Outcome::Failure(e))?; if protective(e) { return Err(e); } continue; }
             }
-        } else { emit(tx, "TCP Anti-DPI: не назначен правилами")?; }
+        } else { record(tx, Some(&domain), CheckKind::Strategy("TCP Anti-DPI".into()), Outcome::Skipped("не назначен правилами"))?; }
         let result = https(&carrier, cache, &domain, expected, true, action, tls.clone()).await;
         match result {
             Ok((code, route, ms)) => {
@@ -337,7 +354,7 @@ async fn https(carrier: &Carrier, cache: &super::Cache, name: &str, digest: [u8;
         cache.policy.pin(digest)?.check()?;
         let code = observed.load(Ordering::Relaxed);
         let fallback = if allow_dpi && action == Action::DirectDpi {
-            Some(if strategy.is_some() { "до первой отправки" } else if !cache.dpi.enabled() { "Anti-DPI отключён" } else { "локальный маршрут не выбран" })
+            Some(if strategy.is_some() { FallbackCause::BeforeFirstSend } else if !cache.dpi.enabled() { FallbackCause::Disabled } else { FallbackCause::NoLocalRoute })
         } else { None };
         let route = match code >> 2 {
             2 => ActualRoute::Xhttp { carrier: "H2", mode: xhttp_observation(code & 3), fallback },
@@ -396,7 +413,7 @@ async fn proxy_lifecycle(doc: &config::ClientDocument, id: &str, digest: [u8; 32
 async fn check_proxy(instance: &crate::management::ProxyLifecycle, digest: [u8; 32]) -> Result<(), ClientError> {
     use crate::management::{StatusCommand, StatusReply};
     match timeout(Duration::from_secs(3), crate::management::query_client_environment(StatusCommand::ClientLifecycle)).await {
-        Ok(Ok(StatusReply::ClientLifecycle(view))) if view.instance == instance.instance && view.config_sha256 == digest
+        Ok(Ok(StatusReply::ClientLifecycle(view))) if view.instance == instance.instance && view.revision == instance.revision && view.config_sha256 == digest
             && view.phase == 2 && view.listeners_ready && view.proxy_applied == 1 => Ok(()),
         _ => Err(ClientError::Configuration),
     }
