@@ -1664,15 +1664,14 @@ impl ClientRuntime {
     /// Pin exactly the published client generation for native capture.
     /// A structural or profile update needs explicit stop/recovery until
     /// carrier and rule changes can be committed in one platform transaction.
-    async fn attach_native(self: &Arc<Self>) -> Result<NativeIngress, ClientError> {
+    async fn attach_native(self: &Arc<Self>, owner: NativeOwner, registrar: Option<Arc<dyn crate::routing::carrier_socket::Registrar>>) -> Result<NativeIngress, ClientError> {
         let _stage = self.stage.try_lock().map_err(|_| ClientError::Configuration)?;
         if *self.stopped.borrow() || self.native_attached.load(std::sync::atomic::Ordering::Acquire) {
             return Err(ClientError::Configuration);
         }
         let view = self.slot.borrow().clone();
         saved_client_bytes(&self.path, view.digest)?;
-        let owner = NativeOwner::acquire()?;
-        view.client.routing_policy().await?;
+        crate::routing::carrier_socket::scope(registrar.clone(), view.client.routing_policy()).await?;
         saved_client_bytes(&self.path, view.digest)?;
         if *self.stopped.borrow() { return Err(ClientError::Configuration); }
         self.native_attached.store(true, std::sync::atomic::Ordering::Release);
@@ -1680,7 +1679,7 @@ impl ClientRuntime {
             runtime: self.clone(),
             client: view.client.clone(),
             revision: view.revision,
-            registrar: Mutex::new(None),
+            registrar: Mutex::new(registrar),
             verdict_gate: Mutex::new(()),
             #[cfg(target_os = "linux")]
             raw: Mutex::new(std::collections::HashMap::new()),
@@ -2030,6 +2029,7 @@ impl NativeIngress {
     /// Preflight only; the caller owns an isolated network namespace/rule
     /// transaction. No new CLI or second system interception mode.
     pub async fn prepare(path: &Path) -> Result<Self, ClientError> {
+        let owner = NativeOwner::acquire()?;
         let raw = zeroize::Zeroizing::new(config::editor_bytes(path).map_err(|_| ClientError::Configuration)?);
         let Config::Client(document) = config::parse(std::str::from_utf8(&raw).map_err(|_| ClientError::Configuration)?)
             .map_err(|_| ClientError::Configuration)? else { return Err(ClientError::Configuration); };
@@ -2038,7 +2038,7 @@ impl NativeIngress {
         let client = prepare_client(&document, path).await?;
         saved_client_bytes(path, digest)?;
         let runtime = ClientRuntime::new(std::path::absolute(path).map_err(|_| ClientError::Configuration)?, document, digest, client);
-        runtime.attach_native().await
+        runtime.attach_native(owner, None).await
     }
 
     /// Cancels all native relay operations, retires the policy lease and
@@ -2081,9 +2081,6 @@ impl NativeIngress {
         rules: crate::routing::linux_rules::LabRules,
         host_namespace: std::fs::File,
     ) -> Result<(), ClientError> {
-        struct StopOnDrop<'a>(&'a NativeIngress);
-        impl Drop for StopOnDrop<'_> { fn drop(&mut self) { self.0.shutdown(); } }
-        let _stop = StopOnDrop(self);
         self.ensure_running()?;
         if !rules.owns_queue(&queue).map_err(|_| ClientError::Io)? { return Err(ClientError::Configuration); }
         let rules = Arc::new(Mutex::new(rules));
@@ -2093,6 +2090,21 @@ impl NativeIngress {
             if slot.is_some() { return Err(ClientError::Configuration); }
             *slot = Some(registrar.clone());
         }
+        self.serve_linux_shared(queue, rules, registrar).await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn serve_linux_shared(
+        &self,
+        queue: crate::routing::nfqueue::Queue,
+        rules: Arc<Mutex<crate::routing::linux_rules::LabRules>>,
+        registrar: Arc<dyn crate::routing::carrier_socket::Registrar>,
+    ) -> Result<(), ClientError> {
+        struct StopOnDrop<'a>(&'a NativeIngress);
+        impl Drop for StopOnDrop<'_> { fn drop(&mut self) { self.0.shutdown(); } }
+        let _stop = StopOnDrop(self);
+        self.ensure_running()?;
+        if !rules.lock().map_err(|_| ClientError::Configuration)?.owns_queue(&queue).map_err(|_| ClientError::Io)? { return Err(ClientError::Configuration); }
         let mut queue = queue.into_async().map_err(|_| ClientError::Io)?;
         let consume = async {
             loop {
@@ -2109,6 +2121,72 @@ impl NativeIngress {
             result=crate::routing::carrier_socket::scope(Some(registrar.clone()), self.runtime.maintain())=>result,
             result=crate::routing::carrier_socket::scope(Some(registrar), consume)=>result,
         }
+    }
+
+    /// End-to-end managed startup for a dedicated Linux laboratory
+    /// namespace. This is intentionally not exposed as the product's
+    /// Connect action: transparent Redirect and attribution are incomplete.
+    /// No preflight carrier is opened before the registrar is in scope.
+    /// A failed or cancelled run leaves the fail-closed table and durable
+    /// journal intact. Only an explicit successful Stop may restore rules.
+    #[cfg(target_os = "linux")]
+    pub async fn run_linux_lab(
+        path: &Path,
+        host_namespace: std::fs::File,
+        journal: &Path,
+        queue_number: u16,
+        stop: impl std::future::Future<Output = std::io::Result<()>>,
+    ) -> Result<(), ClientError> {
+        use crate::routing::{carrier_socket, linux_rules::{self, LabRegistrar, LabRules}, nfqueue::Queue};
+        use sha2::{Digest, Sha256};
+        // Namespace ownership must not move between executor threads.
+        if tokio::runtime::Handle::current().runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread {
+            return Err(ClientError::Configuration);
+        }
+        let owner = NativeOwner::acquire()?;
+        let path = std::path::absolute(path).map_err(|_| ClientError::Configuration)?;
+        let raw = zeroize::Zeroizing::new(config::editor_bytes(&path).map_err(|_| ClientError::Configuration)?);
+        let Config::Client(document) = config::parse(std::str::from_utf8(&raw).map_err(|_| ClientError::Configuration)?)
+            .map_err(|_| ClientError::Configuration)? else { return Err(ClientError::Configuration); };
+        let digest: [u8;32] = Sha256::digest(raw.as_slice()).into();
+        saved_client_bytes(&path, digest)?;
+        let queue = Queue::bind(queue_number, 256).map_err(|_| ClientError::Io)?;
+        let rules = Arc::new(Mutex::new(LabRules::install(&queue, &host_namespace, journal).map_err(|_| ClientError::Io)?));
+        let registrar: Arc<dyn carrier_socket::Registrar> = Arc::new(LabRegistrar::new(rules.clone(), host_namespace.try_clone().map_err(|_| ClientError::Io)?));
+        let client = carrier_socket::scope(Some(registrar.clone()), prepare_client(&document,&path)).await?;
+        saved_client_bytes(&path,digest)?;
+        let runtime = ClientRuntime::new(path,document,digest,client);
+        let ingress = runtime.attach_native(owner,Some(registrar.clone())).await?;
+        let control = crate::management::client_server(runtime.clone()).map_err(|_| ClientError::Configuration)?;
+        let management = async move {
+            match control {
+                Some(server) => server.serve().await.map_err(|_| ClientError::Io),
+                None => std::future::pending::<Result<(),ClientError>>().await,
+            }
+        };
+        let explicit = tokio::select! {
+            biased;
+            result=stop=>result.map_err(|_| ClientError::Io),
+            result=ingress.serve_linux_shared(queue,rules.clone(),registrar.clone())=>{
+                result?;
+                Err(ClientError::Io) // unexpected consumer exit, never auto restore
+            },
+            result=management=>{ result?; Err(ClientError::Io) }
+        };
+        ingress.shutdown();
+        drop(ingress);
+        drop(runtime);
+        drop(registrar);
+        explicit?;
+        // Connection drivers may release their socket leases asynchronously
+        // after abort. Never restore while a live carrier retains our rules.
+        timeout(Duration::from_secs(3), async {
+            while Arc::strong_count(&rules) != 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.map_err(|_| ClientError::Timeout)?;
+        drop(rules);
+        linux_rules::recover(&host_namespace,journal).map_err(|_| ClientError::Io)
     }
 
     /// Correlate a laboratory resolver link with protected DNS from the
