@@ -1266,11 +1266,18 @@ impl Carrier {
     }
 }
 
+struct RoutePlan {
+    snapshot: Arc<Snapshot>,
+    action: Action,
+    pinned: Option<Vec<IpAddr>>,
+    authorization: crate::routing::policy_lease::PolicyLease,
+}
+
 async fn route_decision(
     carrier: &Carrier,
     cache: &Cache,
     address: &Address,
-) -> Result<(Arc<Snapshot>, Action, Option<Vec<IpAddr>>), ClientError> {
+) -> Result<RoutePlan, ClientError> {
     let snapshot = cache.get(|known| carrier.fetch_routing(known)).await?;
     let authorization = cache.policy.pin(snapshot.digest())?;
     let policy = snapshot.policy();
@@ -1328,259 +1335,196 @@ async fn route_decision(
     // DNS preflight may have awaited network I/O; never return a superseded
     // policy as authorization to initiate an egress.
     authorization.check()?;
-    Ok((snapshot, action, pinned))
+    Ok(RoutePlan { snapshot, action, pinned, authorization })
 }
 
-async fn routed_open(
-    carrier: &Carrier,
-    cache: &Cache,
-    address: Address,
-    port: u16,
-    allow_dpi: bool,
-) -> Result<RoutedTcp, ClientError> {
-    let (snapshot, action, pinned) = route_decision(carrier, cache, &address).await?;
-    if action.packet_action() == crate::routing::PacketAction::Drop {
+/// Protocol-specific inputs do not own routing or authorization.
+#[derive(Clone, Copy)]
+enum EgressRequest<'a> {
+    Tcp { allow_dpi: bool },
+    Udp {
+        candidate: &'a crate::routing::dpi::udp::Candidate,
+        first: &'a [u8],
+        observed: &'a Arc<std::sync::atomic::AtomicU8>,
+    },
+}
+impl EgressRequest<'_> {
+    fn protocol(self) -> crate::routing::flow::Protocol {
+        match self { Self::Tcp { .. } => crate::routing::flow::Protocol::Tcp, Self::Udp { .. } => crate::routing::flow::Protocol::Udp }
+    }
+    async fn direct(self, address: Address, port: u16, pinned: Option<Vec<IpAddr>>) -> Result<RoutedEgress, ClientError> {
+        match self {
+            Self::Tcp { .. } => Ok(RoutedEgress::Tcp(ProxyTunnel::Direct(client_state::dial_direct(address, port, pinned).await?))),
+            Self::Udp { .. } => Ok(RoutedEgress::Udp(crate::udp_relay::Tunnel::Direct(crate::udp_relay::direct(address, port, pinned).await?))),
+        }
+    }
+    async fn redirect(self, carrier: &Carrier, address: Address, port: u16) -> Result<RoutedEgress, ClientError> {
+        match self {
+            Self::Tcp { .. } => Ok(RoutedEgress::Tcp(carrier.open(address, port).await?)),
+            Self::Udp { .. } => Ok(RoutedEgress::Udp(carrier.open_udp(address, port).await?)),
+        }
+    }
+    fn record_fallback(self) {
+        use crate::routing::dpi::udp::Candidate;
+        match self {
+            Self::Tcp { .. } => crate::traffic::dpi_fallback_open(),
+            Self::Udp { candidate, .. } => {
+                crate::traffic::udp_dpi_fallback();
+                if matches!(candidate, Candidate::Stun | Candidate::StunBinding) { crate::traffic::udp_stun_fallback(); }
+                if matches!(candidate, Candidate::QuicV2H3(_)) { crate::traffic::udp_quic_v2_fallback(); }
+            }
+        }
+    }
+}
+enum RoutedEgress {
+    Tcp(ProxyTunnel),
+    Udp(crate::udp_relay::Tunnel),
+}
+
+/// Preserve one exact policy lease through classification, DNS, dialing
+/// and the flow table. A revoked digest republished during DNS cannot revive it.
+async fn route_egress(
+    carrier: &Carrier, cache: &Cache, address: Address, port: u16, request: EgressRequest<'_>,
+) -> Result<(RoutedEgress, crate::routing::flow::FlowLease), ClientError> {
+    use crate::routing::PacketAction;
+    let RoutePlan { snapshot, action, pinned, authorization } = route_decision(carrier, cache, &address).await?;
+    if action.packet_action() == PacketAction::Drop {
         crate::traffic::blocked();
         return Err(ClientError::Open(ErrorCode::PolicyDenied));
     }
-    let flow = cache.flows.begin(
-        cache.policy.clone(),
-        crate::routing::flow::Protocol::Tcp,
-        address.clone(),
-        port,
-        snapshot.digest(),
-        action.packet_action(),
-    )?;
-    let tunnel =
-        routed_open_selected(carrier, cache, address, port, snapshot, action, pinned, allow_dpi).await?;
-    flow.check_pending()?;
-    Ok(RoutedTcp { tunnel, flow })
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn routed_open_selected(
-    carrier: &Carrier,
-    cache: &Cache,
-    address: Address,
-    port: u16,
-    snapshot: Arc<Snapshot>,
-    action: Action,
-    pinned: Option<Vec<IpAddr>>,
-    allow_dpi: bool,
-) -> Result<ProxyTunnel, ClientError> {
-    let authorization = cache.policy.pin(snapshot.digest())?;
-    let policy = snapshot.policy();
-    let denied = || ClientError::Open(ErrorCode::PolicyDenied);
-    match action.packet_action() {
-        crate::routing::PacketAction::Drop => {
-            crate::traffic::blocked();
-            Err(denied())
-        }
-        crate::routing::PacketAction::Redirect => {
-            authorization.check()?;
-            let tunnel = carrier.open(address, port).await?;
-            authorization.check()?;
-            Ok(tunnel)
-        }
-        crate::routing::PacketAction::Modify => {
-            // Initial native backend supports domain HTTPS TCP only. Resolve
-            // via the authenticated policy endpoint, never the local resolver.
-            if allow_dpi && cache.dpi.enabled() && matches!(port, 443 | 8443) {
-                if let Address::Dns(name) = &address {
-                    let ips = match pinned {
-                        Some(ips) => ips,
-                        None => match carrier.resolve_routing(name, snapshot.digest()).await {
-                            Ok(ips) => ips,
-                            // Only a conclusive domain rule can fall back on a
-                            // transient DNS server error. Auth/policy/digest
-                            // errors must not be hidden by a fallback.
-                            Err(ClientError::Rejected(502 | 504)) => Vec::new(),
-                            Err(error) => return Err(error),
-                        },
-                    };
+    let flow = cache.flows.begin_pinned(authorization.clone(), request.protocol(), address.clone(), port, action.packet_action())?;
+    authorization.check()?;
+    let egress = match action.packet_action() {
+        PacketAction::Pass => request.direct(address, port, pinned).await?,
+        PacketAction::Redirect => request.redirect(carrier, address, port).await?,
+        PacketAction::Modify => {
+            match open_local_modify(carrier, cache, &address, port, request, &snapshot, pinned, &authorization).await? {
+                Some(local) => local,
+                None => {
                     authorization.check()?;
-                    let permitted = !ips.is_empty()
-                        && ips.iter().all(|ip| {
-                            policy.classify(
-                                crate::routing::Evidence::Known(name),
-                                crate::routing::Evidence::Known(*ip),
-                            ) == Ok(crate::routing::Classification::Matched(Action::DirectDpi))
-                        });
-                    if !ips.is_empty() && !permitted {
-                        return Err(denied());
-                    }
-                    if permitted {
-                        if let Some(tunnel) =
-                            carrier.warm_during(cache.dpi.open_checked(name, port, &ips, snapshot.digest())).await?
-                        {
-                            authorization.check()?;
-                            return Ok(ProxyTunnel::Dpi(Box::new(DpiRoute {
-                                tunnel,
-                                observed: None,
-                                carrier: carrier.clone(),
-                                address,
-                                port,
-                            })));
-                        }
-                    }
+                    let redirected = request.redirect(carrier, address, port).await?;
+                    authorization.check()?;
+                    request.record_fallback();
+                    redirected
                 }
             }
-            // A changed local policy does not authorize an older fallback.
-            authorization.check()?;
-            // Failed local probe/dial or unsupported traffic uses the same
-            // authenticated VPS carrier. No silent unprotected direct route.
-            let tunnel = carrier.open(address, port).await?;
-            authorization.check()?;
-            crate::traffic::dpi_fallback_open();
-            Ok(tunnel)
         }
-        crate::routing::PacketAction::Pass => {
-            authorization.check()?;
-            let target = client_state::dial_direct(address, port, pinned).await?;
-            authorization.check()?;
-            Ok(ProxyTunnel::Direct(target))
-        }
+        PacketAction::Drop => return Err(ClientError::Open(ErrorCode::PolicyDenied)),
+    };
+    authorization.check()?;
+    flow.check_pending()?;
+    Ok((egress, flow))
+}
+
+/// Protected resolution and all-address policy verification are shared by TCP/UDP.
+/// Only transient resolver errors for an already conclusive rule permit fallback.
+async fn modify_ips(
+    carrier: &Carrier, name: &str, snapshot: &Snapshot, pinned: Option<Vec<IpAddr>>,
+    authorization: &crate::routing::policy_lease::PolicyLease,
+) -> Result<Vec<IpAddr>, ClientError> {
+    authorization.check()?;
+    let ips = match pinned {
+        Some(ips) => ips,
+        None => match carrier.resolve_routing(name, snapshot.digest()).await {
+            Ok(ips) => ips,
+            Err(ClientError::Rejected(502 | 504)) => Vec::new(),
+            Err(error) => return Err(error),
+        },
+    };
+    authorization.check()?;
+    if !ips.iter().all(|ip| snapshot.policy().classify(
+        crate::routing::Evidence::Known(name), crate::routing::Evidence::Known(*ip),
+    ) == Ok(crate::routing::Classification::Matched(Action::DirectDpi))) {
+        return Err(ClientError::Open(ErrorCode::PolicyDenied));
+    }
+    Ok(ips)
+}
+
+fn udp_strategy(address: &Address, port: u16, candidate: &crate::routing::dpi::udp::Candidate, first: &[u8], stun_enabled: bool) -> Option<crate::routing::dpi::UdpStrategy> {
+    use crate::routing::dpi::{UdpStrategy, udp::{Candidate, BindingStrategy}};
+    use crate::quic_core::wire::Version;
+    // The classified name must match the explicit target, and the actual
+    // first datagram must be transformable. A probe alone is not consent.
+    match (address, candidate) {
+        (Address::Dns(name), Candidate::QuicH3(sni)) if port == 443
+            && crate::routing::domain_name(name).as_deref() == Ok(sni.as_str())
+            && crate::routing::packet_modify::quic_initial_datagrams(first, sni).is_some()
+            && crate::reality_quic_wire::long(first).is_some_and(|h| h.version == Version::V1.wire())
+            => Some(UdpStrategy::Quic(Version::V1)),
+        (Address::Dns(name), Candidate::QuicV2H3(sni)) if port == 443
+            && crate::routing::domain_name(name).as_deref() == Ok(sni.as_str())
+            && crate::routing::packet_modify::quic_initial_datagrams(first, sni).is_some()
+            && crate::reality_quic_wire::long(first).is_some_and(|h| h.version == Version::V2.wire())
+            => Some(UdpStrategy::Quic(Version::V2)),
+        (Address::Dns(_), Candidate::StunBinding) if port == 3478 && stun_enabled
+            && crate::routing::dpi::udp::prepare_binding(first, BindingStrategy::Fingerprint).is_some_and(|bytes| bytes.as_ref() != first)
+            => Some(UdpStrategy::StunBinding(BindingStrategy::Fingerprint)),
+        _ => None,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn open_local_modify(
+    carrier: &Carrier, cache: &Cache, address: &Address, port: u16, request: EgressRequest<'_>,
+    snapshot: &Snapshot, pinned: Option<Vec<IpAddr>>, authorization: &crate::routing::policy_lease::PolicyLease,
+) -> Result<Option<RoutedEgress>, ClientError> {
+    use crate::routing::dpi::UdpStrategy;
+    use crate::quic_core::wire::Version;
+    let Address::Dns(name) = address else { return Ok(None) };
+    if !cache.dpi.enabled() { return Ok(None); }
+    let strategy = match request {
+        EgressRequest::Tcp { allow_dpi: true } if matches!(port, 443 | 8443) => None,
+        EgressRequest::Tcp { .. } => return Ok(None),
+        EgressRequest::Udp { candidate, first, .. } => {
+            let Some(strategy) = udp_strategy(address, port, candidate, first, cache.dpi.stun_enabled()) else { return Ok(None) };
+            if !strategy.accepted_for_proxy() { return Ok(None); }
+            Some(strategy)
+        }
+    };
+    let ips = modify_ips(carrier, name, snapshot, pinned, authorization).await?;
+    if ips.is_empty() { return Ok(None); }
+    match (request, strategy) {
+        (EgressRequest::Tcp { .. }, None) => {
+            let tunnel = carrier.warm_during(cache.dpi.open_checked_pinned(name, port, &ips, authorization)).await?;
+            authorization.check()?;
+            Ok(tunnel.map(|tunnel| RoutedEgress::Tcp(ProxyTunnel::Dpi(Box::new(DpiRoute {
+                tunnel, observed: None, carrier: carrier.clone(), address: address.clone(), port,
+            })))))
+        }
+        (EgressRequest::Udp { observed, .. }, Some(strategy)) => {
+            let verified = carrier.warm_during(cache.dpi.open_proxy_udp_pinned(name, port, &ips, authorization, strategy)).await?;
+            authorization.check()?;
+            let Some(verified) = verified else { return Ok(None) };
+            let carrier = carrier.clone();
+            let target = address.clone();
+            let observed = Arc::clone(observed);
+            let authorization = (*authorization).clone();
+            let fallback = Box::pin(async move {
+                authorization.check()?;
+                let tunnel = carrier.open_udp(target, port).await?;
+                authorization.check()?;
+                tunnel.record_transport(&observed);
+                crate::traffic::udp_dpi_fallback();
+                if matches!(strategy, UdpStrategy::StunBinding(_)) { crate::traffic::udp_stun_fallback(); }
+                if strategy == UdpStrategy::Quic(Version::V2) { crate::traffic::udp_quic_v2_fallback(); }
+                Ok(tunnel)
+            });
+            Ok(Some(RoutedEgress::Udp(crate::udp_relay::Tunnel::VerifiedLocal(Box::new(verified), fallback))))
+        }
+        _ => Err(ClientError::Protocol),
+    }
+}
+
+async fn routed_open(carrier: &Carrier, cache: &Cache, address: Address, port: u16, allow_dpi: bool) -> Result<RoutedTcp, ClientError> {
+    let (egress, flow) = route_egress(carrier, cache, address, port, EgressRequest::Tcp { allow_dpi }).await?;
+    match egress { RoutedEgress::Tcp(tunnel) => Ok(RoutedTcp { tunnel, flow }), _ => Err(ClientError::Protocol) }
+}
 async fn routed_udp(
-    carrier: &Carrier,
-    cache: &Cache,
-    address: Address,
-    port: u16,
-    candidate: &crate::routing::dpi::udp::Candidate,
-    first: &[u8],
-    observed: &Arc<std::sync::atomic::AtomicU8>,
+    carrier: &Carrier, cache: &Cache, address: Address, port: u16,
+    candidate: &crate::routing::dpi::udp::Candidate, first: &[u8], observed: &Arc<std::sync::atomic::AtomicU8>,
 ) -> Result<RoutedUdp, ClientError> {
-    let (snapshot, action, pinned) = route_decision(carrier, cache, &address).await?;
-    if action.packet_action() == crate::routing::PacketAction::Drop {
-        crate::traffic::blocked();
-        return Err(ClientError::Open(ErrorCode::PolicyDenied));
-    }
-    let flow = cache.flows.begin(
-        cache.policy.clone(),
-        crate::routing::flow::Protocol::Udp,
-        address.clone(),
-        port,
-        snapshot.digest(),
-        action.packet_action(),
-    )?;
-    let tunnel = routed_udp_selected(
-        carrier, cache, address, port, candidate, first, observed, snapshot, action, pinned,
-    )
-    .await?;
-    flow.check_pending()?;
-    Ok(RoutedUdp { tunnel, flow })
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn routed_udp_selected(
-    carrier: &Carrier,
-    cache: &Cache,
-    address: Address,
-    port: u16,
-    candidate: &crate::routing::dpi::udp::Candidate,
-    first: &[u8],
-    observed: &Arc<std::sync::atomic::AtomicU8>,
-    snapshot: Arc<Snapshot>,
-    action: Action,
-    pinned: Option<Vec<IpAddr>>,
-) -> Result<crate::udp_relay::Tunnel, ClientError> {
-    let authorization = cache.policy.pin(snapshot.digest())?;
-    match action.packet_action() {
-        crate::routing::PacketAction::Drop => {
-            crate::traffic::blocked();
-            Err(ClientError::Open(ErrorCode::PolicyDenied))
-        }
-        crate::routing::PacketAction::Pass => {
-            authorization.check()?;
-            let target = crate::udp_relay::direct(address, port, pinned).await?;
-            authorization.check()?;
-            Ok(crate::udp_relay::Tunnel::Direct(target))
-        }
-        crate::routing::PacketAction::Redirect => {
-            authorization.check()?;
-            let tunnel = carrier.open_udp(address, port).await?;
-            authorization.check()?;
-            Ok(tunnel)
-        }
-        crate::routing::PacketAction::Modify => {
-            use crate::routing::dpi::udp::Candidate;
-            use crate::routing::dpi::{UdpStrategy, udp::BindingStrategy};
-            use crate::quic_core::wire::Version;
-            // Do not probe a name inferred from the payload alone. The
-            // explicit SOCKS destination must agree with the classified
-            // name and the actual first datagram must be transformable.
-            let strategy = match (&address, candidate) {
-                (Address::Dns(name), Candidate::QuicH3(sni)) if port == 443
-                    && crate::routing::domain_name(name).as_deref() == Ok(sni.as_str())
-                    && crate::routing::packet_modify::quic_initial_datagrams(first, sni).is_some()
-                    && crate::reality_quic_wire::long(first).is_some_and(|h| h.version == Version::V1.wire())
-                    => Some(UdpStrategy::Quic(Version::V1)),
-                (Address::Dns(name), Candidate::QuicV2H3(sni)) if port == 443
-                    && crate::routing::domain_name(name).as_deref() == Ok(sni.as_str())
-                    && crate::routing::packet_modify::quic_initial_datagrams(first, sni).is_some()
-                    && crate::reality_quic_wire::long(first).is_some_and(|h| h.version == Version::V2.wire())
-                    => Some(UdpStrategy::Quic(Version::V2)),
-                (Address::Dns(_), Candidate::StunBinding) if port == 3478 && cache.dpi.stun_enabled()
-                    && crate::routing::dpi::udp::prepare_binding(first, BindingStrategy::Fingerprint)
-                        .is_some_and(|bytes| bytes.as_ref() != first)
-                    => Some(UdpStrategy::StunBinding(BindingStrategy::Fingerprint)),
-                _ => None,
-            };
-            if let (Address::Dns(name), Some(strategy)) = (&address, strategy) {
-                if strategy.accepted_for_proxy() && cache.dpi.enabled() {
-                    authorization.check()?;
-                    let ips = match pinned {
-                        Some(ips) => ips,
-                        None => match carrier.resolve_routing(name, snapshot.digest()).await {
-                            Ok(ips) => ips,
-                            Err(ClientError::Rejected(502 | 504)) => Vec::new(),
-                            Err(error) => return Err(error),
-                        },
-                    };
-                    authorization.check()?;
-                    if !ips.iter().all(|ip| snapshot.policy().classify(
-                        crate::routing::Evidence::Known(name),
-                        crate::routing::Evidence::Known(*ip),
-                    ) == Ok(crate::routing::Classification::Matched(Action::DirectDpi))) {
-                        return Err(ClientError::Open(ErrorCode::PolicyDenied));
-                    }
-                    if let Some(verified) = carrier.warm_during(cache.dpi.open_proxy_udp_checked(
-                        name, port, &ips, snapshot.digest(), strategy,
-                    )).await? {
-                        authorization.check()?;
-                        let carrier = carrier.clone();
-                        let target = address.clone();
-                        let observed = observed.clone();
-                        let stun = matches!(strategy, UdpStrategy::StunBinding(_));
-                        let fallback = Box::pin(async move {
-                            let tunnel = carrier.open_udp(target, port).await?;
-                            tunnel.record_transport(&observed);
-                            crate::traffic::udp_dpi_fallback();
-                            if stun { crate::traffic::udp_stun_fallback(); }
-                            if strategy == UdpStrategy::Quic(Version::V2) {
-                                crate::traffic::udp_quic_v2_fallback();
-                            }
-                            Ok(tunnel)
-                        });
-                        return Ok(crate::udp_relay::Tunnel::VerifiedLocal(Box::new(verified), fallback));
-                    }
-                }
-            }
-            authorization.check()?;
-            let tunnel = carrier.open_udp(address, port).await?;
-            authorization.check()?;
-            crate::traffic::udp_dpi_fallback();
-            if matches!(candidate, Candidate::Stun | Candidate::StunBinding) {
-                crate::traffic::udp_stun_fallback();
-            }
-            if matches!(candidate, Candidate::QuicV2H3(_)) {
-                crate::traffic::udp_quic_v2_fallback();
-            }
-            Ok(tunnel)
-        }
-    }
+    let (egress, flow) = route_egress(carrier, cache, address, port, EgressRequest::Udp { candidate, first, observed }).await?;
+    match egress { RoutedEgress::Udp(tunnel) => Ok(RoutedUdp { tunnel, flow }), _ => Err(ClientError::Protocol) }
 }
 
 impl ProxyClient {

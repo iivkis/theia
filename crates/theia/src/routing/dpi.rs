@@ -47,7 +47,7 @@ const OPEN_BUDGET: Duration = Duration::from_secs(6);
 const FIRST_FLIGHT: Duration = Duration::from_secs(5);
 
 pub(crate) use super::policy_lease::stale_policy;
-use super::policy_lease::PolicyState;
+use super::policy_lease::{PolicyLease, PolicyState};
 
 /// Profile-local, bounded strategy evidence. No state on disk or in logs.
 /// Consent is local configuration, not a command in the server snapshot.
@@ -266,10 +266,6 @@ impl Engine {
     pub(crate) fn retire(&self) { self.policy.retire(); }
     pub(super) fn policy_epoch(&self, digest: [u8; 32]) -> Result<u64, ClientError> { self.policy.policy_epoch(digest) }
 
-    pub(crate) fn pin_policy(self: &Arc<Self>, digest: [u8; 32]) -> Result<FallbackPolicy, ClientError> {
-        Ok(FallbackPolicy { engine: self.clone(), digest, epoch: self.policy_epoch(digest)?, scope: None, require_stun: false, tcp_evidence: None })
-    }
-
     fn check_key_policy(&self, key: &Key) -> Result<(), ClientError> {
         if self.policy_epoch(key.policy)? == key.epoch { Ok(()) } else { Err(stale_policy()) }
     }
@@ -347,11 +343,20 @@ impl Engine {
     /// with a verified active de-coalescing probe. The current native
     /// dialer disables tickets/0-RTT and uses MTU 1200, so it cannot produce
     /// the required independently originated coalesced first flight.
+    #[cfg(test)]
     pub(crate) async fn open_proxy_udp_checked(
         self: &Arc<Self>, name: &str, port: u16, ips: &[IpAddr], policy: [u8;32],
         strategy: UdpStrategy,
     ) -> Result<Option<VerifiedUdp>, ClientError> {
-        let pin = self.pin_policy(policy)?;
+        let pin = self.policy.pin(policy)?;
+        self.open_proxy_udp_pinned(name, port, ips, &pin, strategy).await
+    }
+
+    pub(crate) async fn open_proxy_udp_pinned(
+        self: &Arc<Self>, name: &str, port: u16, ips: &[IpAddr], pin: &PolicyLease,
+        strategy: UdpStrategy,
+    ) -> Result<Option<VerifiedUdp>, ClientError> {
+        pin.check_owner(&self.policy)?;
         if matches!(strategy, UdpStrategy::Quic(_)) {
             // Fail closed to an authorized pre-send XHTTP fallback, without
             // probing the target or reusing lab-only reachability evidence.
@@ -361,7 +366,7 @@ impl Engine {
             pin.check()?;
             return Ok(None);
         }
-        self.open_udp_checked(name, port, ips, policy, strategy).await
+        self.open_udp_pinned(name, port, ips, pin, strategy).await
     }
 
     /// Ok(None) is a safe pre-user-write fallback. Err is a protective
@@ -371,7 +376,16 @@ impl Engine {
         self: &Arc<Self>, name: &str, port: u16, ips: &[IpAddr], policy: [u8; 32],
         strategy: UdpStrategy,
     ) -> Result<Option<VerifiedUdp>, ClientError> {
-        let pin = self.pin_policy(policy)?;
+        let pin = self.policy.pin(policy)?;
+        self.open_udp_pinned(name, port, ips, &pin, strategy).await
+    }
+
+    async fn open_udp_pinned(
+        self: &Arc<Self>, name: &str, port: u16, ips: &[IpAddr], pin: &PolicyLease,
+        strategy: UdpStrategy,
+    ) -> Result<Option<VerifiedUdp>, ClientError> {
+        pin.check_owner(&self.policy)?;
+        let policy = pin.digest();
         let stun = match strategy {
             UdpStrategy::Quic(_) if port == 443 => false,
             UdpStrategy::StunBinding(udp::BindingStrategy::Fingerprint) if port == 3478 => true,
@@ -384,7 +398,7 @@ impl Engine {
         let name = super::domain_name(name).map_err(|_| ClientError::Protocol)?;
         let probe = strategy.probe();
         let deadline = tokio::time::Instant::now() + OPEN_BUDGET;
-        let keys = self.ranked_udp_keys(&name, port, ips, policy, pin.epoch, probe);
+        let keys = self.ranked_udp_keys(&name, port, ips, policy, pin.epoch(), probe);
         let probe_key = |key: Key| {
             let name = &name;
             async move {
@@ -491,14 +505,22 @@ impl Engine {
         ips: &[IpAddr],
         policy: [u8; 32],
     ) -> Result<Option<Tunnel>, ClientError> {
-        let pin = self.pin_policy(policy)?;
+        let pin = self.policy.pin(policy)?;
+        self.open_checked_pinned(name, port, ips, &pin).await
+    }
+
+    pub(crate) async fn open_checked_pinned(
+        self: &Arc<Self>, name: &str, port: u16, ips: &[IpAddr], pin: &PolicyLease,
+    ) -> Result<Option<Tunnel>, ClientError> {
+        pin.check_owner(&self.policy)?;
+        let policy = pin.digest();
         if !self.enabled() || !matches!(port, 443 | 8443) || ips.is_empty() {
             return Ok(None);
         }
         if ips.len() > 64 || !ips.iter().all(|ip| crate::server::allowed_destination(*ip, false)) {
             return Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied));
         }
-        let epoch = pin.epoch;
+        let epoch = pin.epoch();
         let name = super::domain_name(name).map_err(|_| ClientError::Protocol)?;
         let deadline = tokio::time::Instant::now() + OPEN_BUDGET;
         let result = timeout(OPEN_BUDGET, async {

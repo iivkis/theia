@@ -79,6 +79,7 @@ impl FlowTable {
         Some(counts)
     }
 
+    #[cfg(test)]
     pub(crate) fn begin(
         self: &Arc<Self>,
         engine: Arc<PolicyState>,
@@ -374,6 +375,15 @@ mod tests {
             [1; 32],
             action,
         )
+    }
+
+    #[test]
+    fn preflight_policy_pin_is_not_reacquired_on_flow_creation() {
+        let (table, policy) = setup();
+        let lease = policy.pin([1;32]).unwrap();
+        policy.authorize_policy(None);
+        policy.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture([1;32])));
+        assert!(table.begin_pinned(lease, Protocol::Tcp, Address::V4([192,0,2,1]), 443, PacketAction::Redirect).is_err());
     }
 
     #[test]

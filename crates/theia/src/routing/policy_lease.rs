@@ -102,6 +102,11 @@ pub(crate) struct PolicyLease {
 }
 impl PolicyLease {
     pub(crate) fn digest(&self) -> [u8; 32] { self.digest }
+    pub(crate) fn epoch(&self) -> u64 { self.epoch }
+    pub(crate) fn check_owner(&self, owner: &Arc<PolicyState>) -> Result<(), ClientError> {
+        if !Arc::ptr_eq(&self.state, owner) { return Err(stale_policy()); }
+        self.check()
+    }
     pub(crate) fn check(&self) -> Result<(), ClientError> {
         if self.state.policy_epoch(self.digest)? != self.epoch { return Err(stale_policy()); }
         Ok(())
