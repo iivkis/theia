@@ -1029,10 +1029,20 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang llvm libbpf-dev linux-tools-generic
-          test -r /sys/kernel/btf/vmlinux
-          bpftool_path="$(find /usr/lib/linux-tools -type f -name bpftool -print | sort -V | tail -n 1)"
-          test -x "$bpftool_path"
-          make -C drivers/linux CLANG=/usr/bin/clang BPFTOOL="$bpftool_path"
+          uname -r
+          # Runner sysfs may be readable only to root. Keep the actual
+          # kernel's BTF, not a synthetic or unrelated vmlinux.h.
+          btf="$RUNNER_TEMP/theia-vmlinux.btf"
+          sudo install -m 0644 /sys/kernel/btf/vmlinux "$btf"
+          test -s "$btf"
+          bpftool_path="$(find -L /usr/lib/linux-tools -type f -name bpftool -print | sort -V | tail -n 1)"
+          if [[ ! -x "$bpftool_path" ]]; then
+            echo "::error::No executable bpftool in installed Linux tools packages"
+            exit 1
+          fi
+          "$bpftool_path" version
+          sha256sum "$btf"
+          make -C drivers/linux CLANG=/usr/bin/clang BPFTOOL="$bpftool_path" BTF="$btf"
           llvm-objdump -h drivers/linux/theia_flow_events.bpf.o
           mkdir f15-build-evidence
           cp drivers/linux/theia_flow_events.bpf.o f15-build-evidence/

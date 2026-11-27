@@ -5,7 +5,7 @@
 
 use crate::{
     config::{self, WriteFailure},
-    quic_transport::ObservedEndpoint,
+    quic_core::{dial, h3_adapter, negotiation::VersionPolicy, wire::Version},
 };
 use bytes::Bytes;
 use http::{Method, Request};
@@ -387,23 +387,26 @@ async fn h2_head(target: &Target, roots: RootCertStore) -> Option<u16> {
 /// Separate H3 application witness over the existing strict QUIC verifier.
 /// A QUIC handshake alone cannot produce a successful observation.
 async fn h3_head(target: &Target, roots: RootCertStore) -> Option<u16> {
-    let bind = if target.address.is_ipv4() {
-        SocketAddr::from(([0, 0, 0, 0], 0))
-    } else {
-        SocketAddr::from(([0u16; 8], 0))
-    };
-    let endpoint = ObservedEndpoint::new(bind, roots).ok()?;
-    let connection = endpoint
-        .connect(target.address, &target.server_name, ATTEMPT)
-        .await
-        .ok()?;
-    if connection.remote_address() != target.address {
+    let tls = crate::transport_policy::Carrier::H3.client_tls(roots).ok()?;
+    let name = ServerName::try_from(target.server_name.clone()).ok()?;
+    let (_, session) = dial::connect(
+        target.address,
+        name,
+        Arc::new(tls),
+        None,
+        VersionPolicy::exact(Version::V1),
+        ATTEMPT,
+    )
+    .await
+    .ok()?;
+    if session.peer_addr() != target.address {
         return None;
     }
+    let (connection, _) = h3_adapter::NativeConnection::start(session).ok()?;
     let mut builder = h3::client::builder();
     builder.max_field_section_size(8192);
     let (mut driver, mut sender) = builder
-        .build::<_, _, Bytes>(h3_quinn::Connection::new(connection))
+        .build::<_, _, Bytes>(connection)
         .await
         .ok()?;
     let keep = sender.clone();
@@ -1369,7 +1372,7 @@ mod tests {
         let listener = TcpListener::from_std(listener).unwrap();
         let endpoint = quinn::Endpoint::new(
             quinn::EndpointConfig::default(),
-            Some(crate::quic_transport::server_config(vec![cert], key.into()).unwrap()),
+            Some(crate::quinn_reference::server_config(vec![cert], key.into()).unwrap()),
             udp_socket,
             Arc::new(quinn::TokioRuntime),
         )
@@ -1396,7 +1399,7 @@ mod tests {
         }));
         let udp = Driver(tokio::spawn(async move {
             let incoming = endpoint.accept().await.unwrap();
-            let Ok(connection) = crate::quic_transport::accept(incoming).await else {
+            let Ok(connection) = crate::quinn_reference::accept(incoming).await else {
                 return;
             };
             let mut builder = h3::server::builder();

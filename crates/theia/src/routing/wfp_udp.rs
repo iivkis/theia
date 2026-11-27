@@ -53,7 +53,7 @@ fn address(data: &[u8]) -> io::Result<SocketAddr> {
     Ok(SocketAddr::new(ip, port))
 }
 fn controls(mut data: &[u8], ipv4: bool) -> io::Result<(&[u8], &[u8])> {
-    let header = aligned(mem::size_of::<WSACMSGHDR>()).ok_or_else(invalid)?;
+    let header = aligned(mem::size_of::<CMSGHDR>()).ok_or_else(invalid)?;
     let (level, records, context) = if ipv4 {
         (
             IPPROTO_IP as i32,
@@ -72,7 +72,7 @@ fn controls(mut data: &[u8], ipv4: bool) -> io::Result<(&[u8], &[u8])> {
         if data.len() < header {
             return Err(invalid());
         }
-        let h = unsafe { ptr::read_unaligned(data.as_ptr().cast::<WSACMSGHDR>()) };
+        let h = unsafe { ptr::read_unaligned(data.as_ptr().cast::<CMSGHDR>()) };
         let len = h.cmsg_len;
         if len < header || len > data.len() {
             return Err(invalid());
@@ -259,16 +259,16 @@ mod tests {
     }
 
     fn control(kind: i32, data: &[u8]) -> Vec<u8> {
-        let header = aligned(mem::size_of::<WSACMSGHDR>()).unwrap();
+        let header = aligned(mem::size_of::<CMSGHDR>()).unwrap();
         let size = header + data.len();
         let mut bytes = vec![0u8; aligned(size).unwrap()];
-        let h = WSACMSGHDR {
+        let h = CMSGHDR {
             cmsg_len: size,
             cmsg_level: IPPROTO_IP as i32,
             cmsg_type: kind,
         };
         unsafe {
-            ptr::write_unaligned(bytes.as_mut_ptr().cast::<WSACMSGHDR>(), h);
+            ptr::write_unaligned(bytes.as_mut_ptr().cast::<CMSGHDR>(), h);
         }
         bytes[header..size].copy_from_slice(data);
         bytes
@@ -285,14 +285,14 @@ mod tests {
         assert_eq!(controls(&valid, true).unwrap().0, &[1, 2, 3]);
         assert!(controls(&valid, false).is_err());
         let mut foreign = records.clone();
-        let header = aligned(mem::size_of::<WSACMSGHDR>()).unwrap();
-        let h = WSACMSGHDR {
+        let header = aligned(mem::size_of::<CMSGHDR>()).unwrap();
+        let h = CMSGHDR {
             cmsg_len: header + 3,
             cmsg_level: IPPROTO_IPV6 as i32,
             cmsg_type: IPV6_WFP_REDIRECT_RECORDS as i32,
         };
         unsafe {
-            ptr::write_unaligned(foreign.as_mut_ptr().cast::<WSACMSGHDR>(), h);
+            ptr::write_unaligned(foreign.as_mut_ptr().cast::<CMSGHDR>(), h);
         }
         assert!(controls(&[valid.as_slice(), &foreign].concat(), true).is_err());
         assert!(controls(&[valid.as_slice(), records.as_slice()].concat(), true).is_err());
