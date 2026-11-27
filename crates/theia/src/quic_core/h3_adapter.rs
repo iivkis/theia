@@ -939,7 +939,10 @@ mod tests {
         // State::fail prevents progress even after that close is consumed.
         let mut state = shared.lock().unwrap();
         assert_eq!(state.close.take(), Some(0x100));
-        assert!(matches!(state.error, Some(CE::ApplicationClose { error_code: 0x100 })));
+        assert!(matches!(
+            state.error,
+            Some(CE::ApplicationClose { error_code: 0x100 })
+        ));
         drop(state);
         // A later destructor must never replace a previously committed close.
         opener.close_inner(Code::H3_INTERNAL_ERROR);

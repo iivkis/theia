@@ -528,12 +528,18 @@ impl Store {
         let roots = tokio::task::spawn_blocking(roots)
             .await
             .map_err(|_| Error::Io)??;
-        self.refresh_from(rules, previous, &|uri, limit| get_once(uri, limit, &roots)).await
+        self.refresh_from(rules, previous, &|uri, limit| get_once(uri, limit, &roots))
+            .await
     }
 
     // Share the complete release validation and publication transaction with
     // deterministic fixtures; only the transport is supplied by the caller.
-    async fn refresh_from<F, Fut>(&self, rules: &[Rule], previous: Option<Vec<u8>>, get: &F) -> Result<Pair, Error>
+    async fn refresh_from<F, Fut>(
+        &self,
+        rules: &[Rule],
+        previous: Option<Vec<u8>>,
+        get: &F,
+    ) -> Result<Pair, Error>
     where
         F: Fn(Uri, usize) -> Fut,
         Fut: std::future::Future<Output = Result<Reply, Error>>,
@@ -605,12 +611,19 @@ mod tests {
         vec![10, 13, 10, 1, b'X', 18, 8, 10, 4, 192, 0, 2, 0, 16, 24]
     }
 
-
     fn release_reply(tag: &str) -> Reply {
-        Reply { status: StatusCode::FOUND, redirect: Some(format!("{REPO}/tag/{tag}")), bytes: vec![] }
+        Reply {
+            status: StatusCode::FOUND,
+            redirect: Some(format!("{REPO}/tag/{tag}")),
+            bytes: vec![],
+        }
     }
     fn data_reply(bytes: Vec<u8>) -> Reply {
-        Reply { status: StatusCode::OK, redirect: None, bytes }
+        Reply {
+            status: StatusCode::OK,
+            redirect: None,
+            bytes,
+        }
     }
     fn gzip(bytes: &[u8]) -> Vec<u8> {
         let mut writer = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
@@ -630,17 +643,36 @@ mod tests {
     }
     impl Script {
         fn new(tag: &str, site: &[u8], ip: &[u8]) -> Self {
-            let mut replies = std::collections::VecDeque::from([(LATEST.parse().unwrap(), 0, release_reply(tag))]);
+            let mut replies = std::collections::VecDeque::from([(
+                LATEST.parse().unwrap(),
+                0,
+                release_reply(tag),
+            )]);
             for (name, data) in [(SITE, site), (IP, ip)] {
-                let names = [format!("{name}.sha256sum"), format!("{name}.gz.sha256sum"), format!("{name}.gz")];
-                for ((name, limit), reply) in names.into_iter().zip([MAX_CHECKSUM, MAX_CHECKSUM, MAX_COMPRESSED]).zip(dataset_responses(name, data)) {
+                let names = [
+                    format!("{name}.sha256sum"),
+                    format!("{name}.gz.sha256sum"),
+                    format!("{name}.gz"),
+                ];
+                for ((name, limit), reply) in names
+                    .into_iter()
+                    .zip([MAX_CHECKSUM, MAX_CHECKSUM, MAX_COMPRESSED])
+                    .zip(dataset_responses(name, data))
+                {
                     replies.push_back((asset_uri(tag, &name).unwrap(), limit, reply));
                 }
             }
-            Self { replies: std::sync::Mutex::new(replies) }
+            Self {
+                replies: std::sync::Mutex::new(replies),
+            }
         }
         fn get(&self, uri: Uri, limit: usize) -> std::future::Ready<Result<Reply, Error>> {
-            let (expected, budget, reply) = self.replies.lock().unwrap().pop_front().expect("unexpected request");
+            let (expected, budget, reply) = self
+                .replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected request");
             assert_eq!(uri, expected);
             assert_eq!(limit, budget);
             std::future::ready(Ok(reply))
@@ -660,35 +692,74 @@ mod tests {
         let new_site = dat(b'Y');
         let ip = ip();
         let script = Script::new(old_tag, &old_site, &ip);
-        let old = store.refresh_from(&[], None, &|uri, limit| script.get(uri, limit)).await.unwrap();
+        let old = store
+            .refresh_from(&[], None, &|uri, limit| script.get(uri, limit))
+            .await
+            .unwrap();
         assert_eq!(old.geosite(), old_site);
         assert!(script.replies.lock().unwrap().is_empty());
         let baseline = store.current_bytes().unwrap().unwrap();
-        let same = store.refresh_from(&[], Some(baseline.clone()), &|uri, limit| {
-            assert_eq!(uri, LATEST.parse::<Uri>().unwrap());
-            assert_eq!(limit, 0);
-            std::future::ready(Ok(release_reply(old_tag)))
-        }).await.unwrap();
+        let same = store
+            .refresh_from(&[], Some(baseline.clone()), &|uri, limit| {
+                assert_eq!(uri, LATEST.parse::<Uri>().unwrap());
+                assert_eq!(limit, 0);
+                std::future::ready(Ok(release_reply(old_tag)))
+            })
+            .await
+            .unwrap();
         assert_eq!(same.manifest(), old.manifest());
         assert_eq!(store.current_bytes().unwrap().unwrap(), baseline);
 
         let bad = Script::new(new_tag, &new_site, &ip);
-        bad.replies.lock().unwrap().get_mut(3).unwrap().2.bytes.push(0x99);
-        assert!(matches!(store.refresh_from(&[], Some(baseline.clone()), &|u,l| bad.get(u,l)).await, Err(Error::Integrity)));
+        bad.replies
+            .lock()
+            .unwrap()
+            .get_mut(3)
+            .unwrap()
+            .2
+            .bytes
+            .push(0x99);
+        assert!(matches!(
+            store
+                .refresh_from(&[], Some(baseline.clone()), &|u, l| bad.get(u, l))
+                .await,
+            Err(Error::Integrity)
+        ));
         assert_eq!(store.current_bytes().unwrap().unwrap(), baseline);
         let good = Script::new(new_tag, &new_site, &ip);
-        let next = store.refresh_from(&[], Some(baseline.clone()), &|u,l| good.get(u,l)).await.unwrap();
+        let next = store
+            .refresh_from(&[], Some(baseline.clone()), &|u, l| good.get(u, l))
+            .await
+            .unwrap();
         assert_eq!(next.geosite(), new_site);
         assert_eq!(next.geoip(), ip);
-        assert_eq!(store.load(&[]).unwrap().unwrap().manifest(), next.manifest());
-        assert_eq!(store.load_pinned(old.manifest(), &[]).unwrap().geosite(), old_site);
+        assert_eq!(
+            store.load(&[]).unwrap().unwrap().manifest(),
+            next.manifest()
+        );
+        assert_eq!(
+            store.load_pinned(old.manifest(), &[]).unwrap().geosite(),
+            old_site
+        );
         assert!(good.replies.lock().unwrap().is_empty());
 
         let active = store.current_bytes().unwrap().unwrap();
-        assert!(matches!(store.refresh_from(&[], Some(active.clone()), &|_,_| std::future::ready(Ok(release_reply(old_tag)))).await, Err(Error::Conflict)));
+        assert!(matches!(
+            store
+                .refresh_from(&[], Some(active.clone()), &|_, _| std::future::ready(Ok(
+                    release_reply(old_tag)
+                )))
+                .await,
+            Err(Error::Conflict)
+        ));
         assert_eq!(store.current_bytes().unwrap().unwrap(), active);
         let stale = Script::new("20261128014317", &old_site, &ip);
-        assert!(matches!(store.refresh_from(&[], Some(baseline), &|u,l| stale.get(u,l)).await, Err(Error::Conflict)));
+        assert!(matches!(
+            store
+                .refresh_from(&[], Some(baseline), &|u, l| stale.get(u, l))
+                .await,
+            Err(Error::Conflict)
+        ));
         assert_eq!(store.current_bytes().unwrap().unwrap(), active);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -705,13 +776,19 @@ mod tests {
             let first = count.fetch_add(1, Ordering::Relaxed) == 0;
             let response = if first {
                 assert_eq!(uri, source);
-                Reply { status: StatusCode::FOUND, redirect: Some(location.into()), bytes: vec![] }
+                Reply {
+                    status: StatusCode::FOUND,
+                    redirect: Some(location.into()),
+                    bytes: vec![],
+                }
             } else {
                 assert_eq!(uri, location.parse::<Uri>().unwrap());
                 data_reply(b"valid".to_vec())
             };
             std::future::ready(Ok(response))
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         assert_eq!(output, b"valid");
         assert_eq!(count.load(Ordering::Relaxed), 2);
         for bad in [
@@ -724,13 +801,32 @@ mod tests {
             assert_eq!(asset(tag, SITE, 16, &|_,_| std::future::ready(Ok(Reply { status: StatusCode::FOUND, redirect: Some(bad.into()), bytes: vec![] }))).await, Err(Error::Format));
         }
         count.store(0, Ordering::Relaxed);
-        assert_eq!(asset(tag, SITE, 16, &|_,_| {
-            count.fetch_add(1, Ordering::Relaxed);
-            std::future::ready(Ok(Reply { status: StatusCode::FOUND, redirect: Some(location.into()), bytes: vec![] }))
-        }).await, Err(Error::Format));
+        assert_eq!(
+            asset(tag, SITE, 16, &|_, _| {
+                count.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(Ok(Reply {
+                    status: StatusCode::FOUND,
+                    redirect: Some(location.into()),
+                    bytes: vec![],
+                }))
+            })
+            .await,
+            Err(Error::Format)
+        );
         assert_eq!(count.load(Ordering::Relaxed), MAX_REDIRECTS + 1);
-        assert_eq!(latest(&|_,_| std::future::ready(Ok(data_reply(vec![])))).await, Err(Error::Format));
-        assert_eq!(latest(&|_,_| std::future::ready(Ok(Reply { status: StatusCode::FOUND, redirect: None, bytes: vec![] }))).await, Err(Error::Format));
+        assert_eq!(
+            latest(&|_, _| std::future::ready(Ok(data_reply(vec![])))).await,
+            Err(Error::Format)
+        );
+        assert_eq!(
+            latest(&|_, _| std::future::ready(Ok(Reply {
+                status: StatusCode::FOUND,
+                redirect: None,
+                bytes: vec![]
+            })))
+            .await,
+            Err(Error::Format)
+        );
     }
 
     async fn response_fixture(

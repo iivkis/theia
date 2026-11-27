@@ -814,7 +814,10 @@ mod tests {
             p.addresses = vec!["93.184.216.10".parse().unwrap()];
             p.selected = p.addresses.clone();
             p.dns_received = Some(Instant::now());
-            p.state = DomainState::DnsRunning { result, cancel: Some(cancel) };
+            p.state = DomainState::DnsRunning {
+                result,
+                cancel: Some(cancel),
+            };
             assert!(p.body().contains("Никакого TCP/H2"));
             tx.send(Err(error)).unwrap();
             p.poll();
@@ -831,14 +834,29 @@ mod tests {
             (DomainUiError::WorkerUnavailable, "недоступен worker"),
             (DomainUiError::StaleDnsPin, "DNS-пины устарели"),
             (DomainUiError::Batch(DualBatchError::Empty), "пустой список"),
-            (DomainUiError::Batch(DualBatchError::TooManyTargets), "слишком много IP"),
-            (DomainUiError::Batch(DualBatchError::DuplicateTarget), "дублирующаяся цель"),
-            (DomainUiError::Batch(DualBatchError::TaskFailed), "ошибка задачи"),
-            (DomainUiError::Batch(DualBatchError::BatchTimedOut), "таймаут 20с"),
+            (
+                DomainUiError::Batch(DualBatchError::TooManyTargets),
+                "слишком много IP",
+            ),
+            (
+                DomainUiError::Batch(DualBatchError::DuplicateTarget),
+                "дублирующаяся цель",
+            ),
+            (
+                DomainUiError::Batch(DualBatchError::TaskFailed),
+                "ошибка задачи",
+            ),
+            (
+                DomainUiError::Batch(DualBatchError::BatchTimedOut),
+                "таймаут 20с",
+            ),
         ] {
             let (tx, result) = mpsc::channel();
             let (cancel, _) = oneshot::channel();
-            p.state = DomainState::ProbeRunning { result, cancel: Some(cancel) };
+            p.state = DomainState::ProbeRunning {
+                result,
+                cancel: Some(cancel),
+            };
             assert!(p.body().contains("без DNS"));
             p.poll(); // Empty channel cannot advance a state.
             assert!(p.is_running());
@@ -853,7 +871,10 @@ mod tests {
         }
         let (tx, result) = mpsc::channel();
         let (cancel, mut cancelled) = oneshot::channel();
-        p.state = DomainState::ProbeRunning { result, cancel: Some(cancel) };
+        p.state = DomainState::ProbeRunning {
+            result,
+            cancel: Some(cancel),
+        };
         assert!(p.back_or_close());
         assert_eq!(cancelled.try_recv(), Ok(()));
         drop(tx);

@@ -1029,7 +1029,8 @@ mod tests {
         tx.send(Ok(Update::Observation {
             brief: "verified brief".into(),
             details: Some("verified details".into()),
-        })).unwrap();
+        }))
+        .unwrap();
         p.poll();
         assert!(p.summary().contains("verified brief"));
         assert!(!p.summary().contains("verified details"));
@@ -1056,10 +1057,17 @@ mod tests {
         let (stop, mut stopped) = tokio::sync::oneshot::channel();
         let (_tx, done) = mpsc::channel();
         let report = std::sync::Arc::new(std::sync::Mutex::new("other details".into()));
-        p.client_run = Some(ClientRun { stop: Some(stop), done, report: report.clone() });
+        p.client_run = Some(ClientRun {
+            stop: Some(stop),
+            done,
+            report: report.clone(),
+        });
         assert!(p.routing_observation([1; 32]).is_none());
         *report.lock().unwrap() = "private header\nПравила маршрутизации:\nDirect 1".into();
-        assert_eq!(p.routing_observation([1; 32]).as_deref(), Some("Правила маршрутизации:\nDirect 1"));
+        assert_eq!(
+            p.routing_observation([1; 32]).as_deref(),
+            Some("Правила маршрутизации:\nDirect 1")
+        );
         assert!(p.routing_observation([2; 32]).is_none());
         p.client_active = false;
         assert!(p.routing_observation([1; 32]).is_none());
