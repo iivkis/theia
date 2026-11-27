@@ -5,7 +5,7 @@
  * terminating filters only in a dedicated non-default network compartment.
  * Unsupported, unconfigured and ambiguous requests fail closed.
  */
-#include <ntddk.h>
+#include <ntifs.h>
 #include <wdmsec.h>
 /* WFP kernel headers require NDIS 6 packet-list declarations. The
  * Microsoft headers intentionally use anonymous structures and unions. */
