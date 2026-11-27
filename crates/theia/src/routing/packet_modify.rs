@@ -10,7 +10,10 @@ use std::borrow::Cow;
 
 fn words(bytes: &[u8]) -> u32 {
     let (chunks, tail) = bytes.as_chunks::<2>();
-    let sum = chunks.iter().map(|p| u32::from(u16::from_be_bytes(*p))).sum::<u32>();
+    let sum = chunks
+        .iter()
+        .map(|p| u32::from(u16::from_be_bytes(*p)))
+        .sum::<u32>();
     sum + tail.first().map_or(0, |b| u32::from(*b) << 8)
 }
 fn checksum(mut sum: u32) -> u16 {

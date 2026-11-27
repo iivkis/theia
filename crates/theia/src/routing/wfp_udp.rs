@@ -55,11 +55,7 @@ fn address(data: &[u8]) -> io::Result<SocketAddr> {
 fn controls(mut data: &[u8], ipv4: bool) -> io::Result<(&[u8], &[u8])> {
     let header = aligned(mem::size_of::<CMSGHDR>()).ok_or_else(invalid)?;
     let (level, records, context) = if ipv4 {
-        (
-            IPPROTO_IP,
-            IP_WFP_REDIRECT_RECORDS,
-            IP_WFP_REDIRECT_CONTEXT,
-        )
+        (IPPROTO_IP, IP_WFP_REDIRECT_RECORDS, IP_WFP_REDIRECT_CONTEXT)
     } else {
         (
             IPPROTO_IPV6,
@@ -89,8 +85,7 @@ fn controls(mut data: &[u8], ipv4: bool) -> io::Result<(&[u8], &[u8])> {
             }
             c = Some(value);
         } else if (h.cmsg_level == IPPROTO_IP
-            && (h.cmsg_type == IP_WFP_REDIRECT_RECORDS
-                || h.cmsg_type == IP_WFP_REDIRECT_CONTEXT))
+            && (h.cmsg_type == IP_WFP_REDIRECT_RECORDS || h.cmsg_type == IP_WFP_REDIRECT_CONTEXT))
             || (h.cmsg_level == IPPROTO_IPV6
                 && (h.cmsg_type == IPV6_WFP_REDIRECT_RECORDS
                     || h.cmsg_type == IPV6_WFP_REDIRECT_CONTEXT))

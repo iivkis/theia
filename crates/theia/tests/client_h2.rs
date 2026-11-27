@@ -17,10 +17,10 @@ use tokio::{
 };
 use tokio_rustls::TlsAcceptor;
 
-#[path = "support/shared_port.rs"]
-mod shared_port;
 #[path = "support/quinn_reference.rs"]
 mod quinn_reference;
+#[path = "support/shared_port.rs"]
+mod shared_port;
 
 const TOKEN: [u8; 32] = [0x42; 32];
 
@@ -1279,7 +1279,8 @@ async fn auto_wrong_h3_certificate_never_retries_working_h2() {
             Some(quinn_reference::server_config(vec![der], key.into()).unwrap()),
             udp,
             Arc::new(quinn::TokioRuntime),
-        ).unwrap();
+        )
+        .unwrap();
         let (endpoint, _roots, pem, server) = listener_with_pem_bound(true, tcp);
         let quic = tokio::spawn(async move {
             let incoming = udp.accept().await.unwrap();
