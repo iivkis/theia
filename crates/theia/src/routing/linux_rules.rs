@@ -47,6 +47,16 @@ fn invalid() -> io::Error {
     io::Error::from(io::ErrorKind::InvalidData)
 }
 
+fn valid_boot_id(boot: &str) -> bool {
+    boot.len() == 36 && boot.bytes().enumerate().all(|(index, b)| {
+        if matches!(index, 8 | 13 | 18 | 23) {
+            b == b'-'
+        } else {
+            b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
+        }
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Scope {
@@ -76,7 +86,7 @@ impl Scope {
         let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?
             .trim()
             .to_owned();
-        if boot.len() != 36 || !boot.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
+        if !valid_boot_id(&boot) {
             return Err(invalid());
         }
         Ok(Self {
@@ -939,6 +949,39 @@ impl super::carrier_socket::Registrar for LabRegistrar {
     }
 }
 
+/// Reconcile an old-boot laboratory journal without modifying any kernel
+/// rule. The original boot is gone, so its namespace/generation cannot be
+/// used as deletion authority. Require stable absence of the old table in
+/// the current isolated scope, then CAS a restored journal into this scope.
+/// A recreated or foreign table is refused, never deleted. This is explicit
+/// operator recovery, not an automatic production startup or kill switch.
+pub fn reconcile_after_reboot(host_namespace: &File, path: &Path) -> io::Result<()> {
+    let _lock = scope_lock()?;
+    let scope = Scope::current(host_namespace)?;
+    check_parent(path)?;
+    let raw = journal_bytes(path)?.ok_or_else(refused)?;
+    let mut journal: Journal = toml::from_str(std::str::from_utf8(&raw).map_err(|_| invalid())?)
+        .map_err(|_| invalid())?;
+    journal.validate(&journal.scope)?;
+    if !valid_boot_id(&journal.scope.boot) || journal.scope.boot == scope.boot {
+        return Err(refused());
+    }
+    let net = Netlink::open()?;
+    let generation = net.generation()?;
+    if net.table(&journal)? || net.generation()? != generation {
+        return Err(refused());
+    }
+    // Never call net.batch on an old-boot journal. Reconciliation is only
+    // evidence of absence; installation remains a separate fresh intent.
+    journal.scope = scope;
+    journal.restored = true;
+    store(path, &journal, Some(&raw))?;
+    if net.generation()? != generation || net.table(&journal)? {
+        return Err(refused());
+    }
+    Ok(())
+}
+
 /// Explicit recovery, after the previous LabRules lease is dropped. A
 /// foreign change anywhere in this namespace makes deletion fail closed.
 /// No forced flush, no whole-ruleset restoration, no table-name guessing.
@@ -1031,6 +1074,9 @@ mod tests {
         reboot.boot = "different-boot".into();
         let data = toml::to_string(&j).unwrap();
         assert!(parse_journal(data.as_bytes(), &reboot).is_err());
+        assert!(valid_boot_id("00000000-0000-0000-0000-000000000001"));
+        assert!(!valid_boot_id("000000000000-0000-0000-0000-00000000"));
+        assert!(!valid_boot_id("FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF"));
         // Recovery for an older journal must not guess prior ownership.
         let legacy = data.replace("previous_present = true\n", "");
         let old = parse_journal(legacy.as_bytes(), &j.scope).unwrap();
@@ -1185,6 +1231,13 @@ mod tests {
             let journal = parse_journal(&journal_bytes(&path).unwrap().unwrap(), &scope).unwrap();
             assert!(Netlink::open().unwrap().table(&journal).unwrap());
             assert!(recover(&host, &path).is_err()); // live owner
+            let raw = journal_bytes(&path).unwrap().unwrap();
+            let mut altered = journal.clone();
+            altered.restored = true;
+            let altered_bytes = store(&path, &altered, Some(&raw)).unwrap();
+            assert!(!lease.current().unwrap());
+            store(&path, &journal, Some(&altered_bytes)).unwrap();
+            assert!(lease.current().unwrap());
             drop(lease);
             recover(&host, &path).unwrap();
             assert!(!Netlink::open().unwrap().table(&journal).unwrap());
@@ -1206,6 +1259,15 @@ mod tests {
             assert_eq!(journal_bytes(&path).unwrap().unwrap(), restored);
             assert!(net.table(&journal).unwrap());
 
+            // Reboot reconciliation is also forbidden while a same-name
+            // object exists. Emulate an old boot ID without rebooting CI.
+            let mut old_boot = journal.clone();
+            old_boot.scope.boot = "00000000-0000-0000-0000-000000000001".into();
+            let old_bytes = store(&path, &old_boot, Some(&restored)).unwrap();
+            assert!(reconcile_after_reboot(&host, &path).is_err());
+            assert_eq!(journal_bytes(&path).unwrap().unwrap(), old_bytes);
+            assert!(net.table(&journal).unwrap());
+
             // Test-only cleanup inside the disposable namespace. Neither
             // product recovery nor installation was allowed to remove it.
             let mut attrs = Vec::new();
@@ -1215,6 +1277,15 @@ mod tests {
                 &[nft_message(DEL_TABLE, REQUEST | ACK, 2, &attrs)],
             )
             .unwrap();
+            assert!(recover(&host, &path).is_err());
+            let before = net.generation().unwrap();
+            reconcile_after_reboot(&host, &path).unwrap();
+            assert_eq!(net.generation().unwrap(), before);
+            assert!(!net.table(&journal).unwrap());
+            assert!(reconcile_after_reboot(&host, &path).is_err());
+            recover(&host, &path).unwrap();
+            let lease = LabRules::install(&queue, &host, &path).unwrap();
+            drop(lease);
             recover(&host, &path).unwrap();
             fs::remove_dir_all(dir).unwrap();
         })

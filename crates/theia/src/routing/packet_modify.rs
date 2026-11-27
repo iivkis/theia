@@ -206,18 +206,73 @@ pub struct TcpSplitPlan {
 
 impl TcpSplitPlan {
     pub fn begin(packet: &[u8], expected_name: &str) -> Option<(Self, [Vec<u8>; 2])> {
-        let (meta, off, end) = tcp_view(packet)?;
-        let payload = packet.get(end..)?;
-        if payload.len() > crate::reality_admission::MAX_HELLO {
+        let (plan, outputs) = Self::begin_flight(&[packet], expected_name)?;
+        Some((plan, outputs.try_into().ok()?))
+    }
+
+    /// Build a byte-exact split/retransmission plan from a complete,
+    /// ordered, bounded first TLS flight captured before any payload send.
+    /// The backend must own the live socket generation, hold all original
+    /// packets, verify policy and commit once before emission. This method
+    /// never transmits or authorizes packets, and rejects gaps/overlaps.
+    pub fn begin_flight(
+        packets: &[&[u8]],
+        expected_name: &str,
+    ) -> Option<(Self, Vec<Vec<u8>>)> {
+        const MAX_PACKETS: usize = 32;
+        const BOUNDARY: usize = 5;
+        if packets.is_empty() || packets.len() > MAX_PACKETS {
             return None;
         }
-        let outputs = tcp_tls_segments(packet, expected_name)?;
-        let sequence = u32::from_be_bytes(packet[off + 4..off + 8].try_into().ok()?);
+        let name = super::domain_name(expected_name).ok()?;
+        let (first, off, _) = tcp_view(packets[0])?;
+        if first.flow.destination.port() != 443
+            || first.flow.destination.ip().is_multicast()
+            || first.flow.destination.ip().is_unspecified()
+        {
+            return None;
+        }
+        let sequence = u32::from_be_bytes(packets[0][off + 4..off + 8].try_into().ok()?);
+        let mut payload = Vec::new();
+        let mut boundary_packet = None;
+        for (index, packet) in packets.iter().enumerate() {
+            let (meta, off, end) = tcp_view(packet)?;
+            let bytes = packet.get(end..)?;
+            let start = payload.len();
+            let limit = start.checked_add(bytes.len())?;
+            if meta.flow != first.flow
+                || bytes.is_empty()
+                || limit > crate::reality_admission::MAX_HELLO
+                || u32::from_be_bytes(packet[off + 4..off + 8].try_into().ok()?)
+                    != sequence.wrapping_add(u32::try_from(start).ok()?)
+            {
+                return None;
+            }
+            if start < BOUNDARY && limit > BOUNDARY {
+                boundary_packet = Some((index, BOUNDARY - start));
+            }
+            payload.extend_from_slice(bytes);
+        }
+        if !super::dpi::complete_packet_hello(&payload, &name) {
+            return None;
+        }
+        // Already split at exactly this boundary is a no-op, not Modify.
+        let (index, boundary) = boundary_packet?;
+        let (meta, off, end) = tcp_view(packets[index])?;
+        let [a, b] = split_tcp(packets[index], meta, off, end, boundary)?;
+        let mut outputs = Vec::with_capacity(packets.len() + 1);
+        for packet in &packets[..index] {
+            outputs.push(packet.to_vec());
+        }
+        outputs.extend([a, b]);
+        for packet in &packets[index + 1..] {
+            outputs.push(packet.to_vec());
+        }
         Some((
             Self {
-                key: meta.flow,
+                key: first.flow,
                 sequence,
-                payload: payload.to_vec(),
+                payload,
                 acknowledged: 0,
             },
             outputs,
@@ -408,7 +463,26 @@ mod tests {
             original.extend_from_slice(&hello);
             let sum = tcp_checksum(&original, off);
             original[off + 16..off + 18].copy_from_slice(&sum.to_be_bytes());
+            // A complete ClientHello can span several captured TCP segments.
+            let (meta, _, end) = tcp_view(&original).unwrap();
+            let [prefix, tail] = split_tcp(&original, meta, off, end, 2).unwrap();
+            let (tail_meta, _, tail_end) = tcp_view(&tail).unwrap();
+            let [middle, last] = split_tcp(&tail, tail_meta, off, tail_end, 10).unwrap();
+            let (flight, outputs) = TcpSplitPlan::begin_flight(
+                &[&prefix, &middle, &last], "example.org"
+            ).unwrap();
+            assert_eq!(outputs.len(), 4);
+            let restored: Vec<u8> = outputs.iter().flat_map(|packet| {
+                let (_, _, end) = tcp_view(packet).unwrap();
+                packet[end..].iter().copied()
+            }).collect();
+            assert_eq!(restored, hello);
+            assert_eq!(flight.retransmission(&middle).unwrap(), outputs[1..3]);
+            assert!(TcpSplitPlan::begin_flight(&[&prefix, &last], "example.org").is_none());
+            assert!(TcpSplitPlan::begin_flight(&[&prefix, &prefix, &middle, &last], "example.org").is_none());
+            assert!(TcpSplitPlan::begin_flight(&[&prefix, &middle, &last], "wrong.invalid").is_none());
             let (mut plan, [a, b]) = TcpSplitPlan::begin(&original, "example.org").unwrap();
+            assert!(TcpSplitPlan::begin_flight(&[&a, &b], "example.org").is_none());
             assert_eq!([&a[off + 20..], &b[off + 20..]].concat(), hello);
             assert_eq!(a[off + 13], 0x10);
             assert_eq!(b[off + 13], 0x18);
