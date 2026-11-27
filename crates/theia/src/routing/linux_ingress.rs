@@ -636,6 +636,106 @@ mod tests {
         bytes
     }
 
+    /// Exercise actual policy routing + TPROXY and reverse UDP source
+    /// identity in both address families. These rules are disposable lab
+    /// rules, NOT the production owner transaction.
+    #[test]
+    #[ignore = "requires isolated Linux namespace, nftables, iproute2 and CAP_NET_ADMIN"]
+    fn kernel_dual_stack_transparent_redirect_and_reply() {
+        std::thread::spawn(|| {
+            use std::{io::Write, process::{Command, Stdio}, time::Duration};
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let host = std::fs::File::open("/proc/thread-self/ns/net").unwrap();
+            assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) }, 0);
+            let ip = |args: &[&str]| {
+                assert!(Command::new("ip").args(args).status().unwrap().success(), "{args:?}");
+            };
+            ip(&["link", "set", "lo", "up"]);
+            ip(&["link", "add", "theiatest0", "type", "dummy"]);
+            ip(&["link", "set", "theiatest0", "up"]);
+            ip(&["addr", "add", "192.0.2.1/24", "dev", "theiatest0"]);
+            ip(&["-6", "addr", "add", "2001:db8:1::1/64", "dev", "theiatest0", "nodad"]);
+            ip(&["route", "add", "198.51.100.2/32", "dev", "theiatest0", "src", "192.0.2.1"]);
+            ip(&["-6", "route", "add", "2001:db8:2::2/128", "dev", "theiatest0", "src", "2001:db8:1::1"]);
+            ip(&["rule", "add", "fwmark", "0x5449", "lookup", "100"]);
+            ip(&["-6", "rule", "add", "fwmark", "0x5449", "lookup", "100"]);
+            ip(&["route", "add", "local", "0.0.0.0/0", "dev", "lo", "table", "100"]);
+            ip(&["-6", "route", "add", "local", "::/0", "dev", "lo", "table", "100"]);
+
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(async {
+                let listeners = RedirectListeners::bind(&host, 49001).unwrap();
+                // Exact fixture destinations only; no host route, global
+                // firewall changes, process-wide exemption or shell interpolation.
+                let mut nft = Command::new("nft").args(["-f", "-"]).stdin(Stdio::piped()).spawn().unwrap();
+                {
+                    let mut stdin = nft.stdin.take().unwrap();
+                    for (family, target, suffix) in [
+                        ("ip", "198.51.100.2", "4"),
+                        ("ip6", "2001:db8:2::2", "6"),
+                    ] {
+                        let table = format!("theia_redirect_lab{suffix}");
+                        writeln!(stdin, "add table {family} {table}").unwrap();
+                        writeln!(stdin, "add chain {family} {table} output {{ type route hook output priority mangle; policy accept; }}").unwrap();
+                        writeln!(stdin, "add chain {family} {table} prerouting {{ type filter hook prerouting priority mangle; policy accept; }}").unwrap();
+                        writeln!(stdin, "add rule {family} {table} output {family} daddr {target} meta l4proto {{ tcp, udp }} meta mark set 0x5449").unwrap();
+                        writeln!(stdin, "add rule {family} {table} prerouting iifname lo meta mark 0x5449 {family} daddr {target} meta l4proto {{ tcp, udp }} tproxy to :49001 accept").unwrap();
+                    }
+                }
+                assert!(nft.wait().unwrap().success());
+
+                for (tcp, udp, source, target) in [
+                    (&listeners.tcp4, &listeners.udp4, "192.0.2.1:0", "198.51.100.2:443"),
+                    (&listeners.tcp6, &listeners.udp6, "[2001:db8:1::1]:0", "[2001:db8:2::2]:443"),
+                ] {
+                    let source: SocketAddr = source.parse().unwrap();
+                    let target: SocketAddr = target.parse().unwrap();
+                    let tcp_client = async {
+                        let socket = if source.is_ipv4() {
+                            tokio::net::TcpSocket::new_v4().unwrap()
+                        } else {
+                            tokio::net::TcpSocket::new_v6().unwrap()
+                        };
+                        socket.bind(source).unwrap();
+                        let mut stream = socket.connect(target).await.unwrap();
+                        assert_eq!(stream.peer_addr().unwrap(), target);
+                        stream.write_all(b"tcp").await.unwrap();
+                        let mut reply = [0; 3];
+                        stream.read_exact(&mut reply).await.unwrap();
+                        assert_eq!(&reply, b"ack");
+                    };
+                    let tcp_proxy = async {
+                        let captured = accept_transparent(tcp).await.unwrap();
+                        assert_eq!(captured.key.destination, target);
+                        assert_eq!(captured.key.source.ip(), source.ip());
+                        let mut stream = captured.stream;
+                        let mut bytes = [0; 3];
+                        stream.read_exact(&mut bytes).await.unwrap();
+                        assert_eq!(&bytes, b"tcp");
+                        stream.write_all(b"ack").await.unwrap();
+                    };
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        tokio::join!(tcp_client, tcp_proxy);
+                    }).await.unwrap();
+
+                    let client = tokio::net::UdpSocket::bind(source).await.unwrap();
+                    client.connect(target).await.unwrap();
+                    client.send(b"udp").await.unwrap();
+                    let captured = tokio::time::timeout(Duration::from_secs(5), udp.receive()).await.unwrap().unwrap();
+                    assert_eq!(captured.key().destination, target);
+                    assert_eq!(captured.key().source, client.local_addr().unwrap());
+                    assert_eq!(captured.payload(), b"udp");
+                    let reverse = UdpReply::open(&captured).unwrap();
+                    reverse.send(b"ack").await.unwrap();
+                    let mut reply = [0; 3];
+                    let (n, from) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut reply)).await.unwrap().unwrap();
+                    assert_eq!(from, target);
+                    assert_eq!(&reply[..n], b"ack");
+                }
+            });
+        }).join().unwrap();
+    }
+
     #[test]
     fn local_peer_address_is_checked_against_kernel_interfaces() {
         assert!(is_local_ip("127.0.0.1".parse().unwrap()).unwrap());

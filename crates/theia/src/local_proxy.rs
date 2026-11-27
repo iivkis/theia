@@ -2744,7 +2744,11 @@ impl NativeIngress {
     ) -> Result<bool, ClientError> {
         self.ensure_accepting()?;
         let denied = || ClientError::Open(ErrorCode::PolicyDenied);
-        let flow = observation.revalidate().map_err(|_| denied())?;
+        let flow = observation.flow();
+        if observation.revalidate().is_err() {
+            candidates.invalidate(flow);
+            return Err(denied());
+        }
         // Never allow an older, already published candidate to survive
         // a failed attempt to revalidate its source.
         let result = self.corroborate_dns_inner(flow, link, candidates, || {
@@ -2753,7 +2757,7 @@ impl NativeIngress {
             Ok(())
         }).await;
         if !matches!(&result, Ok(true)) {
-            candidates.forget(flow);
+            candidates.invalidate(flow);
         }
         result
     }

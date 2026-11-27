@@ -12,6 +12,7 @@ import subprocess
 import sys
 
 TESTS = (
+    "routing::linux_ingress::tests::kernel_dual_stack_transparent_redirect_and_reply",
     "routing::linux_rules::tests::kernel_install_and_recovery_in_new_namespace",
     "routing::linux_rules::tests::kernel_hard_kill_keeps_capture_fail_closed_until_explicit_recovery",
     "routing::linux_rules::tests::kernel_socket_queue_proves_descriptor_not_just_destination",
@@ -53,6 +54,7 @@ def verify_coverage(path: Path) -> None:
         ("crates/theia/src/routing/linux_rules.rs", "journal.restored = true;"),
         ("crates/theia/src/routing/linux_rules.rs", "journal.restored = true; // old-boot absence reconciliation"),
         ("crates/theia/src/routing/packet_modify.rs", "assert_eq!(outputs.len(), 3);"),
+        ("crates/theia/src/routing/linux_ingress.rs", "Ok(TransparentTcp { stream, key })"),
     )
     root = Path(__file__).resolve().parents[1]
     for source, anchor in sentinels:

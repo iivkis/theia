@@ -132,6 +132,14 @@ impl DnsCandidates {
         (entry.flow == flow && entry.digest == digest && !entry.ambiguous && entry.deadline > now)
             .then_some(entry.domain.as_str())
     }
+    /// Poison rather than delete after an uncertain source check. Removing
+    /// a failed candidate would allow the same request to create a fresh TTL.
+    pub(crate) fn invalidate(&mut self, flow: CorroboratedFlow) {
+        if let Some(entry) = self.entries.get_mut(&flow.key) {
+            entry.ambiguous = true;
+        }
+    }
+
     pub fn forget(&mut self, flow: CorroboratedFlow) {
         if self
             .entries
@@ -177,6 +185,9 @@ mod tests {
         assert!(table
             .candidate(CorroboratedFlow { cookie: 9, ..flow }, [1; 32])
             .is_none());
+        table.invalidate(flow);
+        assert!(table.candidate(flow, [1; 32]).is_none());
+        assert!(!table.record(flow, &link, [1; 32], &ips, deadline).unwrap());
         link.domain = "other.example".into();
         link.request_id = [4; 16];
         assert!(!table.record(flow, &link, [1; 32], &ips, deadline).unwrap());
