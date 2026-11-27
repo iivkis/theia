@@ -131,6 +131,16 @@ async fn run() {
                 Err(CliError::NotImplemented("WinDivert x64 Windows backend"))
             }
         }
+        Ok(Command::ClientWinDivertInterfaceRedirectLab{config,directory,dll_sha256,sys_sha256,capture,carrier,seconds})=>{
+            #[cfg(all(windows,target_arch="x86_64"))]
+            {
+                local_proxy::NativeIngress::run_windows_interface_redirect_lab(Path::new(&config),directory.into(),dll_sha256,sys_sha256,capture,carrier,seconds).await
+                    .map(|_|"WinDivert isolated interface redirect ended; outside interface never protected; no production readiness asserted".to_owned())
+                    .map_err(CliError::Client)
+            }
+            #[cfg(not(all(windows,target_arch="x86_64")))]
+            {let _=(config,directory,dll_sha256,sys_sha256,capture,carrier,seconds);Err(CliError::NotImplemented("WinDivert x64 interface redirect"))}
+        }
         Ok(Command::ClientWinDivertRedirectLab { config,directory,dll_sha256,sys_sha256,targets,seconds }) => {
             #[cfg(all(windows,target_arch="x86_64"))]
             {

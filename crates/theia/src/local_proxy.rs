@@ -2769,8 +2769,25 @@ impl NativeIngress {
         path:&Path,directory:std::path::PathBuf,dll:[u8;32],sys:[u8;32],
         targets:Vec<SocketAddr>,seconds:u32,
     )->Result<(),ClientError> {
-        use crate::routing::{carrier_socket,windivert::{self,CarrierRegistry,ScopeRelayEvent}};
-        let registry=Arc::new(CarrierRegistry::for_redirect_lab(&targets).ok_or(ClientError::Configuration)?);
+        Self::run_windows_relay_scope(path,directory,dll,sys,crate::routing::windivert::RelayScope::Targets(targets),seconds).await
+    }
+
+    /// All destinations on one explicitly reviewed nonloopback device.
+    /// The carrier must use a distinct reviewed device, outside this lab.
+    /// No system-wide capture or carrier exemption is asserted.
+    #[cfg(all(target_os="windows",target_arch="x86_64"))]
+    pub async fn run_windows_interface_redirect_lab(path:&Path,directory:std::path::PathBuf,dll:[u8;32],sys:[u8;32],
+        capture:u32,carrier:u32,seconds:u32)->Result<(),ClientError> {
+        Self::run_windows_relay_scope(path,directory,dll,sys,crate::routing::windivert::RelayScope::Interface{capture,carrier},seconds).await
+    }
+    #[cfg(all(target_os="windows",target_arch="x86_64"))]
+    async fn run_windows_relay_scope(path:&Path,directory:std::path::PathBuf,dll:[u8;32],sys:[u8;32],
+        scope:crate::routing::windivert::RelayScope,seconds:u32)->Result<(),ClientError> {
+        use crate::routing::{carrier_socket,windivert::{self,CarrierRegistry,ScopeRelayEvent,RelayScope}};
+        let registry=Arc::new(match &scope {
+            RelayScope::Targets(targets)=>CarrierRegistry::for_redirect_lab(targets).ok_or(ClientError::Configuration)?,
+            RelayScope::Interface{capture,carrier}=>CarrierRegistry::for_interface_lab(*capture,*carrier).map_err(|_|ClientError::Configuration)?,
+        });
         if !(5..=120).contains(&seconds) { return Err(ClientError::Configuration); }
         let registrar:Arc<dyn carrier_socket::Registrar>=registry.clone();
         let ingress=Arc::new(Self::prepare_with_registrar(path,Some(registrar.clone())).await?);
@@ -2779,7 +2796,7 @@ impl NativeIngress {
             fn drop(&mut self) { self.0.shutdown();self.1.retire(); }
         }
         let _stop=Stop(&ingress,&registry);
-        let mut lab=windivert::begin_scope_relay_lab(directory,dll,sys,targets,seconds).await
+        let mut lab=windivert::begin_scope_relay_lab(directory,dll,sys,scope,seconds).await
             .map_err(|_|ClientError::Io)?;
         ingress.runtime.capture_state.ready()?;
         eprintln!("WinDivert isolated redirect capture ready; start authorized test applications now");

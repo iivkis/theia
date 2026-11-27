@@ -358,6 +358,14 @@ impl CaptureCorrelation {
     }
 }
 
+#[cfg(all(target_os="windows",target_arch="x86_64"))]
+pub(crate) enum RelayScope {
+    Targets(Vec<std::net::SocketAddr>),
+    /// No destination or PID exemptions inside the captured interface.
+    /// The separately reviewed carrier interface is OUTSIDE this lab.
+    Interface{capture:u32,carrier:u32},
+}
+
 /// Bound registry for the existing H2/H3 registrar hooks. A lease records
 /// only the actual owned socket endpoint, exact concrete local/remote tuple
 /// and process. It is not a process-wide or destination-wide filter permit.
@@ -373,6 +381,8 @@ struct CarrierState {
     retired:bool,
     next:u64,
     lab_blocked_ips:Vec<std::net::IpAddr>,
+    #[cfg(all(target_os="windows",target_arch="x86_64"))]
+    lab_interfaces:Option<(u32,u32)>,
 }
 #[derive(Clone,Copy)]
 struct CarrierEntry {
@@ -1296,9 +1306,49 @@ mod native {
         Ok(ticks)
     }
 
+    impl CarrierRegistry {
+        pub(crate) fn for_interface_lab(capture:u32,carrier:u32)->io::Result<Self> {
+            if capture==carrier {return Err(io::ErrorKind::InvalidInput.into());}
+            interface_identity(capture)?;
+            interface_identity(carrier)?;
+            Ok(Self{state:Arc::new(Mutex::new(CarrierState {
+                lab_interfaces:Some((capture,carrier)),..CarrierState::default()
+            }))})
+        }
+        fn pin_lab_carrier(&self,socket:&impl std::os::windows::io::AsRawSocket,
+            local:std::net::SocketAddr,peer:std::net::SocketAddr)->io::Result<()> {
+            let pair=self.state.lock().map_err(|_|io::ErrorKind::PermissionDenied)?.lab_interfaces;
+            let Some((capture,carrier))=pair else {return Ok(());};
+            interface_identity(capture)?;
+            interface_identity(carrier)?;
+            let (source,index)=crate::local_proxy::windows_route_binding(peer).ok_or(io::ErrorKind::PermissionDenied)?;
+            if index!=carrier || source.ip()!=local.ip() {return Err(io::ErrorKind::PermissionDenied.into());}
+            // IP_UNICAST_IF uses network order for IPv4, host order for
+            // IPv6. Pin the actual socket before its first connect/send.
+            use std::os::windows::io::AsRawSocket;
+            use windows_sys::Win32::Networking::WinSock::{setsockopt,getsockopt,WSAGetLastError,IPPROTO_IP,IPPROTO_IPV6};
+            let level=if local.is_ipv4(){IPPROTO_IP}else{IPPROTO_IPV6};
+            let value=if local.is_ipv4(){carrier.to_be()}else{carrier};
+            let raw=socket.as_raw_socket() as usize;
+            if unsafe{setsockopt(raw,level,31,(&value as *const u32).cast(),4)}!=0 {
+                return Err(io::Error::from_raw_os_error(unsafe{WSAGetLastError()}));
+            }
+            let mut observed=0u32;
+            let mut len=4i32;
+            if unsafe{getsockopt(raw,level,31,(&mut observed as *mut u32).cast(),&mut len)}!=0 ||
+                len!=4 || observed!=value {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            if crate::local_proxy::windows_route_binding(peer)!=Some((source,index)) {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            Ok(())
+        }
+    }
     impl crate::routing::carrier_socket::Registrar for CarrierRegistry {
         fn tcp(&self,socket:&tokio::net::TcpSocket,peer:std::net::SocketAddr)->io::Result<crate::routing::carrier_socket::Lease> {
             verify_carrier_socket(socket)?;
+            self.pin_lab_carrier(socket,socket.local_addr()?,peer)?;
             let lease=self.register(socket_endpoint(socket)?,std::process::id(),EndpointTuple {
                 local:socket.local_addr()?,remote:peer,transport:super::super::packet::Transport::Tcp
             },registration_timestamp()?).ok_or(io::ErrorKind::PermissionDenied)?;
@@ -1306,6 +1356,7 @@ mod native {
         }
         fn udp(&self,socket:&tokio::net::UdpSocket,peer:std::net::SocketAddr)->io::Result<crate::routing::carrier_socket::Lease> {
             verify_carrier_socket(socket)?;
+            self.pin_lab_carrier(socket,socket.local_addr()?,peer)?;
             let lease=self.register(socket_endpoint(socket)?,std::process::id(),EndpointTuple {
                 local:socket.local_addr()?,remote:peer,transport:super::super::packet::Transport::Udp
             },registration_timestamp()?).ok_or(io::ErrorKind::PermissionDenied)?;
@@ -1613,10 +1664,13 @@ mod native {
     }
 
     pub(crate) async fn begin_scope_relay_lab(directory:std::path::PathBuf,dll:[u8;32],sys:[u8;32],
-        targets:Vec<SocketAddr>,seconds:u32)->io::Result<ScopeRelayLab> {
-        if !validate_redirect_lab_targets(&targets) || !(5..=120).contains(&seconds) {
-            return Err(io::ErrorKind::InvalidInput.into());
-        }
+        scope:RelayScope,seconds:u32)->io::Result<ScopeRelayLab> {
+        if !(5..=120).contains(&seconds) {return Err(io::ErrorKind::InvalidInput.into());}
+        let (targets,interfaces)=match scope {
+            RelayScope::Targets(targets) if validate_redirect_lab_targets(&targets)=>(targets,None),
+            RelayScope::Interface{capture,carrier} if capture!=carrier && capture!=0 && carrier!=0=>(Vec::new(),Some((capture,carrier))),
+            _=>return Err(io::ErrorKind::InvalidInput.into()),
+        };
         let cancel=Cancel(Arc::new(AtomicBool::new(false)));
         let signal=cancel.0.clone();
         let runtime=tokio::runtime::Handle::current();
@@ -1631,12 +1685,18 @@ mod native {
             // local or shares a route source with its own address.
             let scopes=targets.iter().map(|target|Ok((*target,RedirectRoute::observe(*target)?)))
                 .collect::<io::Result<Vec<_>>>()?;
-            let outgoing=format!("outbound and !loopback and ({})",destination_filter(&targets,false)?);
-            // Guard ALL ports/protocols at the explicitly authorized IPs,
-            // including fragments and genuine inbound packets. The
-            // injector is below both handles and only emits local inbound.
-            let guard_filter=std::ffi::CString::new(format!("({outgoing}) or (inbound and !loopback and ({}))",
-                destination_filter(&targets,true)?)).map_err(|_|io::ErrorKind::InvalidInput)?;
+            let epoch=crate::network_scope::generation().ok_or(io::ErrorKind::PermissionDenied)?;
+            let pinned=interfaces.map(|(capture,carrier)|Ok::<_,io::Error>((capture,interface_identity(capture)?,
+                carrier,interface_identity(carrier)?))).transpose()?;
+            let (outgoing,guard)=if let Some((capture,_,_,_))=pinned {
+                (format!("outbound and !loopback and ifIdx == {capture}"),format!("!loopback and ifIdx == {capture}"))
+            } else {
+                let outgoing=format!("outbound and !loopback and ({})",destination_filter(&targets,false)?);
+                let guard=format!("({outgoing}) or (inbound and !loopback and ({}))",destination_filter(&targets,true)?);
+                (outgoing,guard)
+            };
+            // All protocols and both directions in the selected scope.
+            let guard_filter=std::ffi::CString::new(guard).map_err(|_|io::ErrorKind::InvalidInput)?;
             let capture_filter=std::ffi::CString::new(outgoing).map_err(|_|io::ErrorKind::InvalidInput)?;
             let mut attribution=LiveCaptureObservers::start(&directory,dll,sys)?;
             let guard=api.open_priority(&guard_filter,0,-100,0x12)?;
@@ -1651,7 +1711,12 @@ mod native {
                 let mut packets=0usize;
                 while !signal.load(Ordering::Acquire) && Instant::now()<deadline {
                     if packets>=65_536 { return Err(io::ErrorKind::OutOfMemory.into()); }
-                    if scopes.iter().any(|(target,scope)|RedirectRoute::observe(*target).ok()!=Some(*scope)) {
+                    if let Some((capture,capture_id,carrier,carrier_id))=pinned {
+                        if interface_identity(capture)?!=capture_id || interface_identity(carrier)?!=carrier_id ||
+                            crate::network_scope::generation()!=Some(epoch) {
+                            return Err(io::ErrorKind::PermissionDenied.into());
+                        }
+                    } else if scopes.iter().any(|(target,scope)|RedirectRoute::observe(*target).ok()!=Some(*scope)) {
                         return Err(io::ErrorKind::PermissionDenied.into());
                     }
                     // Bound command work so an active downlink cannot
@@ -1705,15 +1770,21 @@ mod native {
                     let key=obs.meta.flow;
                     // Match route source even for the reverse TCP listener
                     // direction (the target IP stays the same).
-                    if !scopes.iter().any(|(target,scope)|target.ip()==key.destination.ip() &&
+                    if let Some((capture,_,_,_))=pinned {
+                        if key.interface!=capture || !reflect_address(key.destination) ||
+                            !RedirectRoute::observe(key.destination).is_ok_and(|route|route.matches(key)) {
+                            continue;
+                        }
+                    } else if !scopes.iter().any(|(target,scope)|target.ip()==key.destination.ip() &&
                         scope.matches(key)) { continue; }
+                    let allowed_target=pinned.is_some() || targets.contains(&key.destination);
                     match key.transport {
                         Transport::Tcp=>{
                             let existing=table.lock().map_err(|_|io::ErrorKind::PermissionDenied)?.lookup(&address,&packet);
                             let token=match existing {
                                 Some(token)=>token,
                                 None=>{
-                                    if !targets.contains(&key.destination) || obs.meta.payload_len!=0 ||
+                                    if !allowed_target || obs.meta.payload_len!=0 ||
                                         !obs.meta.tcp_flags.is_some_and(|flags|flags & !0xc0 == 2) { continue; }
                                     // A different exclusive listener is reserved for
                                     // every SYN. No source-port or target-port guessing.
@@ -1745,7 +1816,7 @@ mod native {
                             api.send(&injector,&reverse.packet,&incoming,&signal,deadline)?;
                         }
                         Transport::Udp=>{
-                            if !targets.contains(&key.destination) || obs.meta.payload_len>crate::protocol::MAX_DATAGRAM { continue; }
+                            if !allowed_target || obs.meta.payload_len>crate::protocol::MAX_DATAGRAM { continue; }
                             let Some(plan)=UdpReversePlan::from_diverted_packet(&address,&packet) else { continue; };
                             let Some(start)=packet.len().checked_sub(obs.meta.payload_len) else { continue; };
                             let Some((flow,first))=udp.observe(plan,address) else { continue; };

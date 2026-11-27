@@ -184,6 +184,10 @@ pub enum Command {
         config:String, directory:String, dll_sha256:[u8;32], sys_sha256:[u8;32],
         targets:Vec<std::net::SocketAddr>, seconds:u32,
     },
+    ClientWinDivertInterfaceRedirectLab {
+        config:String,directory:String,dll_sha256:[u8;32],sys_sha256:[u8;32],
+        capture:u32,carrier:u32,seconds:u32,
+    },
     ClientWinDivertTcpRelayLab {
         config:String, directory:String, dll_sha256:[u8;32], sys_sha256:[u8;32], target:std::net::SocketAddr,
     },
@@ -422,6 +426,18 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
                 interface:interface.parse::<u32>().ok().filter(|n|*n!=0).ok_or(CliError::InvalidArguments)?,
                 seconds:seconds.parse::<u32>().ok().filter(|n|(1..=30).contains(n)).ok_or(CliError::InvalidArguments)?,
             }),
+        ["client","windivert","--interface-redirect-lab","--config",config,"--directory",directory,
+            "--dll-sha256",dll,"--sys-sha256",sys,"--capture-interface",capture,"--carrier-interface",carrier,
+            "--seconds",seconds,"--confirm-isolated-two-interface"]=>{
+            let capture=capture.parse::<u32>().ok().filter(|n|*n!=0).ok_or(CliError::InvalidArguments)?;
+            let carrier=carrier.parse::<u32>().ok().filter(|n|*n!=0 && *n!=capture).ok_or(CliError::InvalidArguments)?;
+            Ok(Command::ClientWinDivertInterfaceRedirectLab {
+                config:config_path(config)?,directory:config_path(directory)?,
+                dll_sha256:parse_restart_digest(dll).ok_or(CliError::InvalidArguments)?,
+                sys_sha256:parse_restart_digest(sys).ok_or(CliError::InvalidArguments)?,
+                capture,carrier,seconds:seconds.parse::<u32>().ok().filter(|n|(5..=120).contains(n)).ok_or(CliError::InvalidArguments)?,
+            })
+        },
         ["client", "windivert", "--redirect-lab", "--config", config, "--directory", directory,
             "--dll-sha256", dll, "--sys-sha256", sys, "--targets", targets, "--seconds", seconds, "--confirm-isolated"] => {
             if targets.len()>512 { return Err(CliError::InvalidArguments); }
@@ -587,6 +603,16 @@ mod tests {
         args[8]="53";assert!(command(&args).is_err());
         assert!(matches!(command(&["client","linux","--recover-lab","--journal","/private/guard.toml","--confirm-isolated-recovery"]),Ok(Command::ClientLinuxRecoverLab{..})));
         assert!(command(&["client","linux","--recover-lab","--journal","/private/guard.toml"]).is_err());
+    }
+    #[test]
+    fn interface_redirect_requires_distinct_explicit_devices() {
+        let dll="ab".repeat(32);let sys="cd".repeat(32);
+        let mut args=["client","windivert","--interface-redirect-lab","--config","client.toml","--directory","C:/Theia/WinDivert",
+            "--dll-sha256",&dll,"--sys-sha256",&sys,"--capture-interface","3","--carrier-interface","4","--seconds","30","--confirm-isolated-two-interface"];
+        assert!(matches!(command(&args),Ok(Command::ClientWinDivertInterfaceRedirectLab{capture:3,carrier:4,..})));
+        assert!(command(&args[..17]).is_err());
+        args[14]="3";assert!(command(&args).is_err());
+        args[14]="0";assert!(command(&args).is_err());
     }
     #[test]
     fn windivert_redirect_lab_requires_literal_reviewed_targets_and_duration() {
