@@ -326,7 +326,8 @@ impl AsyncQueue {
     pub(crate) async fn next(&mut self) -> io::Result<Packet<'_>> {
         let captured = loop {
             let mut ready = self.ready.readable().await?;
-            match ready.try_io(|_| self.queue.receive_captured()) {
+            let queue = &mut self.queue;
+            match ready.try_io(|_| queue.receive_captured()) {
                 Ok(result) => break result?,
                 Err(_) => continue,
             }

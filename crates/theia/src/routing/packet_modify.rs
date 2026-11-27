@@ -224,7 +224,7 @@ mod tests {
     fn quic_candidate_never_splits_unauthenticated_or_short_initial() {
         use crate::reality_quic_wire as wire;
         for version in [wire::V1,wire::V2] {
-            let initial = wire::test_initial(version, &super::super::dpi::packet_test_hello("example.org")[5..]);
+            let initial = wire::test_initial(version, &super::super::dpi::packet_test_quic_hello("example.org"));
             assert!(quic_initial_datagrams(&initial,"example.org").is_none());
             let mut data = initial.clone();
             let header = wire::long(&initial).unwrap();

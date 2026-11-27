@@ -14,6 +14,21 @@ pub(super) fn packet_quic_hello(message: &[u8], expected: &str) -> bool {
 }
 #[cfg(test)]
 pub(super) fn packet_test_hello(name: &str) -> Vec<u8> { tls::fixture(name) }
+#[cfg(test)]
+pub(super) fn packet_test_quic_hello(name: &str) -> Vec<u8> {
+    let mut record = tls::fixture(name);
+    // Fixture has no session ID, one cipher and one compression method.
+    // Append ALPN h3 and update the extension/handshake/record lengths.
+    let extension_len = u16::from_be_bytes(record[50..52].try_into().unwrap());
+    record.extend([0,16,0,5,0,3,2,b'h',b'3']);
+    record[50..52].copy_from_slice(&(extension_len+9).to_be_bytes());
+    let body_len = (record.len()-9) as u32;
+    record[6..9].copy_from_slice(&body_len.to_be_bytes()[1..]);
+    let record_len = (record.len()-5) as u16;
+    record[3..5].copy_from_slice(&record_len.to_be_bytes());
+    assert!(packet_quic_hello(&record[5..],name));
+    record[5..].to_vec()
+}
 
 use crate::{client::ClientError, network_scope};
 use std::{

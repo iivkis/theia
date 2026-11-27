@@ -9,6 +9,7 @@ pub(crate) struct Lease {
     _resource: Option<Box<dyn Send + Sync>>,
 }
 impl Lease {
+    #[cfg(target_os = "linux")]
     pub(crate) fn retain<T: Send + Sync + 'static>(resource: T) -> Self {
         Self { _resource: Some(Box::new(resource)) }
     }
