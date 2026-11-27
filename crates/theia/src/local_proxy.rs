@@ -2587,6 +2587,11 @@ impl NativeIngress {
         drop(runtime);
         drop(registrar);
         explicit?;
+        // A failed carrier revocation poisons the rule owner. Do not
+        // interpret an explicit Stop as permission to erase that guard.
+        if !rules.lock().map_err(|_|ClientError::Configuration)?.current().map_err(|_|ClientError::Io)? {
+            return Err(ClientError::Open(ErrorCode::PolicyDenied));
+        }
         // Connection drivers may release their socket leases asynchronously
         // after abort. Never restore while a live carrier retains our rules.
         timeout(Duration::from_secs(3), async {
@@ -2596,6 +2601,9 @@ impl NativeIngress {
         })
         .await
         .map_err(|_| ClientError::Timeout)?;
+        if !rules.lock().map_err(|_|ClientError::Configuration)?.current().map_err(|_|ClientError::Io)? {
+            return Err(ClientError::Open(ErrorCode::PolicyDenied));
+        }
         drop(rules);
         let recovered = linux_rules::recover(&host_namespace, journal).map_err(|_| ClientError::Io);
         drop(owner);
