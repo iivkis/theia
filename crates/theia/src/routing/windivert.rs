@@ -315,6 +315,49 @@ impl CandidateLedger {
     }
 }
 
+/// Capture-time diagnostic only. Even a unique live endpoint candidate
+/// does not attach that endpoint to the NETWORK packet. This enum has no
+/// Known application or carrier-authorization variant.
+#[derive(Debug,Clone,Copy,PartialEq,Eq)]
+pub enum CaptureAttribution {
+    Unknown,
+    CorrelatedEndpoint,
+}
+impl CaptureAttribution {
+    pub fn application_evidence(self)->super::Evidence<super::ApplicationId> {
+        // Do not infer the sender or loaded executable from correlation.
+        super::Evidence::Unknown
+    }
+}
+
+#[cfg(any(test,all(target_os="windows",target_arch="x86_64")))]
+struct CaptureCorrelation {
+    ledger:CandidateLedger,
+    start:i64,
+    correlated:usize,
+    unknown:usize,
+}
+#[cfg(any(test,all(target_os="windows",target_arch="x86_64")))]
+impl CaptureCorrelation {
+    fn new(start:i64,max_age:i64)->Option<Self> {
+        if start<=0 {return None;}
+        Some(Self{ledger:CandidateLedger::new(4096,max_age)?,start,correlated:0,unknown:0})
+    }
+    fn observe(&mut self,event:EndpointCandidate) {
+        if event.timestamp>=self.start {self.ledger.observe(event);}
+    }
+    fn invalidate(&mut self) {self.ledger.invalidate();}
+    fn classify(&mut self,packet:&NetworkObservation)->CaptureAttribution {
+        if packet.timestamp>=self.start && self.ledger.correlate(packet).is_some() {
+            self.correlated+=1;
+            CaptureAttribution::CorrelatedEndpoint
+        } else {
+            self.unknown+=1;
+            CaptureAttribution::Unknown
+        }
+    }
+}
+
 /// Bound registry for the existing H2/H3 registrar hooks. A lease records
 /// only the actual owned socket endpoint, exact concrete local/remote tuple
 /// and process. It is not a process-wide or destination-wide filter permit.
@@ -1482,6 +1525,93 @@ mod native {
         }
     }
 
+
+    // These private observers are opened before NETWORK capture and live
+    // for the same bounded lab epoch. No flow is ever passed or assigned
+    // an application hash because an event happened to match its tuple.
+    struct LiveCaptureObservers {
+        stop:Arc<AtomicBool>,
+        lost:Arc<AtomicBool>,
+        receiver:std::sync::mpsc::Receiver<EndpointCandidate>,
+        workers:Vec<std::thread::JoinHandle<()>>,
+        correlation:CaptureCorrelation,
+    }
+    impl LiveCaptureObservers {
+        fn start(directory:&std::path::Path,dll:[u8;32],sys:[u8;32])->io::Result<Self> {
+            use windows_sys::Win32::System::Performance::QueryPerformanceFrequency;
+            let mut frequency=0i64;
+            if unsafe {QueryPerformanceFrequency(&mut frequency)}==0 || frequency<=0 {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            let start=registration_timestamp()?;
+            let max_age=frequency.checked_mul(2).ok_or(io::ErrorKind::InvalidData)?;
+            let correlation=CaptureCorrelation::new(start,max_age).ok_or(io::ErrorKind::InvalidData)?;
+            let (sender,receiver)=std::sync::mpsc::sync_channel(1024);
+            let stop=Arc::new(AtomicBool::new(false));
+            let lost=Arc::new(AtomicBool::new(false));
+            let mut owner=Self{stop,lost,receiver,workers:Vec::new(),correlation};
+            for layer in [2u32,3u32] {
+                let directory=directory.to_path_buf();
+                let stop=owner.stop.clone();
+                let lost=owner.lost.clone();
+                let sender=sender.clone();
+                let (ready_tx,ready_rx)=std::sync::mpsc::sync_channel(1);
+                let worker=std::thread::Builder::new().name(format!("theia-endpoint-{layer}")).spawn(move || {
+                    let result=(||->io::Result<()> {
+                        let api=load(&directory,dll,sys)?;
+                        // Include close/delete events and competing
+                        // endpoints. Never filter to the current PID.
+                        let handle=api.open_handle(c"outbound and (protocol == 6 or protocol == 17)",layer,0x15)?;
+                        api.bounded(&handle)?;
+                        ready_tx.send(()).map_err(|_|io::ErrorKind::BrokenPipe)?;
+                        while !stop.load(Ordering::Acquire) {
+                            match api.receive_event(&handle,&stop,Instant::now()+Duration::from_millis(100)) {
+                                Ok(event)=>{
+                                    if event.layer!=layer || sender.try_send(event).is_err() {
+                                        return Err(io::ErrorKind::InvalidData.into());
+                                    }
+                                },
+                                Err(_) if stop.load(Ordering::Acquire)=>break,
+                                Err(e) if e.kind()==io::ErrorKind::TimedOut=>{},
+                                Err(e)=>return Err(e),
+                            }
+                        }
+                        api.retire(handle)
+                    })();
+                    if result.is_err() {lost.store(true,Ordering::Release);}
+                })?;
+                owner.workers.push(worker);
+                ready_rx.recv_timeout(Duration::from_secs(5))
+                    .map_err(|_|io::ErrorKind::TimedOut)?;
+            }
+            Ok(owner)
+        }
+        fn observe_packet(&mut self,packet:&NetworkObservation)->CaptureAttribution {
+            for _ in 0..1024 {
+                match self.receiver.try_recv() {
+                    Ok(event)=>self.correlation.observe(event),
+                    Err(std::sync::mpsc::TryRecvError::Empty)=>break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected)=>{
+                        self.lost.store(true,Ordering::Release);break;
+                    }
+                }
+            }
+            if self.lost.load(Ordering::Acquire) {self.correlation.invalidate();}
+            self.correlation.classify(packet)
+        }
+        fn report(&self) {
+            eprintln!("WinDivert capture attribution: correlated candidates={}, unresolved={}, trusted application=0, observer invalidated={}",
+                self.correlation.correlated,self.correlation.unknown,
+                self.correlation.ledger.poisoned || self.lost.load(Ordering::Acquire));
+        }
+    }
+    impl Drop for LiveCaptureObservers {
+        fn drop(&mut self) {
+            self.stop.store(true,Ordering::Release);
+            for worker in self.workers.drain(..) {let _=worker.join();}
+        }
+    }
+
     pub(crate) async fn begin_scope_relay_lab(directory:std::path::PathBuf,dll:[u8;32],sys:[u8;32],
         targets:Vec<SocketAddr>,seconds:u32)->io::Result<ScopeRelayLab> {
         if !validate_redirect_lab_targets(&targets) || !(5..=120).contains(&seconds) {
@@ -1508,6 +1638,7 @@ mod native {
             let guard_filter=std::ffi::CString::new(format!("({outgoing}) or (inbound and !loopback and ({}))",
                 destination_filter(&targets,true)?)).map_err(|_|io::ErrorKind::InvalidInput)?;
             let capture_filter=std::ffi::CString::new(outgoing).map_err(|_|io::ErrorKind::InvalidInput)?;
+            let mut attribution=LiveCaptureObservers::start(&directory,dll,sys)?;
             let guard=api.open_priority(&guard_filter,0,-100,0x12)?;
             let capture=api.open_priority(&capture_filter,0,100,0x14)?;
             api.bounded(&capture)?;
@@ -1564,6 +1695,13 @@ mod native {
                     packets+=1;
                     let Ok(obs)=address.network(&packet) else { continue; };
                     if !obs.outbound || obs.sniffed { return Err(io::ErrorKind::PermissionDenied.into()); }
+                    let candidate=attribution.observe_packet(&obs);
+                    // The common Redirect adapter still receives Unknown
+                    // application evidence. A candidate is not permission
+                    // to bypass capture or a policy rule.
+                    if candidate.application_evidence()!=super::super::Evidence::Unknown {
+                        return Err(io::ErrorKind::PermissionDenied.into());
+                    }
                     let key=obs.meta.flow;
                     // Match route source even for the reverse TCP listener
                     // direction (the target IP stays the same).
@@ -1629,6 +1767,8 @@ mod native {
             // the owner has explicitly requested teardown.
             if let Ok(mut t)=table.lock() { t.retire(); }
             udp.retire();
+            attribution.report();
+            drop(attribution);
             let _=end_tx.send(());
             drop(event_tx);
             drop(reply_rx);
@@ -2316,6 +2456,33 @@ pub(crate) use native::{begin_udp_relay_lab, run_tcp_relay_lab, RelayLab, UDP_LA
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn capture_correlation_cannot_be_application_evidence() {
+        use super::super::{Evidence,packet::{FlowKey,Transport}};
+        let source="192.0.2.1:1234".parse().unwrap();
+        let destination="198.51.100.2:443".parse().unwrap();
+        let words=|v:&str|u128::from(v.parse::<std::net::Ipv6Addr>().unwrap()).to_le_bytes();
+        let event=EndpointCandidate{endpoint:1,pid:42,timestamp:100,layer:3,event:4,protocol:17,
+            outbound:true,local_port:1234,remote_port:443,local_words:words("::ffff:192.0.2.1"),
+            remote_words:words("::ffff:198.51.100.2")};
+        let packet=NetworkObservation{timestamp:110,outbound:true,sniffed:false,interface:7,sub_interface:0,
+            meta:PacketMeta{flow:FlowKey{source,destination,transport:Transport::Udp,interface:7},
+                payload_len:1,tcp_flags:None},transport_checksum_reported_valid:true};
+        let mut capture=CaptureCorrelation::new(90,100).unwrap();
+        capture.observe(EndpointCandidate{timestamp:89,..event});
+        assert_eq!(capture.classify(&packet),CaptureAttribution::Unknown);
+        capture.observe(event);
+        capture.observe(EndpointCandidate{layer:2,event:1,timestamp:101,..event});
+        let matched=capture.classify(&packet);
+        assert_eq!(matched,CaptureAttribution::CorrelatedEndpoint);
+        assert_eq!(matched.application_evidence(),Evidence::Unknown);
+        capture.observe(EndpointCandidate{event:7,timestamp:111,..event});
+        assert_eq!(capture.classify(&NetworkObservation{timestamp:112,..packet}),CaptureAttribution::Unknown);
+        capture.invalidate();
+        assert_eq!(capture.classify(&packet),CaptureAttribution::Unknown);
+        assert_eq!((capture.correlated,capture.unknown),(1,3));
+    }
+
     #[test]
     fn scope_udp_reverse_capability_is_epoch_and_interface_bound() {
         let mut raw=[0u8;80];
