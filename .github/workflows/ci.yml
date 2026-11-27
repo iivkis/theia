@@ -1065,13 +1065,13 @@ jobs:
           retention-days: 7
 
   f15-driver-build:
-    name: F-15 native driver build (${{ matrix.os }})
+    name: F-15 native backend prerequisites (${{ matrix.os }})
     needs: specification
     if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2025-vs2026]
+        os: [ubuntu-24.04, windows-2025]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -1104,34 +1104,21 @@ jobs:
           mkdir f15-build-evidence
           cp drivers/linux/theia_flow_events.bpf.o f15-build-evidence/
           sha256sum f15-build-evidence/theia_flow_events.bpf.o
-      - name: Test offline driver attestation and manifest validation
+      - name: Validate WinDivert package staging without installing a driver
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./drivers/windows/test-attestation.ps1
-      - name: Restore pinned Microsoft SDK and WDK packages
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          nuget restore drivers/windows/packages.config -PackagesDirectory drivers/windows/packages -Source https://api.nuget.org/v3/index.json -NonInteractive
-          if ($LASTEXITCODE -ne 0) { throw 'Pinned WDK restore failed' }
-      - name: Compile WDK callout and BFE controller (unsigned, no install)
+        run: ./drivers/windows/windivert/test-package.ps1
+      - name: Record Windows package validation scope
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          if (!$vs) { throw 'Visual Studio C++ toolchain unavailable' }
-          & (Join-Path $vs 'Common7\Tools\Launch-VsDevShell.ps1') -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
-          & ./drivers/windows/build-lab.ps1 -OutputDirectory (Join-Path $PWD 'f15-build-evidence')
-      - name: Publish exact-source unsigned driver build evidence
+          New-Item -ItemType Directory f15-build-evidence | Out-Null
+          [pscustomobject]@{SourceSha='${{ needs.specification.outputs.tested_sha }}';Backend='WinDivert';UpstreamVersion='2.2.2';PackageFixtureTests=$true;OfficialPackageVerified=$false;Installed=$false;CaptureReady=$false} | ConvertTo-Json | Set-Content f15-build-evidence/build-evidence.json
+      - name: Publish exact-source native prerequisite evidence
         uses: actions/upload-artifact@v4
         with:
           name: f15-driver-build-${{ runner.os }}-${{ needs.specification.outputs.tested_sha }}
           path: |
-            f15-build-evidence/*.sys
-            f15-build-evidence/*.pdb
-            f15-build-evidence/*.exe
             f15-build-evidence/*.o
             f15-build-evidence/hashes.json
             f15-build-evidence/build-evidence.json

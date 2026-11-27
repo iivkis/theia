@@ -80,6 +80,19 @@ async fn run() {
                 Err(CliError::NotImplemented("Windows user proxy"))
             }
         }
+        Ok(Command::ClientWinDivertCheck { directory, dll_sha256, sys_sha256, install_lab }) => {
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            {
+                theia::routing::windivert::probe(Path::new(&directory), dll_sha256, sys_sha256, install_lab)
+                    .map(|_| "WinDivert 2.2 API available; capture inactive; loaded driver hash not attested".to_owned())
+                    .map_err(|_| CliError::Client(theia::client::ClientError::Io))
+            }
+            #[cfg(not(all(windows, target_arch = "x86_64")))]
+            {
+                let _ = (directory, dll_sha256, sys_sha256, install_lab);
+                Err(CliError::NotImplemented("WinDivert x64 Windows backend"))
+            }
+        }
         Ok(Command::ClientStatus)=>{
             match management::query_client_environment(management::StatusCommand::ClientStatus).await{
                 Ok(management::StatusReply::ClientRunning{revision,config_sha256,descriptor_revision,transport,xhttp,fallback,routing_revision,routing_state,routing_totals,flow_counts,capture_state})=>{

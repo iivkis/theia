@@ -24,6 +24,8 @@ pub mod linux_rules;
 pub mod nfqueue;
 pub mod packet;
 pub mod packet_modify;
+#[cfg(any(target_os = "windows", test))]
+pub mod windivert;
 mod settings;
 pub mod snapshot;
 #[cfg(any(target_os = "windows", test))]
