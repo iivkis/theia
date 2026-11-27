@@ -53,9 +53,9 @@ fn controls(mut data: &[u8], ipv4: bool) -> io::Result<(&[u8], &[u8])> {
             if c.is_some() || value.len() != super::wfp_context::SIZE { return Err(invalid()); }
             c = Some(value);
         } else if (h.cmsg_level == IPPROTO_IP as i32
-            && matches!(h.cmsg_type, x if x == IP_WFP_REDIRECT_RECORDS as i32 || x == IP_WFP_REDIRECT_CONTEXT as i32))
+            && (h.cmsg_type == IP_WFP_REDIRECT_RECORDS as i32 || h.cmsg_type == IP_WFP_REDIRECT_CONTEXT as i32))
             || (h.cmsg_level == IPPROTO_IPV6 as i32
-            && matches!(h.cmsg_type, x if x == IPV6_WFP_REDIRECT_RECORDS as i32 || x == IPV6_WFP_REDIRECT_CONTEXT as i32)) {
+            && (h.cmsg_type == IPV6_WFP_REDIRECT_RECORDS as i32 || h.cmsg_type == IPV6_WFP_REDIRECT_CONTEXT as i32)) {
             return Err(invalid());
         }
         let next = aligned(len).ok_or_else(invalid)?;

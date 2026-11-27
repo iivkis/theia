@@ -1666,7 +1666,7 @@ impl ClientRuntime {
     /// Pin exactly the published client generation for native capture.
     /// A structural or profile update needs explicit stop/recovery until
     /// carrier and rule changes can be committed in one platform transaction.
-    async fn attach_native(self: &Arc<Self>, owner: NativeOwner, registrar: Option<Arc<dyn crate::routing::carrier_socket::Registrar>>) -> Result<NativeIngress, ClientError> {
+    async fn attach_native(self: &Arc<Self>, owner: Arc<NativeOwner>, registrar: Option<Arc<dyn crate::routing::carrier_socket::Registrar>>) -> Result<NativeIngress, ClientError> {
         let _stage = self.stage.try_lock().map_err(|_| ClientError::Configuration)?;
         if *self.stopped.borrow() || self.native_attached.load(std::sync::atomic::Ordering::Acquire) {
             return Err(ClientError::Configuration);
@@ -1951,7 +1951,7 @@ pub struct NativeIngress {
     verdict_gate: Mutex<()>,
     #[cfg(target_os = "linux")]
     raw: Mutex<std::collections::HashMap<crate::routing::packet::FlowKey, RawLease>>,
-    _owner: NativeOwner,
+    _owner: Arc<NativeOwner>,
 }
 
 /// A single experimental packet strategy bound to a specific native flow.
@@ -2038,7 +2038,7 @@ impl NativeIngress {
     /// Preflight only; the caller owns an isolated network namespace/rule
     /// transaction. No new CLI or second system interception mode.
     pub async fn prepare(path: &Path) -> Result<Self, ClientError> {
-        let owner = NativeOwner::acquire()?;
+        let owner = Arc::new(NativeOwner::acquire()?);
         let raw = zeroize::Zeroizing::new(config::editor_bytes(path).map_err(|_| ClientError::Configuration)?);
         let Config::Client(document) = config::parse(std::str::from_utf8(&raw).map_err(|_| ClientError::Configuration)?)
             .map_err(|_| ClientError::Configuration)? else { return Err(ClientError::Configuration); };
@@ -2134,7 +2134,7 @@ impl NativeIngress {
                 if !rules.lock().map_err(|_| ClientError::Configuration)?.owns_packet(&packet).map_err(|_| ClientError::Io)? {
                     return Err(ClientError::Open(ErrorCode::PolicyDenied));
                 }
-                self.verdict(packet).await.map_err(|_| ClientError::Io)?;
+                self.verdict(&rules, packet).await.map_err(|_| ClientError::Io)?;
             }
         };
         tokio::select! {
@@ -2165,7 +2165,7 @@ impl NativeIngress {
         if tokio::runtime::Handle::current().runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread {
             return Err(ClientError::Configuration);
         }
-        let owner = NativeOwner::acquire()?;
+        let owner = Arc::new(NativeOwner::acquire()?);
         let path = std::path::absolute(path).map_err(|_| ClientError::Configuration)?;
         let raw = zeroize::Zeroizing::new(config::editor_bytes(&path).map_err(|_| ClientError::Configuration)?);
         let Config::Client(document) = config::parse(std::str::from_utf8(&raw).map_err(|_| ClientError::Configuration)?)
@@ -2178,7 +2178,9 @@ impl NativeIngress {
         let client = carrier_socket::scope(Some(registrar.clone()), prepare_client(&document,&path)).await?;
         saved_client_bytes(&path,digest)?;
         let runtime = ClientRuntime::new(path,document,digest,client);
-        let ingress = runtime.attach_native(owner,Some(registrar.clone())).await?;
+        // Keep the process/namespace owner alive across the entire explicit
+        // recovery transaction, not just across the packet consumer.
+        let ingress = runtime.attach_native(owner.clone(),Some(registrar.clone())).await?;
         let control = crate::management::client_server(runtime.clone()).map_err(|_| ClientError::Configuration)?;
         let management = async move {
             match control {
@@ -2188,12 +2190,14 @@ impl NativeIngress {
         };
         let explicit = tokio::select! {
             biased;
-            result=stop=>result.map_err(|_| ClientError::Io),
             result=ingress.serve_linux_shared(queue,rules.clone(),registrar.clone())=>{
                 result?;
                 Err(ClientError::Io) // unexpected consumer exit, never auto restore
             },
-            result=management=>{ result?; Err(ClientError::Io) }
+            result=management=>{ result?; Err(ClientError::Io) },
+            // When a failure and explicit stop are already ready together,
+            // do not reinterpret a failed consumer as a clean shutdown.
+            result=stop=>result.map_err(|_| ClientError::Io),
         };
         ingress.shutdown();
         drop(ingress);
@@ -2208,7 +2212,9 @@ impl NativeIngress {
             }
         }).await.map_err(|_| ClientError::Timeout)?;
         drop(rules);
-        linux_rules::recover(&host_namespace,journal).map_err(|_| ClientError::Io)
+        let recovered = linux_rules::recover(&host_namespace,journal).map_err(|_| ClientError::Io);
+        drop(owner);
+        recovered
     }
 
     /// Correlate a laboratory resolver link with protected DNS from the
@@ -2226,23 +2232,26 @@ impl NativeIngress {
         if flow.key() != link.key || flow.cookie() != link.cookie || flow.process_start() != link.process_start {
             return Ok(false);
         }
-        let (carrier, cache) = match &self.client {
-            ProxyClient::Direct(c) => (c.carrier.clone(), &c.routing),
-            ProxyClient::Reality(c) => (c.generation().await?.carrier.clone(), &c.routing),
-        };
-        let snapshot = cache.get(|known| carrier.fetch_routing(known)).await?;
-        let digest = snapshot.digest();
-        let name = crate::routing::domain_name(&link.domain).map_err(|_| ClientError::Protocol)?;
-        // The current wire response contains addresses, not authoritative
-        // DNS TTLs. Bound this diagnostic to the original policy lease and
-        // a short window beginning BEFORE the authenticated request.
-        let original_deadline = cache.observation_deadline(digest)?;
-        let requested = Instant::now();
-        let ips = carrier.resolve_routing(&name, digest).await?;
-        let deadline = original_deadline.min(cache.observation_deadline(digest)?)
-            .min(requested + Duration::from_secs(30));
-        self.ensure_running()?;
-        candidates.record(flow, link, digest, &ips, deadline).map_err(|_| ClientError::Protocol)
+        let registrar = self.registrar()?.ok_or(ClientError::Open(ErrorCode::PolicyDenied))?;
+        crate::routing::carrier_socket::scope(Some(registrar), async {
+            let (carrier, cache) = match &self.client {
+                ProxyClient::Direct(c) => (c.carrier.clone(), &c.routing),
+                ProxyClient::Reality(c) => (c.generation().await?.carrier.clone(), &c.routing),
+            };
+            let snapshot = cache.get(|known| carrier.fetch_routing(known)).await?;
+            let digest = snapshot.digest();
+            let name = crate::routing::domain_name(&link.domain).map_err(|_| ClientError::Protocol)?;
+            // The current wire response contains addresses, not authoritative
+            // DNS TTLs. Bound this diagnostic to the original policy lease and
+            // a short window beginning BEFORE the authenticated request.
+            let original_deadline = cache.observation_deadline(digest)?;
+            let requested = Instant::now();
+            let ips = carrier.resolve_routing(&name, digest).await?;
+            let deadline = original_deadline.min(cache.observation_deadline(digest)?)
+                .min(requested + Duration::from_secs(30));
+            self.ensure_running()?;
+            candidates.record(flow, link, digest, &ips, deadline).map_err(|_| ClientError::Protocol)
+        }).await
     }
 
     /// Prepare a narrowly scoped laboratory Modify permit. The route must
@@ -2329,8 +2338,17 @@ impl NativeIngress {
     /// Modify, Redirect and all errors fail closed on raw packet ingress.
     /// No raw TCP connection is moved to the carrier after its SYN.
     #[cfg(target_os = "linux")]
-    pub async fn verdict(&self, packet: crate::routing::nfqueue::Packet<'_>) -> std::io::Result<crate::routing::PacketAction> {
+    pub async fn verdict(
+        &self,
+        rules: &Mutex<crate::routing::linux_rules::LabRules>,
+        packet: crate::routing::nfqueue::Packet<'_>,
+    ) -> std::io::Result<crate::routing::PacketAction> {
         use crate::routing::PacketAction;
+        // Check before doing any async policy work; a standalone queue
+        // without the exact owned rule set must not authorize native Pass.
+        if !rules.lock().map_err(|_| std::io::ErrorKind::PermissionDenied)?.owns_packet(&packet)? {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
         let meta = packet.metadata();
         let action = if packet.local_output() {
             match meta {
@@ -2341,6 +2359,13 @@ impl NativeIngress {
             PacketAction::Drop
         };
         let gate = self.verdict_gate.lock();
+        // Recheck AFTER the asynchronous policy fetch. Hold the rule mutex
+        // through the actual verdict so our own dynamic lease transaction
+        // cannot race this check. A foreign change is a terminal error.
+        let owned = rules.lock().map_err(|_| std::io::ErrorKind::PermissionDenied)?;
+        if !owned.owns_packet(&packet)? {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
         let mut action = if gate.is_ok() && self.ensure_running().is_ok() { action } else { PacketAction::Drop };
         if action == PacketAction::Pass {
             let current = meta.and_then(|m| {
@@ -2352,7 +2377,9 @@ impl NativeIngress {
             }).unwrap_or(false);
             if !current { action = PacketAction::Drop; }
         }
-        packet.finish(action)
+        let result = packet.finish(action);
+        drop(owned);
+        result
     }
 
     #[cfg(target_os = "linux")]

@@ -500,6 +500,28 @@ mod tests {
         assert!(!expired.valid(second.digest()));
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn diagnostic_deadline_rejects_wrong_digest_refresh_and_retirement() {
+        let cache = Cache::new("scope".into(), None);
+        let (_, wire) = Snapshot::build("scope", 1, &[], &[], &[]).unwrap();
+        let snapshot = cache.get(|_| async { Ok(wire) }).await.unwrap();
+        let digest = snapshot.digest();
+        let original = cache.observation_deadline(digest).unwrap();
+        assert!(original > Instant::now());
+        assert!(cache.observation_deadline([0; 32]).is_err());
+        {
+            let mut state = cache.state.lock().await;
+            assert!(cache.observation_deadline(digest).is_err());
+            state.expires = Some(Instant::now());
+        }
+        assert!(cache.observation_deadline(digest).is_err());
+        cache.get(|_| async { Ok(super::super::exchange::unchanged_receipt(digest).to_vec()) }).await.unwrap();
+        assert!(cache.observation_deadline(digest).unwrap() >= original);
+        cache.dpi.retire();
+        assert!(cache.observation_deadline(digest).is_err());
+    }
+
     #[tokio::test]
     async fn cache_rejects_rollback_and_equivocation() {
         let cache = Cache::new("scope".into(), None);
