@@ -673,20 +673,40 @@ mod tests {
     async fn diagnostic_task_does_not_increment_ordinary_relay_counters() {
         let c = Counters::new();
         assert!(!diagnostic());
-        PROFILE_DIAGNOSTIC.scope((), async {
-            assert!(diagnostic());
-            let relay = c.enter();
-            assert!(std::ptr::eq(relay.0, &DIAGNOSTIC_COUNTERS));
-            relay.upload(17);
-            relay.download(23);
-            assert_eq!(c.snapshot(), Snapshot::default());
-            udp_stun_fingerprint(); udp_stun_local(); udp_stun_probe(true); udp_quic_v2_fallback();
-            udp_peer_failure(); dpi_policy_stale(); dpi_post_hello_failure(); dpi_bidirectional();
-            udp_peer_reply(); dpi_cache_hit(); dpi_probe(false); dpi_tls_alert(); dpi_timeout();
-            udp_verified_local(); udp_queue_drop(); udp_stun_fallback(); udp_quic_flow();
-            udp_stun_flow(); udp_stun_response(); udp_dpi_fallback(); blocked();
-            dpi_first_response(); dpi_fallback_open(); dpi_first_failure();
-        }).await;
+        PROFILE_DIAGNOSTIC
+            .scope((), async {
+                assert!(diagnostic());
+                let relay = c.enter();
+                assert!(std::ptr::eq(relay.0, &DIAGNOSTIC_COUNTERS));
+                relay.upload(17);
+                relay.download(23);
+                assert_eq!(c.snapshot(), Snapshot::default());
+                udp_stun_fingerprint();
+                udp_stun_local();
+                udp_stun_probe(true);
+                udp_quic_v2_fallback();
+                udp_peer_failure();
+                dpi_policy_stale();
+                dpi_post_hello_failure();
+                dpi_bidirectional();
+                udp_peer_reply();
+                dpi_cache_hit();
+                dpi_probe(false);
+                dpi_tls_alert();
+                dpi_timeout();
+                udp_verified_local();
+                udp_queue_drop();
+                udp_stun_fallback();
+                udp_quic_flow();
+                udp_stun_flow();
+                udp_stun_response();
+                udp_dpi_fallback();
+                blocked();
+                dpi_first_response();
+                dpi_fallback_open();
+                dpi_first_failure();
+            })
+            .await;
         assert!(!diagnostic());
         assert_eq!(c.snapshot(), Snapshot::default());
         let relay = c.enter();
