@@ -1162,7 +1162,7 @@ impl Tunnel {
                     .map_err(|_| ClientError::Protocol)?;
                 match frame {
                     Frame::Datagram(data) => {
-                        if let Some(flow)=flow {flow.check_live(crate::routing::PacketAction::Redirect)?;}
+                        if let Some(flow)=flow {flow.commit(crate::routing::PacketAction::Redirect)?;}
                         let size = data.len();
                         if crate::udp_relay::deliver(&download, || data)? {
                             traffic.download(size);
@@ -1283,7 +1283,7 @@ impl Tunnel {
                 match frame {
                     Frame::Padding(_) => tokio::task::yield_now().await,
                     Frame::Data(data) => {
-                        if let Some(flow)=flow {flow.check_live(crate::routing::PacketAction::Redirect)?;}
+                        if let Some(flow)=flow {flow.commit(crate::routing::PacketAction::Redirect)?;}
                         crate::diag!(
                             Trace,
                             "client.h2",

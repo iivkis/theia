@@ -381,7 +381,12 @@ impl RealityClient {
         self.changed.notify_one();
         Ok(next)
     }
-    async fn open(&self, address: Address, port: u16, allow_dpi: bool) -> Result<RoutedTcp, ClientError> {
+    #[cfg(test)]
+    async fn open(&self, address: Address, port: u16) -> Result<RoutedTcp, ClientError> {
+        self.open_for(address, port, true).await
+    }
+
+    async fn open_for(&self, address: Address, port: u16, allow_dpi: bool) -> Result<RoutedTcp, ClientError> {
         let generation = self.generation().await?;
         let mut result = routed_open(&generation.carrier, &self.routing, address, port, allow_dpi).await;
         if let Ok(tunnel) = &mut result {
@@ -1039,7 +1044,11 @@ impl RoutedTcp {
         self.tunnel.open_code()
     }
     async fn relay(self, socket: TcpStream) -> Result<(), ClientError> {
-        self.tunnel.relay_guarded(socket, Some(&self.flow)).await
+        tokio::select! {
+            biased;
+            result = self.flow.wait_revoked() => result,
+            result = self.tunnel.relay_guarded(socket, Some(&self.flow)) => result,
+        }
     }
 
     async fn relay_http(self, socket: TcpStream, request: Vec<u8>) -> Result<(), ClientError> {
@@ -1047,12 +1056,19 @@ impl RoutedTcp {
         // request can reuse the selected destination or bypass policy.
         let local = HttpOnce { socket, request: request.into() };
         let flow = Some(&self.flow);
-        match self.tunnel {
+        let relay = async {
+            match self.tunnel {
             ProxyTunnel::Direct(target) => client_state::relay_http_direct_guarded(local, target, flow).await,
             ProxyTunnel::H2(tunnel) => tunnel.relay_guarded(local, flow).await,
             ProxyTunnel::H3(tunnel) => tunnel.relay_guarded(local, flow).await,
             // Plain HTTP is known not to be a TLS ClientHello before OPEN.
             ProxyTunnel::Dpi(_) => Err(ClientError::Protocol),
+            }
+        };
+        tokio::select! {
+            biased;
+            result = self.flow.wait_revoked() => result,
+            result = relay => result,
         }
     }
 }
@@ -1064,15 +1080,6 @@ struct RoutedUdp {
 impl RoutedUdp {
     fn record_transport(&self, observed: &std::sync::atomic::AtomicU8) {
         self.tunnel.record_transport(observed);
-    }
-    async fn relay(
-        self,
-        upload: tokio::sync::mpsc::Receiver<Vec<u8>>,
-        download: tokio::sync::mpsc::Sender<Vec<u8>>,
-    ) -> Result<(), ClientError> {
-        self.tunnel
-            .relay_guarded(upload, download, Some(&self.flow))
-            .await
     }
 }
 
@@ -1591,6 +1598,16 @@ impl ProxyClient {
         }
     }
 
+    async fn refresh_routing_policy(&self) -> Result<Arc<Snapshot>, ClientError> {
+        match self {
+            Self::Direct(c) => c.routing.refresh(|known| c.carrier.fetch_routing(known)).await,
+            Self::Reality(c) => {
+                let generation = c.generation().await?;
+                c.routing.refresh(|known| generation.carrier.fetch_routing(known)).await
+            }
+        }
+    }
+
     async fn open_udp(
         &self,
         address: Address,
@@ -1654,7 +1671,7 @@ impl ProxyClient {
                 }
                 Ok(tunnel)
             }
-            Self::Reality(client) => client.open(address, port, allow_dpi).await,
+            Self::Reality(client) => client.open_for(address, port, allow_dpi).await,
         }
     }
     async fn maintain(&self) -> Result<(), ClientError> {
@@ -1666,7 +1683,7 @@ impl ProxyClient {
         };
         let routing = async {
             loop {
-                let _ = self.routing_policy().await;
+                let _ = self.refresh_routing_policy().await;
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         };
@@ -5564,9 +5581,9 @@ async fn udp_association(
                     let _completion=completion;
                     let (address,port)=key;
                     let candidate=udp::await_candidate(classified, deadline).await;
-                    let tunnel=proxy.open_udp(address.clone(),port,&candidate).await?;
+                    let RoutedUdp { tunnel, flow }=proxy.open_udp(address.clone(),port,&candidate).await?;
                     let (down_tx,mut down_rx)=mpsc::channel(QUEUE);
-                    let relay=tunnel.relay(rx,down_tx);
+                    let relay=tunnel.relay_guarded(rx,down_tx,Some(&flow));
                     let deliver=async {
                         let mut packet = Vec::new();
                         while let Some(data)=down_rx.recv().await {
@@ -5576,6 +5593,7 @@ async fn udp_association(
                                 // this is not queue congestion.
                                 continue;
                             }
+                            flow.check_delivery()?;
                             let n=timeout(REPLY_TIMEOUT,socket.send_to(&packet,source)).await
                                 .map_err(|_|ClientError::Timeout)?.map_err(|_|ClientError::Io)?;
                             if n!=packet.len(){return Err(ClientError::Io);}
@@ -5584,7 +5602,11 @@ async fn udp_association(
                     };
                     // On clean termination drain accepted responses instead
                     // of cancelling the downstream queue when relay returns.
-                    tokio::try_join!(relay, deliver).map(|_| ())
+                    tokio::select! {
+                        biased;
+                        result=flow.wait_revoked()=>result,
+                        result=async { tokio::try_join!(relay, deliver).map(|_| ()) }=>result,
+                    }
                 });
             }
         }
@@ -6363,8 +6385,13 @@ mod selector_tests {
                         ..
                     }
                 ));
-                // Apply deliberately retires the old client's policy lease.
-                // Its established flows may finish, but new OPEN must fail.
+                // Profile switch retires old local policy leases, including
+                // idle established flows; server auth-only Apply is separate.
+                let mut old = [0; 1];
+                assert!(matches!(
+                    timeout(Duration::from_secs(3), established[0].read(&mut old)).await,
+                    Ok(Ok(0) | Err(_))
+                ));
                 assert!(matches!(
                     managed_clients[0]
                         .open(Address::V4([127, 0, 0, 1]), target.port())
@@ -6382,6 +6409,20 @@ mod selector_tests {
                 let ProxyClient::Reality(fresh_h2) = load_client(h2_profile).await.unwrap() else {
                     panic!("wrong security mode");
                 };
+                // Open a separate H2 flow under a fresh independent runtime
+                // so the subsequent H2/H3 rotation regression remains intact.
+                let (http, socks) = (
+                    TcpListener::bind("127.0.0.1:0").await.unwrap(),
+                    TcpListener::bind("127.0.0.1:0").await.unwrap(),
+                );
+                let address = http.local_addr().unwrap();
+                proxies[0].spawn(serve_proxy(http, socks, ProxyClient::Reality(fresh_h2.clone())));
+                let mut fresh_stream = TcpStream::connect(address).await.unwrap();
+                fresh_stream.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes()).await.unwrap();
+                let mut reply = vec![0; HTTP_OK.len()];
+                fresh_stream.read_exact(&mut reply).await.unwrap();
+                assert_eq!(reply, HTTP_OK);
+                established[0] = fresh_stream;
                 managed_clients[0] = fresh_h2;
                 for stream in &mut established {
                     stream.write_all(b"keep").await.unwrap();

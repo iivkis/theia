@@ -137,7 +137,7 @@ impl FlowTable {
         if port == 0 || configured == PacketAction::Drop {
             return Err(denied());
         }
-        engine.check_policy(digest)?;
+        let epoch = engine.policy_epoch(digest)?;
         let identity = Identity {
             protocol,
             target,
@@ -173,6 +173,7 @@ impl FlowTable {
             id,
             identity,
             engine,
+            epoch,
         })
     }
 }
@@ -196,18 +197,51 @@ pub(crate) struct FlowLease {
     id: u64,
     identity: Identity,
     engine: Arc<Engine>,
+    epoch: u64,
 }
 
 impl FlowLease {
-    /// Native egress is authorized only while its pinned policy is live.
-    /// Compatibility flows deliberately retain their prior drain semantics.
-    /// This does not change the irreversible first-send action.
-    pub(crate) fn check_live(&self,action:PacketAction)->Result<(),ClientError> {
-        if self.identity.native.is_some() {
-            self.engine.check_policy(self.identity.digest)?;
-            if action==PacketAction::Modify && !self.engine.enabled() {return Err(denied());}
+    /// Every ingress, including explicit proxy requests, pins the same
+    /// policy generation. A reaccepted digest cannot revive revoked flows.
+    fn check_epoch(&self) -> Result<(), ClientError> {
+        if self.engine.policy_epoch(self.identity.digest)? != self.epoch {
+            return Err(denied());
         }
         Ok(())
+    }
+
+    pub(crate) fn check_live(&self, action: PacketAction) -> Result<(), ClientError> {
+        self.check_epoch()?;
+        if action == PacketAction::Modify && !self.engine.enabled() {
+            return Err(denied());
+        }
+        Ok(())
+    }
+
+    fn actual_action(&self) -> Result<Option<PacketAction>, ClientError> {
+        let state = self.table.state.lock().map_err(|_| denied())?;
+        let entry = state.entries.get(&self.id).ok_or_else(denied)?;
+        if entry.identity != self.identity {
+            return Err(denied());
+        }
+        Ok(entry.committed)
+    }
+
+    /// Check again at the real SOCKS UDP socket, after a bounded relay queue.
+    pub(crate) fn check_delivery(&self) -> Result<(), ClientError> {
+        self.check_live(self.actual_action()?.ok_or_else(denied)?)
+    }
+
+    /// Idle flows must close on expiry, digest/consent revocation or runtime
+    /// retirement even when neither side is sending application bytes.
+    pub(crate) async fn wait_revoked(&self) -> Result<(), ClientError> {
+        loop {
+            self.check_epoch()?;
+            if let Some(action) = self.actual_action()? {
+                self.check_live(action)?;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
     }
 
     /// Check a live native flow against its pinned policy and configured
@@ -223,7 +257,7 @@ impl FlowLease {
             || !state.entries.get(&self.id).is_some_and(|entry|entry.identity==self.identity) {
             return Err(denied());
         }
-        self.engine.check_policy(digest)
+        self.check_epoch()
     }
 
     #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
@@ -264,10 +298,7 @@ impl FlowLease {
         {
             return Err(denied());
         }
-        self.engine.check_policy(self.identity.digest)?;
-        if action == PacketAction::Modify && !self.engine.enabled() {
-            return Err(denied());
-        }
+        self.check_live(action)?;
         entry.committed = Some(action);
         Ok(())
     }
@@ -358,7 +389,7 @@ mod tests {
         assert_eq!(table.counts(), Some([0, 0, 1, 0]));
         assert!(flow.commit(PacketAction::Redirect).is_err());
         engine.authorize_policy(None);
-        assert!(flow.commit(PacketAction::Modify).is_ok());
+        assert!(flow.commit(PacketAction::Modify).is_err());
         drop(flow);
         assert_eq!(table.counts(), Some([0, 0, 0, 0]));
         assert!(begin(&table, &engine, PacketAction::Pass).is_err());
@@ -443,14 +474,34 @@ mod tests {
         assert!(begin(&table, &engine, PacketAction::Pass).is_err());
     }
 
+    #[tokio::test]
+    async fn revoked_idle_flow_cannot_revive_after_same_digest_refresh() {
+        let (table, engine) = setup();
+        let flow = begin(&table, &engine, PacketAction::Redirect).unwrap();
+        flow.commit(PacketAction::Redirect).unwrap();
+        // An unchanged, still-current receipt does not interrupt a relay.
+        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture([1; 32])));
+        assert!(flow.check_delivery().is_ok());
+        engine.authorize_policy(None);
+        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture([1; 32])));
+        assert_eq!(flow.check_delivery(), Err(denied()));
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), flow.wait_revoked()).await.unwrap(),
+            Err(denied())
+        );
+        drop(flow);
+        let fresh = begin(&table, &engine, PacketAction::Redirect).unwrap();
+        assert!(fresh.commit(PacketAction::Redirect).is_ok());
+    }
+
     #[test]
-    fn committed_flow_keeps_egress_after_retirement() {
+    fn committed_flow_loses_egress_after_retirement() {
         let (table, engine) = setup();
         let flow = begin(&table, &engine, PacketAction::Pass).unwrap();
         let mut send = FirstSend::new(Some(&flow), PacketAction::Pass);
         send.attempt().unwrap();
         engine.retire();
-        send.attempt().unwrap();
+        assert_eq!(send.attempt(), Err(denied()));
         assert_eq!(flow.commit(PacketAction::Redirect), Err(denied()));
     }
 }

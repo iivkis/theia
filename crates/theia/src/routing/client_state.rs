@@ -21,6 +21,7 @@ use tokio::{
 };
 
 const TTL: Duration = Duration::from_secs(60);
+const REFRESH_MARGIN: Duration = Duration::from_secs(10);
 const RETRY: Duration = Duration::from_secs(3);
 const DIAL: Duration = Duration::from_secs(15);
 
@@ -78,6 +79,10 @@ pub(super) struct LocalPolicy {
 }
 
 impl LocalPolicy {
+    pub(super) fn continues(&self, next: &Self) -> bool {
+        self.checkpoint == next.checkpoint && self.floor == next.floor && Instant::now() < self.deadline
+    }
+
     pub(super) fn valid(&self, digest: [u8; 32]) -> bool {
         if self.checkpoint.digest != digest || Instant::now() >= self.deadline {
             return false;
@@ -202,11 +207,28 @@ impl Cache {
         F: FnOnce(Option<[u8; 32]>) -> Fut,
         Fut: Future<Output = Result<Vec<u8>, ClientError>>,
     {
+        self.get_inner(fetch, false).await
+    }
+
+    pub(crate) async fn refresh<F, Fut>(&self, fetch: F) -> Result<Arc<Snapshot>, ClientError>
+    where
+        F: FnOnce(Option<[u8; 32]>) -> Fut,
+        Fut: Future<Output = Result<Vec<u8>, ClientError>>,
+    {
+        self.get_inner(fetch, true).await
+    }
+
+    async fn get_inner<F, Fut>(&self, fetch: F, proactive: bool) -> Result<Arc<Snapshot>, ClientError>
+    where
+        F: FnOnce(Option<[u8; 32]>) -> Fut,
+        Fut: Future<Output = Result<Vec<u8>, ClientError>>,
+    {
         let mut state = self.state.lock().await;
         if self.dpi.retired() {
             return Err(super::dpi::stale_policy());
         }
         let now = Instant::now();
+        let mut keep_lease = false;
         if let (Some(deadline), Some(snapshot)) = (
             state.expires.filter(|until| now < *until),
             state.snapshot.as_ref(),
@@ -222,7 +244,10 @@ impl Cache {
             match result {
                 Ok(true) => {
                     self.authorize_local(snapshot, deadline);
-                    return Ok(snapshot.clone());
+                    if !proactive || deadline.saturating_duration_since(now) > REFRESH_MARGIN {
+                        return Ok(snapshot.clone());
+                    }
+                    keep_lease = true;
                 }
                 Ok(false) => {}
                 Err(error) => {
@@ -231,33 +256,45 @@ impl Cache {
                 }
             }
         }
-        // Invalidate before any refresh await, including cancellation/failure.
-        self.dpi.authorize_policy(None);
+        // A proactive unchanged refresh may retain the unexpired lease
+        // while in flight. Expired, mismatched and failed refreshes revoke it.
+        if !keep_lease {
+            self.dpi.authorize_policy(None);
+        }
         if state.retry.is_some_and(|until| now < until) {
             return Err(ClientError::Open(ErrorCode::PolicyDenied));
         }
         state.expires = None;
         state.retry = Some(now + RETRY);
-        let previous = state.snapshot.as_ref();
-        let wire = fetch(previous.map(|s| s.digest())).await?;
-        let snapshot = if let Some(previous) = previous.filter(|s| {
-            wire.as_slice() == super::exchange::unchanged_receipt(s.digest()).as_slice()
-        }) {
-            previous.clone()
-        } else {
-            let scope = self.scope.clone();
-            Arc::new(
-                tokio::task::spawn_blocking(move || Snapshot::decode(&wire, &scope))
-                    .await
-                    .map_err(|_| ClientError::Protocol)?
-                    .map_err(|_| ClientError::Protocol)?,
-            )
+        let refreshed = async {
+            let previous = state.snapshot.as_ref();
+            let wire = fetch(previous.map(|s| s.digest())).await?;
+            let snapshot = if let Some(previous) = previous.filter(|s| {
+                wire.as_slice() == super::exchange::unchanged_receipt(s.digest()).as_slice()
+            }) {
+                previous.clone()
+            } else {
+                let scope = self.scope.clone();
+                Arc::new(
+                    tokio::task::spawn_blocking(move || Snapshot::decode(&wire, &scope))
+                        .await
+                        .map_err(|_| ClientError::Protocol)?
+                        .map_err(|_| ClientError::Protocol)?,
+                )
+            };
+            if self.dpi.retired() {
+                return Err(super::dpi::stale_policy());
+            }
+            self.persist(&snapshot, state.snapshot.as_deref())?;
+            Ok::<_, ClientError>(snapshot)
+        }.await;
+        let snapshot = match refreshed {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.dpi.authorize_policy(None);
+                return Err(error);
+            }
         };
-        if self.dpi.retired() {
-            return Err(super::dpi::stale_policy());
-        }
-        // The durable floor is checked even for an unchanged receipt.
-        self.persist(&snapshot, state.snapshot.as_deref())?;
         state.snapshot = Some(snapshot.clone());
         let deadline = Instant::now() + TTL;
         state.expires = Some(deadline);
@@ -416,13 +453,10 @@ async fn copy_direction(
             activity.half_closed();
             return Ok(());
         }
-        if upload {
-            first_send
-                .attempt()
-                .map_err(|error| DirectRelayError { error, peer: false })?;
-        } else if let Some(flow)=flow {
-            flow.check_live(action).map_err(|error|DirectRelayError{error,peer:false})?;
-        }
+        // Either direction may be first (server-first protocols).
+        first_send
+            .attempt()
+            .map_err(|error| DirectRelayError { error, peer: false })?;
         output
             .write_all(&bytes[..count])
             .await

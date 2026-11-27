@@ -36,7 +36,7 @@ use crate::{client::ClientError, network_scope};
 use std::{
     net::{IpAddr, SocketAddr},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::Duration,
@@ -60,6 +60,7 @@ pub(crate) struct Engine {
     retired: AtomicBool,
     stun_enabled: AtomicBool,
     policy: std::sync::Mutex<Option<super::client_state::LocalPolicy>>,
+    policy_epoch: AtomicU64,
     cache: strategy::Cache,
     udp_cache: std::sync::Mutex<std::collections::VecDeque<UdpEvidence>>,
     probes: Semaphore,
@@ -182,6 +183,7 @@ impl Default for Engine {
             retired: AtomicBool::new(false),
             stun_enabled: AtomicBool::new(false),
             policy: std::sync::Mutex::new(None),
+            policy_epoch: AtomicU64::new(0),
             cache: strategy::Cache::default(),
             udp_cache: std::sync::Mutex::new(std::collections::VecDeque::new()),
             probes: Semaphore::new(4),
@@ -205,7 +207,16 @@ impl Engine {
 
     pub(super) fn authorize_policy(&self, lease: Option<super::client_state::LocalPolicy>) {
         if let Ok(mut policy) = self.policy.lock() {
-            *policy = if self.retired() { None } else { lease };
+            let next = if self.retired() { None } else { lease };
+            let continuous = match (&*policy, &next) {
+                (Some(old), Some(new)) => old.continues(new),
+                (None, None) => true,
+                _ => false,
+            };
+            if !continuous {
+                self.policy_epoch.fetch_add(1, Ordering::AcqRel);
+            }
+            *policy = next;
         }
     }
 
@@ -213,8 +224,8 @@ impl Engine {
         self.retired.load(Ordering::Acquire)
     }
 
-    /// Retired runtime generations may drain committed flows, but cannot
-    /// authorize a new first send or refresh their old policy lease.
+    /// Retired client generations cannot authorize any more user payload.
+    /// Server auth-only Apply is a separate admission contract.
     pub(crate) fn retire(&self) {
         self.retired.store(true, Ordering::Release);
         self.authorize_policy(None);
@@ -224,6 +235,14 @@ impl Engine {
         self.policy.lock().ok().is_some_and(|policy| {
             !self.retired() && policy.as_ref().is_some_and(|lease| lease.valid(digest))
         })
+    }
+
+    pub(super) fn policy_epoch(&self, digest: [u8; 32]) -> Result<u64, ClientError> {
+        let policy = self.policy.lock().map_err(|_| stale_policy())?;
+        if self.retired() || !policy.as_ref().is_some_and(|lease| lease.valid(digest)) {
+            return Err(stale_policy());
+        }
+        Ok(self.policy_epoch.load(Ordering::Acquire))
     }
 
     pub(crate) fn check_policy(&self, digest: [u8; 32]) -> Result<(), ClientError> {
