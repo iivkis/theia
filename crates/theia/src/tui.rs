@@ -515,8 +515,8 @@ fn page_actions_for(
         ],
         (Role::Client, 2) => &[('i', "Ввести ключ")],
         (Role::Client, 3) if cfg!(windows) => &[
-            ('p', "Включить / выключить системный прокси"),
-            ('V', "Запустить / остановить локальный прокси"),
+            ('p', "Подключиться / отключиться"),
+            ('V', "Запустить / остановить локальный прокси (диагностика)"),
             ('L', "Выбрать другой профиль"),
             ('A', "Выбрать активный профиль"),
         ],
@@ -658,7 +658,7 @@ fn recommended_step(editor: &Editor, owned_running: bool) -> (char, &'static str
             "Получите приглашение у администратора и импортируйте его.",
         )
     } else if owned_running {
-        ('V', "Локальный процесс запущен или запускается. Откройте его состояние для проверки туннеля.")
+        (if cfg!(windows) { 'p' } else { 'V' }, "Клиент запущен или запускается. Откройте его состояние для проверки туннеля.")
     } else if !editor.selected_record_is_active() {
         (
             'A',
@@ -668,7 +668,7 @@ fn recommended_step(editor: &Editor, owned_running: bool) -> (char, &'static str
         (
             'P',
             if cfg!(windows) {
-                "Выберите системный или локальный прокси. Запуск требует подтверждения."
+                "Подключитесь через системный прокси. Запуск требует подтверждения."
             } else {
                 "Откройте подключение и запустите локальный прокси. Затем настройте нужные приложения."
             },
@@ -1200,6 +1200,8 @@ struct Interaction {
     runtime: Option<RuntimePanel>,
     #[cfg(windows)]
     system_proxy: Option<crate::tui_system_proxy::Panel>,
+    #[cfg(windows)]
+    proxy_background: Option<crate::tui_system_proxy::Panel>,
     pending: Option<KeyEvent>,
     saving: Option<mpsc::Receiver<(Editor, bool)>>,
     exporting: Option<mpsc::Receiver<ExportResult>>,
@@ -1251,6 +1253,8 @@ impl Interaction {
             runtime: None,
             #[cfg(windows)]
             system_proxy: None,
+            #[cfg(windows)]
+            proxy_background: None,
             pending: None,
             saving: None,
             exporting: None,
@@ -1500,6 +1504,11 @@ impl Interaction {
     }
 
     fn owned_running(&self, role: Role) -> bool {
+        #[cfg(windows)]
+        if role == Role::Client && (self.system_proxy.as_ref().is_some_and(|p| p.running())
+            || self.proxy_background.as_ref().is_some_and(|p| p.running())) {
+            return true;
+        }
         if role == Role::Server {
             self.server_process.running()
         } else {
@@ -1729,6 +1738,12 @@ impl Interaction {
         }
     }
     fn open_config(&mut self, role: Role) {
+        #[cfg(windows)]
+        if self.proxy_background.as_ref().is_some_and(|p| p.running()) {
+            self.system_proxy = self.proxy_background.take();
+            self.modal_action = 0;
+            return;
+        }
         if self
             .editor
             .as_ref()
@@ -1819,6 +1834,8 @@ impl Interaction {
         if let Some(background) = self.client_background.as_mut() {
             background.poll();
         }
+        #[cfg(windows)]
+        if let Some(background) = self.proxy_background.as_mut() { background.poll(); }
         if let Some(dialog) = self.config_dialog.as_mut() {
             if let Some(editor) = dialog.poll() {
                 if dialog.imported() {
@@ -2741,7 +2758,11 @@ impl Interaction {
                 return false;
             };
             if proxy.key(KeyEvent { code, ..key }) {
-                self.system_proxy = None;
+                if proxy.running() {
+                    self.proxy_background = self.system_proxy.take();
+                } else {
+                    self.system_proxy = None;
+                }
                 self.modal_action = 0;
             }
             return false;
@@ -2973,6 +2994,13 @@ impl Interaction {
             let exiting = key.code == KeyCode::Char('q')
                 || (key.code == KeyCode::Char('c')
                     && key.modifiers.contains(KeyModifiers::CONTROL));
+            #[cfg(windows)]
+            if self.proxy_background.as_ref().is_some_and(|p| p.running())
+                && (exiting || (role == Some(Role::Client) && matches!(key.code, KeyCode::Char('p' | 'V')))) {
+                self.system_proxy = self.proxy_background.take();
+                self.modal_action = 0;
+                return false;
+            }
             if exiting && self.server_process.running() {
                 self.show_server_process = true;
                 return false;
@@ -8443,7 +8471,7 @@ mod tests {
         let keys = page_actions(Role::Client, 3, ui.editor.as_ref());
         assert_eq!(keys.iter().any(|a| a.key == 'p'), cfg!(windows));
         #[cfg(windows)]
-        assert_eq!(keys[0].label, "Включить / выключить системный прокси");
+        assert_eq!(keys[0].label, "Подключиться / отключиться");
         ui.update(&mut model, press(KeyCode::Down));
         assert!(!ui.owned_running(Role::Client));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);

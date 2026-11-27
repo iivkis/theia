@@ -1,22 +1,18 @@
 //! Explicit Windows client listener/WinINet lifecycle. The terminal never
 //! owns a native mutex and never waits for networking during a keypress.
 use crate::{
-    client::ClientError,
-    local_proxy::{saved_client_bytes, PreparedLocalProxy},
+    local_proxy::{saved_client_bytes, SystemProxySession},
     windows_system_proxy::{
-        self as native, ApplyReview, ObservedProxy, OwnedProxy, ProxyStatus, RecoveryReview,
+        self as native, ApplyReview, ObservedProxy, ProxyStatus, RecoveryReview,
     },
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::{net::SocketAddr, path::PathBuf, sync::mpsc, thread};
-use tokio::{sync::mpsc as async_mpsc, task::JoinHandle};
+use tokio::sync::mpsc as async_mpsc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
-    Start,
     Enable,
-    Apply,
-    Restore,
     Recover,
     Stop,
 }
@@ -30,25 +26,15 @@ enum Command {
 }
 
 enum Pending {
-    Start,
-    Enable(SocketAddr, ApplyReview),
-    Apply(ApplyReview),
-    Restore,
+    Enable(ApplyReview),
     Recover(RecoveryReview),
     Stop,
-}
-
-struct Local {
-    address: SocketAddr,
-    task: JoinHandle<Result<(), ClientError>>,
-    reality: Option<std::sync::Arc<crate::local_proxy::RealityClient>>,
 }
 
 struct Worker {
     path: PathBuf,
     digest: [u8; 32],
-    local: Option<Local>,
-    lease: Option<OwnedProxy>,
+    session: Option<SystemProxySession>,
     pending: Option<Pending>,
 }
 
@@ -73,8 +59,7 @@ impl Worker {
         Self {
             path,
             digest,
-            local: None,
-            lease: None,
+            session: None,
             pending: None,
         }
     }
@@ -90,12 +75,12 @@ impl Worker {
     fn view(&self) -> View {
         let observed = native::observed_proxy();
         let known = observed.is_ok();
-        let applied = self.lease.is_some()
+        let applied = self.session.as_ref().is_some_and(SystemProxySession::applied)
             && matches!(
                 &observed,
                 Ok(ObservedProxy::Journal(ProxyStatus::PendingOwned))
             );
-        let recovery = self.lease.is_none()
+        let recovery = self.session.is_none()
             && matches!(
                 &observed,
                 Ok(ObservedProxy::Journal(
@@ -107,7 +92,7 @@ impl Worker {
         let status = match observed {
             Ok(ObservedProxy::Direct) => "Выключен: прямое подключение".into(),
             Ok(ObservedProxy::External) => "Настроен вне этой TUI".into(),
-            Ok(ObservedProxy::Journal(ProxyStatus::PendingOwned)) if self.lease.is_some() => {
+            Ok(ObservedProxy::Journal(ProxyStatus::PendingOwned)) if self.session.is_some() => {
                 "Управляется этой TUI (снимок совпадает)".into()
             }
             Ok(ObservedProxy::Journal(ProxyStatus::PendingOwned)) => {
@@ -123,11 +108,8 @@ impl Worker {
             Err(error) => format!("Неизвестно: {error}"),
         };
         View {
-            running: self
-                .local
-                .as_ref()
-                .is_some_and(|local| !local.task.is_finished()),
-            owned: self.lease.is_some(),
+            running: self.session.as_ref().is_some_and(SystemProxySession::running),
+            owned: self.session.is_some(),
             applied,
             recovery,
             known,
@@ -138,67 +120,30 @@ impl Worker {
     fn review(&mut self, action: Action) -> Result<String, String> {
         self.pending = None;
         let (pending, message) = match action {
-            Action::Start if self.local.is_none() && self.lease.is_none() => {
-                self.unchanged()?;
-                let message = "Запустить только локальные HTTP CONNECT/SOCKS5 listeners? WinINet не меняется.";
-                (Pending::Start, message.into())
-            }
-            Action::Enable if self.lease.is_none() => {
+            Action::Enable if self.session.is_none() => {
                 let bytes = saved_client_bytes(&self.path, self.digest)
                     .map_err(|error| error.to_string())?;
-                let source =
-                    std::str::from_utf8(&bytes).map_err(|_| "Некорректный файл клиента.")?;
+                let source = std::str::from_utf8(&bytes).map_err(|_| "Некорректный файл клиента.")?;
                 let crate::config::Config::Client(document) =
                     crate::config::parse(source).map_err(|_| "Некорректные настройки клиента.")?
                 else {
                     return Err("Требуется клиентский профиль.".into());
                 };
-                let address: SocketAddr = document
-                    .client
-                    .proxy
-                    .http_listen
-                    .parse()
+                let address: SocketAddr = document.client.proxy.http_listen.parse()
                     .map_err(|_| "Некорректный адрес локального HTTP-прокси.")?;
-                if self.local.as_ref().is_some_and(|local| {
-                    local.task.is_finished() || local.address != address
-                }) {
-                    return Err("Остановите старое локальное подключение и повторите.".into());
-                }
                 let review = native::review_apply(address).map_err(|error| error.to_string())?;
                 let message = format!(
-                    "{}\nЗапустить локальный прокси при необходимости и направить приложения Windows на {address}? Исходные настройки будут сохранены для восстановления.",
+                    "{}\nПодключиться? Запустить локальный прокси при необходимости и направить приложения Windows на {address}. Исходные настройки будут сохранены для восстановления.",
                     review.description()
                 );
-                (Pending::Enable(address, review), message)
+                (Pending::Enable(review), message)
             }
-            Action::Apply if self.lease.is_none() => {
-                let local = self
-                    .local
-                    .as_ref()
-                    .filter(|local| !local.task.is_finished())
-                    .ok_or("Сначала запустите локальный клиент.")?;
-                self.unchanged()?;
-                let review =
-                    native::review_apply(local.address).map_err(|error| error.to_string())?;
-                let message = format!(
-                    "{} Адрес назначения: {}. Сохранить снимок и изменить WinINet текущего пользователя?",
-                    review.description(),
-                    local.address
-                );
-                (Pending::Apply(review), message)
-            }
-            Action::Restore if self.lease.is_some() => {
-                let message = "Восстановить только собственные параметры WinINet? Локальные listeners останутся.";
-                (Pending::Restore, message.into())
-            }
-            Action::Recover if self.lease.is_none() => {
+            Action::Recover if self.session.is_none() => {
                 let review = native::review_recovery().map_err(|error| error.to_string())?;
-                let message = "Восстановить проверенный журнал? Чужие изменения и активный владелец блокируют операцию.";
-                (Pending::Recover(review), message.into())
+                (Pending::Recover(review), "Восстановить проверенный журнал? Чужие изменения и активный владелец блокируют операцию.".into())
             }
-            Action::Stop if self.local.is_some() => {
-                let message = "Остановить локальный клиент? Сначала будет выполнено условное восстановление WinINet, если есть собственный lease.";
-                (Pending::Stop, message.into())
+            Action::Stop if self.session.is_some() => {
+                (Pending::Stop, "Отключиться? Остановить локальный клиент и условно восстановить WinINet.".into())
             }
             _ => return Err("Действие недоступно в текущем состоянии.".into()),
         };
@@ -206,83 +151,15 @@ impl Worker {
         Ok(message)
     }
 
-    async fn start_local(&mut self) -> Result<(), String> {
-        let prepared = PreparedLocalProxy::start(&self.path, self.digest)
-            .await
-            .map_err(|error| error.to_string())?;
-        let address = prepared.http_address().map_err(|error| error.to_string())?;
-        self.unchanged()?;
-        let reality = prepared.reality_monitor();
-        let task = tokio::spawn(prepared.serve());
-        self.local = Some(Local {
-            address,
-            task,
-            reality,
-        });
-        Ok(())
-    }
-
-    async fn enable(&mut self, address: SocketAddr, review: ApplyReview) -> Result<String, String> {
-        let started_here = self.local.is_none();
-        if started_here {
-            self.start_local().await?;
-        }
-        let result = (|| {
-            self.unchanged()?;
-            self.local
-                .as_ref()
-                .filter(|local| {
-                    !local.task.is_finished() && local.address == address
-                })
-                .ok_or("Локальный клиент не готов.")?;
-            OwnedProxy::apply_reviewed(address, review).map_err(|error| error.to_string())
-        })();
-        match result {
-            Ok(lease) => {
-                self.lease = Some(lease);
-                Ok("Системный прокси включён. Удалённый туннель проверяется отдельно.".into())
-            }
-            Err(error) => {
-                // If native apply may have written a journal, preserve the
-                // listeners until the user reviews recovery. Never claim success.
-                if started_here
-                    && matches!(
-                        native::observed_proxy(),
-                        Ok(ObservedProxy::Direct | ObservedProxy::External)
-                    )
-                {
-                    self.stop().await?;
-                }
-                Err(error)
-            }
-        }
-    }
-
     async fn confirm(&mut self) -> Result<String, String> {
         let pending = self.pending.take().ok_or("Нет подтверждаемой операции.")?;
         match pending {
-            Pending::Start => {
-                self.start_local().await?;
-                Ok("Оба локальных listener привязаны; удалённый транспорт не проверен.".into())
-            }
-            Pending::Enable(address, review) => self.enable(address, review).await,
-            Pending::Apply(review) => {
-                let local = self
-                    .local
-                    .as_ref()
-                    .filter(|local| !local.task.is_finished())
-                    .ok_or("Локальный клиент не готов.")?;
+            Pending::Enable(review) => {
                 self.unchanged()?;
-                let lease = OwnedProxy::apply_reviewed(local.address, review)
-                    .map_err(|error| error.to_string())?;
-                self.lease = Some(lease);
-                Ok("WinINet применён; точный снимок проверен.".into())
-            }
-            Pending::Restore => {
-                let lease = self.lease.as_mut().ok_or("Нет собственного lease.")?;
-                let result = lease.restore().map_err(|error| error.to_string())?;
-                self.lease = None;
-                Ok(format!("Восстановление WinINet: {result:?}."))
+                let session = Box::pin(SystemProxySession::connect(&self.path, self.digest, Some(review)))
+                    .await.map_err(|error| error.to_string())?;
+                self.session = Some(session);
+                Ok("Системный прокси включён. Удалённый туннель проверяется отдельно.".into())
             }
             Pending::Recover(review) => {
                 let result = native::recover_reviewed(review).map_err(|error| error.to_string())?;
@@ -297,21 +174,10 @@ impl Worker {
 
     async fn stop(&mut self) -> Result<(), String> {
         self.pending = None;
-        // Restore before releasing listeners. On a refusal preserve the
-        // recovery journal; never force the old settings over foreign state.
-        let restored = if let Some(mut lease) = self.lease.take() {
-            lease
-                .restore()
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        } else {
-            Ok(())
-        };
-        if let Some(local) = self.local.take() {
-            local.task.abort();
-            let _ = local.task.await;
+        if let Some(mut session) = self.session.take() {
+            session.disconnect().await.map_err(|error| error.to_string())?;
         }
-        restored
+        Ok(())
     }
 
     async fn command(&mut self, command: Command) -> Event {
@@ -340,12 +206,10 @@ impl Worker {
     }
 }
 
-async fn local_ended(local: &mut Option<Local>) {
-    match local {
-        Some(local) => {
-            let _ = (&mut local.task).await;
-        }
-        None => std::future::pending::<()>().await,
+async fn local_ended(session: &mut Option<SystemProxySession>) -> Result<(), crate::client::ClientError> {
+    match session {
+        Some(session) => session.ended().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -357,10 +221,9 @@ async fn run(
     loop {
         tokio::select! {
             biased;
-            () = local_ended(&mut worker.local) => {
-                // JoinHandle has already been consumed; do not poll it twice.
-                worker.local = None;
-                let result = worker.stop().await;
+            result = local_ended(&mut worker.session) => {
+                worker.session = None;
+                worker.pending = None;
                 let message = match result {
                     Ok(()) => {
                         "Локальный клиент неожиданно завершился; собственный lease завершён.".into()
@@ -376,9 +239,9 @@ async fn run(
             command = commands.recv() => {
                 let Some(command) = command else { break };
                 let mut event=worker.command(command).await;
-                if let Some(reality)=worker.local.as_ref().and_then(|l|l.reality.as_ref()){
+                if let Some(session) = worker.session.as_ref() {
                     event.view.status.push_str("\n\n");
-                    event.view.status.push_str(&reality.runtime_report().await);
+                    event.view.status.push_str(&session.report().await);
                 }
                 if events.send(event).is_err() {
                     break;
@@ -475,8 +338,8 @@ impl Panel {
         previous != self.phase
     }
 
-    /// Return true only when the modal may close; a live local client must
-    /// first be explicitly stopped. No key repeat, paste or lone y applies.
+    /// Esc minimizes the live controller; quitting requires explicit Stop.
+    /// No key repeat, paste or lone y applies.
     pub(crate) fn key(&mut self, key: KeyEvent) -> bool {
         if key.kind != KeyEventKind::Press || self.phase == Phase::Busy {
             return false;
@@ -496,7 +359,7 @@ impl Panel {
             return false;
         }
         if quit {
-            if !self.view.running && !self.view.owned {
+            if key.code == KeyCode::Esc || (!self.view.running && !self.view.owned) {
                 return true;
             }
             self.send(Command::Review(Action::Stop));
@@ -507,16 +370,17 @@ impl Panel {
         }
         let command = match key.code {
             KeyCode::Char('v') => Command::Refresh,
-            KeyCode::Char('s') => Command::Review(Action::Start),
             KeyCode::Char('e') => Command::Review(Action::Enable),
-            KeyCode::Char('a') => Command::Review(Action::Apply),
-            KeyCode::Char('r') => Command::Review(Action::Restore),
             KeyCode::Char('c') => Command::Review(Action::Recover),
             KeyCode::Char('x') => Command::Review(Action::Stop),
             _ => return false,
         };
         self.send(command);
         false
+    }
+
+    pub(crate) fn running(&self) -> bool {
+        !self.unavailable && (self.view.running || self.view.owned)
     }
 
     pub(crate) fn confirmation_choice(&self) -> Option<(char, &'static str)> {
@@ -544,11 +408,7 @@ impl Panel {
         if self.view.owned {
             items.push(ActionItem {
                 key: 'x',
-                label: "Выключить системный прокси и отключиться",
-            });
-            items.push(ActionItem {
-                key: 'r',
-                label: "Выключить, оставить локальный прокси",
+                label: "Отключиться",
             });
         } else if self.view.recovery {
             items.push(ActionItem {
@@ -558,13 +418,7 @@ impl Panel {
         } else if self.view.known {
             items.push(ActionItem {
                 key: 'e',
-                label: "Включить системный прокси",
-            });
-        }
-        if self.view.running && !self.view.owned {
-            items.push(ActionItem {
-                key: 'x',
-                label: "Остановить локальный прокси",
+                label: "Подключиться",
             });
         }
         items.push(ActionItem {
@@ -599,7 +453,7 @@ impl Panel {
                 "Сначала проверьте восстановление исходных параметров."
             }
             Phase::Idle if !self.view.known => "Обновите состояние. Изменения не подтверждены.",
-            Phase::Idle => "Выберите «Включить системный прокси». Esc — назад.",
+            Phase::Idle => "Выберите «Подключиться». Esc — назад.",
         };
         format!(
             "{headline}\n{}\n{controls}\n\nWindows: {status}\nЛокальный прокси: {}\nУдалённый туннель проверяется отдельно. Это не VPN.",
@@ -762,7 +616,7 @@ pub(crate) mod tests {
         let mut panel = Panel::open(path.clone(), digest).unwrap();
         wait(&mut panel);
         assert_original();
-        panel.key(key('a'));
+        panel.key(key('x'));
         wait(&mut panel);
         assert!(panel.phase == Phase::Idle);
         assert_original();
@@ -775,81 +629,56 @@ pub(crate) mod tests {
         assert_original();
         drop(second);
 
-        review(&mut panel, 's');
-        panel.key(key('n'));
-        wait(&mut panel);
-        assert!(!panel.view.running);
-        assert_original();
         review(&mut panel, 'e');
         panel.key(key('n'));
         wait(&mut panel);
         assert!(!panel.view.running);
         assert_original();
 
-        action(&mut panel, 'e');
-        assert!(panel.view.running);
-        assert!(panel.view.applied);
-        assert!(panel.view.owned);
-        assert_eq!(native::status().unwrap(), ProxyStatus::PendingOwned);
-        action(&mut panel, 'x');
-        assert!(!panel.view.running);
-        assert!(!panel.view.owned);
-        assert_original();
-
-        action(&mut panel, 's');
-        assert!(panel.view.running);
-        assert!(!panel.view.owned);
-        assert!(TcpStream::connect_timeout(&http, Duration::from_secs(2)).is_ok());
-        assert!(TcpStream::connect_timeout(&socks, Duration::from_secs(2)).is_ok());
-        assert_original();
-
-        review(&mut panel, 'a');
+        // The confirmation is pinned to exact saved bytes.
+        review(&mut panel, 'e');
         fs::write(&path, format!("{source}\n# external edit\n")).unwrap();
         confirm(&mut panel);
-        assert!(!panel.view.owned);
+        assert!(!panel.view.running && !panel.view.owned);
         assert_original();
         fs::write(&path, &source).unwrap();
 
-        action(&mut panel, 'a');
-        assert!(panel.view.owned);
+        action(&mut panel, 'e');
+        assert!(panel.view.running && panel.view.applied && panel.view.owned);
         assert_eq!(native::status().unwrap(), ProxyStatus::PendingOwned);
+        assert!(TcpStream::connect_timeout(&http, Duration::from_secs(2)).is_ok());
+        assert!(TcpStream::connect_timeout(&socks, Duration::from_secs(2)).is_ok());
         panel.key(key('c'));
         wait(&mut panel);
-        assert!(panel.phase == Phase::Idle);
-        assert!(panel.view.owned);
-
-        action(&mut panel, 'r');
-        assert!(!panel.view.owned);
-        assert!(panel.view.running);
-        assert_original();
-        action(&mut panel, 'a');
+        assert!(panel.phase == Phase::Idle && panel.view.owned);
+        let mut other = Panel::open(path.clone(), digest).unwrap();
+        wait(&mut other);
+        other.key(key('e'));
+        wait(&mut other);
+        assert!(!other.view.running && !other.view.owned);
+        assert_eq!(native::status().unwrap(), ProxyStatus::PendingOwned);
+        drop(other);
         action(&mut panel, 'x');
-        assert!(!panel.view.running);
-        assert!(!panel.view.owned);
+        assert!(!panel.view.running && !panel.view.owned);
         assert_original();
+        assert!(TcpStream::connect_timeout(&http, Duration::from_millis(100)).is_err());
+        assert!(TcpStream::connect_timeout(&socks, Duration::from_millis(100)).is_err());
 
         // Terminal failure/drop follows the same owned restoration path.
-        action(&mut panel, 's');
-        action(&mut panel, 'a');
+        action(&mut panel, 'e');
         assert!(panel.view.owned);
         drop(panel);
         assert_original();
 
-        // A saved System Proxy mode and local diagnostic listener are not
-        // permission to modify WinINet; review must still be confirmed.
         let saved = Config::Client(doc).to_toml().unwrap();
         fs::write(&path, &saved).unwrap();
         let mut panel = Panel::open(path, Sha256::digest(saved.as_bytes()).into()).unwrap();
         wait(&mut panel);
-        action(&mut panel, 's');
-        assert!(panel.view.running);
         review(&mut panel, 'e');
         panel.key(key('n'));
         wait(&mut panel);
-        assert!(panel.phase == Phase::Idle);
-        assert!(!panel.view.owned);
+        assert!(panel.phase == Phase::Idle && !panel.view.running && !panel.view.owned);
         assert_original();
-        action(&mut panel, 'x');
         crash();
         assert_eq!(native::status().unwrap(), ProxyStatus::PendingOwned);
         review(&mut panel, 'c');

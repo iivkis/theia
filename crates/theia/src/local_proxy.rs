@@ -1761,7 +1761,7 @@ impl ProxyTunnel {
 }
 
 pub async fn run_file(config_path: &Path) -> Result<(), ClientError> {
-    Box::pin(run_file_inner(config_path, false)).await
+    Box::pin(run_file_inner(config_path)).await
 }
 
 /// Windows-only, explicitly confirmed user WinINet proxy operation. The
@@ -1769,7 +1769,18 @@ pub async fn run_file(config_path: &Path) -> Result<(), ClientError> {
 /// loopback TCP listeners are bound, never on plain client run or server run.
 #[cfg(windows)]
 pub async fn run_file_with_system_proxy(config_path: &Path) -> Result<(), ClientError> {
-    Box::pin(run_file_inner(config_path, true)).await
+    use sha2::{Digest, Sha256};
+    let raw = zeroize::Zeroizing::new(config::editor_bytes(config_path).map_err(|_| ClientError::Configuration)?);
+    let digest = Sha256::digest(raw.as_slice()).into();
+    let mut session = SystemProxySession::connect(config_path, digest, None).await?;
+    tokio::select! {
+        result = session.ended() => result,
+        signal = tokio::signal::ctrl_c() => {
+            let result = session.disconnect().await;
+            signal.map_err(|_| ClientError::Io)?;
+            result
+        }
+    }
 }
 
 // The process-level generation owns the exact saved config. Old accepted
@@ -1942,6 +1953,11 @@ pub(crate) struct ClientRuntime {
     stage: tokio::sync::Mutex<()>,
     capture_state: CaptureLifecycle,
     stopped: tokio::sync::watch::Sender<bool>,
+    admission: std::sync::atomic::AtomicBool,
+    #[cfg(windows)]
+    system_proxy_phase: std::sync::atomic::AtomicU8,
+    #[cfg(windows)]
+    disconnect_requested: tokio::sync::watch::Sender<bool>,
 }
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 impl ClientRuntime {
@@ -1964,6 +1980,11 @@ impl ClientRuntime {
             stage: tokio::sync::Mutex::new(()),
             capture_state: CaptureLifecycle::default(),
             stopped,
+            admission: std::sync::atomic::AtomicBool::new(true),
+            #[cfg(windows)]
+            system_proxy_phase: std::sync::atomic::AtomicU8::new(0),
+            #[cfg(windows)]
+            disconnect_requested: tokio::sync::watch::channel(false).0,
         })
     }
     /// Pin exactly the published client generation for native capture.
@@ -1978,7 +1999,7 @@ impl ClientRuntime {
             .stage
             .try_lock()
             .map_err(|_| ClientError::Configuration)?;
-        if *self.stopped.borrow() || !self.capture_state.idle() {
+        if !self.admitting() || *self.stopped.borrow() || !self.capture_state.idle() {
             return Err(ClientError::Configuration);
         }
         let view = self.slot.borrow().clone();
@@ -1986,7 +2007,7 @@ impl ClientRuntime {
         crate::routing::carrier_socket::scope(registrar.clone(), view.client.routing_policy())
             .await?;
         saved_client_bytes(&self.path, view.digest)?;
-        if *self.stopped.borrow() {
+        if !self.admitting() || *self.stopped.borrow() {
             return Err(ClientError::Configuration);
         }
         self.capture_state.begin()?;
@@ -2012,12 +2033,21 @@ impl ClientRuntime {
         })
     }
 
+    fn admitting(&self) -> bool {
+        self.admission.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn quiesce(&self) {
+        self.admission.store(false, std::sync::atomic::Ordering::Release);
+        self.slot.borrow().client.routing_cache().dpi.retire();
+    }
+
     fn stop(&self) {
+        self.quiesce();
         // Capture rules may remain after the queue stops. Never publish
         // inactive/connected until the owner has finished recovery.
         self.capture_state.stop();
         self.stopped.send_replace(true);
-        self.slot.borrow().client.routing_cache().dpi.retire();
     }
 
     async fn stopped(&self) {
@@ -2157,7 +2187,7 @@ impl ClientRuntime {
             .stage
             .try_lock()
             .map_err(|_| ClientError::Configuration)?;
-        if *self.stopped.borrow() || !self.capture_state.idle() {
+        if !self.admitting() || *self.stopped.borrow() || !self.capture_state.idle() {
             return Err(ClientError::Configuration);
         }
         let previous = self.slot.borrow().clone();
@@ -2171,7 +2201,7 @@ impl ClientRuntime {
         let revision = expected.checked_add(1).ok_or(ClientError::Configuration)?;
         // No await between final exact-byte recheck and publication.
         saved_client_bytes(&self.path, digest)?;
-        if *self.stopped.borrow() {
+        if !self.admitting() || *self.stopped.borrow() {
             return Err(ClientError::Configuration);
         }
         previous.client.routing_cache().dpi.retire();
@@ -2198,12 +2228,11 @@ impl ClientRuntime {
     }
 }
 
-async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result<(), ClientError> {
+async fn run_file_inner(config_path: &Path) -> Result<(), ClientError> {
     crate::diag!(
         Info,
         "client.proxy",
-        "config_read_begin",
-        "system_proxy_requested" = Value::Flag(enable_system_proxy)
+        "config_read_begin"
     );
     let raw = zeroize::Zeroizing::new(
         config::editor_bytes(config_path).map_err(|_| ClientError::Configuration)?,
@@ -2214,13 +2243,7 @@ async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result
     else {
         return Err(ClientError::Configuration);
     };
-    if enable_system_proxy {
-        #[cfg(not(windows))]
-        return Err(ClientError::SystemProxy);
-    }
     let (http, socks, client) = Box::pin(prepare_proxy(&document, config_path)).await?;
-    #[cfg(windows)]
-    let http_bound = http.local_addr().map_err(|_| ClientError::Io)?;
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     let managed = {
         use sha2::{Digest, Sha256};
@@ -2251,25 +2274,142 @@ async fn run_file_inner(config_path: &Path, enable_system_proxy: bool) -> Result
     };
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     let serving = serve_proxy(http, socks, client);
-    #[cfg(windows)]
-    if enable_system_proxy {
-        // A config declaration is insufficient by itself: this branch
-        // requires the *additional CLI* --system-proxy --confirm.
-        let mut lease = crate::windows_system_proxy::OwnedProxy::apply(http_bound)
-            .map_err(|_| ClientError::SystemProxy)?;
-        // Ctrl+C is the normal scoped exit. A killed process cannot execute
-        // destructors; persistent registry journal permits explicit recovery
-        // on the next invocation, without overwriting a foreign proxy change.
-        let result = tokio::select! {
-            result = serving => result,
-            signal = tokio::signal::ctrl_c() => {
-                signal.map_err(|_| ClientError::SystemProxy)
-            }
-        };
-        lease.restore().map_err(|_| ClientError::SystemProxy)?;
-        return result;
-    }
     serving.await
+}
+
+/// Sole product owner for Windows System Proxy, shared by CLI and TUI.
+#[cfg(windows)]
+pub(crate) struct SystemProxySession {
+    runtime: Arc<ClientRuntime>,
+    task: Option<tokio::task::JoinHandle<Result<(), ClientError>>>,
+}
+
+#[cfg(windows)]
+impl ClientRuntime {
+    fn set_proxy_phase(&self, phase: u8) {
+        self.system_proxy_phase.store(phase, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn proxy_phase(&self) -> u8 {
+        self.system_proxy_phase.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    async fn disconnect_requested(&self) {
+        let mut stop = self.disconnect_requested.subscribe();
+        if !*stop.borrow() { let _ = stop.wait_for(|requested| *requested).await; }
+    }
+
+    fn request_disconnect(&self) {
+        self.quiesce();
+        self.disconnect_requested.send_replace(true);
+    }
+}
+
+#[cfg(windows)]
+impl SystemProxySession {
+    pub(crate) async fn connect(
+        path: &Path,
+        expected: [u8; 32],
+        review: Option<crate::windows_system_proxy::ApplyReview>,
+    ) -> Result<Self, ClientError> {
+        // Acquire the global per-user owner BEFORE DNS or opening listeners.
+        let reservation = crate::windows_system_proxy::ReservedProxy::acquire()
+            .map_err(|_| ClientError::SystemProxy)?;
+        let bytes = saved_client_bytes(path, expected)?;
+        let Config::Client(document) = config::parse(
+            std::str::from_utf8(&bytes).map_err(|_| ClientError::Configuration)?
+        ).map_err(|_| ClientError::Configuration)? else {
+            return Err(ClientError::Configuration);
+        };
+        let (http, socks, client) = prepare_proxy(&document, path).await?;
+        let bind = http.local_addr().map_err(|_| ClientError::Io)?;
+        let runtime = ClientRuntime::new(
+            std::path::absolute(path).map_err(|_| ClientError::Configuration)?,
+            document, expected, client,
+        );
+        runtime.set_proxy_phase(1); // preparing, not ready
+        let control = crate::management::client_server(runtime.clone())
+            .map_err(|_| ClientError::Configuration)?;
+        saved_client_bytes(path, expected)?;
+        let lease = reservation.apply(bind, review).map_err(|_| ClientError::SystemProxy)?;
+        lease.verify().map_err(|_| ClientError::SystemProxy)?;
+        runtime.set_proxy_phase(2); // both listeners bound + exact OS readback
+        let owner = runtime.clone();
+        let task = tokio::spawn(async move {
+            let mut lease = lease;
+            let serving = serve_managed_proxy(http, socks, owner.clone());
+            tokio::pin!(serving);
+            let management = async move {
+                match control {
+                    Some(server) => server.serve().await.map_err(|_| ClientError::Io),
+                    None => std::future::pending::<Result<(), ClientError>>().await,
+                }
+            };
+            tokio::pin!(management);
+            // Inspect the exact journal and current WinINet snapshot even
+            // when no traffic or UI action occurs.
+            let (result, worker_ended) = loop {
+                tokio::select! {
+                    biased;
+                    () = owner.disconnect_requested() => break (Ok(()), false),
+                    result = &mut serving => break (result, true),
+                    result = &mut management => break (result, false),
+                    () = tokio::time::sleep(Duration::from_secs(1)) => {
+                        if lease.verify().is_err() {
+                            break (Err(ClientError::SystemProxy), false);
+                        }
+                    }
+                }
+            };
+            // Block new application admission and revoke active payload
+            // permissions before touching OS settings. Keep the listener
+            // future owned until the CAS restore finishes.
+            owner.set_proxy_phase(3);
+            owner.quiesce();
+            let restored = lease.restore().map_err(|_| ClientError::SystemProxy);
+            owner.stop();
+            if !worker_ended {
+                let _ = timeout(Duration::from_secs(5), &mut serving).await;
+            }
+            owner.set_proxy_phase(if restored.is_ok() { 0 } else { 4 });
+            restored.and(result)
+        });
+        Ok(Self { runtime, task: Some(task) })
+    }
+
+    pub(crate) fn running(&self) -> bool {
+        self.task.as_ref().is_some_and(|task| !task.is_finished())
+    }
+
+    pub(crate) fn applied(&self) -> bool {
+        self.runtime.proxy_phase() == 2 && self.running()
+    }
+
+    pub(crate) async fn report(&self) -> String {
+        let view = self.runtime.slot.borrow().clone();
+        view.client.runtime_report().await
+    }
+
+    pub(crate) async fn ended(&mut self) -> Result<(), ClientError> {
+        let result = match self.task.as_mut() {
+            Some(task) => task.await.map_err(|_| ClientError::Io)?,
+            None => return Ok(()),
+        };
+        self.task.take();
+        result
+    }
+
+    pub(crate) async fn disconnect(&mut self) -> Result<(), ClientError> {
+        self.runtime.request_disconnect();
+        self.ended().await
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SystemProxySession {
+    fn drop(&mut self) {
+        self.runtime.request_disconnect();
+    }
 }
 
 /// Experimental native-ingress adapter for an already isolated platform
@@ -4803,23 +4943,6 @@ pub(crate) struct PreparedLocalProxy {
 }
 
 impl PreparedLocalProxy {
-    #[cfg(windows)]
-    pub(crate) async fn start(path: &Path, expected: [u8; 32]) -> Result<Self, ClientError> {
-        let bytes = saved_client_bytes(path, expected)?;
-        let source = std::str::from_utf8(&bytes).map_err(|_| ClientError::Configuration)?;
-        let Config::Client(document) =
-            config::parse(source).map_err(|_| ClientError::Configuration)?
-        else {
-            return Err(ClientError::Configuration);
-        };
-        let (http, socks, client) = prepare_proxy(&document, path).await?;
-        Ok(Self {
-            http,
-            socks,
-            client,
-        })
-    }
-
     pub(crate) async fn start_selected(
         path: &Path,
         expected: [u8; 32],
@@ -4869,22 +4992,7 @@ impl PreparedLocalProxy {
         }
     }
 
-    #[cfg(windows)]
-    pub(crate) fn reality_monitor(&self) -> Option<Arc<RealityClient>> {
-        match &self.client {
-            ProxyClient::Reality(r) => Some(r.clone()),
-            _ => None,
-        }
-    }
-    #[cfg(windows)]
-    pub(crate) fn http_address(&self) -> Result<SocketAddr, ClientError> {
-        self.http.local_addr().map_err(|_| ClientError::Io)
-    }
 
-    #[cfg(windows)]
-    pub(crate) async fn serve(self) -> Result<(), ClientError> {
-        serve_proxy(self.http, self.socks, self.client).await
-    }
 }
 
 pub(crate) fn saved_client_bytes(
@@ -4916,7 +5024,7 @@ async fn serve_proxy(
     client: ProxyClient,
 ) -> Result<(), ClientError> {
     let maintenance = async { client.maintain().await };
-    serve_proxy_loop(http, socks, || client.clone(), maintenance).await
+    serve_proxy_loop(http, socks, || Some(client.clone()), maintenance).await
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -4928,7 +5036,7 @@ async fn serve_managed_proxy(
     serve_proxy_loop(
         http,
         socks,
-        || runtime.slot.borrow().client.clone(),
+        || runtime.admitting().then(|| runtime.slot.borrow().client.clone()),
         runtime.maintain(),
     )
     .await
@@ -4937,7 +5045,7 @@ async fn serve_managed_proxy(
 async fn serve_proxy_loop(
     http: TcpListener,
     socks: TcpListener,
-    current: impl Fn() -> ProxyClient,
+    current: impl Fn() -> Option<ProxyClient>,
     maintenance: impl std::future::Future<Output = Result<(), ClientError>>,
 ) -> Result<(), ClientError> {
     // Preserve the boundary even for callers bypassing TOML validation.
@@ -4963,7 +5071,11 @@ async fn serve_proxy_loop(
     tokio::pin!(maintenance);
     loop {
         let (socket, is_http) = tokio::select! {
-            result = &mut maintenance => return result,
+            biased;
+            result = &mut maintenance => {
+                tasks.shutdown().await;
+                return result;
+            },
             _ = tasks.join_next(), if !tasks.is_empty() => continue,
             accepted = http.accept() => (accepted.map_err(|_| ClientError::Io)?.0, true),
             accepted = socks.accept() => (accepted.map_err(|_| ClientError::Io)?.0, false),
@@ -4985,7 +5097,7 @@ async fn serve_proxy_loop(
             );
             continue;
         };
-        let client = current();
+        let Some(client) = current() else { continue };
         tasks.spawn(async move {
             let _slot = slot;
             let result = handle(socket, is_http, &client, session_id).await;
