@@ -70,6 +70,10 @@ struct Journal {
     nonce: [u8; 16],
     before: u32,
     installed: u32,
+    // True only for a durable update of an already verified owned table.
+    // Old journals without this field retain the stricter recovery rule.
+    #[serde(default)]
+    previous_present: bool,
     restored: bool,
 }
 impl Journal {
@@ -83,6 +87,12 @@ impl Journal {
             return Err(refused());
         }
         Ok(())
+    }
+
+    fn recovery_generation(&self, observed: u32) -> io::Result<u32> {
+        if observed == self.installed || (self.previous_present && observed == self.before) {
+            Ok(observed)
+        } else { Err(refused()) }
     }
 }
 
@@ -427,7 +437,7 @@ impl LabRules {
         let installed = before.checked_add(1).ok_or_else(refused)?;
         let mut nonce = [0; 16];
         SystemRandom::new().fill(&mut nonce).map_err(|_| refused())?;
-        let journal = Journal { version: 1, scope, nonce, before, installed, restored: false };
+        let journal = Journal { version: 1, scope, nonce, before, installed, previous_present: false, restored: false };
         if net.table(&journal)? { return Err(refused()); }
         let queue_number = queue.number()?;
         let operations = install_messages(&journal, queue_number, &carriers);
@@ -453,6 +463,7 @@ impl LabRules {
         let mut next = self.journal.clone();
         next.before = generation;
         next.installed = generation.checked_add(1).ok_or_else(refused)?;
+        next.previous_present = true;
         let operations = replace_messages(&next, self.queue_number, &next_admissions);
         self.poisoned = true;
         store(&self.journal_path, &next, Some(&raw))?;
@@ -563,7 +574,8 @@ pub fn recover(host_namespace: &File, path: &Path) -> io::Result<()> {
     let net = Netlink::open()?;
     let generation = net.generation()?;
     if net.table(&journal)? {
-        if generation != journal.installed || net.generation()? != generation { return Err(refused()); }
+        journal.recovery_generation(generation)?;
+        if net.generation()? != generation { return Err(refused()); }
         crate::config::guarded_trust_assert(path, &raw).map_err(|_| refused())?;
         let mut attrs = Vec::new();
         name_attr(&mut attrs, 1, &journal.name());
@@ -579,7 +591,7 @@ pub fn recover(host_namespace: &File, path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     fn journal() -> Journal {
-        Journal { version: 1, scope: Scope { boot: "test".into(), dev: 1, ino: 2 }, nonce: [7;16], before: 12, installed: 13, restored: false }
+        Journal { version: 1, scope: Scope { boot: "test".into(), dev: 1, ino: 2 }, nonce: [7;16], before: 12, installed: 13, previous_present: false, restored: false }
     }
     #[test]
     fn exact_generation_and_scope_required() {
@@ -593,6 +605,106 @@ mod tests {
         assert!(j.validate(&changed).is_err());
         assert_eq!(parse_journal(toml::to_string(&j).unwrap().as_bytes(), &j.scope).unwrap(), j);
     }
+    #[test]
+    fn recovery_distinguishes_initial_intent_update_intent_and_other_boot() {
+        let mut j = journal();
+        assert!(j.recovery_generation(12).is_err());
+        assert_eq!(j.recovery_generation(13).unwrap(),13);
+        assert!(j.recovery_generation(14).is_err());
+        j.previous_present = true;
+        assert_eq!(j.recovery_generation(12).unwrap(),12);
+        assert_eq!(j.recovery_generation(13).unwrap(),13);
+        assert!(j.recovery_generation(11).is_err());
+        assert!(j.recovery_generation(14).is_err());
+        let mut reboot = j.scope.clone();
+        reboot.boot = "different-boot".into();
+        let data = toml::to_string(&j).unwrap();
+        assert!(parse_journal(data.as_bytes(), &reboot).is_err());
+        // Recovery for an older journal must not guess prior ownership.
+        let legacy = data.replace("previous_present = true\n", "");
+        let old = parse_journal(legacy.as_bytes(), &j.scope).unwrap();
+        assert!(old.recovery_generation(12).is_err());
+    }
+
+    /// The test harness calls this helper in a new process, inheriting its
+    /// parent's already isolated net namespace. The marker is written only
+    /// AFTER the kernel transaction has been confirmed. No Drop runs on kill.
+    #[test]
+    #[ignore = "child of the explicit isolated crash-recovery test only"]
+    fn kernel_crash_owner_child() {
+        let Ok(parent) = std::env::var("THEIA_NFT_CRASH_TEST_PARENT") else { return; };
+        let pid: u32 = parent.parse().expect("parent PID");
+        assert!(pid > 1);
+        let path = std::path::PathBuf::from(std::env::var_os("THEIA_NFT_CRASH_TEST_JOURNAL").expect("journal"));
+        let host = File::open(format!("/proc/{pid}/ns/net")).unwrap();
+        let queue = Queue::bind(49000,64).unwrap();
+        let lease = LabRules::install(&queue,&host,&path).unwrap();
+        assert!(lease.owns_queue(&queue).unwrap());
+        fs::OpenOptions::new().write(true).create_new(true).open(path.with_extension("ready")).unwrap();
+        // Keep both leases alive indefinitely. The parent owns a bounded
+        // deadline and kills/reaps the child, including on panic.
+        loop { std::thread::park_timeout(std::time::Duration::from_secs(1)); std::hint::black_box((&lease,&queue)); }
+    }
+
+    #[test]
+    #[ignore = "requires Linux CAP_SYS_ADMIN, CAP_NET_ADMIN, iproute2 and isolated namespace"]
+    fn kernel_hard_kill_keeps_capture_fail_closed_until_explicit_recovery() {
+        std::thread::spawn(|| {
+            use std::{os::unix::fs::DirBuilderExt, process::{Child,Command,Stdio}, time::{Duration,Instant}};
+            struct Reap(Child);
+            impl Drop for Reap {
+                fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+            }
+            let host = File::open("/proc/thread-self/ns/net").unwrap();
+            assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) },0);
+            let scope = Scope::current(&host).unwrap();
+            assert!(Command::new("ip").args(["link","set","lo","up"]).status().unwrap().success());
+            let mut random = [0;16];
+            SystemRandom::new().fill(&mut random).unwrap();
+            let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
+            let dir = std::env::temp_dir().join(format!("theia-nft-crash-{suffix}"));
+            fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+            let path = dir.join("journal.toml");
+            let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            receiver.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+            let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let target = receiver.local_addr().unwrap();
+            let mut bytes = [0;32];
+            sender.send_to(b"before",target).unwrap();
+            let (n,_) = receiver.recv_from(&mut bytes).unwrap();
+            assert_eq!(&bytes[..n],b"before");
+            let mut child = Reap(Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored","--exact","routing::linux_rules::tests::kernel_crash_owner_child","--nocapture"])
+                .env("THEIA_NFT_CRASH_TEST_PARENT",std::process::id().to_string())
+                .env("THEIA_NFT_CRASH_TEST_JOURNAL",&path)
+                .stdin(Stdio::null()).spawn().unwrap());
+            let deadline = Instant::now()+Duration::from_secs(10);
+            while !path.with_extension("ready").exists() {
+                assert!(child.0.try_wait().unwrap().is_none(),"capture owner exited before commit");
+                assert!(Instant::now()<deadline,"capture owner did not commit");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let j = parse_journal(&journal_bytes(&path).unwrap().unwrap(),&scope).unwrap();
+            assert!(Netlink::open().unwrap().table(&j).unwrap());
+            assert!(recover(&host,&path).is_err(),"live owner must prevent restore");
+            child.0.kill().unwrap();
+            let status = child.0.wait().unwrap();
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(),Some(libc::SIGKILL));
+            assert!(Netlink::open().unwrap().table(&j).unwrap(),"owned table disappeared on hard kill");
+            let _ = sender.send_to(b"must-not-pass",target);
+            let error = receiver.recv_from(&mut bytes).unwrap_err();
+            assert!(matches!(error.kind(),io::ErrorKind::WouldBlock|io::ErrorKind::TimedOut));
+            recover(&host,&path).unwrap();
+            assert!(!Netlink::open().unwrap().table(&j).unwrap());
+            sender.send_to(b"restored",target).unwrap();
+            let (n,_) = receiver.recv_from(&mut bytes).unwrap();
+            assert_eq!(&bytes[..n],b"restored");
+            recover(&host,&path).unwrap();
+            fs::remove_dir_all(dir).unwrap();
+        }).join().unwrap();
+    }
+
     #[test]
     #[ignore = "requires Linux CAP_SYS_ADMIN and CAP_NET_ADMIN; isolated network namespace only"]
     fn kernel_install_and_recovery_in_new_namespace() {
