@@ -5465,7 +5465,11 @@ mod selector_tests {
             max_connections_total: 8,
             connect_timeout_ms: 1500,
         };
-        let context = Arc::new(ServerContext::new(&inbound, std::slice::from_ref(&user), &policy));
+        let context = Arc::new(ServerContext::new(
+            &inbound,
+            std::slice::from_ref(&user),
+            &policy,
+        ));
         let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -5593,35 +5597,39 @@ mod selector_tests {
                     // would prevent native IP-only authorization.
                     let mut native_policy = policy.clone();
                     native_policy.routing.as_mut().unwrap().rules = vec![
-                    crate::routing::Rule {
-                        name: "native test pass".into(),
-                        action: Action::Direct,
-                        domains: vec![],
-                        ips: vec!["192.0.2.0/24".into()],
-                        applications: vec![],
-                    },
-                    crate::routing::Rule {
-                        name: "native test redirect".into(),
-                        action: Action::Allowed,
-                        domains: vec![],
-                        ips: vec!["198.51.100.0/24".into()],
-                        applications: vec![],
-                    },
-                    crate::routing::Rule {
-                        name: "native test drop".into(),
-                        action: Action::Blocked,
-                        domains: vec![],
-                        ips: vec!["203.0.113.0/24".into()],
-                        applications: vec![],
-                    },
+                        crate::routing::Rule {
+                            name: "native test pass".into(),
+                            action: Action::Direct,
+                            domains: vec![],
+                            ips: vec!["192.0.2.0/24".into()],
+                            applications: vec![],
+                        },
+                        crate::routing::Rule {
+                            name: "native test redirect".into(),
+                            action: Action::Allowed,
+                            domains: vec![],
+                            ips: vec!["198.51.100.0/24".into()],
+                            applications: vec![],
+                        },
+                        crate::routing::Rule {
+                            name: "native test drop".into(),
+                            action: Action::Blocked,
+                            domains: vec![],
+                            ips: vec!["203.0.113.0/24".into()],
+                            applications: vec![],
+                        },
                     ];
                     let native_context = Arc::new(ServerContext::new(
-                        &inbound, std::slice::from_ref(&user), &native_policy
+                        &inbound,
+                        std::slice::from_ref(&user),
+                        &native_policy,
                     ));
                     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                     let native_remote = listener.local_addr().unwrap();
                     let native_server = tokio::spawn(crate::server::serve(
-                        listener, tokio_rustls::TlsAcceptor::from(Arc::new(tls.clone())), native_context
+                        listener,
+                        tokio_rustls::TlsAcceptor::from(Arc::new(tls.clone())),
+                        native_context,
                     ));
                     let path = directory.join("native.toml");
                     let mut native = doc.clone();
