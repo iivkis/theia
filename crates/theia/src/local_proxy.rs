@@ -4797,6 +4797,20 @@ mod selector_tests {
                         ..
                     }
                 ));
+                // Apply deliberately retires the old client's policy lease.
+                // Its established flows may finish, but new OPEN must fail.
+                assert!(matches!(
+                    managed_clients[0].open(Address::V4([127, 0, 0, 1]), target.port()).await,
+                    Err(ClientError::Open(ErrorCode::PolicyDenied))
+                ));
+                // Exercise signer rotation on a fresh independent H2 owner
+                // instead of asking the retired runtime to admit new flows.
+                let h2_profile = client_doc.client.profiles.iter()
+                    .find(|profile| profile.id == "native-h2").unwrap();
+                let ProxyClient::Reality(fresh_h2) = load_client(h2_profile).await.unwrap() else {
+                    panic!("wrong security mode");
+                };
+                managed_clients[0] = fresh_h2;
                 for stream in &mut established {
                     stream.write_all(b"keep").await.unwrap();
                     stream.read_exact(&mut bytes).await.unwrap();

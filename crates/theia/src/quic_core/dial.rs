@@ -119,11 +119,28 @@ pub(crate) async fn connect(
             &observation,
         )
         .await
-        .map_err(|error| match error {
-            handshake_udp::Error::Timeout => observation.failure(true),
-            handshake_udp::Error::Io(_) => observation.failure(false),
-            handshake_udp::Error::Scope => Error::Configuration,
-            _ => Error::Handshake,
+        .map_err(|error| {
+            use handshake_udp::Error as E;
+            let category = match &error {
+                E::Scope => "scope",
+                E::Protocol => "protocol",
+                E::Timeout => "timeout",
+                E::VersionNegotiation(_) => "version",
+                E::Io(_) => "io",
+                E::Tls(_) => "tls_factory",
+                E::Driver(_) => "tls_driver",
+                E::Packet(_) => "packet",
+                E::Schedule(_) => "recovery",
+                E::Endpoint(_) => "endpoint",
+            };
+            crate::diag!(Warn, "quic.dial", "handshake_failed",
+                "category" = crate::diagnostics::Value::Label(category));
+            match error {
+                E::Timeout => observation.failure(true),
+                E::Io(_) => observation.failure(false),
+                E::Scope => Error::Configuration,
+                _ => Error::Handshake,
+            }
         })?;
         // Completion of TLS alone is insufficient for a verified probe.
         // No HTTP streams, bearer or user data have been created.
@@ -147,7 +164,22 @@ pub(crate) async fn confirm(session: &mut LabSession) -> Result<(), Error> {
             at.saturating_duration_since(Instant::now())
                 .min(Duration::from_millis(100))
         });
-        session.recv(wait).await.map_err(|_| Error::Handshake)?;
+        session.recv(wait).await.map_err(|error| {
+            use super::endpoint::Error as E;
+            let category = match error {
+                E::Io(_) => "io",
+                E::Scope => "scope",
+                E::Protocol => "protocol",
+                E::Closed => "closed",
+                E::Packet(_) => "packet",
+                E::Send(_) => "send_flow",
+                E::Receive(_) => "receive_flow",
+                E::Schedule(_) => "recovery",
+            };
+            crate::diag!(Warn, "quic.dial", "confirmation_failed",
+                "category" = crate::diagnostics::Value::Label(category));
+            Error::Handshake
+        })?;
     }
     Ok(())
 }

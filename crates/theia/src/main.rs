@@ -4,8 +4,18 @@ use theia::{
     CliError, Command,
 };
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() {
+fn main() {
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    runtime.enable_all();
+    // Windows' small default stacks are insufficient for the debug and
+    // instrumented async carrier call chains. Reserve, do not commit, 8 MiB
+    // per worker; ordinary allocation and queue limits remain unchanged.
+    #[cfg(windows)]
+    runtime.thread_stack_size(8 * 1024 * 1024);
+    runtime.build().expect("create Theia runtime").block_on(Box::pin(run()));
+}
+
+async fn run() {
     diagnostics::init();
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic| {

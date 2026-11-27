@@ -397,6 +397,10 @@ def trial(binary, cert, key, transport, workload, condition):
             if name.startswith("THEIA_"):
                 del env[name]
         env["THEIA_BENCH_TOKEN"] = base64.urlsafe_b64encode(token).decode().rstrip("=")
+        if platform.system() == "Windows":
+            # The immutable reference uses Tokio's default std-thread stack.
+            # Match the candidate's worker reserve for both variants.
+            env["RUST_MIN_STACK"] = str(8 * 1024 * 1024)
         scratch = tempfile.TemporaryDirectory(prefix="theia-perf-")
         if scratch:
             directory = Path(scratch.name)

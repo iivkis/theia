@@ -674,7 +674,13 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $actual = (git -C .perf-baseline rev-parse HEAD).Trim()
           if ($LASTEXITCODE -ne 0 -or $actual -ne 'abbb89834a406b4c53be0f1ac0b3ab1a65e66f8d') { throw 'Wrong benchmark reference SHA' }
-          cargo build --manifest-path .perf-baseline/Cargo.toml --locked --bin theia --target-dir target
+          if ($IsWindows) {
+            # Same bounded main-thread stack reserve as the candidate's
+            # binary, without modifying the immutable reference source.
+            cargo rustc --manifest-path .perf-baseline/Cargo.toml --locked --bin theia --target-dir target -- -C link-arg=/STACK:8388608
+          } else {
+            cargo build --manifest-path .perf-baseline/Cargo.toml --locked --bin theia --target-dir target
+          }
           if ($LASTEXITCODE -ne 0) { throw 'Native baseline build failed' }
           $name = if ($IsWindows) { 'theia.exe' } else { 'theia' }
           Copy-Item (Join-Path 'target/debug' $name) (Join-Path $env:RUNNER_TEMP "perf-baseline-$name")
@@ -761,7 +767,13 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $actual = (git -C .f19-baseline rev-parse HEAD).Trim()
           if ($LASTEXITCODE -ne 0 -or $actual -ne '917417b09f209334939c38551112081c480eb958') { throw 'Wrong F-19 reference SHA' }
-          cargo build --manifest-path .f19-baseline/Cargo.toml --locked --bin theia --target-dir target
+          if ($IsWindows) {
+            # Same bounded main-thread stack reserve as the candidate's
+            # binary, without modifying the immutable reference source.
+            cargo rustc --manifest-path .f19-baseline/Cargo.toml --locked --bin theia --target-dir target -- -C link-arg=/STACK:8388608
+          } else {
+            cargo build --manifest-path .f19-baseline/Cargo.toml --locked --bin theia --target-dir target
+          }
           if ($LASTEXITCODE -ne 0) { throw 'F-19 baseline build failed' }
           $name = if ($IsWindows) { 'theia.exe' } else { 'theia' }
           Copy-Item (Join-Path 'target/debug' $name) (Join-Path $env:RUNNER_TEMP "f19-baseline-$name")

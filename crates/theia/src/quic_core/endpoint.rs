@@ -67,6 +67,7 @@ pub(crate) struct Established {
     pub tail: Option<HandshakeTail>,
     pub scheduler: Scheduler,
     pub early_application: Vec<Vec<u8>>,
+    pub post_handshake: Option<Box<super::handshake::Driver>>,
 }
 
 pub struct LabSession {
@@ -82,6 +83,7 @@ pub struct LabSession {
     protection: Option<Protection>,
     handshake_tail: Option<HandshakeTail>,
     early_application: VecDeque<Vec<u8>>,
+    post_handshake: Option<Box<super::handshake::Driver>>,
     acknowledgments: History,
     send: SendFlow,
     receive: ReceiveFlow,
@@ -145,6 +147,7 @@ impl LabSession {
             tail,
             scheduler,
             early_application,
+            post_handshake,
         } = established;
         let mut session = Self::connect_inner(
             socket,
@@ -201,6 +204,7 @@ impl LabSession {
         session.peer_leaf = peer_leaf;
         session.handshake_tail = tail;
         session.early_application = early_application.into();
+        session.post_handshake = post_handshake;
         if server {
             session
                 .scheduler
@@ -261,6 +265,7 @@ impl LabSession {
             protection: Some(protection),
             handshake_tail: None,
             early_application: VecDeque::new(),
+            post_handshake: None,
             acknowledgments: History::default(),
             send,
             receive,
@@ -695,6 +700,7 @@ impl LabSession {
         self.protection = None;
         self.handshake_tail = None;
         self.early_application.clear();
+        self.post_handshake = None;
         self.binding = None;
     }
 
@@ -986,6 +992,7 @@ impl LabSession {
         self.protection = None;
         self.handshake_tail = None;
         self.early_application.clear();
+        self.post_handshake = None;
         self.binding = None;
         Ok(())
     }
@@ -1288,6 +1295,19 @@ impl LabSession {
                         .reset(id, final_size, code)
                         .map_err(Error::Receive)?;
                     self.register_implicit(id)?;
+                }
+                Frame::Crypto { offset, data } if !self.server => {
+                    // Independent TLS 1.3 peers may send NewSessionTicket
+                    // in 1-RTT, even though we never resume. Feed only the
+                    // authenticated, bounded CRYPTO stream to rustls.
+                    // Fixed-key fixtures and server-side peers cannot use
+                    // this path; unexpected TLS output is a protocol error.
+                    let driver = self.post_handshake.as_mut().ok_or(Error::Protocol)?;
+                    driver.receive(super::handshake::Level::Application, offset, data)
+                        .map_err(|_| Error::Protocol)?;
+                    if driver.poll_output().map_err(|_| Error::Protocol)?.is_some() {
+                        return Err(Error::Protocol);
+                    }
                 }
                 Frame::NewToken(_) if !self.server => {
                     // No address-token cache or 0-RTT in this backend. Never

@@ -621,6 +621,24 @@ impl Handshake {
         Ok(sent)
     }
 
+    // A failed TLS handshake must release the peer's pending admission.
+    // Send only a generic transport close, at the highest available
+    // encryption level, with no identity, certificate or error text.
+    async fn reject(&mut self, socket: &SessionIo, peer: SocketAddr) {
+        let index = if self.epochs[1].is_some() { 1 } else { 0 };
+        let Some(epoch) = self.epochs[index].as_mut() else { return; };
+        let token = if self.server { &[][..] } else { self.token.as_slice() };
+        // CONNECTION_CLOSE (transport), PROTOCOL_VIOLATION, no trigger/reason.
+        let mut payload = vec![0x1c, 0x0a, 0, 0];
+        let minimum = if !self.server && index == 0 { MTU } else { 0 };
+        let Ok(head) = header(self.version, index, &self.local, &self.remote,
+            token, &mut payload, minimum) else { return; };
+        let Ok((_, packet)) = epoch.writer.seal(&head, &payload) else { return; };
+        if !self.server || self.budget.reserve_send(packet.len() as u64) {
+            let _ = socket.send_to(&packet, peer).await;
+        }
+    }
+
     fn wait(&self, now: Instant, sent: bool) -> Duration {
         if sent {
             return Duration::ZERO;
@@ -1219,7 +1237,7 @@ async fn establish_inner(
     if socket.peer_addr().is_ok() {
         return Err(Error::Scope);
     }
-    tokio::time::timeout(DEADLINE, async {
+    let outcome = tokio::time::timeout(DEADLINE, async {
         let mut buffer = [0; super::mtu::MAX_UDP_PAYLOAD + 1];
         loop {
             handshake.collect()?;
@@ -1268,7 +1286,13 @@ async fn establish_inner(
         Ok::<(), Error>(())
     })
     .await
-    .map_err(|_| Error::Timeout)??;
+    .map_err(|_| Error::Timeout)?;
+    if let Err(error) = outcome {
+        if matches!(&error, Error::Tls(_) | Error::Driver(_) | Error::Protocol) {
+            handshake.reject(&socket, peer).await;
+        }
+        return Err(error);
+    }
     if handshake.driver.negotiated_alpn() != Some(b"h3".as_slice()) {
         return Err(Error::Protocol);
     }
@@ -1340,6 +1364,7 @@ async fn establish_inner(
             tail,
             scheduler: handshake.application_schedule,
             early_application: handshake.early_application,
+            post_handshake: (!server).then(|| Box::new(handshake.driver)),
         },
     )
     .await
