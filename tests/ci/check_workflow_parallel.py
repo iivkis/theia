@@ -205,7 +205,7 @@ for name in ("Instrument real dual-mode TUI", "Instrument real disposable Window
 contains(cg, "pattern: coverage-shard-*", "merge-multiple: false",
          "ci-coverage.py gate --reports-dir coverage-shards --shards 6",
          "THEIA_COVERAGE_SYNTAX_TESTS", "coverage-summary")
-require(workflow.count('--sha "${{ needs.specification.outputs.tested_sha }}"') == 2, "exact coverage SHA")
+require((cov + cg).count('--sha "${{ needs.specification.outputs.tested_sha }}"') == 2, "exact coverage SHA")
 contains((ROOT / "scripts/ci-coverage.py").read_text(encoding="utf-8"), "MIN_PERCENT = 80",
          "read_shards", "identity in seen", 'report["inventory"] != expected',
          "Production sources missing executable evidence", "max(combined[name].get(number, 0), hits)")
