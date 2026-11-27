@@ -32,7 +32,7 @@ const ACK: u16 = 4;
 const CREATE_EXCLUSIVE: u16 = 0x600;
 const APPEND: u16 = 0x800;
 const MAX_CARRIERS: usize = 16;
-const MAX_RULE_OPERATIONS: usize = 64;
+const MAX_RULE_OPERATIONS: usize = 96;
 /// Reserved skb routing mark. It is never a carrier socket mark.
 pub const REDIRECT_MARK: u32 = 0x5449;
 pub(crate) const PASS_MARK:u32=0x544a;

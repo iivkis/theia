@@ -2,7 +2,7 @@
 # the selected interface (not only TCP/UDP). Do not run over remote access.
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory=$true)][ValidateSet('Prepare','Verify','Recover')][string]$Mode,
+    [Parameter(Mandatory=$true)][ValidateSet('Prepare','Verify','Recover','CaptureVerify')][string]$Mode,
     [Parameter(Mandatory=$true)][string]$JournalDirectory,
     [Parameter(Mandatory=$true)][string]$Helper,
     [Parameter(Mandatory=$true)][string]$HelperSha256,
@@ -11,7 +11,14 @@ param(
     [string]$IntentSha256,
     [switch]$IsolatedTestMachine,
     [switch]$ConfirmRecovery,
-    [switch]$RequireDifferentBoot
+    [switch]$RequireDifferentBoot,
+    [string]$TheiaExe,
+    [string]$TheiaSha256,
+    [string]$DriverDirectory,
+    [string]$DllSha256,
+    [string]$SysSha256,
+    [uint32]$CaptureInterfaceIndex,
+    [ValidateRange(1,30)][int]$CaptureSeconds=10
 )
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
@@ -122,7 +129,7 @@ try {
             $r=Read-Pinned $intentLease $IntentSha256
             if ($r.Version -notin @(1,2) -or $r.Machine -cne $machine -or $r.HelperSha256 -cne $hash) { throw 'Intent scope/version mismatch.' }
             if ($RequireDifferentBoot -and $r.BootUtc -eq $boot) { throw 'Reboot has not been observed.' }
-            $operation=switch($Mode) {'Prepare' {'install'} 'Verify' {'inspect'} 'Recover' {'recover'}}
+            $operation=switch($Mode) {'Prepare' {'install'} 'Verify' {'inspect'} 'CaptureVerify' {'inspect'} 'Recover' {'recover'}}
             if ($r.Version -eq 1) {
                 $plans=@($r)
                 $bootConfigured=$false
@@ -157,7 +164,54 @@ try {
             $expected=if ($Mode -eq 'Recover') {'absent'} else {'exact'}
             if ($state -cne $expected) { throw 'Unexpected committed WFP state; retain journal.' }
             $null=Read-Pinned $intentLease $IntentSha256
+            $captureObserved=$null
+            if ($Mode -eq 'CaptureVerify') {
+                if (!$TheiaExe -or !$DriverDirectory -or !$CaptureInterfaceIndex -or $TheiaSha256 -cnotmatch '^[a-f0-9]{64}
+                Interfaces=$seenInterfaces;TransactionalObjectCas=$true;PacketEnforcementVerified=$false;
+                BootTimeObjectsConfigured=($bootConfigured -and $state -ceq 'exact');
+                BootTimeCoverageVerified=$false;ProductionCaptureReady=$false} | ConvertTo-Json -Compress
+        } finally { $intentLease.Dispose() }
+    } finally { $lock.Dispose() }
+} finally { $helperLease.Dispose() }
+ -or $DllSha256 -cnotmatch '^[a-f0-9]{64}
+                Interfaces=$seenInterfaces;TransactionalObjectCas=$true;PacketEnforcementVerified=$false;
+                BootTimeObjectsConfigured=($bootConfigured -and $state -ceq 'exact');
+                BootTimeCoverageVerified=$false;ProductionCaptureReady=$false} | ConvertTo-Json -Compress
+        } finally { $intentLease.Dispose() }
+    } finally { $lock.Dispose() }
+} finally { $helperLease.Dispose() }
+ -or $SysSha256 -cnotmatch '^[a-f0-9]{64}
+                Interfaces=$seenInterfaces;TransactionalObjectCas=$true;PacketEnforcementVerified=$false;
+                BootTimeObjectsConfigured=($bootConfigured -and $state -ceq 'exact');
+                BootTimeCoverageVerified=$false;ProductionCaptureReady=$false} | ConvertTo-Json -Compress
+        } finally { $intentLease.Dispose() }
+    } finally { $lock.Dispose() }
+} finally { $helperLease.Dispose() }
+) { throw 'Explicit pinned capture inputs required.' }
+                $adapters=@(Get-NetAdapter -IncludeHidden | Where-Object { $_.ifIndex -eq $CaptureInterfaceIndex })
+                if ($adapters.Count -ne 1 -or (CanonicalGuid ([string]$adapters[0].InterfaceGuid)) -cnotin $seenInterfaces) { throw 'Capture interface is not covered by the pinned guard.' }
+                $exe=Assert-Regular ([IO.Path]::GetFullPath($TheiaExe))
+                $null=Assert-ProtectedDirectory $exe.DirectoryName
+                if ($exe.Extension -ine '.exe') { throw 'Executable required.' }
+                $driverDir=Assert-ProtectedDirectory $DriverDirectory
+                $exeLease=[IO.File]::Open($exe.FullName,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+                try {
+                    $digest=[Security.Cryptography.SHA256]::Create()
+                    try { $actual=[BitConverter]::ToString($digest.ComputeHash($exeLease)).Replace('-','').ToLowerInvariant() } finally { $digest.Dispose() }
+                    if ($actual -cne $TheiaSha256) { throw 'Capture executable hash mismatch.' }
+                    try {
+                        $captureOutput=(& $exe.FullName client windivert --scope-drop-lab --directory $driverDir --dll-sha256 $DllSha256 --sys-sha256 $SysSha256 --interface-index $CaptureInterfaceIndex --seconds $CaptureSeconds --confirm-block | Out-String)
+                        if ($LASTEXITCODE -ne 0 -or $captureOutput -notmatch 'observed=(\d+)') { throw 'Capture verification failed.' }
+                        $captureObserved=[uint64]$Matches[1]
+                    } finally {
+                        $state=(& $helperFile.FullName @native)
+                        if ($LASTEXITCODE -ne 0 -or $state -cne 'exact') { throw 'Guard changed during capture; retain journal.' }
+                        $null=Read-Pinned $intentLease $IntentSha256
+                    }
+                } finally { $exeLease.Dispose() }
+            }
             [pscustomobject]@{Version=$r.Version;IntentSha256=$IntentSha256;BootUtc=$boot;State=$state;
+                JointCaptureChecked=($Mode -eq 'CaptureVerify');CaptureObserved=$captureObserved;
                 Interfaces=$seenInterfaces;TransactionalObjectCas=$true;PacketEnforcementVerified=$false;
                 BootTimeObjectsConfigured=($bootConfigured -and $state -ceq 'exact');
                 BootTimeCoverageVerified=$false;ProductionCaptureReady=$false} | ConvertTo-Json -Compress

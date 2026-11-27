@@ -1325,7 +1325,6 @@ mod native {
             if index!=carrier || source.ip()!=local.ip() {return Err(io::ErrorKind::PermissionDenied.into());}
             // IP_UNICAST_IF uses network order for IPv4, host order for
             // IPv6. Pin the actual socket before its first connect/send.
-            use std::os::windows::io::AsRawSocket;
             use windows_sys::Win32::Networking::WinSock::{setsockopt,getsockopt,WSAGetLastError,IPPROTO_IP,IPPROTO_IPV6};
             let level=if local.is_ipv4(){IPPROTO_IP}else{IPPROTO_IPV6};
             let value=if local.is_ipv4(){carrier.to_be()}else{carrier};

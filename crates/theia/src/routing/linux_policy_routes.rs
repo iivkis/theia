@@ -125,7 +125,7 @@ impl Rtnl {
                     if rest.len()!=align4(len) || (!body.is_empty() && (body.len()<4 || body[..4]!=[0;4])) {return Err(invalid());}
                     return Ok(objects);
                 }
-                if typ!=if kind==GET_ROUTE {NEW_ROUTE}else{NEW_RULE} || body.len()<12 || body[0]!=family || objects.len()>=4096 {
+                if typ!=(if kind==GET_ROUTE {NEW_ROUTE}else{NEW_RULE}) || body.len()<12 || body[0]!=family || objects.len()>=4096 {
                     return Err(invalid());
                 }
                 let object=Object{kind:typ,body:body.to_vec()};

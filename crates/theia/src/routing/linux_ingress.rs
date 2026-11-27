@@ -669,10 +669,6 @@ mod tests {
             for address in ["198.51.100.2","203.0.113.2"] {
                 ip(&["neigh","replace",address,"lladdr","02:00:00:00:01:02","nud","permanent","dev","theiatest0"]);
             }
-            ip(&["rule", "add", "fwmark", "0x5449", "lookup", "100"]);
-            ip(&["-6", "rule", "add", "fwmark", "0x5449", "lookup", "100"]);
-            ip(&["route", "add", "local", "0.0.0.0/0", "dev", "lo", "table", "100"]);
-            ip(&["-6", "route", "add", "local", "::/0", "dev", "lo", "table", "100"]);
 
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             runtime.block_on(async {
@@ -682,6 +678,8 @@ mod tests {
                 let directory=std::env::temp_dir().join(format!("theia-all-redirect-{suffix}"));
                 std::fs::DirBuilder::new().mode(0o700).create(&directory).unwrap();
                 let journal=directory.join("guard.toml");
+                let policy_routes=linux_rules::PolicyRoutes::install(&host,&journal,false).unwrap();
+                assert!(policy_routes.current().unwrap());
                 let rules=Arc::new(Mutex::new(LabRules::install_redirect(&host,&journal,listeners.port()).unwrap()));
                 let registrar=LabRegistrar::new(rules.clone(),host.try_clone().unwrap());
                 assert!(rules.lock().unwrap().redirect_ready(listeners.port()).unwrap());
@@ -788,7 +786,8 @@ mod tests {
                 assert!(!seen(b"theia-no-listener-negative",Duration::from_millis(150)));
                 // Even if the marked local route disappears, the actual
                 // physical postrouting guard must reject the reroute.
-                ip(&["rule","del","fwmark","0x5449","lookup","100"]);
+                ip(&["rule","del","priority","21577","fwmark","0x5449","lookup","21577"]);
+                assert!(!policy_routes.current().unwrap());
                 assert!(!rules.lock().unwrap().redirect_ready(49001).unwrap());
                 let _=competitor.send(b"theia-no-route-negative").await;
                 assert!(!seen(b"theia-no-route-negative",Duration::from_millis(150)));
@@ -797,6 +796,7 @@ mod tests {
                 drop(registrar);drop(rules);
                 let _=competitor.send(b"theia-no-owner-negative").await;
                 assert!(!seen(b"theia-no-owner-negative",Duration::from_millis(150)));
+                drop(policy_routes);
                 linux_rules::recover(&host,&journal).unwrap();
                 // Positive control proves the same wire and route can
                 // actually emit the packet after explicit owned recovery.
