@@ -739,7 +739,12 @@ impl Handshake {
     }
 
     fn receive_datagram(&mut self, datagram: &[u8]) -> Result<(), Error> {
-        let Ok(packets) = super::datagram::split(datagram) else {
+        let packets = if self.server {
+            super::datagram::split(datagram)
+        } else {
+            super::datagram::split_from_server(datagram)
+        };
+        let Ok(packets) = packets else {
             return Ok(());
         };
         for packet in packets {
@@ -1488,6 +1493,29 @@ mod coalescing_tests {
                 assert!(parse_header(&inbound, version, &local, &[3; 8], &[]).is_none());
                 assert_eq!(packet[5] as usize, len);
             }
+        }
+    }
+
+    #[test]
+    fn client_can_receive_unpadded_server_initial_close() {
+        for version in [Version::V1, Version::V2] {
+            let client = [1; CID_LEN];
+            let server = [2; CID_LEN];
+            let keys = initial_keys(version, &server, true).unwrap();
+            let mut payload = vec![0x1c, 0x0a, 0, 0];
+            let h = header(version, 0, &server, &client, &[], &mut payload, 0).unwrap();
+            let (_, packet) = Writer::new(keys.local).seal(&h, &payload).unwrap();
+            assert!(packet.len() < 1200);
+            assert!(super::super::datagram::split(&packet).is_err());
+            let packets = super::super::datagram::split_from_server(&packet).unwrap();
+            assert_eq!(packets.len(), 1);
+            let (_, at) = parse_header(packets[0].bytes, version, &client, &server, &[]).unwrap();
+            let mut reader = Reader::new(initial_keys(version, &server, false).unwrap().remote);
+            let opened = reader.open(packets[0].bytes, at).unwrap();
+            assert!(matches!(
+                frames::decode(&opened.payload, Space::Initial).unwrap().as_slice(),
+                [Frame::Close { .. }]
+            ));
         }
     }
 

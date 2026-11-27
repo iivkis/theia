@@ -326,6 +326,16 @@ async fn h3_peer(
                             }
                         }
                         Ok(None) => break,
+                        // The final client lease may send a graceful
+                        // H3_NO_ERROR before join_next observes a completed
+                        // echo handler. Only accept that exact wire close
+                        // after all expected admissions and GOAWAY; the
+                        // joins below must still prove every echo completed.
+                        Err(_) if accepted == expected && pending.is_empty()
+                            && command.is_none()
+                            && matches!(quic.close_reason(),
+                                Some(quinn::ConnectionError::ApplicationClosed(close))
+                                if close.error_code.into_inner() == 0x100) => break,
                         Err(error) => panic!("H3 fixture connection: {error}"),
                     }
                 }

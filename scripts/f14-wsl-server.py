@@ -135,12 +135,12 @@ revision = 2
 
 [[server.policy.routing.rules]]
 name = "local direct"
-action = "direct"
+action = "direct_via_client"
 domains = ["full:localhost"]
 
 [[server.policy.routing.rules]]
 name = "blocked test name"
-action = "blocked"
+action = "blackhole"
 domains = ["full:blocked.invalid"]
 
 [management]
