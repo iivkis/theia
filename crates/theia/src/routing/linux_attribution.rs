@@ -275,6 +275,95 @@ fn observe_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn flow_event(peer: std::net::SocketAddr, protocol: u32) -> super::super::linux_events::KernelFlowEvent {
+        let mut bytes = [0u8; 88];
+        for offset in [0, 8, 16, 24] {
+            bytes[offset..offset+8].copy_from_slice(&1u64.to_ne_bytes());
+        }
+        bytes[32..40].copy_from_slice(&0x1_0000_0001u64.to_ne_bytes());
+        bytes[52..56].copy_from_slice(&protocol.to_ne_bytes());
+        bytes[56..60].copy_from_slice(&1u32.to_ne_bytes());
+        match peer.ip() {
+            std::net::IpAddr::V4(ip) => {
+                bytes[48..52].copy_from_slice(&4u32.to_ne_bytes());
+                bytes[64..68].copy_from_slice(&ip.octets());
+            }
+            std::net::IpAddr::V6(ip) => {
+                bytes[48..52].copy_from_slice(&6u32.to_ne_bytes());
+                bytes[64..80].copy_from_slice(&ip.octets());
+            }
+        }
+        bytes[80..82].copy_from_slice(&peer.port().to_ne_bytes());
+        super::super::linux_events::KernelFlowEvent::parse(&bytes).unwrap()
+    }
+
+    #[test]
+    fn exact_connected_tuple_requires_matching_protocol_and_peer() {
+        use super::super::packet::Transport;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap();
+        let tcp = TcpStream::connect(target).unwrap();
+        let (_accepted, _) = listener.accept().unwrap();
+        let fd: OwnedFd = tcp.try_clone().unwrap().into();
+        let key = connected_key(&fd, &flow_event(target, 6)).unwrap();
+        assert_eq!(key.source, tcp.local_addr().unwrap());
+        assert_eq!(key.destination, target);
+        assert_eq!(key.transport, Transport::Tcp);
+        assert!(connected_key(&fd, &flow_event(target, 17)).is_err());
+
+        let a = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let c = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dest = b.local_addr().unwrap();
+        let fd: OwnedFd = a.try_clone().unwrap().into();
+        assert!(connected_key(&fd, &flow_event(dest, 17)).is_err());
+        a.connect(dest).unwrap();
+        let key = connected_key(&fd, &flow_event(dest, 17)).unwrap();
+        assert_eq!(key.source, a.local_addr().unwrap());
+        assert_eq!(key.destination, dest);
+        assert_eq!(key.transport, Transport::Udp);
+        assert!(connected_key(&fd, &flow_event(c.local_addr().unwrap(), 17)).is_err());
+        assert!(connected_key(&fd, &flow_event(dest, 6)).is_err());
+        let ordinary_file: OwnedFd = File::open("/dev/null").unwrap().into();
+        assert!(connected_key(&ordinary_file, &flow_event(dest, 17)).is_err());
+        assert!(socket_cookie(&ordinary_file).is_err());
+    }
+
+    #[test]
+    fn live_process_and_executable_metadata_are_not_interchangeable() {
+        let pid = std::process::id();
+        let pidfd = owned_syscall(unsafe { libc::syscall(libc::SYS_pidfd_open, pid as i32, 0) }).unwrap();
+        assert!(live(&pidfd).is_ok());
+        let ticks = proc_start_ticks(pid).unwrap();
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u128;
+        let ns = u64::try_from((u128::from(ticks) * 1_000_000_000).div_ceil(hz)).unwrap();
+        assert!(matches_start(pid, ns).unwrap());
+        assert!(!matches_start(pid, ns + 5_000_000_000).unwrap());
+        assert!(proc_start_ticks(u32::MAX).is_err());
+        assert!(owned_syscall(unsafe { libc::syscall(libc::SYS_pidfd_open, -1i32, 0) }).is_err());
+        assert_eq!(linux_device(0x1234), (0x12, 0x34));
+        assert!(identity(&File::open("/dev/null").unwrap()).is_err());
+        let path = std::env::temp_dir().join(format!(
+            "theia-executable-identity-{}-{}",
+            pid,
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::write(&path, b"fixture").unwrap();
+        let file = File::open(&path).unwrap();
+        let before = identity(&file).unwrap();
+        assert_eq!(before.size, 7);
+        assert!(identity(&file).unwrap() == before);
+        std::fs::write(&path, b"replacement").unwrap();
+        assert!(identity(&file).unwrap() != before);
+        std::fs::remove_file(path).unwrap();
+
+        // The real pidfd_getfd may be restricted by runner policy. A wrong
+        // cookie must never succeed regardless of that permission.
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let other = UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert!(observe_socket_owner(pid, socket.as_raw_fd(), socket_cookie(&other).unwrap()).is_err());
+    }
+
     #[test]
     fn actual_kernel_cookies_distinguish_sockets_and_survive_duplication() {
         let a = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();

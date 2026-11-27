@@ -1795,6 +1795,27 @@ impl NativeIngress {
         self.raw_decision(meta, socket_cookie, false).await
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) async fn unified_redirect_regression_fixture(&self, meta: crate::routing::packet::PacketMeta) {
+        use crate::routing::PacketAction;
+        use std::sync::atomic::Ordering;
+        let digest = self.client.routing_policy().await.unwrap().digest();
+        assert!(self.check_unified_redirect(meta.flow, digest).is_err());
+        // No platform capture or carrier socket is installed by this fixture.
+        // Test the production decision and its revocation before any handoff.
+        self.unified.store(true, Ordering::Release);
+        assert!(self.native_modify_enabled().unwrap());
+        assert_eq!(self.raw_decision(meta, Some(77), true).await, PacketAction::Redirect);
+        assert!(self.check_native_modify(meta.flow, digest).is_ok());
+        assert_eq!(self.raw_decision(meta, Some(77), true).await, PacketAction::Redirect);
+        assert!(self.check_native_modify(meta.flow, [0; 32]).is_err());
+        self.deny_raw_packet(Some(meta));
+        assert!(self.check_native_modify(meta.flow, digest).is_err());
+        assert_eq!(self.raw_decision(meta, Some(77), true).await, PacketAction::Drop);
+        self.unified.store(false, Ordering::Release);
+        assert!(!self.native_modify_enabled().unwrap());
+    }
+
     #[cfg(target_os = "linux")]
     async fn raw_decision(
         &self,

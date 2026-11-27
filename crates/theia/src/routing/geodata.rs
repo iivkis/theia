@@ -238,6 +238,11 @@ async fn get_once(uri: Uri, limit: usize, roots: &rustls::RootCertStore) -> Resu
         .send_request(request, true)
         .map_err(|_| Error::Network)?;
     let response = response.await.map_err(|_| Error::Network)?;
+    read_reply(response, limit).await
+}
+
+// Validate the real HTTP/2 response independently of socket and TLS setup.
+async fn read_reply(response: http::Response<h2::RecvStream>, limit: usize) -> Result<Reply, Error> {
     let status = response.status();
     if status.is_redirection() {
         if response.headers().get_all(header::LOCATION).iter().count() != 1 {
@@ -582,6 +587,114 @@ mod tests {
     }
     fn ip() -> Vec<u8> {
         vec![10, 13, 10, 1, b'X', 18, 8, 10, 4, 192, 0, 2, 0, 16, 24]
+    }
+
+    async fn response_fixture(
+        status: StatusCode,
+        headers: &[(&str, &str)],
+        chunks: Vec<&'static [u8]>,
+        trailers: bool,
+        limit: usize,
+    ) -> Result<Reply, Error> {
+        let mut response = http::Response::builder().status(status);
+        for (name, value) in headers {
+            response = response.header(*name, *value);
+        }
+        let response = response.body(()).unwrap();
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_io).await.unwrap();
+            let (_, mut respond) = connection.accept().await.unwrap().unwrap();
+            let mut stream = respond
+                .send_response(response, chunks.is_empty() && !trailers)
+                .unwrap();
+            let count = chunks.len();
+            for (index, chunk) in chunks.into_iter().enumerate() {
+                stream
+                    .send_data(bytes::Bytes::from_static(chunk), index + 1 == count && !trailers)
+                    .unwrap();
+            }
+            if trailers {
+                let mut values = http::HeaderMap::new();
+                values.insert("x-fixture", http::HeaderValue::from_static("trailer"));
+                stream.send_trailers(values).unwrap();
+            }
+            // Drive the real connection until the client has consumed the response.
+            while connection.accept().await.is_some() {}
+        });
+        let (mut sender, connection) = h2::client::handshake(client_io).await.unwrap();
+        let driver = tokio::spawn(connection);
+        let (response, _) = sender
+            .send_request(
+                http::Request::get("https://github.com/fixture").body(()).unwrap(),
+                true,
+            )
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(3), async {
+            read_reply(response.await.map_err(|_| Error::Network)?, limit).await
+        })
+        .await
+        .expect("bounded in-memory HTTP/2 fixture");
+        server.abort();
+        driver.abort();
+        result
+    }
+
+    #[tokio::test]
+    async fn h2_dataset_response_limits_and_redirect_contract() {
+        let valid = response_fixture(
+            StatusCode::OK,
+            &[("content-length", "6"), ("content-encoding", "identity")],
+            vec![b"abc", b"def"],
+            false,
+            6,
+        )
+        .await
+        .unwrap();
+        assert_eq!(valid.status, StatusCode::OK);
+        assert_eq!(valid.bytes, b"abcdef");
+        assert!(valid.redirect.is_none());
+        let redirect = response_fixture(
+            StatusCode::FOUND,
+            &[("location", "/XTLS/Xray-rules-dat/releases/tag/20261126014317")],
+            vec![],
+            false,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(redirect.status, StatusCode::FOUND);
+        assert_eq!(redirect.redirect.as_deref(), Some("/XTLS/Xray-rules-dat/releases/tag/20261126014317"));
+        assert!(redirect.bytes.is_empty());
+        for headers in [
+            vec![],
+            vec![("location", "/a"), ("location", "/b")],
+        ] {
+            assert!(matches!(
+                response_fixture(StatusCode::FOUND, &headers, vec![], false, 0).await,
+                Err(Error::Format)
+            ));
+        }
+        assert!(matches!(
+            response_fixture(StatusCode::NOT_FOUND, &[], vec![], false, 16).await,
+            Err(Error::Network)
+        ));
+        assert!(matches!(
+            response_fixture(StatusCode::OK, &[("content-encoding", "gzip")], vec![], false, 16).await,
+            Err(Error::Network)
+        ));
+        assert!(matches!(
+            response_fixture(StatusCode::OK, &[("content-length", "6")], vec![b"abcdef"], false, 5).await,
+            Err(Error::Limit)
+        ));
+        assert!(matches!(
+            response_fixture(StatusCode::OK, &[], vec![b"abc", b"def"], false, 5).await,
+            Err(Error::Limit)
+        ));
+        assert!(matches!(
+            response_fixture(StatusCode::OK, &[], vec![b"abc"], true, 16).await,
+            Err(Error::Format)
+        ));
     }
 
     #[test]

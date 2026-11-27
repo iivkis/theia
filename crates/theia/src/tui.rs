@@ -11158,6 +11158,11 @@ mod tests {
                 "Файл содержит bearer",
             ),
             (IssueFlow::ExportFailed, "Секрет повторно не выдаётся"),
+            (IssueFlow::ConfirmReveal, "повторная выдача невозможна"),
+            (IssueFlow::Sharing, "URI скрыт"),
+            (IssueFlow::ShareDone("Передано".into()), "Работающий процесс не изменён"),
+            (IssueFlow::ShareConfirm { action: crate::tui_share::Action::Qr, public: None }, "КОНФИДЕНЦИАЛЬНО"),
+            (IssueFlow::ShareConfirm { action: crate::tui_share::Action::Clipboard, public: Some("public-fixture".into()) }, "Публичное приглашение без bearer"),
         ] {
             let screen =
                 render(|f, a| draw_issuance(f, a, &flow, None, IssueKind::NewUser, None, 0));
@@ -11212,6 +11217,9 @@ mod tests {
             ),
             (ImportFlow::Saving, "Сохраняем профиль и ключ"),
             (ImportFlow::Done, "Профиль сохранён"),
+            (ImportFlow::ActivateConfirm, "Выбор профиля"),
+            (ImportFlow::Activating, "Соединение не запускается"),
+            (ImportFlow::ActivationFailed, "Выбор профиля не подтверждён"),
             (ImportFlow::Failed, "Импорт НЕ подтверждён"),
         ] {
             let screen = render(|f, a| draw_import(f, a, &flow, None, None));
