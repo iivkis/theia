@@ -33,11 +33,11 @@ fn native32(data: &[u8]) -> u32 {
 fn be32(data: &[u8]) -> u32 {
     u32::from_be_bytes(data.try_into().expect("checked field"))
 }
-fn align4(n: usize) -> usize {
+pub(super) fn align4(n: usize) -> usize {
     (n + 3) & !3
 }
 
-fn attr(out: &mut Vec<u8>, kind: u16, data: &[u8]) {
+pub(super) fn attr(out: &mut Vec<u8>, kind: u16, data: &[u8]) {
     let len = 4 + data.len();
     let len16 = u16::try_from(len).expect("fixed bounded command");
     out.extend_from_slice(&len16.to_ne_bytes());
@@ -45,7 +45,7 @@ fn attr(out: &mut Vec<u8>, kind: u16, data: &[u8]) {
     out.extend_from_slice(data);
     out.resize(align4(out.len()), 0);
 }
-fn message(kind: u16, flags: u16, sequence: u32, queue: u16, attrs: &[u8]) -> Vec<u8> {
+pub(super) fn message(kind: u16, flags: u16, sequence: u32, queue: u16, attrs: &[u8]) -> Vec<u8> {
     let len = HEADER + NFGEN + attrs.len();
     let mut out = Vec::with_capacity(len);
     out.extend_from_slice(&(len as u32).to_ne_bytes());
@@ -58,7 +58,7 @@ fn message(kind: u16, flags: u16, sequence: u32, queue: u16, attrs: &[u8]) -> Ve
     out.extend_from_slice(attrs);
     out
 }
-fn checked_header(data: &[u8]) -> io::Result<(u16, u32, &[u8])> {
+pub(super) fn checked_header(data: &[u8]) -> io::Result<(u16, u32, &[u8])> {
     let header = data.get(..HEADER).ok_or_else(invalid)?;
     let len = native32(&header[..4]) as usize;
     if len < HEADER || align4(len) != data.len() {
@@ -67,7 +67,7 @@ fn checked_header(data: &[u8]) -> io::Result<(u16, u32, &[u8])> {
     let body = data.get(HEADER..len).ok_or_else(invalid)?;
     Ok((native16(&header[4..6]), native32(&header[8..12]), body))
 }
-fn next_attr<'a>(rest: &mut &'a [u8]) -> io::Result<Option<(u16, &'a [u8])>> {
+pub(super) fn next_attr<'a>(rest: &mut &'a [u8]) -> io::Result<Option<(u16, &'a [u8])>> {
     if rest.is_empty() {
         return Ok(None);
     }
@@ -135,13 +135,13 @@ fn decode(data: &[u8], queue: u16) -> io::Result<Captured> {
     })
 }
 
-fn kernel_address() -> libc::sockaddr_nl {
+pub(super) fn kernel_address() -> libc::sockaddr_nl {
     // All padding and groups are zero; no multicast subscription.
     let mut address: libc::sockaddr_nl = unsafe { mem::zeroed() };
     address.nl_family = libc::AF_NETLINK as libc::sa_family_t;
     address
 }
-fn send(fd: RawFd, bytes: &[u8]) -> io::Result<()> {
+pub(super) fn send(fd: RawFd, bytes: &[u8]) -> io::Result<()> {
     let kernel = kernel_address();
     let sent = unsafe {
         libc::sendto(fd, bytes.as_ptr().cast(), bytes.len(), 0,
@@ -156,7 +156,7 @@ fn send(fd: RawFd, bytes: &[u8]) -> io::Result<()> {
     }
     Ok(())
 }
-fn receive(fd: RawFd, buffer: &mut [u8]) -> io::Result<usize> {
+pub(super) fn receive(fd: RawFd, buffer: &mut [u8]) -> io::Result<usize> {
     let mut sender = kernel_address();
     let mut len = mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
     let read = unsafe {
@@ -238,6 +238,11 @@ impl Queue {
         attr(&mut attrs, 5, &0u32.to_be_bytes());
         configure(raw, number, 2, &attrs, &mut buffer)?;
         Ok(Self { fd: Some(fd), number, buffer })
+    }
+
+    pub(super) fn number(&self) -> io::Result<u16> {
+        self.descriptor()?;
+        Ok(self.number)
     }
 
     fn descriptor(&self) -> io::Result<RawFd> {

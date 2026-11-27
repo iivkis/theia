@@ -16,6 +16,8 @@ mod wfp_context;
 pub(crate) mod wfp_ingress;
 #[cfg(target_os = "linux")]
 pub mod nfqueue;
+#[cfg(target_os = "linux")]
+pub mod linux_rules;
 pub mod geodata;
 mod settings;
 pub mod snapshot;
