@@ -1450,8 +1450,11 @@ async fn blocked_diagnostic_fixture(
     doc.client.profiles.push(selected.clone());
     let path = directory.join("diagnostic.toml");
     crate::config::atomic_write(&path, &Config::Client(doc)).unwrap();
-    let digest: [u8; 32] = Sha256::digest(crate::config::editor_bytes(&path).unwrap()).into();
-    for consent in [false, true] {
+    let saved = crate::config::editor_bytes(&path).unwrap();
+    let digest: [u8; 32] = Sha256::digest(&saved).into();
+    // Closing consent, editing the saved profile while awaiting consent,
+    // and explicitly accepting are three distinct terminal outcomes.
+    for (consent, changed) in [(false, false), (true, true), (true, false)] {
         let (tx, rx) = std::sync::mpsc::channel();
         let (confirm, confirmed) = tokio::sync::oneshot::channel();
         let (_cancel, cancelled) = tokio::sync::watch::channel(false);
@@ -1486,7 +1489,7 @@ async fn blocked_diagnostic_fixture(
                 match event {
                     Event::Check(check) => {
                         if check.domain.is_some() {
-                            assert!(consent && domains_seen, "target check before consent");
+                            assert!(consent && !changed && domains_seen, "target check without live consent");
                             assert_eq!(check.domain.as_deref(), Some("blocked.invalid"));
                         }
                         match (check.kind, check.outcome) {
@@ -1502,6 +1505,11 @@ async fn blocked_diagnostic_fixture(
                         assert_eq!(domains, vec!["blocked.invalid"]);
                         domains_seen = true;
                         let confirmation = confirm.take().unwrap();
+                        if changed {
+                            let mut edited = saved.clone();
+                            edited.push(b'\n');
+                            std::fs::write(&path, edited).unwrap();
+                        }
                         if consent {
                             confirmation.send(()).unwrap();
                         }
@@ -1513,7 +1521,10 @@ async fn blocked_diagnostic_fixture(
                     }
                     Event::Done(result) => {
                         assert!(verified && domains_seen);
-                        if consent {
+                        if changed {
+                            assert_eq!(result, Err(ClientError::Configuration));
+                            assert!(!blocked && !skipped && !done);
+                        } else if consent {
                             assert_eq!(result, Ok(()));
                             assert!(blocked && skipped && done);
                         } else {
@@ -1531,6 +1542,9 @@ async fn blocked_diagnostic_fixture(
         })
         .await
         .expect("bounded authenticated diagnostic fixture");
+        if changed {
+            std::fs::write(&path, &saved).unwrap();
+        }
     }
 }
 
