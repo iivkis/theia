@@ -956,7 +956,31 @@ impl RoutingPanel {
         })
     }
 
+    fn form(&self) -> Option<Form> {
+        let (_, values, focus) = self.fields.as_ref()?;
+        let definitions = [
+            ("Имя правила", "Короткое понятное название."),
+            ("Действие (←→)", "Стрелки влево и вправо выбирают действие из списка."),
+            ("Домены / GeoSite", "Через запятую: example.org или geosite:google."),
+            ("IP / CIDR / GeoIP", "Через запятую: 192.0.2.0/24 или geoip:private."),
+            ("Приложения (будущие режимы)", "В MVP атрибуция отсутствует. Формат: sha256: и 64 hex-символа."),
+        ];
+        Some(Form {
+            fields: definitions.iter().enumerate().map(|(id, &(label, hint))| Field {
+                id, label, hint,
+                value: if id == 1 { Self::action_label(&values[id]).to_owned() } else { values[id].clone() },
+            }).collect(),
+            selected: *focus,
+            lead: "↑↓ / Tab: поле · ←→: действие · Enter: в черновик · Esc: отменить".into(),
+            error: self.message.clone(),
+        })
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, active: bool) {
+        if let Some(form) = self.form() {
+            form.render(frame, area, "Редактирование правила");
+            return;
+        }
         let items = self.actions();
         let body = self.body();
         if let Some([report, controls]) = self.layout(area) {
@@ -1005,7 +1029,15 @@ impl RoutingPanel {
         (start, capacity)
     }
     fn select_at(&mut self, area: Rect, x: u16, y: u16) {
-        if self.fields.is_some() || self.download.is_some() || self.search.is_some() {
+        if let Some(form) = self.form() {
+            if let Some(id) = form.hit(area, x, y) {
+                if let Some((_, _, focus)) = self.fields.as_mut() {
+                    *focus = id;
+                }
+            }
+            return;
+        }
+        if self.download.is_some() || self.search.is_some() {
             return;
         }
         if let Some([report, controls]) = self.layout(area) {
@@ -1818,6 +1850,30 @@ impl Interaction {
                 self.workspace_action = 0;
             }
         }
+        if matches!(code, KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End) {
+            let jump = |current: usize, len: usize| match code {
+                KeyCode::Home => 0,
+                KeyCode::End => len.saturating_sub(1),
+                KeyCode::PageUp => current.saturating_sub(10),
+                _ => current.saturating_add(10).min(len.saturating_sub(1)),
+            };
+            match self.workspace_focus {
+                WorkspaceFocus::Records => {
+                    if count > 0 {
+                        if let Some(editor) = self.editor.as_mut() { editor.workspace_select(jump(record, count)); }
+                        self.workspace_user = 0;
+                        self.workspace_action = 0;
+                    }
+                    return true;
+                }
+                WorkspaceFocus::Users => {
+                    self.workspace_user = jump(self.workspace_user, users);
+                    self.workspace_action = 0;
+                    return true;
+                }
+                _ => {}
+            }
+        }
         match (self.workspace_focus, code) {
             (WorkspaceFocus::Navigation, KeyCode::Up) => {
                 self.select_workspace_page(role, self.workspace_page.saturating_sub(1));
@@ -1924,7 +1980,7 @@ impl Interaction {
         let mut items = runtime.actions();
         if self.workspace_page == 3 && self.editor_for(Role::Server).is_some() && !items.is_empty() {
             if let Some(action) = self.server_process.actions().first() {
-                items.insert(0, ActionItem { key: 'P', label: action.label });
+                items.push(ActionItem { key: 'P', label: action.label });
             }
         }
         items
@@ -3341,6 +3397,13 @@ impl Interaction {
                                 self.workspace_focus = WorkspaceFocus::Fields;
                             }
                         }
+                        return false;
+                    }
+                    if key.modifiers.is_empty()
+                        && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End)
+                        && matches!(self.workspace_focus, WorkspaceFocus::Records | WorkspaceFocus::Users)
+                        && self.workspace_arrow(role, key.code)
+                    {
                         return false;
                     }
                     if key.modifiers.is_empty()
