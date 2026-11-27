@@ -862,12 +862,11 @@ struct NativeOwner {
 }
 
 impl NativeOwner {
-    fn apply_locked(lock: Mutex, bind: SocketAddr, review: Option<ApplyReview>) -> Result<Self, ProxyError> {
+    fn apply_locked(lock: Mutex, before: Snapshot, bind: SocketAddr, review: Option<ApplyReview>) -> Result<Self, ProxyError> {
         if read_journal()?.is_some() {
             return Err(ProxyError::RecoveryRequired);
         }
-        let before = query()?;
-        if review.is_some_and(|review| review.0 != before) {
+        if query()? != before || review.is_some_and(|review| review.0 != before) {
             return Err(ProxyError::Conflict);
         }
         let applied = before.for_loopback(bind)?;
@@ -918,6 +917,10 @@ impl Drop for NativeOwner {
 }
 
 type RestoreReply = std::sync::mpsc::SyncSender<Result<Recovery, ProxyError>>;
+enum OwnerCommand {
+    Restore(RestoreReply),
+    Abandon,
+}
 type ApplyRequest = (SocketAddr, Option<ApplyReview>);
 
 /// The SID-scoped owner is reserved before DNS, credential preflight or bind.
@@ -925,7 +928,7 @@ type ApplyRequest = (SocketAddr, Option<ApplyReview>);
 pub(crate) struct ReservedProxy {
     start: Option<std::sync::mpsc::SyncSender<ApplyRequest>>,
     ready: std::sync::mpsc::Receiver<Result<Journal, ProxyError>>,
-    commands: Option<std::sync::mpsc::Sender<RestoreReply>>,
+    commands: Option<std::sync::mpsc::Sender<OwnerCommand>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -934,7 +937,7 @@ impl ReservedProxy {
         let (reserved_tx, reserved_rx) = std::sync::mpsc::sync_channel(1);
         let (start_tx, start_rx) = std::sync::mpsc::sync_channel::<ApplyRequest>(1);
         let (ready_tx, ready) = std::sync::mpsc::sync_channel(1);
-        let (commands, commands_rx) = std::sync::mpsc::channel::<RestoreReply>();
+        let (commands, commands_rx) = std::sync::mpsc::channel::<OwnerCommand>();
         let thread = std::thread::Builder::new()
             .name("theia-wininet-owner".into())
             .spawn(move || {
@@ -943,12 +946,13 @@ impl ReservedProxy {
                     if read_journal()?.is_some() {
                         return Err(ProxyError::RecoveryRequired);
                     }
-                    // Validate per-user scope before any network preflight.
-                    query()?;
-                    Ok(lock)
+                    // Pin the original snapshot before network preflight,
+                    // including CLI Connect which has no interactive review.
+                    let before = query()?;
+                    Ok((lock, before))
                 })();
-                let lock = match reservation {
-                    Ok(lock) => lock,
+                let (lock, before) = match reservation {
+                    Ok(value) => value,
                     Err(error) => {
                         let _ = reserved_tx.send(Err(error));
                         return;
@@ -956,7 +960,7 @@ impl ReservedProxy {
                 };
                 if reserved_tx.send(Ok(())).is_err() { return; }
                 let Ok((bind, review)) = start_rx.recv() else { return };
-                let mut owner = match NativeOwner::apply_locked(lock, bind, review) {
+                let mut owner = match NativeOwner::apply_locked(lock, before, bind, review) {
                     Ok(owner) => owner,
                     Err(error) => {
                         let _ = ready_tx.send(Err(error));
@@ -964,11 +968,18 @@ impl ReservedProxy {
                     }
                 };
                 if ready_tx.send(Ok(owner.journal.clone())).is_err() { return; }
-                while let Ok(reply) = commands_rx.recv() {
-                    let outcome = owner.restore();
-                    let done = outcome.is_ok();
-                    let _ = reply.send(outcome);
-                    if done { break; }
+                while let Ok(command) = commands_rx.recv() {
+                    match command {
+                        OwnerCommand::Restore(reply) => {
+                            let _ = reply.send(owner.restore());
+                            // Keep the SID mutex held even after successful
+                            // restore until the controller releases listeners.
+                        }
+                        OwnerCommand::Abandon => {
+                            owner.active = false;
+                            break;
+                        }
+                    }
                 }
             })
             .map_err(|_| ProxyError::Unavailable)?;
@@ -1005,7 +1016,7 @@ impl Drop for ReservedProxy {
 }
 
 pub struct OwnedProxy {
-    commands: Option<std::sync::mpsc::Sender<RestoreReply>>,
+    commands: Option<std::sync::mpsc::Sender<OwnerCommand>>,
     thread: Option<std::thread::JoinHandle<()>>,
     active: bool,
     journal: Journal,
@@ -1033,26 +1044,39 @@ impl OwnedProxy {
         require_journal(&self.journal)
     }
 
-    /// Synchronous conditional restore on the same OS thread that owns
-    /// WinINet mutex; safe across async task migration or Ctrl+C callbacks.
-    pub fn restore(&mut self) -> Result<Recovery, ProxyError> {
+    /// Restore the exact settings but retain the native thread and SID
+    /// lock until all listener/session resources are closed.
+    pub(crate) fn restore_held(&mut self) -> Result<Recovery, ProxyError> {
         if !self.active {
             return Ok(Recovery::NothingPending);
         }
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        self.commands
-            .as_ref()
-            .ok_or(ProxyError::Unavailable)?
-            .send(tx)
-            .map_err(|_| ProxyError::Unavailable)?;
+        self.commands.as_ref().ok_or(ProxyError::Unavailable)?
+            .send(OwnerCommand::Restore(tx)).map_err(|_| ProxyError::Unavailable)?;
         let outcome = rx.recv().map_err(|_| ProxyError::Unavailable)??;
         self.active = false;
+        Ok(outcome)
+    }
+
+    /// Synchronous conditional restore for callers without an owned listener.
+    pub fn restore(&mut self) -> Result<Recovery, ProxyError> {
+        let outcome = self.restore_held()?;
         self.commands.take();
         if let Some(thread) = self.thread.take() {
             thread.join().map_err(|_| ProxyError::Unavailable)?;
         }
         Ok(outcome)
     }
+
+    /// A reported CAS conflict is not permission to retry automatically.
+    /// Release ownership with the durable record intact after runtime drain.
+    pub(crate) fn abandon_after_conflict(mut self) {
+        self.active = false;
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(OwnerCommand::Abandon);
+        }
+    }
+
 }
 
 impl Drop for OwnedProxy {
@@ -1335,7 +1359,19 @@ auto_url = "https://pac.invalid/proxy.pac"
         assert_eq!(recover_explicit(), Err(ProxyError::Busy));
         assert_eq!(query().unwrap(), original);
         assert_eq!(status().unwrap(), ProxyStatus::NoJournal);
-        drop(reservation);
+        let mut changed_during_preflight = original.clone();
+        changed_during_preflight.bypass = "preflight-drift.invalid".into();
+        set(&changed_during_preflight).unwrap();
+        assert!(matches!(reservation.apply("127.0.0.1:45991".parse().unwrap(), None), Err(ProxyError::Conflict)));
+        assert_eq!(query().unwrap(), changed_during_preflight);
+        assert_eq!(status().unwrap(), ProxyStatus::NoJournal);
+        set(&original).unwrap();
+        let mut held = ReservedProxy::acquire().unwrap().apply("127.0.0.1:45991".parse().unwrap(), None).unwrap();
+        assert_eq!(held.restore_held(), Ok(Recovery::Restored));
+        assert_eq!(query().unwrap(), original);
+        assert!(matches!(ReservedProxy::acquire(), Err(ProxyError::Busy)));
+        drop(held);
+        drop(ReservedProxy::acquire().unwrap());
         let bind = "127.0.0.1:45991".parse().unwrap();
         let review = review_apply(bind).unwrap();
         let mut changed = original.clone();

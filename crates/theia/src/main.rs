@@ -251,12 +251,13 @@ async fn run() {
         }
         Ok(Command::ClientLifecycle) => {
             match management::query_client_environment(management::StatusCommand::ClientLifecycle).await {
-                Ok(management::StatusReply::ClientLifecycle { revision, config_sha256, instance, phase }) => {
-                    let digest = config_sha256.iter().map(|b| format!("{b:02x}")).collect::<String>();
-                    let instance = instance.iter().map(|b| format!("{b:02x}")).collect::<String>();
-                    let lifecycle = match phase { 0=>"inactive", 1=>"preparing", 2=>"connected", 3=>"stopping", _=>"recovery_required" };
-                    let actual = if phase == 2 { "system_proxy" } else { "none" };
-                    Ok(format!("configured_mode=system_proxy; actual_mode={actual}; lifecycle={lifecycle}; scope=proxy_requests; guard=not_applicable; revision={revision}; config_sha256={digest}; instance={instance}"))
+                Ok(management::StatusReply::ClientLifecycle(view)) => {
+                    let digest = view.config_sha256.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                    let instance = view.instance.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                    let lifecycle = match view.phase { 0=>"inactive", 1=>"preparing", 2=>"connected", 3=>"stopping", _=>"recovery_required" };
+                    let actual = if view.phase == 2 { "system_proxy" } else { "none" };
+                    let applied = match view.proxy_applied { 0=>"no", 1=>"yes", _=>"unknown" };
+                    Ok(format!("configured_mode=system_proxy; actual_mode={actual}; lifecycle={lifecycle}; scope=proxy_requests; guard=not_applicable; listeners_ready={}; proxy_settings_applied={applied}; revision={}; config_sha256={digest}; instance={instance}", view.listeners_ready, view.revision))
                 }
                 Ok(_) => Err(CliError::Management(management::ManagementError::InvalidReply)),
                 Err(error) => Err(CliError::Management(error)),

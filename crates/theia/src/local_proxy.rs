@@ -1960,6 +1960,8 @@ pub(crate) struct ClientRuntime {
     #[cfg(windows)]
     system_proxy_phase: std::sync::atomic::AtomicU8,
     #[cfg(windows)]
+    system_proxy_applied: std::sync::atomic::AtomicU8,
+    #[cfg(windows)]
     disconnect_requested: tokio::sync::watch::Sender<bool>,
 }
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1989,6 +1991,8 @@ impl ClientRuntime {
             proxy_instance: std::sync::OnceLock::new(),
             #[cfg(windows)]
             system_proxy_phase: std::sync::atomic::AtomicU8::new(0),
+            #[cfg(windows)]
+            system_proxy_applied: std::sync::atomic::AtomicU8::new(0),
             #[cfg(windows)]
             disconnect_requested: tokio::sync::watch::channel(false).0,
         })
@@ -2323,10 +2327,21 @@ impl ClientRuntime {
 
     /// The nonsecret instance nonce changes on every Connect, including
     /// reconnect to the same TOML at the same revision.
-    pub(crate) fn proxy_lifecycle(&self) -> Option<(u64, [u8; 32], [u8; 32], u8)> {
+    pub(crate) fn proxy_lifecycle(&self) -> Option<crate::management::ProxyLifecycle> {
         let _publication = self.publication.lock().ok()?;
         let view = self.slot.borrow();
-        Some((view.revision, view.digest, *self.proxy_instance.get()?, self.proxy_phase()))
+        Some(crate::management::ProxyLifecycle {
+            revision: view.revision,
+            config_sha256: view.digest,
+            instance: *self.proxy_instance.get()?,
+            phase: self.proxy_phase(),
+            listeners_ready: self.proxy_phase() == 2 && self.admitting(),
+            proxy_applied: self.system_proxy_applied.load(std::sync::atomic::Ordering::Acquire),
+        })
+    }
+
+    fn set_proxy_applied(&self, value: u8) {
+        self.system_proxy_applied.store(value, std::sync::atomic::Ordering::Release);
     }
 
     pub(crate) fn request_disconnect_bound(
@@ -2379,6 +2394,7 @@ impl SystemProxySession {
         saved_client_bytes(path, expected)?;
         let lease = reservation.apply(bind, review).map_err(|_| ClientError::SystemProxy)?;
         lease.verify().map_err(|_| ClientError::SystemProxy)?;
+        runtime.set_proxy_applied(1);
         runtime.set_proxy_phase(2); // both listeners bound + exact OS readback
         let owner = runtime.clone();
         let task = tokio::spawn(async move {
@@ -2402,6 +2418,7 @@ impl SystemProxySession {
                     result = &mut management => break (result, false, true),
                     () = tokio::time::sleep(Duration::from_secs(1)) => {
                         if lease.verify().is_err() {
+                            owner.set_proxy_applied(2);
                             break (Err(ClientError::SystemProxy), false, false);
                         }
                     }
@@ -2412,9 +2429,9 @@ impl SystemProxySession {
             // future owned until the CAS restore finishes.
             owner.set_proxy_phase(3);
             owner.quiesce();
-            let restored = lease.restore().map_err(|_| ClientError::SystemProxy);
+            let restored = lease.restore_held().map_err(|_| ClientError::SystemProxy);
+            owner.set_proxy_applied(if restored.is_ok() { 0 } else { 2 });
             owner.stop();
-            owner.set_proxy_phase(if restored.is_ok() { 0 } else { 4 });
             let drain = async {
                 if !worker_ended {
                     let _ = timeout(Duration::from_secs(5), &mut serving).await;
@@ -2428,6 +2445,10 @@ impl SystemProxySession {
                 }
             };
             tokio::join!(drain, replies);
+            // The product owner remains reserved across CAS and all
+            // bounded cleanup. On conflict leave the journal for recovery.
+            owner.set_proxy_phase(if restored.is_ok() { 0 } else { 4 });
+            if restored.is_err() { lease.abandon_after_conflict(); } else { drop(lease); }
             restored.and(result)
         });
         Ok(Self { runtime, task: Some(task) })
@@ -2438,7 +2459,9 @@ impl SystemProxySession {
     }
 
     pub(crate) fn applied(&self) -> bool {
-        self.runtime.proxy_phase() == 2 && self.running()
+        self.runtime.proxy_phase() == 2
+            && self.runtime.system_proxy_applied.load(std::sync::atomic::Ordering::Acquire) == 1
+            && self.running()
     }
 
     pub(crate) async fn report(&self) -> String {
@@ -5176,8 +5199,14 @@ async fn serve_proxy_loop(
                 return result;
             },
             _ = tasks.join_next(), if !tasks.is_empty() => continue,
-            accepted = http.accept() => (accepted.map_err(|_| ClientError::Io)?.0, true),
-            accepted = socks.accept() => (accepted.map_err(|_| ClientError::Io)?.0, false),
+            accepted = http.accept() => match accepted {
+                Ok((socket, _)) => (socket, true),
+                Err(_) => { tasks.shutdown().await; return Err(ClientError::Io); }
+            },
+            accepted = socks.accept() => match accepted {
+                Ok((socket, _)) => (socket, false),
+                Err(_) => { tasks.shutdown().await; return Err(ClientError::Io); }
+            },
         };
         let session_id = diagnostics::next_id();
         crate::diag!(
