@@ -122,18 +122,17 @@ for name in ("rust-tests", "windows-smoke"):
 contains(job("rust-tests"), "pyte==0.8.2")
 contains(job("windows-smoke"), "pywinpty==3.0.5 pyte==0.8.2")
 checks = job("native-checks")
-contains(checks, "check: linux-clippy", "check: windows-clippy", "check: windows-cross-sid",
-         "if: matrix.check == 'linux-clippy'",
-         "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings",
-         "if: matrix.check == 'windows-clippy'",
+contains(checks, "check: windows-clippy", "if: matrix.check == 'windows-clippy'",
          "cargo clippy --workspace --all-targets --features experimental-btls-h2 --locked -- -D warnings",
-         "if: matrix.check == 'windows-cross-sid'",
-         "Cross-logon Windows pipe kernel-denial E2E (mandatory)", "windows-cross-sid-ci.ps1",
-         "save-if: false",
-         "if: matrix.check == 'windows-clippy'\n        with:\n          shared-key: native-clippy-deps-v1\n          cache-workspace-crates: false\n          cache-bin: false\n          save-if: true")
+         "id: clippy-cache", "shared-key: native-clippy-deps-v1",
+         "if: steps.clippy-cache.outputs.cache-hit != 'true'",
+         "shared-key: native-default-deps-v4", "save-if: false")
 require(checks.count("save-if: true") == 1, "only trusted Windows Clippy writes its dependency cache")
-require("cargo clippy" not in job("rust-tests") + job("windows-smoke"),
-        "lint must not delay native tests")
+require("check: linux-clippy" not in checks and "check: windows-cross-sid" not in checks,
+        "do not allocate duplicate runners for short checks")
+contains(job("rust-tests"), "Linux all-feature Clippy", "if: matrix.shard == 1\n        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings")
+contains(job("windows-smoke"), "Cross-logon Windows pipe kernel-denial E2E (mandatory)\n        if: matrix.shard == 1",
+         "windows-cross-sid-ci.ps1")
 f14, cross = job("f14-build"), job("f14-cross-host")
 contains(f14, "os: [ubuntu-24.04, windows-latest]", "fail-fast: false",
          "cargo tree --locked -p theia -e normal,build",
@@ -166,7 +165,7 @@ contains(cov, "os: [ubuntu-latest, windows-latest]", "shard: [1, 2, 3, 4, 5, 6]"
          "Instrumented real WinINet CAS and recovery failed or did not execute",
          "Instrumented real ConPTY lifecycle failed or did not execute",
          "Instrument real disposable Windows WinINet lifecycle\n        if: runner.os == 'Windows' && matrix.shard == 1",
-         "Instrument real disposable Windows ConPTY lifecycle\n        if: runner.os == 'Windows' && matrix.shard == 2",
+         "Instrument real disposable Windows ConPTY lifecycle\n        if: runner.os == 'Windows' && matrix.shard == 4",
          "if: matrix.shard >= 4", "$_.shard -eq [int]$env:COVERAGE_SHARD",
          "No mandatory fixtures assigned to coverage shard", "$name --ignored --exact", "test result: ok",
          "cargo llvm-cov report --lcov --include-build-script",
