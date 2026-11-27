@@ -21,7 +21,11 @@ pub fn client(
     if config.enable_early_data {
         return Err(Error::General("Theia QUIC forbids 0-RTT".into()));
     }
-    quic::ClientConnection::new(config, version(wire_version), name, params)
+    // Independent peers may send post-handshake tickets. Parse them
+    // through rustls but never retain tickets or resume a later connection.
+    let mut config = (*config).clone();
+    config.resumption = rustls::client::Resumption::disabled();
+    quic::ClientConnection::new(Arc::new(config), version(wire_version), name, params)
         .map(quic::Connection::Client)
 }
 
