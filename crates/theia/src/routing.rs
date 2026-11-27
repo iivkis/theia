@@ -13,7 +13,7 @@ pub mod linux_attribution;
 #[cfg(any(target_os = "windows", test))]
 mod wfp_context;
 #[cfg(target_os = "windows")]
-pub(crate) mod wfp_ingress;
+pub mod wfp_ingress;
 #[cfg(target_os = "linux")]
 pub mod nfqueue;
 #[cfg(target_os = "linux")]

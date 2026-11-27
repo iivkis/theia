@@ -2061,8 +2061,8 @@ impl NativeIngress {
     /// bound to the current private driver/service session. This entry
     /// point does not install callouts or trust a client-supplied header.
     #[cfg(target_os = "windows")]
-    pub async fn relay_windows_tcp(&self, stream: TcpStream, session_token: &[u8; 32]) -> Result<(), ClientError> {
-        let key = crate::routing::wfp_ingress::original_tcp(&stream, session_token)
+    pub async fn relay_windows_tcp(&self, stream: TcpStream, session: &crate::routing::wfp_ingress::WfpLabSession) -> Result<(), ClientError> {
+        let key = session.original_tcp(&stream)
             .map_err(|_| ClientError::Open(ErrorCode::PolicyDenied))?;
         self.relay_terminated_tcp(key, stream).await
     }

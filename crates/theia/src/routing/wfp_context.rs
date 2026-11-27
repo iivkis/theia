@@ -28,7 +28,8 @@ pub(super) fn decode(bytes: &[u8], token: &[u8; 32], peer: SocketAddr, local: So
     let source = SocketAddr::new(ip(&bytes[52..68])?, source_port);
     let destination = SocketAddr::new(ip(&bytes[68..84])?, destination_port);
     if source != peer || source_port == 0 || destination_port == 0
-        || !local.ip().is_loopback() || destination == local || destination == source
+        || source.ip().is_unspecified() || source.ip().is_multicast()
+        || !(local.ip().is_loopback() || local.ip() == source.ip()) || destination == local || destination == source
         || destination.ip().is_loopback() || destination.ip().is_multicast() || destination.ip().is_unspecified() {
         return None;
     }
