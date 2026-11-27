@@ -9112,6 +9112,121 @@ mod tests {
     }
 
     #[test]
+    fn routing_rule_editor_preserves_order_cancel_and_offline_dataset_failure() {
+        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("routing-draft").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("server.toml");
+        let source = server_issuance_fixture();
+        std::fs::write(&path, &source).unwrap();
+        let mut editor = Editor::load(Role::Server, &path).unwrap();
+        let mut panel = RoutingPanel::new(&editor);
+        assert!(panel.body().contains("Нет правил"));
+        for name in ["alpha", "beta", "gamma"] {
+            assert!(panel.key(press(KeyCode::Char('n')), None));
+            panel.paste(name);
+            panel.key(press(KeyCode::Tab), None);
+            let before = panel.fields.as_ref().unwrap().1[1].clone();
+            panel.key(press(KeyCode::Right), None);
+            assert_ne!(panel.fields.as_ref().unwrap().1[1], before);
+            panel.key(press(KeyCode::Left), None);
+            assert_eq!(panel.fields.as_ref().unwrap().1[1], before);
+            panel.key(press(KeyCode::Down), None);
+            panel.paste("domain:example.org");
+            assert!(panel.body().contains("example.org"));
+            panel.key(press(KeyCode::Enter), None);
+            assert!(panel.fields.is_none());
+        }
+        let names = |p: &RoutingPanel| p.settings.rules.iter().map(|r| r.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&panel), ["alpha", "beta", "gamma"]);
+        panel.key(press(KeyCode::Char('[')), None);
+        assert_eq!(names(&panel), ["alpha", "gamma", "beta"]);
+        panel.key(press(KeyCode::Char(']')), None);
+        assert_eq!(names(&panel), ["alpha", "beta", "gamma"]);
+        panel.key(press(KeyCode::Up), None);
+        panel.key(press(KeyCode::Enter), None);
+        panel.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), None);
+        panel.key(press(KeyCode::Char('x')), None);
+        panel.key(press(KeyCode::Backspace), None);
+        panel.key(press(KeyCode::Enter), None);
+        assert!(panel.fields.is_some());
+        assert!(panel.body().contains("не прошло проверку"));
+        panel.paste("discarded");
+        panel.key(press(KeyCode::Esc), None);
+        assert_eq!(names(&panel), ["alpha", "beta", "gamma"]);
+        panel.key(press(KeyCode::Enter), None);
+        panel.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), None);
+        panel.paste("beta-edited");
+        panel.key(press(KeyCode::Enter), None);
+        assert_eq!(names(&panel), ["alpha", "beta-edited", "gamma"]);
+        panel.key(press(KeyCode::Delete), None);
+        assert_eq!(names(&panel), ["alpha", "gamma"]);
+        panel.key(press(KeyCode::Down), None);
+        assert_eq!(panel.selected, 1);
+        // Select a local-only dataset in an empty private directory; no network.
+        panel.key(press(KeyCode::Char('l')), None);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while panel.download.is_some() {
+            panel.poll();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!panel.message.is_empty());
+        assert!(panel.settings.datasets.is_none());
+        assert!(!editor.dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        assert!(!panel.key(press(KeyCode::Char('s')), Some(&mut editor)));
+        assert!(editor.dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn routing_observation_never_treats_stale_or_mismatched_runtime_as_active() {
+        let digest = [7; 32];
+        let mut observation = RoutingObservation::new(digest);
+        assert!(observation.body().contains("Проверяем"));
+        for (routing_state, capture_state, expected) in [
+            (0, 0, "не активирован"),
+            (1, 1, "подготовка"),
+            (2, 3, "Новые соединения заблокированы"),
+            (3, 2, "Синхронизация выполняется"),
+        ] {
+            let (tx, rx) = mpsc::channel();
+            observation.pending = Some(rx);
+            tx.send(Ok(crate::management::StatusReply::ClientRunning {
+                revision: 1, config_sha256: digest, descriptor_revision: 0,
+                transport: 2, xhttp: 1, fallback: false, routing_revision: 5,
+                routing_state, routing_totals: Box::new([0; 38]), flow_counts: None,
+                capture_state,
+            })).unwrap();
+            observation.poll();
+            assert!(observation.body().contains(expected));
+        }
+        observation.observed = Some(std::time::Instant::now() - Duration::from_secs(7));
+        assert!(observation.body().contains("устарел"));
+        let (tx, rx) = mpsc::channel();
+        observation.pending = Some(rx);
+        tx.send(Ok(crate::management::StatusReply::ClientRunning {
+            revision: 1, config_sha256: [8; 32], descriptor_revision: 0,
+            transport: 2, xhttp: 1, fallback: false, routing_revision: 5,
+            routing_state: 1, routing_totals: Box::new([0; 38]), flow_counts: None,
+            capture_state: 2,
+        })).unwrap();
+        observation.poll();
+        assert!(observation.observed.is_none());
+        assert!(observation.body().contains("не подтверждено"));
+        assert!(!observation.body().contains("изолированный тестовый захват"));
+        let (tx, rx) = mpsc::channel();
+        observation.pending = Some(rx);
+        observation.poll();
+        assert!(observation.pending.is_some());
+        drop(tx);
+        observation.poll();
+        assert!(observation.pending.is_none());
+        assert!(observation.observed.is_none());
+    }
+
+    #[test]
     fn configured_sections_shortcut_uses_navigation_not_second_menu() {
         for role in [Role::Server, Role::Client] {
             let path =
