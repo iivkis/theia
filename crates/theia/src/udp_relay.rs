@@ -61,17 +61,7 @@ pub(crate) async fn connect(address: SocketAddr) -> io::Result<UdpSocket> {
     {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
     }
-    let bind = if address.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
-    let socket = UdpSocket::bind(bind).await?;
-    socket.connect(address).await?;
-    if socket.peer_addr()? != address {
-        return Err(io::Error::other("UDP peer mismatch"));
-    }
-    Ok(socket)
+    crate::routing::carrier_socket::connect_plain_udp(address).await
 }
 pub(crate) async fn send_datagram(socket: &UdpSocket, data: &[u8]) -> io::Result<()> {
     if data.len() > protocol::MAX_DATAGRAM || socket.send(data).await? != data.len() {
@@ -146,11 +136,16 @@ pub(crate) enum Tunnel {
     H3(Box<crate::h3_client::H3Tunnel>),
 }
 impl Tunnel {
+    pub(crate) fn local_delivery_guard(&self) -> Option<crate::routing::dpi::FallbackPolicy> {
+        match self { Self::VerifiedLocal(verified, _) => Some(verified.fallback_policy()), _ => None }
+    }
+
     pub(crate) fn record_transport(&self, observed: &std::sync::atomic::AtomicU8) {
         let (transport, up) = match self {
             Self::H2(tunnel) => (2, tunnel.opened_stream_up()),
             Self::H3(tunnel) => (3, tunnel.opened_stream_up()),
-            Self::Direct(_) | Self::VerifiedLocal(..) => return,
+            Self::Direct(_) => return,
+            Self::VerifiedLocal(..) => return,
         };
         observed.store(
             (transport << 2) | if up { 2 } else { 1 },
@@ -169,59 +164,63 @@ impl Tunnel {
 
     pub(crate) async fn relay_guarded(
         self,
-        mut upload: mpsc::Receiver<Vec<u8>>,
+        upload: mpsc::Receiver<Vec<u8>>,
         download: mpsc::Sender<Vec<u8>>,
         flow: Option<&crate::routing::flow::FlowLease>,
     ) -> Result<(), ClientError> {
         match self {
             Self::VerifiedLocal(verified, fallback) => {
-                let Some(first) = upload.recv().await else {
-                    return Ok(());
+                use crate::routing::dpi::{UdpStrategy, udp::{BindingStrategy, prepare_binding}};
+                let mut upload = upload;
+                let Some(first) = upload.recv().await else { return Ok(()) };
+                // Fixtures without a flow exercise the old prewrite
+                // fallback. Real product flows must have live authorization.
+                if let Some(flow) = flow {
+                    flow.check_pending()?;
+                    verified.check_live()?;
+                }
+                let admissible = verified.admissible()?;
+                let batch = match verified.strategy {
+                    UdpStrategy::Quic(_) => verified.quic_batch(&first),
+                    _ => None,
                 };
-                let stun = match verified.strategy {
-                    crate::routing::dpi::UdpStrategy::StunBinding(strategy) => Some(strategy),
-                    crate::routing::dpi::UdpStrategy::Quic(_) => None,
-                };
-                let unmodified = flow.is_some()
-                    && stun.is_none_or(|strategy| {
-                        crate::routing::dpi::udp::prepare_binding(&first, strategy)
-                            .is_none_or(|bytes| bytes.as_ref() == first.as_slice())
-                    });
-                if !verified.admissible()?
-                    || unmodified
-                    || stun.is_some_and(|strategy| {
-                        crate::routing::dpi::udp::prepare_binding(&first, strategy).is_none()
-                    })
-                {
+                let stun = matches!(verified.strategy, UdpStrategy::StunBinding(BindingStrategy::Fingerprint))
+                    && prepare_binding(&first, BindingStrategy::Fingerprint)
+                        .is_some_and(|bytes| bytes.as_ref() != first.as_slice());
+                if !admissible || (!stun && batch.is_none()) {
+                    // Exactly one original first datagram, never its changed
+                    // form. Drop the local socket before opening the VPS.
                     let authorization = verified.fallback_policy();
                     drop(verified);
                     authorization.check()?;
+                    if let Some(flow) = flow { flow.check_pending()?; }
                     let tunnel = fallback.await?;
                     authorization.check()?;
+                    if let Some(flow) = flow { flow.check_pending()?; }
                     if !matches!(tunnel, Self::H2(_) | Self::H3(_)) {
                         return Err(ClientError::Protocol);
                     }
-                    return tunnel
-                        .relay_selected(Some(first), upload, download, flow)
-                        .await;
+                    return tunnel.relay_selected(Some(first), upload, download, flow).await;
                 }
-                // Once a send is attempted no fallback or replay is legal.
+                // Destroy fallback before any attempted user send. Errors
+                // after this point can never replay the original datagram.
                 drop(fallback);
-                verified.check_policy()?;
-                let result = if let Some(strategy) = stun {
-                    relay_stun(&verified.socket, strategy, first, upload, download, flow).await
-                } else {
-                    relay_local(
-                        &verified.socket,
-                        Some(FIRST_RESPONSE),
-                        Some(first),
-                        upload,
-                        download,
-                        flow,
-                    )
-                    .await
+                verified.check_live()?;
+                let relay = async {
+                    if stun {
+                        relay_stun(&verified.socket, BindingStrategy::Fingerprint,
+                            first, upload, download, flow, Some(&verified)).await
+                    } else {
+                        relay_local_batch(&verified.socket, Some(FIRST_RESPONSE),
+                            Some(first), batch, upload, download, flow, Some(&verified)).await
+                    }
                 };
-                if matches!(&result, Err(LocalRelayError::Peer(_))) {
+                let result = tokio::select! {
+                    biased;
+                    result = verified.wait_revoked() => result.map_err(LocalRelayError::Application),
+                    result = relay => result,
+                };
+                if matches!(&result, Err(LocalRelayError::Peer(_))) && verified.check_live().is_ok() {
                     verified.failed();
                     crate::traffic::udp_peer_failure();
                 }
@@ -276,13 +275,44 @@ async fn relay_local(
         upload,
         download,
         flow,
+        None,
     )
     .await
 }
 
-/// Explicit native lab only. Ordinary proxy relay still refuses
-/// reachability-only QUIC as Modify. The actual first datagram must split.
-#[cfg(target_os = "linux")]
+/// The unified native lab commits a real transformation only. All other
+/// strategies are rejected; there is no fallback after this boundary.
+#[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
+pub(crate) async fn relay_native_modify_lab(
+    verified: &crate::routing::dpi::VerifiedUdp,
+    first: Vec<u8>,
+    upload: mpsc::Receiver<Vec<u8>>,
+    download: mpsc::Sender<Vec<u8>>,
+    flow: &crate::routing::flow::FlowLease,
+) -> Result<(), ClientError> {
+    use crate::routing::dpi::{UdpStrategy, udp::{BindingStrategy, prepare_binding}};
+    if !verified.admissible()? {
+        return Err(ClientError::Open(ErrorCode::PolicyDenied));
+    }
+    match verified.strategy {
+        UdpStrategy::Quic(_) => relay_quic_lab(verified, first, upload, download, flow).await,
+        UdpStrategy::StunBinding(BindingStrategy::Fingerprint) => {
+            if !prepare_binding(&first, BindingStrategy::Fingerprint)
+                .is_some_and(|bytes| bytes.as_ref() != first.as_slice()) {
+                return Err(ClientError::Open(ErrorCode::PolicyDenied));
+            }
+            let result = relay_stun(&verified.socket, BindingStrategy::Fingerprint,
+                first, upload, download, Some(flow), Some(verified)).await;
+            if matches!(&result, Err(LocalRelayError::Peer(_))) { verified.failed(); crate::traffic::udp_peer_failure(); }
+            result.map_err(LocalRelayError::into_client)
+        }
+        _ => Err(ClientError::Open(ErrorCode::PolicyDenied)),
+    }
+}
+
+/// Native lab entrypoint. The shared relay also requires the actual
+/// first datagram to split; reachability alone is never Modify.
+#[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
 pub(crate) async fn relay_quic_lab(
     verified: &crate::routing::dpi::VerifiedUdp,
     first: Vec<u8>,
@@ -304,10 +334,12 @@ pub(crate) async fn relay_quic_lab(
         upload,
         download,
         Some(flow),
+        Some(verified),
     )
     .await;
     if matches!(&result, Err(LocalRelayError::Peer(_))) {
         verified.failed();
+        crate::traffic::udp_peer_failure();
     }
     result.map_err(LocalRelayError::into_client)
 }
@@ -321,7 +353,9 @@ async fn relay_local_batch(
     mut upload: mpsc::Receiver<Vec<u8>>,
     download: mpsc::Sender<Vec<u8>>,
     flow: Option<&crate::routing::flow::FlowLease>,
+    verified: Option<&crate::routing::dpi::VerifiedUdp>,
 ) -> Result<(), LocalRelayError> {
+    let live = || verified.map_or(Ok(()), |v| v.check_live()).map_err(LocalRelayError::Application);
     use crate::routing::{flow::FirstSend, PacketAction};
     let mut first_send = FirstSend::new(
         flow,
@@ -352,26 +386,28 @@ async fn relay_local_batch(
                 }
                 parts
             }
-            None => vec![data.clone()],
+            None if verified.is_none() => vec![data.clone()],
+            None => return Err(LocalRelayError::Application(ClientError::Protocol)),
         };
-        first_send.attempt().map_err(LocalRelayError::Application)?;
         // One deadline for the entire actual emission. Failure/cancellation
         // after any attempt is terminal; no replay of the original flight.
         timeout(deadline, async {
             for part in &parts {
-                send_datagram(socket, part).await?;
+                live()?;
+                first_send.attempt().map_err(LocalRelayError::Application)?;
+                send_datagram(socket, part).await.map_err(|_|LocalRelayError::Peer(ClientError::Io))?;
             }
-            Ok::<(), io::Error>(())
+            Ok::<(), LocalRelayError>(())
         })
         .await
-        .map_err(|_| LocalRelayError::Peer(ClientError::Timeout))?
-        .map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
+        .map_err(|_| LocalRelayError::Peer(ClientError::Timeout))??;
         traffic.upload(data.len());
         crate::traffic::udp_verified_local();
         activity.touch();
     }
     let send = async {
         while let Some(data) = next_datagram(&mut first, &mut upload).await {
+            live()?;
             first_send.attempt().map_err(LocalRelayError::Application)?;
             send_datagram(socket, &data)
                 .await
@@ -399,6 +435,11 @@ async fn relay_local_batch(
             if waiting.take().is_some() {
                 crate::traffic::udp_peer_reply();
             }
+            live()?;
+            if let Some(flow)=flow {
+                flow.commit(if verification_deadline.is_some(){PacketAction::Modify}else{PacketAction::Pass})
+                    .map_err(LocalRelayError::Application)?;
+            }
             if deliver(&download, || buf[..n].to_vec()).map_err(LocalRelayError::Application)? {
                 traffic.download(n);
                 activity.touch();
@@ -419,7 +460,9 @@ async fn relay_stun(
     mut upload: mpsc::Receiver<Vec<u8>>,
     download: mpsc::Sender<Vec<u8>>,
     flow: Option<&crate::routing::flow::FlowLease>,
+    verified: Option<&crate::routing::dpi::VerifiedUdp>,
 ) -> Result<(), LocalRelayError> {
+    let live = || verified.map_or(Ok(()), |v| v.check_live()).map_err(LocalRelayError::Application);
     use crate::routing::dpi::udp::{prepare_binding, BindingTransactions};
     let traffic = crate::traffic::enter_udp(crate::Role::Client, false, true);
     let activity = Activity::new();
@@ -433,6 +476,7 @@ async fn relay_stun(
     }
     let packet = prepare_binding(&first, strategy)
         .ok_or(LocalRelayError::Application(ClientError::Protocol))?;
+    live()?;
     if let Some(flow) = flow {
         flow.commit(crate::routing::PacketAction::Modify)
             .map_err(LocalRelayError::Application)?;
@@ -459,6 +503,10 @@ async fn relay_stun(
             }
             let packet = prepare_binding(&data, strategy)
                 .ok_or(LocalRelayError::Application(ClientError::Protocol))?;
+            live()?;
+            if let Some(flow)=flow {
+                flow.commit(crate::routing::PacketAction::Modify).map_err(LocalRelayError::Application)?;
+            }
             send_datagram(socket, &packet)
                 .await
                 .map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
@@ -490,6 +538,10 @@ async fn relay_stun(
             }
             if waiting.take().is_some() {
                 crate::traffic::udp_peer_reply();
+            }
+            live()?;
+            if let Some(flow)=flow {
+                flow.commit(crate::routing::PacketAction::Modify).map_err(LocalRelayError::Application)?;
             }
             if deliver(&download, || buf[..n].to_vec()).map_err(LocalRelayError::Application)? {
                 traffic.download(n);
@@ -676,6 +728,120 @@ mod tests {
         assert!(deliver(&tx, || b"closed".to_vec()).is_err());
     }
 
+    /// Independent peers use real loopback UDP and application traffic.
+    /// The test supplies local fixture evidence only; it cannot change the
+    /// production acceptance gate or authorize a public target.
+    #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
+    async fn run_independent_udp_peer(
+        mut command: std::process::Command, strategy: crate::routing::dpi::UdpStrategy,
+    ) {
+        use std::{io::{Read, Write}, process::{Child, Stdio}, sync::Arc};
+        struct ChildGuard(Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        }
+        let mut peer = ChildGuard(command.stdin(Stdio::piped()).stdout(Stdio::piped())
+            .stderr(Stdio::inherit()).spawn().unwrap());
+        let mut stdout = peer.0.stdout.take().unwrap();
+        let ports = timeout(Duration::from_secs(12), tokio::task::spawn_blocking(move || {
+            let mut ports = [0; 4];
+            stdout.read_exact(&mut ports).unwrap();
+            ports
+        })).await.unwrap().unwrap();
+        let target: SocketAddr = ([127,0,0,1], u16::from_be_bytes([ports[0],ports[1]])).into();
+        let app: SocketAddr = ([127,0,0,1], u16::from_be_bytes([ports[2],ports[3]])).into();
+        let ingress = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        ingress.connect(app).await.unwrap();
+        let (verified, flow) = crate::routing::dpi::VerifiedUdp::active_fixture(
+            connect(target).await.unwrap(), strategy, "localhost",
+        );
+        let flow = Arc::new(flow);
+        let relay_flow = flow.clone();
+        let (up, upload) = mpsc::channel::<Vec<u8>>(QUEUE);
+        let (download, mut down) = mpsc::channel::<Vec<u8>>(QUEUE);
+        let fallback: Fallback = Box::pin(async {
+            panic!("a committed active strategy must never invoke fallback")
+        });
+        let tunnel = Tunnel::VerifiedLocal(Box::new(verified), fallback);
+        let relay = tokio::spawn(async move {
+            tunnel.relay_guarded(upload, download, Some(&relay_flow)).await
+        });
+        let reader = ingress.clone();
+        let up_task = tokio::spawn(async move {
+            let mut buf = vec![0; protocol::MAX_DATAGRAM + 1];
+            while let Ok(n) = reader.recv(&mut buf).await {
+                assert!(n <= protocol::MAX_DATAGRAM);
+                if up.send(buf[..n].to_vec()).await.is_err() { break; }
+            }
+        });
+        let writer = ingress.clone();
+        let down_task = tokio::spawn(async move {
+            while let Some(data) = down.recv().await {
+                send_datagram(&writer, &data).await.unwrap();
+            }
+        });
+        {
+            let mut stdin = peer.0.stdin.take().unwrap();
+            stdin.write_all(&ingress.local_addr().unwrap().port().to_be_bytes()).unwrap();
+        }
+        let status = timeout(Duration::from_secs(15), async {
+            loop {
+                if let Some(status) = peer.0.try_wait().unwrap() { break status; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        assert!(status.success(), "independent UDP peer rejected the real relay");
+        assert_eq!(flow.actual_action().unwrap(), Some(crate::routing::PacketAction::Modify));
+        up_task.abort();
+        let _ = up_task.await;
+        timeout(Duration::from_secs(2), relay).await.unwrap().unwrap().unwrap();
+        timeout(Duration::from_secs(2), down_task).await.unwrap().unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
+    fn independent_python(script: &str) -> std::process::Command {
+        let python = std::env::var_os("THEIA_DPI_PYTHON").unwrap_or_else(||
+            if cfg!(windows) { "python".into() } else { "python3".into() });
+        let mut command = std::process::Command::new(python);
+        command.arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/e2e").join(script));
+        command
+    }
+
+    #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
+    #[tokio::test]
+    async fn independent_stun_product_relay_binding_exchange() {
+        use crate::routing::dpi::{UdpStrategy, udp::BindingStrategy};
+        run_independent_udp_peer(
+            independent_python("independent_stun_live_modify.py"),
+            UdpStrategy::StunBinding(BindingStrategy::Fingerprint),
+        ).await;
+    }
+
+    #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
+    #[tokio::test]
+    #[ignore = "requires pinned aioquic from browser-e2e CI"]
+    async fn independent_quic_product_relay_v1_v2() {
+        use crate::{quic_core::wire::Version, routing::dpi::UdpStrategy};
+        use ring::rand::{SecureRandom, SystemRandom};
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        let mut random = [0;16];
+        SystemRandom::new().fill(&mut random).unwrap();
+        let unique: String = random.iter().map(|b| format!("{b:02x}")).collect();
+        let directory = Scratch(std::env::temp_dir().join(format!("theia-quic-relay-{unique}")));
+        std::fs::create_dir(&directory.0).unwrap();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        std::fs::write(directory.0.join("cert.pem"), cert.cert.pem()).unwrap();
+        std::fs::write(directory.0.join("key.pem"), cert.key_pair.serialize_pem()).unwrap();
+        for version in [Version::V1, Version::V2] {
+            let mut command = independent_python("independent_quic_live_modify.py");
+            command.arg(&directory.0).arg(version.wire().to_string()).arg("--relay");
+            run_independent_udp_peer(command, UdpStrategy::Quic(version)).await;
+        }
+    }
+
     #[tokio::test]
     async fn verified_local_relay_preserves_first_datagram_and_peer_response() {
         let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -731,6 +897,7 @@ mod tests {
                 Some(vec![b"abc".to_vec(), b"def".to_vec()]),
                 up_rx,
                 down_tx,
+                None,
                 None,
             )
             .await
@@ -794,7 +961,7 @@ mod tests {
             .unwrap()
             .into_owned();
         let task = tokio::spawn(async move {
-            relay_stun(&socket, BindingStrategy::Fingerprint, first, rx, down, None).await
+            relay_stun(&socket, BindingStrategy::Fingerprint, first, rx, down, None, None).await
         });
         let mut buf = [0; 512];
         let (n, peer) = timeout(Duration::from_secs(2), target.recv_from(&mut buf))

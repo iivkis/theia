@@ -94,7 +94,11 @@ class SpecContractTests(unittest.TestCase):
             self.assertTrue(profile["auth_token"].startswith(("env:", "file:")))
             self.assertEqual(profile["security_mode"], "own-tls")
         proxy = client["proxy"]
-        self.assertEqual(proxy["system_proxy"], "off")
+        self.assertEqual(client["ingress_mode"], "system_proxy")
+        self.assertNotIn("system_proxy", proxy)
+        self.assertNotIn("direct_dpi", proxy)
+        self.assertNotIn("direct_dpi_stun", proxy)
+        self.assertTrue(all(not p.get("direct_dpi", False) and not p.get("direct_dpi_stun", False) for p in profiles))
         for name in ("http_listen", "socks5_listen"):
             self.assertRegex(proxy[name], r"^(127\.0\.0\.1|\[::1\]):[0-9]+$")
 
@@ -136,8 +140,12 @@ class SpecContractTests(unittest.TestCase):
         self.assertTrue(all(p["security_mode"] == "own-tls" for p in client["profiles"]))
         self.assertIn('profile.security_mode.is_plain()', read("crates/theia/src/config.rs"))
 
-    def test_windows_manual_proxy_is_not_auto_enabled(self):
-        self.assertNotIn('system_proxy = "on"', read("examples/client.toml"))
+    def test_saved_ingress_mode_is_not_auto_enabled(self):
+        client = toml("examples/client.toml")["client"]
+        self.assertEqual(client["ingress_mode"], "system_proxy")
+        self.assertNotIn("system_proxy", client["proxy"])
+        self.assertIn("ingress_defaults_and_legacy_proxy_keys_are_rejected", read("crates/theia/src/config.rs"))
+        self.assertIn("wininet_system_proxy_requires_independent_confirmation", read("crates/theia/src/lib.rs"))
 
     def test_m01_api_spike_isolated_and_locked(self):
         from pathlib import Path
@@ -247,7 +255,7 @@ class SpecContractTests(unittest.TestCase):
         implementation = read("crates/theia/src/config.rs")
         for required in ("deny_unknown_fields", "allowed_user_ids", "overlaps(",
                          "Ipv6Addr::UNSPECIFIED", "atomic_write", "file.sync_all()",
-                         "secret", "SystemProxy", "MAX_BYTES"):
+                         "secret", "IngressMode", "MAX_BYTES"):
             self.assertIn(required, implementation)
 
     def test_m13_pure_smarttheia_protocol_has_golden_tests(self):

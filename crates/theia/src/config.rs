@@ -140,6 +140,8 @@ pub struct ServerPolicy {
 #[serde(deny_unknown_fields)]
 pub struct ClientSettings {
     pub active_profile: String,
+    #[serde(default)]
+    pub ingress_mode: IngressMode,
     pub profiles: Vec<Profile>,
     pub proxy: LocalProxy,
 }
@@ -162,6 +164,11 @@ pub struct Profile {
     pub transport: Transport,
     pub quic_connect_timeout_ms: u32,
     pub quic_negative_cache_ttl_s: u32,
+    /// Local consent for this profile, never supplied by an invitation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_dpi: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_dpi_stun: Option<bool>,
 }
 /// The imported root is immutable even as the separate signed trust
 /// history advances. Pin the exact enrollment bytes and independent root.
@@ -207,19 +214,15 @@ impl Profile {
 pub struct LocalProxy {
     pub http_listen: String,
     pub socks5_listen: String,
-    pub system_proxy: SystemProxy,
-    /// Local consent for experimental native direct DPI and direct egress IP.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub direct_dpi: Option<bool>,
-    /// Separate opt-in for unauthenticated, credential-free STUN reachability.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub direct_dpi_stun: Option<bool>,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SystemProxy {
-    Off,
-    Manual,
+
+/// Saved ingress selection, not an instruction to change OS settings.
+/// Future TUN and packet modes are deliberately rejected by the MVP parser.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngressMode {
+    #[default]
+    SystemProxy,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -625,9 +628,9 @@ impl ClientDocument {
                 profile
                     .tls_ca
                     .as_ref()
-                    .is_none_or(|path| valid_file_ref(path)),
+                    .is_none_or(|path| valid_file_ref(path) || crate::own_tls::Anchor::parse(path).is_some()),
                 format!("{field}.tls_ca"),
-                "expected absolute file: reference to PEM CA bundle",
+                "expected absolute PEM CA reference or canonical pinned anchor",
             )?;
             ensure(
                 if profile.security_mode == crate::security_profile::SecurityMode::SmartReality {
@@ -686,6 +689,11 @@ impl ClientDocument {
                 "must be within 500..=15000",
             )?;
             ensure(
+                profile.direct_dpi_stun != Some(true) || profile.direct_dpi == Some(true),
+                format!("{field}.direct_dpi_stun"),
+                "requires explicit direct_dpi consent",
+            )?;
+            ensure(
                 profile.quic_negative_cache_ttl_s <= 86_400,
                 format!("{field}.quic_negative_cache_ttl_s"),
                 "must be within 0..=86400",
@@ -697,11 +705,6 @@ impl ClientDocument {
             "unknown profile",
         )?;
         let proxy = &self.client.proxy;
-        ensure(
-            proxy.direct_dpi_stun != Some(true) || proxy.direct_dpi == Some(true),
-            "client.proxy.direct_dpi_stun",
-            "requires explicit direct_dpi consent",
-        )?;
         let http = listen(&proxy.http_listen, "client.proxy.http_listen")?;
         let socks = listen(&proxy.socks5_listen, "client.proxy.socks5_listen")?;
         for (address, field) in [
@@ -1100,27 +1103,43 @@ mod tests {
         let Config::Client(default) = parse(&original).unwrap() else {
             panic!("client");
         };
-        assert_ne!(default.client.proxy.direct_dpi_stun, Some(true));
+        assert_ne!(default.client.profiles[0].direct_dpi_stun, Some(true));
         let stun_only = original.replacen(
-            "system_proxy = \"off\"",
-            "system_proxy = \"off\"\ndirect_dpi_stun = true",
+            "quic_negative_cache_ttl_s = 900",
+            "quic_negative_cache_ttl_s = 900\ndirect_dpi_stun = true",
             1,
         );
         assert_eq!(
             parse(&stun_only).unwrap_err().field,
-            "client.proxy.direct_dpi_stun"
+            "client.profiles[0].direct_dpi_stun"
         );
         let consent = original.replacen(
-            "system_proxy = \"off\"",
-            "system_proxy = \"off\"\ndirect_dpi = true\ndirect_dpi_stun = true",
+            "quic_negative_cache_ttl_s = 900",
+            "quic_negative_cache_ttl_s = 900\ndirect_dpi = true\ndirect_dpi_stun = true",
             1,
         );
         let accepted = parse(&consent).unwrap();
         let Config::Client(doc) = &accepted else {
             panic!("client");
         };
-        assert_eq!(doc.client.proxy.direct_dpi_stun, Some(true));
+        assert_eq!(doc.client.profiles[0].direct_dpi_stun, Some(true));
         assert_eq!(parse(&accepted.to_toml().unwrap()).unwrap(), accepted);
+    }
+
+    #[test]
+    fn ingress_defaults_and_legacy_proxy_keys_are_rejected() {
+        let original = client();
+        let omitted = original.replace("ingress_mode = \"system_proxy\"\n", "");
+        let Config::Client(doc) = parse(&omitted).unwrap() else { panic!("client") };
+        assert_eq!(doc.client.ingress_mode, IngressMode::SystemProxy);
+        for mode in ["tun", "packet", "off", "manual", "system-proxy"] {
+            let input = original.replace("ingress_mode = \"system_proxy\"", &format!("ingress_mode = \"{mode}\""));
+            assert!(parse(&input).is_err(), "{mode}");
+        }
+        for key in ["system_proxy = \"off\"", "system_proxy = \"manual\"", "direct_dpi = true", "direct_dpi_stun = true"] {
+            let input = original.replace("[client.proxy]", &format!("[client.proxy]\n{key}"));
+            assert!(parse(&input).is_err(), "{key}");
+        }
     }
 
     #[test]
@@ -1128,8 +1147,8 @@ mod tests {
         let original = client();
         for (from, to, expected) in [
             (
-                "system_proxy = \"off\"",
-                "system_proxy = \"on\"",
+                "ingress_mode = \"system_proxy\"",
+                "ingress_mode = \"tun\"",
                 "document",
             ),
             (
@@ -1205,8 +1224,8 @@ mod tests {
         for src in [
             client().replace("schema_version = 1", "schema_version = 2"),
             client().replace(
-                "system_proxy = \"off\"",
-                "system_proxy = \"off\"\nunsafe = true",
+                "ingress_mode = \"system_proxy\"",
+                "ingress_mode = \"system_proxy\"\nunsafe = true",
             ),
             client().replace(
                 "schema_version = 1",

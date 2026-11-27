@@ -1052,21 +1052,13 @@ async fn connect_scoped(
     let (congestion, observation) = options;
     let mut version = versions.preferred();
     for restarted in [false, true] {
-        let socket = UdpSocket::bind(local).await.map_err(Error::Io)?;
-        if !scope.permits(socket.local_addr().map_err(Error::Io)?, peer) {
-            return Err(Error::Scope);
-        }
-        let carrier_lease =
-            crate::routing::carrier_socket::udp(&socket, peer).map_err(|_| Error::Scope)?;
-        let pinned = if crate::routing::carrier_socket::active() {
-            socket.connect(peer).await.map_err(|_| Error::Scope)?;
-            if socket.peer_addr().ok() != Some(peer) {
-                return Err(Error::Scope);
-            }
-            Some(peer)
-        } else {
-            None
-        };
+        use crate::routing::carrier_socket::{self, UdpDialError};
+        let native = carrier_socket::active();
+        let (socket, carrier_lease) = carrier_socket::dial_udp(local, peer, native, |bound| scope.permits(bound, peer)).await.map_err(|error| match error {
+            UdpDialError::Bind(error) => Error::Io(error),
+            UdpDialError::Denied | UdpDialError::Connect(_) => Error::Scope,
+        })?;
+        let pinned = native.then_some(peer);
         let cid = super::negotiation::random_cid().map_err(|_| Error::Protocol)?;
         let original = super::negotiation::random_cid().map_err(|_| Error::Protocol)?;
         if cid == original || cid == [0; CID_LEN] || original == [0; CID_LEN] {

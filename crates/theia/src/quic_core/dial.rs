@@ -17,15 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Error {
-    Configuration,
-    Bind,
-    Handshake,
-    Timeout,
-    Unreachable,
-    EndpointNetworkRefused,
-}
+pub(crate) use crate::net::error::QuicDialError as Error;
 
 #[derive(Default)]
 pub(crate) struct Observation {

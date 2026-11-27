@@ -3,17 +3,28 @@ use super::tls::{self, Flight};
 use crate::client::ClientError;
 use std::{io, net::SocketAddr};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
 };
 
-pub(super) async fn connect(address: SocketAddr) -> io::Result<TcpStream> {
-    let socket = TcpStream::connect(address).await?;
-    socket.set_nodelay(true)?;
-    if socket.peer_addr()? != address || !socket.nodelay()? {
-        return Err(io::Error::other("socket policy not confirmed"));
+pub(super) async fn connect(address: SocketAddr) -> io::Result<(TcpStream, crate::routing::carrier_socket::Lease)> {
+    crate::routing::carrier_socket::connect_tcp(address, true).await
+}
+
+/// Every attempted write revalidates the original scope. A short write
+/// does not authorize the remainder after a concurrent revoke.
+pub(super) async fn write_checked(
+    socket: &mut (impl AsyncWrite + Unpin),
+    mut bytes: &[u8],
+    check: &(dyn Fn() -> Result<(), ClientError> + Sync),
+) -> Result<(), ClientError> {
+    while !bytes.is_empty() {
+        check()?;
+        let n = socket.write(bytes).await.map_err(|_| ClientError::Io)?;
+        if n == 0 { return Err(ClientError::Io); }
+        bytes = &bytes[n..];
     }
-    Ok(socket)
+    Ok(())
 }
 
 /// Cancellation-safe bounded read: every consumed byte stays in prefix,
@@ -119,6 +130,23 @@ pub(super) async fn read_server_hello(socket: &mut TcpStream) -> Result<ServerFl
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+    #[tokio::test]
+    async fn partial_write_rechecks_before_remaining_bytes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (mut output, mut peer) = tokio::io::duplex(1);
+        let attempts = AtomicUsize::new(0);
+        let check = || {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 { Ok(()) }
+            else { Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied)) }
+        };
+        assert!(matches!(write_checked(&mut output, b"abc", &check).await,
+            Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied))));
+        drop(output);
+        let mut bytes = Vec::new();
+        peer.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"a");
+    }
+
     #[tokio::test]
     async fn inspection_retains_prefix_on_timeout_and_leaves_tail() {
         let (mut app, mut proxy) = tokio::io::duplex(4096);

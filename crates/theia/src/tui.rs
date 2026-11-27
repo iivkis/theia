@@ -515,8 +515,8 @@ fn page_actions_for(
         ],
         (Role::Client, 2) => &[('i', "Ввести ключ")],
         (Role::Client, 3) if cfg!(windows) => &[
-            ('p', "Включить / выключить системный прокси"),
-            ('V', "Запустить / остановить локальный прокси"),
+            ('p', "Подключиться / отключиться"),
+            ('V', "Запустить / остановить локальный прокси (диагностика)"),
             ('L', "Выбрать другой профиль"),
             ('A', "Выбрать активный профиль"),
         ],
@@ -528,7 +528,7 @@ fn page_actions_for(
         (Role::Client, 6) => &[
             ('j', "Обновить состояние"),
             ('d', "Разрешить / отключить Anti-DPI"),
-            ('u', "Разрешить / отключить локальный STUN"),
+            ('u', "Разрешить / отозвать согласие STUN"),
         ],
         (Role::Client, 5) => &[('S', "Сохранить файл"), ('o', "Открыть другой файл")],
         _ => &[],
@@ -568,15 +568,10 @@ fn page_actions_for(
                 _ => true,
             };
             let label = match (role, key) {
-                (Role::Client, 'p') if !editor.system_proxy_allowed() => {
-                    "Настроить и включить системный прокси"
-                }
                 (Role::Client, 'd') if editor.direct_dpi_allowed() => "Отключить Anti-DPI",
                 (Role::Client, 'd') => "Разрешить Anti-DPI",
-                (Role::Client, 'u') if editor.direct_dpi_stun_allowed() => {
-                    "Отключить локальный STUN"
-                }
-                (Role::Client, 'u') => "Разрешить локальный STUN",
+                (Role::Client, 'u') if editor.direct_dpi_stun_allowed() => "Отозвать согласие STUN",
+                (Role::Client, 'u') => "Разрешить STUN",
                 (Role::Client, 'V') if !active => "Состояние выбранного профиля",
                 (_, 'z') if advanced => "Скрыть расширенные настройки",
                 _ => label,
@@ -594,7 +589,8 @@ fn recommendation_page(role: Role, key: char) -> (usize, char) {
         (Role::Server, 'u' | 'b' | 'G') => (2, key),
         (Role::Server, _) => (3, key),
         (Role::Client, 'i') => (2, key),
-        (Role::Client, 'A') => (3, key),
+        (Role::Client, 'A' | 'p') => (3, key),
+        (Role::Client, 'P') if cfg!(windows) => (3, 'p'),
         (Role::Client, _) => (3, 'V'),
     }
 }
@@ -661,7 +657,7 @@ fn recommended_step(editor: &Editor, owned_running: bool) -> (char, &'static str
             "Получите приглашение у администратора и импортируйте его.",
         )
     } else if owned_running {
-        ('V', "Локальный процесс запущен или запускается. Откройте его состояние для проверки туннеля.")
+        (if cfg!(windows) { 'p' } else { 'V' }, "Клиент запущен или запускается. Откройте его состояние для проверки туннеля.")
     } else if !editor.selected_record_is_active() {
         (
             'A',
@@ -671,7 +667,7 @@ fn recommended_step(editor: &Editor, owned_running: bool) -> (char, &'static str
         (
             'P',
             if cfg!(windows) {
-                "Выберите системный или локальный прокси. Запуск требует подтверждения."
+                "Подключитесь через системный прокси. Запуск требует подтверждения."
             } else {
                 "Откройте подключение и запустите локальный прокси. Затем настройте нужные приложения."
             },
@@ -1167,7 +1163,6 @@ struct Interaction {
     workspace_action: usize,
     workspace_user: usize,
     workspace_advanced: bool,
-    proxy_permission_pending: bool,
     value_preview: bool,
     preview_text: Option<String>,
     modal_action: usize,
@@ -1204,6 +1199,8 @@ struct Interaction {
     runtime: Option<RuntimePanel>,
     #[cfg(windows)]
     system_proxy: Option<crate::tui_system_proxy::Panel>,
+    #[cfg(windows)]
+    proxy_background: Option<crate::tui_system_proxy::Panel>,
     pending: Option<KeyEvent>,
     saving: Option<mpsc::Receiver<(Editor, bool)>>,
     exporting: Option<mpsc::Receiver<ExportResult>>,
@@ -1219,7 +1216,6 @@ impl Interaction {
             workspace_action: 0,
             workspace_user: 0,
             workspace_advanced: false,
-            proxy_permission_pending: false,
             value_preview: false,
             preview_text: None,
             modal_action: 0,
@@ -1256,6 +1252,8 @@ impl Interaction {
             runtime: None,
             #[cfg(windows)]
             system_proxy: None,
+            #[cfg(windows)]
+            proxy_background: None,
             pending: None,
             saving: None,
             exporting: None,
@@ -1452,23 +1450,6 @@ impl Interaction {
             Ok((editor, saved)) => {
                 self.saving = None;
                 self.editor = Some(editor);
-                if std::mem::take(&mut self.proxy_permission_pending) {
-                    #[cfg(windows)]
-                    if saved {
-                        if let Some(editor) = self.editor.as_mut() {
-                            match crate::tui_system_proxy::Panel::open(
-                                editor.saved_path().to_owned(),
-                                editor.saved_sha256(),
-                            ) {
-                                Ok(panel) => {
-                                    self.system_proxy = Some(panel);
-                                    self.modal_action = 0;
-                                }
-                                Err(message) => editor.error = Some(message.into()),
-                            }
-                        }
-                    }
-                }
                 if matches!(self.issuance, Some(IssueFlow::Saving)) {
                     self.modal_action = 0;
                     self.issuance = Some(if saved {
@@ -1522,6 +1503,11 @@ impl Interaction {
     }
 
     fn owned_running(&self, role: Role) -> bool {
+        #[cfg(windows)]
+        if role == Role::Client && (self.system_proxy.as_ref().is_some_and(|p| p.running())
+            || self.proxy_background.as_ref().is_some_and(|p| p.running())) {
+            return true;
+        }
         if role == Role::Server {
             self.server_process.running()
         } else {
@@ -1751,6 +1737,12 @@ impl Interaction {
         }
     }
     fn open_config(&mut self, role: Role) {
+        #[cfg(windows)]
+        if self.proxy_background.as_ref().is_some_and(|p| p.running()) {
+            self.system_proxy = self.proxy_background.take();
+            self.modal_action = 0;
+            return;
+        }
         if self
             .editor
             .as_ref()
@@ -1841,6 +1833,8 @@ impl Interaction {
         if let Some(background) = self.client_background.as_mut() {
             background.poll();
         }
+        #[cfg(windows)]
+        if let Some(background) = self.proxy_background.as_mut() { background.poll(); }
         if let Some(dialog) = self.config_dialog.as_mut() {
             if let Some(editor) = dialog.poll() {
                 if dialog.imported() {
@@ -2763,7 +2757,11 @@ impl Interaction {
                 return false;
             };
             if proxy.key(KeyEvent { code, ..key }) {
-                self.system_proxy = None;
+                if proxy.running() {
+                    self.proxy_background = self.system_proxy.take();
+                } else {
+                    self.system_proxy = None;
+                }
                 self.modal_action = 0;
             }
             return false;
@@ -2995,6 +2993,13 @@ impl Interaction {
             let exiting = key.code == KeyCode::Char('q')
                 || (key.code == KeyCode::Char('c')
                     && key.modifiers.contains(KeyModifiers::CONTROL));
+            #[cfg(windows)]
+            if self.proxy_background.as_ref().is_some_and(|p| p.running())
+                && (exiting || (role == Some(Role::Client) && matches!(key.code, KeyCode::Char('p' | 'V')))) {
+                self.system_proxy = self.proxy_background.take();
+                self.modal_action = 0;
+                return false;
+            }
             if exiting && self.server_process.running() {
                 self.show_server_process = true;
                 return false;
@@ -3627,14 +3632,11 @@ impl Interaction {
                         match editor.stage_record(*review) {
                             Ok(()) => self.start_save(),
                             Err(message) => {
-                                self.proxy_permission_pending = false;
                                 editor.error = Some(message.into());
                             }
                         }
                     }
-                    KeyCode::Esc | KeyCode::Char('n') => {
-                        self.proxy_permission_pending = false;
-                    }
+                    KeyCode::Esc | KeyCode::Char('n') => {}
                     _ => self.records = Some(RecordFlow::Confirm(review)),
                 },
                 RecordFlow::Input {
@@ -4049,9 +4051,10 @@ impl Interaction {
                             }
                             Ok(client_import::ProductSource::OwnTls(invitation)) => {
                                 editor.error = None;
+                                let ca = invitation.trust_reference();
                                 self.importing = Some(ImportFlow::Preview {
                                     invitation,
-                                    ca: None,
+                                    ca,
                                     public_ref: None,
                                 });
                             }
@@ -4100,7 +4103,7 @@ impl Interaction {
                                 reference: String::new(),
                             });
                         }
-                        KeyCode::Char('c') => {
+                        KeyCode::Char('c') if invitation.trust_reference().is_none() => {
                             self.importing = Some(ImportFlow::Trust {
                                 invitation,
                                 ca: ca.unwrap_or_default(),
@@ -4547,27 +4550,16 @@ impl Interaction {
                 } else {
                     #[cfg(windows)]
                     {
-                        if !editor.system_proxy_allowed() {
-                            match editor.review_system_proxy_permission() {
-                                Ok(review) => {
-                                    self.proxy_permission_pending = true;
-                                    self.records = Some(RecordFlow::Confirm(Box::new(review)));
-                                    editor.error = None;
-                                }
-                                Err(message) => editor.error = Some(message.into()),
+                        match crate::tui_system_proxy::Panel::open(
+                            editor.saved_path().to_owned(),
+                            editor.saved_sha256(),
+                        ) {
+                            Ok(panel) => {
+                                self.system_proxy = Some(panel);
+                                self.modal_action = 0;
+                                editor.error = None;
                             }
-                        } else {
-                            match crate::tui_system_proxy::Panel::open(
-                                editor.saved_path().to_owned(),
-                                editor.saved_sha256(),
-                            ) {
-                                Ok(panel) => {
-                                    self.system_proxy = Some(panel);
-                                    self.modal_action = 0;
-                                    editor.error = None;
-                                }
-                                Err(message) => editor.error = Some(message.into()),
-                            }
+                            Err(message) => editor.error = Some(message.into()),
                         }
                     }
                     #[cfg(not(windows))]
@@ -6579,12 +6571,13 @@ fn draw_import(
         ImportFlow::Preview { invitation, ca, public_ref } => (
             "Проверка ключа · собственный TLS",
             format!(
-                "Профиль: {}\nАдрес сервера: {}\nИмя сертификата: {}\nТип подключения: {}\nТранспорт: {:?}\nРежим: {:?}\nЛичный ключ: {}\nДоверенный сертификат: {}\nПолучите сертификат отдельно от приглашения.\n\nСохраняется новый профиль без подключения. Существующий профиль не заменяется.\n{}Системный прокси не изменяется.\n\nc: выбрать доверенный сертификат\n{}y: сохранить профиль  n/Esc: отменить\n\n{}",
+                "Профиль: {}\nАдрес сервера: {}\nИмя сертификата: {}\nТип подключения: {}\nТранспорт: {:?}\nРежим: {:?}\nЛичный ключ: {}\nДоверенный сертификат: {}\nПодтвердите доверие к источнику ключа.\n\nСохраняется новый профиль без подключения. Существующий профиль не заменяется.\n{}Системный прокси не изменяется.\n\n{}{}y: сохранить профиль  n/Esc: отменить\n\n{}",
                 invitation.id, invitation.endpoint, invitation.server_name,
                 invitation.security_mode().canonical_name(), invitation.transport, invitation.xhttp_mode(),
                 if invitation.has_token() { "будет сохранён в защищённый отдельный файл" } else { "нет в ссылке; нужна env: ссылка" },
-                if ca.is_some() { "CA указан, ещё НЕ проверено соединение" } else { "НЕТ; профиль не готов к подключению" },
+                if invitation.trust_reference().is_some() { "Закреплён в ключе, соединение ещё НЕ проверено" } else if ca.is_some() { "CA указан, ещё НЕ проверено соединение" } else { "НЕТ; профиль не готов к подключению" },
                 if editor.is_some_and(|e| e.can_refresh_credential(invitation)) { "r: отдельная замена credential существующего профиля; выбранный CA не используется.\n" } else { "" },
+                if invitation.trust_reference().is_some() { "" } else { "c: выбрать доверенный сертификат\n" },
                 if invitation.has_token() { "".into() } else { format!("e: указать env:NAME ({})\n", if public_ref.is_some() { "задано" } else { "обязательно" }) },
                 editor.and_then(|e| e.error.as_deref()).unwrap_or("")
             ),
@@ -6823,39 +6816,29 @@ fn client_mode_lines(editor: &Editor, running: bool) -> Vec<Line<'static>> {
         }),
         Line::raw(""),
         Line::styled(
+            "Системный прокси",
+            Style::default().fg(if cfg!(windows) { TEXT } else { MUTED }).add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(if cfg!(windows) {
+            "Основной режим MVP. Для приложений, использующих прокси Windows. Подключение требует подтверждения."
+        } else {
+            "Основной режим MVP; Linux backend пока недоступен. Возможен локальный диагностический прокси."
+        }),
+        Line::raw(""),
+        Line::styled(
             "Локальный прокси",
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         ),
         Line::raw(format!("HTTP {http} · SOCKS5 {socks}")),
         Line::styled(
-            "Укажите адрес в приложении после запуска. Остальной трафик не защищается этим режимом.",
+            "Ручной режим диагностики. Остальной трафик не защищается.",
             Style::default().fg(MUTED),
         ),
         Line::raw(""),
         Line::styled(
-            "Системный прокси",
-            Style::default()
-                .fg(if cfg!(windows) { TEXT } else { MUTED })
-                .add_modifier(Modifier::BOLD),
-        ),
-        Line::raw(if cfg!(windows) {
-            if editor.system_proxy_allowed() {
-                "Для программ, использующих настройки прокси Windows. Не VPN."
-            } else {
-                "Для программ с системным прокси Windows. Сначала потребуется разрешение."
-            }
-        } else {
-            "На Linux пока недоступен. Настройте прокси в нужных приложениях."
-        }),
-        Line::styled(
-            "TUN / VPN",
-            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
-        ),
-        Line::styled(
-            "Пока недоступен. Весь трафик устройства через Theia не направляется.",
+            "TUN / WinDivert / NFQUEUE — в будущем",
             Style::default().fg(MUTED),
         ),
-
     ];
     if !editor.selected_record_is_active() {
         lines.insert(
@@ -7217,7 +7200,7 @@ fn draw_page(
                 } else {
                     ui.and_then(|u| u.routing_observation.as_ref()).filter(|o| o.digest == editor.saved_sha256()).map_or_else(|| "Проверяем состояние клиента…".into(), RoutingObservation::body)
                 };
-                format!("Anti-DPI в сохранённом файле: {}\n{observation}", if editor.direct_dpi_stun_allowed() { "разрешён; TLS/QUIC v1 и STUN Binding (экспериментально)" } else if editor.direct_dpi_allowed() { "разрешён; TLS/QUIC v1, STUN выключен" } else { "выключен (резерв VPS)" })
+                format!("Anti-DPI выбранного профиля: {}\nСогласие STUN: {}\nUDP Modify: {}; непринятые стратегии используют VPS.\n{observation}", if editor.direct_dpi_allowed() { "разрешён" } else { "выключен (резерв VPS)" }, if editor.direct_dpi_stun_allowed() { "сохранено" } else { "нет" }, crate::routing::dpi::UdpStrategy::capability_summary())
             }
             (Role::Server,7) => editor.routing_settings().map_or_else(|| "Правил нет. По умолчанию весь трафик Theia идёт через сервер.".into(), |s| format!("Ревизия: {} · правил: {}\nGeoData: {}\nСохраните TOML, затем примените через Управление.", s.revision, s.rules.len(), s.datasets.as_ref().map_or("не выбраны", |m| m.release.as_str()))),
             (_,5) => format!("Файл: {}\n{}\nСохранение не меняет работающий процесс.", editor.saved_path().display(), editor.settings_summary()),
@@ -8101,7 +8084,7 @@ mod tests {
                 assert_eq!(editor.selected_record_id(), "backup");
                 assert!(!editor.selected_record_is_active());
                 assert_eq!(recommended_step(editor, false).0, 'A');
-                assert_eq!(recommended_step(editor, true).0, 'V');
+                assert_eq!(recommended_step(editor, true).0, if cfg!(windows) { 'p' } else { 'V' });
                 let view = rendered_interaction(160, 42, &model, &ui);
                 assert!(view.contains("Активный профиль: №1 · edge.example.org:443"));
                 assert_eq!(ui.workspace_focus, WorkspaceFocus::Records);
@@ -8473,7 +8456,7 @@ mod tests {
         let screen = rendered_interaction(120, 40, &model, &ui);
         for label in [
             "Системный прокси",
-            "TUN / VPN",
+            "TUN / WinDivert / NFQUEUE",
             "Локальный прокси",
             "Активный профиль",
             "127.0.0.1",
@@ -8487,22 +8470,13 @@ mod tests {
         let keys = page_actions(Role::Client, 3, ui.editor.as_ref());
         assert_eq!(keys.iter().any(|a| a.key == 'p'), cfg!(windows));
         #[cfg(windows)]
-        assert_eq!(keys[0].label, "Настроить и включить системный прокси");
+        assert_eq!(keys[0].label, "Подключиться / отключиться");
         ui.update(&mut model, press(KeyCode::Down));
         assert!(!ui.owned_running(Role::Client));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-        // The saved permission is separate from all operating-system effects.
-        let editor = ui.editor.as_mut().unwrap();
-        assert!(!editor.system_proxy_allowed());
-        let review = editor.review_system_proxy_permission().unwrap();
-        assert!(review
-            .body()
-            .contains("Прокси Windows и соединение не изменятся"));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-        editor.stage_record(review).unwrap();
-        assert!(!editor.system_proxy_allowed());
-        assert!(editor.save());
-        assert!(editor.system_proxy_allowed());
+        // Saved ingress selection is not an OS mutation or activation.
+        let Config::Client(doc) = config::read_file(&path).unwrap() else { panic!("client") };
+        assert_eq!(doc.client.ingress_mode, config::IngressMode::SystemProxy);
         assert!(!ui.owned_running(Role::Client));
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -9839,11 +9813,7 @@ mod tests {
     }
 
     fn server_issuance_fixture() -> String {
-        use sha2::{Digest, Sha256};
-        include_str!("../../../examples/server.toml").replace(
-            "REPLACE_WITH_64_LOWERCASE_HEX",
-            &format!("{:x}", Sha256::digest([0x42; 32])),
-        )
+        crate::invite::fixture_server_source(&[0x42; 32])
     }
 
     fn rendered_interaction(width: u16, height: u16, model: &Model, ui: &Interaction) -> String {
@@ -10065,11 +10035,7 @@ mod tests {
         }
         assert!(!path.exists());
         capture("client-first-key-trust", &model, &ui);
-        ui.update(&mut model, press(KeyCode::Enter)); // CA is mandatory.
-        assert_eq!(ui.config_dialog.as_ref().unwrap().guide().unwrap().0, 3);
-        assert!(!path.exists());
-        ui.paste_record_field(ca.to_str().unwrap());
-        ui.update(&mut model, press(KeyCode::Enter));
+        ui.update(&mut model, press(KeyCode::Enter)); // The trusted key already contains its anchor.
         assert_eq!(ui.config_dialog.as_ref().unwrap().guide().unwrap().0, 4);
         assert!(!path.exists());
         capture("client-first-key-save-review", &model, &ui);
@@ -10095,8 +10061,11 @@ mod tests {
         };
         assert_eq!(doc.client.profiles.len(), 1);
         assert_eq!(doc.client.active_profile, doc.client.profiles[0].id);
-        assert_eq!(doc.client.proxy.system_proxy, config::SystemProxy::Off);
+        assert_eq!(doc.client.ingress_mode, config::IngressMode::SystemProxy);
+        assert_ne!(doc.client.profiles[0].direct_dpi, Some(true));
+        assert_ne!(doc.client.profiles[0].direct_dpi_stun, Some(true));
         assert!(doc.client.profiles[0].auth_token.starts_with("file:"));
+        assert_eq!(doc.client.profiles[0].tls_ca, invite.trust_reference());
         let bytes = std::fs::read(&path).unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains(uri.as_str()));
         assert!(Editor::create_first_invitation(

@@ -614,6 +614,8 @@ jobs:
         run: cargo test --workspace --locked --lib routing::packet_modify::tests::independent_aioquic_initial_modify_v1_v2 -- --ignored --exact --nocapture
       - name: Independent live QUIC v1/v2 TLS resumption and H3 after Modify
         run: cargo test --workspace --locked --test independent_quic_modify independent_aioquic_live_modify_v1_v2 -- --ignored --exact --nocapture
+      - name: Independent live QUIC v1/v2 through production UDP relay
+        run: cargo test --workspace --locked --lib udp_relay::tests::independent_quic_product_relay_v1_v2 -- --ignored --exact --nocapture
       - name: Measure matched native and Quinn loopback samples (diagnostic)
         run: python tests/benchmark/run_native_quic_comparison.py --revision "${{ needs.specification.outputs.tested_sha }}" --output native-quic-comparison.json
       - uses: actions/upload-artifact@v4
@@ -992,6 +994,7 @@ jobs:
             @{ target = @('--test', 'independent_native_quic'); name = 'independent_aioquic_v1_v2_bidirectional_h3' },
             @{ target = @('--lib'); name = 'routing::packet_modify::tests::independent_aioquic_initial_modify_v1_v2' },
             @{ target = @('--test', 'independent_quic_modify'); name = 'independent_aioquic_live_modify_v1_v2' },
+            @{ target = @('--lib'); name = 'udp_relay::tests::independent_quic_product_relay_v1_v2' },
             @{ target = @('--lib'); name = 'server::hardening_tests::independent_external_reference_through_registered_reality_dispatchers' }
           )
           foreach ($case in $cases) {
@@ -1065,13 +1068,13 @@ jobs:
           retention-days: 7
 
   f15-driver-build:
-    name: F-15 native driver build (${{ matrix.os }})
+    name: F-15 native backend prerequisites (${{ matrix.os }})
     needs: specification
     if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2025-vs2026]
+        os: [ubuntu-24.04, windows-2025]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -1104,31 +1107,37 @@ jobs:
           mkdir f15-build-evidence
           cp drivers/linux/theia_flow_events.bpf.o f15-build-evidence/
           sha256sum f15-build-evidence/theia_flow_events.bpf.o
-      - name: Restore pinned Microsoft SDK and WDK packages
+      - name: Validate WinDivert package staging without installing a driver
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          nuget restore drivers/windows/packages.config -PackagesDirectory drivers/windows/packages -Source https://api.nuget.org/v3/index.json -NonInteractive
-          if ($LASTEXITCODE -ne 0) { throw 'Pinned WDK restore failed' }
-      - name: Compile WDK callout and BFE controller (unsigned, no install)
+          ./drivers/windows/windivert/test-package.ps1
+          Get-ChildItem drivers/windows/windivert -Filter '*.ps1' | ForEach-Object {
+            $tokens=$null; $errors=$null
+            $null=[System.Management.Automation.Language.Parser]::ParseFile($_.FullName,[ref]$tokens,[ref]$errors)
+            if ($errors.Count -ne 0) { throw "PowerShell parser rejected $($_.Name): $errors" }
+          }
+      - name: Compile WFP guard and validate native BFE transactions (abort only)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          if (!$vs) { throw 'Visual Studio C++ toolchain unavailable' }
-          & (Join-Path $vs 'Common7\Tools\Launch-VsDevShell.ps1') -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
-          & ./drivers/windows/build-lab.ps1 -OutputDirectory (Join-Path $PWD 'f15-build-evidence')
-      - name: Publish exact-source unsigned driver build evidence
+          ./drivers/windows/windivert/build-wfp-guard-lab.ps1 -OutputDirectory "$env:RUNNER_TEMP/theia-wfp-guard" -TestBfeTransaction
+      - name: Verify independent dual-stack external socket fixture (loopback only)
+        run: python drivers/windows/windivert/test-redirect-apps.py self-test
+      - name: Record Windows package validation scope
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory f15-build-evidence | Out-Null
+          [pscustomobject]@{SourceSha='${{ needs.specification.outputs.tested_sha }}';Backend='WinDivert';UpstreamVersion='2.2.2';PackageFixtureTests=$true;OfficialPackageVerified=$false;Installed=$false;CaptureReady=$false} | ConvertTo-Json | Set-Content f15-build-evidence/build-evidence.json
+      - name: Publish exact-source native prerequisite evidence
         uses: actions/upload-artifact@v4
         with:
           name: f15-driver-build-${{ runner.os }}-${{ needs.specification.outputs.tested_sha }}
           path: |
-            f15-build-evidence/*.sys
-            f15-build-evidence/*.exe
             f15-build-evidence/*.o
             f15-build-evidence/hashes.json
+            f15-build-evidence/build-evidence.json
           if-no-files-found: error
           retention-days: 3
 

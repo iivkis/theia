@@ -40,6 +40,29 @@ fn opt_u64(fd: &impl AsRawFd, option: libc::c_int) -> io::Result<u64> {
     }
     Ok(value)
 }
+fn verify_descriptor(socket:&impl AsRawFd,transport:Transport)->io::Result<()> {
+    // All factory sockets and all retained duplicates must be
+    // close-on-exec. This does not prevent deliberate descriptor passing
+    // or a privileged fork; such sharing remains outside the lab scope.
+    let flags=unsafe {libc::fcntl(socket.as_raw_fd(),libc::F_GETFD)};
+    if flags<0 {return Err(io::Error::last_os_error());}
+    if flags&libc::FD_CLOEXEC==0 {return Err(denied());}
+    for (option,expected) in [
+        (libc::SO_TYPE,if transport==Transport::Tcp {libc::SOCK_STREAM}else{libc::SOCK_DGRAM}),
+        (libc::SO_PROTOCOL,if transport==Transport::Tcp {libc::IPPROTO_TCP}else{libc::IPPROTO_UDP}),
+        (libc::SO_REUSEADDR,0),
+        (libc::SO_REUSEPORT,0),
+    ] {
+        let mut value=0i32;
+        let mut len=mem::size_of_val(&value) as libc::socklen_t;
+        if unsafe {libc::getsockopt(socket.as_raw_fd(),libc::SOL_SOCKET,option,
+            (&mut value as *mut i32).cast(),&mut len)}!=0 {
+            return Err(io::Error::last_os_error());
+        }
+        if len as usize!=mem::size_of_val(&value) || value!=expected {return Err(denied());}
+    }
+    Ok(())
+}
 fn get_mark(fd: &OwnedFd) -> io::Result<u32> {
     let mut value = 0u32;
     let mut len = mem::size_of_val(&value) as libc::socklen_t;
@@ -82,7 +105,11 @@ fn current_namespace() -> io::Result<(u64, u64)> {
     let meta = std::fs::metadata("/proc/thread-self/ns/net")?;
     Ok((meta.dev(), meta.ino()))
 }
-fn check_scope(host: &File) -> io::Result<(u64, u64)> {
+fn check_scope(host:&File,host_mode:bool)->io::Result<(u64,u64)> {
+    if host_mode {
+        super::linux_rules::verify_host_scope(host)?;
+        return current_namespace();
+    }
     let host_meta = host.metadata()?;
     let current = current_namespace()?;
     if current == (host_meta.dev(), host_meta.ino())
@@ -111,44 +138,47 @@ impl LabCarrierSocket {
     /// owned exclusively by the trusted service. The FD is duplicated to
     /// retain the kernel object until the rules lease is dropped.
     pub fn tcp(socket: &TcpStream, host_namespace: &File) -> io::Result<Self> {
+        verify_descriptor(socket,Transport::Tcp)?;
         let key = FlowKey {
             source: socket.local_addr()?,
             destination: socket.peer_addr()?,
             transport: Transport::Tcp,
             interface: 0,
         };
-        Self::claim(socket.try_clone()?.into(), key, host_namespace, false)
+        Self::claim(socket.try_clone()?.into(),key,host_namespace,false,false)
     }
     pub fn udp(socket: &UdpSocket, host_namespace: &File) -> io::Result<Self> {
+        verify_descriptor(socket,Transport::Udp)?;
         let key = FlowKey {
             source: socket.local_addr()?,
             destination: socket.peer_addr()?,
             transport: Transport::Udp,
             interface: 0,
         };
-        Self::claim(socket.try_clone()?.into(), key, host_namespace, false)
+        Self::claim(socket.try_clone()?.into(),key,host_namespace,false,false)
     }
     pub(super) fn pending_tcp(
         socket: &tokio::net::TcpSocket,
         peer: SocketAddr,
-        host: &File,
-    ) -> io::Result<Self> {
-        Self::pending(socket, socket.local_addr()?, peer, Transport::Tcp, host)
+        host:&File,host_mode:bool,
+    )->io::Result<Self> {
+        Self::pending(socket,socket.local_addr()?,peer,Transport::Tcp,host,host_mode)
     }
     pub(super) fn pending_udp(
         socket: &tokio::net::UdpSocket,
         peer: SocketAddr,
-        host: &File,
-    ) -> io::Result<Self> {
-        Self::pending(socket, socket.local_addr()?, peer, Transport::Udp, host)
+        host:&File,host_mode:bool,
+    )->io::Result<Self> {
+        Self::pending(socket,socket.local_addr()?,peer,Transport::Udp,host,host_mode)
     }
     fn pending(
         socket: &impl AsRawFd,
         source: SocketAddr,
         destination: SocketAddr,
-        transport: Transport,
-        host: &File,
-    ) -> io::Result<Self> {
+        transport:Transport,
+        host:&File,host_mode:bool,
+    )->io::Result<Self> {
+        verify_descriptor(socket,transport)?;
         let fd = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
@@ -162,12 +192,12 @@ impl LabCarrierSocket {
                 transport,
                 interface: 0,
             },
-            host,
-            true,
+            host,true,host_mode,
         )
     }
-    fn claim(fd: OwnedFd, key: FlowKey, host_namespace: &File, pending: bool) -> io::Result<Self> {
-        let namespace = check_scope(host_namespace)?;
+    fn claim(fd:OwnedFd,key:FlowKey,host_namespace:&File,pending:bool,host_mode:bool)->io::Result<Self> {
+        verify_descriptor(&fd,key.transport)?;
+        let namespace=check_scope(host_namespace,host_mode)?;
         if !valid(key) || get_mark(&fd)? != 0 {
             return Err(denied());
         }
@@ -179,7 +209,7 @@ impl LabCarrierSocket {
         let mut bytes = [0u8; 4];
         SystemRandom::new().fill(&mut bytes).map_err(|_| denied())?;
         let mark = u32::from_ne_bytes(bytes);
-        if mark == 0 {
+        if mark == 0 || super::linux_rules::reserved_mark(mark) {
             return Err(denied());
         }
         let lease = Self {
@@ -195,6 +225,7 @@ impl LabCarrierSocket {
         Ok(lease)
     }
     pub(super) fn verify(&self) -> io::Result<()> {
+        verify_descriptor(&self.fd,self.key.transport)?;
         if current_namespace()? != self.namespace
             || socket_cookie(&self.fd)? != self.cookie
             || get_mark(&self.fd)? != self.mark
@@ -259,6 +290,25 @@ impl Drop for LabCarrierSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn descriptor_checks_reject_wrong_protocol_and_inheritable_fd() {
+        let socket=UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert!(verify_descriptor(&socket,Transport::Udp).is_ok());
+        assert!(verify_descriptor(&socket,Transport::Tcp).is_err());
+        let enabled=1i32;
+        assert_eq!(unsafe {libc::setsockopt(socket.as_raw_fd(),libc::SOL_SOCKET,libc::SO_REUSEADDR,
+            (&enabled as *const i32).cast(),mem::size_of_val(&enabled) as libc::socklen_t)},0);
+        assert!(verify_descriptor(&socket,Transport::Udp).is_err());
+        let disabled=0i32;
+        assert_eq!(unsafe {libc::setsockopt(socket.as_raw_fd(),libc::SOL_SOCKET,libc::SO_REUSEADDR,
+            (&disabled as *const i32).cast(),mem::size_of_val(&disabled) as libc::socklen_t)},0);
+        let raw=unsafe {libc::fcntl(socket.as_raw_fd(),libc::F_DUPFD,0)};
+        assert!(raw>=0);
+        let fd=unsafe {OwnedFd::from_raw_fd(raw)};
+        assert!(verify_descriptor(&fd,Transport::Udp).is_err());
+        assert_eq!(unsafe {libc::fcntl(fd.as_raw_fd(),libc::F_SETFD,libc::FD_CLOEXEC)},0);
+        assert!(verify_descriptor(&fd,Transport::Udp).is_ok());
+    }
     #[test]
     fn never_marks_a_socket_in_the_host_namespace() {
         let host = File::open("/proc/thread-self/ns/net").unwrap();

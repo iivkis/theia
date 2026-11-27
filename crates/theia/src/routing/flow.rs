@@ -1,7 +1,7 @@
 //! Shared client flow lifetime and irreversible first-payload authorization.
 //! Compatibility ingress uses synthetic IDs; native backends must bind their
 //! platform flow identities to this same table before forwarding any payload.
-use super::{dpi::Engine, packet::FlowKey, PacketAction};
+use super::{policy_lease::{PolicyLease, PolicyState}, packet::FlowKey, PacketAction};
 use crate::{
     client::ClientError,
     protocol::{Address, ErrorCode},
@@ -79,21 +79,29 @@ impl FlowTable {
         Some(counts)
     }
 
+    #[cfg(test)]
     pub(crate) fn begin(
         self: &Arc<Self>,
-        engine: Arc<Engine>,
+        engine: Arc<PolicyState>,
         protocol: Protocol,
         target: Address,
         port: u16,
         digest: [u8; 32],
         configured: PacketAction,
     ) -> Result<FlowLease, ClientError> {
-        self.begin_inner(engine, protocol, target, port, digest, configured, None)
+        self.begin_pinned(engine.pin(digest)?, protocol, target, port, configured)
+    }
+
+    pub(crate) fn begin_pinned(
+        self: &Arc<Self>, policy: PolicyLease, protocol: Protocol, target: Address,
+        port: u16, configured: PacketAction,
+    ) -> Result<FlowLease, ClientError> {
+        self.begin_inner(policy, protocol, target, port, configured, None)
     }
 
     pub(crate) fn begin_native(
         self: &Arc<Self>,
-        engine: Arc<Engine>,
+        engine: Arc<PolicyState>,
         mut key: FlowKey,
         digest: [u8; 32],
         configured: PacketAction,
@@ -113,11 +121,10 @@ impl FlowTable {
             std::net::IpAddr::V6(ip) => Address::V6(ip.octets()),
         };
         self.begin_inner(
-            engine,
+            engine.pin(digest)?,
             protocol,
             target,
             key.destination.port(),
-            digest,
             configured,
             Some(key),
         )
@@ -126,18 +133,18 @@ impl FlowTable {
     #[allow(clippy::too_many_arguments)]
     fn begin_inner(
         self: &Arc<Self>,
-        engine: Arc<Engine>,
+        policy: PolicyLease,
         protocol: Protocol,
         target: Address,
         port: u16,
-        digest: [u8; 32],
         configured: PacketAction,
         native: Option<FlowKey>,
     ) -> Result<FlowLease, ClientError> {
         if port == 0 || configured == PacketAction::Drop {
             return Err(denied());
         }
-        engine.check_policy(digest)?;
+        policy.check()?;
+        let digest = policy.digest();
         let identity = Identity {
             protocol,
             target,
@@ -172,7 +179,7 @@ impl FlowTable {
             table: self.clone(),
             id,
             identity,
-            engine,
+            policy,
         })
     }
 }
@@ -195,12 +202,69 @@ pub(crate) struct FlowLease {
     table: Arc<FlowTable>,
     id: u64,
     identity: Identity,
-    engine: Arc<Engine>,
+    policy: PolicyLease,
 }
 
 impl FlowLease {
-    #[cfg(target_os = "linux")]
+    /// Every ingress, including explicit proxy requests, pins the same
+    /// policy generation. A reaccepted digest cannot revive revoked flows.
+    pub(crate) fn check_pending(&self) -> Result<(), ClientError> {
+        self.policy.check()
+    }
+
+    pub(crate) fn check_live(&self, action: PacketAction) -> Result<(), ClientError> {
+        self.check_pending()?;
+        if action == PacketAction::Modify && !self.policy.modify_enabled() {
+            return Err(denied());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn actual_action(&self) -> Result<Option<PacketAction>, ClientError> {
+        let state = self.table.state.lock().map_err(|_| denied())?;
+        let entry = state.entries.get(&self.id).ok_or_else(denied)?;
+        if entry.identity != self.identity {
+            return Err(denied());
+        }
+        Ok(entry.committed)
+    }
+
+    /// Check again at the real SOCKS UDP socket, after a bounded relay queue.
+    pub(crate) fn check_delivery(&self) -> Result<(), ClientError> {
+        self.check_live(self.actual_action()?.ok_or_else(denied)?)
+    }
+
+    /// Idle flows must close on expiry, digest/consent revocation or runtime
+    /// retirement even when neither side is sending application bytes.
+    pub(crate) async fn wait_revoked(&self) -> Result<(), ClientError> {
+        loop {
+            self.check_pending()?;
+            if let Some(action) = self.actual_action()? {
+                self.check_live(action)?;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
+
+    /// Check a live native flow against its pinned policy and configured
+    /// action without committing payload. This is not a kernel identity.
+    #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
+    pub(crate) fn check_native(&self,mut key:FlowKey,digest:[u8;32],configured:PacketAction)->Result<(),ClientError> {
+        key.interface=0;
+        if self.identity.native!=Some(key) || self.identity.digest!=digest || self.identity.configured!=configured {
+            return Err(denied());
+        }
+        let state=self.table.state.lock().map_err(|_|denied())?;
+        if state.native.get(&key)!=Some(&self.id)
+            || !state.entries.get(&self.id).is_some_and(|entry|entry.identity==self.identity) {
+            return Err(denied());
+        }
+        self.check_pending()
+    }
+
+    #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
     pub(crate) fn committed(&self, action: PacketAction) -> bool {
+        if self.check_live(action).is_err() {return false;}
         self.table
             .state
             .lock()
@@ -224,7 +288,7 @@ impl FlowLease {
         }
         if let Some(committed) = entry.committed {
             return if committed == action {
-                Ok(())
+                self.check_live(action)
             } else {
                 Err(denied())
             };
@@ -236,10 +300,7 @@ impl FlowLease {
         {
             return Err(denied());
         }
-        self.engine.check_policy(self.identity.digest)?;
-        if action == PacketAction::Modify && !self.engine.enabled() {
-            return Err(denied());
-        }
+        self.check_live(action)?;
         entry.committed = Some(action);
         Ok(())
     }
@@ -259,7 +320,8 @@ impl Drop for FlowLease {
 }
 
 /// A cheap local latch, used directly at the actual egress writer.
-/// Only the first send acquires the shared table lock.
+/// Only the first send acquires the shared table lock. Native writes
+/// also revalidate the pinned policy on each subsequent attempt.
 pub(crate) struct FirstSend<'a> {
     flow: Option<&'a FlowLease>,
     action: PacketAction,
@@ -274,12 +336,14 @@ impl<'a> FirstSend<'a> {
         }
     }
     pub(crate) fn attempt(&mut self) -> Result<(), ClientError> {
-        if !self.started {
-            if let Some(flow) = self.flow {
+        if let Some(flow)=self.flow {
+            if !self.started {
                 flow.commit(self.action)?;
+            } else {
+                flow.check_live(self.action)?;
             }
-            self.started = true;
         }
+        self.started=true;
         Ok(())
     }
 }
@@ -288,9 +352,9 @@ impl<'a> FirstSend<'a> {
 mod tests {
     use super::*;
 
-    fn setup() -> (Arc<FlowTable>, Arc<Engine>) {
+    fn setup() -> (Arc<FlowTable>, Arc<PolicyState>) {
         let table = Arc::new(FlowTable::new(1));
-        let engine = Arc::new(Engine::default());
+        let engine = Arc::new(PolicyState::default());
         engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(
             [1; 32],
         )));
@@ -300,7 +364,7 @@ mod tests {
 
     fn begin(
         table: &Arc<FlowTable>,
-        engine: &Arc<Engine>,
+        engine: &Arc<PolicyState>,
         action: PacketAction,
     ) -> Result<FlowLease, ClientError> {
         table.begin(
@@ -311,6 +375,31 @@ mod tests {
             [1; 32],
             action,
         )
+    }
+
+    #[test]
+    fn preflight_policy_pin_is_not_reacquired_on_flow_creation() {
+        let (table, policy) = setup();
+        let lease = policy.pin([1;32]).unwrap();
+        policy.authorize_policy(None);
+        policy.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture([1;32])));
+        assert!(table.begin_pinned(lease, Protocol::Tcp, Address::V4([192,0,2,1]), 443, PacketAction::Redirect).is_err());
+    }
+
+    #[test]
+    fn redirect_and_pass_do_not_depend_on_modify_consent() {
+        let (table, policy) = setup();
+        policy.set_enabled(false);
+        let flow = begin(&table, &policy, PacketAction::Redirect).unwrap();
+        flow.commit(PacketAction::Redirect).unwrap();
+        assert!(flow.check_delivery().is_ok());
+        drop(flow);
+        let flow = begin(&table, &policy, PacketAction::Pass).unwrap();
+        flow.commit(PacketAction::Pass).unwrap();
+        drop(flow);
+        let flow = begin(&table, &policy, PacketAction::Modify).unwrap();
+        assert!(flow.commit(PacketAction::Modify).is_err());
+        flow.commit(PacketAction::Redirect).unwrap();
     }
 
     #[test]
@@ -327,7 +416,7 @@ mod tests {
         assert_eq!(table.counts(), Some([0, 0, 1, 0]));
         assert!(flow.commit(PacketAction::Redirect).is_err());
         engine.authorize_policy(None);
-        assert!(flow.commit(PacketAction::Modify).is_ok());
+        assert!(flow.commit(PacketAction::Modify).is_err());
         drop(flow);
         assert_eq!(table.counts(), Some([0, 0, 0, 0]));
         assert!(begin(&table, &engine, PacketAction::Pass).is_err());
@@ -363,12 +452,40 @@ mod tests {
             )
             .is_err());
         assert!(begin(&table, &engine, PacketAction::Pass).is_err());
+        #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
+        {
+            assert!(flow.check_native(key,[1;32],PacketAction::Redirect).is_ok());
+            assert!(flow.check_native(key,[2;32],PacketAction::Redirect).is_err());
+            assert!(flow.check_native(key,[1;32],PacketAction::Pass).is_err());
+            let mut wrong=key;
+            wrong.source.set_port(1235);
+            assert!(flow.check_native(wrong,[1;32],PacketAction::Redirect).is_err());
+        }
         flow.commit(PacketAction::Redirect).unwrap();
         assert!(flow.commit(PacketAction::Pass).is_err());
         drop(flow);
         assert!(table
             .begin_native(engine, key, [1; 32], PacketAction::Redirect)
             .is_ok());
+    }
+
+    #[test]
+    fn native_committed_flow_stops_writes_on_policy_revocation() {
+        let (table,engine)=setup();
+        let key=FlowKey {
+            source:"192.0.2.1:1234".parse().unwrap(),
+            destination:"198.51.100.1:443".parse().unwrap(),
+            transport:super::super::packet::Transport::Tcp,
+            interface:1,
+        };
+        let flow=table.begin_native(engine.clone(),key,[1;32],PacketAction::Modify).unwrap();
+        let mut send=FirstSend::new(Some(&flow),PacketAction::Modify);
+        send.attempt().unwrap();
+        engine.authorize_policy(None);
+        assert!(send.attempt().is_err());
+        assert!(flow.commit(PacketAction::Modify).is_err());
+        assert!(flow.commit(PacketAction::Redirect).is_err());
+        assert!(flow.check_live(PacketAction::Modify).is_err());
     }
 
     #[test]
@@ -384,14 +501,37 @@ mod tests {
         assert!(begin(&table, &engine, PacketAction::Pass).is_err());
     }
 
+    #[tokio::test]
+    async fn revoked_idle_flow_cannot_revive_after_same_digest_refresh() {
+        let (table, engine) = setup();
+        let flow = begin(&table, &engine, PacketAction::Redirect).unwrap();
+        flow.commit(PacketAction::Redirect).unwrap();
+        // An unchanged, still-current receipt does not interrupt a relay.
+        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture([1; 32])));
+        assert!(flow.check_delivery().is_ok());
+        let (revoked, ()) = tokio::join!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), flow.wait_revoked()),
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                engine.authorize_policy(None);
+                engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture([1; 32])));
+            },
+        );
+        assert_eq!(revoked.unwrap(), Err(denied()));
+        assert_eq!(flow.check_delivery(), Err(denied()));
+        drop(flow);
+        let fresh = begin(&table, &engine, PacketAction::Redirect).unwrap();
+        assert!(fresh.commit(PacketAction::Redirect).is_ok());
+    }
+
     #[test]
-    fn committed_flow_keeps_egress_after_retirement() {
+    fn committed_flow_loses_egress_after_retirement() {
         let (table, engine) = setup();
         let flow = begin(&table, &engine, PacketAction::Pass).unwrap();
         let mut send = FirstSend::new(Some(&flow), PacketAction::Pass);
         send.attempt().unwrap();
         engine.retire();
-        send.attempt().unwrap();
+        assert_eq!(send.attempt(), Err(denied()));
         assert_eq!(flow.commit(PacketAction::Redirect), Err(denied()));
     }
 }

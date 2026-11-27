@@ -106,36 +106,20 @@ pub(crate) struct ModeTicket {
 }
 
 #[derive(Default)]
-struct ModeCache {
-    route: Option<crate::network_scope::Scope>,
-    generation: u64,
-    expires: Option<Instant>,
-}
+struct ModeCache(crate::net::evidence::ScopedDecision);
 
 impl ModeCache {
     fn observe(&mut self, route: Option<crate::network_scope::Scope>, now: Instant) -> ModeTicket {
-        if route.is_none()
-            || route != self.route
-            || self.expires.is_some_and(|expires| now >= expires)
-        {
-            self.route = route;
-            self.generation = self.generation.wrapping_add(1);
-            self.expires = None;
-        }
-        ModeTicket {
-            generation: self.generation,
-            stream_up: self.expires.is_some(),
-        }
+        let (generation, stream_up) = self.0.observe(route, now);
+        ModeTicket { generation, stream_up }
     }
 
     fn current(&self, ticket: ModeTicket) -> bool {
-        self.route.is_some() && self.generation == ticket.generation
+        self.0.current(ticket.generation)
     }
 
     fn remember(&mut self, ticket: ModeTicket, now: Instant, ttl: Duration) {
-        if self.current(ticket) && self.expires.is_none() && !ttl.is_zero() {
-            self.expires = now.checked_add(ttl);
-        }
+        self.0.record(ticket.generation, now, ttl);
     }
 }
 

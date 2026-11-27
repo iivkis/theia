@@ -206,18 +206,73 @@ pub struct TcpSplitPlan {
 
 impl TcpSplitPlan {
     pub fn begin(packet: &[u8], expected_name: &str) -> Option<(Self, [Vec<u8>; 2])> {
-        let (meta, off, end) = tcp_view(packet)?;
-        let payload = packet.get(end..)?;
-        if payload.len() > crate::reality_admission::MAX_HELLO {
+        let (plan, outputs) = Self::begin_flight(&[packet], expected_name)?;
+        Some((plan, outputs.try_into().ok()?))
+    }
+
+    /// Build a byte-exact split/retransmission plan from a complete,
+    /// ordered, bounded first TLS flight captured before any payload send.
+    /// The backend must own the live socket generation, hold all original
+    /// packets, verify policy and commit once before emission. This method
+    /// never transmits or authorizes packets, and rejects gaps/overlaps.
+    pub fn begin_flight(
+        packets: &[&[u8]],
+        expected_name: &str,
+    ) -> Option<(Self, Vec<Vec<u8>>)> {
+        const MAX_PACKETS: usize = 32;
+        const BOUNDARY: usize = 5;
+        if packets.is_empty() || packets.len() > MAX_PACKETS {
             return None;
         }
-        let outputs = tcp_tls_segments(packet, expected_name)?;
-        let sequence = u32::from_be_bytes(packet[off + 4..off + 8].try_into().ok()?);
+        let name = super::domain_name(expected_name).ok()?;
+        let (first, off, _) = tcp_view(packets[0])?;
+        if first.flow.destination.port() != 443
+            || first.flow.destination.ip().is_multicast()
+            || first.flow.destination.ip().is_unspecified()
+        {
+            return None;
+        }
+        let sequence = u32::from_be_bytes(packets[0][off + 4..off + 8].try_into().ok()?);
+        let mut payload = Vec::new();
+        let mut boundary_packet = None;
+        for (index, packet) in packets.iter().enumerate() {
+            let (meta, off, end) = tcp_view(packet)?;
+            let bytes = packet.get(end..)?;
+            let start = payload.len();
+            let limit = start.checked_add(bytes.len())?;
+            if meta.flow != first.flow
+                || bytes.is_empty()
+                || limit > crate::reality_admission::MAX_HELLO
+                || u32::from_be_bytes(packet[off + 4..off + 8].try_into().ok()?)
+                    != sequence.wrapping_add(u32::try_from(start).ok()?)
+            {
+                return None;
+            }
+            if start < BOUNDARY && limit > BOUNDARY {
+                boundary_packet = Some((index, BOUNDARY - start));
+            }
+            payload.extend_from_slice(bytes);
+        }
+        if !super::dpi::complete_packet_hello(&payload, &name) {
+            return None;
+        }
+        // Already split at exactly this boundary is a no-op, not Modify.
+        let (index, boundary) = boundary_packet?;
+        let (meta, off, end) = tcp_view(packets[index])?;
+        let [a, b] = split_tcp(packets[index], meta, off, end, boundary)?;
+        let mut outputs = Vec::with_capacity(packets.len() + 1);
+        for packet in &packets[..index] {
+            outputs.push(packet.to_vec());
+        }
+        outputs.extend([a, b]);
+        for packet in &packets[index + 1..] {
+            outputs.push(packet.to_vec());
+        }
         Some((
             Self {
-                key: meta.flow,
+                key: first.flow,
                 sequence,
-                payload: payload.to_vec(),
+                payload,
                 acknowledged: 0,
             },
             outputs,
@@ -274,6 +329,79 @@ impl TcpSplitPlan {
         Some(self.acknowledged == self.payload.len())
     }
 }
+/// One-way execution state for a bounded, already policy-authorized raw
+/// TCP split. The caller must exclusively own the capture generation and
+/// packet sender, discard the held originals before the first send and
+/// bind ACK/retransmission observations to the same kernel socket. This
+/// type cannot establish any of those platform credentials by itself.
+///
+/// An unsuccessful send attempt (even of the first segment) is terminal.
+/// There is no API for replaying the initial batch or choosing fallback
+/// once the sender has been invoked.
+#[cfg(test)]
+pub(crate) struct TcpSplitExecution {
+    plan: TcpSplitPlan,
+    initial: Option<Vec<Vec<u8>>>,
+    state: SplitState,
+}
+#[cfg(test)]
+#[derive(Clone,Copy,PartialEq,Eq)]
+enum SplitState {
+    Pending,
+    Active,
+    Complete,
+    Failed,
+}
+#[cfg(test)]
+impl TcpSplitExecution {
+    pub(crate) fn prepare(packets:&[&[u8]],name:&str)->Option<Self> {
+        let (plan,initial)=TcpSplitPlan::begin_flight(packets,name)?;
+        Some(Self{plan,initial:Some(initial),state:SplitState::Pending})
+    }
+
+    /// The commit callback must irreversibly authorize Modify for the
+    /// exact native flow before the first writer invocation. A denial is
+    /// terminal for this execution (no original packet is returned).
+    pub(crate) fn emit_initial(
+        &mut self,
+        commit:impl FnOnce()->std::io::Result<()>,
+        mut emit:impl FnMut(&[u8])->std::io::Result<()>,
+    )->std::io::Result<()> {
+        if self.state!=SplitState::Pending {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
+        // Default to terminal before invoking any callback, including on
+        // panic or partial write. Active is published only on full return.
+        self.state=SplitState::Failed;
+        let initial=self.initial.take().ok_or(std::io::ErrorKind::InvalidData)?;
+        commit()?;
+        for part in &initial {emit(part)?;}
+        self.state=SplitState::Active;
+        Ok(())
+    }
+
+    pub(crate) fn emit_retransmission(
+        &mut self, packet:&[u8],
+        mut emit:impl FnMut(&[u8])->std::io::Result<()>,
+    )->std::io::Result<()> {
+        if self.state!=SplitState::Active {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
+        self.state=SplitState::Failed;
+        let outputs=self.plan.retransmission(packet).ok_or(std::io::ErrorKind::InvalidData)?;
+        for part in &outputs {emit(part)?;}
+        self.state=SplitState::Active;
+        Ok(())
+    }
+
+    pub(crate) fn acknowledge(&mut self,packet:&[u8])->Option<bool> {
+        if self.state!=SplitState::Active {return None;}
+        let complete=self.plan.acknowledge(packet)?;
+        if complete {self.state=SplitState::Complete;}
+        Some(complete)
+    }
+}
+
 fn tcp_checksum(packet: &[u8], off: usize) -> u16 {
     let len = (packet.len() - off) as u32;
     let pseudo = if off == 20 {
@@ -323,6 +451,22 @@ pub fn quic_initial_datagrams(data: &[u8], expected_name: &str) -> Option<Vec<Ve
         offset = end;
     }
     (result.len() > 1).then_some(result)
+}
+
+/// An untrusted probe hint, never a domain identity. The lab accepts
+/// complete v1/v2 H3 Initials only if an actual transformation is possible.
+/// The caller must independently verify the exact version, not downgrade.
+#[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
+pub(crate) fn unified_quic_hint(data: &[u8]) -> Option<(String, crate::quic_core::wire::Version)> {
+    use super::dpi::udp::{Candidate, Observer};
+    use crate::quic_core::wire::Version;
+    let (name, version) = match Observer::default().outgoing(data) {
+        Candidate::QuicH3(name) => (name, Version::V1),
+        Candidate::QuicV2H3(name) => (name, Version::V2),
+        _ => return None,
+    };
+    quic_initial_datagrams(data, &name)?;
+    Some((name, version))
 }
 
 #[cfg(test)]
@@ -408,7 +552,43 @@ mod tests {
             original.extend_from_slice(&hello);
             let sum = tcp_checksum(&original, off);
             original[off + 16..off + 18].copy_from_slice(&sum.to_be_bytes());
+            // A complete ClientHello can span several captured TCP segments.
+            let (meta, _, end) = tcp_view(&original).unwrap();
+            let [prefix, tail] = split_tcp(&original, meta, off, end, 2).unwrap();
+            let (tail_meta, _, tail_end) = tcp_view(&tail).unwrap();
+            let [middle, last] = split_tcp(&tail, tail_meta, off, tail_end, 10).unwrap();
+            let (flight, outputs) = TcpSplitPlan::begin_flight(
+                &[&prefix, &middle, &last], "example.org"
+            ).unwrap();
+            assert_eq!(outputs.len(), 4);
+            let restored: Vec<u8> = outputs.iter().flat_map(|packet| {
+                let (_, _, end) = tcp_view(packet).unwrap();
+                packet[end..].iter().copied()
+            }).collect();
+            assert_eq!(restored, hello);
+            assert_eq!(flight.retransmission(&middle).unwrap(), outputs[1..3]);
+            assert!(TcpSplitPlan::begin_flight(&[&prefix, &last], "example.org").is_none());
+            assert!(TcpSplitPlan::begin_flight(&[&prefix, &prefix, &middle, &last], "example.org").is_none());
+            assert!(TcpSplitPlan::begin_flight(&[&prefix, &middle, &last], "wrong.invalid").is_none());
+            // A partial injection or commit denial permanently consumes
+            // the batch. Neither retry nor kernel retransmission is valid
+            // after the writer itself reports an ambiguous failure.
+            let mut execution=TcpSplitExecution::prepare(&[&prefix,&middle,&last],"example.org").unwrap();
+            let mut writes=0;
+            assert!(execution.emit_initial(||Ok(()),|_|{
+                writes+=1;
+                if writes==2 {Err(std::io::ErrorKind::BrokenPipe.into())} else {Ok(())}
+            }).is_err());
+            assert_eq!(writes,2);
+            assert!(execution.emit_initial(||panic!("must not recommit"),|_|panic!("must not replay")).is_err());
+            assert!(execution.emit_retransmission(&middle,|_|panic!("must not inject")).is_err());
+            let mut denied=TcpSplitExecution::prepare(&[&prefix,&middle,&last],"example.org").unwrap();
+            assert!(denied.emit_initial(||Err(std::io::ErrorKind::PermissionDenied.into()),
+                |_|panic!("commit denied")).is_err());
+            assert!(denied.emit_initial(||Ok(()),|_|panic!("must not replay")).is_err());
+
             let (mut plan, [a, b]) = TcpSplitPlan::begin(&original, "example.org").unwrap();
+            assert!(TcpSplitPlan::begin_flight(&[&a, &b], "example.org").is_none());
             assert_eq!([&a[off + 20..], &b[off + 20..]].concat(), hello);
             assert_eq!(a[off + 13], 0x10);
             assert_eq!(b[off + 13], 0x18);
@@ -459,6 +639,13 @@ mod tests {
             fix_tcp_lengths_and_checksums(&mut ack, off).unwrap();
             assert_eq!(plan.acknowledge(&ack), Some(true));
             assert!(plan.retransmission(&original).is_none());
+            let mut active=TcpSplitExecution::prepare(&[&prefix,&middle,&last],"example.org").unwrap();
+            let mut written=Vec::new();
+            active.emit_initial(||Ok(()),|part|{written.push(part.to_vec());Ok(())}).unwrap();
+            assert_eq!(written,outputs);
+            assert!(active.emit_initial(||panic!("must not recommit"),|_|panic!("must not replay")).is_err());
+            assert_eq!(active.acknowledge(&ack),Some(true));
+            assert!(active.emit_retransmission(&middle,|_|panic!("already acknowledged")).is_err());
         }
     }
 
@@ -647,9 +834,12 @@ mod tests {
             }
             assert!(nft.wait().unwrap().success());
             let hello = super::super::dpi::packet_test_hello("example.org");
-            client.write_all(&hello).unwrap();
+            // Force two distinct native sends by waiting for the first
+            // kernel capture before submitting the remaining bytes.
+            client.write_all(&hello[..2]).unwrap();
             let deadline = Instant::now()+Duration::from_secs(12);
-            let mut plan: Option<TcpSplitPlan> = None;
+            let mut initial_packets = Vec::<Vec<u8>>::new();
+            let mut plan: Option<TcpSplitExecution> = None;
             let mut retransmitted = false;
             let mut complete = false;
             while Instant::now() < deadline {
@@ -670,13 +860,33 @@ mod tests {
                 }
                 if meta.flow.source == client.local_addr().unwrap() && meta.payload_len != 0 {
                     packet.finish(PacketAction::Drop).unwrap();
-                    if let Some(plan) = &plan {
-                        let parts = plan.retransmission(&bytes).expect("native retransmission must match original sequence bytes");
-                        for part in &parts { emit(part); }
+                    if let Some(plan) = &mut plan {
+                        plan.emit_retransmission(&bytes,|part|{emit(part);Ok(())})
+                            .expect("native retransmission must match original sequence bytes");
                         retransmitted = true;
                     } else {
-                        let (new,[first,_lost]) = TcpSplitPlan::begin(&bytes,"example.org").expect("real TLS payload split");
-                        emit(&first); // intentionally lose second segment
+                        if initial_packets.is_empty() {
+                            assert_eq!(meta.payload_len, 2);
+                            initial_packets.push(bytes);
+                            client.write_all(&hello[2..]).unwrap();
+                            continue;
+                        }
+                        assert_eq!(initial_packets.len(), 1);
+                        assert_eq!(meta.payload_len, hello.len() - 2);
+                        initial_packets.push(bytes);
+                        let inputs: Vec<&[u8]> = initial_packets.iter().map(Vec::as_slice).collect();
+                        let mut new=TcpSplitExecution::prepare(&inputs,"example.org")
+                            .expect("real multi-packet TLS payload split");
+                        let mut count=0;
+                        // This isolated fixture already owns the exact socket
+                        // and raw sender. Simulate a network drop of the last
+                        // emitted segment, not a local sender error.
+                        new.emit_initial(||Ok(()),|part|{
+                            count+=1;
+                            if count<=2 {emit(part);}
+                            Ok(())
+                        }).unwrap();
+                        assert_eq!(count,3);
                         plan = Some(new);
                     }
                 } else {
@@ -689,6 +899,7 @@ mod tests {
                     if complete { break; }
                 }
             }
+            assert_eq!(initial_packets.len(), 2, "must observe multiple original kernel packets");
             assert!(retransmitted,"native TCP did not retransmit the lost sequence range");
             assert!(complete,"peer did not acknowledge the entire split payload");
             let mut received = vec![0;hello.len()];
@@ -726,10 +937,20 @@ mod tests {
             tail.extend([7; 20]);
             data.extend_from_slice(&tail);
             let split = quic_initial_datagrams(&data, "example.org").unwrap();
+            #[cfg(target_os = "linux")]
+            {
+                assert!(unified_quic_hint(&initial).is_none());
+                assert_eq!(
+                    unified_quic_hint(&data),
+                    Some(("example.org".to_owned(), crate::quic_core::wire::Version::from_wire(version).unwrap()))
+                );
+            }
             assert_eq!(split, vec![initial, tail]);
             assert_eq!(split.concat(), data);
             data[100] ^= 1;
             assert!(quic_initial_datagrams(&data, "example.org").is_none());
+            #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
+            assert!(unified_quic_hint(&data).is_none());
         }
     }
 

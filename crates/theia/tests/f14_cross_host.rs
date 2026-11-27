@@ -14,7 +14,7 @@ use std::{
 };
 use theia::{
     client_import,
-    config::{self, ClientDocument, Config, SystemProxy, Transport},
+    config::{self, ClientDocument, Config, IngressMode, Transport},
     invite::Invitation,
     tui_editor::Editor,
     Role,
@@ -189,7 +189,7 @@ async fn client_scenario(
             .unwrap();
     } else {
         editor
-            .import_invitation(&invitation, Some(&ca_ref), None)
+            .import_invitation(&invitation, None, None)
             .unwrap();
     }
     assert!(
@@ -209,16 +209,22 @@ async fn client_scenario(
         assert_eq!(imported.auth_token, "env:THEIA_F14_XHOST_WRONG_TOKEN");
     } else {
         assert!(imported.auth_token.starts_with("file:"));
+        assert_eq!(imported.tls_ca, invitation.trust_reference());
     }
-    assert_eq!(client_doc.client.proxy.system_proxy, SystemProxy::Off);
+    assert_eq!(client_doc.client.ingress_mode, IngressMode::SystemProxy);
+    assert_ne!(client_doc.client.profiles[0].direct_dpi, Some(true));
     assert!(!fs::read_to_string(&config_path)
         .unwrap()
         .contains(&URL_SAFE_NO_PAD.encode(token)));
 
     client_doc.client.active_profile = invitation.id.clone();
     if invalid_ca {
+        use sha2::{Digest, Sha256};
         let wrong_ca = std::env::var("THEIA_F14_XHOST_WRONG_CA").unwrap();
-        client_doc.client.profiles[1].tls_ca = Some(format!("file:{wrong_ca}"));
+        let pem = fs::read(wrong_ca).unwrap();
+        let cert = rustls_pemfile::certs(&mut std::io::BufReader::new(pem.as_slice()))
+            .next().unwrap().unwrap();
+        client_doc.client.profiles[1].tls_ca = Some(format!("anchor-sha256:{:x}", Sha256::digest(cert.as_ref())));
     }
     let successful = !invalid_token && !invalid_ca;
     run_client(&config_path, client_doc, origin, successful).await;
@@ -437,7 +443,12 @@ async fn linux_server_windows_client_f14_h2_h3_open_ok() {
             .unwrap()
             .try_into()
             .unwrap();
-        let config = config::read_file(Path::new(&server_config)).unwrap();
+        let mut config = config::read_file(Path::new(&server_config)).unwrap();
+        let Config::Server(server) = &mut config else { panic!("server fixture"); };
+        // The independently transferred public certificate is the actual
+        // server certificate; its private key remains on the Linux node.
+        server.server.inbounds.iter_mut().find(|inbound| inbound.id == "cross")
+            .unwrap().tls_cert = format!("file:{}", trusted_ca.display());
         let fixture = CrossOsFixture {
             source: &config,
             endpoint: &endpoint,

@@ -148,6 +148,17 @@ impl IssuedInvitation {
     }
 }
 
+fn invitation_trust(invite: &Invitation, ca: Option<&str>) -> Result<Option<String>, &'static str> {
+    if let Some(anchor) = invite.trust_reference() {
+        if ca.is_some_and(|value| !invite.matches_trust(Some(value))) {
+            return Err("Доверие в ключе не совпадает с указанным сертификатом.");
+        }
+        Ok(Some(anchor))
+    } else {
+        client_import::checked_ca_ref(ca).map_err(|_| "Explicit TLS CA reference is invalid or unreadable")
+    }
+}
+
 fn server_invitation(
     config: &Config,
     id: &str,
@@ -279,7 +290,7 @@ impl Editor {
     /// F-14: commit a completely new client profile from a reviewed invitation.
     /// The source's bearer is never written to TOML; the file is protected by
     /// a fresh owner-only directory and private ACL/mode on both platforms.
-    /// Caller must explicitly review ID/endpoint/SNI/transport and CA trust.
+    /// Caller must explicitly review ID/endpoint/SNI/transport and pinned trust.
     /// First Own-TLS import: create only a real, fully reviewed profile.
     /// A conflicting destination is never replaced; credentials survive an
     /// indeterminate publication but are removed after a pre-commit refusal.
@@ -296,8 +307,9 @@ impl Editor {
         {
             return Err("Выберите новый файл настроек в существующем каталоге.");
         }
-        let ca = client_import::checked_ca_ref(Some(ca_ref))
-            .map_err(|_| "Не удалось проверить доверенный сертификат.")?;
+        let ca = invitation_trust(invite, (!ca_ref.is_empty()).then_some(ca_ref))?
+            .ok_or("Не удалось проверить доверенный сертификат.")?;
+        let ca = Some(ca);
         let mut secret = if let Some(bytes) = invite.token_bytes() {
             let token = Zeroizing::new(bytes);
             Some(
@@ -330,13 +342,11 @@ impl Editor {
             },
             client: config::ClientSettings {
                 active_profile: profile.id.clone(),
+                ingress_mode: config::IngressMode::SystemProxy,
                 profiles: vec![profile],
                 proxy: config::LocalProxy {
                     http_listen: "127.0.0.1:7890".into(),
                     socks5_listen: "127.0.0.1:7891".into(),
-                    system_proxy: config::SystemProxy::Off,
-                    direct_dpi: None,
-                    direct_dpi_stun: None,
                 },
             },
         });
@@ -396,8 +406,7 @@ impl Editor {
         if document.client.profiles.iter().any(|p| p.id == invite.id) {
             return Err("An existing profile ID cannot be overwritten");
         }
-        let ca = client_import::checked_ca_ref(ca_ref)
-            .map_err(|_| "Explicit TLS CA reference is invalid or unreadable")?;
+        let ca = invitation_trust(invite, ca_ref)?;
         // Only a NEW secret is ever written. A secretless public invitation
         // demands a separately supplied env: reference, never a default.
         let secret = if let Some(bytes) = invite.token_bytes() {
@@ -501,6 +510,7 @@ impl Editor {
             || profile.server_name != invite.server_name
             || profile.path_prefix.as_deref() != Some(invite.path_prefix.as_str())
             || profile.security_mode != invite.security_mode()
+            || !invite.matches_trust(profile.tls_ca.as_deref())
             || (invite.xhttp_mode() != XhttpMode::Auto
                 && profile.effective_xhttp_mode() != invite.xhttp_mode())
             || (invite.transport != Transport::Auto && profile.transport != invite.transport)
@@ -777,6 +787,23 @@ impl Editor {
         if !config::editor_bytes(&self.path).is_ok_and(|bytes| bytes == self.source) {
             self.error = Some("Saved configuration changed; issuance refused".into());
             return None;
+        }
+        if let IssuedInvitation::OwnTls(invitation) = &invite {
+            let token = Zeroizing::new(invitation.token_bytes()?);
+            let Config::Server(document) = &self.original else { return None; };
+            let digest = format!("{:x}", Sha256::digest(&token[..]));
+            let current = document.server.users.iter()
+                .find(|user| !user.disabled && user.token_sha256 == digest)
+                .and_then(|user| Invitation::issued_from_server(&self.original, &invitation.id, &user.id, &token).ok());
+            let unchanged = current.as_ref().is_some_and(|value| {
+                let left = invitation.encode().ok().map(Zeroizing::new);
+                let right = value.encode().ok().map(Zeroizing::new);
+                matches!((left, right), (Some(a), Some(b)) if a.as_str() == b.as_str())
+            });
+            if !unchanged {
+                self.error = Some("Own-TLS trust changed; issue a new credential.".into());
+                return None;
+            }
         }
         if let IssuedInvitation::Reality { invitation, user } = &invite {
             // Publication/health may have advanced during TOML save. Never
@@ -1138,6 +1165,8 @@ impl Editor {
                     transport: Transport::Auto,
                     quic_connect_timeout_ms: 1600,
                     quic_negative_cache_ttl_s: 900,
+                    direct_dpi: None,
+                    direct_dpi_stun: None,
                 });
                 next_selection = doc.client.profiles.len() - 1;
                 format!(
@@ -1309,13 +1338,19 @@ impl Editor {
             .map(|inbound| inbound.server_name.as_str())
     }
 
-    /// Saved local consent is not an observation of a working DPI route.
+    /// Saved local consent belongs to the selected profile, not the backend.
+    /// A draft or another profile never grants consent to this one.
+    fn saved_selected_profile(&self) -> Option<&config::Profile> {
+        let Config::Client(doc) = &self.original else { return None };
+        doc.client.profiles.iter().find(|p| p.id == self.selected_record_id())
+    }
+
     pub(crate) fn direct_dpi_allowed(&self) -> bool {
-        matches!(&self.original, Config::Client(doc) if doc.client.proxy.direct_dpi == Some(true))
+        self.saved_selected_profile().is_some_and(|p| p.direct_dpi == Some(true))
     }
 
     pub(crate) fn direct_dpi_stun_allowed(&self) -> bool {
-        matches!(&self.original, Config::Client(doc) if doc.client.proxy.direct_dpi == Some(true) && doc.client.proxy.direct_dpi_stun == Some(true))
+        self.saved_selected_profile().is_some_and(|p| p.direct_dpi == Some(true) && p.direct_dpi_stun == Some(true))
     }
 
     pub(crate) fn review_direct_dpi_permission(&self) -> Result<RecordReview, &'static str> {
@@ -1328,9 +1363,12 @@ impl Editor {
         let Config::Client(doc) = &mut candidate else {
             return Err("Требуется клиентская конфигурация.");
         };
-        doc.client.proxy.direct_dpi = Some(enable);
+        let profile = doc.client.profiles.iter_mut()
+            .find(|p| p.id == self.selected_record_id())
+            .ok_or("Профиль не найден.")?;
+        profile.direct_dpi = Some(enable);
         if !enable {
-            doc.client.proxy.direct_dpi_stun = Some(false);
+            profile.direct_dpi_stun = Some(false);
         }
         candidate
             .validate()
@@ -1346,9 +1384,9 @@ impl Editor {
                 "Отключить Anti-DPI"
             },
             body: if enable {
-                "Разрешить локальный Anti-DPI для этого файла клиента?\n\nДля правил direct_dpi возможен прямой выход и независимая TLS/QUIC-проверка назначения: сайт увидит IP вашего устройства. STUN разрешается отдельно. DNS запрашивается через Theia. Остальные правила не меняются.\nСохранение не запускает режим; перезапустите клиент.\n\ny: разрешить · n/Esc: отменить".into()
+                "Разрешить локальный Anti-DPI для выбранного профиля?\n\nДля правил direct_via_client_anti_dpi возможен локальный TCP/TLS-выход и независимая TLS-проверка назначения: сайт увидит IP вашего устройства. QUIC Modify допускается только после приёмки конкретной стратегии; STUN требует отдельного согласия. Непринятые стратегии используют VPS. DNS запрашивается через Theia. Остальные правила не меняются.\nСохранение не запускает режим; перезапустите клиент.\n\ny: разрешить · n/Esc: отменить".into()
             } else {
-                "Отключить локальный Anti-DPI?\nПравила direct_dpi будут использовать VPS после перезапуска клиента. Текущие соединения не изменятся.\n\ny: отключить · n/Esc: отменить".into()
+                "Отключить локальный Anti-DPI?\nПравила direct_via_client_anti_dpi будут использовать VPS после применения нового поколения клиента.\n\ny: отключить · n/Esc: отменить".into()
             },
         })
     }
@@ -1366,7 +1404,10 @@ impl Editor {
         let Config::Client(doc) = &mut candidate else {
             return Err("Требуется клиентская конфигурация.");
         };
-        doc.client.proxy.direct_dpi_stun = Some(enable);
+        let profile = doc.client.profiles.iter_mut()
+            .find(|p| p.id == self.selected_record_id())
+            .ok_or("Профиль не найден.")?;
+        profile.direct_dpi_stun = Some(enable);
         candidate
             .validate()
             .map_err(|_| "Настройки клиента не прошли проверку.")?;
@@ -1375,49 +1416,12 @@ impl Editor {
             selected: self.selected_record_id().to_owned(),
             candidate,
             next_selection: self.selected_record,
-            confirmation_label: if enable {
-                "Разрешить STUN"
-            } else {
-                "Отключить STUN"
-            },
+            confirmation_label: if enable { "Разрешить STUN" } else { "Отозвать согласие STUN" },
             body: if enable {
-                "Разрешить экспериментальный локальный STUN Binding?\n\nТолько direct_dpi, публичный домен и UDP/3478. Сервер STUN увидит IP устройства. Независимый ответ подтверждает доступность, но не удостоверяет сервер. Возможен дополнительный FINGERPRINT без изменения защищённых полей. ICE/TURN и прочий UDP остаются через VPS.\nСохраните настройки и перезапустите клиент.\n\ny: разрешить · n/Esc: отменить".into()
+                format!("Сохранить отдельное согласие на STUN Binding для этого профиля?\nПосле приёмки стратегии публичный STUN-сервер может увидеть IP вашего устройства. Только credential-free Binding; ICE/TURN и неподдерживаемые запросы остаются через VPS.\n{}\nСогласие не заменяет приёмку и не запускает сеть.\n\ny: разрешить · n/Esc: отменить", crate::routing::dpi::UdpStrategy::capability_summary())
             } else {
-                "Отключить локальный STUN? После сохранения и перезапуска новые STUN direct_dpi будут идти через VPS.\n\ny: отключить · n/Esc: отменить".into()
+                "Отозвать согласие STUN? После применения нового поколения локальный STUN Modify не разрешён.\n\ny: отозвать · n/Esc: отменить".into()
             },
-        })
-    }
-
-    /// Display the saved permission, never infer the operating-system state.
-    pub(crate) fn system_proxy_allowed(&self) -> bool {
-        matches!(&self.original, Config::Client(doc)
-            if doc.client.proxy.system_proxy == config::SystemProxy::Manual)
-    }
-
-    #[cfg(any(windows, test))]
-    pub(crate) fn review_system_proxy_permission(&self) -> Result<RecordReview, &'static str> {
-        self.require_clean_records()?;
-        if self.write_uncertain {
-            return Err("Откройте настройки заново.");
-        }
-        let mut candidate = self.original.clone();
-        let Config::Client(doc) = &mut candidate else {
-            return Err("Требуется клиентский профиль.");
-        };
-        if doc.client.active_profile != self.selected_record_id() {
-            return Err("Сначала выберите активный профиль.");
-        }
-        doc.client.proxy.system_proxy = config::SystemProxy::Manual;
-        candidate
-            .validate()
-            .map_err(|_| "Настройки клиента не прошли проверку.")?;
-        Ok(RecordReview {
-            source: self.saved_sha256(),
-            selected: self.selected_record_id().to_owned(),
-            candidate,
-            next_selection: self.selected_record,
-            confirmation_label: "Сохранить разрешение",
-            body: "Разрешить управление системным прокси?\n\nTheia сможет менять HTTP(S)-прокси текущего пользователя Windows только после отдельного подтверждения.\nСейчас сохраняется только разрешение в файле настроек. Прокси Windows и соединение не изменятся.\n\ny: сохранить разрешение · n/Esc: отменить".into(),
         })
     }
 
@@ -1429,14 +1433,9 @@ impl Editor {
                 doc.server.policy.max_connections_per_user, doc.server.policy.max_connections_total
             ),
             Config::Client(doc) => format!(
-                "HTTP: {}\nSOCKS5: {}\nРазрешение управления системным прокси: {}",
+                "HTTP: {}\nSOCKS5: {}\nРежим: System Proxy (сохранённый выбор, не состояние ОС)",
                 doc.client.proxy.http_listen,
-                doc.client.proxy.socks5_listen,
-                if self.system_proxy_allowed() {
-                    "разрешено"
-                } else {
-                    "нет"
-                }
+                doc.client.proxy.socks5_listen
             ),
         }
     }
@@ -1928,10 +1927,7 @@ mod tests {
     }
 
     fn server_source() -> String {
-        include_str!("../../../examples/server.toml").replace(
-            "REPLACE_WITH_64_LOWERCASE_HEX",
-            &format!("{:x}", Sha256::digest([0x42; 32])),
-        )
+        crate::invite::fixture_server_source(&[0x42; 32])
     }
 
     fn two_inbounds() -> String {
@@ -2551,10 +2547,7 @@ mod tests {
     }
 
     fn refresh_fixture(token: [u8; 32]) -> Invitation {
-        let source = include_str!("../../../examples/server.toml").replace(
-            "REPLACE_WITH_64_LOWERCASE_HEX",
-            &format!("{:x}", Sha256::digest(token)),
-        );
+        let source = crate::invite::fixture_server_source(&token);
         let server = config::parse(&source).unwrap();
         Invitation::issued_from_server(&server, "public", "device-a", &token).unwrap()
     }
@@ -2586,8 +2579,7 @@ mod tests {
         };
         // Simulate operator-selected existing transport and trust reference.
         doc.client.profiles[1].transport = Transport::H2;
-        let trust = "file:/existing-ca.pem".to_owned();
-        doc.client.profiles[1].tls_ca = Some(trust);
+        assert_eq!(doc.client.profiles[1].tls_ca, initial.trust_reference());
         doc.client.active_profile = "public".into();
         config::atomic_write(&temp.0, &before).unwrap();
         let mut editor = Editor::load(Role::Client, &temp.0).unwrap();
@@ -2635,6 +2627,15 @@ mod tests {
         wrong.endpoint = "other.example.org:443".into();
         assert!(editor.refresh_credential(&wrong).is_err());
         wrong.endpoint = initial.endpoint.clone();
+        // Same endpoint/name/transport but different trust is not rotation.
+        let mut other_server = config::parse(&crate::invite::fixture_server_source(&[0x43; 32])).unwrap();
+        let Config::Server(document) = &mut other_server else { panic!("server"); };
+        let other_cert = rcgen::generate_simple_self_signed(vec![initial.server_name.clone()]).unwrap();
+        let cert_file = Temp::write(&other_cert.cert.pem());
+        document.server.inbounds[0].tls_cert = format!("file:{}", cert_file.0.display());
+        let other_invite = Invitation::issued_from_server(&other_server, "public", "device-a", &[0x43; 32]).unwrap();
+        assert_ne!(other_invite.trust_reference(), initial.trust_reference());
+        assert!(editor.refresh_credential(&other_invite).is_err());
         wrong.transport = Transport::H3;
         assert!(editor.refresh_credential(&wrong).is_err());
         assert_eq!(fs::read(&temp.0).unwrap(), before);
@@ -2714,7 +2715,7 @@ mod tests {
         assert_eq!(imported.id, "public");
         assert_eq!(imported.server, "edge.example.org:443");
         assert_eq!(imported.server_name, "edge.example.org");
-        assert!(imported.tls_ca.is_none(), "trust is not granted by URI");
+        assert_eq!(imported.tls_ca, invite.trust_reference());
         assert!(imported.auth_token.starts_with("file:"));
         let secret_path = Path::new(imported.auth_token.strip_prefix("file:").unwrap());
         assert!(secret_path.is_absolute());
@@ -2806,7 +2807,7 @@ mod tests {
     }
 
     #[test]
-    fn import_requires_independent_valid_ca_file_and_never_trusts_uri_ca() {
+    fn import_rejects_unrelated_ca_and_preserves_invitation_anchor() {
         use crate::invite::Invitation;
         let cert = rcgen::generate_simple_self_signed(vec!["edge.example.org".into()]).unwrap();
         let ca = Temp::write(&cert.cert.pem());
@@ -2821,13 +2822,14 @@ mod tests {
             .is_err());
         assert!(editor
             .import_invitation(&invite, Some(&ca_ref), None)
-            .is_ok());
+            .is_err());
+        assert!(editor.import_invitation(&invite, None, None).is_ok());
         let Config::Client(doc) = config::read_file(&temp.0).unwrap() else {
             panic!("client");
         };
         assert_eq!(
             doc.client.profiles[1].tls_ca.as_deref(),
-            Some(ca_ref.as_str())
+            invite.trust_reference().as_deref()
         );
         let secret_file = Path::new(
             doc.client.profiles[1]

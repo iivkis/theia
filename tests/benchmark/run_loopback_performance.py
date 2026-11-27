@@ -294,6 +294,7 @@ connect_timeout_ms = 2000
     client = f'''schema_version = 1
 [client]
 active_profile = "bench"
+ingress_mode = "system_proxy"
 [[client.profiles]]
 id = "bench"
 path_prefix = "/v1/bench"
@@ -309,7 +310,6 @@ quic_negative_cache_ttl_s = 900
 [client.proxy]
 http_listen = "{LOOP}:{http}"
 socks5_listen = "{LOOP}:{socks}"
-system_proxy = "off"
 '''
     for name, content in (("server", server), ("client", client)):
         (directory / (name + ".toml")).write_text(content + common, encoding="utf-8")

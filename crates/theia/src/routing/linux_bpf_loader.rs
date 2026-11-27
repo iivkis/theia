@@ -3,7 +3,7 @@
 //! No route authorization is derived from a parsed event alone.
 use super::{
     linux_attribution::socket_cookie,
-    linux_events::{CorroboratedFlow, KernelFlowEvent},
+    linux_events::{CorroboratedFlow, KernelFlowEvent, KernelPacketEvent, PACKET_EVENT_SIZE},
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -41,6 +41,7 @@ unsafe extern "C" {
     fn bpf_object__close(object: *mut c_void);
     fn bpf_object__find_program_by_name(object: *const c_void, name: *const c_char) -> *mut c_void;
     fn bpf_program__attach_cgroup(program: *const c_void, cgroup_fd: c_int) -> *mut c_void;
+    fn bpf_program__set_autoload(program:*mut c_void, autoload:bool)->c_int;
     fn bpf_link__destroy(link: *mut c_void) -> c_int;
     fn bpf_object__find_map_fd_by_name(object: *const c_void, name: *const c_char) -> c_int;
     fn libbpf_get_error(pointer: *const c_void) -> c_long;
@@ -241,7 +242,44 @@ pub struct CollectedEvent {
     event: KernelFlowEvent,
     loss: Arc<LossMonitor>,
 }
+/// A diagnostic capture proof borrows the actual queue packet and its
+/// live collector event. It cannot be constructed from public parsed bytes,
+/// copied into a later packet, or kept after the kernel verdict.
+pub struct CapturedObservation<'a, 'queue> {
+    event: &'a CollectedEvent,
+    rules: &'a super::linux_rules::LabRules,
+    packet: &'a super::nfqueue::Packet<'queue>,
+    fd: i32,
+    flow: CorroboratedFlow,
+}
+
+impl CapturedObservation<'_, '_> {
+    pub fn flow(&self) -> CorroboratedFlow {
+        self.flow
+    }
+
+    /// Revalidate the live socket, private ring and queue identity, and
+    /// event age after any awaited work. Never upgrades sender attribution.
+    pub fn revalidate(&self) -> io::Result<CorroboratedFlow> {
+        let observed = self.event.corroborate_packet(self.rules, self.packet, self.fd)?;
+        if observed != self.flow {
+            return Err(denied());
+        }
+        Ok(observed)
+    }
+}
+
 impl CollectedEvent {
+    pub fn capture_observation<'a, 'queue>(
+        &'a self,
+        rules: &'a super::linux_rules::LabRules,
+        packet: &'a super::nfqueue::Packet<'queue>,
+        fd: i32,
+    ) -> io::Result<CapturedObservation<'a, 'queue>> {
+        let flow = self.corroborate_packet(rules, packet, fd)?;
+        Ok(CapturedObservation { event: self, rules, packet, fd, flow })
+    }
+
     /// Correlate a live collector event with an actual packet selected
     /// by the dedicated kernel socket rule. A matching tuple alone is
     /// insufficient: the private queue proof and kernel cookie must agree.
@@ -308,6 +346,11 @@ impl Collector {
         let object = Object(checked_pointer(unsafe {
             bpf_object__open_mem(bytes.as_ptr().cast(), bytes.len(), ptr::null())
         })?);
+        // The flow-only collector has no packet ring consumer.
+        // Never attach or load the optional egress program here.
+        let egress=unsafe { bpf_object__find_program_by_name(object.0.as_ptr(),b"theia_egress\0".as_ptr().cast()) };
+        if egress.is_null() { return Err(denied()); }
+        result(unsafe { bpf_program__set_autoload(egress,false) })?;
         result(unsafe { bpf_object__load(object.0.as_ptr()) })?;
         let map_fd = |name: &[u8]| {
             let fd =
@@ -370,30 +413,32 @@ impl Collector {
     }
     /// Blocking bounded poll; execute only on the dedicated collector worker.
     /// Loss is terminal for the entire session, not just for one event.
-    pub fn poll(&mut self, timeout_ms: u32) -> io::Result<Option<CollectedEvent>> {
-        if timeout_ms > 250 || !self.loss.live.load(Ordering::Acquire) {
-            return Err(denied());
+    pub fn poll(&mut self,timeout_ms:u32)->io::Result<Option<CollectedEvent>> {
+        let mut wait=timeout_ms;
+        for _ in 0..MAX_BUFFER {
+            let Some(record)=self.poll_record(wait)? else {return Ok(None);};
+            if record.event.fresh().is_ok() {return Ok(Some(record));}
+            wait=0;
         }
+        self.buffer.poison();
+        Err(denied())
+    }
+
+    /// Keep stale records for the verdict collector's ambiguity
+    /// tombstones. An expired event cannot grant access, but an observed
+    /// conflicting sender must not disappear merely because it expired.
+    fn poll_record(&mut self,timeout_ms:u32)->io::Result<Option<CollectedEvent>> {
+        if timeout_ms>250 || !self.loss.live.load(Ordering::Acquire) {return Err(denied());}
         self.check_loss()?;
         if self.buffer.queue.is_empty() {
-            let rc = unsafe { ring_buffer__poll(self.ring.0.as_ptr(), timeout_ms as c_int) };
-            if rc < 0 {
+            let rc=unsafe {ring_buffer__poll(self.ring.0.as_ptr(),timeout_ms as c_int)};
+            if rc<0 {
                 self.buffer.poison();
-                return Err(io::Error::from_raw_os_error(
-                    rc.checked_neg().unwrap_or(libc::EINVAL),
-                ));
+                return Err(io::Error::from_raw_os_error(rc.checked_neg().unwrap_or(libc::EINVAL)));
             }
         }
         self.check_loss()?;
-        while let Some(event) = self.buffer.queue.pop_front() {
-            if event.fresh().is_ok() {
-                return Ok(Some(CollectedEvent {
-                    event,
-                    loss: self.loss.clone(),
-                }));
-            }
-        }
-        Ok(None)
+        Ok(self.buffer.queue.pop_front().map(|event|CollectedEvent{event,loss:self.loss.clone()}))
     }
 }
 impl Drop for Collector {
@@ -402,9 +447,219 @@ impl Drop for Collector {
     }
 }
 
+
+/// Live pre-verdict reader for one explicitly owned, tagged socket.
+/// Owns the private cgroup collector from before the socket was
+/// connected. A flow record is not an authenticated sender identity;
+/// this gate only narrows the existing socket proof and never upgrades
+/// application evidence. No public raw-record insertion API.
+pub struct VerdictCollector {
+    collector:Collector,
+    expected_cookie:u64,
+    fd:i32,
+    candidate:Option<CollectedEvent>,
+    retired:bool,
+}
+impl VerdictCollector {
+    pub fn new(collector:Collector,socket:&impl AsRawFd,fd:i32)->io::Result<Self> {
+        if fd<0 {return Err(denied());}
+        Ok(Self{collector,expected_cookie:socket_cookie(socket)?,fd,candidate:None,retired:false})
+    }
+
+    fn observe(&mut self,record:CollectedEvent)->io::Result<()> {
+        if record.event.cookie!=self.expected_cookie {return Ok(());}
+        if let Some(previous)=&self.candidate {
+            if !previous.event.same_actor(&record.event) ||
+                record.event.timestamp()<previous.event.timestamp() {
+                self.retired=true;
+                return Err(denied());
+            }
+        }
+        self.candidate=Some(record);
+        Ok(())
+    }
+
+    fn drain(&mut self)->io::Result<()> {
+        if self.retired {return Err(denied());}
+        for _ in 0..MAX_BUFFER {
+            match self.collector.poll_record(0) {
+                Ok(Some(record))=>self.observe(record)?,
+                Ok(None)=>return Ok(()),
+                Err(error)=>{self.retired=true;return Err(error);}
+            }
+        }
+        self.retired=true;
+        Err(denied())
+    }
+
+    /// Called while the packet is held in NFQUEUE, both before and after
+    /// policy evaluation. Drain the actual private ring, never the
+    /// downstream cgroup_skb egress observations. A busy/overflowed or
+    /// revoked session cannot silently fall back to a cached identity.
+    pub(crate) fn verify(&mut self,rules:&super::linux_rules::LabRules,
+        packet:&super::nfqueue::Packet<'_>,proof:super::linux_rules::CapturedSocket)
+        ->io::Result<CorroboratedFlow> {
+        if self.retired || proof.cookie()!=self.expected_cookie {return Err(denied());}
+        self.drain()?;
+        let candidate=self.candidate.as_ref().ok_or_else(denied)?;
+        let actor=candidate.event;
+        let observed=candidate.corroborate_packet(rules,packet,self.fd)?;
+        // Hashing /proc/PID/exe may take time. Consume newly arrived
+        // competing events before allowing this diagnostic gate to
+        // succeed. The final kernel verdict remains separately guarded.
+        self.drain()?;
+        let current=self.candidate.as_ref().ok_or_else(denied)?;
+        current.loss.check()?;
+        current.event.fresh()?;
+        if !current.event.same_actor(&actor) || observed.cookie()!=proof.cookie() ||
+            observed.key()!=proof.key() || rules.captured_socket(packet)?!=proof {
+            self.retired=true;
+            return Err(denied());
+        }
+        Ok(observed)
+    }
+}
+
+// Separate collector for actual cgroup egress skb observations. Its
+// private ring cannot be fed by the public packet parser. It is not
+// a pre-verdict NFQUEUE packet proof, and cannot authorize a route.
+struct PacketBuffer {
+    queue:VecDeque<KernelPacketEvent>,
+    live:Arc<AtomicBool>,
+}
+impl PacketBuffer {
+    fn poison(&mut self) {
+        self.live.store(false,Ordering::Release);
+        self.queue.clear();
+    }
+    fn push(&mut self,bytes:&[u8])->io::Result<()> {
+        if !self.live.load(Ordering::Acquire) || self.queue.len()>=MAX_BUFFER {
+            self.poison();
+            return Err(denied());
+        }
+        match KernelPacketEvent::parse(bytes) {
+            Ok(event)=>{self.queue.push_back(event);Ok(())},
+            Err(error)=>{self.poison();Err(error)},
+        }
+    }
+}
+unsafe extern "C" fn packet_sample(context:*mut c_void,data:*mut c_void,len:usize)->c_int {
+    if context.is_null() { return -libc::EINVAL; }
+    let buffer=unsafe {&mut *context.cast::<PacketBuffer>()};
+    if data.is_null() || len!=PACKET_EVENT_SIZE {
+        buffer.poison();return -libc::EINVAL;
+    }
+    let bytes=unsafe {std::slice::from_raw_parts(data.cast::<u8>(),len)};
+    if buffer.push(bytes).is_ok() {0} else {-libc::ENOBUFS}
+}
+
+pub struct CollectedPacket {
+    event:KernelPacketEvent,
+    loss:Arc<LossMonitor>,
+}
+impl CollectedPacket {
+    /// Returns only kernel socket identity and observed L3/L4 tuple.
+    /// Same cookie from a live descriptor corroborates the socket, not
+    /// the task that called send (shared sockets, retransmits, softirq).
+    pub fn observation(&self)->io::Result<KernelPacketEvent> {
+        self.loss.check()?;
+        self.event.fresh()?;
+        Ok(self.event)
+    }
+    pub fn corroborate_socket(&self,socket:&impl AsRawFd)->io::Result<KernelPacketEvent> {
+        let event=self.observation()?;
+        if socket_cookie(socket)?!=event.cookie() { return Err(denied()); }
+        self.loss.check()?;
+        event.fresh()?;
+        Ok(event)
+    }
+    /// Correlation is diagnostic only. Both independently pinned
+    /// collector sessions must remain live and both records fresh.
+    pub fn corroborate_flow(&self,flow:&CollectedEvent,fd:i32)->io::Result<CorroboratedFlow> {
+        let event=self.observation()?;
+        flow.loss.check()?;
+        if !event.matches_flow(&flow.event) { return Err(denied()); }
+        let observed=flow.event.corroborate(fd)?;
+        let mut key=event.key();key.interface=0;
+        if observed.key()!=key || observed.cookie()!=event.cookie() { return Err(denied()); }
+        flow.loss.check()?;
+        flow.event.fresh()?;
+        self.loss.check()?;
+        event.fresh()?;
+        Ok(observed)
+    }
+}
+
+pub struct PacketCollector {
+    ring:Ring,
+    _link:Link,
+    _object:Object,
+    buffer:Box<PacketBuffer>,
+    loss:Arc<LossMonitor>,
+}
+impl PacketCollector {
+    /// Requires an explicitly selected root-owned non-root cgroup and
+    /// independently pinned ELF; does not attach to host by default.
+    pub fn attach(bytes:&[u8],expected:[u8;32],cgroup:&File)->io::Result<Self> {
+        check_object(bytes,expected)?;
+        check_cgroup(cgroup)?;
+        let object=Object(checked_pointer(unsafe {
+            bpf_object__open_mem(bytes.as_ptr().cast(),bytes.len(),ptr::null())
+        })?);
+        for name in PROGRAMS {
+            let program=unsafe {bpf_object__find_program_by_name(object.0.as_ptr(),name.as_ptr().cast())};
+            if program.is_null() { return Err(denied()); }
+            result(unsafe {bpf_program__set_autoload(program,false)})?;
+        }
+        let program=unsafe {bpf_object__find_program_by_name(object.0.as_ptr(),b"theia_egress\0".as_ptr().cast())};
+        if program.is_null() {return Err(denied());}
+        result(unsafe {bpf_object__load(object.0.as_ptr())})?;
+        let map=|name:&[u8]|->io::Result<c_int>{
+            let fd=unsafe {bpf_object__find_map_fd_by_name(object.0.as_ptr(),name.as_ptr().cast())};
+            if fd<0 {Err(denied())} else {Ok(fd)}
+        };
+        let cpus=usize::try_from(unsafe {libbpf_num_possible_cpus()}).map_err(|_|denied())?;
+        let live=Arc::new(AtomicBool::new(true));
+        let loss=Arc::new(LossMonitor::new(map(b"lost_events\0")?,cpus,live.clone())?);
+        let mut buffer=Box::new(PacketBuffer{queue:VecDeque::with_capacity(MAX_BUFFER),live});
+        let ring=Ring(checked_pointer(unsafe {ring_buffer__new(map(b"packet_events\0")?,
+            packet_sample,(&mut *buffer as *mut PacketBuffer).cast(),ptr::null())})?);
+        let link=Link(checked_pointer(unsafe {bpf_program__attach_cgroup(program,cgroup.as_raw_fd())})?);
+        loss.check()?;
+        Ok(Self{ring,_link:link,_object:object,buffer,loss})
+    }
+    pub fn poll(&mut self,timeout_ms:u32)->io::Result<Option<CollectedPacket>> {
+        if timeout_ms>250 { return Err(denied()); }
+        if self.loss.check().is_err() {self.buffer.poison();return Err(denied());}
+        if self.buffer.queue.is_empty() {
+            let status=unsafe {ring_buffer__poll(self.ring.0.as_ptr(),timeout_ms as c_int)};
+            if status<0 {
+                self.buffer.poison();
+                return Err(io::Error::from_raw_os_error(status.checked_neg().unwrap_or(libc::EINVAL)));
+            }
+        }
+        if self.loss.check().is_err() {self.buffer.poison();return Err(denied());}
+        while let Some(event)=self.buffer.queue.pop_front() {
+            if event.fresh().is_ok() {return Ok(Some(CollectedPacket{event,loss:self.loss.clone()}));}
+        }
+        Ok(None)
+    }
+}
+impl Drop for PacketCollector {
+    fn drop(&mut self) {self.buffer.poison();}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn malformed_packet_callback_revokes_packet_session() {
+        let live=Arc::new(AtomicBool::new(true));
+        let mut buffer=PacketBuffer{queue:VecDeque::new(),live:live.clone()};
+        assert!(buffer.push(&[0;PACKET_EVENT_SIZE]).is_err());
+        assert!(!live.load(Ordering::Acquire));
+        assert_eq!(unsafe {packet_sample((&mut buffer as *mut PacketBuffer).cast(),ptr::null_mut(),PACKET_EVENT_SIZE)},-libc::EINVAL);
+    }
     #[test]
     fn rejects_wrong_object_before_libbpf() {
         let mut object = [0u8; 64];

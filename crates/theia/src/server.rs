@@ -904,7 +904,7 @@ async fn connect_target(
     policy: &ServerPolicy,
     routing: &crate::routing::Policy,
 ) -> Result<TcpStream, ErrorCode> {
-    connect_target_with(address, port, policy, routing, TcpStream::connect).await
+    connect_target_with(address, port, policy, routing, crate::routing::carrier_socket::connect_plain_tcp).await
 }
 
 async fn connect_target_with<T, F, Fut>(
@@ -2334,7 +2334,7 @@ async fn prepare_selected_listeners_inner(
                 crate::tcp_bbr::Error::Unavailable => ServerError::TcpControllerUnavailable,
             })?;
             let tcp = crate::reality_tcp::PreparedTcp::from_live(listener, carrier.clone())?;
-            let udp = tokio::net::UdpSocket::bind(udp_addr)
+            let udp = crate::routing::carrier_socket::bind_plain_udp(udp_addr)
                 .await
                 .map_err(|_| ServerError::Io)?;
             let (quic, silent) = if h3 {
@@ -3809,7 +3809,7 @@ async fn run_reality_document_inner(
                 crate::reality_live::Live::new(generation, Arc::new(context), now)?;
             let tcp =
                 crate::reality_tcp::PreparedTcp::from_live(listener, live_generation.clone())?;
-            let udp = tokio::net::UdpSocket::bind(udp_addr)
+            let udp = crate::routing::carrier_socket::bind_plain_udp(udp_addr)
                 .await
                 .map_err(|_| ServerError::Io)?;
             let (quic, silent) = if h3 {

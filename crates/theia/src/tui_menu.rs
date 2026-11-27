@@ -118,9 +118,9 @@ const CLIENT: &[Group] = &[
     Group {
         title: "Подключение",
         entries: &[
-            always("Состояние / подключить / отключить / Apply", key('V')),
+            always("Состояние / управление локальным прокси / Apply", key('V')),
             always("Монитор трафика этого процесса", Action::Traffic),
-            entry("Режим подключения (прокси / TUN)", key('P')),
+            entry("Системный перехват и режимы совместимости", key('P')),
         ],
     },
     Group {
@@ -766,6 +766,9 @@ impl FirstInvite {
                     Some("Ключ слишком длинный. Вставьте его целиком или запросите новый.");
             }
         } else {
+            if self.focus == 0 && self.own.as_ref().is_some_and(|invite| invite.trust_reference().is_some()) {
+                return;
+            }
             let field = if self.focus == 0 {
                 &mut self.ca
             } else {
@@ -799,12 +802,18 @@ impl FirstInvite {
             let mut fields = vec![Field {
                 id: 0,
                 label: "Доверенный сертификат (CA)",
-                value: if self.ca.is_empty() {
+                value: if invite.trust_reference().is_some() {
+                    "Закреплён в ключе".into()
+                } else if self.ca.is_empty() {
                     String::new()
                 } else {
                     "Файл выбран".into()
                 },
-                hint: "F6 — выбрать PEM-сертификат, полученный отдельно от администратора.",
+                hint: if invite.trust_reference().is_some() {
+                    "Получите ключ по доверенному каналу; отдельный CA не нужен."
+                } else {
+                    "F6 — выбрать PEM-сертификат, полученный отдельно от администратора."
+                },
             }];
             if !invite.has_token() {
                 fields.push(Field {
@@ -880,7 +889,7 @@ impl FirstInvite {
         }
         if self.review {
             if let Some(invite) = &self.own {
-                return format!("Тип: собственный TLS\nПрофиль: {}\nСервер: {}\nИмя TLS: {}\nДоверенный сертификат выбран и проверен локально.\n{credential}\n\nФайл настроек: {path}\nСоздаётся первый активный профиль. Соединение и системный прокси не запускаются.", invite.id, invite.endpoint, invite.server_name, credential = if invite.has_token() { "Личный ключ будет сохранён в защищённом хранилище." } else { "Будет использована указанная ссылка на отдельный ключ." });
+                return format!("Тип: собственный TLS\nПрофиль: {}\nСервер: {}\nИмя TLS: {}\nДоверие подтверждается по ключу или выбранному CA; соединение ещё не проверено.\n{credential}\n\nФайл настроек: {path}\nСоздаётся первый активный профиль. Соединение и системный прокси не запускаются.", invite.id, invite.endpoint, invite.server_name, credential = if invite.has_token() { "Личный ключ будет сохранён в защищённом хранилище." } else { "Будет использована указанная ссылка на отдельный ключ." });
             }
         }
         String::new()
@@ -942,7 +951,7 @@ impl FirstInvite {
                     return FirstInviteAction::Back;
                 }
             }
-            KeyCode::F(6) if self.focus == 0 => {
+            KeyCode::F(6) if self.focus == 0 && !self.own.as_ref().is_some_and(|invite| invite.trust_reference().is_some()) => {
                 self.browser = Some(FileBrowser::files(if self.own.is_some() {
                     self.ca.strip_prefix("file:").unwrap_or(&self.ca)
                 } else {
@@ -956,10 +965,13 @@ impl FirstInvite {
             }
             KeyCode::Enter => {
                 if let Some(invite) = &self.own {
-                    if !self.ca.is_empty() && !self.ca.starts_with("file:") {
+                    let embedded = invite.trust_reference();
+                    if let Some(anchor) = &embedded {
+                        self.ca = anchor.clone();
+                    } else if !self.ca.is_empty() && !self.ca.starts_with("file:") {
                         self.ca = format!("file:{}", self.ca);
                     }
-                    if crate::client_import::checked_ca_ref(Some(&self.ca)).is_err() {
+                    if embedded.is_none() && crate::client_import::checked_ca_ref(Some(&self.ca)).is_err() {
                         self.error = Some("Выберите доверенный PEM-сертификат через F6.");
                     } else if !invite.has_token()
                         && !crate::client_import::valid_explicit_reference(&self.reference)
@@ -1382,6 +1394,7 @@ impl ConfigDialog {
             match result {
                 Ok((_, crate::client_import::ProductSource::OwnTls(invite))) => {
                     panel.source = Zeroizing::new(String::new());
+                    panel.ca = invite.trust_reference().unwrap_or_default();
                     panel.own = Some(invite);
                     panel.focus = 0;
                 }
@@ -1751,6 +1764,7 @@ impl FirstSetup {
                 ui,
                 client: config::ClientSettings {
                     active_profile: f(0),
+                    ingress_mode: config::IngressMode::SystemProxy,
                     profiles: vec![config::Profile {
                         id: f(0),
                         path_prefix: Some(f(5)),
@@ -1764,13 +1778,12 @@ impl FirstSetup {
                         transport: config::Transport::Auto,
                         quic_connect_timeout_ms: 1600,
                         quic_negative_cache_ttl_s: 900,
+                        direct_dpi: None,
+                        direct_dpi_stun: None,
                     }],
                     proxy: config::LocalProxy {
                         http_listen: "127.0.0.1:7890".into(),
                         socks5_listen: "127.0.0.1:7891".into(),
-                        system_proxy: config::SystemProxy::Off,
-                        direct_dpi: None,
-                        direct_dpi_stun: None,
                     },
                 },
             }),

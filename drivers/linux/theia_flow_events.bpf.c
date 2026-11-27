@@ -86,4 +86,70 @@ int theia_sendmsg4(struct bpf_sock_addr *ctx) { return observe(ctx, 4, 2); }
 SEC("cgroup/sendmsg6")
 int theia_sendmsg6(struct bpf_sock_addr *ctx) { return observe(ctx, 6, 2); }
 
+/* This hook sees the actual skb/socket, not a guessed tuple-to-PID
+ * mapping. It runs on cgroup egress, not the earlier NFQUEUE LOCAL_OUT
+ * hook: these records cannot be used to approve a queued packet.
+ * No payload, mark changes, permits or process identity from softirq.
+ */
+struct packet_event {
+    __u64 cookie;
+    __u64 timestamp;
+    __u32 family;
+    __u32 protocol;
+    __u32 ifindex;
+    __u32 length;
+    __u8 source[16];
+    __u8 destination[16];
+    __u16 source_port;
+    __u16 destination_port;
+    __u32 reserved;
+};
+_Static_assert(sizeof(struct packet_event) == 72, "packet wire layout");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 20);
+} packet_events SEC(".maps");
+
+/* 1 = BPF_HDR_START_NET. No IPv4 options, fragments, IPv6 extension
+ * headers or offload assumptions in this first observation format.
+ * An unsupported packet is intentionally not an attribution token.
+ */
+SEC("cgroup_skb/egress")
+int theia_egress(struct __sk_buff *skb) {
+    struct packet_event event = {};
+    __u8 hdr[40] = {};
+    __u8 ports[4] = {};
+    __u32 offset;
+    if (bpf_skb_load_bytes_relative(skb, 0, hdr, 20, 1)) return 1;
+    if (hdr[0] == 0x45) {
+        if ((hdr[6] & 0x3f) || hdr[7]) return 1;
+        event.family = 4;
+        event.protocol = hdr[9];
+        __builtin_memcpy(event.source, hdr + 12, 4);
+        __builtin_memcpy(event.destination, hdr + 16, 4);
+        offset = 20;
+    } else if ((hdr[0] >> 4) == 6) {
+        if (bpf_skb_load_bytes_relative(skb, 0, hdr, 40, 1)) return 1;
+        event.family = 6;
+        event.protocol = hdr[6];
+        __builtin_memcpy(event.source, hdr + 8, 16);
+        __builtin_memcpy(event.destination, hdr + 24, 16);
+        offset = 40;
+    } else return 1;
+    if (event.protocol != 6 && event.protocol != 17) return 1;
+    if (skb->len < offset + (event.protocol == 6 ? 20 : 8) ||
+        bpf_skb_load_bytes_relative(skb, offset, ports, 4, 1)) return 1;
+    event.source_port = ((__u16)ports[0] << 8) | ports[1];
+    event.destination_port = ((__u16)ports[2] << 8) | ports[3];
+    if (!event.source_port || !event.destination_port) return 1;
+    event.cookie = bpf_get_socket_cookie(skb);
+    event.timestamp = bpf_ktime_get_ns();
+    event.ifindex = skb->ifindex;
+    event.length = skb->len;
+    if (!event.cookie || !event.timestamp) { lost(); return 1; }
+    if (bpf_ringbuf_output(&packet_events, &event, sizeof(event), 0)) lost();
+    return 1;
+}
+
 char LICENSE[] SEC("license") = "GPL";
