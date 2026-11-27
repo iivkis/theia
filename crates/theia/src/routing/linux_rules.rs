@@ -497,16 +497,20 @@ impl LabRules {
             if !marks.insert(socket.mark()) || !cookies.insert(socket.cookie()) { return Err(refused()); }
         }
         let old = journal_bytes(path)?;
-        if let Some(bytes) = &old {
-            if !parse_journal(bytes, &scope)?.restored { return Err(refused()); }
-        }
+        let previous = old.as_deref().map(|bytes| parse_journal(bytes, &scope)).transpose()?;
+        if previous.as_ref().is_some_and(|journal| !journal.restored) { return Err(refused()); }
         let net = Netlink::open()?;
         let before = net.generation()?;
+        // Never overwrite the only journal for a table that unexpectedly
+        // exists again, even if an earlier recovery was recorded as complete.
+        if let Some(previous) = &previous {
+            if net.table(previous)? { return Err(refused()); }
+        }
         let installed = before.checked_add(1).ok_or_else(refused)?;
         let mut nonce = [0; 16];
         SystemRandom::new().fill(&mut nonce).map_err(|_| refused())?;
         let journal = Journal { version: 1, scope, nonce, before, installed, previous_present: false, restored: false };
-        if net.table(&journal)? { return Err(refused()); }
+        if net.table(&journal)? || net.generation()? != before { return Err(refused()); }
         let queue_number = queue.number()?;
         let mut operations = install_messages(&journal, queue_number, &carriers);
         if let Some(tag) = &capture {
@@ -658,18 +662,31 @@ pub fn recover(host_namespace: &File, path: &Path) -> io::Result<()> {
     check_parent(path)?;
     let raw = journal_bytes(path)?.ok_or_else(refused)?;
     let mut journal = parse_journal(&raw, &scope)?;
-    if journal.restored { return Ok(()); }
     let net = Netlink::open()?;
     let generation = net.generation()?;
-    if net.table(&journal)? {
+    let present = net.table(&journal)?;
+    if net.generation()? != generation { return Err(refused()); }
+    if journal.restored {
+        // Idempotence is evidence of absence, not permission to delete
+        // an object that appeared after the recorded restoration.
+        return if present { Err(refused()) } else { Ok(()) };
+    }
+    let expected = if present {
         journal.recovery_generation(generation)?;
-        if net.generation()? != generation { return Err(refused()); }
+        let after = generation.checked_add(1).ok_or_else(refused)?;
         crate::config::guarded_trust_assert(path, &raw).map_err(|_| refused())?;
         let mut attrs = Vec::new();
         name_attr(&mut attrs, 1, &journal.name());
         net.batch(generation, &[nft_message(DEL_TABLE, REQUEST | ACK, 2, &attrs)])?;
+        after
+    } else {
+        generation
+    };
+    // A stable absence observation is required even if a prior recovery
+    // died after deletion but before persisting the restored journal.
+    if net.generation()? != expected || net.table(&journal)? || net.generation()? != expected {
+        return Err(refused());
     }
-    if net.table(&journal)? { return Err(refused()); }
     journal.restored = true;
     store(path, &journal, Some(&raw))?;
     Ok(())
@@ -815,6 +832,25 @@ mod tests {
             drop(lease);
             recover(&host, &path).unwrap();
             assert!(!Netlink::open().unwrap().table(&journal).unwrap());
+            recover(&host, &path).unwrap();
+
+            // Simulate an external privileged recreation under the same
+            // identity. A restored journal cannot authorize deletion or
+            // be replaced with a fresh journal while that object exists.
+            let restored = journal_bytes(&path).unwrap().unwrap();
+            let net = Netlink::open().unwrap();
+            net.batch(net.generation().unwrap(), &install_messages(&journal, 49000, &[])).unwrap();
+            assert!(net.table(&journal).unwrap());
+            assert!(recover(&host, &path).is_err());
+            assert!(LabRules::install(&queue, &host, &path).is_err());
+            assert_eq!(journal_bytes(&path).unwrap().unwrap(), restored);
+            assert!(net.table(&journal).unwrap());
+
+            // Test-only cleanup inside the disposable namespace. Neither
+            // product recovery nor installation was allowed to remove it.
+            let mut attrs = Vec::new();
+            name_attr(&mut attrs, 1, &journal.name());
+            net.batch(net.generation().unwrap(), &[nft_message(DEL_TABLE, REQUEST | ACK, 2, &attrs)]).unwrap();
             recover(&host, &path).unwrap();
             fs::remove_dir_all(dir).unwrap();
         }).join().unwrap();
