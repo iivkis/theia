@@ -46,6 +46,13 @@ MVP_MERGED_JOBS = frozenset({
       for os in ("ubuntu-latest", "windows-latest") for n in range(1, 7)),
 })
 
+# Distinct target compilation and independent lints/cross-SID checks.
+TARGET_GROUP_MVP_JOBS = MVP_MERGED_JOBS | frozenset({
+    "Native prerequisite (linux-clippy)",
+    "Native prerequisite (windows-clippy)",
+    "Native prerequisite (windows-cross-sid)",
+})
+
 
 class EvidenceError(ValueError):
     """Incomplete or incomparable timing evidence."""
@@ -96,7 +103,9 @@ def summarize(run: dict, response: dict) -> dict:
     if merged and isinstance(jobs, list):
         names = {job.get("name") for job in jobs if isinstance(job, dict)
                  and isinstance(job.get("name"), str)}
-        if names == MVP_MERGED_JOBS:
+        if names == TARGET_GROUP_MVP_JOBS:
+            expected_jobs = TARGET_GROUP_MVP_JOBS
+        elif names == MVP_MERGED_JOBS:
             expected_jobs = MVP_MERGED_JOBS
         elif len(jobs) == len(SHARDED_MERGED_JOBS):
             expected_jobs = SHARDED_MERGED_JOBS

@@ -1,6 +1,6 @@
 # Only used by the full ordinary and instrumented native CI suites.
-# Start real wall-clock admission and liveness cases first, then overlap the
-# other tests. No retries, no default exclusions, no shortened deadlines.
+# Start real wall-clock liveness and terminal CAS cases first, then overlap
+# other integration tests. No retries, exclusions, or shortened deadlines.
 [profile.default]
 test-threads = 4
 retries = 0
@@ -8,9 +8,9 @@ fail-fast = false
 default-filter = "all()"
 
 [[profile.default.overrides]]
-filter = 'test(=compiled_dual_mode_tui_invitation_import_apply_and_rollback)'
+filter = 'test(=production_h2_h3_asymmetric_traffic_half_close_and_idle)'
 priority = 100
 
 [[profile.default.overrides]]
-filter = 'test(=production_h2_h3_asymmetric_traffic_half_close_and_idle)'
+filter = 'test(=compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas)'
 priority = 90

@@ -94,6 +94,20 @@ class TimingTests(unittest.TestCase):
         with self.assertRaises(timing.EvidenceError):
             timing.summarize(run, broken)
 
+    def test_target_group_mvp_matrix_requires_independent_native_checks(self):
+        run, jobs = snapshot(merged=True)
+        template = deepcopy(jobs["jobs"][0])
+        jobs["jobs"] = [{**deepcopy(template), "name": name}
+                        for name in sorted(timing.TARGET_GROUP_MVP_JOBS)]
+        jobs["total_count"] = len(jobs["jobs"])
+        self.assertEqual(len(timing.summarize(run, jobs)["jobs"]), 25)
+        for missing in timing.TARGET_GROUP_MVP_JOBS - timing.MVP_MERGED_JOBS:
+            broken = deepcopy(jobs)
+            broken["jobs"] = [job for job in broken["jobs"] if job["name"] != missing]
+            broken["total_count"] -= 1
+            with self.assertRaises(timing.EvidenceError):
+                timing.summarize(run, broken)
+
     def test_real_sanitized_api_snapshots_match_observed_durations(self):
         path = SOURCE.parents[1] / "tests" / "ci" / "fixtures" / "timing-snapshots.json"
         snapshots = json.loads(path.read_text(encoding="utf-8"))
