@@ -41,7 +41,7 @@ use std::{
     },
     time::Duration,
 };
-use strategy::{Key, Strategy, Verdict};
+use strategy::{Key, Lease, Strategy, Verdict};
 use tokio::{io::AsyncWriteExt, net::TcpStream, sync::Semaphore, time::timeout};
 
 const ATTEMPT: Duration = Duration::from_secs(2);
@@ -517,16 +517,16 @@ impl Engine {
                 let slot = self.probe_slot(&key.name, address, policy);
                 let guard = self.probe_slots[slot].lock().await;
                 if !self.enabled() || !self.policy_current(policy) || network_scope::observe(address) != Some(network) { continue; }
-                let strategy = match self.cache.cached(&key) {
-                    Some(Verdict::Verified(strategy)) => { crate::traffic::dpi_cache_hit(); strategy },
-                    Some(Verdict::Unavailable) => continue,
+                let (strategy, lease) = match self.cache.evidence(&key) {
+                    Some((Verdict::Verified(strategy), lease)) => { crate::traffic::dpi_cache_hit(); (strategy, lease) },
+                    Some((Verdict::Unavailable, _)) => continue,
                     previous => {
                         let _permit = self.probes.try_acquire().ok()?;
                         let config = tokio::task::spawn_blocking(tls::native_config).await.ok()??;
                         let mut verified = None;
                         for strategy in self.cache.ranked(&key) {
                             if !self.enabled() || !self.policy_current(policy) || network_scope::observe(address) != Some(network) { break; }
-                            if matches!(previous, Some(Verdict::Avoid { strategy: failed, .. }) if failed == strategy) { continue; }
+                            if matches!(&previous, Some((Verdict::Avoid { strategy: failed, .. }, _)) if *failed == strategy) { continue; }
                             let started = std::time::Instant::now();
                             let good = timeout(ATTEMPT, tls::probe(&name, address, Some(network), strategy, config.clone()))
                                 .await.ok().flatten().is_some();
@@ -537,12 +537,17 @@ impl Engine {
                                 break;
                             }
                         }
+                        if !self.enabled() || !self.policy_current(policy) || network_scope::observe(address) != Some(network) {
+                            continue;
+                        }
                         let Some(strategy) = verified else {
-                            self.cache.remember(&key, Verdict::Unavailable);
+                            let _ = self.cache.remember(&key, Verdict::Unavailable);
                             continue;
                         };
-                        self.cache.remember(&key, Verdict::Verified(strategy));
-                        strategy
+                        let Some(lease) = self.cache.remember(&key, Verdict::Verified(strategy)) else {
+                            continue;
+                        };
+                        (strategy, lease)
                     }
                 };
                 drop(guard);
@@ -556,6 +561,7 @@ impl Engine {
                         return Some(Tunnel {
                             target,
                             strategy,
+                            lease,
                             engine: self.clone(),
                             key,
                         });
@@ -565,7 +571,7 @@ impl Engine {
                         // the peer or a strategy on the previous network.
                     }
                     _ if self.enabled() && self.policy_current(policy) => {
-                        self.cache.failed(&key, strategy);
+                        self.cache.failed(&key, strategy, &lease);
                     }
                     _ => {}
 
@@ -582,6 +588,7 @@ impl Engine {
 pub(crate) struct Tunnel {
     target: TcpStream,
     strategy: Strategy,
+    lease: Lease,
     engine: Arc<Engine>,
     key: Key,
 }
@@ -647,7 +654,7 @@ impl Tunnel {
                 .target
                 .local_addr()
                 .is_ok_and(|local| self.key.network.matches_local(local))
-            || self.engine.cache.cached(&self.key) != Some(Verdict::Verified(self.strategy))
+            || !self.engine.cache.current(&self.key, self.strategy, &self.lease)
         {
             return Ok(RelayOutcome::Fallback { client, prefix });
         }
@@ -669,7 +676,7 @@ impl Tunnel {
         let response = match response {
             Ok(Ok(tcp::ServerFlight::Hello(response))) => response,
             Ok(Ok(tcp::ServerFlight::Alert(alert))) => {
-                self.engine.cache.failed(&self.key, self.strategy);
+                self.engine.cache.failed(&self.key, self.strategy, &self.lease);
                 crate::traffic::dpi_first_failure();
                 crate::traffic::dpi_tls_alert();
                 // Forward the genuine alert; do not retry or manufacture a
@@ -681,12 +688,12 @@ impl Tunnel {
                 return Err(ClientError::Tls);
             }
             Ok(Err(error)) => {
-                self.engine.cache.failed(&self.key, self.strategy);
+                self.engine.cache.failed(&self.key, self.strategy, &self.lease);
                 crate::traffic::dpi_first_failure();
                 return Err(error);
             }
             Err(_) => {
-                self.engine.cache.failed(&self.key, self.strategy);
+                self.engine.cache.failed(&self.key, self.strategy, &self.lease);
                 crate::traffic::dpi_first_failure();
                 crate::traffic::dpi_timeout();
                 return Err(ClientError::Timeout);
@@ -708,12 +715,12 @@ impl Tunnel {
         // A ServerHello alone is insufficient evidence of usable application
         // traffic. Do not penalize a clean early application disconnect.
         if peer_failure {
-            self.engine.cache.failed(&self.key, self.strategy);
+            self.engine.cache.failed(&self.key, self.strategy, &self.lease);
             crate::traffic::dpi_post_hello_failure();
         } else if exchanged && result.is_ok() {
             self.engine
                 .cache
-                .observe(&self.key, self.strategy, true, hello_elapsed);
+                .succeeded(&self.key, self.strategy, &self.lease, hello_elapsed);
         }
         result?;
         Ok(RelayOutcome::Finished)
@@ -727,6 +734,7 @@ impl Tunnel {
         Self {
             target,
             strategy: Strategy::Header,
+            lease: Lease::new(),
             engine,
             key: Key {
                 name: name.into(),
@@ -976,10 +984,11 @@ mod tests {
                     .find_map(|_| network_scope::observe(tunnel.key.address))
                     .unwrap();
                 tunnel.engine.set_enabled(true);
-                tunnel
+                tunnel.lease = tunnel
                     .engine
                     .cache
-                    .remember(&tunnel.key, Verdict::Verified(Strategy::Header));
+                    .remember(&tunnel.key, Verdict::Verified(Strategy::Header))
+                    .unwrap();
                 let expected = tls::transform(
                     &tls::fixture("example.org"),
                     "example.org",

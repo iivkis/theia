@@ -3,7 +3,7 @@ use crate::network_scope;
 use std::{
     collections::VecDeque,
     net::SocketAddr,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 const CACHE_LIMIT: usize = 128;
@@ -38,8 +38,24 @@ pub(super) enum Verdict {
     Unavailable,
     Avoid { strategy: Strategy, until: Instant },
 }
+// A lease identifies one publication, not just a strategy or a key. Holding
+// it prevents ABA even after eviction, expiry or re-publication.
+#[derive(Clone, Debug)]
+pub(super) struct Lease(Arc<()>);
+
+impl Lease {
+    pub(super) fn new() -> Self {
+        Self(Arc::new(()))
+    }
+
+    fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 struct Entry {
     key: Key,
+    lease: Lease,
     verdict: Verdict,
     expires: Instant,
 }
@@ -114,64 +130,101 @@ impl Cache {
         }
         history.push_back(entry);
     }
-    pub(super) fn cached(&self, key: &Key) -> Option<Verdict> {
+    #[cfg(test)]
+    fn cached(&self, key: &Key) -> Option<Verdict> {
+        self.evidence(key).map(|(verdict, _)| verdict)
+    }
+
+    pub(super) fn evidence(&self, key: &Key) -> Option<(Verdict, Lease)> {
         let mut cache = self.0.lock().ok()?;
         let now = Instant::now();
         cache.retain(|entry| entry.expires > now);
-        cache
-            .iter()
-            .find(|entry| &entry.key == key)
-            .map(|entry| match entry.verdict {
+        cache.iter().find(|entry| &entry.key == key).map(|entry| {
+            let verdict = match entry.verdict {
                 Verdict::Avoid { until, .. } if until > now => Verdict::Unavailable,
                 other => other,
-            })
+            };
+            (verdict, entry.lease.clone())
+        })
     }
 
-    pub(super) fn remember(&self, key: &Key, verdict: Verdict) {
+    pub(super) fn current(&self, key: &Key, strategy: Strategy, lease: &Lease) -> bool {
+        self.evidence(key).is_some_and(|(verdict, current)| {
+            verdict == Verdict::Verified(strategy) && current.same(lease)
+        })
+    }
+
+    pub(super) fn remember(&self, key: &Key, verdict: Verdict) -> Option<Lease> {
         // A network change or loss of OS evidence prevents reuse/publication.
         if network_scope::observe(key.address) != Some(key.network) {
-            return;
+            return None;
         }
-        self.insert(key, verdict);
+        self.insert(key, verdict)
     }
 
-    pub(super) fn insert(&self, key: &Key, verdict: Verdict) {
-        if let Ok(mut cache) = self.0.lock() {
-            let now = Instant::now();
-            cache.retain(|entry| entry.expires > now && &entry.key != key);
-            if cache.len() >= CACHE_LIMIT {
-                cache.pop_front();
-            }
-            let ttl = match verdict {
-                Verdict::Verified(_) | Verdict::Avoid { .. } => POSITIVE_TTL,
-                Verdict::Unavailable => NEGATIVE_TTL,
-            };
-            cache.push_back(Entry {
-                key: key.clone(),
-                verdict,
-                expires: now + ttl,
-            });
+    fn insert(&self, key: &Key, verdict: Verdict) -> Option<Lease> {
+        let mut cache = self.0.lock().ok()?;
+        let now = Instant::now();
+        cache.retain(|entry| entry.expires > now && &entry.key != key);
+        if cache.len() >= CACHE_LIMIT {
+            cache.pop_front();
         }
+        let ttl = match verdict {
+            Verdict::Verified(_) | Verdict::Avoid { .. } => POSITIVE_TTL,
+            Verdict::Unavailable => NEGATIVE_TTL,
+        };
+        let lease = Lease::new();
+        cache.push_back(Entry {
+            key: key.clone(),
+            lease: lease.clone(),
+            verdict,
+            expires: now + ttl,
+        });
+        Some(lease)
     }
 
-    pub(super) fn failed(&self, key: &Key, strategy: Strategy) {
+    pub(super) fn failed(&self, key: &Key, strategy: Strategy, lease: &Lease) {
         if network_scope::observe(key.address) != Some(key.network) {
             return;
         }
-        self.sample(key, strategy, false, Duration::ZERO);
-        self.invalidate_strategy(key, strategy);
+        self.record_outcome(key, strategy, lease, false, Duration::ZERO);
     }
 
-    fn invalidate_strategy(&self, key: &Key, strategy: Strategy) {
+    pub(super) fn succeeded(
+        &self,
+        key: &Key,
+        strategy: Strategy,
+        lease: &Lease,
+        elapsed: Duration,
+    ) {
+        if network_scope::observe(key.address) == Some(key.network) {
+            self.record_outcome(key, strategy, lease, true, elapsed);
+        }
+    }
+
+    fn record_outcome(
+        &self,
+        key: &Key,
+        strategy: Strategy,
+        lease: &Lease,
+        good: bool,
+        elapsed: Duration,
+    ) {
         let Ok(mut cache) = self.0.lock() else {
             return;
         };
         let now = Instant::now();
         cache.retain(|entry| entry.expires > now);
-        if let Some(entry) = cache.iter_mut().find(|entry| &entry.key == key) {
-            // Late results from a previous stream must not invalidate an
-            // independently verified different strategy or extend a cooldown.
-            if entry.verdict == Verdict::Verified(strategy) {
+        if let Some(entry) = cache.iter_mut().find(|entry| {
+            &entry.key == key
+                && entry.verdict == Verdict::Verified(strategy)
+                && entry.lease.same(lease)
+        }) {
+            // Keep the generation check and the history update under the
+            // same cache lock. The lock order is cache -> history; no
+            // history operation holds its lock while acquiring the cache.
+            self.sample(key, strategy, good, elapsed);
+            if !good {
                 entry.verdict = Verdict::Avoid {
                     strategy,
                     until: now + NEGATIVE_TTL,
@@ -214,17 +267,52 @@ mod tests {
             policy: [1; 32],
             network: network_scope::Scope::fixture(address, 0),
         };
-        cache.insert(&key, Verdict::Verified(Strategy::Middle));
-        cache.invalidate_strategy(&key, Strategy::Header);
+        let lease = cache.insert(&key, Verdict::Verified(Strategy::Middle)).unwrap();
+        cache.record_outcome(&key, Strategy::Header, &lease, false, Duration::ZERO);
         assert!(matches!(
             cache.cached(&key),
             Some(Verdict::Verified(Strategy::Middle))
         ));
-        cache.invalidate_strategy(&key, Strategy::Middle);
+        cache.record_outcome(&key, Strategy::Middle, &lease, false, Duration::ZERO);
         let first = cache.0.lock().unwrap().front().unwrap().verdict;
         assert!(matches!(cache.cached(&key), Some(Verdict::Unavailable)));
-        cache.invalidate_strategy(&key, Strategy::Middle);
+        cache.record_outcome(&key, Strategy::Middle, &lease, false, Duration::ZERO);
         assert!(cache.0.lock().unwrap().front().unwrap().verdict == first);
+    }
+
+    #[test]
+    fn stale_same_strategy_cannot_revoke_or_reweight_new_evidence() {
+        let cache = Cache::default();
+        let address = "127.0.0.1:443".parse().unwrap();
+        let key = Key {
+            name: "example.org".into(),
+            address,
+            policy: [1; 32],
+            network: network_scope::Scope::fixture(address, 0),
+        };
+        let old = cache.insert(&key, Verdict::Verified(Strategy::Header)).unwrap();
+        let fresh = cache.insert(&key, Verdict::Verified(Strategy::Header)).unwrap();
+        assert!(!cache.current(&key, Strategy::Header, &old));
+        assert!(cache.current(&key, Strategy::Header, &fresh));
+        cache.record_outcome(&key, Strategy::Header, &old, false, Duration::ZERO);
+        cache.record_outcome(&key, Strategy::Header, &old, true, Duration::from_millis(1));
+        assert!(cache.current(&key, Strategy::Header, &fresh));
+        assert!(cache.1.lock().unwrap().is_empty());
+
+        cache.record_outcome(&key, Strategy::Header, &fresh, false, Duration::ZERO);
+        assert!(matches!(cache.cached(&key), Some(Verdict::Unavailable)));
+        assert_eq!(cache.1.lock().unwrap().front().unwrap().samples[0].failures, 1);
+        // Repeated reports from the same failed lease cannot extend cooldown.
+        let original = cache.0.lock().unwrap().front().unwrap().verdict;
+        cache.record_outcome(&key, Strategy::Header, &fresh, false, Duration::ZERO);
+        assert!(cache.0.lock().unwrap().front().unwrap().verdict == original);
+        assert_eq!(cache.1.lock().unwrap().front().unwrap().samples[0].failures, 1);
+
+        // A retained lease cannot become current after expiry/eviction.
+        cache.0.lock().unwrap().clear();
+        let newest = cache.insert(&key, Verdict::Verified(Strategy::Header)).unwrap();
+        assert!(!cache.current(&key, Strategy::Header, &fresh));
+        assert!(cache.current(&key, Strategy::Header, &newest));
     }
 
     #[test]
@@ -237,7 +325,7 @@ mod tests {
             policy: [1; 32],
             network: network_scope::Scope::fixture(address, 1),
         };
-        cache.insert(&key, Verdict::Verified(Strategy::Header));
+        let _ = cache.insert(&key, Verdict::Verified(Strategy::Header));
         assert!(matches!(
             cache.cached(&key),
             Some(Verdict::Verified(Strategy::Header))
@@ -248,7 +336,7 @@ mod tests {
         key.network = network_scope::Scope::fixture(address, 2);
         assert!(cache.cached(&key).is_none());
         key.network = network_scope::Scope::fixture(address, 1);
-        cache.insert(
+        let _ = cache.insert(
             &key,
             Verdict::Avoid {
                 strategy: Strategy::Header,
@@ -256,7 +344,7 @@ mod tests {
             },
         );
         assert!(matches!(cache.cached(&key), Some(Verdict::Unavailable)));
-        cache.insert(
+        let _ = cache.insert(
             &key,
             Verdict::Avoid {
                 strategy: Strategy::Header,
@@ -272,7 +360,7 @@ mod tests {
         ));
         for i in 0..=CACHE_LIMIT {
             key.name = format!("{i}.example.org");
-            cache.insert(&key, Verdict::Unavailable);
+            let _ = cache.insert(&key, Verdict::Unavailable);
         }
         assert_eq!(cache.0.lock().unwrap().len(), CACHE_LIMIT);
         cache
