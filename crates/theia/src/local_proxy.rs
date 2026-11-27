@@ -2533,7 +2533,7 @@ impl NativeIngress {
             loop {
                 let packet = tokio::select! {
                     _ = heartbeat.tick() => {
-                        if !rules.lock().map_err(|_| ClientError::Configuration)?.current().map_err(|_| ClientError::Io)? {
+                        if !rules.lock().map_err(|_| ClientError::Configuration)?.live_admissions().map_err(|_| ClientError::Io)? {
                             return Err(ClientError::Open(ErrorCode::PolicyDenied));
                         }
                         continue;

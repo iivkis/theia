@@ -104,8 +104,8 @@ try {
                 $plan=[ordered]@{Interface=$id;Luid=$luid;Sub=[Guid]::NewGuid().ToString('B');V4=[Guid]::NewGuid().ToString('B');
                     V6=[Guid]::NewGuid().ToString('B');Marker=[Guid]::NewGuid().ToString('B')}
                 if ($IncludeBootTime) {
-                    $plan.Boot4=[Guid]::NewGuid().ToString('B')
-                    $plan.Boot6=[Guid]::NewGuid().ToString('B')
+                    $plan['Boot4']=[Guid]::NewGuid().ToString('B')
+                    $plan['Boot6']=[Guid]::NewGuid().ToString('B')
                 }
                 $plans+=[pscustomobject]$plan
             }

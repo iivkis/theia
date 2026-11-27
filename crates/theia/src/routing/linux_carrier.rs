@@ -50,6 +50,8 @@ fn verify_descriptor(socket:&impl AsRawFd,transport:Transport)->io::Result<()> {
     for (option,expected) in [
         (libc::SO_TYPE,if transport==Transport::Tcp {libc::SOCK_STREAM}else{libc::SOCK_DGRAM}),
         (libc::SO_PROTOCOL,if transport==Transport::Tcp {libc::IPPROTO_TCP}else{libc::IPPROTO_UDP}),
+        (libc::SO_REUSEADDR,0),
+        (libc::SO_REUSEPORT,0),
     ] {
         let mut value=0i32;
         let mut len=mem::size_of_val(&value) as libc::socklen_t;
@@ -290,6 +292,13 @@ mod tests {
         let socket=UdpSocket::bind("127.0.0.1:0").unwrap();
         assert!(verify_descriptor(&socket,Transport::Udp).is_ok());
         assert!(verify_descriptor(&socket,Transport::Tcp).is_err());
+        let enabled=1i32;
+        assert_eq!(unsafe {libc::setsockopt(socket.as_raw_fd(),libc::SOL_SOCKET,libc::SO_REUSEADDR,
+            (&enabled as *const i32).cast(),mem::size_of_val(&enabled) as libc::socklen_t)},0);
+        assert!(verify_descriptor(&socket,Transport::Udp).is_err());
+        let disabled=0i32;
+        assert_eq!(unsafe {libc::setsockopt(socket.as_raw_fd(),libc::SOL_SOCKET,libc::SO_REUSEADDR,
+            (&disabled as *const i32).cast(),mem::size_of_val(&disabled) as libc::socklen_t)},0);
         let raw=unsafe {libc::fcntl(socket.as_raw_fd(),libc::F_DUPFD,0)};
         assert!(raw>=0);
         let fd=unsafe {OwnedFd::from_raw_fd(raw)};

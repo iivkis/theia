@@ -935,9 +935,25 @@ impl LabRules {
         Self::install_inner(None,host_namespace,path,Vec::new(),None,Some(scope))
     }
 
+    /// Check every retained descriptor against the published admissions,
+    /// not merely the existence of the nftables table. A changed socket
+    /// is terminal for this epoch; shutdown revokes all marks and rules.
+    pub(crate) fn live_admissions(&self)->io::Result<bool> {
+        if self.carrier_retired || !self.current()? ||
+            self.admissions.len()!=self._carriers.len()+self.dynamic.len() {
+            return Ok(false);
+        }
+        for socket in self._carriers.iter().chain(self.dynamic.values().map(Arc::as_ref)) {
+            if socket.verify().is_err() || self.admissions.get(&socket.mark())!=Some(&socket.key()) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub(crate) fn redirect_ready(&self,port:u16)->io::Result<bool> {
         let Some(scope)=self.journal.redirect else {return Ok(false);};
-        Ok(scope.port==port && self.current()? && redirect_routes_ready(scope)?)
+        Ok(scope.port==port && self.live_admissions()? && redirect_routes_ready(scope)?)
     }
 
     fn install_inner(
@@ -956,14 +972,16 @@ impl LabRules {
         }
         let mut marks = std::collections::HashSet::new();
         let mut cookies = std::collections::HashSet::new();
+        let mut keys=std::collections::HashSet::new();
         if let Some(tag) = &capture {
             tag.socket.verify()?;
             marks.insert(tag.socket.mark());
             cookies.insert(tag.socket.cookie());
+            keys.insert(tag.socket.key());
         }
         for socket in &carriers {
             socket.verify()?;
-            if !marks.insert(socket.mark()) || !cookies.insert(socket.cookie()) {
+            if !marks.insert(socket.mark()) || !cookies.insert(socket.cookie()) || !keys.insert(socket.key()) {
                 return Err(refused());
             }
         }
@@ -1099,6 +1117,7 @@ impl LabRules {
             || socket.mark()==REDIRECT_MARK
             || self.used_marks.contains(&socket.mark())
             || self.used_cookies.contains(&socket.cookie())
+            || self.admissions.values().any(|key|*key==socket.key())
             || self.capture.as_ref().is_some_and(|tag|tag.socket.key()==socket.key())
         {
             return Err(refused());
