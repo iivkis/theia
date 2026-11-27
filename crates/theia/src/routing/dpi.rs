@@ -39,7 +39,8 @@ use std::{
     time::Duration,
 };
 use strategy::{Key, Lease, Strategy, Verdict};
-use tokio::{io::AsyncWriteExt, net::TcpStream, sync::Semaphore, time::timeout};
+use tokio::{io::AsyncWriteExt, net::TcpStream, time::timeout};
+use crate::net::probe::{self, ProbeScheduler};
 
 const ATTEMPT: Duration = Duration::from_secs(2);
 const PROBE_WAVE: usize = 2;
@@ -54,9 +55,7 @@ use super::policy_lease::{PolicyLease, PolicyState};
 pub(crate) struct Engine {
     policy: Arc<PolicyState>,
     cache: strategy::Cache,
-    probes: Semaphore,
-    // Bounded lock stripes coalesce simultaneous probes without an unbounded map.
-    probe_slots: [tokio::sync::Mutex<()>; 32],
+    scheduler: ProbeScheduler,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -247,8 +246,7 @@ impl Engine {
         Self {
             policy,
             cache: strategy::Cache::default(),
-            probes: Semaphore::new(4),
-            probe_slots: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
+            scheduler: ProbeScheduler::new(4),
         }
     }
     pub(crate) fn set_enabled(&self, enabled: bool) { self.policy.set_enabled(enabled); }
@@ -272,13 +270,6 @@ impl Engine {
     }
 
     pub(crate) fn enabled(&self) -> bool { self.policy.enabled() }
-
-    fn probe_slot(&self, name: &str, address: SocketAddr, policy: [u8; 32]) -> usize {
-        use std::hash::{Hash, Hasher};
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
-        (name, address, policy).hash(&mut hash);
-        (hash.finish() as usize) % self.probe_slots.len()
-    }
 
     fn udp_evidence(&self, key: &Key, probe: UdpProbe) -> Option<(bool, Lease)> {
         self.cache.udp_evidence(key, probe)
@@ -399,10 +390,9 @@ impl Engine {
             async move {
                 let address = key.address;
                 let live = || self.key_live(&key) && (!stun || self.stun_enabled());
-                let slot = &self.probe_slots[self.probe_slot(&name, address, policy)];
                 // Contention before a probe is a safe budget fallback, not
                 // a negative strategy result or an ambiguous handshake.
-                let Ok(_guard) = timeout(Duration::from_millis(250), slot.lock()).await else { return Ok(None) };
+                let Some(_guard) = self.scheduler.lock((name, address, policy), Duration::from_millis(250)).await else { return Ok(None) };
                 if !live() { return Err(stale_policy()); }
                 let cached = self.udp_evidence(&key, probe);
                 let lease = match cached {
@@ -412,10 +402,10 @@ impl Engine {
                         lease
                     }
                     _ => {
-                        let Ok(_permit) = self.probes.try_acquire() else { return Ok(None) };
+                        let Ok(_permit) = self.scheduler.try_acquire() else { return Ok(None) };
                         let ceiling = if stun { Duration::from_millis(1200) } else { ATTEMPT };
                         let budget = self.cache.udp_budget(&key, probe, ceiling);
-                        if deadline.saturating_duration_since(tokio::time::Instant::now()) < budget + ATTEMPT {
+                        if !probe::fits(deadline, budget, ATTEMPT) {
                             return Ok(None);
                         }
                         let started = std::time::Instant::now();
@@ -425,7 +415,7 @@ impl Engine {
                                 if !live() { return Err(stale_policy()); }
                                 // A shorter outer budget must not mask a
                                 // received but unauthenticated QUIC handshake.
-                                if deadline.saturating_duration_since(tokio::time::Instant::now()) < budget + ATTEMPT { return Ok(None); }
+                                if !probe::fits(deadline, budget, ATTEMPT) { return Ok(None); }
                                 let revoked = async {
                                     loop {
                                         if !live() { return Err(stale_policy()); }
@@ -523,8 +513,7 @@ impl Engine {
                 let address = SocketAddr::new(*ip, port);
                 let Some(network) = network_scope::observe(address) else { continue };
                 let key = Key { name: name.clone(), address, policy, epoch, network };
-                let slot = self.probe_slot(&key.name, address, policy);
-                let Ok(guard) = timeout(Duration::from_millis(250), self.probe_slots[slot].lock()).await else { return Ok(None) };
+                let Some(guard) = self.scheduler.lock((&key.name, address, policy), Duration::from_millis(250)).await else { return Ok(None) };
                 if !self.key_live(&key) { return Err(stale_policy()); }
                 let (strategy, lease) = match self.cache.evidence(&key) {
                     Some((Verdict::Verified(strategy), lease)) => {
@@ -552,10 +541,10 @@ impl Engine {
                                 let config = config.clone();
                                 async move {
                                     let budget = self.cache.tcp_budget(key, strategy, ATTEMPT);
-                                    if deadline.saturating_duration_since(tokio::time::Instant::now()) < budget + ATTEMPT {
+                                    if !probe::fits(deadline, budget, ATTEMPT) {
                                         return None;
                                     }
-                                    let _permit = self.probes.try_acquire().ok()?;
+                                    let _permit = self.scheduler.try_acquire().ok()?;
                                     let started = std::time::Instant::now();
                                     let mut rtt = None;
                                     let verdict = tls::probe_measured(
@@ -656,9 +645,8 @@ impl Engine {
     pub(crate) async fn refresh_tcp(&self, target: RefreshTarget) {
         let RefreshTarget { key, strategy, lease } = target;
         if !self.key_live(&key) { return; }
-        let slot = &self.probe_slots[self.probe_slot(&key.name, key.address, key.policy)];
-        let Ok(_guard) = slot.try_lock() else { return };
-        let Ok(_permit) = self.probes.try_acquire() else { return };
+        let Some(_guard) = self.scheduler.try_lock((&key.name, key.address, key.policy)) else { return };
+        let Ok(_permit) = self.scheduler.try_acquire() else { return };
         if !self.key_live(&key) || !self.cache.current(&key, strategy, &lease) { return; }
         let Ok(Some(config)) = tokio::task::spawn_blocking(tls::native_config).await else { return };
         let budget = self.cache.tcp_budget(&key, strategy, ATTEMPT);

@@ -13,11 +13,11 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{sync::Semaphore, time::timeout};
+use tokio::time::timeout;
+use crate::net::probe::REFERENCE_PROBES;
 use tokio_rustls::TlsConnector;
 
 const MAX_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(5);
-static ACTIVE_PROBES: Semaphore = Semaphore::const_new(4);
 
 /// Observe the locally selected source address for an existing OS route.
 /// UDP connect() selects a route but sends no packet. This tells us neither
@@ -131,7 +131,7 @@ pub async fn probe_tls_h2(
     let start = Instant::now();
 
     timeout(deadline, async move {
-        let _permit = ACTIVE_PROBES
+        let _permit = REFERENCE_PROBES
             .acquire()
             .await
             .map_err(|_| ProbeError::ConnectFailed)?;

@@ -20,7 +20,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::{sync::Semaphore, task::JoinHandle, time::timeout};
+use tokio::{task::JoinHandle, time::timeout};
 use tokio_rustls::TlsConnector;
 
 pub const MAX_PLAN: usize = 16 * 1024;
@@ -36,7 +36,7 @@ const BATCH: Duration = Duration::from_secs(60);
 const INTERVAL: u64 = 12 * 60 * 60;
 const JITTER: u64 = 30 * 60;
 const FAILURE_THRESHOLD: u8 = 2;
-static ACTIVE: Semaphore = Semaphore::const_new(1);
+static ACTIVE: crate::net::probe::ProbeBudget = crate::net::probe::ProbeBudget::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {

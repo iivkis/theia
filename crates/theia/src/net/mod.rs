@@ -2,3 +2,4 @@
 pub(crate) mod evidence;
 pub(crate) mod error;
 pub(crate) mod tls;
+pub(crate) mod probe;

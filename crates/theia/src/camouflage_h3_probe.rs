@@ -14,10 +14,10 @@ use std::{
     net::{IpAddr, SocketAddr},
     time::{Duration, Instant},
 };
-use tokio::{sync::Semaphore, time::timeout};
+use tokio::time::timeout;
+use crate::net::probe::REFERENCE_PROBES;
 
 const MAX_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(5);
-static ACTIVE_H3_PROBES: Semaphore = Semaphore::const_new(4);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum H3ProbeError {
@@ -82,7 +82,7 @@ pub async fn probe_quic_h3(
     let start = Instant::now();
     let deadline = request.deadline.min(MAX_HANDSHAKE_DEADLINE);
     timeout(deadline, async move {
-        let _permit = ACTIVE_H3_PROBES
+        let _permit = REFERENCE_PROBES
             .acquire()
             .await
             .map_err(|_| H3ProbeError::BindFailed)?;
@@ -161,7 +161,7 @@ pub async fn probe_quic_h3_native(
     }
     let start = Instant::now();
     timeout(request.deadline.min(MAX_HANDSHAKE_DEADLINE), async move {
-        let _permit = ACTIVE_H3_PROBES
+        let _permit = REFERENCE_PROBES
             .acquire()
             .await
             .map_err(|_| H3ProbeError::BindFailed)?;

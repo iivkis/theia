@@ -15,7 +15,6 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::Semaphore,
     time::timeout,
 };
 use tokio_rustls::TlsConnector;
@@ -38,7 +37,7 @@ pub enum IpifyConsent {
 const MAX_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_RESPONSE_HEADER: usize = 4096;
 const MAX_RESPONSE_BODY: usize = 64;
-static ACTIVE_EGRESS_REQUESTS: Semaphore = Semaphore::const_new(2);
+static ACTIVE_EGRESS_REQUESTS: crate::net::probe::ProbeBudget = crate::net::probe::ProbeBudget::new(2);
 
 /// Caller-granted scope, not automatically derived from a local interface,
 /// provider CIDR, popular domain, or external service response. Only a single
