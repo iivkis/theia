@@ -359,9 +359,9 @@ impl Panel {
                 }
             }
             KeyCode::Char('e') if self.phase == Phase::Done && !self.checks.is_empty() => {
-                if self.export().is_err() {
+                self.export().unwrap_or_else(|_| {
                     self.error = "Не удалось записать обезличенный отчёт.".into();
-                }
+                });
             }
             _ => {}
         }
