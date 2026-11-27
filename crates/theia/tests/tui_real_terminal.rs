@@ -550,11 +550,10 @@ async fn compiled_dual_mode_tui_invitation_import_apply_and_rollback() {
     })
     .await
     .unwrap();
-    // The actual production process deliberately rejects admission timestamps
-    // through startup + 120s to prevent cross-restart replay without a journal.
-    // Readiness above proves IPC only, not admission. Wait outside the bounded
-    // interactive terminal scenario; do not backdate or bypass the replay guard.
-    sleep(Duration::from_secs(121)).await;
+    // The real server rejects REALITY admission through startup + 120s.
+    // The driver starts its monotonic 121s barrier only AFTER this readiness
+    // check, overlaps independent Own-TLS work, and waits before REALITY
+    // enrollment. No test clock override or backdating of admission.
     assert!(running.0.try_wait().unwrap().is_none());
     assert!(cli_status(binary, env_key, &endpoint, 1));
     let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -575,7 +574,9 @@ async fn compiled_dual_mode_tui_invitation_import_apply_and_rollback() {
         "python3"
     };
     let output = timeout(
-        Duration::from_secs(50),
+        // Same total budget as the previous 121s sleep + 50s driver.
+        // The driver separately enforces a 50s active-work budget.
+        Duration::from_secs(171),
         tokio::task::spawn_blocking(move || {
             Command::new(interpreter)
                 .arg(script)
@@ -612,6 +613,7 @@ async fn compiled_dual_mode_tui_invitation_import_apply_and_rollback() {
     .unwrap()
     .unwrap();
     echo_task.abort();
+    assert!(running.0.try_wait().unwrap().is_none());
     assert!(
         output.status.success(),
         "dual-mode terminal scenario failed: {}",

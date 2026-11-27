@@ -359,7 +359,8 @@ jobs:
   native-checks:
     name: Native prerequisite (${{ matrix.check }})
     needs: specification
-    if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
+    cache-mode: write
+    if: github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'dev' && github.event.pull_request.head.repo.full_name == github.repository && needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -385,11 +386,21 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        if: matrix.check != 'windows-clippy'
         with:
           shared-key: native-default-deps-v4
           cache-workspace-crates: false
           cache-bin: false
           save-if: false
+      # cargo check/Clippy uses different dependency fingerprints from cargo test.
+      # Persist only the successful trusted Windows check's dependencies.
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.check == 'windows-clippy'
+        with:
+          shared-key: native-clippy-deps-v1
+          cache-workspace-crates: false
+          cache-bin: false
+          save-if: true
       - name: Install native eBPF linker for all-feature lint
         if: matrix.check == 'linux-clippy'
         run: sudo apt-get install -y --no-install-recommends libbpf-dev
@@ -433,7 +444,20 @@ jobs:
         with:
           distribution: Ubuntu-24.04
           wsl-version: 2
-          additional-packages: python3 openssl
+      - name: Verify guest fixture dependencies; install only when missing
+        shell: pwsh
+        run: |
+          wsl.exe --distribution Ubuntu-24.04 -- sh -ec 'command -v python3 >/dev/null && command -v openssl >/dev/null'
+          if ($LASTEXITCODE -ne 0) {
+            wsl.exe --distribution Ubuntu-24.04 --user root -- apt-get update
+            if ($LASTEXITCODE -ne 0) { throw 'WSL package index update failed' }
+            wsl.exe --distribution Ubuntu-24.04 --user root -- apt-get install --yes --no-install-recommends python3 openssl
+            if ($LASTEXITCODE -ne 0) { throw 'WSL fixture dependency installation failed' }
+          }
+          wsl.exe --distribution Ubuntu-24.04 -- python3 -c 'import sys; assert sys.version_info >= (3, 10)'
+          if ($LASTEXITCODE -ne 0) { throw 'WSL fixture requires Python >= 3.10' }
+          wsl.exe --distribution Ubuntu-24.04 -- openssl version
+          if ($LASTEXITCODE -ne 0) { throw 'WSL OpenSSL fixture unavailable' }
       - name: Prove separate Linux VM kernel before starting E2E
         shell: pwsh
         run: |
@@ -481,6 +505,7 @@ jobs:
         with:
           tool: cargo-llvm-cov@0.9.1
       - uses: taiki-e/install-action@v2
+        if: matrix.shard <= 2
         with:
           tool: cargo-nextest@0.9.140
       - uses: Swatinem/rust-cache@v2
@@ -494,12 +519,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install pinned real-terminal test dependencies
-        if: matrix.shard <= 4 || matrix.shard == 6
+      - name: Install pinned Linux terminal test dependencies
+        if: runner.os == 'Linux' && matrix.shard <= 4
         run: python -m pip install pyte==0.8.2
-      - name: Install pinned Windows ConPTY test dependency
-        if: runner.os == 'Windows' && (matrix.shard <= 4 || matrix.shard == 6)
-        run: python -m pip install pywinpty==3.0.5
+      - name: Install pinned Windows terminal test dependencies
+        if: runner.os == 'Windows' && matrix.shard <= 4
+        run: python -m pip install pyte==0.8.2 pywinpty==3.0.5
       - name: Install native eBPF linker dependency (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get install -y --no-install-recommends libbpf-dev
@@ -521,25 +546,31 @@ jobs:
       - name: Instrument all native unit and binary tests
         if: matrix.shard == 1
         run: cargo llvm-cov nextest --workspace --lib --bins --all-features --locked --no-report --no-fail-fast
-      - name: Instrument all native integration tests
-        if: matrix.shard == 2
-        run: cargo llvm-cov nextest --workspace --test '*' --all-features --locked --no-report --no-fail-fast
-      - name: Instrument real dual-mode TUI and startup replay guard
-        if: matrix.shard == 3
-        shell: pwsh
-        run: |
-          cargo llvm-cov test --workspace --all-features --locked --no-report --test tui_real_terminal -- compiled_dual_mode_tui_invitation_import_apply_and_rollback --ignored --exact --nocapture 2>&1 | Tee-Object -Variable result
-          if ($LASTEXITCODE -ne 0 -or ($result -join "`n") -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;') { throw 'Real startup replay guard and dual-mode TUI did not pass' }
-      - name: Instrument real disposable Windows proxy and ConPTY lifecycle
-        if: runner.os == 'Windows' && matrix.shard == 6
+      - name: Instrument real disposable Windows WinINet lifecycle
+        if: runner.os == 'Windows' && matrix.shard == 1
         shell: pwsh
         env:
           THEIA_WINDOWS_PROXY_E2E_ALLOWED: "yes"
         run: |
           cargo llvm-cov test --workspace --all-features --locked --no-report --lib -- windows_system_proxy::tests::native_wininet_cas_recovery_and_foreign_override --ignored --exact --nocapture 2>&1 | Tee-Object -Variable result
           if ($LASTEXITCODE -ne 0 -or ($result -join "`n") -notmatch 'test windows_system_proxy::tests::native_wininet_cas_recovery_and_foreign_override \.\.\. ok') { throw 'Instrumented real WinINet CAS and recovery failed or did not execute' }
+      - name: Instrument all native integration tests
+        if: matrix.shard == 2
+        run: cargo llvm-cov nextest --workspace --test '*' --all-features --locked --no-report --no-fail-fast
+      - name: Instrument real disposable Windows ConPTY lifecycle
+        if: runner.os == 'Windows' && matrix.shard == 2
+        shell: pwsh
+        env:
+          THEIA_WINDOWS_PROXY_E2E_ALLOWED: "yes"
+        run: |
           cargo llvm-cov test --workspace --all-features --locked --no-report --test tui_real_terminal -- compiled_client_proxy_conpty_lifecycle --ignored --exact --nocapture 2>&1 | Tee-Object -Variable result
           if ($LASTEXITCODE -ne 0 -or ($result -join "`n") -notmatch 'test compiled_client_proxy_conpty_lifecycle \.\.\. ok') { throw 'Instrumented real ConPTY lifecycle failed or did not execute' }
+      - name: Instrument real dual-mode TUI and startup replay guard
+        if: matrix.shard == 3
+        shell: pwsh
+        run: |
+          cargo llvm-cov test --workspace --all-features --locked --no-report --test tui_real_terminal -- compiled_dual_mode_tui_invitation_import_apply_and_rollback --ignored --exact --nocapture 2>&1 | Tee-Object -Variable result
+          if ($LASTEXITCODE -ne 0 -or ($result -join "`n") -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;') { throw 'Real startup replay guard and dual-mode TUI did not pass' }
       - name: Instrument independent protocol and browser interoperability
         if: matrix.shard >= 4
         shell: pwsh
