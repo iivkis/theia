@@ -528,7 +528,7 @@ fn page_actions_for(
         (Role::Client, 6) => &[
             ('j', "Обновить состояние"),
             ('d', "Разрешить / отключить Anti-DPI"),
-            ('u', "Разрешить / отключить локальный STUN"),
+            ('u', "Отозвать сохранённое согласие STUN"),
         ],
         (Role::Client, 5) => &[('S', "Сохранить файл"), ('o', "Открыть другой файл")],
         _ => &[],
@@ -559,7 +559,7 @@ fn page_actions_for(
                 (_, 'E') => has_record && !reality,
                 (Role::Server, 'D') => editor.record_count() > 1,
                 (Role::Client, 'D' | 'A') => has_record && !active,
-                (Role::Client, 'u') => editor.direct_dpi_allowed(),
+                (Role::Client, 'u') => editor.direct_dpi_stun_allowed(),
                 (Role::Client, 'L') => editor.record_count() > 1,
                 (Role::Server, 'b') => can_recover,
                 (Role::Server, 'x' | 't') => can_rotate,
@@ -570,10 +570,7 @@ fn page_actions_for(
             let label = match (role, key) {
                 (Role::Client, 'd') if editor.direct_dpi_allowed() => "Отключить Anti-DPI",
                 (Role::Client, 'd') => "Разрешить Anti-DPI",
-                (Role::Client, 'u') if editor.direct_dpi_stun_allowed() => {
-                    "Отключить локальный STUN"
-                }
-                (Role::Client, 'u') => "Разрешить локальный STUN",
+                (Role::Client, 'u') => "Отозвать согласие STUN",
                 (Role::Client, 'V') if !active => "Состояние выбранного профиля",
                 (_, 'z') if advanced => "Скрыть расширенные настройки",
                 _ => label,
@@ -7202,7 +7199,7 @@ fn draw_page(
                 } else {
                     ui.and_then(|u| u.routing_observation.as_ref()).filter(|o| o.digest == editor.saved_sha256()).map_or_else(|| "Проверяем состояние клиента…".into(), RoutingObservation::body)
                 };
-                format!("Anti-DPI выбранного профиля: {}\n{observation}", if editor.direct_dpi_stun_allowed() { "разрешён; TLS/QUIC v1 и STUN Binding (экспериментально)" } else if editor.direct_dpi_allowed() { "разрешён; TLS/QUIC v1, STUN выключен" } else { "выключен (резерв VPS)" })
+                format!("Anti-DPI выбранного профиля: {}\nUDP Modify в System Proxy недоступен; правило Anti-DPI использует VPS.\n{observation}", if editor.direct_dpi_allowed() { "разрешён TCP/TLS; отдельное согласие STUN не активирует UDP" } else { "выключен (резерв VPS)" })
             }
             (Role::Server,7) => editor.routing_settings().map_or_else(|| "Правил нет. По умолчанию весь трафик Theia идёт через сервер.".into(), |s| format!("Ревизия: {} · правил: {}\nGeoData: {}\nСохраните TOML, затем примените через Управление.", s.revision, s.rules.len(), s.datasets.as_ref().map_or("не выбраны", |m| m.release.as_str()))),
             (_,5) => format!("Файл: {}\n{}\nСохранение не меняет работающий процесс.", editor.saved_path().display(), editor.settings_summary()),

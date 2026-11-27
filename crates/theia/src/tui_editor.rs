@@ -1384,9 +1384,9 @@ impl Editor {
                 "Отключить Anti-DPI"
             },
             body: if enable {
-                "Разрешить локальный Anti-DPI для выбранного профиля?\n\nДля правил direct_dpi возможен прямой выход и независимая TLS/QUIC-проверка назначения: сайт увидит IP вашего устройства. STUN разрешается отдельно. DNS запрашивается через Theia. Остальные правила не меняются.\nСохранение не запускает режим; перезапустите клиент.\n\ny: разрешить · n/Esc: отменить".into()
+                "Разрешить локальный Anti-DPI для выбранного профиля?\n\nДля правил direct_via_client_anti_dpi возможен локальный TCP/TLS-выход и независимая TLS-проверка назначения: сайт увидит IP вашего устройства. Локальный UDP Modify недоступен; для UDP этого правила используется VPS. DNS запрашивается через Theia. Остальные правила не меняются.\nСохранение не запускает режим; перезапустите клиент.\n\ny: разрешить · n/Esc: отменить".into()
             } else {
-                "Отключить локальный Anti-DPI?\nПравила direct_dpi будут использовать VPS после перезапуска клиента. Текущие соединения не изменятся.\n\ny: отключить · n/Esc: отменить".into()
+                "Отключить локальный Anti-DPI?\nПравила direct_via_client_anti_dpi будут использовать VPS после применения нового поколения клиента.\n\ny: отключить · n/Esc: отменить".into()
             },
         })
     }
@@ -1399,7 +1399,9 @@ impl Editor {
         if !self.direct_dpi_allowed() {
             return Err("Сначала разрешите и сохраните Anti-DPI.");
         }
-        let enable = !self.direct_dpi_stun_allowed();
+        if !self.direct_dpi_stun_allowed() {
+            return Err("Локальный UDP Anti-DPI недоступен в MVP; согласие нельзя включить до отдельной приёмки.");
+        }
         let mut candidate = self.original.clone();
         let Config::Client(doc) = &mut candidate else {
             return Err("Требуется клиентская конфигурация.");
@@ -1407,7 +1409,7 @@ impl Editor {
         let profile = doc.client.profiles.iter_mut()
             .find(|p| p.id == self.selected_record_id())
             .ok_or("Профиль не найден.")?;
-        profile.direct_dpi_stun = Some(enable);
+        profile.direct_dpi_stun = Some(false);
         candidate
             .validate()
             .map_err(|_| "Настройки клиента не прошли проверку.")?;
@@ -1416,16 +1418,8 @@ impl Editor {
             selected: self.selected_record_id().to_owned(),
             candidate,
             next_selection: self.selected_record,
-            confirmation_label: if enable {
-                "Разрешить STUN"
-            } else {
-                "Отключить STUN"
-            },
-            body: if enable {
-                "Разрешить экспериментальный локальный STUN Binding?\n\nТолько direct_dpi, публичный домен и UDP/3478. Сервер STUN увидит IP устройства. Независимый ответ подтверждает доступность, но не удостоверяет сервер. Возможен дополнительный FINGERPRINT без изменения защищённых полей. ICE/TURN и прочий UDP остаются через VPS.\nСохраните настройки и перезапустите клиент.\n\ny: разрешить · n/Esc: отменить".into()
-            } else {
-                "Отключить локальный STUN? После сохранения и перезапуска новые STUN direct_dpi будут идти через VPS.\n\ny: отключить · n/Esc: отменить".into()
-            },
+            confirmation_label: "Отозвать согласие STUN",
+            body: "Отозвать сохранённое согласие STUN? Локальный UDP Modify в System Proxy и сейчас недоступен. Изменение не запускает сеть.\n\ny: отозвать · n/Esc: отменить".into(),
         })
     }
 

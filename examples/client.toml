@@ -24,9 +24,9 @@ quic_negative_cache_ttl_s = 900
 # Explicit local consent: selected direct_dpi rules may expose your device IP
 # to the destination and perform a separate authenticated TLS probe. Off by default.
 # direct_dpi = true
-# Separate opt-in for credential-free STUN Binding on pinned public domain:3478.
-# The STUN server sees your device IP; reachability is not authentication.
-# direct_dpi_stun = true
+# Reserved future lab consent; does not activate UDP Modify in System Proxy MVP.
+# UDP matching direct_via_client_anti_dpi uses authenticated XHTTP fallback.
+# direct_dpi_stun = false
 
 [client.proxy]
 http_listen = "127.0.0.1:7890"

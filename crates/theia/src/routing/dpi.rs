@@ -116,6 +116,7 @@ impl VerifiedUdp {
             engine: self.engine.clone(),
             digest: self.key.policy,
             epoch: self.key.epoch,
+            scope: None,
         }
     }
 
@@ -266,7 +267,7 @@ impl Engine {
     }
 
     pub(crate) fn pin_policy(self: &Arc<Self>, digest: [u8; 32]) -> Result<FallbackPolicy, ClientError> {
-        Ok(FallbackPolicy { engine: self.clone(), digest, epoch: self.policy_epoch(digest)? })
+        Ok(FallbackPolicy { engine: self.clone(), digest, epoch: self.policy_epoch(digest)?, scope: None })
     }
 
     fn check_key_policy(&self, key: &Key) -> Result<(), ClientError> {
@@ -671,10 +672,15 @@ pub(crate) struct FallbackPolicy {
     engine: Arc<Engine>,
     digest: [u8; 32],
     epoch: u64,
+    scope: Option<(SocketAddr, network_scope::Scope)>,
 }
 impl FallbackPolicy {
     pub(crate) fn check(&self) -> Result<(), ClientError> {
-        if self.engine.policy_epoch(self.digest)? == self.epoch { Ok(()) } else { Err(stale_policy()) }
+        if self.engine.policy_epoch(self.digest)? != self.epoch { return Err(stale_policy()); }
+        if self.scope.is_some_and(|(address, scope)| !self.engine.enabled() || network_scope::observe(address) != Some(scope)) {
+            return Err(stale_policy());
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -707,6 +713,7 @@ impl Tunnel {
             engine: self.engine.clone(),
             digest: self.key.policy,
             epoch: self.key.epoch,
+            scope: self.engine.enabled().then_some((self.key.address, self.key.network)),
         }
     }
 
@@ -734,6 +741,7 @@ impl Tunnel {
     ) -> Result<RelayOutcome, ClientError> {
         // A superseded/expired policy is not permission for VPS fallback.
         self.engine.check_key_policy(&self.key)?;
+        if flow.is_some() && !self.engine.key_live(&self.key) { return Err(stale_policy()); }
         let transformed = if ready {
             tls::transform(&prefix, &self.key.name, self.strategy)
         } else {
@@ -965,6 +973,7 @@ mod tests {
             engine: engine.clone(),
             digest,
             epoch: engine.policy_epoch(digest).unwrap(),
+            scope: None,
         };
         assert!(authorization.check().is_ok());
         engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(
