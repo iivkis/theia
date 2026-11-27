@@ -57,6 +57,14 @@ pub(crate) fn read_product_source(raw: &str) -> Result<ProductSource, ImportErro
         )
     };
     let wire = crate::invite::decode_wire(&uri).map_err(|_| ImportError::InvalidSource)?;
+    if !inline && wire.token.is_some() {
+        let protected = crate::reality_bootstrap::read_text(
+            Path::new(raw), crate::invite::MAX_URI, true,
+        ).map_err(|_| ImportError::InvalidSource)?;
+        if protected.trim_end_matches(['\r', '\n']) != uri.as_str() {
+            return Err(ImportError::InvalidSource);
+        }
+    }
     match wire.security_mode {
         crate::invite::WireSecurity::OwnTls => Invitation::decode(&uri)
             .map(ProductSource::OwnTls)
@@ -94,7 +102,17 @@ pub fn read_source(raw: &str) -> Result<Invitation, ImportError> {
     }
     let contents = read_local_file(Path::new(raw), MAX_URI)?;
     let value = std::str::from_utf8(&contents).map_err(|_| ImportError::InvalidSource)?;
-    Invitation::decode(value.trim_end_matches(['\r', '\n'])).map_err(|_| ImportError::InvalidSource)
+    let uri = value.trim_end_matches(['\r', '\n']);
+    let invite = Invitation::decode(uri).map_err(|_| ImportError::InvalidSource)?;
+    if invite.has_token() {
+        let protected = crate::reality_bootstrap::read_text(
+            Path::new(raw), crate::invite::MAX_URI, true,
+        ).map_err(|_| ImportError::InvalidSource)?;
+        if protected.trim_end_matches(['\r', '\n']) != uri {
+            return Err(ImportError::InvalidSource);
+        }
+    }
+    Ok(invite)
 }
 
 fn read_local_file(path: &Path, limit: u64) -> Result<Zeroizing<Vec<u8>>, ImportError> {
@@ -671,10 +689,7 @@ mod storage_tests {
     fn confidential_export_uses_private_distinct_create_new_files() {
         let scratch = Scratch::new();
         let path = scratch.0.join("server.toml");
-        let source = include_str!("../../../examples/server.toml").replace(
-            "REPLACE_WITH_64_LOWERCASE_HEX",
-            &format!("{:x}", sha2::Sha256::digest([0x42; 32])),
-        );
+        let source = crate::invite::fixture_server_source(&[0x42; 32]);
         let server = crate::config::parse(&source).unwrap();
         let public = Invitation::public_from_server(&server, "public").unwrap();
         assert!(export_invitation_file(&path, &public).is_err());

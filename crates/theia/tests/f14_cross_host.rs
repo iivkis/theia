@@ -189,7 +189,7 @@ async fn client_scenario(
             .unwrap();
     } else {
         editor
-            .import_invitation(&invitation, Some(&ca_ref), None)
+            .import_invitation(&invitation, None, None)
             .unwrap();
     }
     assert!(
@@ -209,6 +209,7 @@ async fn client_scenario(
         assert_eq!(imported.auth_token, "env:THEIA_F14_XHOST_WRONG_TOKEN");
     } else {
         assert!(imported.auth_token.starts_with("file:"));
+        assert_eq!(imported.tls_ca, invitation.trust_reference());
     }
     assert_eq!(client_doc.client.proxy.system_proxy, SystemProxy::Off);
     assert!(!fs::read_to_string(&config_path)
@@ -437,7 +438,12 @@ async fn linux_server_windows_client_f14_h2_h3_open_ok() {
             .unwrap()
             .try_into()
             .unwrap();
-        let config = config::read_file(Path::new(&server_config)).unwrap();
+        let mut config = config::read_file(Path::new(&server_config)).unwrap();
+        let Config::Server(server) = &mut config else { panic!("server fixture"); };
+        // The independently transferred public certificate is the actual
+        // server certificate; its private key remains on the Linux node.
+        server.server.inbounds.iter_mut().find(|inbound| inbound.id == "cross")
+            .unwrap().tls_cert = format!("file:{}", trusted_ca.display());
         let fixture = CrossOsFixture {
             source: &config,
             endpoint: &endpoint,

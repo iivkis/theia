@@ -4049,9 +4049,10 @@ impl Interaction {
                             }
                             Ok(client_import::ProductSource::OwnTls(invitation)) => {
                                 editor.error = None;
+                                let ca = invitation.trust_reference();
                                 self.importing = Some(ImportFlow::Preview {
                                     invitation,
-                                    ca: None,
+                                    ca,
                                     public_ref: None,
                                 });
                             }
@@ -4100,7 +4101,7 @@ impl Interaction {
                                 reference: String::new(),
                             });
                         }
-                        KeyCode::Char('c') => {
+                        KeyCode::Char('c') if invitation.trust_reference().is_none() => {
                             self.importing = Some(ImportFlow::Trust {
                                 invitation,
                                 ca: ca.unwrap_or_default(),
@@ -6579,12 +6580,13 @@ fn draw_import(
         ImportFlow::Preview { invitation, ca, public_ref } => (
             "Проверка ключа · собственный TLS",
             format!(
-                "Профиль: {}\nАдрес сервера: {}\nИмя сертификата: {}\nТип подключения: {}\nТранспорт: {:?}\nРежим: {:?}\nЛичный ключ: {}\nДоверенный сертификат: {}\nПолучите сертификат отдельно от приглашения.\n\nСохраняется новый профиль без подключения. Существующий профиль не заменяется.\n{}Системный прокси не изменяется.\n\nc: выбрать доверенный сертификат\n{}y: сохранить профиль  n/Esc: отменить\n\n{}",
+                "Профиль: {}\nАдрес сервера: {}\nИмя сертификата: {}\nТип подключения: {}\nТранспорт: {:?}\nРежим: {:?}\nЛичный ключ: {}\nДоверенный сертификат: {}\nПодтвердите доверие к источнику ключа.\n\nСохраняется новый профиль без подключения. Существующий профиль не заменяется.\n{}Системный прокси не изменяется.\n\n{}{}y: сохранить профиль  n/Esc: отменить\n\n{}",
                 invitation.id, invitation.endpoint, invitation.server_name,
                 invitation.security_mode().canonical_name(), invitation.transport, invitation.xhttp_mode(),
                 if invitation.has_token() { "будет сохранён в защищённый отдельный файл" } else { "нет в ссылке; нужна env: ссылка" },
-                if ca.is_some() { "CA указан, ещё НЕ проверено соединение" } else { "НЕТ; профиль не готов к подключению" },
+                if invitation.trust_reference().is_some() { "Закреплён в ключе, соединение ещё НЕ проверено" } else if ca.is_some() { "CA указан, ещё НЕ проверено соединение" } else { "НЕТ; профиль не готов к подключению" },
                 if editor.is_some_and(|e| e.can_refresh_credential(invitation)) { "r: отдельная замена credential существующего профиля; выбранный CA не используется.\n" } else { "" },
+                if invitation.trust_reference().is_some() { "" } else { "c: выбрать доверенный сертификат\n" },
                 if invitation.has_token() { "".into() } else { format!("e: указать env:NAME ({})\n", if public_ref.is_some() { "задано" } else { "обязательно" }) },
                 editor.and_then(|e| e.error.as_deref()).unwrap_or("")
             ),
@@ -9839,11 +9841,7 @@ mod tests {
     }
 
     fn server_issuance_fixture() -> String {
-        use sha2::{Digest, Sha256};
-        include_str!("../../../examples/server.toml").replace(
-            "REPLACE_WITH_64_LOWERCASE_HEX",
-            &format!("{:x}", Sha256::digest([0x42; 32])),
-        )
+        crate::invite::fixture_server_source(&[0x42; 32])
     }
 
     fn rendered_interaction(width: u16, height: u16, model: &Model, ui: &Interaction) -> String {
@@ -10065,11 +10063,7 @@ mod tests {
         }
         assert!(!path.exists());
         capture("client-first-key-trust", &model, &ui);
-        ui.update(&mut model, press(KeyCode::Enter)); // CA is mandatory.
-        assert_eq!(ui.config_dialog.as_ref().unwrap().guide().unwrap().0, 3);
-        assert!(!path.exists());
-        ui.paste_record_field(ca.to_str().unwrap());
-        ui.update(&mut model, press(KeyCode::Enter));
+        ui.update(&mut model, press(KeyCode::Enter)); // The trusted key already contains its anchor.
         assert_eq!(ui.config_dialog.as_ref().unwrap().guide().unwrap().0, 4);
         assert!(!path.exists());
         capture("client-first-key-save-review", &model, &ui);
@@ -10097,6 +10091,7 @@ mod tests {
         assert_eq!(doc.client.active_profile, doc.client.profiles[0].id);
         assert_eq!(doc.client.proxy.system_proxy, config::SystemProxy::Off);
         assert!(doc.client.profiles[0].auth_token.starts_with("file:"));
+        assert_eq!(doc.client.profiles[0].tls_ca, invite.trust_reference());
         let bytes = std::fs::read(&path).unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains(uri.as_str()));
         assert!(Editor::create_first_invitation(

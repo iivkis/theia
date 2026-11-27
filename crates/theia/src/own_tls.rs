@@ -19,6 +19,47 @@ const MAX_CHAIN: usize = 32;
 pub(crate) struct Anchor([u8; 32]);
 
 impl Anchor {
+    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub(crate) fn reference(self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::from(PREFIX);
+        for byte in self.0 {
+            let _ = write!(out, "{byte:02x}");
+        }
+        out
+    }
+
+    pub(crate) fn from_server(cert_ref: &str, name: &str) -> Result<Self, Error> {
+        let pem = crate::server::pem_data(cert_ref, false).map_err(|_| invalid())?;
+        let chain = rustls_pemfile::certs(&mut std::io::BufReader::new(pem.as_slice()))
+            .collect::<Result<Vec<_>, _>>().map_err(|_| invalid())?;
+        if chain.is_empty() || chain.len() > MAX_CHAIN {
+            return Err(invalid());
+        }
+        let leaf = chain.first().ok_or_else(invalid)?;
+        let anchor = Self::from_der(chain.last().ok_or_else(invalid)?.as_ref());
+        let name = ServerName::try_from(name.to_owned()).map_err(|_| invalid())?;
+        anchor.verify_server_cert(leaf, &chain[1..], &name, &[], UnixTime::now())?;
+        Ok(anchor)
+    }
+
+    pub(crate) fn matches_reference(self, reference: &str) -> bool {
+        if let Some(other) = Self::parse(reference) {
+            return self == other;
+        }
+        let Some(path) = reference.strip_prefix("file:") else { return false; };
+        let Ok(pem) = crate::bounded_input::read(std::path::Path::new(path), 1024 * 1024, true, false) else {
+            return false;
+        };
+        let Ok(certs) = rustls_pemfile::certs(&mut std::io::BufReader::new(pem.as_slice()))
+            .collect::<Result<Vec<_>, _>>() else { return false; };
+        // A wider CA bundle is not equivalent to a single pinned anchor.
+        certs.len() == 1 && self.matches(certs[0].as_ref())
+    }
+
     pub(crate) fn bytes(self) -> [u8; 32] {
         self.0
     }

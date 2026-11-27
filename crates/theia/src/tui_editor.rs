@@ -148,6 +148,17 @@ impl IssuedInvitation {
     }
 }
 
+fn invitation_trust(invite: &Invitation, ca: Option<&str>) -> Result<Option<String>, &'static str> {
+    if let Some(anchor) = invite.trust_reference() {
+        if ca.is_some_and(|value| !invite.matches_trust(Some(value))) {
+            return Err("Доверие в ключе не совпадает с указанным сертификатом.");
+        }
+        Ok(Some(anchor))
+    } else {
+        client_import::checked_ca_ref(ca).map_err(|_| "Explicit TLS CA reference is invalid or unreadable")
+    }
+}
+
 fn server_invitation(
     config: &Config,
     id: &str,
@@ -296,8 +307,9 @@ impl Editor {
         {
             return Err("Выберите новый файл настроек в существующем каталоге.");
         }
-        let ca = client_import::checked_ca_ref(Some(ca_ref))
-            .map_err(|_| "Не удалось проверить доверенный сертификат.")?;
+        let ca = invitation_trust(invite, (!ca_ref.is_empty()).then_some(ca_ref))?
+            .ok_or("Не удалось проверить доверенный сертификат.")?;
+        let ca = Some(ca);
         let mut secret = if let Some(bytes) = invite.token_bytes() {
             let token = Zeroizing::new(bytes);
             Some(
@@ -396,8 +408,7 @@ impl Editor {
         if document.client.profiles.iter().any(|p| p.id == invite.id) {
             return Err("An existing profile ID cannot be overwritten");
         }
-        let ca = client_import::checked_ca_ref(ca_ref)
-            .map_err(|_| "Explicit TLS CA reference is invalid or unreadable")?;
+        let ca = invitation_trust(invite, ca_ref)?;
         // Only a NEW secret is ever written. A secretless public invitation
         // demands a separately supplied env: reference, never a default.
         let secret = if let Some(bytes) = invite.token_bytes() {
@@ -501,6 +512,7 @@ impl Editor {
             || profile.server_name != invite.server_name
             || profile.path_prefix.as_deref() != Some(invite.path_prefix.as_str())
             || profile.security_mode != invite.security_mode()
+            || !invite.matches_trust(profile.tls_ca.as_deref())
             || (invite.xhttp_mode() != XhttpMode::Auto
                 && profile.effective_xhttp_mode() != invite.xhttp_mode())
             || (invite.transport != Transport::Auto && profile.transport != invite.transport)
@@ -777,6 +789,23 @@ impl Editor {
         if !config::editor_bytes(&self.path).is_ok_and(|bytes| bytes == self.source) {
             self.error = Some("Saved configuration changed; issuance refused".into());
             return None;
+        }
+        if let IssuedInvitation::OwnTls(invitation) = &invite {
+            let token = Zeroizing::new(invitation.token_bytes()?);
+            let Config::Server(document) = &self.original else { return None; };
+            let digest = format!("{:x}", Sha256::digest(&token[..]));
+            let current = document.server.users.iter()
+                .find(|user| !user.disabled && user.token_sha256 == digest)
+                .and_then(|user| Invitation::issued_from_server(&self.original, &invitation.id, &user.id, &token).ok());
+            let unchanged = current.as_ref().is_some_and(|value| {
+                let left = invitation.encode().ok().map(Zeroizing::new);
+                let right = value.encode().ok().map(Zeroizing::new);
+                matches!((left, right), (Some(a), Some(b)) if a.as_str() == b.as_str())
+            });
+            if !unchanged {
+                self.error = Some("Own-TLS trust changed; issue a new credential.".into());
+                return None;
+            }
         }
         if let IssuedInvitation::Reality { invitation, user } = &invite {
             // Publication/health may have advanced during TOML save. Never
@@ -1928,10 +1957,7 @@ mod tests {
     }
 
     fn server_source() -> String {
-        include_str!("../../../examples/server.toml").replace(
-            "REPLACE_WITH_64_LOWERCASE_HEX",
-            &format!("{:x}", Sha256::digest([0x42; 32])),
-        )
+        crate::invite::fixture_server_source(&[0x42; 32])
     }
 
     fn two_inbounds() -> String {
@@ -2551,10 +2577,7 @@ mod tests {
     }
 
     fn refresh_fixture(token: [u8; 32]) -> Invitation {
-        let source = include_str!("../../../examples/server.toml").replace(
-            "REPLACE_WITH_64_LOWERCASE_HEX",
-            &format!("{:x}", Sha256::digest(token)),
-        );
+        let source = crate::invite::fixture_server_source(&token);
         let server = config::parse(&source).unwrap();
         Invitation::issued_from_server(&server, "public", "device-a", &token).unwrap()
     }
@@ -2586,8 +2609,7 @@ mod tests {
         };
         // Simulate operator-selected existing transport and trust reference.
         doc.client.profiles[1].transport = Transport::H2;
-        let trust = "file:/existing-ca.pem".to_owned();
-        doc.client.profiles[1].tls_ca = Some(trust);
+        assert_eq!(doc.client.profiles[1].tls_ca, initial.trust_reference());
         doc.client.active_profile = "public".into();
         config::atomic_write(&temp.0, &before).unwrap();
         let mut editor = Editor::load(Role::Client, &temp.0).unwrap();
@@ -2714,7 +2736,7 @@ mod tests {
         assert_eq!(imported.id, "public");
         assert_eq!(imported.server, "edge.example.org:443");
         assert_eq!(imported.server_name, "edge.example.org");
-        assert!(imported.tls_ca.is_none(), "trust is not granted by URI");
+        assert_eq!(imported.tls_ca, invite.trust_reference());
         assert!(imported.auth_token.starts_with("file:"));
         let secret_path = Path::new(imported.auth_token.strip_prefix("file:").unwrap());
         assert!(secret_path.is_absolute());
@@ -2806,7 +2828,7 @@ mod tests {
     }
 
     #[test]
-    fn import_requires_independent_valid_ca_file_and_never_trusts_uri_ca() {
+    fn import_rejects_unrelated_ca_and_preserves_invitation_anchor() {
         use crate::invite::Invitation;
         let cert = rcgen::generate_simple_self_signed(vec!["edge.example.org".into()]).unwrap();
         let ca = Temp::write(&cert.cert.pem());
@@ -2821,13 +2843,14 @@ mod tests {
             .is_err());
         assert!(editor
             .import_invitation(&invite, Some(&ca_ref), None)
-            .is_ok());
+            .is_err());
+        assert!(editor.import_invitation(&invite, None, None).is_ok());
         let Config::Client(doc) = config::read_file(&temp.0).unwrap() else {
             panic!("client");
         };
         assert_eq!(
             doc.client.profiles[1].tls_ca.as_deref(),
-            Some(ca_ref.as_str())
+            invite.trust_reference().as_deref()
         );
         let secret_file = Path::new(
             doc.client.profiles[1]

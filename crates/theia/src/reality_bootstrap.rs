@@ -321,6 +321,7 @@ impl Invitation {
             transport: Transport::Auto,
             xhttp_mode: XhttpMode::Auto,
             public_key: Some(URL_SAFE_NO_PAD.encode(self.public)),
+            own_anchor: None,
             minimum_revision: Some(self.revision),
             descriptor: Some(self.signed.clone()),
             token: self

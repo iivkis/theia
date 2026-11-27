@@ -24,6 +24,7 @@ pub struct Invitation {
     pub server_name: String,
     pub transport: Transport,
     xhttp_mode: XhttpMode,
+    anchor: Option<crate::own_tls::Anchor>,
     token: Option<[u8; 32]>,
 }
 
@@ -84,6 +85,8 @@ pub(crate) struct Wire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) public_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) own_anchor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) minimum_revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) descriptor: Option<String>,
@@ -119,9 +122,12 @@ fn check_wire(wire: &Wire) -> Result<(), InviteError> {
                 && wire.minimum_revision.is_none()
                 && wire.descriptor.is_none()
                 && wire.admission.is_none()
+                && (wire.token.is_none() || wire.own_anchor.is_some())
+                && wire.own_anchor.as_deref().is_none_or(|value| raw_key::<32>(value).is_ok())
         }
         WireSecurity::SmartReality => {
-            wire.public_key.is_some()
+            wire.own_anchor.is_none()
+                && wire.public_key.is_some()
                 && wire.minimum_revision.is_some_and(|revision| revision > 0)
                 && wire.descriptor.as_ref().is_some_and(|value| {
                     !value.is_empty() && value.len() <= crate::descriptor::MAX_DOCUMENT
@@ -342,6 +348,10 @@ pub(crate) fn encode_wire(wire: &Wire) -> Result<Zeroizing<String>, InviteError>
             put_text(&mut bytes, &wire.endpoint)?;
             put_text(&mut bytes, &wire.server_name)?;
             put_text(&mut bytes, &wire.path_prefix)?;
+            bytes.push(u8::from(wire.own_anchor.is_some()));
+            if let Some(anchor) = &wire.own_anchor {
+                bytes.extend_from_slice(&raw_key::<32>(anchor)?[..]);
+            }
         }
         WireSecurity::SmartReality => {
             let public = raw_key::<32>(wire.public_key.as_deref().ok_or(InviteError::Invalid)?)?;
@@ -428,6 +438,7 @@ pub(crate) fn decode_wire(uri: &str) -> Result<Wire, InviteError> {
         token: None,
         admission: None,
         public_key: None,
+        own_anchor: None,
         minimum_revision: None,
         descriptor: None,
     };
@@ -452,6 +463,9 @@ pub(crate) fn decode_wire(uri: &str) -> Result<Wire, InviteError> {
             wire.endpoint = r.text()?;
             wire.server_name = r.text()?;
             wire.path_prefix = r.text()?;
+            if r.flag()? {
+                wire.own_anchor = Some(URL_SAFE_NO_PAD.encode(r.array::<32>()?));
+            }
         }
         WireSecurity::SmartReality => {
             wire.public_key = Some(URL_SAFE_NO_PAD.encode(r.array::<32>()?));
@@ -486,6 +500,7 @@ impl Invitation {
             server_name: profile.server_name.clone(),
             transport: profile.transport,
             xhttp_mode: profile.effective_xhttp_mode(),
+            anchor: profile.tls_ca.as_deref().and_then(crate::own_tls::Anchor::parse),
             token: None,
         };
         invite.check()?;
@@ -534,6 +549,7 @@ impl Invitation {
             server_name: inbound.server_name.clone(),
             transport: Transport::Auto,
             xhttp_mode: XhttpMode::Auto,
+            anchor: crate::own_tls::Anchor::from_server(&inbound.tls_cert, &inbound.server_name).ok(),
             token: None,
         };
         invite.check()?;
@@ -571,7 +587,11 @@ impl Invitation {
         if !bool::from(user.token_sha256.as_bytes().ct_eq(digest.as_bytes())) {
             return Err(InviteError::Unavailable);
         }
+        if invite.anchor.is_none() {
+            return Err(InviteError::Unavailable);
+        }
         invite.token = Some(*token);
+        invite.check()?;
         Ok(invite)
     }
 
@@ -589,6 +609,7 @@ impl Invitation {
             xhttp_mode: self.xhttp_mode,
             transport: self.transport,
             public_key: None,
+            own_anchor: self.anchor.map(|pin| URL_SAFE_NO_PAD.encode(pin.bytes())),
             minimum_revision: None,
             descriptor: None,
             token: self.token.as_ref().map(|v| URL_SAFE_NO_PAD.encode(v)),
@@ -632,6 +653,8 @@ impl Invitation {
             server_name: std::mem::take(&mut wire.server_name),
             transport: wire.transport,
             xhttp_mode: wire.xhttp_mode,
+            anchor: wire.own_anchor.as_deref().map(raw_key::<32>).transpose()?
+                .map(|bytes| crate::own_tls::Anchor::from_bytes(*bytes)),
             token,
         };
         invite.check()?;
@@ -651,6 +674,15 @@ impl Invitation {
         self.token.is_some()
     }
 
+    /// Nonsecret fingerprint from a trusted invitation, not a local path.
+    pub fn trust_reference(&self) -> Option<String> {
+        self.anchor.map(crate::own_tls::Anchor::reference)
+    }
+
+    pub(crate) fn matches_trust(&self, reference: Option<&str>) -> bool {
+        self.anchor.is_some_and(|pin| reference.is_some_and(|r| pin.matches_reference(r)))
+    }
+
     /// Explicit secret access for future secure file/env import transactions.
     pub fn token_bytes(&self) -> Option<[u8; 32]> {
         self.token
@@ -664,6 +696,15 @@ impl Invitation {
         tls_ca: Option<String>,
     ) -> Result<Profile, InviteError> {
         self.check()?;
+        let tls_ca = match self.anchor {
+            Some(anchor) => {
+                if tls_ca.as_deref().is_some_and(|value| !anchor.matches_reference(value)) {
+                    return Err(InviteError::Invalid);
+                }
+                Some(anchor.reference())
+            }
+            None => tls_ca,
+        };
         validate_profile(Profile {
             id: self.id.clone(),
             path_prefix: Some(self.path_prefix.clone()),
@@ -681,7 +722,10 @@ impl Invitation {
     }
 
     fn check(&self) -> Result<(), InviteError> {
-        let profile = self.to_profile_unchecked("env:THEIA_INVITE_TOKEN".into(), None)?;
+        if self.token.is_some() && self.anchor.is_none() {
+            return Err(InviteError::Invalid);
+        }
+        let profile = self.to_profile_unchecked("env:THEIA_INVITE_TOKEN".into(), self.trust_reference())?;
         if profile.effective_xhttp_mode() != self.xhttp_mode {
             return Err(InviteError::Invalid);
         }
@@ -738,15 +782,21 @@ fn validate_profile(profile: Profile) -> Result<Profile, InviteError> {
 }
 
 #[cfg(test)]
+pub(crate) fn fixture_server_source(token: &[u8; 32]) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/f14-public-anchor.pem");
+    let reference = format!("file:{}", path.display()).replace('\\', "\\\\").replace('"', "\\\"");
+    include_str!("../../../examples/server.toml")
+        .replace("file:/etc/theia/tls/fullchain.pem", &reference)
+        .replace("REPLACE_WITH_64_LOWERCASE_HEX", &format!("{:x}", Sha256::digest(token)))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     fn server_with_token(token: &[u8; 32]) -> Config {
-        let fixture = include_str!("../../../examples/server.toml");
-        let src = fixture.replace(
-            "REPLACE_WITH_64_LOWERCASE_HEX",
-            &format!("{:x}", Sha256::digest(token)),
-        );
+        let src = fixture_server_source(token);
         crate::config::parse(&src).unwrap()
     }
 
@@ -767,6 +817,12 @@ mod tests {
         assert_eq!(profile.auth_token, "file:/trusted/theia-token");
         assert_eq!(profile.transport, Transport::Auto);
         assert_eq!(profile.effective_xhttp_mode(), XhttpMode::Auto);
+        assert_eq!(profile.tls_ca, received.trust_reference());
+        assert!(profile.tls_ca.is_some());
+        // Retired confidential envelopes without an anchor must fail closed.
+        let mut raw = URL_SAFE_NO_PAD.decode(encoded.strip_prefix(PREFIX).unwrap()).unwrap();
+        raw.truncate(raw.len() - 33);
+        assert!(Invitation::decode(&format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(raw))).is_err());
     }
 
     #[test]
@@ -1042,6 +1098,7 @@ mod tests {
             server_name: d.references[0].server_name.clone(),
             path_prefix: d.path_prefix.clone(),
             public_key: Some(URL_SAFE_NO_PAD.encode(key.public_key().as_ref())),
+            own_anchor: None,
             minimum_revision: Some(d.revision),
             descriptor: Some(signed.clone()),
             token: Some(URL_SAFE_NO_PAD.encode([7; 32])),
