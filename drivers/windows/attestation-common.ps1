@@ -30,8 +30,13 @@ function Get-TheiaImageIdentity([string]$Path,[bool]$RequireCertificate) {
         [BitConverter]::ToUInt16($b,[int]($pe+4)) -ne 0x8664) { throw 'Expected AMD64 PE image.' }
     $opt=[int]($pe+24)
     $optionalSize=[BitConverter]::ToUInt16($b,[int]($pe+20))
-    if ($optionalSize -lt 240 -or [BitConverter]::ToUInt16($b,$opt) -ne 0x20b -or
-        [BitConverter]::ToUInt32($b,$opt+108) -lt 5) { throw 'Expected PE32+ security directory.' }
+    $sections=[BitConverter]::ToUInt16($b,[int]($pe+6))
+    $sectionStart=$opt+$optionalSize
+    if ($optionalSize -lt 240 -or $sections -lt 1 -or $sections -gt 96 -or
+        $sectionStart+40*$sections -gt $b.Length -or
+        [BitConverter]::ToUInt16($b,$opt) -ne 0x20b -or
+        [BitConverter]::ToUInt16($b,$opt+68) -ne 1 -or
+        [BitConverter]::ToUInt32($b,$opt+108) -lt 5) { throw 'Expected complete PE32+ native driver.' }
     $security=$opt+112+4*8
     $offset=[long][BitConverter]::ToUInt32($b,$security)
     $size=[long][BitConverter]::ToUInt32($b,$security+4)
@@ -40,9 +45,34 @@ function Get-TheiaImageIdentity([string]$Path,[bool]$RequireCertificate) {
         if ($offset -lt $opt+$optionalSize -or $size -lt 8 -or $offset%8 -ne 0 -or
             $offset+$size -ne $b.Length) { throw 'Expected embedded certificate table at EOF.' }
         $end=[int]$offset
+        # The certificate table is excluded from image identity, never
+        # from SignTool verification. Validate its framing before hashing.
+        $cursor=$offset
+        while ($cursor -lt $b.Length) {
+            if ($cursor+8 -gt $b.Length) { throw 'Truncated WIN_CERTIFICATE.' }
+            $length=[long][BitConverter]::ToUInt32($b,[int]$cursor)
+            $aligned=[long](8*[Math]::Ceiling($length/8.0))
+            if ($length -le 8 -or $cursor+$aligned -gt $b.Length -or
+                [BitConverter]::ToUInt16($b,[int]($cursor+4)) -ne 0x200 -or
+                [BitConverter]::ToUInt16($b,[int]($cursor+6)) -ne 2) { throw 'Invalid WIN_CERTIFICATE.' }
+            for ($i=$cursor+$length;$i -lt $cursor+$aligned;++$i) {
+                if ($b[$i] -ne 0) { throw 'Nonzero certificate alignment padding.' }
+            }
+            $cursor+=$aligned
+        }
     } else {
         if ($offset -ne 0) { throw 'Submission source must be unsigned.' }
         $end=$b.Length
+    }
+    $headers=[long][BitConverter]::ToUInt32($b,$opt+60)
+    if ($headers -lt $sectionStart+40*$sections -or $headers -gt $end) { throw 'Invalid PE headers size.' }
+    for ($i=0;$i -lt $sections;++$i) {
+        $section=$sectionStart+40*$i
+        $rawSize=[long][BitConverter]::ToUInt32($b,$section+16)
+        $rawOffset=[long][BitConverter]::ToUInt32($b,$section+20)
+        if ($rawSize -ne 0 -and ($rawOffset -lt $headers -or $rawOffset+$rawSize -gt $end)) {
+            throw 'PE section extends beyond executable image.'
+        }
     }
     # Intentionally stronger than a section-only comparison: only the
     # checksum, security directory, alignment padding and certificate table

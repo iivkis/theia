@@ -19,9 +19,14 @@ try {
     Put32 $u 60 128
     Put32 $u 128 0x4550
     Put16 $u 132 0x8664
+    Put16 $u 134 1
     Put16 $u 148 240
     Put16 $u 152 0x20b
+    Put32 $u 212 512
+    Put16 $u 220 1
     Put32 $u 260 16
+    Put32 $u 408 256
+    Put32 $u 412 512
     $u[600]=123
     $original=Join-Path $dir 'original.sys'
     [IO.File]::WriteAllBytes($original,$u)
@@ -31,7 +36,7 @@ try {
     Put32 $s 216 0x12345678
     Put32 $s 296 1024
     Put32 $s 300 16
-    Put32 $s 1024 16
+    Put32 $s 1024 12
     Put16 $s 1028 0x200
     Put16 $s 1030 2
     $signed=Join-Path $dir 'fixture.sys'
@@ -51,6 +56,16 @@ try {
     [IO.File]::WriteAllBytes($signed,$s)
     Expect-Rejection { Get-TheiaImageIdentity $signed $true }
     Put32 $s 300 16
+    foreach ($index in @(1028,1030,1039)) {
+        $changed=[byte[]]$s.Clone()
+        $changed[$index]=$changed[$index] -bxor 1
+        [IO.File]::WriteAllBytes($signed,$changed)
+        Expect-Rejection { Get-TheiaImageIdentity $signed $true }
+    }
+    $changed=[byte[]]$s.Clone()
+    Put32 $changed 412 1000
+    [IO.File]::WriteAllBytes($signed,$changed)
+    Expect-Rejection { Get-TheiaImageIdentity $signed $true }
     Put16 $s 132 0x14c
     [IO.File]::WriteAllBytes($signed,$s)
     Expect-Rejection { Get-TheiaImageIdentity $signed $true }
