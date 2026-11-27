@@ -1834,6 +1834,33 @@ mod tests {
     }
 
     #[test]
+    fn redirect_transaction_keeps_all_three_egress_gates_bounded() {
+        let mut j=journal();
+        let scope=RedirectScope{port:49001,loopback:1};
+        j.redirect=Some(scope);
+        let mut admissions=std::collections::BTreeMap::new();
+        for n in 0..MAX_CARRIERS {
+            admissions.insert(100+n as u32,super::super::packet::FlowKey{
+                source:std::net::SocketAddr::from(([192,0,2,1],10000+n as u16)),
+                destination:"198.51.100.2:443".parse().unwrap(),
+                transport:super::super::packet::Transport::Udp,interface:0,
+            });
+        }
+        let installed=redirect_install(&j,scope,&admissions);
+        let updated=redirect_replace(&j,scope,&admissions);
+        assert!(installed.len()<=MAX_RULE_OPERATIONS);
+        assert!(updated.len()<=MAX_RULE_OPERATIONS);
+        for operations in [&installed,&updated] {
+            for (index,msg) in operations.iter().enumerate() {
+                let (_,sequence,_)=checked_header(msg).unwrap();
+                assert_eq!(sequence,index as u32+2);
+            }
+        }
+        let empty=redirect_replace(&j,scope,&Default::default());
+        assert_eq!(updated.len()-empty.len(),3*MAX_CARRIERS);
+    }
+
+    #[test]
     fn carrier_rule_uses_socket_mark_and_exact_four_tuple() {
         let key = super::super::packet::FlowKey {
             source: "192.0.2.1:1234".parse().unwrap(),

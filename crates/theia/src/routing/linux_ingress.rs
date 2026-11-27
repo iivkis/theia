@@ -196,7 +196,6 @@ pub(crate) async fn accept_transparent(listener: &TcpListener) -> io::Result<Tra
         || sockopt_int(&stream, level, opt)? != 1
         || !is_local_ip(peer.ip())?
         || is_local_ip(target.ip())?
-        || target.port() == local.port()
     {
         return Err(io::ErrorKind::PermissionDenied.into());
     }
@@ -425,7 +424,7 @@ fn receive_udp(socket: &std::net::UdpSocket) -> io::Result<CapturedDatagram> {
     let destination = original_ancillary(control_bytes, local.is_ipv4())?;
     // Ordinary datagrams sent to the listener port cannot become relay
     // requests. Conservatively refuse this port even on a wildcard bind.
-    if destination.port() == local.port() {
+    if destination.port()==local.port() || !is_local_ip(source.ip())? || is_local_ip(destination.ip())? {
         return Err(invalid());
     }
     let mut key = validate_redirect(local, source, destination)?;
@@ -636,14 +635,16 @@ mod tests {
         bytes
     }
 
-    /// Exercise actual policy routing + TPROXY and reverse UDP source
-    /// identity in both address families. These rules are disposable lab
-    /// rules, NOT the production owner transaction.
+    /// Exercise the actual journaled guard, policy routing, TPROXY,
+    /// carrier exception/revocation and reverse UDP in a disposable
+    /// namespace. No manual target-specific nft rules.
     #[test]
     #[ignore = "requires isolated Linux namespace, nftables, iproute2 and CAP_NET_ADMIN"]
     fn kernel_dual_stack_transparent_redirect_and_reply() {
         std::thread::spawn(|| {
-            use std::{io::Write, process::{Command, Stdio}, time::Duration};
+            use std::{process::Command,time::{Duration,Instant},sync::{Arc,Mutex},os::unix::fs::DirBuilderExt};
+            use crate::routing::{linux_rules::{self,LabRules,LabRegistrar},carrier_socket::Registrar};
+            use ring::rand::{SecureRandom,SystemRandom};
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let host = std::fs::File::open("/proc/thread-self/ns/net").unwrap();
             assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) }, 0);
@@ -651,12 +652,19 @@ mod tests {
                 assert!(Command::new("ip").args(args).status().unwrap().success(), "{args:?}");
             };
             ip(&["link", "set", "lo", "up"]);
-            ip(&["link", "add", "theiatest0", "type", "dummy"]);
+            ip(&["link","add","theiatest0","type","veth","peer","name","theiawire0"]);
+            ip(&["link","set","theiawire0","address","02:00:00:00:01:02"]);
+            ip(&["link","set","theiawire0","up"]);
             ip(&["link", "set", "theiatest0", "up"]);
             ip(&["addr", "add", "192.0.2.1/24", "dev", "theiatest0"]);
             ip(&["-6", "addr", "add", "2001:db8:1::1/64", "dev", "theiatest0", "nodad"]);
             ip(&["route", "add", "198.51.100.2/32", "dev", "theiatest0", "src", "192.0.2.1"]);
             ip(&["-6", "route", "add", "2001:db8:2::2/128", "dev", "theiatest0", "src", "2001:db8:1::1"]);
+            ip(&["route","add","203.0.113.2/32","dev","theiatest0","src","192.0.2.1"]);
+            ip(&["-6","route","add","2001:db8:3::2/128","dev","theiatest0","src","2001:db8:1::1"]);
+            for address in ["198.51.100.2","203.0.113.2"] {
+                ip(&["neigh","replace",address,"lladdr","02:00:00:00:01:02","nud","permanent","dev","theiatest0"]);
+            }
             ip(&["rule", "add", "fwmark", "0x5449", "lookup", "100"]);
             ip(&["-6", "rule", "add", "fwmark", "0x5449", "lookup", "100"]);
             ip(&["route", "add", "local", "0.0.0.0/0", "dev", "lo", "table", "100"]);
@@ -665,28 +673,47 @@ mod tests {
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             runtime.block_on(async {
                 let listeners = RedirectListeners::bind(&host, 49001).unwrap();
-                // Exact fixture destinations only; no host route, global
-                // firewall changes, process-wide exemption or shell interpolation.
-                let mut nft = Command::new("nft").args(["-f", "-"]).stdin(Stdio::piped()).spawn().unwrap();
-                {
-                    let mut stdin = nft.stdin.take().unwrap();
-                    for (family, target, suffix) in [
-                        ("ip", "198.51.100.2", "4"),
-                        ("ip6", "2001:db8:2::2", "6"),
-                    ] {
-                        let table = format!("theia_redirect_lab{suffix}");
-                        writeln!(stdin, "add table {family} {table}").unwrap();
-                        writeln!(stdin, "add chain {family} {table} output {{ type route hook output priority mangle; policy accept; }}").unwrap();
-                        writeln!(stdin, "add chain {family} {table} prerouting {{ type filter hook prerouting priority mangle; policy accept; }}").unwrap();
-                        writeln!(stdin, "add rule {family} {table} output {family} daddr {target} meta l4proto {{ tcp, udp }} meta mark set 0x5449").unwrap();
-                        writeln!(stdin, "add rule {family} {table} prerouting iifname lo meta mark 0x5449 {family} daddr {target} meta l4proto {{ tcp, udp }} tproxy to :49001 accept").unwrap();
+                let mut nonce=[0u8;16];SystemRandom::new().fill(&mut nonce).unwrap();
+                let suffix=nonce.iter().map(|b|format!("{b:02x}")).collect::<String>();
+                let directory=std::env::temp_dir().join(format!("theia-all-redirect-{suffix}"));
+                std::fs::DirBuilder::new().mode(0o700).create(&directory).unwrap();
+                let journal=directory.join("guard.toml");
+                let rules=Arc::new(Mutex::new(LabRules::install_redirect(&host,&journal,listeners.port()).unwrap()));
+                let registrar=LabRegistrar::new(rules.clone(),host.try_clone().unwrap());
+                assert!(rules.lock().unwrap().redirect_ready(listeners.port()).unwrap());
+                // Independent wire observation on the peer veth. No
+                // reliance on send() success or listener silence alone.
+                let raw=unsafe {libc::socket(libc::AF_PACKET,libc::SOCK_DGRAM|libc::SOCK_NONBLOCK|libc::SOCK_CLOEXEC,
+                    i32::from(0x0800u16.to_be()))};
+                assert!(raw>=0);
+                let wire=unsafe {OwnedFd::from_raw_fd(raw)};
+                let mut link:libc::sockaddr_ll=unsafe {mem::zeroed()};
+                link.sll_family=libc::AF_PACKET as u16;
+                link.sll_protocol=0x0800u16.to_be();
+                link.sll_ifindex=unsafe {libc::if_nametoindex(c"theiawire0".as_ptr())} as i32;
+                assert!(link.sll_ifindex>0);
+                assert_eq!(unsafe {libc::bind(wire.as_raw_fd(),(&link as *const libc::sockaddr_ll).cast(),
+                    mem::size_of_val(&link) as libc::socklen_t)},0);
+                let seen=|sentinel:&[u8],wait:Duration| {
+                    let end=Instant::now()+wait;
+                    let mut data=[0u8;65536];
+                    loop {
+                        let n=unsafe {libc::recv(wire.as_raw_fd(),data.as_mut_ptr().cast(),data.len(),0)};
+                        if n>=0 {
+                            if data[..n as usize].windows(sentinel.len()).any(|part|part==sentinel) {return true;}
+                        } else {
+                            assert_eq!(io::Error::last_os_error().kind(),io::ErrorKind::WouldBlock);
+                        }
+                        if Instant::now()>=end {return false;}
+                        std::thread::sleep(Duration::from_millis(5));
                     }
-                }
-                assert!(nft.wait().unwrap().success());
+                };
 
                 for (tcp, udp, source, target) in [
                     (&listeners.tcp4, &listeners.udp4, "192.0.2.1:0", "198.51.100.2:443"),
+                    (&listeners.tcp4, &listeners.udp4, "192.0.2.1:0", "203.0.113.2:853"),
                     (&listeners.tcp6, &listeners.udp6, "[2001:db8:1::1]:0", "[2001:db8:2::2]:443"),
+                    (&listeners.tcp6, &listeners.udp6, "[2001:db8:1::1]:0", "[2001:db8:3::2]:853"),
                 ] {
                     let source: SocketAddr = source.parse().unwrap();
                     let target: SocketAddr = target.parse().unwrap();
@@ -732,6 +759,48 @@ mod tests {
                     assert_eq!(from, target);
                     assert_eq!(&reply[..n], b"ack");
                 }
+                let peer:SocketAddr="198.51.100.2:443".parse().unwrap();
+                let carrier=tokio::net::UdpSocket::bind("192.0.2.1:0").await.unwrap();
+                let lease=registrar.udp(&carrier,peer).unwrap();
+                carrier.connect(peer).await.unwrap();
+                carrier.send(b"theia-carrier-positive").await.unwrap();
+                assert!(seen(b"theia-carrier-positive",Duration::from_secs(2)));
+                let competitor=tokio::net::UdpSocket::bind("192.0.2.1:0").await.unwrap();
+                competitor.connect(peer).await.unwrap();
+                competitor.send(b"theia-ordinary-negative").await.unwrap();
+                let captured=tokio::time::timeout(Duration::from_secs(2),listeners.udp4.receive()).await.unwrap().unwrap();
+                assert_eq!(captured.payload(),b"theia-ordinary-negative");
+                assert!(!seen(b"theia-ordinary-negative",Duration::from_millis(150)));
+                drop(lease);
+                carrier.send(b"theia-revoked-negative").await.unwrap();
+                let captured=tokio::time::timeout(Duration::from_secs(2),listeners.udp4.receive()).await.unwrap().unwrap();
+                assert_eq!(captured.key().source,carrier.local_addr().unwrap());
+                assert_eq!(captured.payload(),b"theia-revoked-negative");
+                assert!(!seen(b"theia-revoked-negative",Duration::from_millis(150)));
+                assert!(registrar.udp(&carrier,peer).is_err());
+                // Listener death does not restore direct egress.
+                drop(listeners);
+                let _=competitor.send(b"theia-no-listener-negative").await;
+                assert!(!seen(b"theia-no-listener-negative",Duration::from_millis(150)));
+                // Even if the marked local route disappears, the actual
+                // physical postrouting guard must reject the reroute.
+                ip(&["rule","del","fwmark","0x5449","lookup","100"]);
+                assert!(!rules.lock().unwrap().redirect_ready(49001).unwrap());
+                let _=competitor.send(b"theia-no-route-negative").await;
+                assert!(!seen(b"theia-no-route-negative",Duration::from_millis(150)));
+                registrar.retire().unwrap();
+                assert!(rules.lock().unwrap().current().unwrap());
+                drop(registrar);drop(rules);
+                let _=competitor.send(b"theia-no-owner-negative").await;
+                assert!(!seen(b"theia-no-owner-negative",Duration::from_millis(150)));
+                linux_rules::recover(&host,&journal).unwrap();
+                // Positive control proves the same wire and route can
+                // actually emit the packet after explicit owned recovery.
+                let positive=tokio::net::UdpSocket::bind("192.0.2.1:0").await.unwrap();
+                positive.connect(peer).await.unwrap();
+                positive.send(b"theia-restored-positive").await.unwrap();
+                assert!(seen(b"theia-restored-positive",Duration::from_secs(2)));
+                std::fs::remove_dir_all(directory).unwrap();
             });
         }).join().unwrap();
     }

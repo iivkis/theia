@@ -579,6 +579,16 @@ mod tests {
         assert!(command(&args).is_err());
     }
     #[test]
+    fn linux_redirect_lab_requires_explicit_isolated_consent() {
+        let mut args=["client","linux","--redirect-lab","--config","client.toml","--journal","/private/guard.toml","--port","49001","--confirm-isolated"];
+        assert!(matches!(command(&args),Ok(Command::ClientLinuxRedirectLab{port:49001,..})));
+        assert!(command(&args[..9]).is_err());
+        args[8]="0";assert!(command(&args).is_err());
+        args[8]="53";assert!(command(&args).is_err());
+        assert!(matches!(command(&["client","linux","--recover-lab","--journal","/private/guard.toml","--confirm-isolated-recovery"]),Ok(Command::ClientLinuxRecoverLab{..})));
+        assert!(command(&["client","linux","--recover-lab","--journal","/private/guard.toml"]).is_err());
+    }
+    #[test]
     fn windivert_redirect_lab_requires_literal_reviewed_targets_and_duration() {
         let dll="ab".repeat(32);
         let sys="cd".repeat(32);
