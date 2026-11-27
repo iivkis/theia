@@ -108,10 +108,14 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("pub mod camouflage_probe;", read("crates/theia/src/lib.rs"))
         for token in ("pub fn route_selected_local_ip", "pub async fn probe_tls_h2",
                       "ProbeApproval", "IsolatedLoopbackFixture", "PublicHttpsIp",
-                      "TlsConnector", "RootCertStore", "Semaphore::const_new(4)",
+                      "TlsConnector", "RootCertStore", "REFERENCE_PROBES",
                       "MAX_HANDSHAKE_DEADLINE", "Observation::Unknown"):
             with self.subTest(token=token):
                 self.assertIn(token, code)
+        scheduler = read("crates/theia/src/net/probe.rs")
+        self.assertIn("REFERENCE_PROBES: ProbeBudget = ProbeBudget::new(4)", scheduler)
+        self.assertIn("Semaphore::const_new(limit)", scheduler)
+        self.assertIn("REFERENCE_PROBES", read("crates/theia/src/camouflage_h3_probe.rs"))
         for token in ("wrong_ca", "wrong_sni", "timeout", "NoTrustAnchors",
                       "NotApproved", "fingerprint", "TLS1.3"):
             with self.subTest(token=token):
@@ -283,10 +287,13 @@ class SpecContractTests(unittest.TestCase):
         binary = read("crates/theia/src/main.rs")
         for term in ("pub async fn serve(", "pub async fn run_file(",
                      "fn allowed_destination(", "URL_SAFE_NO_PAD", "Sha256::digest",
-                     "ct_eq(", "lookup_host(", "TcpStream::connect",
+                     "ct_eq(", "lookup_host(", "carrier_socket::connect_plain_tcp",
                      "Frame::OpenOk", "TlsAcceptor", "Carrier::H2.h2_server()",
                      "Carrier::H2.accepts_tls("):
             self.assertIn(term, implementation)
+        factory = read("crates/theia/src/routing/carrier_socket.rs")
+        self.assertIn("socket.connect(peer).await?", factory)
+        self.assertIn("admit_tcp_dial(&socket, peer)?", factory)
         policy = read("crates/theia/src/transport_policy.rs")
         for term in ("MAX_BIDI_STREAMS: u32 = 32", "MAX_HEADER_LIST_BYTES: u32 = 8192",
                      "builder.max_concurrent_streams(MAX_BIDI_STREAMS)",
@@ -421,7 +428,9 @@ class SpecContractTests(unittest.TestCase):
         self.assertNotIn("quinn::", client.split("#[cfg(test)]\nmod probe_tests", 1)[0])
         self.assertIn("bearer_header(token)?", client)
         self.assertIn("Frame::OpenOk if state.tunnel_open()", client)
-        self.assertIn(".run(upload, download, ClientError::Timeout)", client)
+        self.assertIn("session::relay_tcp(", client)
+        self.assertIn(".run(upload, download, ClientError::Timeout)",
+                      read("crates/theia/src/xhttp/session.rs"))
         self.assertIn("tokio::try_join!(upload, download)", read("crates/theia/src/relay_liveness.rs"))
         tests = read("crates/theia/tests/h3_server.rs")
         self.assertIn("production_h3_client_and_server_relay_exact_bytes", tests)
@@ -431,6 +440,9 @@ class SpecContractTests(unittest.TestCase):
         for adapter in ("client", "h3_client", "server", "h3_server"):
             source = read(f"crates/theia/src/{adapter}.rs")
             with self.subTest(adapter=adapter):
+                if adapter in ("client", "h3_client"):
+                    self.assertIn("session::relay_tcp(", source)
+                    source = read("crates/theia/src/xhttp/session.rs")
                 self.assertIn("relay_liveness::Activity::new()", source)
                 self.assertIn("activity.data(", source)
                 self.assertIn("activity.half_closed()", source)
@@ -454,7 +466,8 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("enum Carrier", proxy)
         self.assertIn("(None, Some(h3)) => Ok(Self::H3(h3))", proxy)
         self.assertRegex(proxy, r"Self::H3\(client\)\s*=>\s*client\s*\.open\(address,\s*port\)")
-        self.assertIn("Err(ClientError::QuicUnreachable)", proxy)
+        self.assertIn("Err(ClientError::QuicUnreachable)",
+                      read("crates/theia/src/local_proxy/auto.rs"))
         server = read("crates/theia/src/server.rs")
         self.assertIn("tasks.spawn(endpoint.serve(context))", server)
         self.assertIn("tasks.spawn(serve(listener, acceptor, context.clone()))", server)
@@ -463,23 +476,27 @@ class SpecContractTests(unittest.TestCase):
 
     def test_m32_auto_selector_is_fail_closed(self):
         proxy = read("crates/theia/src/local_proxy.rs")
+        auto = read("crates/theia/src/local_proxy/auto.rs")
+        regression = read("crates/theia/src/local_proxy/selector_tests.rs")
+        errors = read("crates/theia/src/net/error.rs")
         quic = read("crates/theia/src/quic_core/dial.rs")
-        self.assertIn("Err(ClientError::QuicUnreachable)", proxy)
+        self.assertIn("Err(ClientError::QuicUnreachable)", auto)
         self.assertIn("self.sent.load", quic)
         self.assertIn("self.received.load", quic)
         self.assertIn("observation.failure(true)", quic)
         self.assertIn("fallback_requires_observed_send_or_exact_send_error_and_no_response", quic)
         self.assertIn("malformed_response_disables_silence_classification", quic)
-        self.assertIn("QuicEndpointNetworkRefused", proxy)
-        self.assertIn("AUTO_QUIC_ATTEMPTS", proxy)
-        self.assertIn("negative_cache_expires_and_zero_ttl_disables_it", proxy)
-        self.assertIn("recheck_deadline_is_not_extended_and_only_one_generation_can_claim_it", proxy)
-        self.assertIn("idle_profile_rechecks_quic_without_opening_an_application_tunnel", proxy)
-        self.assertIn("result = &mut maintenance => return result", proxy)
-        self.assertIn("self.attempt_h3(generation, || self.h3.probe()).await", proxy)
+        self.assertIn("ClientError::QuicEndpointNetworkRefused => Some(EndpointUnavailable::Refused)", errors)
+        self.assertIn("endpoint_unavailable(error)", auto)
+        self.assertIn("AUTO_QUIC_ATTEMPTS", auto)
+        self.assertIn("negative_cache_expires_and_zero_ttl_disables_it", regression)
+        self.assertIn("recheck_deadline_is_not_extended_and_only_one_generation_can_claim_it", regression)
+        self.assertIn("idle_profile_rechecks_quic_without_opening_an_application_tunnel", regression)
+        self.assertRegex(proxy, r"result = &mut maintenance => \{\s*tasks.shutdown\(\).await;\s*return result;")
+        self.assertIn("self.attempt_h3(generation, || self.h3.probe()).await", auto)
         self.assertIn("dial::close_probe(session)", read("crates/theia/src/h3_client.rs"))
-        self.assertIn("route_change_rejects_stale_results_and_unknown_route_disables_cache", proxy)
-        self.assertIn("crate::network_scope::observe(self.h3.remote())", proxy)
+        self.assertIn("route_change_rejects_stale_results_and_unknown_route_disables_cache", regression)
+        self.assertIn("crate::network_scope::observe(self.h3.remote())", auto)
         tests = read("crates/theia/tests/client_h2.rs")
         for name in ("auto_falls_back_only_after_udp_silence_and_uses_negative_cache",
                      "auto_wrong_h3_certificate_never_retries_working_h2",
