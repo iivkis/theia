@@ -2107,9 +2107,9 @@ impl Interaction {
     }
     fn open_config(&mut self, role: Role) {
         self.access_observation = None;
-        if let Some(editor) = self.editor_for(role).filter(|e| e.write_uncertain()) {
+        if let Some(path) = self.editor_for(role).filter(|e| e.write_uncertain()).map(|e| e.saved_path().to_owned()) {
             self.last_apply = None;
-            self.config_dialog = Some(ConfigDialog::reopen(role, editor.saved_path().to_owned()));
+            self.config_dialog = Some(ConfigDialog::reopen(role, path));
             return;
         }
         #[cfg(windows)]
@@ -6781,7 +6781,7 @@ fn draw_issuance(
             },
             format!(
                 "Пользователь: {id}\nПодключение: {}\n\n{}\n\ny: подтвердить и сохранить  n/Esc: отменить",
-                editor.map_or("", |e| e.selected_record_id()),
+                editor.and_then(|e| e.server_connection_label(e.selected_record_id())).unwrap_or_else(|| "Не определено".into()),
                 if first {
                     "Создать личный ключ и включить доступ выбранного пользователя?\nКлюч будет доступен один раз после сохранения.\nДоступ включится для всех разрешённых этому пользователю подключений.\nСервер не запускается и не изменяется этой операцией."
                 } else if recovering {
@@ -6970,7 +6970,7 @@ fn draw_revocation(
             "Подтверждение отзыва доступа",
             format!(
                 "Пользователь: {id}\nВыбранное подключение: {}\n\nВНИМАНИЕ: отключение действует для всех подключений пользователя.\nКлюч и права останутся в файле. Новые сеансы будут запрещены после отдельного применения прав.\nТекущие сеансы продолжатся.\n\ny: подтвердить и сохранить  n/Esc: отменить",
-                editor.map_or("", |e| e.selected_record_id())
+                editor.and_then(|e| e.server_connection_label(e.selected_record_id())).unwrap_or_else(|| "Не определено".into())
             ),
         ),
         DisableFlow::Saving => (
@@ -8769,9 +8769,9 @@ mod tests {
                 assert!(ui.workspace_visible());
                 assert_eq!(ui.workspace_page, 4);
                 let wide = rendered_interaction(120, 40, &model, &ui);
-                assert!(wide.contains("Разделы") && wide.contains("H2") && wide.contains("H3"));
+                assert!(wide.contains("Разделы") && wide.contains("Нет подтверждённого источника данных"));
                 let compact = rendered_interaction(60, 18, &model, &ui);
-                assert!(compact.contains("Монитор трафика"));
+                assert!(compact.contains("Нет подтверждённого источника данных"));
                 ui.poll_navigation(&mut model);
                 ui.update(&mut model, press(KeyCode::F(4)));
                 assert_eq!(ui.workspace_page, 4);
