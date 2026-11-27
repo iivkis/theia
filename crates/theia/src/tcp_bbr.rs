@@ -132,7 +132,7 @@ fn new_socket(address: SocketAddr) -> Result<TcpSocket, Error> {
 
 /// Select before connect and observe after connect; return the actual
 /// controller when the platform exposes readback.
-#[cfg(test)]
+#[allow(dead_code)]
 pub(crate) async fn connect(endpoint: &str) -> Result<(TcpStream, Controller), Error> {
     for address in tokio::net::lookup_host(endpoint).await? {
         let socket = new_socket(address)?;

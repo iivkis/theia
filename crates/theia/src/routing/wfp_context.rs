@@ -8,9 +8,14 @@ pub(super) const SIZE: usize = 84;
 const MAGIC: &[u8; 8] = b"THWFP001";
 
 pub(super) fn decode(bytes: &[u8], token: &[u8; 32], peer: SocketAddr, local: SocketAddr) -> Option<FlowKey> {
+    decode_transport(bytes, token, peer, local, Transport::Tcp)
+}
+
+pub(super) fn decode_transport(bytes: &[u8], token: &[u8; 32], peer: SocketAddr, local: SocketAddr, transport: Transport) -> Option<FlowKey> {
+    let protocol = match transport { Transport::Tcp => 6, Transport::Udp => 17 };
     if bytes.len() != SIZE || &bytes[..8] != MAGIC || *token == [0; 32]
         || !bool::from(bytes[8..40].ct_eq(token.as_slice()))
-        || bytes[41] != 6 || bytes[42..44] != [0, 0] {
+        || bytes[41] != protocol || bytes[42..44] != [0, 0] {
         return None;
     }
     let compartment = u32::from_be_bytes(bytes[44..48].try_into().ok()?);
@@ -33,7 +38,7 @@ pub(super) fn decode(bytes: &[u8], token: &[u8; 32], peer: SocketAddr, local: So
         || destination.ip().is_loopback() || destination.ip().is_multicast() || destination.ip().is_unspecified() {
         return None;
     }
-    Some(FlowKey { source, destination, transport: Transport::Tcp, interface: compartment })
+    Some(FlowKey { source, destination, transport, interface: compartment })
 }
 
 #[cfg(test)]
@@ -59,5 +64,6 @@ mod tests {
         for len in 0..SIZE { assert!(decode(&bytes[..len], &[7; 32], peer, local).is_none()); }
         bytes[41] = 17;
         assert!(decode(&bytes, &[7; 32], peer, local).is_none());
+        assert_eq!(decode_transport(&bytes, &[7; 32], peer, local, Transport::Udp).unwrap().transport, Transport::Udp);
     }
 }

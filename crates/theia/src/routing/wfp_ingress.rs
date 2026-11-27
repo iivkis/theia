@@ -6,11 +6,10 @@ use std::{io, net::SocketAddr, os::windows::io::{AsRawHandle, AsRawSocket, FromR
 use ring::rand::{SecureRandom, SystemRandom};
 use zeroize::Zeroizing;
 use tokio::net::TcpStream;
-use windows_sys::Win32::Networking::WinSock::{WSAGetLastError, WSAIoctl};
+use windows_sys::Win32::Networking::WinSock::{WSAGetLastError, WSAIoctl, SIO_QUERY_WFP_CONNECTION_REDIRECT_RECORDS, SIO_QUERY_WFP_CONNECTION_REDIRECT_CONTEXT, SIO_QUERY_WFP_ALE_ENDPOINT_HANDLE};
 
-// mstcpip.h: _WSAIOW(IOC_VENDOR, 220/221).
-const QUERY_RECORDS: u32 = 0x9800_00dc;
-const QUERY_CONTEXT: u32 = 0x9800_00dd;
+const QUERY_RECORDS: u32 = SIO_QUERY_WFP_CONNECTION_REDIRECT_RECORDS;
+const QUERY_CONTEXT: u32 = SIO_QUERY_WFP_CONNECTION_REDIRECT_CONTEXT;
 const MAX_RECORDS: usize = 4096;
 
 fn query(stream: &impl AsRawSocket, code: u32, buffer: &mut [u8]) -> io::Result<usize> {
@@ -44,7 +43,7 @@ pub struct WfpLabSession {
 
 const CONFIGURE: u32 = (0x22 << 16) | (2 << 14) | (0x800 << 2);
 const AUTHORIZE_ENDPOINT: u32 = (0x22 << 16) | (2 << 14) | (0x801 << 2);
-const QUERY_ENDPOINT: u32 = 0x5800_00cd; // _WSAIOR(IOC_VENDOR,205)
+const QUERY_ENDPOINT: u32 = SIO_QUERY_WFP_ALE_ENDPOINT_HANDLE;
 
 fn ioctl(handle: &OwnedHandle, code: u32, bytes: &[u8]) -> io::Result<()> {
     use windows_sys::Win32::System::IO::DeviceIoControl;
@@ -99,6 +98,14 @@ impl WfpLabSession {
             std::net::IpAddr::V6(ip) => request[12..28].copy_from_slice(&ip.octets()),
         }
         ioctl(&self.handle, AUTHORIZE_ENDPOINT, &request)
+    }
+
+    pub(super) fn udp_context(&self, context: &[u8], peer: SocketAddr, local: SocketAddr) -> io::Result<FlowKey> {
+        if local.port() != self.port { return Err(io::ErrorKind::PermissionDenied.into()); }
+        let key = wfp_context::decode_transport(context, &self.token, peer, local, super::packet::Transport::Udp)
+            .ok_or(io::ErrorKind::PermissionDenied)?;
+        if key.interface != self.compartment { return Err(io::ErrorKind::PermissionDenied.into()); }
+        Ok(key)
     }
 
     pub(crate) fn original_tcp(&self, stream: &TcpStream) -> io::Result<FlowKey> {

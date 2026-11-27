@@ -21,6 +21,8 @@ pub mod dns_attribution;
 mod wfp_context;
 #[cfg(target_os = "windows")]
 pub mod wfp_ingress;
+#[cfg(target_os = "windows")]
+pub mod wfp_udp;
 #[cfg(target_os = "linux")]
 pub mod nfqueue;
 #[cfg(target_os = "linux")]

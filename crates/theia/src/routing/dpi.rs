@@ -6,6 +6,15 @@ mod tcp;
 mod tls;
 pub(crate) mod udp;
 
+pub(super) fn complete_packet_hello(bytes: &[u8], expected: &str) -> bool {
+    matches!(tls::inspect(bytes), tls::Flight::Complete { consumed, name, .. } if consumed == bytes.len() && name == expected)
+}
+pub(super) fn packet_quic_hello(message: &[u8], expected: &str) -> bool {
+    tls::hello_metadata(message).is_some_and(|(name, h3)| h3 && name == expected)
+}
+#[cfg(test)]
+pub(super) fn packet_test_hello(name: &str) -> Vec<u8> { tls::fixture(name) }
+
 use crate::{client::ClientError, network_scope};
 use std::{
     net::{IpAddr, SocketAddr},

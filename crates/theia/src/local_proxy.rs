@@ -2008,7 +2008,7 @@ impl NativeIngress {
         let _gate = self.verdict_gate.lock();
         self.runtime.stop();
         self.client.routing_cache().dpi.retire();
-        if let Ok(mut registrar) = self.registrar.lock() { registrar.take(); }
+        if let Ok(mut registrar) = self.registrar.lock() { drop(registrar.take()); }
         #[cfg(target_os = "linux")]
         if let Ok(mut raw) = self.raw.lock() {
             raw.clear();
