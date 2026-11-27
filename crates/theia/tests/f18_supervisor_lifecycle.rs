@@ -124,7 +124,11 @@ fn reserve_address() -> (SocketAddr, TcpListener, UdpSocket) {
                 return (address, tcp, udp);
             }
         }
-        let port = 20_000 + ((std::process::id().wrapping_mul(137).wrapping_add(attempt * 131)) % 20_000) as u16;
+        let port = 20_000
+            + ((std::process::id()
+                .wrapping_mul(137)
+                .wrapping_add(attempt * 131))
+                % 20_000) as u16;
         let address = SocketAddr::from(([127, 0, 0, 1], port));
         if let Ok(tcp) = TcpListener::bind(address) {
             if let Ok(udp) = UdpSocket::bind(address) {
