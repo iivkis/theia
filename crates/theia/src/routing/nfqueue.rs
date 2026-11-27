@@ -60,7 +60,9 @@ pub(super) fn message(kind: u16, flags: u16, sequence: u32, queue: u16, attrs: &
 pub(super) fn checked_header(data: &[u8]) -> io::Result<(u16, u32, &[u8])> {
     let header = data.get(..HEADER).ok_or_else(invalid)?;
     let len = native32(&header[..4]) as usize;
-    if len < HEADER || align4(len) != data.len() {
+    // NFQUEUE uses skb_zerocopy for its final payload, so the kernel
+    // can report an exact, unaligned nlmsg_len and datagram length.
+    if len < HEADER || (len != data.len() && align4(len) != data.len()) {
         return Err(invalid());
     }
     let body = data.get(HEADER..len).ok_or_else(invalid)?;
@@ -88,6 +90,20 @@ struct Captured {
     checksum_pending: bool,
     local_output: bool,
 }
+// The kernel's final NFQA_PAYLOAD is attached without tail padding.
+fn next_packet_attr<'a>(rest: &mut &'a [u8]) -> io::Result<Option<(u16, &'a [u8])>> {
+    if let Some(header) = rest.get(..4) {
+        let len = usize::from(native16(&header[..2]));
+        let kind = native16(&header[2..4]) & 0x3fff;
+        if kind == 10 && len == rest.len() && len >= 4 {
+            let value = &rest[4..];
+            *rest = &[];
+            return Ok(Some((kind, value)));
+        }
+    }
+    next_attr(rest)
+}
+
 fn decode(data: &[u8], queue: u16) -> io::Result<Captured> {
     let (kind, _, body) = checked_header(data)?;
     let nfgen = body.get(..NFGEN).ok_or_else(invalid)?;
@@ -99,7 +115,7 @@ fn decode(data: &[u8], queue: u16) -> io::Result<Captured> {
         (None, None, None, None, None, None);
     let mut ethertype = 0;
     let mut local_output = false;
-    while let Some((kind, value)) = next_attr(&mut rest)? {
+    while let Some((kind, value)) = next_packet_attr(&mut rest)? {
         match kind {
             1 if id.is_none() && value.len() == 7 => {
                 id = Some(be32(&value[..4]));
@@ -514,6 +530,34 @@ mod tests {
             assert!(decode(&data[..end], 9).is_err());
         }
     }
+    #[test]
+    fn kernel_zerocopy_payload_without_terminal_padding() {
+        let mut payload = udp4();
+        payload.extend_from_slice(b"owned");
+        payload[2..4].copy_from_slice(&33u16.to_be_bytes());
+        payload[24..26].copy_from_slice(&13u16.to_be_bytes());
+        let mut attrs = Vec::new();
+        attr(&mut attrs, 1, &[0, 0, 0, 7, 8, 0, 3]);
+        attr(&mut attrs, 6, &12u32.to_be_bytes());
+        attr(&mut attrs, 14, &1u32.to_be_bytes());
+        attr(&mut attrs, 10, &payload);
+        // Model the kernel's skb_zerocopy output: last attribute has no pad.
+        attrs.truncate(attrs.len() - 3);
+        let mut data = message(PACKET, 0, 0, 9, &attrs);
+        data[HEADER] = 2;
+        assert_ne!(data.len() % 4, 0);
+        let captured = decode(&data, 9).unwrap();
+        assert_eq!(captured.bytes, payload);
+        assert!(captured.meta.is_some());
+        assert_eq!(captured.meta.unwrap().flow.interface, 12);
+        assert!(captured.checksum_pending);
+        assert!(decode(&data[..data.len() - 1], 9).is_err());
+        let mut truncated = data[..data.len() - 1].to_vec();
+        let len = truncated.len() as u32;
+        truncated[..4].copy_from_slice(&len.to_ne_bytes());
+        assert!(decode(&truncated, 9).is_err());
+    }
+
     #[test]
     fn duplicate_or_invalid_attributes_fail_closed() {
         let mut attrs = Vec::new();
