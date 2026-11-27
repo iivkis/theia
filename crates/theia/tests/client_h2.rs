@@ -644,7 +644,7 @@ async fn imported_server_invitation_reaches_real_connect_and_socks5_without_env_
         let decoded = theia::client_import::read_source(&confidential).unwrap();
         let mut editor = Editor::load(Role::Client, &config_path).unwrap();
         editor
-            .import_invitation(&decoded, Some(&ca_ref), None)
+            .import_invitation(&decoded, None, None)
             .unwrap();
         let Config::Client(mut client) = config::read_file(&config_path).unwrap() else {
             panic!("client");
@@ -657,7 +657,7 @@ async fn imported_server_invitation_reaches_real_connect_and_socks5_without_env_
             .unwrap()
             .contains(&token()));
         assert_eq!(imported.server, endpoint);
-        assert_eq!(imported.tls_ca.as_deref(), Some(ca_ref.as_str()));
+        assert_eq!(imported.tls_ca, invitation.trust_reference());
 
         // The user separately selects the imported profile and starts the
         // client. Neither step was part of the import operation itself.
