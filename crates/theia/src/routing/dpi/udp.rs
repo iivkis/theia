@@ -426,6 +426,45 @@ mod tests {
         serving.abort();
     }
 
+    #[tokio::test]
+    async fn independent_v2_only_probe_never_negotiates_v1_or_reuses_v1_evidence() {
+        use crate::quic_core::{listener::Listener, negotiation::VersionPolicy, handshake_udp, wire::Version};
+        use crate::quic_core::lifecycle::ShutdownPhase;
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+        use std::sync::Arc;
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let der = cert.cert.der().clone();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(der.clone()).unwrap();
+        let client_tls = super::super::tls::tls_config(roots).unwrap();
+        let mut server_tls = crate::transport_policy::Carrier::H3.server_tls(
+            vec![der], PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into()).unwrap();
+        server_tls.send_tls13_tickets = 0;
+        let server_tls = Arc::new(server_tls);
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let mut listener = Listener::with_versions(socket,4,VersionPolicy::exact(Version::V2)).unwrap();
+        tokio::time::timeout(Duration::from_secs(12), async {
+            let server = async {
+                let candidate = listener.accept().await.unwrap();
+                let mut session = handshake_udp::accept(candidate,server_tls).await.unwrap();
+                while session.shutdown_phase() == ShutdownPhase::Open {
+                    session.flush(tokio::time::Instant::now()).await.unwrap();
+                    session.recv(Duration::from_millis(10)).await.unwrap();
+                }
+            };
+            let client = async {
+                // A v2-only server may return VN; exact-v1 must still fail.
+                assert!(probe_quic("localhost",addr,None,client_tls.clone(),Version::V1).await.is_none());
+                assert!(probe_quic("localhost",addr,None,client_tls,Version::V2).await.is_some());
+            };
+            tokio::select! {
+                _ = server => panic!("server closed before verified v2 probe completed"),
+                () = client => {}
+            }
+        }).await.unwrap();
+    }
+
     fn h3_hello() -> Vec<u8> {
         let mut hello = super::super::tls::fixture("example.org");
         // Fixture has exactly one extension block containing SNI. Add h3 ALPN.
