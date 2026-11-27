@@ -215,6 +215,61 @@ impl UdpReversePlan {
     }
 }
 
+/// Exact TCP loopback mapping: original listener remains reserved, and
+/// only the dedicated client/redirect listener pair can be translated.
+/// The general native adapter must additionally prove socket ownership,
+/// policy lease and route before constructing a non-loopback mapping.
+#[derive(Debug, Clone, Copy)]
+pub struct TcpLoopbackMap {
+    client: std::net::SocketAddr,
+    original: std::net::SocketAddr,
+    relay: std::net::SocketAddr,
+}
+impl TcpLoopbackMap {
+    pub fn new(client: std::net::SocketAddr, original: std::net::SocketAddr, relay: std::net::SocketAddr) -> Option<Self> {
+        if !client.ip().is_loopback() || client.ip()!=original.ip() || client.ip()!=relay.ip()
+            || [client.port(),original.port(),relay.port()].contains(&0)
+            || client==original || client==relay || original==relay {
+            return None;
+        }
+        Some(Self { client, original, relay })
+    }
+
+    /// Does not authorize a send. No other tuple can be rewritten.
+    pub fn rewrite(&self,address:&Address, packet:&[u8]) -> Option<Vec<u8>> {
+        use super::packet::Transport;
+        let obs=address.network_inner(packet,true).ok()?;
+        let key=obs.meta.flow;
+        if obs.sniffed || !obs.outbound || key.transport!=Transport::Tcp { return None; }
+        let (offset,port)=if key.source==self.client && key.destination==self.original {
+            (2,self.relay.port())
+        } else if key.source==self.relay && key.destination==self.client {
+            (0,self.original.port())
+        } else { return None; };
+        // Do not transform extension/options/fragmented IP headers.
+        let ip_len=if packet[0]==0x45 && packet[9]==6 { 20 }
+            else if packet[0]>>4==6 && packet[6]==6 { 40 }
+            else { return None; };
+        let mut out=packet.to_vec();
+        out[ip_len+offset..ip_len+offset+2].copy_from_slice(&port.to_be_bytes());
+        let transport_len=(out.len()-ip_len) as u32;
+        let pseudo=if ip_len==20 {
+            out[10..12].fill(0);
+            let sum=checksum(word_sum(&out[..20]));
+            out[10..12].copy_from_slice(&sum.to_be_bytes());
+            word_sum(&out[12..20])
+        } else { word_sum(&out[8..40]) };
+        out[ip_len+16..ip_len+18].fill(0);
+        let sum=checksum(pseudo+6+transport_len+word_sum(&out[ip_len..]));
+        out[ip_len+16..ip_len+18].copy_from_slice(&sum.to_be_bytes());
+        let after=PacketMeta::parse(&out,obs.interface).ok()?;
+        let (source,destination)=if offset==2 { (self.client,self.relay) } else { (self.original,self.client) };
+        if after.flow.source!=source || after.flow.destination!=destination
+            || after.payload_len!=obs.meta.payload_len || after.tcp_flags!=obs.meta.tcp_flags { return None; }
+        Some(out)
+    }
+}
+
 /// Candidate bytes only, not a live WinDivert injection token.
 #[derive(Debug)]
 pub struct ReverseDatagram {
@@ -345,6 +400,15 @@ mod native {
             if address_len != 80 || count == 0 || count > packet.len() { return Err(io::ErrorKind::InvalidData.into()); }
             packet.truncate(count);
             Ok((packet,address))
+        }
+        fn receive_event(&self, handle: &Handle, cancelled: &AtomicBool, deadline: Instant) -> io::Result<EndpointCandidate> {
+            let mut addr=Address::from_bytes(&[0;80]);
+            let mut addr_len=80;
+            let count=transfer(handle.0,cancelled,deadline,|operation,count| unsafe {
+                (self.recv)(handle.0,std::ptr::null_mut(),0,count,0,&mut addr,&mut addr_len,operation)
+            })?;
+            if count!=0 || addr_len!=80 { return Err(io::ErrorKind::InvalidData.into()); }
+            addr.endpoint_candidate().ok_or_else(||io::ErrorKind::InvalidData.into())
         }
         fn send(&self, handle: &Handle, packet: &[u8], address: &Address, cancelled: &AtomicBool, deadline: Instant) -> io::Result<()> {
             let count = transfer(handle.0,cancelled,deadline,|operation,count| unsafe {
@@ -505,6 +569,131 @@ mod native {
         api.retire(handle)
     }
 
+    fn tcp_lab(api:&Api,v6:bool,cancelled:&AtomicBool) -> io::Result<()> {
+        use tokio::io::{AsyncReadExt,AsyncWriteExt};
+        use std::net::{TcpListener,SocketAddr};
+        let loopback=if v6 { "[::1]:0" } else { "127.0.0.1:0" };
+        let original=TcpListener::bind(loopback)?;
+        original.set_nonblocking(true)?;
+        let relay=TcpListener::bind(loopback)?;
+        relay.set_nonblocking(true)?;
+        let original_addr=original.local_addr()?;
+        let relay_addr=relay.local_addr()?;
+        let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        let client={
+            let _entered=runtime.enter();
+            let socket=if v6 { tokio::net::TcpSocket::new_v6()? } else { tokio::net::TcpSocket::new_v4()? };
+            socket.bind(loopback.parse::<SocketAddr>().map_err(|_|io::ErrorKind::InvalidInput)?)?;
+            socket
+        };
+        let client_addr=client.local_addr()?;
+        let mapping=TcpLoopbackMap::new(client_addr,original_addr,relay_addr).ok_or(io::ErrorKind::InvalidData)?;
+        let address=if v6 { "ipv6.SrcAddr == ::1 and ipv6.DstAddr == ::1" }
+            else { "ip.SrcAddr == 127.0.0.1 and ip.DstAddr == 127.0.0.1" };
+        let filter=std::ffi::CString::new(format!(
+            "outbound and loopback and !impostor and tcp and ({address}) and ((tcp.SrcPort == {} and tcp.DstPort == {}) or (tcp.SrcPort == {} and tcp.DstPort == {}))",
+            client_addr.port(),original_addr.port(),relay_addr.port(),client_addr.port()
+        )).map_err(|_|io::ErrorKind::InvalidInput)?;
+        let handle=api.open_handle(&filter,0,0x10)?;
+        api.bounded(&handle)?;
+        let done=AtomicBool::new(false);
+        let deadline=Instant::now()+Duration::from_secs(8);
+        let result=std::thread::scope(|scope| {
+            let task=scope.spawn(|| {
+                struct Done<'a>(&'a AtomicBool);
+                impl Drop for Done<'_> { fn drop(&mut self) { self.0.store(true,Ordering::Release); } }
+                let _done=Done(&done);
+                runtime.block_on(async move {
+                    let relay=tokio::net::TcpListener::from_std(relay)?;
+                    let (left,right)=tokio::time::timeout(Duration::from_secs(6),async {
+                        tokio::try_join!(
+                            async {
+                                let mut stream=client.connect(original_addr).await?;
+                                if stream.peer_addr()?!=original_addr { return Err(io::ErrorKind::InvalidData.into()); }
+                                stream.write_all(b"theia-tcp-lab").await?;
+                                let mut bytes=[0;13];
+                                stream.read_exact(&mut bytes).await?;
+                                if &bytes!=b"theia-tcp-lab" { return Err(io::ErrorKind::InvalidData.into()); }
+                                stream.shutdown().await?;
+                                let mut eof=[0;1];
+                                if stream.read(&mut eof).await?!=0 { return Err(io::ErrorKind::InvalidData.into()); }
+                                Ok::<(),io::Error>(())
+                            },
+                            async {
+                                let (mut stream,peer)=relay.accept().await?;
+                                if peer!=client_addr { return Err(io::ErrorKind::InvalidData.into()); }
+                                let mut bytes=[0;13];
+                                stream.read_exact(&mut bytes).await?;
+                                stream.write_all(&bytes).await?;
+                                let mut eof=[0;1];
+                                if stream.read(&mut eof).await?!=0 { return Err(io::ErrorKind::InvalidData.into()); }
+                                stream.shutdown().await?;
+                                Ok::<(),io::Error>(())
+                            }
+                        )
+                    }).await.map_err(|_|io::ErrorKind::TimedOut)??;
+                    Ok::<(),io::Error>((left,right))
+                })
+            });
+            let pumping=(|| -> io::Result<()> {
+                let mut packets=0;
+                while !done.load(Ordering::Acquire) {
+                    if cancelled.load(Ordering::Acquire) || Instant::now()>=deadline || packets>=256 {
+                        return Err(io::ErrorKind::TimedOut.into());
+                    }
+                    let receive_until=std::cmp::min(deadline,Instant::now()+Duration::from_millis(100));
+                    match api.receive(&handle,cancelled,receive_until) {
+                        Ok((packet,mut addr)) => {
+                            let translated=mapping.rewrite(&addr,&packet).ok_or(io::ErrorKind::InvalidData)?;
+                            addr.flags |= (1<<22) | if v6 { 0 } else { 1<<21 };
+                            api.send(&handle,&translated,&addr,cancelled,deadline)?;
+                            packets+=1;
+                        },
+                        Err(e) if e.kind()==io::ErrorKind::TimedOut=>{},
+                        Err(e)=>return Err(e),
+                    }
+                }
+                if packets==0 { return Err(io::ErrorKind::InvalidData.into()); }
+                Ok(())
+            })();
+            let completed=task.join().map_err(|_|io::Error::other("TCP lab worker panicked"))?;
+            pumping?;
+            completed?;
+            Ok::<(),io::Error>(())
+        });
+        result?;
+        if !matches!(original.accept(),Err(e) if e.kind()==io::ErrorKind::WouldBlock) {
+            return Err(io::Error::other("original listener received redirected connection"));
+        }
+        api.retire(handle)
+    }
+
+    fn socket_lab(api:&Api,cancelled:&AtomicBool) -> io::Result<()> {
+        // Only capture events belonging to the current process. The
+        // socket is held open until the observed connect and close.
+        let pid=std::process::id();
+        let receiver=UdpSocket::bind("127.0.0.1:0")?;
+        let sender=UdpSocket::bind("127.0.0.1:0")?;
+        let src=sender.local_addr()?;
+        let dst=receiver.local_addr()?;
+        let filter=std::ffi::CString::new(format!("processId == {pid} and protocol == 17 and localPort == {}",src.port()))
+            .map_err(|_|io::ErrorKind::InvalidInput)?;
+        let handle=api.open_handle(&filter,3,0x15)?;
+        api.bounded(&handle)?;
+        sender.connect(dst)?;
+        let deadline=Instant::now()+Duration::from_secs(3);
+        let event=api.receive_event(&handle,cancelled,deadline)?;
+        if event.pid!=pid || event.layer!=3 || event.event!=4 || event.local_port!=src.port() || event.remote_port!=dst.port() {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        drop(sender);
+        let closed=api.receive_event(&handle,cancelled,deadline)?;
+        if closed.pid!=pid || closed.endpoint!=event.endpoint || closed.event!=7 || closed.timestamp<event.timestamp {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        api.retire(handle)
+    }
+
     /// The async owner never runs driver IO on an executor thread.
     /// Dropping the future requests cancellation, and the worker retains
     /// the DLL, handles and operation buffers until completion.
@@ -516,7 +705,10 @@ mod native {
         let result = tokio::task::spawn_blocking(move || {
             let api=load(&directory,dll,sys)?;
             udp_lab(&api,false,&signal)?;
-            udp_lab(&api,true,&signal)
+            udp_lab(&api,true,&signal)?;
+            tcp_lab(&api,false,&signal)?;
+            tcp_lab(&api,true,&signal)?;
+            socket_lab(&api,&signal)
         }).await.map_err(|_|io::Error::other("WinDivert worker failed"))?;
         drop(cancel);
         result
@@ -610,6 +802,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn exact_tcp_translation_and_reverse_preserve_sequence_and_options() {
+        let map=TcpLoopbackMap::new("127.0.0.1:1234".parse().unwrap(),"127.0.0.1:4321".parse().unwrap(),"127.0.0.1:9876".parse().unwrap()).unwrap();
+        let mut raw=[0u8;80];raw[..8].copy_from_slice(&1i64.to_le_bytes());
+        raw[8..12].copy_from_slice(&((1u32<<17)|(1<<18)).to_le_bytes());
+        raw[16..20].copy_from_slice(&1u32.to_le_bytes());
+        let addr=Address::from_bytes(&raw);
+        let mut p=vec![0u8;44];
+        p[0]=0x45;p[2..4].copy_from_slice(&44u16.to_be_bytes());p[9]=6;
+        p[12..16].copy_from_slice(&[127,0,0,1]);p[16..20].copy_from_slice(&[127,0,0,1]);
+        p[20..22].copy_from_slice(&1234u16.to_be_bytes());p[22..24].copy_from_slice(&4321u16.to_be_bytes());
+        p[24..28].copy_from_slice(&99u32.to_be_bytes());p[32]=0x60;p[33]=2;
+        p[40..44].copy_from_slice(&[2,4,5,180]);
+        let out=map.rewrite(&addr,&p).unwrap();
+        assert_eq!(&out[22..24],&9876u16.to_be_bytes());
+        assert_eq!(&out[24..36],&p[24..36]);
+        assert_eq!(&out[40..],&p[40..]);
+        assert_eq!(checksum(word_sum(&out[..20])),0);
+        assert_eq!(checksum(word_sum(&out[12..20])+6+24+word_sum(&out[20..])),0);
+        assert!(map.rewrite(&addr,&out).is_none());
+        p[20..22].copy_from_slice(&9876u16.to_be_bytes());p[22..24].copy_from_slice(&1234u16.to_be_bytes());
+        let out=map.rewrite(&addr,&p).unwrap();
+        assert_eq!(&out[20..22],&4321u16.to_be_bytes());
+        assert!(TcpLoopbackMap::new("192.0.2.1:1".parse().unwrap(),"192.0.2.1:2".parse().unwrap(),"192.0.2.1:3".parse().unwrap()).is_none());
+    }
     #[test]
     fn flow_event_is_candidate_only_and_wrong_event_is_denied() {
         let mut raw=[0u8;80];

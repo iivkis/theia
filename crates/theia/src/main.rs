@@ -84,7 +84,7 @@ async fn run() {
             #[cfg(all(windows, target_arch = "x86_64"))]
             {
                 theia::routing::windivert::loopback_acceptance(directory.into(),dll_sha256,sys_sha256).await
-                    .map(|_| "WinDivert isolated IPv4/IPv6 UDP receive/send/reverse loopback verified; capture inactive".to_owned())
+                    .map(|_| "WinDivert isolated IPv4/IPv6 TCP redirect, UDP receive/send/reverse and socket lifecycle verified; capture inactive".to_owned())
                     .map_err(|_| CliError::Client(theia::client::ClientError::Io))
             }
             #[cfg(not(all(windows, target_arch = "x86_64")))]
