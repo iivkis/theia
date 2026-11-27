@@ -1158,6 +1158,9 @@ impl Wizard {
             ),
             9 => "Дополнительные имена сайтов".into(),
             10 => "Только сети, которые разрешено проверять".into(),
+            11 => if self.advanced { "Свернуть".into() } else { "Открыть".into() },
+            12 => "Открыть редактор".into(),
+            13 => "Проверить и перейти дальше".into(),
             4 => self.custom_domains(),
             6 => {
                 if self.fields[6] == "auto" {
@@ -1349,11 +1352,14 @@ impl Wizard {
             if self.advanced {
                 fields.push(0);
             }
+            fields.push(11);
+            fields.push(13);
             return fields;
         }
         let mut fields = vec![8, 9];
         if self.custom_enabled {
             fields.push(4);
+            fields.push(12);
         }
         fields.push(10);
         if self.ranges_enabled {
@@ -1362,6 +1368,8 @@ impl Wizard {
         if self.advanced {
             fields.push(6);
         }
+        fields.push(11);
+        fields.push(13);
         fields
     }
     fn toggle_source(&mut self) {
@@ -1486,6 +1494,13 @@ impl Wizard {
                         self.error.clear();
                     }
                     KeyCode::Esc => return true,
+                    KeyCode::Enter if self.focus == 11 => {
+                        self.advanced = !self.advanced;
+                    }
+                    KeyCode::Enter if self.focus == 12 && self.sources && self.custom_enabled => {
+                        self.focus = 4;
+                        self.domain_draft = Some(DomainDraft::new(&self.fields[4]));
+                    }
                     KeyCode::F(2) => {
                         self.advanced = !self.advanced;
                         if !self.visible_fields().contains(&self.focus) {
@@ -1955,6 +1970,9 @@ impl Wizard {
                         5 if self.source.is_none() => "Имя первого пользователя",
                         5 => "Пользователи с доступом",
                         7 => "Разрешённые IP-диапазоны",
+                        11 => "Расширенные настройки",
+                        12 => "Редактировать список сайтов",
+                        13 => "Продолжить",
                         _ => WIZARD_LABELS[id],
                     };
                     out.push_str(&format!("{} {label}: {}\n", if id == self.focus { ">" } else { " " }, self.display_value(id)));
@@ -2084,6 +2102,11 @@ impl ProvisionPanel {
         }
     }
 
+    pub(crate) fn recovery_path(&self) -> Option<&Path> {
+        let wizard = self.wizard.as_ref()?;
+        matches!(wizard.stage, WizardStage::SaveFailed { retry: false, .. }).then_some(wizard.config.as_path())
+    }
+
     pub(crate) fn confirmation_choice(&self) -> Option<(char, &'static str)> {
         if let Some(wizard) = &self.wizard {
             if let Some(panel) = &wizard.registration {
@@ -2099,6 +2122,7 @@ impl ProvisionPanel {
                 }
                 WizardStage::CreateConfirm(_) if !wizard.result_details => Some(('y', "Сохранить")),
                 WizardStage::SaveFailed { retry: true, .. } => Some(('y', "Повторить настройку")),
+                WizardStage::SaveFailed { retry: false, .. } => Some(('o', "Открыть настройки заново")),
                 WizardStage::Success => Some((
                     'y',
                     if wizard.source.is_none() {
@@ -2331,6 +2355,9 @@ impl ProvisionPanel {
             (if wizard.catalogue_enabled() { "[x] Готовый каталог сайтов" } else { "[ ] Готовый каталог сайтов" }, "Пробел или ←/→ — включить или выключить. Сеть только после подтверждения."),
             (if wizard.custom_enabled { "[x] Добавить свои сайты" } else { "[ ] Добавить свои сайты" }, "Пробел или ←/→ — включить или выключить дополнительный источник."),
             (if wizard.ranges_enabled { "[x] Проверить IP-диапазоны" } else { "[ ] Проверить IP-диапазоны" }, "Пробел или ←/→ — включить или выключить. Только с разрешением."),
+            ("› Расширенные настройки", "Enter — раскрыть или свернуть."),
+            ("› Редактировать список сайтов", "Enter — открыть редактор."),
+            ("› Продолжить", "Enter — проверить параметры и перейти дальше."),
         ];
         Some(Form {
             fields: wizard
@@ -2692,7 +2719,7 @@ mod tests {
         tx.send(Err(Error::Approval)).unwrap();
         assert!(panel.poll().is_none());
         assert!(panel.body().contains("Повтор недоступен"));
-        assert!(panel.confirmation_choice().is_none());
+        assert_eq!(panel.confirmation_choice(), Some(('o', "Открыть настройки заново")));
         assert!(!path.exists() && !input.health.exists() && !input.bundle.exists());
         std::fs::remove_dir_all(dir).unwrap();
     }

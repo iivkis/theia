@@ -116,6 +116,12 @@ pub enum StatusCommand {
         expected_revision: u64,
         candidate_sha256: [u8; 32],
     },
+    /// Read-only, exact saved-file bound observation for one inbound/user.
+    AccessStatus {
+        inbound: [u8; 64],
+        user: [u8; 64],
+        saved_sha256: [u8; 32],
+    },
     RealityStatus {
         id: [u8; 64],
         len: u8,
@@ -199,6 +205,11 @@ pub enum StatusReply {
     RunningRevision {
         inbounds: usize,
         revision: u64,
+    },
+    AccessObserved {
+        revision: u64,
+        /// 0 missing inbound, 1 no grant/user, 2 disabled, 3 authorized for new sessions.
+        state: u8,
     },
     Unsupported,
     /// Candidate passes the deliberately narrow compatibility preflight.
@@ -678,6 +689,21 @@ where
                     "ERR unsupported\n".into()
                 }
             }
+            candidate if parse_access_status(candidate).is_some() => {
+                let (inbound, user, digest) = parse_access_status(candidate).expect("parsed");
+                if let (Some(preflight), Some(live)) = (&preflight, &live) {
+                    let preflight = preflight.clone();
+                    match tokio::task::spawn_blocking(move || preflight.matches_saved_bytes(digest)).await {
+                        Ok(true) => match live.access_observation(inbound, user) {
+                            Ok((revision, state)) => format!("theia-access-v1 revision={revision} state={state}\n"),
+                            Err(_) => "ERR unsupported\n".into(),
+                        },
+                        _ => "ERR unsupported\n".into(),
+                    }
+                } else {
+                    "ERR unsupported\n".into()
+                }
+            }
             candidate if parse_reality_status(candidate).is_some() => {
                 let (id, manifest) = parse_reality_status(candidate).expect("parsed");
                 match runtime
@@ -990,6 +1016,23 @@ fn parse_restart_rollback(command: &[u8]) -> Option<u64> {
     )
 }
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+fn parse_access_status(command: &[u8]) -> Option<(&str, &str, [u8; 32])> {
+    let raw = std::str::from_utf8(command.strip_prefix(b"access-status inbound=")?).ok()?;
+    let (inbound, tail) = raw.split_once(" user=")?;
+    let (user, digest) = tail.split_once(" sha256=")?;
+    if !crate::config::valid_id(inbound) || !crate::config::valid_id(user) { return None; }
+    Some((inbound, user, decode_digest(digest)?))
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn access_id(bytes: &[u8; 64]) -> Option<&str> {
+    let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    if bytes[len..].iter().any(|&b| b != 0) { return None; }
+    let id = std::str::from_utf8(&bytes[..len]).ok()?;
+    crate::config::valid_id(id).then_some(id)
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn parse_reality_status(command: &[u8]) -> Option<(&str, [u8; 32])> {
     let raw = std::str::from_utf8(command.strip_prefix(b"reality-status id=")?).ok()?;
     let (id, digest) = raw.split_once(" manifest=")?;
@@ -1236,6 +1279,12 @@ where
                 return Err(ManagementError::InvalidReply);
             }
             format!("restart-rollback-apply rev={expected_revision}\n").into_bytes()
+        }
+        StatusCommand::AccessStatus { inbound, user, saved_sha256 } => {
+            let inbound = access_id(&inbound).ok_or(ManagementError::InvalidReply)?;
+            let user = access_id(&user).ok_or(ManagementError::InvalidReply)?;
+            let digest: String = saved_sha256.iter().map(|b| format!("{b:02x}")).collect();
+            format!("access-status inbound={inbound} user={user} sha256={digest}\n").into_bytes()
         }
         StatusCommand::RealityStatus { id, len, manifest } => {
             let raw = id
@@ -1787,6 +1836,17 @@ where
             Err(ManagementError::InvalidReply)
         };
     }
+    if matches!(command, StatusCommand::AccessStatus { .. }) {
+        if reply == b"ERR unsupported\n" { return Err(ManagementError::Unsupported); }
+        let raw = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
+        let (revision, state) = raw.strip_prefix("theia-access-v1 revision=")
+            .and_then(|line| line.strip_suffix('\n'))
+            .and_then(|line| line.split_once(" state="))
+            .ok_or(ManagementError::InvalidReply)?;
+        let revision = positive_decimal(revision).ok_or(ManagementError::InvalidReply)?;
+        let state = match state { "0" => 0, "1" => 1, "2" => 2, "3" => 3, _ => return Err(ManagementError::InvalidReply) };
+        return Ok(StatusReply::AccessObserved { revision, state });
+    }
     if command == StatusCommand::Status {
         let reply = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
         if let Some((count, revision)) = reply
@@ -1911,6 +1971,7 @@ pub async fn query_environment(command: StatusCommand) -> Result<StatusReply, Ma
         StatusCommand::CheckRestartBound { .. } => "restart_preview",
         StatusCommand::CheckRestartRollback => "restart_rollback_check",
         StatusCommand::ApplyRestartRollback { .. } => "restart_rollback_apply",
+        StatusCommand::AccessStatus { .. } => "access_status",
         StatusCommand::RealityStatus { .. } => "reality_status",
         StatusCommand::CheckAuthRollback => "check_auth_rollback",
         StatusCommand::ApplyAuthRollback { .. } => "apply_auth_rollback",
@@ -2357,6 +2418,24 @@ mod strict_wire_matrix_tests {
         ] {
             assert!(parse_reality_status(invalid.as_bytes()).is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn access_status_is_bounded_read_only_and_strictly_parsed() {
+        let mut inbound = [0; 64];
+        inbound[..4].copy_from_slice(b"edge");
+        let mut user = [0; 64];
+        user[..5].copy_from_slice(b"alice");
+        let command = StatusCommand::AccessStatus { inbound, user, saved_sha256: [0xab; 32] };
+        let request = format!("access-status inbound=edge user=alice sha256={}\n", "ab".repeat(32));
+        assert!(request.len() < MAX_COMMAND_BYTES);
+        assert_eq!(parse_access_status(request.trim_end().as_bytes()), Some(("edge", "alice", [0xab; 32])));
+        assert_eq!(peer(command, &request, b"theia-access-v1 revision=7 state=3\n").await,
+            Ok(StatusReply::AccessObserved { revision: 7, state: 3 }));
+        for invalid in [b"theia-access-v1 revision=0 state=3\n".as_slice(), b"theia-access-v1 revision=7 state=4\n", b"theia-access-v1 revision=7 state=3 extra\n"] {
+            assert_eq!(peer(command, &request, invalid).await, Err(ManagementError::InvalidReply));
+        }
+        assert_eq!(peer(command, &request, b"ERR unsupported\n").await, Err(ManagementError::Unsupported));
     }
 
     #[tokio::test]

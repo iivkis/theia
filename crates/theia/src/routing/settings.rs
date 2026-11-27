@@ -12,6 +12,8 @@ pub struct Settings {
     pub geodata_directory: Option<String>,
     #[serde(default)]
     pub rules: Vec<Rule>,
+    #[serde(default = "snapshot::default_diagnostic_domains", skip_serializing_if = "snapshot::is_default_diagnostic_domains")]
+    pub diagnostic_domains: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub datasets: Option<geodata::Manifest>,
 }
@@ -52,7 +54,7 @@ impl Settings {
     pub fn validate(&self) -> Result<(), Error> {
         // Revision 1 is the implicit empty baseline. An explicitly emptied
         // policy must retain its revision, not reset to that baseline.
-        if self.revision < 2 {
+        if self.revision < 2 || !snapshot::validate_diagnostic_domains(&self.diagnostic_domains) {
             return Err(Error::Invalid);
         }
         let (_, site_codes, ip_codes) = super::compile_selectors(&self.rules)?;
@@ -118,6 +120,7 @@ mod tests {
         Settings {
             revision: 2,
             geodata_directory: None,
+            diagnostic_domains: crate::routing::snapshot::default_diagnostic_domains(),
             datasets: None,
             rules: vec![Rule {
                 name: "example".into(),

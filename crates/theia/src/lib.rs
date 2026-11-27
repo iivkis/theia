@@ -85,6 +85,7 @@ pub(crate) mod tui_domain;
 pub mod tui_editor;
 mod tui_menu;
 pub(crate) mod tui_probe;
+mod tui_profile_diagnostics;
 mod tui_reality_enroll;
 mod tui_reality_provision;
 mod tui_reality_register;

@@ -1103,6 +1103,36 @@ async fn connect_scoped(
     Err(Error::Protocol)
 }
 
+/// Establish a real TLS-authenticated QUIC session on an owned connected
+/// loopback socket. Its peer must be the other end of the diagnostic relay;
+/// unlike the normal dialer this never resolves or dials a destination.
+pub(crate) async fn connect_diagnostic_socket(
+    socket: UdpSocket,
+    peer: SocketAddr,
+    tls: Arc<ClientConfig>,
+    name: ServerName<'static>,
+    version: Version,
+) -> Result<LabSession, Error> {
+    let local = socket.local_addr().map_err(Error::Io)?;
+    if !super::loopback_pair(local, peer) || socket.peer_addr().map_err(Error::Io)? != peer {
+        return Err(Error::Scope);
+    }
+    let cid = super::negotiation::random_cid().map_err(|_| Error::Protocol)?;
+    let original = super::negotiation::random_cid().map_err(|_| Error::Protocol)?;
+    if cid == original || cid == [0; CID_LEN] || original == [0; CID_LEN] {
+        return Err(Error::Protocol);
+    }
+    let route = InitialRoute {
+        version, local: cid, remote: original.to_vec(), original: original.to_vec(),
+        retry: None, initial_reset: None, token: Vec::new(),
+        versions: VersionPolicy::exact(version), restarted: false,
+    };
+    establish_inner(
+        SessionIo::direct_carrier(socket, super::scope::NetworkScope::loopback(), Default::default(), Some(peer)),
+        peer, route, Config::Client { tls, name }, Congestion::Bbr, None,
+    ).await
+}
+
 /// The candidate is created exclusively after the listener validates Retry.
 /// TLS and CID parameters must still authenticate before returning a session.
 pub async fn accept(candidate: Candidate, tls: Arc<ServerConfig>) -> Result<LabSession, Error> {

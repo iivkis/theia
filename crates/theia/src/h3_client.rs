@@ -282,7 +282,12 @@ impl H3Client {
         &self,
         known: Option<[u8; 32]>,
     ) -> Result<Vec<u8>, ClientError> {
-        self.routing_resource(None, known).await
+        self.routing_resource(None, known, false).await
+    }
+
+    pub(crate) async fn diagnostic_domains(&self, digest: [u8; 32]) -> Result<Vec<String>, ClientError> {
+        let bytes = self.routing_resource(None, Some(digest), true).await?;
+        crate::routing::exchange::decode_diagnostic_domains(&bytes, digest)
     }
 
     pub(crate) async fn resolve_routing(
@@ -291,7 +296,7 @@ impl H3Client {
         digest: [u8; 32],
     ) -> Result<Vec<std::net::IpAddr>, ClientError> {
         let bytes = self
-            .routing_resource(Some((name, digest, false)), None)
+            .routing_resource(Some((name, digest, false)), None, false)
             .await?;
         crate::routing::exchange::decode_ips(&bytes)
     }
@@ -306,7 +311,7 @@ impl H3Client {
         digest: [u8; 32],
     ) -> Result<Vec<std::net::IpAddr>, ClientError> {
         let bytes = self
-            .routing_resource(Some((name, digest, true)), None)
+            .routing_resource(Some((name, digest, true)), None, false)
             .await?;
         crate::routing::exchange::decode_ips(&bytes)
     }
@@ -323,6 +328,7 @@ impl H3Client {
         &self,
         domain: Option<(&str, [u8; 32], bool)>,
         known: Option<[u8; 32]>,
+        diagnostic: bool,
     ) -> Result<Vec<u8>, ClientError> {
         let routes = self
             .identity_routes
@@ -377,6 +383,9 @@ impl H3Client {
             } else if let Some(digest) = known {
                 crate::routing::exchange::request_digest(&mut request, digest)?;
             }
+            if diagnostic {
+                request.headers_mut().insert(crate::routing::exchange::DIAGNOSTIC_HEADER, http::HeaderValue::from_static("1"));
+            }
             let request = crate::channel_binding::attach(
                 connection.binding.as_ref(),
                 self.padding.request(request)?,
@@ -392,7 +401,7 @@ impl H3Client {
                 .map_err(|_| ClientError::Http3)?;
             crate::split_http::check_status(response.status())?;
             let expected = crate::routing::exchange::validate_headers(response.headers())?;
-            if domain.is_some() && expected > crate::routing::exchange::DNS_LIMIT {
+            if (diagnostic && expected > crate::routing::exchange::DIAGNOSTIC_LIMIT) || (domain.is_some() && expected > crate::routing::exchange::DNS_LIMIT) {
                 return Err(ClientError::Protocol);
             }
             let mut bytes = Vec::new();

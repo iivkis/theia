@@ -264,6 +264,21 @@ impl LiveAuthorization {
         Arc::clone(&self.shared)
     }
 
+    /// One immutable authorization snapshot; never return token digests.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    pub(crate) fn access_observation(&self, inbound: &str, user: &str) -> Result<(u64, u8), LiveAuthError> {
+        let snapshot = self.shared.load()?;
+        let state = match snapshot.grants.get(inbound) {
+            None => 0,
+            Some(grants) => match snapshot.users.iter().find(|entry| entry.id == user) {
+                Some(entry) if entry.disabled => 2,
+                Some(_) if grants.contains(user) => 3,
+                _ => 1,
+            },
+        };
+        Ok((snapshot.revision, state))
+    }
+
     pub fn revision(&self) -> Result<u64, LiveAuthError> {
         Ok(self.shared.load()?.revision)
     }
@@ -381,12 +396,19 @@ mod tests {
         };
         let live = LiveAuthorization::new(doc.clone()).unwrap();
         assert_eq!(live.revision(), Ok(1));
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            assert_eq!(live.access_observation("alpha", "alice"), Ok((1, 3)));
+            assert_eq!(live.access_observation("alpha", "missing"), Ok((1, 1)));
+            assert_eq!(live.access_observation("missing", "alice"), Ok((1, 0)));
+        }
         let mut routed = doc.clone();
         routed.server.policy.routing = Some(crate::routing::Settings {
             revision: 2,
             geodata_directory: None,
             rules: vec![],
             datasets: None,
+            diagnostic_domains: crate::routing::snapshot::default_diagnostic_domains(),
         });
         let (_, staged_routing) = live.prepare_tls_rebase(&routed, 1).unwrap();
         assert_eq!(

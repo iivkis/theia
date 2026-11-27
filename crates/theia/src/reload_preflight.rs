@@ -175,6 +175,13 @@ impl ReloadPreflight {
         Self::new(self.config_path.clone(), candidate, self.identities.clone())
     }
 
+    /// Read only the bounded file; no TLS load, listener probe, or publication.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    pub(crate) fn matches_saved_bytes(&self, expected: [u8; 32]) -> bool {
+        crate::bounded_input::read(&self.config_path, 1024 * 1024, false, false)
+            .is_ok_and(|bytes| <[u8; 32]>::from(Sha256::digest(bytes.as_slice())) == expected)
+    }
+
     /// Read the candidate exactly once and verify every restart-only
     /// field and the actual PEM bytes loaded by the live listeners. The owned
     /// returned document is the only one later staged/published: no second

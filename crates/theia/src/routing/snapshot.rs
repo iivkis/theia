@@ -9,6 +9,28 @@ const MAGIC: &[u8; 8] = b"THEIAR01";
 const HEADER: usize = 20;
 const MAX_MANIFEST: usize = 1024 * 1024;
 pub const MAX_SNAPSHOT: usize = 64 * 1024 * 1024;
+pub const MAX_DIAGNOSTIC_DOMAINS: usize = 16;
+
+pub fn default_diagnostic_domains() -> Vec<String> {
+    ["web.telegram.org", "discord.com", "www.youtube.com", "www.instagram.com", "x.com"]
+        .into_iter().map(str::to_owned).collect()
+}
+
+pub(crate) fn is_default_diagnostic_domains(domains: &[String]) -> bool {
+    domains == default_diagnostic_domains().as_slice()
+}
+
+/// Canonical DNS names only; never URLs, IP literals, wildcard selectors or
+/// arbitrary ports. Destination IP authorization still belongs to the router.
+pub fn validate_diagnostic_domains(domains: &[String]) -> bool {
+    let mut seen = HashSet::new();
+    !domains.is_empty() && domains.len() <= MAX_DIAGNOSTIC_DOMAINS && domains.iter().all(|name| {
+        name.contains('.')
+            && super::domain_name(name).is_ok_and(|canonical| canonical == *name)
+            && ![".local", ".localhost", ".internal", ".onion"].iter().any(|suffix| name.ends_with(suffix))
+            && seen.insert(name)
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -21,6 +43,10 @@ pub struct Manifest {
     pub geosite_payload_sha256: [u8; 32],
     pub geoip_payload_sha256: [u8; 32],
     pub rules: Vec<Rule>,
+    // Default lists are a protocol constant: preserve the old default wire
+    // bytes and durable revision floor. Custom lists always enter the digest.
+    #[serde(default = "default_diagnostic_domains", skip_serializing_if = "is_default_diagnostic_domains")]
+    pub diagnostic_domains: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -107,7 +133,18 @@ impl Snapshot {
         geosite: &[u8],
         geoip: &[u8],
     ) -> Result<(Self, Vec<u8>), SnapshotError> {
-        if !scope_valid(inbound_id) || revision == 0 {
+        Self::build_with_diagnostic_domains(inbound_id, revision, rules, geosite, geoip, &default_diagnostic_domains())
+    }
+
+    pub fn build_with_diagnostic_domains(
+        inbound_id: &str,
+        revision: u64,
+        rules: &[Rule],
+        geosite: &[u8],
+        geoip: &[u8],
+        diagnostic_domains: &[String],
+    ) -> Result<(Self, Vec<u8>), SnapshotError> {
+        if !scope_valid(inbound_id) || revision == 0 || !validate_diagnostic_domains(diagnostic_domains) {
             return Err(SnapshotError::Invalid);
         }
         let policy = Policy::compile(rules, geosite, geoip)?;
@@ -123,6 +160,7 @@ impl Snapshot {
             geosite_payload_sha256: hash(&site),
             geoip_payload_sha256: hash(&ip),
             rules: rules.to_vec(),
+            diagnostic_domains: diagnostic_domains.to_vec(),
         };
         let text = toml::to_string(&manifest).map_err(|_| SnapshotError::Invalid)?;
         let len = HEADER
@@ -182,7 +220,8 @@ impl Snapshot {
         let text =
             std::str::from_utf8(&wire[HEADER..site_start]).map_err(|_| SnapshotError::Invalid)?;
         let manifest: Manifest = toml::from_str(text).map_err(|_| SnapshotError::Invalid)?;
-        if manifest.revision == 0 || !scope_valid(&manifest.inbound_id) {
+        if manifest.revision == 0 || !scope_valid(&manifest.inbound_id)
+            || !validate_diagnostic_domains(&manifest.diagnostic_domains) {
             return Err(SnapshotError::Invalid);
         }
         if manifest.inbound_id != expected_inbound {
@@ -374,5 +413,36 @@ mod tests {
             Err(SnapshotError::Invalid)
         ));
         assert!(Snapshot::build("inbound", 0, &[], &[], &[]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_domain_tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_are_scoped_and_digest_bound() {
+        let defaults = default_diagnostic_domains();
+        assert_eq!(defaults.len(), 5);
+        assert!(validate_diagnostic_domains(&defaults));
+        let custom = vec!["example.com".to_owned()];
+        let (snapshot, wire) = Snapshot::build_with_diagnostic_domains("scope", 2, &[], &[], &[], &custom).unwrap();
+        let decoded = Snapshot::decode(&wire, "scope").unwrap();
+        assert_eq!(decoded.manifest().diagnostic_domains, custom);
+        assert_eq!(snapshot.digest(), decoded.digest());
+        let (original, _) = Snapshot::build("scope", 2, &[], &[], &[]).unwrap();
+        assert_ne!(original.digest(), decoded.digest());
+        assert!(Snapshot::decode(&wire, "other").is_err());
+        assert!(original.checkpoint().accepts(&decoded).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_and_duplicate_names() {
+        for name in ["localhost", "127.0.0.1", "https://example.com", "example.com:443", "*.example.com", "Example.COM", "example.com.", "foo.local"] {
+            assert!(!validate_diagnostic_domains(&[name.to_owned()]));
+        }
+        assert!(!validate_diagnostic_domains(&[]));
+        assert!(!validate_diagnostic_domains(&["example.com".into(), "example.com".into()]));
+        assert!(!validate_diagnostic_domains(&(0..17).map(|i| format!("host{i}.example.com")).collect::<Vec<_>>()));
     }
 }

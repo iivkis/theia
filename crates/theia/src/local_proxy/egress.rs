@@ -165,6 +165,7 @@ async fn route_egress(
     address: Address,
     port: u16,
     request: EgressRequest<'_>,
+    diagnostic_digest: Option<[u8; 32]>,
 ) -> Result<(RoutedEgress, crate::routing::flow::FlowLease), ClientError> {
     use crate::routing::PacketAction;
     let RoutePlan {
@@ -173,6 +174,9 @@ async fn route_egress(
         pinned,
         authorization,
     } = route_decision(carrier, cache, &address).await?;
+    if diagnostic_digest.is_some_and(|digest| digest != snapshot.digest() || action == Action::Blocked || (action == Action::Direct && !matches!(request, EgressRequest::Tcp { allow_dpi: true }))) {
+        return Err(ClientError::Open(ErrorCode::PolicyDenied));
+    }
     if action.packet_action() == PacketAction::Drop {
         crate::traffic::blocked();
         return Err(ClientError::Open(ErrorCode::PolicyDenied));
@@ -410,6 +414,7 @@ pub(super) async fn routed_open(
         address,
         port,
         EgressRequest::Tcp { allow_dpi },
+        None,
     )
     .await?;
     match egress {
@@ -436,8 +441,50 @@ pub(super) async fn routed_udp(
             first,
             observed,
         },
+        None,
     )
     .await?;
+    match egress {
+        RoutedEgress::Udp(tunnel) => Ok(RoutedUdp { tunnel, flow }),
+        _ => Err(ClientError::Protocol),
+    }
+}
+
+pub(super) async fn diagnostic_target(
+    carrier: &Carrier, cache: &Cache, name: &str, digest: [u8; 32],
+) -> Result<(Action, Vec<IpAddr>, crate::routing::policy_lease::PolicyLease), ClientError> {
+    let RoutePlan { snapshot, action, pinned, authorization } =
+        route_decision(carrier, cache, &Address::Dns(name.to_owned())).await?;
+    if snapshot.digest() != digest {
+        return Err(ClientError::Open(ErrorCode::PolicyDenied));
+    }
+    let ips = if action == Action::DirectDpi && cache.dpi.enabled() {
+        modify_ips(carrier, name, &snapshot, pinned, &authorization).await?
+    } else { Vec::new() };
+    Ok((action, ips, authorization))
+}
+
+pub(super) async fn diagnostic_open(
+    carrier: &Carrier, cache: &Cache, name: &str, digest: [u8; 32], allow_dpi: bool,
+) -> Result<RoutedTcp, ClientError> {
+    let (egress, flow) = route_egress(carrier, cache, Address::Dns(name.to_owned()), 443,
+        EgressRequest::Tcp { allow_dpi }, Some(digest)).await?;
+    match egress {
+        RoutedEgress::Tcp(tunnel) => Ok(RoutedTcp { tunnel, flow }),
+        _ => Err(ClientError::Protocol),
+    }
+}
+
+/// Explicitly consented UDP application probe. A control passes Other;
+/// an automatic test passes the observed production candidate and first datagram.
+pub(super) async fn diagnostic_udp(
+    carrier: &Carrier, cache: &Cache, name: &str, digest: [u8; 32],
+    observed: &Arc<std::sync::atomic::AtomicU8>,
+    candidate: &crate::routing::dpi::udp::Candidate,
+    first: &[u8],
+) -> Result<RoutedUdp, ClientError> {
+    let (egress, flow) = route_egress(carrier, cache, Address::Dns(name.to_owned()), 443,
+        EgressRequest::Udp { candidate, first, observed }, Some(digest)).await?;
     match egress {
         RoutedEgress::Udp(tunnel) => Ok(RoutedUdp { tunnel, flow }),
         _ => Err(ClientError::Protocol),

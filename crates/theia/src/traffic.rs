@@ -15,6 +15,10 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+tokio::task_local! { pub(crate) static PROFILE_DIAGNOSTIC: (); }
+fn diagnostic() -> bool { PROFILE_DIAGNOSTIC.try_with(|_| ()).is_ok() }
+static DIAGNOSTIC_COUNTERS: Counters = Counters::new();
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Snapshot {
     pub active: u64,
@@ -40,6 +44,7 @@ impl Counters {
     }
 
     fn enter(&self) -> Relay<'_> {
+        if diagnostic() { DIAGNOSTIC_COUNTERS.opened.fetch_add(1, Ordering::Relaxed); DIAGNOSTIC_COUNTERS.active.fetch_add(1, Ordering::Relaxed); return Relay(&DIAGNOSTIC_COUNTERS); }
         self.opened.fetch_add(1, Ordering::Relaxed);
         self.active.fetch_add(1, Ordering::Relaxed);
         Relay(self)
@@ -99,15 +104,18 @@ static UDP_STUN_FALLBACK: AtomicU64 = AtomicU64::new(0);
 static UDP_STUN_LOCAL: AtomicU64 = AtomicU64::new(0);
 static UDP_STUN_FINGERPRINT: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn udp_stun_fingerprint() {
+    if diagnostic() { return; }
     UDP_STUN_FINGERPRINT.fetch_add(1, Ordering::Relaxed);
 }
 static UDP_STUN_PROBE_OK: AtomicU64 = AtomicU64::new(0);
 static UDP_STUN_PROBE_FAILED: AtomicU64 = AtomicU64::new(0);
 static UDP_QUIC_V2_FALLBACK: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn udp_stun_local() {
+    if diagnostic() { return; }
     UDP_STUN_LOCAL.fetch_add(1, Ordering::Relaxed);
 }
 pub(crate) fn udp_stun_probe(good: bool) {
+    if diagnostic() { return; }
     (if good {
         &UDP_STUN_PROBE_OK
     } else {
@@ -116,6 +124,7 @@ pub(crate) fn udp_stun_probe(good: bool) {
     .fetch_add(1, Ordering::Relaxed);
 }
 pub(crate) fn udp_quic_v2_fallback() {
+    if diagnostic() { return; }
     UDP_QUIC_V2_FALLBACK.fetch_add(1, Ordering::Relaxed);
 }
 static DPI_BIDIRECTIONAL: AtomicU64 = AtomicU64::new(0);
@@ -124,24 +133,31 @@ static UDP_PEER_FAILURE: AtomicU64 = AtomicU64::new(0);
 static DPI_POLICY_STALE: AtomicU64 = AtomicU64::new(0);
 static DPI_POST_HELLO_FAILURE: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn udp_peer_failure() {
+    if diagnostic() { return; }
     UDP_PEER_FAILURE.fetch_add(1, Ordering::Relaxed);
 }
 pub(crate) fn dpi_policy_stale() {
+    if diagnostic() { return; }
     DPI_POLICY_STALE.fetch_add(1, Ordering::Relaxed);
 }
 pub(crate) fn dpi_post_hello_failure() {
+    if diagnostic() { return; }
     DPI_POST_HELLO_FAILURE.fetch_add(1, Ordering::Relaxed);
 }
 pub(crate) fn dpi_bidirectional() {
+    if diagnostic() { return; }
     DPI_BIDIRECTIONAL.fetch_add(1, Ordering::Relaxed);
 }
 pub(crate) fn udp_peer_reply() {
+    if diagnostic() { return; }
     UDP_PEER_REPLY.fetch_add(1, Ordering::Relaxed);
 }
 pub(crate) fn dpi_cache_hit() {
+    if diagnostic() { return; }
     DPI_CACHE_HIT.fetch_add(1, Ordering::Relaxed);
 }
 pub(crate) fn dpi_probe(good: bool) {
+    if diagnostic() { return; }
     (if good {
         &DPI_PROBE_OK
     } else {
@@ -150,18 +166,23 @@ pub(crate) fn dpi_probe(good: bool) {
     .fetch_add(1, Ordering::Relaxed);
 }
 pub(crate) fn dpi_tls_alert() {
+    if diagnostic() { return; }
     DPI_TLS_ALERT.fetch_add(1, Ordering::Relaxed);
 }
 pub(crate) fn dpi_timeout() {
+    if diagnostic() { return; }
     DPI_TIMEOUT.fetch_add(1, Ordering::Relaxed);
 }
 pub(crate) fn udp_verified_local() {
+    if diagnostic() { return; }
     UDP_VERIFIED_LOCAL.fetch_add(1, Ordering::Relaxed);
 }
 pub(crate) fn udp_queue_drop() {
+    if diagnostic() { return; }
     UDP_QUEUE_DROP.fetch_add(1, Ordering::Relaxed);
 }
 pub(crate) fn udp_stun_fallback() {
+    if diagnostic() { return; }
     UDP_STUN_FALLBACK.fetch_add(1, Ordering::Relaxed);
 }
 pub(crate) fn enter_udp(role: Role, h3: bool, direct: bool) -> Relay<'static> {
@@ -177,15 +198,19 @@ pub(crate) fn enter_udp(role: Role, h3: bool, direct: bool) -> Relay<'static> {
     .enter()
 }
 pub(crate) fn udp_quic_flow() {
+    if diagnostic() { return; }
     UDP_QUIC.fetch_add(1, Ordering::Relaxed);
 }
 pub(crate) fn udp_stun_flow() {
+    if diagnostic() { return; }
     UDP_STUN.fetch_add(1, Ordering::Relaxed);
 }
 pub(crate) fn udp_stun_response() {
+    if diagnostic() { return; }
     UDP_STUN_RESPONSE.fetch_add(1, Ordering::Relaxed);
 }
 pub(crate) fn udp_dpi_fallback() {
+    if diagnostic() { return; }
     UDP_DPI_FALLBACK.fetch_add(1, Ordering::Relaxed);
 }
 #[cfg(test)]
@@ -209,15 +234,19 @@ pub(crate) fn enter_direct() -> Relay<'static> {
     CLIENT_DIRECT.enter()
 }
 pub(crate) fn blocked() {
+    if diagnostic() { return; }
     CLIENT_BLOCKED.fetch_add(1, Ordering::Relaxed);
 }
 pub(crate) fn dpi_first_response() {
+    if diagnostic() { return; }
     DPI_FIRST_RESPONSE.fetch_add(1, Ordering::Relaxed);
 }
 pub(crate) fn dpi_fallback_open() {
+    if diagnostic() { return; }
     DPI_FALLBACK_OPEN.fetch_add(1, Ordering::Relaxed);
 }
 pub(crate) fn dpi_first_failure() {
+    if diagnostic() { return; }
     DPI_FIRST_FAILURE.fetch_add(1, Ordering::Relaxed);
 }
 pub(crate) fn routing_totals() -> [u64; 38] {
@@ -376,7 +405,7 @@ impl Monitor {
             area.height.min(if area.width >= 86 { 25 } else { 36 }),
         );
         let layout = Layout::vertical([
-            Constraint::Length(4),
+            Constraint::Length(5),
             Constraint::Min(1),
             Constraint::Length(3),
         ])
@@ -391,7 +420,9 @@ impl Monitor {
             .iter()
             .map(|s| s.opened)
             .fold(0u64, u64::saturating_add);
-        let scope = format!("Активные туннели: {active}   •   Всего открыто: {opened}\nДанные этого процесса без служебного трафика; доставка не подтверждается.");
+        let upload = self.current.iter().map(|s| s.upload).fold(0u64, u64::saturating_add);
+        let download = self.current.iter().map(|s| s.download).fold(0u64, u64::saturating_add);
+        let scope = format!("Активные туннели: {active}   •   Всего открыто: {opened}\nВсего ↑ {} · ↓ {}\nИсточник: только текущий процесс; доставка не подтверждается.", bytes(upload), bytes(download));
         frame.render_widget(
             Paragraph::new(scope)
                 .wrap(Wrap { trim: true })
@@ -497,6 +528,9 @@ impl Monitor {
 
     pub(crate) fn body(&self) -> String {
         let mut result = String::from("Только трафик текущего процесса Theia; внешние сервисы не измеряются.\nДанные после открытия туннеля, без служебного трафика. Доставка не подтверждается.\n");
+        let upload = self.current.iter().map(|s| s.upload).fold(0u64, u64::saturating_add);
+        let download = self.current.iter().map(|s| s.download).fold(0u64, u64::saturating_add);
+        result.push_str(&format!("Всего ↑ {} · ↓ {}\n", bytes(upload), bytes(download)));
         for (i, s) in self.current.iter().enumerate() {
             let transport = if i == 0 { "H2" } else { "H3" };
             let (up, down) = self.rate[i];
