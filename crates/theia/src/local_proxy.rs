@@ -1498,5 +1498,4 @@ use ingress::{
     HTTP_OK,
 };
 
-#[cfg(test)]
 mod selector_tests;
