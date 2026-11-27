@@ -2625,15 +2625,32 @@ impl NativeIngress {
         // generation can be published as isolated lab ready.
         ingress.runtime.capture_state.ready()?;
         let mut relays=JoinSet::new();
+        let mut dispatch=NativeUdpDispatch::default();
         for lab in labs {
+            if lab.payloads.is_empty() || lab.payloads.len()>crate::udp_relay::QUEUE {
+                return Err(ClientError::Protocol);
+            }
+            let (ticket,first,subsequent)=dispatch.admit(lab.key,lab.payloads[0].clone())
+                .ok_or(ClientError::Configuration)?;
+            for payload in lab.payloads.iter().skip(1) {
+                if dispatch.admit(lab.key,payload.clone()).is_some() {
+                    return Err(ClientError::Protocol);
+                }
+            }
             let ingress=ingress.clone();
             let registrar=registrar.clone();
             relays.spawn(async move {
-                crate::routing::carrier_socket::scope(Some(registrar),ingress.relay_windows_udp_lab(lab)).await
+                let result=crate::routing::carrier_socket::scope(Some(registrar),
+                    ingress.relay_windows_udp_lab(lab,first,subsequent)).await;
+                (ticket,result)
             });
         }
         while let Some(result)=relays.join_next().await {
-            if let Err(error)=result.map_err(|_|ClientError::Io).and_then(|result|result) {
+            let outcome=match result {
+                Ok((ticket,result)) if dispatch.complete(ticket)=>result,
+                _=>Err(ClientError::Io),
+            };
+            if let Err(error)=outcome {
                 ingress.shutdown();
                 relays.shutdown().await;
                 return Err(error);
@@ -2643,7 +2660,8 @@ impl NativeIngress {
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    async fn relay_windows_udp_lab(&self,lab:crate::routing::windivert::RelayLab)->Result<(),ClientError> {
+    async fn relay_windows_udp_lab(&self,lab:crate::routing::windivert::RelayLab,
+        first:Vec<u8>,mut subsequent:tokio::sync::mpsc::Receiver<Vec<u8>>)->Result<(),ClientError> {
         use crate::routing::{carrier_socket,PacketAction};
         let key=lab.key;
         let (carrier,flow,address)=self.redirect(key).await?;
@@ -2653,7 +2671,14 @@ impl NativeIngress {
         let mut expected=lab.payloads.clone();
         let count=expected.len();
         if count==0 || count>crate::udp_relay::QUEUE { return Err(ClientError::Protocol); }
-        for payload in &expected { tx.send(payload.clone()).await.map_err(|_|ClientError::Io)?; }
+        if expected.first()!=Some(&first) { return Err(ClientError::Protocol); }
+        tx.send(first).await.map_err(|_|ClientError::Io)?;
+        for payload in expected.iter().skip(1) {
+            let next=subsequent.try_recv().map_err(|_|ClientError::Protocol)?;
+            if &next!=payload { return Err(ClientError::Protocol); }
+            tx.send(next).await.map_err(|_|ClientError::Io)?;
+        }
+        if subsequent.try_recv().is_ok() { return Err(ClientError::Protocol); }
         let relay=tunnel.relay_guarded(up,down,Some(&flow));
         tokio::pin!(relay);
         let deadline=tokio::time::Instant::now()+Duration::from_secs(15);
@@ -3206,7 +3231,7 @@ impl NativeIngress {
                 () = self.stopped() => break Ok(()),
                 finished = tasks.join_next(), if !tasks.is_empty() => {
                     match finished {
-                        Some(Ok(key)) if flows.complete(key) => continue,
+                        Some(Ok(ticket)) if flows.complete(ticket) => continue,
                         _ => break Err(ClientError::Io),
                     }
                 }
@@ -3221,14 +3246,13 @@ impl NativeIngress {
                 }
                 Err(_) => break Err(ClientError::Io),
             };
-            if let Some((first, subsequent)) = flows.admit(packet) {
-                let key = first.key();
+            if let Some((ticket, first, subsequent)) = flows.admit(packet.key(), packet) {
                 let ingress = self.clone();
                 tasks.spawn(async move {
                     // Individual authenticated relay failure closes only
                     // this flow. A panic or inconsistent ownership is fatal.
                     let _ = ingress.relay_linux_udp(first, subsequent).await;
-                    key
+                    ticket
                 });
             }
         };
@@ -3452,28 +3476,44 @@ impl NativeIngress {
     }
 }
 
-/// Exact tuple dispatch shared by both Linux UDP listeners. The common
-/// FlowTable still owns egress authorization and process-wide flow quota.
-#[cfg(target_os = "linux")]
-#[derive(Default)]
-struct NativeUdpDispatch {
-    flows: std::collections::HashMap<
-        crate::routing::packet::FlowKey,
-        tokio::sync::mpsc::Sender<crate::routing::linux_ingress::CapturedDatagram>,
-    >,
+/// Exact tuple dispatch shared by native adapters. A completed task must
+/// return its own generation ticket; stale completion cannot release a
+/// replacement flow. Packet ownership and routing are separate gates.
+#[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeUdpTicket {
+    key: crate::routing::packet::FlowKey,
+    generation: u64,
 }
 
-#[cfg(target_os = "linux")]
-impl NativeUdpDispatch {
+#[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
+struct NativeUdpDispatch<T> {
+    flows: std::collections::HashMap<
+        crate::routing::packet::FlowKey,
+        (NativeUdpTicket, tokio::sync::mpsc::Sender<T>),
+    >,
+    generation: u64,
+}
+
+#[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
+impl<T> Default for NativeUdpDispatch<T> {
+    fn default() -> Self {
+        Self { flows: std::collections::HashMap::new(), generation: 0 }
+    }
+}
+
+#[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
+impl<T> NativeUdpDispatch<T> {
     fn admit(
         &mut self,
-        packet: crate::routing::linux_ingress::CapturedDatagram,
-    ) -> Option<(
-        crate::routing::linux_ingress::CapturedDatagram,
-        tokio::sync::mpsc::Receiver<crate::routing::linux_ingress::CapturedDatagram>,
-    )> {
-        let key = packet.key();
-        if let Some(tx) = self.flows.get(&key) {
+        key: crate::routing::packet::FlowKey,
+        packet: T,
+    ) -> Option<(NativeUdpTicket, T, tokio::sync::mpsc::Receiver<T>)> {
+        if key.transport != crate::routing::packet::Transport::Udp {
+            crate::traffic::udp_queue_drop();
+            return None;
+        }
+        if let Some((_, tx)) = self.flows.get(&key) {
             // Closed and full both drop. Only the joined relay task may
             // release the tuple, after its response drain and lease drop.
             if tx.try_send(packet).is_err() {
@@ -3485,14 +3525,56 @@ impl NativeUdpDispatch {
             crate::traffic::udp_queue_drop();
             return None;
         }
+        let Some(generation) = self.generation.checked_add(1) else {
+            crate::traffic::udp_queue_drop();
+            return None;
+        };
+        self.generation = generation;
+        let ticket = NativeUdpTicket { key, generation };
         let (tx, rx) = tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
-        self.flows.insert(key, tx);
-        Some((packet, rx))
+        self.flows.insert(key, (ticket, tx));
+        Some((ticket, packet, rx))
     }
 
-    fn complete(&mut self, key: crate::routing::packet::FlowKey) -> bool {
-        self.flows.remove(&key).is_some()
+    fn complete(&mut self, ticket: NativeUdpTicket) -> bool {
+        if !self.flows.get(&ticket.key).is_some_and(|(current, _)| *current == ticket) {
+            return false;
+        }
+        self.flows.remove(&ticket.key);
+        true
     }
+}
+
+#[cfg(all(test, any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64"))))]
+#[test]
+fn native_udp_dispatch_keeps_interleaved_interfaces_and_generations_separate() {
+    use crate::routing::packet::{FlowKey, Transport};
+    let a = FlowKey {
+        source: "192.0.2.1:1234".parse().unwrap(),
+        destination: "198.51.100.1:443".parse().unwrap(),
+        transport: Transport::Udp,
+        interface: 7,
+    };
+    let b = FlowKey { interface: 8, ..a };
+    let mut dispatch = NativeUdpDispatch::default();
+    let (a1, first, mut arx) = dispatch.admit(a, vec![1]).unwrap();
+    let (b1, second, mut brx) = dispatch.admit(b, vec![2]).unwrap();
+    assert_eq!(first, vec![1]);
+    assert_eq!(second, vec![2]);
+    assert!(dispatch.admit(a, vec![3]).is_none());
+    assert!(dispatch.admit(b, vec![4]).is_none());
+    assert_eq!(arx.try_recv().unwrap(), vec![3]);
+    assert_eq!(brx.try_recv().unwrap(), vec![4]);
+    assert!(dispatch.admit(FlowKey { transport: Transport::Tcp, ..a }, vec![0]).is_none());
+    drop(arx);
+    assert!(dispatch.admit(a, vec![5]).is_none());
+    assert!(dispatch.complete(a1));
+    let (a2, _, mut new_rx) = dispatch.admit(a, vec![6]).unwrap();
+    assert!(!dispatch.complete(a1));
+    assert!(dispatch.admit(a, vec![7]).is_none());
+    assert_eq!(new_rx.try_recv().unwrap(), vec![7]);
+    assert!(dispatch.complete(a2));
+    assert!(dispatch.complete(b1));
 }
 
 /// A clean relay EOF must not cancel accepted reverse datagrams. Keep the
@@ -3540,29 +3622,32 @@ mod native_udp_lifecycle_tests {
         };
         let packet = |key, n| CapturedDatagram { key, payload: vec![n] };
         let mut dispatch = NativeUdpDispatch::default();
-        let (first, mut rx) = dispatch.admit(packet(key, 0)).unwrap();
+        let (ticket, first, mut rx) = dispatch.admit(key, packet(key, 0)).unwrap();
         assert_eq!(first.payload(), &[0]);
         for n in 1..=crate::udp_relay::QUEUE + 1 {
-            assert!(dispatch.admit(packet(key, n as u8)).is_none());
+            assert!(dispatch.admit(key, packet(key, n as u8)).is_none());
         }
         for n in 1..=crate::udp_relay::QUEUE {
             assert_eq!(rx.try_recv().unwrap().payload(), &[n as u8]);
         }
         assert!(rx.try_recv().is_err());
         drop(rx);
-        assert!(dispatch.admit(packet(key, 99)).is_none());
-        assert!(dispatch.complete(key));
-        assert!(!dispatch.complete(key));
-        let (_, _new) = dispatch.admit(packet(key, 100)).unwrap();
+        assert!(dispatch.admit(key, packet(key, 99)).is_none());
+        assert!(dispatch.complete(ticket));
+        assert!(!dispatch.complete(ticket));
+        let (replacement, _, _new) = dispatch.admit(key, packet(key, 100)).unwrap();
+        assert_ne!(replacement, ticket);
+        assert!(!dispatch.complete(ticket));
         // Keep receivers live to make the capacity test independent of EOF.
         let mut receivers = Vec::new();
         for n in 1..LOCAL_LIMIT {
             let other = FlowKey { source: SocketAddr::new(key.source.ip(), 2000 + n as u16), ..key };
-            receivers.push(dispatch.admit(packet(other, 1)).unwrap().1);
+            receivers.push(dispatch.admit(other, packet(other, 1)).unwrap().2);
         }
         let overflow = FlowKey { source: "192.0.2.1:65000".parse().unwrap(), ..key };
-        assert!(dispatch.admit(packet(overflow, 1)).is_none());
+        assert!(dispatch.admit(overflow, packet(overflow, 1)).is_none());
         assert_eq!(dispatch.flows.len(), LOCAL_LIMIT);
+        assert!(dispatch.complete(replacement));
     }
 
     #[tokio::test]

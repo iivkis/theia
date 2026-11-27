@@ -180,7 +180,14 @@ impl CandidateLedger {
             self.invalidate(); return;
         }
         let history=self.entries.entry(event.endpoint).or_default();
-        if history.terminal { return; }
+        if history.terminal {
+            // A recycled endpoint can now describe a different tuple. Do
+            // not silently ignore the new owner and trust another candidate.
+            if matches!((event.layer,event.event),(2,1)|(3,4)) {
+                self.invalidate();
+            }
+            return;
+        }
         if matches!((event.layer,event.event),(2,2)|(3,7)) {
             history.closed_tuple=event.tuple();
             if history.closed_tuple.is_none() && history.connect.is_none() && history.flow.is_none() {
@@ -504,8 +511,17 @@ impl TcpRedirectTable {
             || listener.port()==0 || listener.ip()!=key.source.ip()
             || listener==key.source || key.source.ip()==key.destination.ip()
             || !reflect_address(key.source) || !reflect_address(key.destination) { return None; }
+        let peer=std::net::SocketAddr::new(key.destination.ip(),key.source.port());
         if self.entries.contains_key(&key)
-            || self.entries.values().any(|e|e.listener==listener)
+            || self.entries.values().any(|e| {
+                let old=e.token.original;
+                let old_peer=std::net::SocketAddr::new(old.destination.ip(),old.source.port());
+                // Both directions must remain unambiguous, including
+                // retired mappings for the duration of this capture epoch.
+                e.listener==listener || (old.interface==key.interface &&
+                    ((old.source==listener && old.destination==peer) ||
+                     (e.listener==key.source && old_peer==key.destination)))
+            })
             || self.entries.len()>=self.max_epoch
             || self.entries.values().filter(|e|e.state!=TcpReflectionState::Retired).count()>=self.max_live { return None; }
         self.generation=self.generation.checked_add(1)?;
@@ -531,11 +547,31 @@ impl TcpRedirectTable {
         entry.state=TcpReflectionState::Retired;
         true
     }
+    /// Resolve the captured outbound tuple, including the dedicated relay
+    /// direction, without accepting a caller-supplied generation. This
+    /// is demultiplexing only, not a proof of socket ownership.
+    pub fn lookup(&self,address:&Address,packet:&[u8])->Option<TcpRedirectToken> {
+        if self.retired { return None; }
+        let obs=address.network(packet).ok()?;
+        if obs.sniffed || !obs.outbound { return None; }
+        let mut found=None;
+        for entry in self.entries.values() {
+            let key=entry.token.original;
+            let peer=std::net::SocketAddr::new(key.destination.ip(),key.source.port());
+            if obs.interface!=key.interface || obs.meta.flow.transport!=key.transport ||
+                !(obs.meta.flow==key ||
+                    (obs.meta.flow.source==entry.listener && obs.meta.flow.destination==peer)) { continue; }
+            if found.is_some() || entry.state==TcpReflectionState::Retired ||
+                obs.sub_interface!=entry.sub_interface || obs.timestamp<entry.first_timestamp { return None; }
+            found=Some(entry.token);
+        }
+        found
+    }
     /// Produces an inbound packet candidate for the exact generation;
     /// does not transmit or authorize a packet. The TCP stack remains
     /// responsible for sequence/window validation after the handshake.
     pub fn reflect(&mut self,token:TcpRedirectToken,address:&Address,packet:&[u8])->Option<ReverseDatagram> {
-        if self.retired { return None; }
+        if self.lookup(address,packet)!=Some(token) { return None; }
         let obs=address.network(packet).ok()?;
         let entry=self.entries.get_mut(&token.original)?;
         let key=token.original;
@@ -1662,7 +1698,12 @@ mod tests {
             assert!(table.begin(&addr,&packet(client,remote,9,0,2,b"x"),listener).is_none());
             let syn=packet(client,remote,9,0,2,b"");
             let token=table.begin(&addr,&syn,listener).unwrap();
+            assert_eq!(table.lookup(&addr,&syn),Some(token));
+            assert_eq!(table.lookup(&addr,&packet(listener,peer,30,10,0x12,b"")),Some(token));
             assert!(table.begin(&addr,&syn,listener).is_none());
+            let mut collision=TcpRedirectTable::new(2,4).unwrap();
+            collision.begin(&addr,&syn,listener).unwrap();
+            assert!(collision.begin(&addr,&packet(listener,peer,44,0,2,b""),SocketAddr::new(client.ip(),49002)).is_none());
             assert!(!table.accept(token,listener,peer));
             let out=table.reflect(token,&addr,&syn).unwrap();
             let parsed=PacketMeta::parse(&out.packet,7).unwrap();
@@ -1683,6 +1724,7 @@ mod tests {
             let pseudo=if v6{word_sum(&out.packet[8..40])}else{word_sum(&out.packet[12..20])};
             assert_eq!(checksum(pseudo+6+(out.packet.len()-off) as u32+word_sum(&out.packet[off..])),0);
             assert!(table.complete(token));
+            assert!(table.lookup(&addr,&data).is_none());
             assert!(table.reflect(token,&addr,&data).is_none());
             assert!(table.begin(&addr,&syn,listener).is_none());
         }
