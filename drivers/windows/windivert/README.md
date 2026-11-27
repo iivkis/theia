@@ -31,6 +31,15 @@ An authorized disposable x64 lab may add --install-lab --confirm after verifying
 the package signature; upstream loads its signed driver on demand. No packets
 are captured, forwarded or altered. Never use probe success as capture ready.
 
+## Offline UDP reverse candidate
+
+The Rust backend builds complete IPv4/IPv6 reverse UDP packets from parsed,
+outbound, non-sniffed NETWORK observations, with the original peer reversed
+and checksums recomputed. It rejects loopback, impostor and ambiguous packet
+formats. Unit tests cover empty, odd, and maximum datagrams. These bytes are
+not an injection authorization: the live endpoint, committed policy lease
+and inbound interface still need verified correlation.
+
 ## Remaining production gates
 
 - Bound packet/event receive, exact socket/carrier ownership correlation;

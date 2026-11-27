@@ -491,6 +491,30 @@ mod tests {
     }
 
     #[test]
+    fn windivert_check_requires_explicit_pins_and_install_confirmation() {
+        let dll = "ab".repeat(32);
+        let sys = "cd".repeat(32);
+        let args = ["client", "windivert", "--check", "--directory", "C:/Theia/WinDivert", "--dll-sha256", &dll, "--sys-sha256", &sys];
+        assert_eq!(command(&args), Ok(Command::ClientWinDivertCheck {
+            directory: "C:/Theia/WinDivert".into(),
+            dll_sha256: [0xab;32],
+            sys_sha256: [0xcd;32],
+            install_lab: false,
+        }));
+        let mut install = args.to_vec();
+        install.push("--install-lab");
+        assert!(command(&install).is_err());
+        install.push("--confirm");
+        assert!(matches!(command(&install), Ok(Command::ClientWinDivertCheck { install_lab: true, .. })));
+        install.push("--confirm");
+        assert!(command(&install).is_err());
+        assert!(command(&args[..8]).is_err());
+        let mut invalid = args;
+        invalid[6] = "invalid";
+        assert!(command(&invalid).is_err());
+    }
+
+    #[test]
     fn help_and_version_are_available_without_side_effects() {
         assert_eq!(command(&["--help"]), Ok(Command::Help(None)));
         assert_eq!(command(&["-h"]), Ok(Command::Help(None)));

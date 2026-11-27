@@ -3,6 +3,7 @@
 //! NETWORK metadata never authenticates an application or a socket.
 //! The probe only opens match-none read-only handles; it cannot set ready.
 use super::packet::{PacketMeta, ParseError};
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
 use std::io;
 
 pub const UPSTREAM_VERSION: &str = "2.2.2";
@@ -115,6 +116,115 @@ pub struct EndpointCandidate {
     pub remote_words: [u8; 16],
 }
 
+/// Offline reverse-datagram candidate for the native UDP relay.
+/// No injection API accepts this as authorization. Before using it with
+/// WinDivertSendEx, bind it to a live, exclusively owned flow generation,
+/// committed redirect lease, current policy and proven inbound interface.
+/// A sniffed packet was not diverted and must never create a reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UdpReversePlan {
+    flow: super::packet::FlowKey,
+    interface: u32,
+    sub_interface: u32,
+}
+
+impl UdpReversePlan {
+    pub fn from_diverted_packet(address: &Address, packet: &[u8]) -> Option<Self> {
+        use super::packet::Transport;
+        use std::net::IpAddr;
+        let n = address.network(packet).ok()?;
+        let key = n.meta.flow;
+        let valid = |ip: IpAddr| {
+            !ip.is_unspecified() && !ip.is_loopback() && !ip.is_multicast()
+                && match ip {
+                    IpAddr::V4(v) => v.octets()[0] != 0 && v.octets()[0] < 224,
+                    IpAddr::V6(v) => !v.is_unicast_link_local() && v.to_ipv4_mapped().is_none(),
+                }
+        };
+        if !n.outbound || n.sniffed || key.transport != Transport::Udp
+            || key.source.ip() == key.destination.ip()
+            || !valid(key.source.ip()) || !valid(key.destination.ip())
+        { return None; }
+        // Interface indices are observations only; a separate physical
+        // acceptance must prove inbound delivery in the correct compartment.
+        Some(Self { flow: key, interface: n.interface, sub_interface: n.sub_interface })
+    }
+
+    pub fn original_flow(&self) -> super::packet::FlowKey { self.flow }
+
+    /// Build a complete IPv4 or IPv6 UDP response. No IP/port or interface
+    /// override is accepted. IPv4 options and IPv6 extension headers are
+    /// not reflected. Both families receive a full UDP checksum.
+    pub fn build(&self, payload: &[u8]) -> Option<ReverseDatagram> {
+        use super::packet::FlowKey;
+        use std::net::IpAddr;
+        if payload.len() > crate::protocol::MAX_DATAGRAM { return None; }
+        let length = u16::try_from(8 + payload.len()).ok()?;
+        let src = self.flow.destination;
+        let dst = self.flow.source;
+        let (mut packet, pseudo) = match (src.ip(), dst.ip()) {
+            (IpAddr::V4(src), IpAddr::V4(dst)) => {
+                let mut packet = vec![0u8; 20];
+                packet[0] = 0x45;
+                packet[2..4].copy_from_slice(&u16::try_from(20 + usize::from(length)).ok()?.to_be_bytes());
+                packet[6] = 0x40; // do not fragment
+                packet[8] = 64;
+                packet[9] = 17;
+                packet[12..16].copy_from_slice(&src.octets());
+                packet[16..20].copy_from_slice(&dst.octets());
+                let sum = checksum(word_sum(&packet));
+                packet[10..12].copy_from_slice(&sum.to_be_bytes());
+                let pseudo = word_sum(&src.octets()) + word_sum(&dst.octets()) + 17 + u32::from(length);
+                (packet, pseudo)
+            }
+            (IpAddr::V6(src), IpAddr::V6(dst)) => {
+                let mut packet = vec![0u8; 40];
+                packet[0] = 0x60;
+                packet[4..6].copy_from_slice(&length.to_be_bytes());
+                packet[6] = 17;
+                packet[7] = 64;
+                packet[8..24].copy_from_slice(&src.octets());
+                packet[24..40].copy_from_slice(&dst.octets());
+                let pseudo = word_sum(&src.octets()) + word_sum(&dst.octets()) + 17 + u32::from(length);
+                (packet, pseudo)
+            }
+            _ => return None,
+        };
+        let offset = packet.len();
+        packet.extend_from_slice(&src.port().to_be_bytes());
+        packet.extend_from_slice(&dst.port().to_be_bytes());
+        packet.extend_from_slice(&length.to_be_bytes());
+        packet.extend_from_slice(&[0, 0]);
+        packet.extend_from_slice(payload);
+        let sum = checksum(pseudo + word_sum(&packet[offset..]));
+        packet[offset + 6..offset + 8].copy_from_slice(&(if sum == 0 { 0xffff } else { sum }).to_be_bytes());
+        let meta = PacketMeta::parse(&packet, self.interface).ok()?;
+        if meta.flow != (FlowKey { source: src, destination: dst, ..self.flow }) || meta.payload_len != payload.len() {
+            return None;
+        }
+        Some(ReverseDatagram { packet, interface: self.interface, sub_interface: self.sub_interface })
+    }
+}
+
+/// Candidate bytes only, not a live WinDivert injection token.
+#[derive(Debug)]
+pub struct ReverseDatagram {
+    pub packet: Vec<u8>,
+    pub interface: u32,
+    pub sub_interface: u32,
+}
+
+fn word_sum(bytes: &[u8]) -> u32 {
+    let chunks = bytes.chunks_exact(2);
+    let tail = chunks.remainder().first().copied().unwrap_or(0);
+    chunks.map(|w| u32::from(u16::from_be_bytes([w[0],w[1]]))).sum::<u32>() + (u32::from(tail) << 8)
+}
+fn checksum(mut sum: u32) -> u16 {
+    while sum >> 16 != 0 { sum = (sum & 0xffff) + (sum >> 16); }
+    !(sum as u16)
+}
+
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
 fn valid_pins(dll: [u8; 32], sys: [u8; 32]) -> io::Result<()> {
     if dll == [0; 32] || sys == [0; 32] || dll == sys {
         Err(io::ErrorKind::InvalidInput.into())
@@ -204,9 +314,9 @@ mod native {
         let module = unsafe { LoadLibraryExW(wide.as_ptr(),std::ptr::null_mut(),LOAD_LIBRARY_SEARCH_SYSTEM32) };
         if module.is_null() { return Err(io::Error::last_os_error()); }
         let library = Library(module);
-        let open: Open = unsafe { std::mem::transmute(GetProcAddress(library.0,c"WinDivertOpen".as_ptr().cast()).ok_or(io::ErrorKind::Unsupported)?) };
-        let get: GetParam = unsafe { std::mem::transmute(GetProcAddress(library.0,c"WinDivertGetParam".as_ptr().cast()).ok_or(io::ErrorKind::Unsupported)?) };
-        let close: Close = unsafe { std::mem::transmute(GetProcAddress(library.0,c"WinDivertClose".as_ptr().cast()).ok_or(io::ErrorKind::Unsupported)?) };
+        let open: Open = unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, Open>(GetProcAddress(library.0,c"WinDivertOpen".as_ptr().cast()).ok_or(io::ErrorKind::Unsupported)?) };
+        let get: GetParam = unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, GetParam>(GetProcAddress(library.0,c"WinDivertGetParam".as_ptr().cast()).ok_or(io::ErrorKind::Unsupported)?) };
+        let close: Close = unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, Close>(GetProcAddress(library.0,c"WinDivertClose".as_ptr().cast()).ok_or(io::ErrorKind::Unsupported)?) };
         // Require ABI symbols needed for later packet and event processing
         // without exposing a production send/receive path prematurely.
         for symbol in [c"WinDivertRecvEx",c"WinDivertSendEx",c"WinDivertShutdown",c"WinDivertSetParam",c"WinDivertHelperCalcChecksums"] {
@@ -268,6 +378,54 @@ mod tests {
         }
         for i in 0..udp.len() { assert!(addr.network(&udp[..i]).is_err()); }
     }
+    #[test]
+    fn reverse_datagrams_preserve_original_peer_and_checksums() {
+        for v6 in [false,true] {
+            let mut raw = [0u8;80];
+            raw[..8].copy_from_slice(&1i64.to_le_bytes());
+            let flags = (1u32<<17) | if v6 { 1<<20 } else { 0 };
+            raw[8..12].copy_from_slice(&flags.to_le_bytes());
+            raw[16..20].copy_from_slice(&7u32.to_le_bytes());
+            raw[20..24].copy_from_slice(&3u32.to_le_bytes());
+            let mut request = vec![0u8; if v6 { 48 } else { 28 }];
+            let off = if v6 {
+                request[0]=0x60;request[4..6].copy_from_slice(&8u16.to_be_bytes());request[6]=17;
+                request[8..24].copy_from_slice(&"2001:db8::1".parse::<std::net::Ipv6Addr>().unwrap().octets());
+                request[24..40].copy_from_slice(&"2001:db8::2".parse::<std::net::Ipv6Addr>().unwrap().octets());
+                40
+            } else {
+                request[0]=0x45;request[2..4].copy_from_slice(&28u16.to_be_bytes());request[9]=17;
+                request[12..16].copy_from_slice(&[192,0,2,1]);request[16..20].copy_from_slice(&[198,51,100,2]);
+                20
+            };
+            request[off..off+2].copy_from_slice(&1000u16.to_be_bytes());
+            request[off+2..off+4].copy_from_slice(&443u16.to_be_bytes());
+            request[off+4..off+6].copy_from_slice(&8u16.to_be_bytes());
+            let plan=UdpReversePlan::from_diverted_packet(&Address::from_bytes(&raw),&request).unwrap();
+            let original=plan.original_flow();
+            for payload in [vec![],vec![3],vec![4;1200],vec![5;crate::protocol::MAX_DATAGRAM]] {
+                let reply=plan.build(&payload).unwrap();
+                assert_eq!((reply.interface,reply.sub_interface),(7,3));
+                let meta=PacketMeta::parse(&reply.packet,7).unwrap();
+                assert_eq!(meta.flow.source, original.destination);
+                assert_eq!(meta.flow.destination, original.source);
+                assert_eq!(&reply.packet[off+8..],payload);
+                let len=(8+payload.len()) as u32;
+                let pseudo=if v6 { word_sum(&reply.packet[8..40]) } else {
+                    assert_eq!(checksum(word_sum(&reply.packet[..20])),0);
+                    word_sum(&reply.packet[12..20])
+                };
+                assert_eq!(checksum(pseudo+17+len+word_sum(&reply.packet[off..])),0);
+                assert_ne!(&reply.packet[off+6..off+8], &[0,0]);
+            }
+            assert!(plan.build(&vec![0;crate::protocol::MAX_DATAGRAM+1]).is_none());
+            for changed in [flags | (1<<16), flags & !(1<<17), flags | (1<<19)] {
+                raw[8..12].copy_from_slice(&changed.to_le_bytes());
+                assert!(UdpReversePlan::from_diverted_packet(&Address::from_bytes(&raw),&request).is_none());
+            }
+        }
+    }
+
     #[test]
     fn flow_event_is_candidate_only_and_wrong_event_is_denied() {
         let mut raw=[0u8;80];
