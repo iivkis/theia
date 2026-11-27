@@ -12,6 +12,8 @@ pub mod linux_ingress;
 pub mod linux_attribution;
 #[cfg(target_os = "linux")]
 pub mod linux_events;
+#[cfg(all(target_os = "linux", feature = "linux-ebpf-lab"))]
+pub mod linux_bpf_loader;
 #[cfg(target_os = "linux")]
 pub mod dns_attribution;
 #[cfg(any(target_os = "windows", test))]

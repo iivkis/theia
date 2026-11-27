@@ -9,6 +9,8 @@ publish = false
 # The product config does not expose a selectable browser security mode.
 default = ["experimental-btls-h2"]
 experimental-btls-h2 = ["dep:btls", "dep:tokio-btls"]
+# Explicit laboratory build; requires system libbpf development/runtime files.
+linux-ebpf-lab = []
 
 [dependencies]
 btls = { version = "=0.5.6", optional = true }
