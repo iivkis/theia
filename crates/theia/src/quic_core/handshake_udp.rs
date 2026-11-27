@@ -1004,6 +1004,7 @@ async fn connect_scoped(
         if !scope.permits(socket.local_addr().map_err(Error::Io)?, peer) {
             return Err(Error::Scope);
         }
+        let carrier_lease = crate::routing::carrier_socket::udp(&socket, peer).map_err(|_| Error::Scope)?;
         let cid = super::negotiation::random_cid().map_err(|_| Error::Protocol)?;
         let original = super::negotiation::random_cid().map_err(|_| Error::Protocol)?;
         if cid == original || cid == [0; CID_LEN] || original == [0; CID_LEN] {
@@ -1021,7 +1022,7 @@ async fn connect_scoped(
             restarted,
         };
         match establish_inner(
-            SessionIo::direct(socket, scope),
+            SessionIo::direct_carrier(socket, scope, carrier_lease),
             peer,
             route,
             Config::Client {

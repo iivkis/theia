@@ -1640,6 +1640,7 @@ impl ClientRuntime {
             runtime: self.clone(),
             client: view.client.clone(),
             revision: view.revision,
+            registrar: Mutex::new(None),
             verdict_gate: Mutex::new(()),
             #[cfg(target_os = "linux")]
             raw: Mutex::new(std::collections::HashMap::new()),
@@ -1898,6 +1899,7 @@ pub struct NativeIngress {
     runtime: Arc<ClientRuntime>,
     client: ProxyClient,
     revision: u64,
+    registrar: Mutex<Option<Arc<dyn crate::routing::carrier_socket::Registrar>>>,
     verdict_gate: Mutex<()>,
     #[cfg(target_os = "linux")]
     raw: Mutex<std::collections::HashMap<crate::routing::packet::FlowKey, RawLease>>,
@@ -2006,6 +2008,7 @@ impl NativeIngress {
         let _gate = self.verdict_gate.lock();
         self.runtime.stop();
         self.client.routing_cache().dpi.retire();
+        if let Ok(mut registrar) = self.registrar.lock() { registrar.take(); }
         #[cfg(target_os = "linux")]
         if let Ok(mut raw) = self.raw.lock() {
             raw.clear();
@@ -2013,6 +2016,10 @@ impl NativeIngress {
     }
 
     async fn stopped(&self) { self.runtime.stopped().await; }
+
+    fn registrar(&self) -> Result<Option<Arc<dyn crate::routing::carrier_socket::Registrar>>, ClientError> {
+        self.registrar.lock().map(|r| r.clone()).map_err(|_| ClientError::Configuration)
+    }
 
     fn ensure_running(&self) -> Result<(), ClientError> {
         if *self.runtime.stopped.borrow() || self.runtime.slot.borrow().revision != self.revision {
@@ -2032,17 +2039,25 @@ impl NativeIngress {
         &self,
         queue: crate::routing::nfqueue::Queue,
         rules: crate::routing::linux_rules::LabRules,
+        host_namespace: std::fs::File,
     ) -> Result<(), ClientError> {
         struct StopOnDrop<'a>(&'a NativeIngress);
         impl Drop for StopOnDrop<'_> { fn drop(&mut self) { self.0.shutdown(); } }
         let _stop = StopOnDrop(self);
         self.ensure_running()?;
         if !rules.owns_queue(&queue).map_err(|_| ClientError::Io)? { return Err(ClientError::Configuration); }
+        let rules = Arc::new(Mutex::new(rules));
+        let registrar: Arc<dyn crate::routing::carrier_socket::Registrar> = Arc::new(crate::routing::linux_rules::LabRegistrar::new(rules.clone(), host_namespace));
+        {
+            let mut slot = self.registrar.lock().map_err(|_| ClientError::Configuration)?;
+            if slot.is_some() { return Err(ClientError::Configuration); }
+            *slot = Some(registrar.clone());
+        }
         let mut queue = queue.into_async().map_err(|_| ClientError::Io)?;
         let consume = async {
             loop {
                 let packet = queue.next().await.map_err(|_| ClientError::Io)?;
-                if !rules.owns_packet(&packet).map_err(|_| ClientError::Io)? {
+                if !rules.lock().map_err(|_| ClientError::Configuration)?.owns_packet(&packet).map_err(|_| ClientError::Io)? {
                     return Err(ClientError::Open(ErrorCode::PolicyDenied));
                 }
                 self.verdict(packet).await.map_err(|_| ClientError::Io)?;
@@ -2051,8 +2066,8 @@ impl NativeIngress {
         tokio::select! {
             biased;
             ()=self.stopped()=>Ok(()),
-            result=self.runtime.maintain()=>result,
-            result=consume=>result,
+            result=crate::routing::carrier_socket::scope(Some(registrar.clone()), self.runtime.maintain())=>result,
+            result=crate::routing::carrier_socket::scope(Some(registrar), consume)=>result,
         }
     }
 
@@ -2250,10 +2265,10 @@ impl NativeIngress {
     /// bound to the current private driver/service session. This entry
     /// point does not install callouts or trust a client-supplied header.
     #[cfg(target_os = "windows")]
-    pub async fn relay_windows_tcp(&self, stream: TcpStream, session: &crate::routing::wfp_ingress::WfpLabSession) -> Result<(), ClientError> {
+    pub async fn relay_windows_tcp(&self, stream: TcpStream, session: Arc<crate::routing::wfp_ingress::WfpLabSession>) -> Result<(), ClientError> {
         let key = session.original_tcp(&stream)
             .map_err(|_| ClientError::Open(ErrorCode::PolicyDenied))?;
-        self.relay_terminated_tcp(key, stream).await
+        crate::routing::carrier_socket::scope(Some(session), self.relay_terminated_tcp(key, stream)).await
     }
 
     async fn relay_terminated_tcp(&self, key: crate::routing::packet::FlowKey, stream: TcpStream) -> Result<(), ClientError> {
@@ -2263,7 +2278,7 @@ impl NativeIngress {
             () = self.stopped() => Err(ClientError::Open(ErrorCode::PolicyDenied)),
             result = async {
                 let (carrier, flow, address) = self.redirect(key).await?;
-                let tunnel = carrier.open(address, key.destination.port()).await?;
+                let tunnel = crate::routing::carrier_socket::scope(self.registrar()?, carrier.open(address, key.destination.port())).await?;
                 tunnel.relay_guarded(stream, Some(&flow)).await
             } => result,
         }
@@ -2288,7 +2303,7 @@ impl NativeIngress {
             () = self.stopped() => Err(ClientError::Open(ErrorCode::PolicyDenied)),
             result = async {
                 let (carrier, flow, address) = self.redirect(key).await?;
-                let tunnel = carrier.open_udp(address, key.destination.port()).await?;
+                let tunnel = crate::routing::carrier_socket::scope(self.registrar()?, carrier.open_udp(address, key.destination.port())).await?;
                 let reply = crate::routing::linux_ingress::UdpReply::open(&first).map_err(|_| ClientError::Io)?;
                 let (tx, up) = tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
                 let (down, mut rx) = tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
@@ -2339,7 +2354,7 @@ impl NativeIngress {
             () = self.stopped() => Err(ClientError::Open(ErrorCode::PolicyDenied)),
             result = async {
                 let (carrier, flow, address) = self.redirect(key).await?;
-                let tunnel = carrier.open_udp(address, key.destination.port()).await?;
+                let tunnel = crate::routing::carrier_socket::scope(self.registrar()?, carrier.open_udp(address, key.destination.port())).await?;
                 tunnel.relay_guarded(upload, download, Some(&flow)).await
             } => result,
         }
@@ -2359,7 +2374,7 @@ impl NativeIngress {
             ProxyClient::Direct(c) => (c.carrier.clone(), &c.routing),
             ProxyClient::Reality(c) => (c.generation().await?.carrier.clone(), &c.routing),
         };
-        let snapshot = cache.get(|known| carrier.fetch_routing(known)).await?;
+        let snapshot = crate::routing::carrier_socket::scope(self.registrar()?, cache.get(|known| carrier.fetch_routing(known))).await?;
         let configured = snapshot.policy().classify_with_application(
             Evidence::Unknown, Evidence::Known(key.destination.ip()), Evidence::Unknown
         ).map_err(|_| denied())?.action().ok_or_else(denied)?.packet_action();

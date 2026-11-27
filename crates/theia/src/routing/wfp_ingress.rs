@@ -121,3 +121,16 @@ fn original_tcp(stream: &TcpStream, token: &[u8; 32]) -> io::Result<FlowKey> {
     wfp_context::decode(&context[..len], token, stream.peer_addr()?, stream.local_addr()?)
         .ok_or_else(|| io::Error::from(io::ErrorKind::PermissionDenied))
 }
+
+
+impl super::carrier_socket::Registrar for WfpLabSession {
+    fn tcp(&self, socket: &tokio::net::TcpSocket, peer: SocketAddr) -> io::Result<super::carrier_socket::Lease> {
+        self.authorize_tcp_carrier(socket, peer)?;
+        Ok(super::carrier_socket::Lease::default())
+    }
+    fn udp(&self, _: &tokio::net::UdpSocket, _: SocketAddr) -> io::Result<super::carrier_socket::Lease> {
+        // No Windows UDP carrier exemption is proven yet. A local
+        // policy failure must not look like network unreachability.
+        Err(io::ErrorKind::PermissionDenied.into())
+    }
+}

@@ -730,7 +730,7 @@ impl H2Client {
     }
 
     async fn connect_verified(&self, operation: u64) -> Result<H2Connection, ClientError> {
-        let (socket, controller) = crate::tcp_bbr::connect(self.endpoint.as_str())
+        let (socket, controller, carrier_lease) = crate::tcp_bbr::connect_carrier(self.endpoint.as_str())
             .await
             .map_err(|error| match error {
                 crate::tcp_bbr::Error::Network => ClientError::Io,
@@ -779,7 +779,7 @@ impl H2Client {
                 } else {
                     None
                 };
-                let (sender, driver) = start_h2(tls, self.wire_shape).await?;
+                let (sender, driver) = start_h2(tls, self.wire_shape, carrier_lease).await?;
                 (sender, driver, binding)
             }
             #[cfg(feature = "experimental-btls-h2")]
@@ -788,7 +788,7 @@ impl H2Client {
                 trusted_ca_pem,
             } => {
                 let tls = crate::h2_btls::connect(socket, server_name, trusted_ca_pem).await?;
-                let (sender, driver) = start_h2(tls, self.wire_shape).await?;
+                let (sender, driver) = start_h2(tls, self.wire_shape, carrier_lease).await?;
                 (sender, driver, None)
             }
         };
@@ -1048,6 +1048,7 @@ impl H2Client {
 async fn start_h2<S>(
     tls: S,
     wire_shape: H2WireShape,
+    carrier_lease: crate::routing::carrier_socket::Lease,
 ) -> Result<(h2::client::SendRequest<Bytes>, Driver), ClientError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1067,6 +1068,7 @@ where
         .await
         .map_err(|_| ClientError::Http2)?;
     let driver = Driver(tokio::spawn(async move {
+        let _carrier = carrier_lease;
         let _ = connection.await;
     }));
     Ok((sender, driver))

@@ -14,7 +14,8 @@ use std::{
     io,
     mem,
     os::{fd::{AsRawFd, FromRawFd, OwnedFd}, linux::net::SocketAddrExt, unix::{fs::MetadataExt, net::UnixDatagram}},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 const NFT: u16 = 10 << 8;
@@ -364,6 +365,9 @@ pub struct LabRules {
     journal: Journal,
     queue_identity: [u8; 16],
     _carriers: Vec<LabCarrierSocket>,
+    journal_path: PathBuf,
+    used_marks: std::collections::HashSet<u32>,
+    poisoned: bool,
     // Drop socket exemptions before releasing ownership to recovery.
     _lock: UnixDatagram,
 }
@@ -375,6 +379,7 @@ impl LabRules {
     }
 
     fn current(&self) -> io::Result<bool> {
+        if self.poisoned { return Ok(false); }
         let meta = fs::metadata("/proc/thread-self/ns/net")?;
         if (meta.dev(), meta.ino()) != (self.journal.scope.dev, self.journal.scope.ino) { return Ok(false); }
         let net = Netlink::open()?;
@@ -430,7 +435,64 @@ impl LabRules {
         if net.generation()? != installed || !net.table(&journal)? || net.generation()? != installed {
             return Err(refused());
         }
-        Ok(Self { _lock: lock, journal, queue_identity: queue.identity(), _carriers: carriers })
+        Ok(Self { _lock: lock, journal, queue_identity: queue.identity(), _carriers: carriers,
+            journal_path: path.to_owned(), used_marks: marks, poisoned: false })
+    }
+    /// Insert a new exact carrier rule ahead of the catch-all queue, with
+    /// durable generation CAS. The mark is never reused in this lab run.
+    /// Rules stay bounded even when sockets close; a new session is required
+    /// after MAX_CARRIERS total admissions. This is intentionally not an
+    /// unbounded production connection rotation mechanism.
+    fn admit(&mut self, socket: &LabCarrierSocket) -> io::Result<()> {
+        if self.used_marks.len() >= MAX_CARRIERS || self.used_marks.contains(&socket.mark())
+            || !self.current()? { return Err(refused()); }
+        socket.verify()?;
+        let raw = journal_bytes(&self.journal_path)?.ok_or_else(refused)?;
+        if parse_journal(&raw, &self.journal.scope)? != self.journal { return Err(refused()); }
+        let generation = self.journal.installed;
+        let mut next = self.journal.clone();
+        next.before = generation;
+        next.installed = generation.checked_add(1).ok_or_else(refused)?;
+        let mut attrs = Vec::new();
+        name_attr(&mut attrs, 1, &next.name());
+        name_attr(&mut attrs, 2, "output");
+        attr(&mut attrs, 4 | NESTED, &carrier_expressions(socket.key(), socket.mark()));
+        let op = nft_message(NEW_RULE, REQUEST | ACK | CREATE_EXCLUSIVE, 2, &attrs);
+        // From here any ambiguous outcome poisons the live lease. Recovery
+        // uses the durable intent; do not continue on a guessed generation.
+        self.poisoned = true;
+        store(&self.journal_path, &next, Some(&raw))?;
+        let net = Netlink::open()?;
+        net.batch(generation, &[op])?;
+        if net.generation()? != next.installed || !net.table(&next)? || net.generation()? != next.installed {
+            return Err(refused());
+        }
+        self.journal = next;
+        self.used_marks.insert(socket.mark());
+        self.poisoned = false;
+        Ok(())
+    }
+}
+
+/// One scope's registrar, used only by actual H2/H3 socket factories.
+pub(crate) struct LabRegistrar {
+    rules: Arc<Mutex<LabRules>>,
+    host: File,
+}
+impl LabRegistrar {
+    pub(crate) fn new(rules: Arc<Mutex<LabRules>>, host: File) -> Self { Self { rules, host } }
+    fn admit(&self, socket: LabCarrierSocket) -> io::Result<super::carrier_socket::Lease> {
+        self.rules.lock().map_err(|_| refused())?.admit(&socket)?;
+        // Reset socket mark before releasing the rules ownership lock.
+        Ok(super::carrier_socket::Lease::retain((socket, self.rules.clone())))
+    }
+}
+impl super::carrier_socket::Registrar for LabRegistrar {
+    fn tcp(&self, socket: &tokio::net::TcpSocket, peer: std::net::SocketAddr) -> io::Result<super::carrier_socket::Lease> {
+        self.admit(LabCarrierSocket::pending_tcp(socket, peer, &self.host)?)
+    }
+    fn udp(&self, socket: &tokio::net::UdpSocket, peer: std::net::SocketAddr) -> io::Result<super::carrier_socket::Lease> {
+        self.admit(LabCarrierSocket::pending_udp(socket, peer, &self.host)?)
     }
 }
 

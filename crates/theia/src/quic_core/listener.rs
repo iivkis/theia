@@ -50,6 +50,7 @@ pub(crate) enum SessionIo {
         socket: UdpSocket,
         scope: NetworkScope,
         options: Options,
+        _carrier: crate::routing::carrier_socket::Lease,
     },
     Routed {
         socket: Arc<UdpSocket>,
@@ -70,11 +71,16 @@ impl From<UdpSocket> for SessionIo {
 
 impl SessionIo {
     pub(crate) fn direct(socket: UdpSocket, scope: NetworkScope) -> Self {
+        Self::direct_carrier(socket, scope, Default::default())
+    }
+
+    pub(crate) fn direct_carrier(socket: UdpSocket, scope: NetworkScope, carrier: crate::routing::carrier_socket::Lease) -> Self {
         let options = Options::configure(&socket);
         Self::Direct {
             socket,
             scope,
             options,
+            _carrier: carrier,
         }
     }
 

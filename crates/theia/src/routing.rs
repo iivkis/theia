@@ -5,6 +5,7 @@ pub(crate) mod dpi;
 pub(crate) mod exchange;
 pub(crate) mod flow;
 pub mod packet;
+pub(crate) mod carrier_socket;
 pub mod packet_modify;
 #[cfg(target_os = "linux")]
 pub mod linux_ingress;

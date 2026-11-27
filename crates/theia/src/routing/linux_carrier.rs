@@ -8,7 +8,7 @@ use std::{
     fs::File,
     io, mem,
     net::{SocketAddr, TcpStream, UdpSocket},
-    os::{fd::{AsRawFd, OwnedFd}, unix::fs::MetadataExt},
+    os::{fd::{AsRawFd, FromRawFd, OwnedFd}, unix::fs::MetadataExt},
 };
 
 fn denied() -> io::Error { io::Error::from(io::ErrorKind::PermissionDenied) }
@@ -59,6 +59,7 @@ pub struct LabCarrierSocket {
     cookie: u64,
     mark: u32,
     namespace: (u64,u64),
+    pending: bool,
 }
 impl LabCarrierSocket {
     /// Only call with a socket already authenticated by the client and
@@ -66,13 +67,25 @@ impl LabCarrierSocket {
     /// retain the kernel object until the rules lease is dropped.
     pub fn tcp(socket: &TcpStream, host_namespace: &File) -> io::Result<Self> {
         let key = FlowKey { source: socket.local_addr()?, destination: socket.peer_addr()?, transport: Transport::Tcp, interface: 0 };
-        Self::claim(socket.try_clone()?.into(), key, host_namespace)
+        Self::claim(socket.try_clone()?.into(), key, host_namespace, false)
     }
     pub fn udp(socket: &UdpSocket, host_namespace: &File) -> io::Result<Self> {
         let key = FlowKey { source: socket.local_addr()?, destination: socket.peer_addr()?, transport: Transport::Udp, interface: 0 };
-        Self::claim(socket.try_clone()?.into(), key, host_namespace)
+        Self::claim(socket.try_clone()?.into(), key, host_namespace, false)
     }
-    fn claim(fd: OwnedFd, key: FlowKey, host_namespace: &File) -> io::Result<Self> {
+    pub(super) fn pending_tcp(socket: &tokio::net::TcpSocket, peer: SocketAddr, host: &File) -> io::Result<Self> {
+        Self::pending(socket, socket.local_addr()?, peer, Transport::Tcp, host)
+    }
+    pub(super) fn pending_udp(socket: &tokio::net::UdpSocket, peer: SocketAddr, host: &File) -> io::Result<Self> {
+        Self::pending(socket, socket.local_addr()?, peer, Transport::Udp, host)
+    }
+    fn pending(socket: &impl AsRawFd, source: SocketAddr, destination: SocketAddr, transport: Transport, host: &File) -> io::Result<Self> {
+        let fd = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if fd < 0 { return Err(io::Error::last_os_error()); }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        Self::claim(fd, FlowKey { source, destination, transport, interface: 0 }, host, true)
+    }
+    fn claim(fd: OwnedFd, key: FlowKey, host_namespace: &File, pending: bool) -> io::Result<Self> {
         let namespace = check_scope(host_namespace)?;
         if !valid(key) || get_mark(&fd)? != 0 { return Err(denied()); }
         let probe = UdpSocket::bind("0.0.0.0:0")?;
@@ -82,7 +95,7 @@ impl LabCarrierSocket {
         SystemRandom::new().fill(&mut bytes).map_err(|_| denied())?;
         let mark = u32::from_ne_bytes(bytes);
         if mark == 0 { return Err(denied()); }
-        let lease = Self { fd, key, cookie, mark, namespace };
+        let lease = Self { fd, key, cookie, mark, namespace, pending };
         set_mark(&lease.fd, mark)?;
         lease.verify()?;
         Ok(lease)
@@ -96,14 +109,19 @@ impl LabCarrierSocket {
         let (source, destination) = match self.key.transport {
             Transport::Tcp => {
                 let s = TcpStream::from(fd);
-                (s.local_addr()?, s.peer_addr()?)
+                (s.local_addr()?, s.peer_addr())
             }
             Transport::Udp => {
                 let s = UdpSocket::from(fd);
-                (s.local_addr()?, s.peer_addr()?)
+                (s.local_addr()?, s.peer_addr())
             }
         };
-        if (source, destination) != (self.key.source, self.key.destination) { return Err(denied()); }
+        if source != self.key.source { return Err(denied()); }
+        match destination {
+            Ok(peer) if peer == self.key.destination => (),
+            Err(error) if self.pending && error.kind() == io::ErrorKind::NotConnected => (),
+            _ => return Err(denied()),
+        }
         Ok(())
     }
     pub(super) fn key(&self) -> FlowKey { self.key }
