@@ -1,0 +1,40 @@
+; Submission-only primitive package for the non-PnP x64 lab driver.
+; Use the guarded SCM installer for the current laboratory lifecycle.
+[Version]
+Signature="$Windows NT$"
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%Provider%
+CatalogFile=theia_wfp_lab.cat
+DriverVer=11/27/2026,0.1.0.0
+PnpLockdown=1
+
+[DestinationDirs]
+DriverCopy=13
+
+[DefaultInstall.NTamd64]
+CopyFiles=DriverCopy
+
+[DefaultInstall.NTamd64.Services]
+AddService=TheiaWfpLab,0,TheiaService
+
+[TheiaService]
+DisplayName=%ServiceName%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%13%\theia_wfp_lab.sys
+
+[DriverCopy]
+theia_wfp_lab.sys
+
+[SourceDisksNames]
+1=%DiskName%,,,
+
+[SourceDisksFiles]
+theia_wfp_lab.sys=1
+
+[Strings]
+Provider="Theia"
+ServiceName="Theia isolated WFP lab"
+DiskName="Theia WFP driver package"

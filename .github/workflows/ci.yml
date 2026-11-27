@@ -1126,6 +1126,7 @@ jobs:
           name: f15-driver-build-${{ runner.os }}-${{ needs.specification.outputs.tested_sha }}
           path: |
             f15-build-evidence/*.sys
+            f15-build-evidence/*.pdb
             f15-build-evidence/*.exe
             f15-build-evidence/*.o
             f15-build-evidence/hashes.json

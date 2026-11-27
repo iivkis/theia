@@ -22,6 +22,7 @@ if ($source.PSIsContainer -or ($source.Attributes -band [IO.FileAttributes]::Rep
 if ($source.Extension -ne '.sys') { throw 'A signed .sys is required.' }
 $expected = $ExpectedSha256.ToUpperInvariant()
 . (Join-Path $PSScriptRoot 'build-evidence.ps1')
+. (Join-Path $PSScriptRoot 'attestation-common.ps1')
 $proof = Read-TheiaBuildEvidence $BuildEvidence $BuildEvidenceSha256 $SourceSha $expected
 $service = 'TheiaWfpLab'
 $destination = Join-Path ([Environment]::SystemDirectory) 'drivers\TheiaWfpLab.sys'
@@ -29,14 +30,15 @@ $serviceKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$service"
 if ((Test-Path -LiteralPath $serviceKey) -or (Test-Path -LiteralPath $destination)) {
     throw 'Existing service or driver file: refuse overwrite. Inspect and recover explicitly.'
 }
-$sign = (Get-Command signtool.exe -ErrorAction Stop).Source
 function Assert-Driver {
     param([string]$Path)
     if ((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -ne $expected) {
         throw 'Driver digest mismatch.'
     }
-    & $sign verify /kp /v $Path
-    if ($LASTEXITCODE -ne 0) { throw 'Kernel-mode signature verification failed.' }
+    Assert-TheiaMicrosoftKernelSignature $Path
+    if ((Get-TheiaImageIdentity $Path $true) -ne $proof.UnsignedImageIdentity) {
+        throw 'Signed PE image does not match approved unsigned build.'
+    }
 }
 Assert-Driver $source.FullName
 if (!$PSCmdlet.ShouldProcess($destination, 'Install and start exact signed laboratory kernel driver; no BFE filters')) { return }
@@ -78,6 +80,7 @@ if (!$driverRecord -or $driverRecord.State -ne 'Running') {
     BuildEvidenceSha256 = $BuildEvidenceSha256.ToUpperInvariant()
     DriverSha256 = $expected
     State = 'Running'
+    MicrosoftKernelSignatureVerified = $true
     BfeFiltersInstalled = $false
     CaptureReady = $false
 } | ConvertTo-Json

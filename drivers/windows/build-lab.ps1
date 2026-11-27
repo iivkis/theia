@@ -28,6 +28,8 @@ function Invoke-Checked {
 Invoke-Checked $msbuild @((Join-Path $root 'theia_wfp_lab.vcxproj'), '/t:Build', '/p:Configuration=Release', '/p:Platform=x64', "/p:OutDir=$destination\", "/p:IntDir=$destination\obj\", '/p:SignMode=Off', '/m:1')
 $driver = Join-Path $destination 'theia_wfp_lab.sys'
 if (!(Test-Path -LiteralPath $driver -PathType Leaf)) { throw 'Expected .sys not produced' }
+$pdb = Join-Path $destination 'theia_wfp_lab.pdb'
+if (!(Test-Path -LiteralPath $pdb -PathType Leaf)) { throw 'Expected WDK linker PDB not produced' }
 $controller = Join-Path $destination 'theia_bfe_lab.exe'
 Invoke-Checked $cl @('/nologo','/W4','/O2','/DUNICODE','/D_UNICODE', (Join-Path $root 'theia_bfe_lab.c'), "/Fo$destination\theia_bfe_lab.obj", "/Fe$controller", '/link', 'fwpuclnt.lib','rpcrt4.lib')
 $kernelVerified = $false
@@ -51,14 +53,16 @@ $finalSha = (& $git -C $root rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0 -or $finalSha -ne $sourceSha) { throw 'Source revision changed during build.' }
 $trackedChanges = & $git -C $root status --porcelain --untracked-files=no
 if ($LASTEXITCODE -ne 0 -or $trackedChanges) { throw 'Tracked source changed during build.' }
-Get-FileHash -Algorithm SHA256 -LiteralPath $driver,$controller |
+Get-FileHash -Algorithm SHA256 -LiteralPath $driver,$controller,$pdb |
     Select-Object Algorithm,Hash,Path | ConvertTo-Json | Set-Content -Encoding utf8 -LiteralPath (Join-Path $destination 'hashes.json')
 [pscustomobject]@{
     Version = 1
     SourceSha = $sourceSha
     DriverSha256 = (Get-FileHash -LiteralPath $driver -Algorithm SHA256).Hash
     ControllerSha256 = (Get-FileHash -LiteralPath $controller -Algorithm SHA256).Hash
+    PdbSha256 = (Get-FileHash -LiteralPath $pdb -Algorithm SHA256).Hash
     KernelSignatureVerified = $kernelVerified
+    MicrosoftKernelSignatureVerified = $false
     MicrosoftAttestationVerified = $false
     PhysicalAcceptanceVerified = $false
     CaptureReady = $false

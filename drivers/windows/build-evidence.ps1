@@ -26,6 +26,7 @@ function Read-TheiaBuildEvidence {
         $evidence.DriverSha256 -ne $ExpectedDriverSha256.ToUpperInvariant() -or
         $evidence.ControllerSha256 -notmatch '^[0-9a-fA-F]{64}$' -or
         $evidence.KernelSignatureVerified -isnot [bool] -or !$evidence.KernelSignatureVerified -or
+        $evidence.MicrosoftKernelSignatureVerified -isnot [bool] -or !$evidence.MicrosoftKernelSignatureVerified -or
         $evidence.CaptureReady -isnot [bool] -or $evidence.CaptureReady) {
         throw 'Exact signed-build evidence is missing or inconsistent.'
     }
