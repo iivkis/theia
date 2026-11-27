@@ -2609,7 +2609,7 @@ mod tests {
         let WizardStage::ProbeConfirm(value) = &panel.wizard.as_ref().unwrap().stage else {
             panic!("expired evidence must require an exact new probe");
         };
-        assert_eq!(value.1.plan.as_ref().unwrap().targets(), targets.as_slice());
+        assert!(value.1.plan.as_ref().unwrap().targets() == targets.as_slice(), "expired evidence must retain exact target list");
         assert!(!path.exists() && !input.bundle.exists() && !input.health.exists());
         panel.key(key(KeyCode::Esc));
         assert!(matches!(
