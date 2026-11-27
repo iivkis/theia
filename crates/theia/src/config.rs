@@ -625,9 +625,9 @@ impl ClientDocument {
                 profile
                     .tls_ca
                     .as_ref()
-                    .is_none_or(|path| valid_file_ref(path)),
+                    .is_none_or(|path| valid_file_ref(path) || crate::own_tls::Anchor::parse(path).is_some()),
                 format!("{field}.tls_ca"),
-                "expected absolute file: reference to PEM CA bundle",
+                "expected absolute PEM CA reference or canonical pinned anchor",
             )?;
             ensure(
                 if profile.security_mode == crate::security_profile::SecurityMode::SmartReality {

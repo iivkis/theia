@@ -138,12 +138,19 @@ impl H2Client {
         token: &str,
         roots: RootCertStore,
     ) -> Result<Self, ClientError> {
-        if roots.is_empty() {
+        Self::new_with_trust(endpoint, name, token, &crate::own_tls::Trust::Roots(roots))
+    }
+
+    pub(crate) fn new_with_trust(
+        endpoint: &str,
+        name: &str,
+        token: &str,
+        trust: &crate::own_tls::Trust,
+    ) -> Result<Self, ClientError> {
+        if !trust.usable() {
             return Err(ClientError::Configuration);
         }
-        let tls = crate::transport_policy::Carrier::H2
-            .client_tls(roots)
-            .map_err(|_| ClientError::Tls)?;
+        let tls = trust.tls(crate::transport_policy::Carrier::H2).map_err(|_| ClientError::Tls)?;
         Self::with_connector(
             endpoint,
             name,

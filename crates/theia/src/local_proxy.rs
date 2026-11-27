@@ -106,28 +106,23 @@ async fn load_client_with_budget(
         .path_prefix
         .as_deref()
         .ok_or(ClientError::Configuration)?;
-    let cert = load_file(
-        profile
-            .tls_ca
-            .as_deref()
-            .ok_or(ClientError::Configuration)?,
-        CA_LIMIT,
-        false,
-    )?;
-    use sha2::{Digest, Sha256};
-    let checkpoint = client_state::checkpoint_path(
-        config_path,
-        profile,
-        Sha256::digest(cert.as_slice()).into(),
-    )?;
-    let mut roots = RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut BufReader::new(cert.as_slice())) {
-        roots
-            .add(cert.map_err(|_| ClientError::Configuration)?)
-            .map_err(|_| ClientError::Configuration)?;
-    }
+    let reference = profile.tls_ca.as_deref().ok_or(ClientError::Configuration)?;
+    let (trust, identity) = if let Some(anchor) = crate::own_tls::Anchor::parse(reference) {
+        (crate::own_tls::Trust::Pinned(anchor), anchor.bytes())
+    } else {
+        let cert = load_file(reference, CA_LIMIT, false)?;
+        use sha2::{Digest, Sha256};
+        let identity = Sha256::digest(cert.as_slice()).into();
+        let mut roots = RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut BufReader::new(cert.as_slice())) {
+            roots.add(cert.map_err(|_| ClientError::Configuration)?)
+                .map_err(|_| ClientError::Configuration)?;
+        }
+        (crate::own_tls::Trust::Roots(roots), identity)
+    };
+    let checkpoint = client_state::checkpoint_path(config_path, profile, identity)?;
     let token = read_token(profile)?;
-    if roots.is_empty() {
+    if !trust.usable() {
         return Err(ClientError::Configuration);
     }
     let mode = profile.effective_xhttp_mode();
@@ -137,7 +132,7 @@ async fn load_client_with_budget(
     match profile.transport {
         Transport::H2 => {
             let endpoint = resolve_server(profile).await?.to_string();
-            let client = H2Client::new(&endpoint, &profile.server_name, &token, roots)?
+            let client = H2Client::new_with_trust(&endpoint, &profile.server_name, &token, &trust)?
                 .with_path_prefix(prefix)?
                 .with_own_tls_policy()?
                 .with_stream_up(stream_up)?;
@@ -159,7 +154,7 @@ async fn load_client_with_budget(
         Transport::H3 | Transport::Auto => {
             // Resolve the configured server only, never the requested target.
             let remote = resolve_server(profile).await?;
-            let h3 = H3Client::new(remote, &profile.server_name, &token, roots.clone())?
+            let h3 = H3Client::new_with_trust(remote, &profile.server_name, &token, trust.clone())?
                 .with_path_prefix(prefix)?
                 .with_own_tls_policy()?
                 .with_stream_up(stream_up)?
@@ -181,7 +176,7 @@ async fn load_client_with_budget(
             // Both carriers use the same resolved endpoint. Do not resolve
             // the hostname again during fallback; retain the configured SNI,
             // trust anchors, certificate pin and authorization unchanged.
-            let h2 = H2Client::new(&remote.to_string(), &profile.server_name, &token, roots)?
+            let h2 = H2Client::new_with_trust(&remote.to_string(), &profile.server_name, &token, &trust)?
                 .with_path_prefix(prefix)?
                 .with_own_tls_policy()?
                 .with_stream_up(stream_up)?;

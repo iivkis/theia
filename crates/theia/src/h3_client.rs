@@ -26,7 +26,7 @@ pub struct H3Client {
     name: String,
     uri: Uri,
     authorization: HeaderValue,
-    roots: RootCertStore,
+    own_trust: crate::own_tls::Trust,
     identity_quic: Option<Arc<rustls::ClientConfig>>,
     native_lab: Option<crate::quic_core::wire::Version>,
     native_pins: Option<(SocketAddr, crate::quic_core::scope::NetworkScope)>,
@@ -50,7 +50,16 @@ impl H3Client {
         token: &str,
         roots: RootCertStore,
     ) -> Result<Self, ClientError> {
-        if remote.port() == 0 || remote.ip().is_unspecified() || roots.is_empty() {
+        Self::new_with_trust(remote, name, token, crate::own_tls::Trust::Roots(roots))
+    }
+
+    pub(crate) fn new_with_trust(
+        remote: SocketAddr,
+        name: &str,
+        token: &str,
+        trust: crate::own_tls::Trust,
+    ) -> Result<Self, ClientError> {
+        if remote.port() == 0 || remote.ip().is_unspecified() || !trust.usable() {
             return Err(ClientError::Configuration);
         }
         if !matches!(ServerName::try_from(name), Ok(ServerName::DnsName(_))) {
@@ -67,7 +76,7 @@ impl H3Client {
             name: name.to_owned(),
             uri,
             authorization: bearer_header(token)?,
-            roots,
+            own_trust: trust,
             identity_quic: None,
             native_lab: None,
             native_pins: None,
@@ -177,7 +186,7 @@ impl H3Client {
             name: name.to_owned(),
             uri,
             authorization: bearer_header(token)?,
-            roots: RootCertStore::empty(),
+            own_trust: crate::own_tls::Trust::Roots(RootCertStore::empty()),
             identity_quic: Some(Arc::new(quic)),
             native_lab: None,
             native_pins: None,
@@ -577,8 +586,8 @@ impl H3Client {
             let tls = match &self.identity_quic {
                 Some(config) => config.clone(),
                 None => Arc::new(
-                    crate::transport_policy::Carrier::H3
-                        .client_tls(self.roots.clone())
+                    self.own_trust
+                        .tls(crate::transport_policy::Carrier::H3)
                         .map_err(|_| ClientError::Tls)?,
                 ),
             };
