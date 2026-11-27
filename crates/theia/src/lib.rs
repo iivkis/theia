@@ -178,6 +178,10 @@ pub enum Command {
     ClientWinDivertScopeDropLab {
         directory:String, dll_sha256:[u8;32], sys_sha256:[u8;32], interface:u32, seconds:u32,
     },
+    ClientWinDivertRedirectLab {
+        config:String, directory:String, dll_sha256:[u8;32], sys_sha256:[u8;32],
+        targets:Vec<std::net::SocketAddr>, seconds:u32,
+    },
     ClientWinDivertTcpRelayLab {
         config:String, directory:String, dll_sha256:[u8;32], sys_sha256:[u8;32], target:std::net::SocketAddr,
     },
@@ -409,6 +413,19 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
                 interface:interface.parse::<u32>().ok().filter(|n|*n!=0).ok_or(CliError::InvalidArguments)?,
                 seconds:seconds.parse::<u32>().ok().filter(|n|(1..=30).contains(n)).ok_or(CliError::InvalidArguments)?,
             }),
+        ["client", "windivert", "--redirect-lab", "--config", config, "--directory", directory,
+            "--dll-sha256", dll, "--sys-sha256", sys, "--targets", targets, "--seconds", seconds, "--confirm-isolated"] => {
+            if targets.len()>512 { return Err(CliError::InvalidArguments); }
+            let targets=targets.split(',').map(str::parse::<std::net::SocketAddr>)
+                .collect::<Result<Vec<_>,_>>().map_err(|_|CliError::InvalidArguments)?;
+            if !routing::windivert::validate_redirect_lab_targets(&targets) { return Err(CliError::InvalidArguments); }
+            Ok(Command::ClientWinDivertRedirectLab {
+                config:config_path(config)?,directory:config_path(directory)?,
+                dll_sha256:parse_restart_digest(dll).ok_or(CliError::InvalidArguments)?,
+                sys_sha256:parse_restart_digest(sys).ok_or(CliError::InvalidArguments)?,
+                targets,seconds:seconds.parse::<u32>().ok().filter(|n|(5..=120).contains(n)).ok_or(CliError::InvalidArguments)?,
+            })
+        }
         ["client", "windivert", "--tcp-relay-lab", "--config", config, "--directory", directory, "--dll-sha256", dll, "--sys-sha256", sys, "--target", target, "--confirm"] => Ok(Command::ClientWinDivertTcpRelayLab {
             config:config_path(config)?,
             directory:config_path(directory)?,
@@ -499,7 +516,7 @@ pub fn help(topic: Option<&str>) -> Result<&'static str, CliError> {
             Ok("Usage: theia server run --config <path> | theia server status | theia server reload --check | theia server restart --check | theia server tls fingerprint --config <path> | theia server tls rollback --check | theia server tls rollback --apply --expected-revision N --confirm | theia server restart --apply --expected-revision N --sha256 HEX --tls-sha256 PEMHEX --confirm | theia server quota --check | theia server quota --apply --expected-revision N --sha256 HEX --confirm | theia server reload --apply --expected-revision N --sha256 HEX --confirm | theia server auth rollback --check | theia server auth rollback --apply --expected-revision N --confirm\nQuota CAS resizes only two session/connection caps, retaining all held permits and denying new admissions while over the decreased cap. All other config, TLS identity bytes, grants, user roster and listener addresses must remain unchanged. Requires private Linux/Windows IPC and exact saved SHA256 TOML; lost ACK is indeterminate, query status. Restart-only fresh-port/TLS cutover uses a separate confirmed dual-digest command; the old TOML-only restart syntax is rejected.")
         }
         Some("client") => {
-            Ok("Usage: theia client run --config <path> [--system-proxy --confirm]\ntheia client status\ntheia client reload --check --expected-revision N --sha256 HEX\ntheia client reload --apply --expected-revision N --sha256 HEX --confirm\ntheia client windivert --check --directory DIR --dll-sha256 HEX --sys-sha256 HEX [--install-lab --confirm]\ntheia client windivert --loopback-lab --directory DIR --dll-sha256 HEX --sys-sha256 HEX --confirm\ntheia client windivert --scope-drop-lab --directory DIR --dll-sha256 HEX --sys-sha256 HEX --interface-index N --seconds 1..30 --confirm-block (isolated local console only; drops all outbound IP on interface)\ntheia client windivert --tcp-relay-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --target IP:PORT --confirm\ntheia client windivert --udp-relay-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --target IP:PORT [--flows 1..8] --confirm\ntheia client proxy --status\ntheia client proxy --recover --confirm\nWindows only: explicitly opt in to user WinINet HTTP(S) proxy after binding local HTTP/SOCKS5 listeners. system_proxy=manual in TOML required. Snapshot+durable journal, conditional restore on Ctrl+C/normal stop, explicit CAS recovery after crash. Never overwrites foreign proxy changes. CLI flags and TUI import alone never apply OS changes.")
+            Ok("Usage: theia client run --config <path> [--system-proxy --confirm]\ntheia client status\ntheia client reload --check --expected-revision N --sha256 HEX\ntheia client reload --apply --expected-revision N --sha256 HEX --confirm\ntheia client windivert --check --directory DIR --dll-sha256 HEX --sys-sha256 HEX [--install-lab --confirm]\ntheia client windivert --loopback-lab --directory DIR --dll-sha256 HEX --sys-sha256 HEX --confirm\ntheia client windivert --scope-drop-lab --directory DIR --dll-sha256 HEX --sys-sha256 HEX --interface-index N --seconds 1..30 --confirm-block (isolated local console only; drops all outbound IP on interface)\ntheia client windivert --redirect-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --targets IP:PORT[,IP:PORT] --seconds 5..120 --confirm-isolated\ntheia client windivert --tcp-relay-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --target IP:PORT --confirm\ntheia client windivert --udp-relay-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --target IP:PORT [--flows 1..8] --confirm\ntheia client proxy --status\ntheia client proxy --recover --confirm\nWindows only: explicitly opt in to user WinINet HTTP(S) proxy after binding local HTTP/SOCKS5 listeners. system_proxy=manual in TOML required. Snapshot+durable journal, conditional restore on Ctrl+C/normal stop, explicit CAS recovery after crash. Never overwrites foreign proxy changes. CLI flags and TUI import alone never apply OS changes.")
         }
         Some("trust") => Ok(descriptor_cli::HELP),
         Some("reference") => Ok(reference_cli::HELP),
@@ -550,6 +567,23 @@ mod tests {
         args[12]="31";
         assert!(command(&args).is_err());
         args[12]="0";
+        assert!(command(&args).is_err());
+    }
+    #[test]
+    fn windivert_redirect_lab_requires_literal_reviewed_targets_and_duration() {
+        let dll="ab".repeat(32);
+        let sys="cd".repeat(32);
+        let mut args=["client","windivert","--redirect-lab","--config","client.toml","--directory","C:/Theia/WinDivert",
+            "--dll-sha256",&dll,"--sys-sha256",&sys,"--targets","192.0.2.1:443,[2001:db8::1]:8443",
+            "--seconds","30","--confirm-isolated"];
+        assert!(matches!(command(&args),Ok(Command::ClientWinDivertRedirectLab{targets,seconds:30,..}) if targets.len()==2));
+        assert!(command(&args[..15]).is_err());
+        args[12]="example.org:443";
+        assert!(command(&args).is_err());
+        args[12]="192.0.2.1:443,192.0.2.1:443";
+        assert!(command(&args).is_err());
+        args[12]="192.0.2.1:443";
+        args[14]="121";
         assert!(command(&args).is_err());
     }
     #[test]

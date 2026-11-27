@@ -2589,6 +2589,157 @@ impl NativeIngress {
         recovered
     }
 
+
+    /// One capture worker and the existing runtime for external TCP/UDP
+    /// applications. Explicit isolated destination scope only: this
+    /// cannot authorize production Connect or establish socket identity.
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    pub async fn run_windows_redirect_lab(
+        path:&Path,directory:std::path::PathBuf,dll:[u8;32],sys:[u8;32],
+        targets:Vec<SocketAddr>,seconds:u32,
+    )->Result<(),ClientError> {
+        use crate::routing::{carrier_socket,windivert::{self,CarrierRegistry,ScopeRelayEvent}};
+        let registry=Arc::new(CarrierRegistry::for_redirect_lab(&targets).ok_or(ClientError::Configuration)?);
+        if !(5..=120).contains(&seconds) { return Err(ClientError::Configuration); }
+        let registrar:Arc<dyn carrier_socket::Registrar>=registry.clone();
+        let ingress=Arc::new(Self::prepare_with_registrar(path,Some(registrar.clone())).await?);
+        struct Stop<'a>(&'a NativeIngress,&'a CarrierRegistry);
+        impl Drop for Stop<'_> {
+            fn drop(&mut self) { self.0.shutdown();self.1.retire(); }
+        }
+        let _stop=Stop(&ingress,&registry);
+        let mut lab=windivert::begin_scope_relay_lab(directory,dll,sys,targets,seconds).await
+            .map_err(|_|ClientError::Io)?;
+        ingress.runtime.capture_state.ready()?;
+        let mut udp=NativeUdpDispatch::default();
+        let mut tasks=JoinSet::<Option<NativeUdpTicket>>::new();
+        let maintenance=carrier_socket::scope(Some(registrar.clone()),ingress.runtime.maintain());
+        tokio::pin!(maintenance);
+        let result=loop {
+            if ingress.ensure_accepting().is_err() { break Err(ClientError::Open(ErrorCode::PolicyDenied)); }
+            let event=tokio::select! {
+                biased;
+                _=&mut lab.ended=>break Ok(()),
+                ()=ingress.stopped()=>break Err(ClientError::Open(ErrorCode::PolicyDenied)),
+                result=&mut maintenance=>break result,
+                finished=tasks.join_next(),if !tasks.is_empty()=>{
+                    match finished {
+                        Some(Ok(None))=>continue,
+                        Some(Ok(Some(ticket))) if udp.complete(ticket)=>continue,
+                        _=>break Err(ClientError::Io),
+                    }
+                }
+                event=lab.events.recv()=>match event {Some(event)=>event,None=>break Err(ClientError::Io)},
+            };
+            match event {
+                ScopeRelayEvent::Tcp(captured)=>{
+                    if tasks.len()>=LOCAL_LIMIT { drop(captured);continue; }
+                    let owner=ingress.clone();
+                    let registrar=registrar.clone();
+                    tasks.spawn(async move {
+                        if let Ok((key,stream))=captured.accept().await {
+                            let result=carrier_socket::scope(Some(registrar),owner.relay_terminated_tcp(key,stream)).await;
+                            // Allow the local TCP stack's FIN/ACK exchange
+                            // to drain before retiring the exact mapping.
+                            if result.is_ok() {
+                                tokio::select! {
+                                    ()=owner.stopped()=>{},
+                                    ()=tokio::time::sleep(Duration::from_secs(2))=>{},
+                                }
+                            }
+                        }
+                        drop(captured);
+                        None
+                    });
+                }
+                ScopeRelayEvent::Udp(packet)=>{
+                    if !packet.flow.live() { continue; }
+                    let key=packet.flow.key();
+                    // Existing UDP queues may accept more packets while
+                    // the shared task quota is full. New flows may not.
+                    if tasks.len()>=LOCAL_LIMIT && !udp.flows.contains_key(&key) {
+                        packet.flow.close();
+                        crate::traffic::udp_queue_drop();
+                        continue;
+                    }
+                    if let Some((ticket,first,subsequent))=udp.admit(key,packet) {
+                        let owner=ingress.clone();
+                        let replies=lab.replies.clone();
+                        let registrar=registrar.clone();
+                        tasks.spawn(async move {
+                            let _=carrier_socket::scope(Some(registrar),
+                                owner.relay_windows_scope_udp(first,subsequent,replies)).await;
+                            Some(ticket)
+                        });
+                    }
+                }
+            }
+        };
+        ingress.shutdown();
+        registry.retire();
+        tasks.shutdown().await;
+        let backend=lab.finish().await.map_err(|_|ClientError::Io);
+        result?;
+        backend
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    async fn relay_windows_scope_udp(&self,first:crate::routing::windivert::ScopeUdpPacket,
+        mut subsequent:tokio::sync::mpsc::Receiver<crate::routing::windivert::ScopeUdpPacket>,
+        replies:crate::routing::windivert::ScopeReplies)->Result<(),ClientError> {
+        use crate::routing::{carrier_socket,PacketAction};
+        // Every completion path revokes the reply capability; the
+        // packet worker retains an un-reusable tuple tombstone.
+        struct Retire<F:FnOnce()>(Option<F>);
+        impl<F:FnOnce()> Drop for Retire<F> {
+            fn drop(&mut self) { if let Some(retire)=self.0.take() { retire(); } }
+        }
+        let source=first.flow.clone();
+        let revoke=source.clone();
+        let _retire=Retire(Some(move ||revoke.close()));
+        let key=source.key();
+        if !source.live() || subsequent.max_capacity()>crate::udp_relay::QUEUE {
+            return Err(ClientError::Open(ErrorCode::PolicyDenied));
+        }
+        tokio::select! {
+            biased;
+            ()=self.stopped()=>Err(ClientError::Open(ErrorCode::PolicyDenied)),
+            result=async {
+                let (carrier,flow,address)=self.redirect(key).await?;
+                let tunnel=carrier_socket::scope(self.registrar()?,carrier.open_udp(address,key.destination.port())).await?;
+                let (tx,up)=tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
+                let (down,mut rx)=tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
+                tx.send(first.payload).await.map_err(|_|ClientError::Io)?;
+                let relay=tunnel.relay_guarded(up,down,Some(&flow));
+                let feed=async {
+                    let tx=tx;
+                    while let Some(packet)=subsequent.recv().await {
+                        if !source.live() || !Arc::ptr_eq(&packet.flow,&source) ||
+                            packet.payload.len()>crate::protocol::MAX_DATAGRAM {
+                            return Err(ClientError::Open(ErrorCode::PolicyDenied));
+                        }
+                        tx.send(packet.payload).await.map_err(|_|ClientError::Io)?;
+                    }
+                    Ok::<(),ClientError>(())
+                };
+                let reverse=async {
+                    while let Some(bytes)=rx.recv().await {
+                        self.ensure_accepting()?;
+                        if !source.live() || !flow.committed(PacketAction::Redirect) {
+                            return Err(ClientError::Open(ErrorCode::PolicyDenied));
+                        }
+                        // Acknowledged by the sole packet worker only
+                        // after exact reverse injection; no echo matching
+                        // and no one-request/one-response assumption.
+                        replies.send(source.clone(),bytes).await.map_err(|_|ClientError::Io)?;
+                    }
+                    Ok::<(),ClientError>(())
+                };
+                supervise_native_udp(relay,feed,reverse).await
+            }=>result,
+        }
+    }
+
     /// Scoped real WinDivert TCP reflection into the existing XHTTP
     /// stream handoff. No application evidence or system-wide Connect.
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -3617,7 +3768,7 @@ fn native_udp_dispatch_keeps_interleaved_interfaces_and_generations_separate() {
 /// flow lease and reply socket until a bounded drain finishes. Feed EOF is
 /// not relay EOF; dropping the upload sender lets the carrier send FIN.
 /// Errors and outer runtime cancellation still terminate immediately.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
 async fn supervise_native_udp(
     relay: impl std::future::Future<Output = Result<(), ClientError>>,
     feed: impl std::future::Future<Output = Result<(), ClientError>>,

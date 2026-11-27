@@ -99,6 +99,19 @@ async fn run() {
                 Err(CliError::NotImplemented("WinDivert x64 Windows backend"))
             }
         }
+        Ok(Command::ClientWinDivertRedirectLab { config,directory,dll_sha256,sys_sha256,targets,seconds }) => {
+            #[cfg(all(windows,target_arch="x86_64"))]
+            {
+                local_proxy::NativeIngress::run_windows_redirect_lab(Path::new(&config),directory.into(),dll_sha256,sys_sha256,targets,seconds).await
+                    .map(|_|"WinDivert scoped TCP/UDP redirect laboratory ended; capture inactive; no production readiness or successful application exchange asserted".to_owned())
+                    .map_err(CliError::Client)
+            }
+            #[cfg(not(all(windows,target_arch="x86_64")))]
+            {
+                let _=(config,directory,dll_sha256,sys_sha256,targets,seconds);
+                Err(CliError::NotImplemented("WinDivert x64 Windows backend"))
+            }
+        }
         Ok(Command::ClientWinDivertTcpRelayLab { config,directory,dll_sha256,sys_sha256,target }) => {
             #[cfg(all(windows,target_arch="x86_64"))]
             {

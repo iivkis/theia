@@ -329,6 +329,7 @@ struct CarrierState {
     entries:std::collections::HashMap<u64,CarrierEntry>,
     retired:bool,
     next:u64,
+    lab_blocked_ips:Vec<std::net::IpAddr>,
 }
 #[derive(Clone,Copy)]
 struct CarrierEntry {
@@ -353,6 +354,14 @@ impl Drop for CarrierLease {
     }
 }
 impl CarrierRegistry {
+    #[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
+    pub(crate) fn for_redirect_lab(targets:&[std::net::SocketAddr])->Option<Self> {
+        if !validate_redirect_lab_targets(targets) { return None; }
+        Some(Self {state:std::sync::Arc::new(std::sync::Mutex::new(CarrierState {
+            lab_blocked_ips:targets.iter().map(|t|t.ip()).collect(),
+            ..CarrierState::default()
+        }))})
+    }
     fn register(&self,endpoint:u64,pid:u32,tuple:EndpointTuple,registered_at:i64)->Option<CarrierLease> {
         if registered_at<=0 || endpoint==0 || pid==0 || tuple.local.port()==0 || tuple.remote.port()==0
             || tuple.local.ip().is_unspecified() || tuple.remote.ip().is_unspecified()
@@ -362,7 +371,7 @@ impl CarrierRegistry {
             || matches!(tuple.remote,std::net::SocketAddr::V6(v) if v.scope_id()!=0 || v.ip().to_ipv4_mapped().is_some() || v.ip().is_unicast_link_local())
         { return None; }
         let mut state=self.state.lock().ok()?;
-        if state.retired { return None; }
+        if state.retired || state.lab_blocked_ips.contains(&tuple.remote.ip()) { return None; }
         // Never reuse a retired kernel endpoint in the same epoch.
         if state.entries.len()>=4096 || state.entries.contains_key(&endpoint)
             || state.entries.values().any(|e|e.tuple==tuple)
@@ -743,6 +752,13 @@ impl TcpRedirectTable {
         if flags&4!=0 { entry.state=TcpReflectionState::Retired; }
         Some(ReverseDatagram {packet:out,interface:key.interface,sub_interface:entry.sub_interface})
     }
+}
+/// Explicit isolated fixture destinations. Never use a caller-supplied
+/// filter expression, hostname, wildcard or broad carrier permit.
+pub(crate) fn validate_redirect_lab_targets(targets:&[std::net::SocketAddr])->bool {
+    !targets.is_empty() && targets.len()<=8 &&
+        targets.iter().all(|target|reflect_address(*target)) &&
+        targets.iter().enumerate().all(|(i,target)|!targets[..i].contains(target))
 }
 fn reflect_address(address:std::net::SocketAddr)->bool {
     let ip=address.ip();
@@ -1254,6 +1270,263 @@ mod native {
 
     struct Cancel(Arc<AtomicBool>);
     impl Drop for Cancel { fn drop(&mut self) { self.0.store(true,Ordering::Release); } }
+
+
+    // Common capture adapter for EXTERNAL applications on explicit lab
+    // destinations. The packet worker never opens a remote socket, trusts
+    // a PID, or passes an original packet. All routing remains in NativeIngress.
+    use std::{collections::HashMap, net::SocketAddr, sync::Mutex};
+    use tokio::sync::{mpsc,oneshot};
+    use super::super::packet::{FlowKey,Transport};
+
+    pub(crate) struct ScopeTcp {
+        token:TcpRedirectToken,
+        listener:tokio::net::TcpListener,
+        table:Arc<Mutex<TcpRedirectTable>>,
+    }
+    impl ScopeTcp {
+        pub(crate) async fn accept(&self)->io::Result<(FlowKey,tokio::net::TcpStream)> {
+            let (stream,peer)=tokio::time::timeout(Duration::from_secs(8),self.listener.accept()).await
+                .map_err(|_|io::ErrorKind::TimedOut)??;
+            if stream.peer_addr()?!=peer ||
+                !self.table.lock().map_err(|_|io::ErrorKind::PermissionDenied)?
+                    .accept(self.token,stream.local_addr()?,peer) {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            Ok((self.token.original(),stream))
+        }
+    }
+    impl Drop for ScopeTcp {
+        fn drop(&mut self) {
+            if let Ok(mut table)=self.table.lock() { table.complete(self.token); }
+        }
+    }
+
+    pub(crate) struct ScopeUdpFlow {
+        plan:UdpReversePlan,
+        address:Address,
+        live:AtomicBool,
+    }
+    impl ScopeUdpFlow {
+        pub(crate) fn key(&self)->FlowKey { self.plan.original_flow() }
+        pub(crate) fn live(&self)->bool { self.live.load(Ordering::Acquire) }
+        pub(crate) fn close(&self) { self.live.store(false,Ordering::Release); }
+    }
+    pub(crate) struct ScopeUdpPacket {
+        pub(crate) flow:Arc<ScopeUdpFlow>,
+        pub(crate) payload:Vec<u8>,
+    }
+    pub(crate) enum ScopeRelayEvent {
+        Tcp(ScopeTcp),
+        Udp(ScopeUdpPacket),
+    }
+    struct ScopeReply {
+        flow:Arc<ScopeUdpFlow>,
+        payload:Vec<u8>,
+        sent:oneshot::Sender<io::Result<()>>,
+    }
+    #[derive(Clone)]
+    pub(crate) struct ScopeReplies(mpsc::Sender<ScopeReply>);
+    impl ScopeReplies {
+        pub(crate) async fn send(&self,flow:Arc<ScopeUdpFlow>,payload:Vec<u8>)->io::Result<()> {
+            if !flow.live() || payload.len()>crate::protocol::MAX_DATAGRAM {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            let (sent,ack)=oneshot::channel();
+            self.0.send(ScopeReply{flow,payload,sent}).await.map_err(|_|io::ErrorKind::BrokenPipe)?;
+            ack.await.map_err(|_|io::ErrorKind::BrokenPipe)?
+        }
+    }
+    pub(crate) struct ScopeRelayLab {
+        pub(crate) events:mpsc::Receiver<ScopeRelayEvent>,
+        pub(crate) replies:ScopeReplies,
+        pub(crate) ended:oneshot::Receiver<()>,
+        worker:tokio::task::JoinHandle<io::Result<()>>,
+        cancel:Cancel,
+    }
+    impl ScopeRelayLab {
+        pub(crate) async fn finish(mut self)->io::Result<()> {
+            self.cancel.0.store(true,Ordering::Release);
+            (&mut self.worker).await.map_err(|_|io::Error::other("WinDivert capture worker failed"))?
+        }
+    }
+
+    fn destination_filter(targets:&[SocketAddr],source:bool)->io::Result<String> {
+        if !validate_redirect_lab_targets(targets) { return Err(io::ErrorKind::InvalidInput.into()); }
+        let mut terms=Vec::new();
+        for target in targets {
+            let layer=if target.is_ipv4() {"ip"} else {"ipv6"};
+            let field=if source {"SrcAddr"} else {"DstAddr"};
+            let term=format!("{layer}.{field} == {}",target.ip());
+            if !terms.contains(&term) { terms.push(term); }
+        }
+        Ok(terms.join(" or "))
+    }
+
+    pub(crate) async fn begin_scope_relay_lab(directory:std::path::PathBuf,dll:[u8;32],sys:[u8;32],
+        targets:Vec<SocketAddr>,seconds:u32)->io::Result<ScopeRelayLab> {
+        if !validate_redirect_lab_targets(&targets) || !(5..=120).contains(&seconds) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let cancel=Cancel(Arc::new(AtomicBool::new(false)));
+        let signal=cancel.0.clone();
+        let runtime=tokio::runtime::Handle::current();
+        let (ready_tx,ready_rx)=oneshot::channel();
+        let (end_tx,ended)=oneshot::channel();
+        let (event_tx,events)=mpsc::channel(64);
+        let (reply_tx,mut reply_rx)=mpsc::channel::<ScopeReply>(64);
+        let mut worker=tokio::task::spawn_blocking(move || {
+            let _winsock=WinsockLease::start()?;
+            let api=load(&directory,dll,sys)?;
+            // Observe every target before capture; fail if the target is
+            // local or shares a route source with its own address.
+            let scopes=targets.iter().map(|target|{
+                let scope=crate::network_scope::observe(*target).ok_or(io::ErrorKind::PermissionDenied)?;
+                if scope.bind_address().ip()==target.ip() { return Err(io::ErrorKind::PermissionDenied); }
+                Ok((*target,scope))
+            }).collect::<Result<Vec<_>,std::io::ErrorKind>>()?;
+            let outgoing=format!("outbound and !loopback and ({})",destination_filter(&targets,false)?);
+            // Guard ALL ports/protocols at the explicitly authorized IPs,
+            // including fragments and genuine inbound packets. The
+            // injector is below both handles and only emits local inbound.
+            let guard_filter=std::ffi::CString::new(format!("({outgoing}) or (inbound and !loopback and ({}))",
+                destination_filter(&targets,true)?)).map_err(|_|io::ErrorKind::InvalidInput)?;
+            let capture_filter=std::ffi::CString::new(outgoing).map_err(|_|io::ErrorKind::InvalidInput)?;
+            let guard=api.open_priority(&guard_filter,0,-100,0x12)?;
+            let capture=api.open_priority(&capture_filter,0,100,0x14)?;
+            api.bounded(&capture)?;
+            let injector=api.open_priority(c"false",0,-200,0x18)?;
+            let table=Arc::new(Mutex::new(TcpRedirectTable::new(64,4096).ok_or(io::ErrorKind::InvalidInput)?));
+            let mut udp=HashMap::<FlowKey,Arc<ScopeUdpFlow>>::new();
+            let deadline=Instant::now()+Duration::from_secs(u64::from(seconds));
+            ready_tx.send(()).map_err(|_|io::ErrorKind::BrokenPipe)?;
+            let result=(||->io::Result<()> {
+                let mut packets=0usize;
+                while !signal.load(Ordering::Acquire) && Instant::now()<deadline {
+                    if packets>=65_536 { return Err(io::ErrorKind::OutOfMemory.into()); }
+                    if scopes.iter().any(|(target,scope)|crate::network_scope::observe(*target)!=Some(*scope)) {
+                        return Err(io::ErrorKind::PermissionDenied.into());
+                    }
+                    // Bound command work so an active downlink cannot
+                    // starve new TCP handshakes or UDP uploads.
+                    for _ in 0..16 {
+                        let command=match reply_rx.try_recv() {
+                            Ok(command)=>command,
+                            Err(mpsc::error::TryRecvError::Empty)=>break,
+                            Err(mpsc::error::TryRecvError::Disconnected)=>return Err(io::ErrorKind::BrokenPipe.into()),
+                        };
+                        let ScopeReply{flow,payload,sent}=command;
+                        if sent.is_closed() || !flow.live() ||
+                            !udp.get(&flow.key()).is_some_and(|current|Arc::ptr_eq(current,&flow)) {
+                            let _=sent.send(Err(io::ErrorKind::PermissionDenied.into()));
+                            continue;
+                        }
+                        let reverse=flow.plan.build(&payload).ok_or(io::ErrorKind::InvalidData)?;
+                        let mut incoming=flow.address;
+                        incoming.flags=(1<<23)|if flow.key().source.is_ipv6(){1<<20}else{1<<21};
+                        let result=api.send(&injector,&reverse.packet,&incoming,&signal,deadline);
+                        let ok=result.is_ok();
+                        let _=sent.send(result);
+                        if !ok { return Err(io::Error::other("UDP reverse injection failed")); }
+                    }
+                    let receive_until=std::cmp::min(deadline,Instant::now()+Duration::from_millis(10));
+                    let (packet,address)=match api.receive(&capture,&signal,receive_until) {
+                        Ok(data)=>data,
+                        Err(_) if signal.load(Ordering::Acquire)=>break,
+                        Err(error) if error.kind()==io::ErrorKind::TimedOut=>continue,
+                        Err(error)=>return Err(error),
+                    };
+                    packets+=1;
+                    let Ok(obs)=address.network(&packet) else { continue; };
+                    if !obs.outbound || obs.sniffed { return Err(io::ErrorKind::PermissionDenied.into()); }
+                    let key=obs.meta.flow;
+                    // Match route source even for the reverse TCP listener
+                    // direction (the target IP stays the same).
+                    if !scopes.iter().any(|(target,scope)|target.ip()==key.destination.ip() &&
+                        scope.matches_local(key.source)) { continue; }
+                    match key.transport {
+                        Transport::Tcp=>{
+                            let existing=table.lock().map_err(|_|io::ErrorKind::PermissionDenied)?.lookup(&address,&packet);
+                            let token=match existing {
+                                Some(token)=>token,
+                                None=>{
+                                    if !targets.contains(&key.destination) || obs.meta.payload_len!=0 ||
+                                        !obs.meta.tcp_flags.is_some_and(|flags|flags & !0xc0 == 2) { continue; }
+                                    // A different exclusive listener is reserved for
+                                    // every SYN. No source-port or target-port guessing.
+                                    let listener={
+                                        let _entered=runtime.enter();
+                                        let socket=if key.source.is_ipv4(){tokio::net::TcpSocket::new_v4()?}
+                                            else {tokio::net::TcpSocket::new_v6()?};
+                                        exclusive(&socket)?;
+                                        socket.bind(SocketAddr::new(key.source.ip(),0))?;
+                                        socket.listen(1)?
+                                    };
+                                    let local=listener.local_addr()?;
+                                    let token=table.lock().map_err(|_|io::ErrorKind::PermissionDenied)?
+                                        .begin(&address,&packet,local);
+                                    let Some(token)=token else { continue; };
+                                    // On queue saturation the dropped reservation
+                                    // retires the tuple; no SYN is reflected.
+                                    if event_tx.try_send(ScopeRelayEvent::Tcp(ScopeTcp{
+                                        token,listener,table:table.clone()
+                                    })).is_err() { continue; }
+                                    token
+                                }
+                            };
+                            let reverse=table.lock().map_err(|_|io::ErrorKind::PermissionDenied)?
+                                .reflect(token,&address,&packet);
+                            let Some(reverse)=reverse else { continue; };
+                            let mut incoming=address;
+                            incoming.flags=(1<<22)|if key.source.is_ipv6(){1<<20}else{1<<21};
+                            api.send(&injector,&reverse.packet,&incoming,&signal,deadline)?;
+                        }
+                        Transport::Udp=>{
+                            if !targets.contains(&key.destination) || obs.meta.payload_len>crate::protocol::MAX_DATAGRAM { continue; }
+                            let Some(plan)=UdpReversePlan::from_diverted_packet(&address,&packet) else { continue; };
+                            let flow=if let Some(current)=udp.get(&key) {
+                                if !current.live() || current.plan!=plan || address.timestamp<current.address.timestamp { continue; }
+                                current.clone()
+                            } else {
+                                // Retain tombstones for the whole bounded
+                                // epoch. Never reuse a finished UDP tuple.
+                                if udp.len()>=4096 || udp.values().filter(|flow|flow.live()).count()>=64 { continue; }
+                                let flow=Arc::new(ScopeUdpFlow{plan,address,live:AtomicBool::new(true)});
+                                udp.insert(key,flow.clone());
+                                flow
+                            };
+                            let Some(start)=packet.len().checked_sub(obs.meta.payload_len) else { continue; };
+                            if event_tx.try_send(ScopeRelayEvent::Udp(ScopeUdpPacket{
+                                flow,payload:packet[start..].to_vec()
+                            })).is_err() {
+                                crate::traffic::udp_queue_drop();
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            })();
+            // Revoke all local capabilities before telling the async
+            // owner to join relays; keep both guard handles alive until
+            // the owner has explicitly requested teardown.
+            if let Ok(mut t)=table.lock() { t.retire(); }
+            for flow in udp.values() { flow.close(); }
+            let _=end_tx.send(());
+            drop(event_tx);
+            drop(reply_rx);
+            while !signal.load(Ordering::Acquire) { std::thread::sleep(Duration::from_millis(10)); }
+            let r1=api.retire(capture);
+            let r2=api.retire(injector);
+            let r3=guard.close();
+            result?;
+            r1?;r2?;r3
+        });
+        if ready_rx.await.is_err() {
+            (&mut worker).await.map_err(|_|io::Error::other("WinDivert scope worker failed"))??;
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        Ok(ScopeRelayLab{events,replies:ScopeReplies(reply_tx),ended,worker,cancel})
+    }
 
     /// One explicitly authorized non-loopback echo flow, never a generic
     /// application capture or an externally supplied packet/injection key.
@@ -1918,11 +2191,28 @@ mod native {
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub use native::{loopback_acceptance, probe, scope_drop_acceptance};
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-pub(crate) use native::{begin_udp_relay_lab, run_tcp_relay_lab, RelayLab, UDP_LAB_DATAGRAMS};
+pub(crate) use native::{begin_udp_relay_lab, run_tcp_relay_lab, RelayLab, UDP_LAB_DATAGRAMS,
+    begin_scope_relay_lab, ScopeRelayEvent, ScopeUdpPacket, ScopeReplies};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scope_targets_are_literal_bounded_and_carrier_cannot_recurse() {
+        let v4="192.0.2.1:443".parse().unwrap();
+        let v6="[2001:db8::1]:443".parse().unwrap();
+        assert!(validate_redirect_lab_targets(&[v4,v6]));
+        assert!(!validate_redirect_lab_targets(&[]));
+        assert!(!validate_redirect_lab_targets(&[v4,v4]));
+        assert!(!validate_redirect_lab_targets(&["127.0.0.1:443".parse().unwrap()]));
+        assert!(!validate_redirect_lab_targets(&["[fe80::1]:443".parse().unwrap()]));
+        let registry=CarrierRegistry::for_redirect_lab(&[v4,v6]).unwrap();
+        let tuple=EndpointTuple{local:"192.0.2.2:40000".parse().unwrap(),remote:v4,
+            transport:super::super::packet::Transport::Tcp};
+        assert!(registry.register(1,1,tuple,1).is_none());
+        assert!(registry.register(1,1,EndpointTuple{remote:"192.0.2.1:8443".parse().unwrap(),..tuple},1).is_none());
+        assert!(registry.register(2,1,EndpointTuple{remote:"198.51.100.1:443".parse().unwrap(),..tuple},1).is_some());
+    }
     #[test]
     fn pins_must_be_nonzero_and_distinct() {
         assert!(valid_pins([0;32],[1;32]).is_err());
