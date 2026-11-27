@@ -19,6 +19,8 @@ use tokio_rustls::TlsAcceptor;
 
 #[path = "support/shared_port.rs"]
 mod shared_port;
+#[path = "support/quinn_reference.rs"]
+mod quinn_reference;
 
 const TOKEN: [u8; 32] = [0x42; 32];
 
@@ -27,7 +29,7 @@ const TOKEN: [u8; 32] = [0x42; 32];
 async fn shared_quic_listener(
     der: rustls::pki_types::CertificateDer<'static>,
     key: rustls::pki_types::PrivateKeyDer<'static>,
-) -> (TcpListener, quinn::Endpoint) {
+) -> (TcpListener, theia::h3_server::OwnTlsEndpoint) {
     let mut rejected = Vec::new();
     let mut last_error = None;
     for _ in 0..64 {
@@ -1267,11 +1269,21 @@ async fn auto_wrong_h3_certificate_never_retries_working_h2() {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let der = cert.cert.der().clone();
         let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-        let (tcp, udp) = shared_quic_listener(der, key.into()).await;
+        // Keep this wrong-PKI peer independent of the native client.
+        let (tcp, udp) = shared_port::reserve_shared_port();
+        tcp.set_nonblocking(true).unwrap();
+        udp.set_nonblocking(true).unwrap();
+        let tcp = TcpListener::from_std(tcp).unwrap();
+        let udp = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(quinn_reference::server_config(vec![der], key.into()).unwrap()),
+            udp,
+            Arc::new(quinn::TokioRuntime),
+        ).unwrap();
         let (endpoint, _roots, pem, server) = listener_with_pem_bound(true, tcp);
         let quic = tokio::spawn(async move {
             let incoming = udp.accept().await.unwrap();
-            assert!(theia::quic_transport::accept(incoming).await.is_err());
+            assert!(quinn_reference::accept(incoming).await.is_err());
         });
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (_dir, _child, _http, _socks) = launch_client_with_profile_expected(
