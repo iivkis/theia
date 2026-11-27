@@ -1158,7 +1158,13 @@ impl Wizard {
             ),
             9 => "Дополнительные имена сайтов".into(),
             10 => "Только сети, которые разрешено проверять".into(),
-            11 => if self.advanced { "Свернуть".into() } else { "Открыть".into() },
+            11 => {
+                if self.advanced {
+                    "Свернуть".into()
+                } else {
+                    "Открыть".into()
+                }
+            }
             12 => "Открыть редактор".into(),
             13 => "Проверить и перейти дальше".into(),
             4 => self.custom_domains(),
@@ -2104,7 +2110,8 @@ impl ProvisionPanel {
 
     pub(crate) fn recovery_path(&self) -> Option<&Path> {
         let wizard = self.wizard.as_ref()?;
-        matches!(wizard.stage, WizardStage::SaveFailed { retry: false, .. }).then_some(wizard.config.as_path())
+        matches!(wizard.stage, WizardStage::SaveFailed { retry: false, .. })
+            .then_some(wizard.config.as_path())
     }
 
     pub(crate) fn confirmation_choice(&self) -> Option<(char, &'static str)> {
@@ -2122,7 +2129,9 @@ impl ProvisionPanel {
                 }
                 WizardStage::CreateConfirm(_) if !wizard.result_details => Some(('y', "Сохранить")),
                 WizardStage::SaveFailed { retry: true, .. } => Some(('y', "Повторить настройку")),
-                WizardStage::SaveFailed { retry: false, .. } => Some(('o', "Открыть настройки заново")),
+                WizardStage::SaveFailed { retry: false, .. } => {
+                    Some(('o', "Открыть настройки заново"))
+                }
                 WizardStage::Success => Some((
                     'y',
                     if wizard.source.is_none() {
@@ -2719,7 +2728,10 @@ mod tests {
         tx.send(Err(Error::Approval)).unwrap();
         assert!(panel.poll().is_none());
         assert!(panel.body().contains("Повтор недоступен"));
-        assert_eq!(panel.confirmation_choice(), Some(('o', "Открыть настройки заново")));
+        assert_eq!(
+            panel.confirmation_choice(),
+            Some(('o', "Открыть настройки заново"))
+        );
         assert!(!path.exists() && !input.health.exists() && !input.bundle.exists());
         std::fs::remove_dir_all(dir).unwrap();
     }

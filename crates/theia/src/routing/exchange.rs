@@ -15,13 +15,18 @@ pub(crate) const DIAGNOSTIC_HEADER: &str = "theia-diagnostic-domains";
 pub(crate) const DIAGNOSTIC_LIMIT: usize = 4096 + 64;
 const DIAGNOSTIC_MAGIC: &[u8; 8] = b"THEIAD01";
 
-pub(crate) fn decode_diagnostic_domains(bytes: &[u8], digest: [u8; 32]) -> Result<Vec<String>, ClientError> {
+pub(crate) fn decode_diagnostic_domains(
+    bytes: &[u8],
+    digest: [u8; 32],
+) -> Result<Vec<String>, ClientError> {
     if bytes == unchanged_receipt(digest).as_slice() {
         // Older authenticated servers ignore the request header.
         return Ok(snapshot::default_diagnostic_domains());
     }
-    if bytes.len() > DIAGNOSTIC_LIMIT || bytes.get(..8) != Some(DIAGNOSTIC_MAGIC.as_slice())
-        || bytes.get(8..40) != Some(digest.as_slice()) {
+    if bytes.len() > DIAGNOSTIC_LIMIT
+        || bytes.get(..8) != Some(DIAGNOSTIC_MAGIC.as_slice())
+        || bytes.get(8..40) != Some(digest.as_slice())
+    {
         return Err(ClientError::Protocol);
     }
     let raw = std::str::from_utf8(&bytes[40..]).map_err(|_| ClientError::Protocol)?;
@@ -94,7 +99,11 @@ impl Published {
         Ok(Self {
             snapshot,
             wire: wire.into(),
-            diagnostic_domains: policy.routing.as_ref().map(|settings| settings.diagnostic_domains.clone()).unwrap_or_else(snapshot::default_diagnostic_domains),
+            diagnostic_domains: policy
+                .routing
+                .as_ref()
+                .map(|settings| settings.diagnostic_domains.clone())
+                .unwrap_or_else(snapshot::default_diagnostic_domains),
         })
     }
 }
@@ -171,18 +180,26 @@ pub(crate) async fn response_data(
     let diagnostic_count = headers.get_all(DIAGNOSTIC_HEADER).iter().count();
     let native_count = headers.get_all(NATIVE_DNS_HEADER).iter().count();
     if diagnostic_count != 0 {
-        if diagnostic_count != 1 || domain_count != 0 || native_count != 0 || digest_count != 1
-            || headers.get(DIAGNOSTIC_HEADER).map(|v| v.as_bytes()) != Some(b"1".as_slice()) {
+        if diagnostic_count != 1
+            || domain_count != 0
+            || native_count != 0
+            || digest_count != 1
+            || headers.get(DIAGNOSTIC_HEADER).map(|v| v.as_bytes()) != Some(b"1".as_slice())
+        {
             return Err(StatusCode::BAD_REQUEST);
         }
         let digest = publication.snapshot.digest();
-        if headers.get(DIGEST_HEADER).and_then(|v| v.to_str().ok()) != Some(digest_text(digest).as_str()) {
+        if headers.get(DIGEST_HEADER).and_then(|v| v.to_str().ok())
+            != Some(digest_text(digest).as_str())
+        {
             return Err(StatusCode::CONFLICT);
         }
         let mut bytes = DIAGNOSTIC_MAGIC.to_vec();
         bytes.extend_from_slice(&digest);
         bytes.extend_from_slice(publication.diagnostic_domains.join("\n").as_bytes());
-        if bytes.len() > DIAGNOSTIC_LIMIT { return Err(StatusCode::INTERNAL_SERVER_ERROR); }
+        if bytes.len() > DIAGNOSTIC_LIMIT {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
         return Ok(Arc::from(bytes));
     }
     let native = native_count == 1
@@ -366,19 +383,100 @@ mod tests {
     #[tokio::test]
     async fn diagnostic_metadata_preserves_legacy_wire() {
         let (snapshot, wire) = snapshot::Snapshot::build("scope", 2, &[], &[], &[]).unwrap();
-        let publication = Published { snapshot, wire: wire.into(), diagnostic_domains: vec!["discord.com".into()] };
+        let publication = Published {
+            snapshot,
+            wire: wire.into(),
+            diagnostic_domains: vec!["discord.com".into()],
+        };
         let mut request = http::Request::new(());
         let deadline = Duration::from_secs(2);
         let digest = publication.snapshot.digest();
-        assert_eq!(response_data(&publication, request.headers(), false, deadline).await.unwrap(), publication.wire);
+        assert_eq!(
+            response_data(&publication, request.headers(), false, deadline)
+                .await
+                .unwrap(),
+            publication.wire
+        );
         request_digest(&mut request, digest).unwrap();
-        request.headers_mut().insert(DIAGNOSTIC_HEADER, http::HeaderValue::from_static("1"));
-        let bytes = response_data(&publication, request.headers(), false, deadline).await.unwrap();
-        assert_eq!(decode_diagnostic_domains(&bytes, digest).unwrap(), vec!["discord.com"]);
+        request
+            .headers_mut()
+            .insert(DIAGNOSTIC_HEADER, http::HeaderValue::from_static("1"));
+        let bytes = response_data(&publication, request.headers(), false, deadline)
+            .await
+            .unwrap();
+        assert_eq!(
+            decode_diagnostic_domains(&bytes, digest).unwrap(),
+            vec!["discord.com"]
+        );
         assert!(decode_diagnostic_domains(&bytes, [0; 32]).is_err());
-        assert_eq!(decode_diagnostic_domains(&unchanged_receipt(digest), digest).unwrap(), snapshot::default_diagnostic_domains());
+        assert_eq!(
+            decode_diagnostic_domains(&unchanged_receipt(digest), digest).unwrap(),
+            snapshot::default_diagnostic_domains()
+        );
         request_digest(&mut request, [0; 32]).unwrap();
-        assert_eq!(response_data(&publication, request.headers(), false, deadline).await.unwrap_err(), http::StatusCode::CONFLICT);
+        assert_eq!(
+            response_data(&publication, request.headers(), false, deadline)
+                .await
+                .unwrap_err(),
+            http::StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostic_metadata_rejects_mixed_duplicate_and_malformed_requests() {
+        let (snapshot, wire) = snapshot::Snapshot::build("scope", 2, &[], &[], &[]).unwrap();
+        let publication = Published {
+            snapshot,
+            wire: wire.into(),
+            diagnostic_domains: vec!["discord.com".into()],
+        };
+        let digest = publication.snapshot.digest();
+        let deadline = Duration::from_secs(1);
+        for header in [
+            DIAGNOSTIC_HEADER,
+            DOMAIN_HEADER,
+            NATIVE_DNS_HEADER,
+            DIGEST_HEADER,
+        ] {
+            let mut request = http::Request::new(());
+            request_digest(&mut request, digest).unwrap();
+            request
+                .headers_mut()
+                .insert(DIAGNOSTIC_HEADER, http::HeaderValue::from_static("1"));
+            request
+                .headers_mut()
+                .append(header, http::HeaderValue::from_static("1"));
+            assert_eq!(
+                response_data(&publication, request.headers(), false, deadline)
+                    .await
+                    .unwrap_err(),
+                http::StatusCode::BAD_REQUEST
+            );
+        }
+        let mut request = http::Request::new(());
+        request
+            .headers_mut()
+            .insert(DIAGNOSTIC_HEADER, http::HeaderValue::from_static("1"));
+        assert_eq!(
+            response_data(&publication, request.headers(), false, deadline)
+                .await
+                .unwrap_err(),
+            http::StatusCode::BAD_REQUEST
+        );
+        let mut malformed = DIAGNOSTIC_MAGIC.to_vec();
+        malformed.extend_from_slice(&digest);
+        for suffix in [
+            b"".as_slice(),
+            b"https://discord.com",
+            b"discord.com\ndiscord.com",
+            &[255],
+        ] {
+            let mut bytes = malformed.clone();
+            bytes.extend_from_slice(suffix);
+            assert!(decode_diagnostic_domains(&bytes, digest).is_err());
+        }
+        malformed.extend(std::iter::repeat_n(b'a', DIAGNOSTIC_LIMIT));
+        assert!(decode_diagnostic_domains(&malformed, digest).is_err());
     }
 
     #[test]

@@ -386,7 +386,10 @@ impl RuntimePanel {
             return false;
         }
         match (self.phase, key.code) {
-            (Phase::Viewing { .. } | Phase::Applied { .. } | Phase::CutoverApplied { .. }, KeyCode::Char('R')) if self.saved_sha256.is_some() => {
+            (
+                Phase::Viewing { .. } | Phase::Applied { .. } | Phase::CutoverApplied { .. },
+                KeyCode::Char('R'),
+            ) if self.saved_sha256.is_some() => {
                 self.phase = Phase::RestartChecking;
                 self.start(StatusCommand::CheckRestart);
                 false
@@ -638,7 +641,10 @@ impl RuntimePanel {
                 });
             }
             items.extend([
-                ActionItem { key: 'R', label: "Проверить возможность перезапуска" },
+                ActionItem {
+                    key: 'R',
+                    label: "Проверить возможность перезапуска",
+                },
                 ActionItem {
                     key: 's',
                     label: "Применить структуру сервера",
