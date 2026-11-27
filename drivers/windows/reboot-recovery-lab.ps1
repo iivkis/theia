@@ -6,6 +6,9 @@ param(
     [Parameter(Mandatory=$true)][ValidatePattern('^[0-9a-fA-F]{64}$')][string]$ControllerSha256,
     [Parameter(Mandatory=$true)][ValidatePattern('^[0-9a-fA-F]{64}$')][string]$DriverSha256,
     [Parameter(Mandatory=$true)][string]$Evidence,
+    [Parameter(Mandatory=$true)][string]$BuildEvidence,
+    [Parameter(Mandatory=$true)][ValidatePattern('^[0-9a-fA-F]{64}$')][string]$BuildEvidenceSha256,
+    [Parameter(Mandatory=$true)][ValidatePattern('^[0-9a-fA-F]{40}$')][string]$SourceSha,
     [Parameter(Mandatory=$true)][switch]$IsolatedTestMachine,
     [switch]$Recover
 )
@@ -20,6 +23,9 @@ $driver = Join-Path ([Environment]::SystemDirectory) 'drivers\TheiaWfpLab.sys'
 $serviceKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\TheiaWfpLab'
 $expectedController = $ControllerSha256.ToUpperInvariant()
 $expectedDriver = $DriverSha256.ToUpperInvariant()
+. (Join-Path $PSScriptRoot 'build-evidence.ps1')
+$proof = Read-TheiaBuildEvidence $BuildEvidence $BuildEvidenceSha256 $SourceSha $expectedDriver
+if ($proof.ControllerSha256 -ne $expectedController) { throw 'Controller build evidence mismatch.' }
 $sign = (Get-Command signtool.exe -ErrorAction Stop).Source
 function Assert-Inputs {
     if ($exe.PSIsContainer -or ($exe.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
@@ -44,7 +50,9 @@ function Read-State {
     $state = Get-CimInstance Win32_SystemDriver -Filter "Name='TheiaWfpLab'"
     if (!$state) { throw 'Driver state missing.' }
     [pscustomobject]@{
-        Version = 1
+        Version = 2
+        SourceSha = $proof.SourceSha
+        BuildEvidenceSha256 = $BuildEvidenceSha256.ToUpperInvariant()
         Machine = $env:COMPUTERNAME
         MachineGuid = [string](Get-ItemPropertyValue -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid)
         BootUtc = ([datetime]$os.LastBootUpTime).ToUniversalTime().ToString('o')
@@ -77,7 +85,8 @@ if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::Reparse
 }
 $before = Get-Content -LiteralPath $evidencePath -Raw | ConvertFrom-Json
 $after = Read-State
-if ($before.Version -ne 1 -or $before.Machine -ne $after.Machine -or
+if ($before.Version -ne 2 -or $before.SourceSha -cne $after.SourceSha -or
+    $before.BuildEvidenceSha256 -ne $after.BuildEvidenceSha256 -or $before.Machine -ne $after.Machine -or
     !$before.MachineGuid -or $before.MachineGuid -ne $after.MachineGuid -or
     $before.Compartment -ne $after.Compartment -or $before.ControllerSha256 -ne $after.ControllerSha256 -or
     $before.DriverSha256 -ne $after.DriverSha256 -or $before.DriverState -ne 'Running' -or

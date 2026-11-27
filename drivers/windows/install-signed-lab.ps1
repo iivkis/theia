@@ -2,6 +2,9 @@
 param(
     [Parameter(Mandatory=$true)][string]$Driver,
     [Parameter(Mandatory=$true)][ValidatePattern('^[0-9a-fA-F]{64}$')][string]$ExpectedSha256,
+    [Parameter(Mandatory=$true)][string]$BuildEvidence,
+    [Parameter(Mandatory=$true)][ValidatePattern('^[0-9a-fA-F]{64}$')][string]$BuildEvidenceSha256,
+    [Parameter(Mandatory=$true)][ValidatePattern('^[0-9a-fA-F]{40}$')][string]$SourceSha,
     [Parameter(Mandatory=$true)][switch]$IsolatedTestMachine
 )
 $ErrorActionPreference = 'Stop'
@@ -18,6 +21,8 @@ if ($source.PSIsContainer -or ($source.Attributes -band [IO.FileAttributes]::Rep
 }
 if ($source.Extension -ne '.sys') { throw 'A signed .sys is required.' }
 $expected = $ExpectedSha256.ToUpperInvariant()
+. (Join-Path $PSScriptRoot 'build-evidence.ps1')
+$proof = Read-TheiaBuildEvidence $BuildEvidence $BuildEvidenceSha256 $SourceSha $expected
 $service = 'TheiaWfpLab'
 $destination = Join-Path ([Environment]::SystemDirectory) 'drivers\TheiaWfpLab.sys'
 $serviceKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$service"
@@ -69,6 +74,8 @@ if (!$driverRecord -or $driverRecord.State -ne 'Running') {
 }
 [pscustomobject]@{
     Service = $service
+    SourceSha = $proof.SourceSha
+    BuildEvidenceSha256 = $BuildEvidenceSha256.ToUpperInvariant()
     DriverSha256 = $expected
     State = 'Running'
     BfeFiltersInstalled = $false

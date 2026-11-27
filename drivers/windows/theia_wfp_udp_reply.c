@@ -116,7 +116,7 @@ NTSTATUS TheiaReplyInject(THEIA_REPLY_ENGINE *engine, const THEIA_REPLY_FLOW *fl
     PMDL mdl = NULL;
     NET_BUFFER_LIST *nbl = NULL;
     REPLY_COMPLETION *completion = NULL;
-    ULONG total;
+    ULONG total = 0;
     NTSTATUS status = STATUS_ACCESS_DENIED;
     if (KeGetCurrentIrql() != PASSIVE_LEVEL || flow == NULL
         || (length != 0 && payload == NULL) || length > REPLY_MAX

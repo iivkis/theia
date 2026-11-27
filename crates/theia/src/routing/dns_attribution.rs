@@ -134,6 +134,7 @@ impl DnsCandidates {
     }
     /// Poison rather than delete after an uncertain source check. Removing
     /// a failed candidate would allow the same request to create a fresh TTL.
+    #[cfg(any(test, feature = "linux-ebpf-lab"))]
     pub(crate) fn invalidate(&mut self, flow: CorroboratedFlow) {
         if let Some(entry) = self.entries.get_mut(&flow.key) {
             entry.ambiguous = true;
