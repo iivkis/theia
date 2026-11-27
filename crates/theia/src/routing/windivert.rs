@@ -1754,17 +1754,77 @@ mod native {
         let mut bytes=[0u8;32];
         let (n,from)=receiver.recv_from(&mut bytes)?;
         if from!=src || &bytes[..n]!=b"correlation-lab" { return Err(io::ErrorKind::InvalidData.into()); }
+        // Isolated fixture only: two exclusively bound loopback sockets,
+        // never an application-wide or destination-wide production exemption.
+        // Demonstrate actual kernel filtering, not merely a registry match.
+        use ring::rand::{SecureRandom,SystemRandom};
+        let other=loopback_udp("127.0.0.1:0")?;
+        other.connect(dst)?;
+        let other_src=other.local_addr()?;
+        if other_src==src { return Err(io::ErrorKind::InvalidData.into()); }
+        let base=format!(
+            "outbound and loopback and !impostor and udp and ip.SrcAddr == 127.0.0.1 and ip.DstAddr == 127.0.0.1 and udp.DstPort == {} and (udp.SrcPort == {} or udp.SrcPort == {})",
+            dst.port(),src.port(),other_src.port()
+        );
+        let excluded=std::ffi::CString::new(format!("({base}) and udp.SrcPort != {}",src.port()))
+            .map_err(|_|io::ErrorKind::InvalidInput)?;
+        let guard=api.open_priority(&excluded,0,-100,0x12)?;
+        let capture=api.open_priority(&excluded,0,100,0x14)?;
+        api.bounded(&capture)?;
+        api.retire(network)?;
+        let mut allowed_nonce=[0u8;32];
+        let mut denied_nonce=[0u8;32];
+        let mut revoked_nonce=[0u8;32];
+        let rng=SystemRandom::new();
+        for nonce in [&mut allowed_nonce,&mut denied_nonce,&mut revoked_nonce] {
+            rng.fill(nonce).map_err(|_|io::Error::other("entropy unavailable"))?;
+        }
+        if other.send(&denied_nonce)?!=denied_nonce.len() || sender.send(&allowed_nonce)?!=allowed_nonce.len() {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        let (p,a)=api.receive(&capture,cancelled,Instant::now()+Duration::from_secs(3))?;
+        let n=a.network_inner(&p,true).map_err(|_|io::ErrorKind::InvalidData)?;
+        if n.sniffed || !n.outbound || n.meta.flow.source!=other_src || n.meta.flow.destination!=dst
+            || n.meta.payload_len!=denied_nonce.len() || !p.ends_with(&denied_nonce) {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        let (size,from)=receiver.recv_from(&mut bytes)?;
+        if from!=src || bytes[..size]!=allowed_nonce { return Err(io::ErrorKind::InvalidData.into()); }
+
+        // Revoke by installing stricter handles before dropping the lease.
+        // No transition in the fixture leaves the negative socket unguarded.
+        let all=std::ffi::CString::new(base).map_err(|_|io::ErrorKind::InvalidInput)?;
+        let revoke_guard=api.open_priority(&all,0,-99,0x12)?;
+        let revoke_capture=api.open_priority(&all,0,101,0x14)?;
+        api.bounded(&revoke_capture)?;
         drop(lease);
         if registry.matches_packet_candidate(&ledger,&observed) { return Err(io::ErrorKind::PermissionDenied.into()); }
+        if sender.send(&revoked_nonce)?!=revoked_nonce.len() { return Err(io::ErrorKind::WriteZero.into()); }
+        let (p,a)=api.receive(&revoke_capture,cancelled,Instant::now()+Duration::from_secs(3))?;
+        let n=a.network_inner(&p,true).map_err(|_|io::ErrorKind::InvalidData)?;
+        if n.sniffed || !n.outbound || n.meta.flow.source!=src || n.meta.flow.destination!=dst
+            || n.meta.payload_len!=revoked_nonce.len() || !p.ends_with(&revoked_nonce) {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        receiver.set_read_timeout(Some(Duration::from_millis(250)))?;
+        match receiver.recv_from(&mut bytes) {
+            Err(e) if matches!(e.kind(),io::ErrorKind::TimedOut|io::ErrorKind::WouldBlock)=>{},
+            Err(e)=>return Err(e),
+            Ok(_)=>return Err(io::ErrorKind::PermissionDenied.into()),
+        }
+        drop(other);
         drop(sender);
-        let closed=api.receive_event(&handle,cancelled,deadline)?;
+        api.retire(revoke_capture)?;
+        api.retire(capture)?;
+        api.retire(revoke_guard)?;
+        api.retire(guard)?;
+        let closed=api.receive_event(&handle,cancelled,Instant::now()+Duration::from_secs(3))?;
         if closed.pid!=pid || closed.endpoint!=event.endpoint || closed.event!=7 || closed.timestamp<event.timestamp {
             return Err(io::ErrorKind::InvalidData.into());
         }
         ledger.observe(closed);
         if ledger.correlate(&observed).is_some() { return Err(io::ErrorKind::PermissionDenied.into()); }
         registry.retire();
-        api.retire(network)?;
         api.retire(flow)?;
         api.retire(handle)
     }
