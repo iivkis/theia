@@ -1226,6 +1226,14 @@ mod tests {
             fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
             let path = dir.join("journal.toml");
             let queue = Queue::bind(49000, 64).unwrap();
+            // The four real transparent sockets must be provisioned before
+            // rule installation, and must not be bindable by another owner.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all().build().unwrap();
+            let _entered = rt.enter();
+            let listeners = super::super::linux_ingress::RedirectListeners::bind(&host, 49001).unwrap();
+            assert_eq!(listeners.port(), 49001);
+            assert!(super::super::linux_ingress::RedirectListeners::bind(&host, 49001).is_err());
             let lease = LabRules::install(&queue, &host, &path).unwrap();
             let scope = Scope::current(&host).unwrap();
             let journal = parse_journal(&journal_bytes(&path).unwrap().unwrap(), &scope).unwrap();

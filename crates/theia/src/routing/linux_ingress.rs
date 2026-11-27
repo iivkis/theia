@@ -6,7 +6,7 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
 };
-use tokio::{io::unix::AsyncFd, net::TcpStream};
+use tokio::{io::unix::AsyncFd, net::{TcpListener, TcpStream}};
 
 const SO_ORIGINAL_DST: libc::c_int = 80;
 
@@ -105,6 +105,105 @@ fn validate_redirect(
     })
 }
 
+/// TCP socket accepted by an owned IP_TRANSPARENT listener. The original
+/// destination is its kernel local endpoint, not a user-provided address.
+pub(crate) struct TransparentTcp {
+    pub(crate) stream: TcpStream,
+    pub(crate) key: FlowKey,
+}
+
+/// The four ingress listeners are prepared as one resource. Dropping
+/// any failed preparation closes every socket; this does not install
+/// TPROXY or policy routing and does not authorize the host namespace.
+pub struct RedirectListeners {
+    pub(crate) tcp4: TcpListener,
+    pub(crate) tcp6: TcpListener,
+    pub(crate) udp4: UdpCapture,
+    pub(crate) udp6: UdpCapture,
+    port: u16,
+}
+
+impl RedirectListeners {
+    /// Bind an isolated, dual-stack transparent ingress before installing
+    /// rules. The caller must be on the dedicated namespace worker.
+    pub fn bind(host_namespace: &std::fs::File, port: u16) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let host = host_namespace.metadata()?;
+        let current = std::fs::metadata("/proc/thread-self/ns/net")?;
+        if port == 0
+            || (host.dev(), host.ino()) == (current.dev(), current.ino())
+            || unsafe { libc::ioctl(host_namespace.as_raw_fd(), 0xb703 as _) } != libc::CLONE_NEWNET
+        {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        let tcp = |ipv4| -> io::Result<TcpListener> {
+            let fd = transparent_bound(ipv4, libc::SOCK_STREAM, port)?;
+            if unsafe { libc::listen(fd.as_raw_fd(), 128) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            TcpListener::from_std(std::net::TcpListener::from(fd))
+        };
+        let udp = |ipv4| -> io::Result<UdpCapture> {
+            UdpCapture::from_bound_socket(std::net::UdpSocket::from(
+                transparent_bound(ipv4, libc::SOCK_DGRAM, port)?,
+            ))
+        };
+        Ok(Self {
+            tcp4: tcp(true)?,
+            tcp6: tcp(false)?,
+            udp4: udp(true)?,
+            udp6: udp(false)?,
+            port,
+        })
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+fn transparent_bound(ipv4: bool, kind: libc::c_int, port: u16) -> io::Result<OwnedFd> {
+    let family = if ipv4 { libc::AF_INET } else { libc::AF_INET6 };
+    let raw = unsafe {
+        libc::socket(family, kind | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0)
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let address = if ipv4 {
+        set_int(&fd, libc::SOL_IP, 19)?; // IP_TRANSPARENT
+        SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port)
+    } else {
+        set_int(&fd, libc::SOL_IPV6, libc::IPV6_V6ONLY)?;
+        set_int(&fd, libc::SOL_IPV6, 75)?; // IPV6_TRANSPARENT
+        SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port)
+    };
+    bind_reply(&fd, address)?;
+    Ok(fd)
+}
+
+/// Accept only a TCP endpoint selected by a transparent listener. An
+/// ordinary connection to a local service/listener is never interpreted
+/// as an original remote destination. The caller must own the rules.
+pub(crate) async fn accept_transparent(listener: &TcpListener) -> io::Result<TransparentTcp> {
+    let (stream, peer) = listener.accept().await?;
+    let local = listener.local_addr()?;
+    let target = stream.local_addr()?;
+    let (level, opt) = if local.is_ipv4() { (libc::SOL_IP, 19) } else { (libc::SOL_IPV6, 75) };
+    if stream.peer_addr()? != peer
+        || sockopt_int(listener, level, opt)? != 1
+        || sockopt_int(&stream, level, opt)? != 1
+        || !is_local_ip(peer.ip())?
+        || is_local_ip(target.ip())?
+        || target.port() == local.port()
+    {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
+    let key = validate_redirect(local, peer, target)?;
+    Ok(TransparentTcp { stream, key })
+}
+
 /// One datagram and its original destination, as supplied by Linux ancillary
 /// data. No domain or application identity is inferred from this tuple.
 pub struct CapturedDatagram {
@@ -131,7 +230,7 @@ const IP_ORIGDSTADDR: libc::c_int = 20;
 const IPV6_ORIGDSTADDR: libc::c_int = 74;
 
 fn sockopt_int(
-    socket: &std::net::UdpSocket,
+    socket: &impl AsRawFd,
     level: libc::c_int,
     option: libc::c_int,
 ) -> io::Result<libc::c_int> {

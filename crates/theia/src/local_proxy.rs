@@ -1926,6 +1926,8 @@ impl ClientRuntime {
             raw: Mutex::new(std::collections::HashMap::new()),
             #[cfg(target_os = "linux")]
             udp_consumer: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(target_os = "linux")]
+            tcp_consumer: std::sync::atomic::AtomicBool::new(false),
             _owner: owner,
         })
     }
@@ -2208,6 +2210,8 @@ pub struct NativeIngress {
     raw: Mutex<std::collections::HashMap<crate::routing::packet::FlowKey, RawLease>>,
     #[cfg(target_os = "linux")]
     udp_consumer: std::sync::atomic::AtomicBool,
+    #[cfg(target_os = "linux")]
+    tcp_consumer: std::sync::atomic::AtomicBool,
     _owner: Arc<NativeOwner>,
 }
 
@@ -3152,6 +3156,85 @@ impl NativeIngress {
                 tunnel.relay_guarded(stream, Some(&flow)).await
             } => result,
         }
+    }
+
+    /// Serve both TCP and UDP terminated adapters with the same native
+    /// runtime/flow table. This is only usable after the existing owned
+    /// queue is ready and the caller has provisioned compatible TPROXY,
+    /// reverse-path and policy-routing rules in the isolated namespace.
+    /// No production ready state or system rule activation is implied.
+    #[cfg(target_os = "linux")]
+    pub async fn serve_linux_redirect_capture(
+        self: &Arc<Self>,
+        listeners: crate::routing::linux_ingress::RedirectListeners,
+    ) -> Result<(), ClientError> {
+        self.ensure_accepting()?;
+        let crate::routing::linux_ingress::RedirectListeners { tcp4, tcp6, udp4, udp6, .. } = listeners;
+        tokio::try_join!(
+            self.serve_linux_tcp_capture(tcp4, tcp6),
+            self.serve_linux_udp_capture(udp4, udp6),
+        ).map(|_| ())
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn serve_linux_tcp_capture(
+        self: &Arc<Self>,
+        v4: TcpListener,
+        v6: TcpListener,
+    ) -> Result<(), ClientError> {
+        use std::sync::atomic::Ordering;
+        let denied = || ClientError::Open(ErrorCode::PolicyDenied);
+        self.ensure_accepting()?;
+        let a = v4.local_addr().map_err(|_| ClientError::Io)?;
+        let b = v6.local_addr().map_err(|_| ClientError::Io)?;
+        if !a.is_ipv4() || !b.is_ipv6() || a.port() == 0 || a.port() != b.port()
+            || self.registrar()?.is_none()
+            || self.tcp_consumer.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err()
+        {
+            return Err(denied());
+        }
+        struct StopOnDrop<'a>(&'a NativeIngress);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.shutdown();
+            }
+        }
+        let _stop = StopOnDrop(self);
+        let mut tasks = JoinSet::new();
+        let result = loop {
+            if self.ensure_accepting().is_err() {
+                break Err(denied());
+            }
+            let accepted = tokio::select! {
+                () = self.stopped() => break Ok(()),
+                finished = tasks.join_next(), if !tasks.is_empty() => {
+                    if finished.is_some_and(|result| result.is_err()) {
+                        break Err(ClientError::Io);
+                    }
+                    continue;
+                }
+                accepted = crate::routing::linux_ingress::accept_transparent(&v4) => accepted,
+                accepted = crate::routing::linux_ingress::accept_transparent(&v6) => accepted,
+            };
+            let captured = match accepted {
+                Ok(captured) => captured,
+                Err(error) if matches!(error.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidData) => continue,
+                Err(_) => break Err(ClientError::Io),
+            };
+            if tasks.len() >= LOCAL_LIMIT {
+                drop(captured);
+                continue;
+            }
+            let ingress = self.clone();
+            tasks.spawn(async move {
+                // A failed per-flow authorization closes only its stream.
+                // All forwarding still uses the shared native policy lease.
+                let _ = ingress.relay_terminated_tcp(captured.key, captured.stream).await;
+            });
+        };
+        self.shutdown();
+        tasks.shutdown().await;
+        result
     }
 
     /// Supervise both transparent UDP listeners under the already ready
