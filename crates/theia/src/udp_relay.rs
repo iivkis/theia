@@ -122,6 +122,7 @@ pub(crate) async fn direct(
     .await
     .map_err(|_| ClientError::Open(ErrorCode::DialTimeout))?
 }
+#[cfg(test)]
 type Fallback =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<Tunnel, ClientError>> + Send>>;
 const FIRST_RESPONSE: Duration = Duration::from_secs(5);
@@ -141,6 +142,7 @@ impl LocalRelayError {
 
 pub(crate) enum Tunnel {
     Direct(UdpSocket),
+    #[cfg(test)]
     VerifiedLocal(Box<crate::routing::dpi::VerifiedUdp>, Fallback),
     H2(Box<crate::client::Tunnel>),
     H3(Box<crate::h3_client::H3Tunnel>),
@@ -150,7 +152,9 @@ impl Tunnel {
         let (transport, up) = match self {
             Self::H2(tunnel) => (2, tunnel.opened_stream_up()),
             Self::H3(tunnel) => (3, tunnel.opened_stream_up()),
-            Self::Direct(_) | Self::VerifiedLocal(..) => return,
+            Self::Direct(_) => return,
+            #[cfg(test)]
+            Self::VerifiedLocal(..) => return,
         };
         observed.store(
             (transport << 2) | if up { 2 } else { 1 },
@@ -169,12 +173,14 @@ impl Tunnel {
 
     pub(crate) async fn relay_guarded(
         self,
-        mut upload: mpsc::Receiver<Vec<u8>>,
+        upload: mpsc::Receiver<Vec<u8>>,
         download: mpsc::Sender<Vec<u8>>,
         flow: Option<&crate::routing::flow::FlowLease>,
     ) -> Result<(), ClientError> {
         match self {
+            #[cfg(test)]
             Self::VerifiedLocal(verified, fallback) => {
+                let mut upload = upload;
                 let Some(first) = upload.recv().await else {
                     return Ok(());
                 };
@@ -244,6 +250,7 @@ impl Tunnel {
             Self::Direct(socket) => relay_local(&socket, None, first, upload, download, flow)
                 .await
                 .map_err(LocalRelayError::into_client),
+            #[cfg(test)]
             Self::VerifiedLocal(..) => Err(ClientError::Protocol),
         }
     }
@@ -303,7 +310,7 @@ pub(crate) async fn relay_native_modify_lab(
             }
             let result = relay_stun(&verified.socket, BindingStrategy::Fingerprint,
                 first, upload, download, Some(flow)).await;
-            if matches!(&result, Err(LocalRelayError::Peer(_))) { verified.failed(); }
+            if matches!(&result, Err(LocalRelayError::Peer(_))) { verified.failed(); crate::traffic::udp_peer_failure(); }
             result.map_err(LocalRelayError::into_client)
         }
         _ => Err(ClientError::Open(ErrorCode::PolicyDenied)),
@@ -338,6 +345,7 @@ pub(crate) async fn relay_quic_lab(
     .await;
     if matches!(&result, Err(LocalRelayError::Peer(_))) {
         verified.failed();
+        crate::traffic::udp_peer_failure();
     }
     result.map_err(LocalRelayError::into_client)
 }

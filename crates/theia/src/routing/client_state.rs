@@ -84,7 +84,11 @@ impl LocalPolicy {
     }
 
     pub(super) fn valid(&self, digest: [u8; 32]) -> bool {
-        if self.checkpoint.digest != digest || Instant::now() >= self.deadline {
+        self.checkpoint.digest == digest && self.valid_current()
+    }
+
+    pub(super) fn valid_current(&self) -> bool {
+        if Instant::now() >= self.deadline {
             return false;
         }
         match &self.floor {
@@ -437,6 +441,7 @@ async fn copy_direction(
     evidence: Option<&ExchangeEvidence>,
     flow: Option<&super::flow::FlowLease>,
     action:super::PacketAction,
+    scope: Option<&(dyn Fn() -> Result<(), ClientError> + Sync)>,
 ) -> Result<(), DirectRelayError> {
     let mut first_send = super::flow::FirstSend::new(flow, action);
     let mut bytes = [0u8; 16 * 1024];
@@ -454,13 +459,16 @@ async fn copy_direction(
             return Ok(());
         }
         // Either direction may be first (server-first protocols).
-        first_send
-            .attempt()
-            .map_err(|error| DirectRelayError { error, peer: false })?;
-        output
-            .write_all(&bytes[..count])
-            .await
-            .map_err(|_| DirectRelayError::io(upload))?;
+        let mut pending = &bytes[..count];
+        while !pending.is_empty() {
+            if let Some(check) = scope {
+                check().map_err(|error| DirectRelayError { error, peer: false })?;
+            }
+            first_send.attempt().map_err(|error| DirectRelayError { error, peer: false })?;
+            let n = output.write(pending).await.map_err(|_| DirectRelayError::io(upload))?;
+            if n == 0 { return Err(DirectRelayError::io(upload)); }
+            pending = &pending[n..];
+        }
         activity.data(count);
         if let Some(evidence) = evidence {
             evidence.wrote(upload);
@@ -483,7 +491,7 @@ pub(crate) async fn relay_direct_guarded(
     target: TcpStream,
     flow: Option<&super::flow::FlowLease>,
 ) -> Result<(), ClientError> {
-    relay_direct_inner(client,target,0,0,flow,super::PacketAction::Pass).await.0
+    relay_direct_inner(client,target,0,0,flow,super::PacketAction::Pass,None).await.0
 }
 
 pub(crate) async fn relay_direct_after_first(
@@ -492,8 +500,9 @@ pub(crate) async fn relay_direct_after_first(
     upload: usize,
     download: usize,
     flow:Option<&super::flow::FlowLease>,
+    scope: &(dyn Fn() -> Result<(), ClientError> + Sync),
 ) -> (Result<(), ClientError>, bool, bool) {
-    relay_direct_inner(client,target,upload,download,flow,super::PacketAction::Modify).await
+    relay_direct_inner(client,target,upload,download,flow,super::PacketAction::Modify,Some(scope)).await
 }
 
 async fn relay_direct_inner(
@@ -503,8 +512,9 @@ async fn relay_direct_inner(
     download: usize,
     flow: Option<&super::flow::FlowLease>,
     action:super::PacketAction,
+    scope: Option<&(dyn Fn() -> Result<(), ClientError> + Sync)>,
 ) -> (Result<(), ClientError>, bool, bool) {
-    relay_direct_parts(client.into_split(), target, upload, download, flow, action).await
+    relay_direct_parts(client.into_split(), target, upload, download, flow, action, scope).await
 }
 
 /// Plain HTTP exposes one bounded request rather than the underlying socket
@@ -515,7 +525,7 @@ pub(crate) async fn relay_http_direct_guarded(
     flow: Option<&super::flow::FlowLease>,
 ) -> Result<(), ClientError> {
     relay_direct_parts(
-        tokio::io::split(client), target, 0, 0, flow, super::PacketAction::Pass,
+        tokio::io::split(client), target, 0, 0, flow, super::PacketAction::Pass, None,
     ).await.0
 }
 
@@ -526,6 +536,7 @@ async fn relay_direct_parts(
     download: usize,
     flow: Option<&super::flow::FlowLease>,
     action: super::PacketAction,
+    scope: Option<&(dyn Fn() -> Result<(), ClientError> + Sync)>,
 ) -> (Result<(), ClientError>, bool, bool) {
     let meter = crate::traffic::enter_direct();
     meter.upload(upload);
@@ -534,16 +545,30 @@ async fn relay_direct_parts(
     let evidence = (upload != 0 && download != 0)
         .then(|| ExchangeEvidence(std::sync::atomic::AtomicU8::new(0)));
     let (tr, tw) = target.into_split();
-    let result = activity
+    let relay = activity
         .run(
-            copy_direction(cr, tw, &activity, &meter, true, evidence.as_ref(), flow,action),
-            copy_direction(tr, cw, &activity, &meter, false, evidence.as_ref(), flow,action),
+            copy_direction(cr, tw, &activity, &meter, true, evidence.as_ref(), flow,action,scope),
+            copy_direction(tr, cw, &activity, &meter, false, evidence.as_ref(), flow,action,scope),
             DirectRelayError {
                 error: ClientError::Timeout,
                 peer: false,
             },
-        )
-        .await;
+        );
+    let watchdog = async {
+        if let Some(check) = scope {
+            loop {
+                if let Err(error) = check() { break DirectRelayError { error, peer: false }; }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        } else {
+            std::future::pending::<DirectRelayError>().await
+        }
+    };
+    let result = tokio::select! {
+        biased;
+        error = watchdog => Err(error),
+        result = relay => result,
+    };
     let exchanged =
         evidence.is_some_and(|value| value.0.load(std::sync::atomic::Ordering::Relaxed) == 3);
     let peer_failure = result.as_ref().is_err_and(|error| error.peer);

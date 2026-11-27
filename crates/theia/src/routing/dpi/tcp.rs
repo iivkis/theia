@@ -3,7 +3,7 @@ use super::tls::{self, Flight};
 use crate::client::ClientError;
 use std::{io, net::SocketAddr};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
 };
 
@@ -25,6 +25,22 @@ pub(super) async fn connect(address: SocketAddr) -> io::Result<(TcpStream, crate
         return Err(io::Error::other("socket policy not confirmed"));
     }
     Ok((socket, admission))
+}
+
+/// Every attempted write revalidates the original scope. A short write
+/// does not authorize the remainder after a concurrent revoke.
+pub(super) async fn write_checked(
+    socket: &mut (impl AsyncWrite + Unpin),
+    mut bytes: &[u8],
+    check: &(dyn Fn() -> Result<(), ClientError> + Sync),
+) -> Result<(), ClientError> {
+    while !bytes.is_empty() {
+        check()?;
+        let n = socket.write(bytes).await.map_err(|_| ClientError::Io)?;
+        if n == 0 { return Err(ClientError::Io); }
+        bytes = &bytes[n..];
+    }
+    Ok(())
 }
 
 /// Cancellation-safe bounded read: every consumed byte stays in prefix,

@@ -108,6 +108,7 @@ impl VerifiedUdp {
         self.engine.check_key_policy(&self.key)
     }
 
+    #[cfg(test)]
     pub(crate) fn fallback_policy(&self) -> FallbackPolicy {
         FallbackPolicy {
             engine: self.engine.clone(),
@@ -234,17 +235,23 @@ impl Engine {
     }
 
     pub(crate) fn policy_current(&self, digest: [u8; 32]) -> bool {
-        self.policy.lock().ok().is_some_and(|policy| {
-            !self.retired() && policy.as_ref().is_some_and(|lease| lease.valid(digest))
-        })
+        self.current_epoch(digest).is_some()
+    }
+
+    fn current_epoch(&self, digest: [u8; 32]) -> Option<u64> {
+        let mut policy = self.policy.lock().ok()?;
+        if self.retired() { return None; }
+        if policy.as_ref().is_some_and(|lease| !lease.valid_current()) {
+            *policy = None;
+            self.policy_epoch.fetch_add(1, Ordering::AcqRel);
+            return None;
+        }
+        policy.as_ref().filter(|lease| lease.valid(digest))?;
+        Some(self.policy_epoch.load(Ordering::Acquire))
     }
 
     pub(super) fn policy_epoch(&self, digest: [u8; 32]) -> Result<u64, ClientError> {
-        let policy = self.policy.lock().map_err(|_| stale_policy())?;
-        if self.retired() || !policy.as_ref().is_some_and(|lease| lease.valid(digest)) {
-            return Err(stale_policy());
-        }
-        Ok(self.policy_epoch.load(Ordering::Acquire))
+        self.current_epoch(digest).ok_or_else(stale_policy)
     }
 
     pub(crate) fn check_policy(&self, digest: [u8; 32]) -> Result<(), ClientError> {
@@ -253,6 +260,10 @@ impl Engine {
         } else {
             Err(stale_policy())
         }
+    }
+
+    pub(crate) fn pin_policy(self: &Arc<Self>, digest: [u8; 32]) -> Result<FallbackPolicy, ClientError> {
+        Ok(FallbackPolicy { engine: self.clone(), digest, epoch: self.policy_epoch(digest)? })
     }
 
     fn check_key_policy(&self, key: &Key) -> Result<(), ClientError> {
@@ -505,35 +516,36 @@ impl Engine {
         .flatten()
     }
 
-    pub(crate) async fn open(
+    #[cfg(test)]
+    async fn open(self: &Arc<Self>, name: &str, port: u16, ips: &[IpAddr], policy: [u8; 32]) -> Option<Tunnel> {
+        self.open_checked(name, port, ips, policy).await.ok().flatten()
+    }
+
+    pub(crate) async fn open_checked(
         self: &Arc<Self>,
         name: &str,
         port: u16,
         ips: &[IpAddr],
         policy: [u8; 32],
-    ) -> Option<Tunnel> {
-        if !self.enabled()
-            || !self.policy_current(policy)
-            || !matches!(port, 443 | 8443)
-            || ips.is_empty()
-            || ips.len() > 64
-            || !ips
-                .iter()
-                .all(|ip| crate::server::allowed_destination(*ip, false))
-        {
-            return None;
+    ) -> Result<Option<Tunnel>, ClientError> {
+        let pin = self.pin_policy(policy)?;
+        if !self.enabled() || !matches!(port, 443 | 8443) || ips.is_empty() {
+            return Ok(None);
         }
-        let epoch = self.policy_epoch(policy).ok()?;
-        let name = super::domain_name(name).ok()?;
+        if ips.len() > 64 || !ips.iter().all(|ip| crate::server::allowed_destination(*ip, false)) {
+            return Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied));
+        }
+        let epoch = pin.epoch;
+        let name = super::domain_name(name).map_err(|_| ClientError::Protocol)?;
         let deadline = tokio::time::Instant::now() + OPEN_BUDGET;
-        timeout(OPEN_BUDGET, async {
+        let result = timeout(OPEN_BUDGET, async {
             for ip in ips.iter().take(2) {
                 let address = SocketAddr::new(*ip, port);
                 let Some(network) = network_scope::observe(address) else { continue };
                 let key = Key { name: name.clone(), address, policy, epoch, network };
                 let slot = self.probe_slot(&key.name, address, policy);
                 let guard = self.probe_slots[slot].lock().await;
-                if !self.key_live(&key) { continue; }
+                if !self.key_live(&key) { return Err(stale_policy()); }
                 let (strategy, lease) = match self.cache.evidence(&key) {
                     Some((Verdict::Verified(strategy), lease)) => {
                         crate::traffic::dpi_cache_hit();
@@ -541,73 +553,83 @@ impl Engine {
                     }
                     Some((Verdict::Unavailable, _)) => continue,
                     previous => {
-                        let _permit = self.probes.try_acquire().ok()?;
-                        let config = tokio::task::spawn_blocking(tls::native_config).await.ok()??;
+                        let Ok(_permit) = self.probes.try_acquire() else { return Ok(None) };
+                        let Ok(Some(config)) = tokio::task::spawn_blocking(tls::native_config).await else { return Ok(None) };
                         let mut verified = None;
                         let mut attempted = 0;
                         let mut order = self.cache.ranked(&key);
-                        // A recently failed strategy is last, not permanently
-                        // excluded. A new complete round can rehabilitate it.
                         if let Some((Verdict::Avoid { strategy: failed, .. }, _)) = previous {
                             order.sort_by_key(|strategy| *strategy == failed);
                         }
                         for strategy in order {
-                            if !self.key_live(&key) { break; }
-                            // Reserve a real application TCP dial before
-                            // starting another independent probe. Never
-                            // record overall budget exhaustion as peer failure.
-                            if deadline.saturating_duration_since(tokio::time::Instant::now())
-                                < ATTEMPT + ATTEMPT {
+                            if !self.key_live(&key) { return Err(stale_policy()); }
+                            if deadline.saturating_duration_since(tokio::time::Instant::now()) < ATTEMPT + ATTEMPT {
                                 break;
                             }
                             let started = std::time::Instant::now();
-                            let good = timeout(ATTEMPT, tls::probe_guarded(
-                                &name, address, Some(network), strategy, config.clone(),
+                            let verdict = tls::probe_guarded(
+                                &name, address, Some(network), strategy, config.clone(), ATTEMPT,
                                 || self.key_live(&key),
-                            )).await.ok().flatten().is_some();
-                            if !self.key_live(&key) { break; }
-                            attempted += 1;
-                            self.cache.observe(&key, strategy, good, started.elapsed());
-                            crate::traffic::dpi_probe(good);
-                            if good {
-                                verified = Some(strategy);
-                                break;
+                            ).await;
+                            if !self.key_live(&key) { return Err(stale_policy()); }
+                            use tls::ProbeVerdict::*;
+                            match verdict {
+                                Verified | StrategyFailed => {
+                                    let good = verdict == Verified;
+                                    attempted += 1;
+                                    self.cache.observe(&key, strategy, good, started.elapsed());
+                                    crate::traffic::dpi_probe(good);
+                                    if good { verified = Some(strategy); break; }
+                                }
+                                // No first-write evidence: don't poison strategy history.
+                                Unavailable => break,
+                                IdentityRejected => return Err(ClientError::Tls),
+                                Denied => return Err(stale_policy()),
                             }
                         }
-                        if !self.key_live(&key) { continue; }
+                        if !self.key_live(&key) { return Err(stale_policy()); }
                         let Some(strategy) = verified else {
-                            // Only a complete, still-authorized strategy round
-                            // may publish negative evidence.
                             if attempted == Strategy::ALL.len() {
                                 let _ = self.cache.remember(&key, Verdict::Unavailable);
                             }
                             continue;
                         };
                         let Some(lease) = self.cache.remember(&key, Verdict::Verified(strategy)) else {
-                            continue;
+                            return Err(stale_policy());
                         };
                         (strategy, lease)
                     }
                 };
                 drop(guard);
-                if !self.key_live(&key) || !self.cache.current(&key, strategy, &lease) {
-                    continue;
-                }
-                if let Ok(Ok((target, admission))) = timeout(ATTEMPT, tcp::connect(address)).await {
-                    if self.key_live(&key)
-                        && self.cache.current(&key, strategy, &lease)
-                        && target.local_addr().is_ok_and(|local| network.matches_local(local)) {
-                        return Some(Tunnel {
-                            target, _admission: admission, strategy, lease,
-                            engine: self.clone(), key,
-                        });
+                if !self.key_live(&key) { return Err(stale_policy()); }
+                if !self.cache.current(&key, strategy, &lease) { continue; }
+                match timeout(ATTEMPT, tcp::connect(address)).await {
+                    Ok(Ok((target, admission))) => {
+                        if !self.key_live(&key)
+                            || !target.local_addr().is_ok_and(|local| network.matches_local(local)) {
+                            return Err(stale_policy());
+                        }
+                        if self.cache.current(&key, strategy, &lease) {
+                            return Ok(Some(Tunnel {
+                                target, _admission: admission, strategy, lease,
+                                engine: self.clone(), key,
+                            }));
+                        }
                     }
+                    Ok(Err(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                        return Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied));
+                    }
+                    _ => {}
                 }
-                // A failed plain TCP dial is not a failed TLS strategy.
+                if !self.key_live(&key) { return Err(stale_policy()); }
             }
-            None
-        }).await.ok().flatten()
+            Ok(None)
+        }).await;
+        pin.check()?;
+        if !self.enabled() { return Err(stale_policy()); }
+        result.unwrap_or(Ok(None))
     }
+
 }
 
 pub(crate) struct Tunnel {
@@ -703,14 +725,21 @@ impl Tunnel {
             // timeout: no origin application bytes have left this process.
             return Ok(RelayOutcome::Fallback { client, prefix });
         };
-        if !self.engine.enabled()
-            || network_scope::observe(self.key.address) != Some(self.key.network)
-            || !self
-                .target
-                .local_addr()
-                .is_ok_and(|local| self.key.network.matches_local(local))
-            || !self.engine.cache.current(&self.key, self.strategy, &self.lease)
-        {
+        let engine = &self.engine;
+        let key = &self.key;
+        let check_scope = || {
+            if engine.key_live(key) {
+                if let Some(flow) = flow { flow.check_live(super::PacketAction::Modify)?; }
+                Ok(())
+            } else {
+                Err(stale_policy())
+            }
+        };
+        check_scope()?;
+        if !self.target.local_addr().is_ok_and(|local| self.key.network.matches_local(local)) {
+            return Err(stale_policy());
+        }
+        if !self.engine.cache.current(&self.key, self.strategy, &self.lease) {
             return Ok(RelayOutcome::Fallback { client, prefix });
         }
         self.engine.check_key_policy(&self.key)?;
@@ -721,13 +750,17 @@ impl Tunnel {
         // timeout is terminal for this stream. Never replay it over the VPS.
         let started = std::time::Instant::now();
         let response = timeout(FIRST_FLIGHT, async {
-            self.target
-                .write_all(&transformed)
-                .await
-                .map_err(|_| ClientError::Io)?;
+            let mut pending = transformed.as_slice();
+            while !pending.is_empty() {
+                check_scope()?;
+                let count = self.target.write(pending).await.map_err(|_| ClientError::Io)?;
+                if count == 0 { return Err(ClientError::Io); }
+                pending = &pending[count..];
+            }
             tcp::read_server_hello(&mut self.target).await
         })
         .await;
+        check_scope()?;
         let response = match response {
             Ok(Ok(tcp::ServerFlight::Hello(response))) => response,
             Ok(Ok(tcp::ServerFlight::Alert(alert))) => {
@@ -736,11 +769,10 @@ impl Tunnel {
                 crate::traffic::dpi_tls_alert();
                 // Forward the genuine alert; do not retry or manufacture a
                 // replacement response on a different connection.
-                if let Some(flow)=flow {flow.check_live(super::PacketAction::Modify)?;}
-                timeout(FIRST_FLIGHT, client.write_all(&alert))
+                check_scope()?;
+                timeout(FIRST_FLIGHT, tcp::write_checked(&mut client, &alert, &check_scope))
                     .await
-                    .map_err(|_| ClientError::Timeout)?
-                    .map_err(|_| ClientError::Io)?;
+                    .map_err(|_| ClientError::Timeout)??;
                 return Err(ClientError::Tls);
             }
             Ok(Err(error)) => {
@@ -755,11 +787,9 @@ impl Tunnel {
                 return Err(ClientError::Timeout);
             }
         };
-        if let Some(flow)=flow {flow.check_live(super::PacketAction::Modify)?;}
-        timeout(FIRST_FLIGHT, client.write_all(&response))
-            .await
-            .map_err(|_| ClientError::Timeout)?
-            .map_err(|_| ClientError::Io)?;
+        check_scope()?;
+        timeout(FIRST_FLIGHT, tcp::write_checked(&mut client, &response, &check_scope))
+            .await.map_err(|_| ClientError::Timeout)??;
         let hello_elapsed = started.elapsed();
         crate::traffic::dpi_first_response();
         let (result, exchanged, peer_failure) = super::client_state::relay_direct_after_first(
@@ -768,14 +798,15 @@ impl Tunnel {
             prefix.len(),
             response.len(),
             flow,
+            &check_scope,
         )
         .await;
         // A ServerHello alone is insufficient evidence of usable application
         // traffic. Do not penalize a clean early application disconnect.
-        if peer_failure {
+        if peer_failure && check_scope().is_ok() {
             self.engine.cache.failed(&self.key, self.strategy, &self.lease);
             crate::traffic::dpi_post_hello_failure();
-        } else if exchanged && result.is_ok() {
+        } else if exchanged && result.is_ok() && check_scope().is_ok() {
             self.engine
                 .cache
                 .succeeded(&self.key, self.strategy, &self.lease, hello_elapsed);
@@ -1082,6 +1113,8 @@ mod tests {
         )));
         engine.set_enabled(true);
         engine.set_stun_enabled(true);
+        assert!(matches!(engine.open_checked("localhost", 443, &["127.0.0.1".parse().unwrap()], policy).await,
+            Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied))));
         let public: IpAddr = "8.8.8.8".parse().unwrap();
         let local: IpAddr = "127.0.0.1".parse().unwrap();
         for (name, ips) in [

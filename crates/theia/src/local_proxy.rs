@@ -1222,6 +1222,7 @@ async fn route_decision(
     address: &Address,
 ) -> Result<(Arc<Snapshot>, Action, Option<Vec<IpAddr>>), ClientError> {
     let snapshot = cache.get(|known| carrier.fetch_routing(known)).await?;
+    let authorization = cache.dpi.pin_policy(snapshot.digest())?;
     let policy = snapshot.policy();
     let denied = || ClientError::Open(ErrorCode::PolicyDenied);
     use crate::routing::Evidence;
@@ -1276,7 +1277,7 @@ async fn route_decision(
     };
     // DNS preflight may have awaited network I/O; never return a superseded
     // policy as authorization to initiate an egress.
-    cache.dpi.check_policy(snapshot.digest())?;
+    authorization.check()?;
     Ok((snapshot, action, pinned))
 }
 
@@ -1317,6 +1318,7 @@ async fn routed_open_selected(
     pinned: Option<Vec<IpAddr>>,
     allow_dpi: bool,
 ) -> Result<ProxyTunnel, ClientError> {
+    let authorization = cache.dpi.pin_policy(snapshot.digest())?;
     let policy = snapshot.policy();
     let denied = || ClientError::Open(ErrorCode::PolicyDenied);
     match action.packet_action() {
@@ -1325,9 +1327,9 @@ async fn routed_open_selected(
             Err(denied())
         }
         crate::routing::PacketAction::Redirect => {
-            cache.dpi.check_policy(snapshot.digest())?;
+            authorization.check()?;
             let tunnel = carrier.open(address, port).await?;
-            cache.dpi.check_policy(snapshot.digest())?;
+            authorization.check()?;
             Ok(tunnel)
         }
         crate::routing::PacketAction::Modify => {
@@ -1346,6 +1348,7 @@ async fn routed_open_selected(
                             Err(error) => return Err(error),
                         },
                     };
+                    authorization.check()?;
                     let permitted = !ips.is_empty()
                         && ips.iter().all(|ip| {
                             policy.classify(
@@ -1358,8 +1361,9 @@ async fn routed_open_selected(
                     }
                     if permitted {
                         if let Some(tunnel) =
-                            cache.dpi.open(name, port, &ips, snapshot.digest()).await
+                            cache.dpi.open_checked(name, port, &ips, snapshot.digest()).await?
                         {
+                            authorization.check()?;
                             return Ok(ProxyTunnel::Dpi(Box::new(DpiRoute {
                                 tunnel,
                                 observed: None,
@@ -1372,20 +1376,18 @@ async fn routed_open_selected(
                 }
             }
             // A changed local policy does not authorize an older fallback.
-            if !cache.dpi.policy_current(snapshot.digest()) {
-                return Err(crate::routing::dpi::stale_policy());
-            }
+            authorization.check()?;
             // Failed local probe/dial or unsupported traffic uses the same
             // authenticated VPS carrier. No silent unprotected direct route.
             let tunnel = carrier.open(address, port).await?;
-            cache.dpi.check_policy(snapshot.digest())?;
+            authorization.check()?;
             crate::traffic::dpi_fallback_open();
             Ok(tunnel)
         }
         crate::routing::PacketAction::Pass => {
-            cache.dpi.check_policy(snapshot.digest())?;
+            authorization.check()?;
             let target = client_state::dial_direct(address, port, pinned).await?;
-            cache.dpi.check_policy(snapshot.digest())?;
+            authorization.check()?;
             Ok(ProxyTunnel::Direct(target))
         }
     }
@@ -1432,21 +1434,22 @@ async fn routed_udp_selected(
     action: Action,
     pinned: Option<Vec<IpAddr>>,
 ) -> Result<crate::udp_relay::Tunnel, ClientError> {
+    let authorization = cache.dpi.pin_policy(snapshot.digest())?;
     match action.packet_action() {
         crate::routing::PacketAction::Drop => {
             crate::traffic::blocked();
             Err(ClientError::Open(ErrorCode::PolicyDenied))
         }
         crate::routing::PacketAction::Pass => {
-            cache.dpi.check_policy(snapshot.digest())?;
+            authorization.check()?;
             let target = crate::udp_relay::direct(address, port, pinned).await?;
-            cache.dpi.check_policy(snapshot.digest())?;
+            authorization.check()?;
             Ok(crate::udp_relay::Tunnel::Direct(target))
         }
         crate::routing::PacketAction::Redirect => {
-            cache.dpi.check_policy(snapshot.digest())?;
+            authorization.check()?;
             let tunnel = carrier.open_udp(address, port).await?;
-            cache.dpi.check_policy(snapshot.digest())?;
+            authorization.check()?;
             Ok(tunnel)
         }
         crate::routing::PacketAction::Modify => {
@@ -1454,11 +1457,9 @@ async fn routed_udp_selected(
             // MVP: local UDP Modify has no accepted independent capability.
             // Consent alone cannot authorize QUIC/STUN probes or user
             // datagrams. Use the already-authorized XHTTP fallback.
-            if !cache.dpi.policy_current(snapshot.digest()) {
-                return Err(crate::routing::dpi::stale_policy());
-            }
+            authorization.check()?;
             let tunnel = carrier.open_udp(address, port).await?;
-            cache.dpi.check_policy(snapshot.digest())?;
+            authorization.check()?;
             crate::traffic::udp_dpi_fallback();
             if matches!(candidate, Candidate::Stun | Candidate::StunBinding) {
                 crate::traffic::udp_stun_fallback();
@@ -1505,7 +1506,7 @@ impl ProxyClient {
             }
         };
         format!(
-            "{report}\nСистемный перехват: не активирован (backend не готов)\n{}\n{}\nЛокальный Anti-DPI: {}\n{}",
+            "{report}\nСистемный перехват: не активирован (backend не готов)\n{}\n{}\nЛокальный Anti-DPI: {}\nUDP Modify: недоступен в System Proxy; для правила Anti-DPI используется VPS\n{}",
             crate::routing::flow::summary(self.routing_cache().flows.counts()),
             self.routing_cache().report(),
             if self.routing_cache().dpi.enabled() {
@@ -4003,8 +4004,8 @@ impl NativeIngress {
                     Ok(ips) => {
                         if !ips.contains(&key.destination.ip()) { return Err(denied()); }
                         self.check_native_modify(key, digest)?;
-                        let tunnel = cache.dpi.open(&name, key.destination.port(),
-                            &[key.destination.ip()], digest).await.ok_or_else(denied)?;
+                        let tunnel = cache.dpi.open_checked(&name, key.destination.port(),
+                            &[key.destination.ip()], digest).await?.ok_or_else(denied)?;
                         if self.native_modify_source(key)?!=source || !tunnel.matches_native_target(key,source) {
                             return Err(denied());
                         }
