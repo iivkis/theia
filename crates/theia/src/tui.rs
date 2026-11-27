@@ -3436,7 +3436,11 @@ impl Interaction {
                             && matches!(key.code,KeyCode::Char(ch) if items.iter().any(|item|item.key==ch)))
                         {
                             if self.workspace_page == 4 && key.code == KeyCode::Enter {
-                                self.traffic_monitor = Some(crate::traffic::Monitor::new(role));
+                                // Server statistics already own the full workspace. Do not
+                                // reopen the removed full-screen monitor with a hidden action.
+                                if role == Role::Client {
+                                    self.traffic_monitor = Some(crate::traffic::Monitor::new(role));
+                                }
                                 return false;
                             }
                             if let Some(KeyCode::Char(ch)) = tui_widgets::action_key(
@@ -8204,6 +8208,39 @@ mod tests {
                     let navigation = rendered_interaction(area.width, area.height, &model, &ui);
                     assert!(navigation.contains(pages(role)[page]));
                     ui.update(&mut model, press(KeyCode::Enter));
+                    if role == Role::Server && page == 7 {
+                        // Routing has its own inline table/actions, not generic workspace actions.
+                        assert_eq!(ui.workspace_focus, WorkspaceFocus::Fields);
+                        let view = rendered_interaction(area.width, area.height, &model, &ui);
+                        assert!(view.contains("Добавить правило"));
+                        assert!(!view.contains("THEIA_AUTH_TOKEN"));
+                        assert!(!view.contains("token_sha256"));
+                        let details = columns.map_or(body, |c| c[2]);
+                        let panel = ui.routing_panel.as_ref().expect("inline routing panel");
+                        assert!(panel.fields.is_none() && panel.download.is_none());
+                        let original_rules = panel.settings.rules.clone();
+                        let [report, controls] = panel.layout(details).expect("routing action layout");
+                        assert_eq!(controls.y, report.bottom());
+                        assert!(controls.bottom() <= details.bottom());
+                        let items = panel.actions();
+                        let actions = Actions { items: &items, selected: 0 };
+                        let (y, index) = (controls.y..controls.bottom())
+                            .find_map(|y| actions.hit(controls, controls.x + 2, y).map(|i| (y, i)))
+                            .expect("visible routing action");
+                        ui.mouse(&mut model, click_at(controls.x + 2, y), area);
+                        let panel = ui.routing_panel.as_ref().unwrap();
+                        assert_eq!(panel.action_focus, Some(index));
+                        assert!(panel.fields.is_none() && panel.download.is_none());
+                        assert_eq!(panel.settings.rules, original_rules);
+                        ui.update(&mut model, press(KeyCode::Esc));
+                        assert!(ui.routing_panel.is_none());
+                        assert_eq!(ui.workspace_focus, WorkspaceFocus::Navigation);
+                        assert!(ui.workspace_visible());
+                        assert!(!ui.owned_running(role));
+                        assert!(!ui.editor.as_ref().unwrap().dirty());
+                        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+                        continue;
+                    }
                     if page == 1 {
                         assert_eq!(ui.workspace_focus, WorkspaceFocus::Records);
                         ui.update(&mut model, press(KeyCode::Right));
@@ -8215,7 +8252,13 @@ mod tests {
                     } else {
                         WorkspaceFocus::Actions
                     };
-                    assert_eq!(ui.workspace_focus, expected_focus);
+                    assert_eq!(ui.workspace_focus, expected_focus, "role={role:?} page={page}");
+                    if role == Role::Server && page == 4 {
+                        ui.update(&mut model, press(KeyCode::Enter));
+                        assert!(ui.traffic_monitor.is_none());
+                        assert!(ui.workspace_monitor.is_some());
+                        assert!(ui.workspace_visible());
+                    }
                     let view = rendered_interaction(area.width, area.height, &model, &ui);
                     assert!(!view.contains("THEIA_AUTH_TOKEN"));
                     assert!(!view.contains("token_sha256"));
@@ -9085,7 +9128,13 @@ mod tests {
         let [_, _, workspace] = workspace_columns(shell_layout(area)[1]).unwrap();
         for role in [Role::Server, Role::Client] {
             for page in [0, 2, 4, 5] {
-                let [content, controls] = page_layout(workspace, role, page, None).unwrap();
+                if role == Role::Server && page == 4 {
+                    // Inline server statistics intentionally have no secondary action panel.
+                    assert!(page_actions(role, page, None).is_empty());
+                    assert!(page_layout(workspace, role, page, None).is_none());
+                    continue;
+                }
+                let [content, controls] = page_layout(workspace, role, page, None).expect("page with visible actions");
                 assert_eq!(controls.x, content.x);
                 assert_eq!(controls.width, content.width);
                 assert_eq!(controls.y, content.bottom());
