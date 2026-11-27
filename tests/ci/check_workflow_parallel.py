@@ -361,6 +361,17 @@ require(coverage_native.count("cargo llvm-cov report --lcov --include-build-scri
         and coverage_native.index("Instrument real disposable Windows proxy and ConPTY lifecycle")
         < coverage_native.index("Export LCOV once after all native instrumented tests"),
         "export LCOV exactly once, after all mandatory instrumented cases")
+for case in ("Instrument actual F-15 isolated kernel tests",
+             "Instrument independent protocol and browser interoperability"):
+    require(case in coverage_native and coverage_native.index(case)
+            < coverage_native.index("Export LCOV once after all native instrumented tests"),
+            f"{case} must contribute real profiles before export")
+require("scripts/f15-kernel-tests.py f15-coverage-build.json --coverage" in coverage_native
+        and "cargo llvm-cov show-env --export-prefix" in coverage_native
+        and "native_clients_require_pki_and_exact_alpn" in coverage_native
+        and "independent_aioquic_live_modify_v1_v2" in coverage_native
+        and "independent_external_reference_through_registered_reality_dispatchers" in coverage_native,
+        "real kernel and independent transport evidence must be instrumented")
 require("$bins = @($testEvents | Where-Object" in f14_build
         and "if ($bins.Count -eq 0)" in f14_build
         and "$_.profile.test -eq $false" in f14_build

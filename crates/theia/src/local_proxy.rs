@@ -5438,6 +5438,27 @@ mod selector_tests {
                 datasets: None,
                 rules: vec![
                     crate::routing::Rule {
+                        name: "native test pass".into(),
+                        action: Action::Direct,
+                        domains: vec![],
+                        ips: vec!["192.0.2.0/24".into()],
+                        applications: vec![],
+                    },
+                    crate::routing::Rule {
+                        name: "native test redirect".into(),
+                        action: Action::Allowed,
+                        domains: vec![],
+                        ips: vec!["198.51.100.0/24".into()],
+                        applications: vec![],
+                    },
+                    crate::routing::Rule {
+                        name: "native test drop".into(),
+                        action: Action::Blocked,
+                        domains: vec![],
+                        ips: vec!["203.0.113.0/24".into()],
+                        applications: vec![],
+                    },
+                    crate::routing::Rule {
                         name: "local direct".into(),
                         action: Action::Direct,
                         domains: vec!["full:localhost".into()],
@@ -5579,6 +5600,69 @@ mod selector_tests {
                             .await,
                         Err(ClientError::Open(ErrorCode::PolicyDenied))
                     ));
+                }
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                if transport == Transport::H2 {
+                    use crate::routing::{packet::{FlowKey, Transport as PacketTransport}, PacketAction};
+                    let path = directory.join("native.toml");
+                    let mut native = doc.clone();
+                    native.client.active_profile = profile.id.clone();
+                    native.client.profiles = vec![profile.clone()];
+                    config::atomic_write(&path, &Config::Client(native)).unwrap();
+                    let ingress = NativeIngress::prepare(&path).await.unwrap();
+                    assert_eq!(ingress.runtime.capture_state.reported(), 1);
+                    assert!(NativeIngress::prepare(&path).await.is_err(), "exclusive native owner");
+                    ingress.runtime.capture_state.ready().unwrap();
+                    assert!(ingress.ensure_running().is_ok());
+                    let source = "10.0.0.2:40001".parse().unwrap();
+                    let key = |destination: &str, transport| FlowKey {
+                        source, destination: destination.parse().unwrap(), transport, interface: 7
+                    };
+                    for destination in ["127.0.0.1:443", "0.0.0.0:443", "224.0.0.1:443", "192.0.2.1:0", "10.0.0.2:40001", "192.0.2.1:443", "203.0.113.1:443"] {
+                        assert!(matches!(ingress.redirect(key(destination, PacketTransport::Tcp)).await,
+                            Err(ClientError::Open(ErrorCode::PolicyDenied))), "{destination}");
+                    }
+                    let (_, flow, address) = ingress.redirect(key("198.51.100.1:443", PacketTransport::Tcp)).await.unwrap();
+                    assert_eq!(address, Address::V4([198,51,100,1]));
+                    assert!(flow.commit(PacketAction::Redirect).is_ok());
+                    drop(flow);
+                    let (_, local) = paired().await;
+                    assert!(matches!(ingress.relay_terminated_tcp(key("198.51.100.1:443", PacketTransport::Udp), local).await,
+                        Err(ClientError::Protocol)));
+                    let (_tx, up) = tokio::sync::mpsc::channel(1);
+                    let (down, _rx) = tokio::sync::mpsc::channel(1);
+                    assert!(matches!(ingress.relay_terminated_udp(key("198.51.100.1:443", PacketTransport::Tcp), up, down).await,
+                        Err(ClientError::Protocol)));
+                    #[cfg(target_os = "linux")]
+                    {
+                        use crate::routing::packet::PacketMeta;
+                        let meta = |destination, transport, tcp_flags| PacketMeta {
+                            flow: key(destination, transport), payload_len: 0, tcp_flags
+                        };
+                        let first = meta("192.0.2.1:443", PacketTransport::Tcp, Some(0x10));
+                        assert_eq!(ingress.raw_verdict(first).await, PacketAction::Drop);
+                        let syn = PacketMeta { tcp_flags: Some(2), ..first };
+                        assert_eq!(ingress.raw_verdict(syn).await, PacketAction::Pass);
+                        assert_eq!(ingress.raw_verdict(first).await, PacketAction::Pass);
+                        assert_eq!(ingress.raw_verdict(meta("192.0.2.2:53", PacketTransport::Udp, None)).await, PacketAction::Pass);
+                        for destination in ["0.0.0.0:443", "224.0.0.1:443", "198.51.100.1:443", "203.0.113.1:443"] {
+                            assert_eq!(ingress.raw_verdict(meta(destination, PacketTransport::Tcp, Some(2))).await, PacketAction::Drop);
+                        }
+                        assert!(ingress.prepare_stun_lab(key("192.0.2.1:3478", PacketTransport::Tcp), "example.org").await.is_err());
+                    }
+                    ingress.shutdown();
+                    assert_eq!(ingress.runtime.capture_state.reported(), 3);
+                    assert!(ingress.ensure_running().is_err());
+                    ingress.stopped().await;
+                    let (_tx, up) = tokio::sync::mpsc::channel(1);
+                    let (down, _rx) = tokio::sync::mpsc::channel(1);
+                    assert!(matches!(ingress.relay_terminated_udp(key("198.51.100.1:443", PacketTransport::Udp), up, down).await,
+                        Err(ClientError::Open(ErrorCode::PolicyDenied))));
+                    drop(ingress);
+                    // A failed preflight releases the exclusive owner.
+                    assert!(NativeIngress::prepare(&directory.join("missing.toml")).await.is_err());
+                    let owner = NativeOwner::acquire().unwrap();
+                    drop(owner);
                 }
                 udp_prewrite_fallback_fixture(&proxy_client).await;
                 udp_revoked_fallback_fixture(&proxy_client).await;

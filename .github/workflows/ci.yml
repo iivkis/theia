@@ -944,7 +944,19 @@ jobs:
         run: python -m pip install pywinpty==3.0.5
       - name: Install native eBPF linker dependency (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libbpf-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libbpf-dev nftables iproute2
+      - name: Install independent protocol fixtures for instrumented interoperability
+        run: python -m pip install h2==4.2.0 aioquic==1.2.0
+      - name: Provision instrumented Chromium fixtures on Linux
+        if: runner.os == 'Linux'
+        run: |
+          python -m pip install playwright==1.65.2
+          python -m playwright install --with-deps chromium
+      - name: Provision instrumented Chromium fixtures on Windows
+        if: runner.os == 'Windows'
+        run: |
+          python -m pip install playwright==1.65.2
+          python -m playwright install chromium
       - name: Purge any restored profile counters before instrumenting this SHA
         run: cargo llvm-cov clean --profraw-only
       - name: Instrument full native workspace tests
@@ -959,6 +971,33 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or ($result -join "`n") -notmatch 'test windows_system_proxy::tests::native_wininet_cas_recovery_and_foreign_override \.\.\. ok') { throw 'Instrumented real WinINet CAS and recovery failed or did not execute' }
           cargo llvm-cov test --workspace --all-features --locked --no-report --test tui_real_terminal -- compiled_client_proxy_conpty_lifecycle --ignored --exact --nocapture 2>&1 | Tee-Object -Variable result
           if ($LASTEXITCODE -ne 0 -or ($result -join "`n") -notmatch 'test compiled_client_proxy_conpty_lifecycle \.\.\. ok') { throw 'Instrumented real ConPTY lifecycle failed or did not execute' }
+      - name: Instrument actual F-15 isolated kernel tests
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n unshare -n true
+          source <(cargo llvm-cov show-env --export-prefix)
+          cargo test --locked -p theia --all-features --lib --no-run --message-format=json > f15-coverage-build.json
+          python3 scripts/f15-kernel-tests.py f15-coverage-build.json --coverage
+      - name: Instrument independent protocol and browser interoperability
+        shell: pwsh
+        run: |
+          $cases = @(
+            @{ target = @('--test', 'client_h2'); name = 'client_binary_chromium_socks5' },
+            @{ target = @('--test', 'client_h2'); name = 'client_binary_chromium_socks5_over_h3' },
+            @{ target = @('--test', 'independent_native_tls'); name = 'native_clients_require_pki_and_exact_alpn' },
+            @{ target = @('--test', 'independent_native_quic'); name = 'independent_aioquic_v1_v2_bidirectional_h3' },
+            @{ target = @('--lib'); name = 'routing::packet_modify::tests::independent_aioquic_initial_modify_v1_v2' },
+            @{ target = @('--test', 'independent_quic_modify'); name = 'independent_aioquic_live_modify_v1_v2' },
+            @{ target = @('--lib'); name = 'server::hardening_tests::independent_external_reference_through_registered_reality_dispatchers' }
+          )
+          foreach ($case in $cases) {
+            $target = $case.target
+            $name = $case.name
+            cargo llvm-cov test --workspace --all-features --locked --no-report @target -- $name --ignored --exact --nocapture 2>&1 | Tee-Object -Variable result
+            if ($LASTEXITCODE -ne 0 -or ($result -join "`n") -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;') { throw "Instrumented fixture failed or did not execute: $name" }
+          }
       - name: Export LCOV once after all native instrumented tests
         run: cargo llvm-cov report --lcov --include-build-script --output-path coverage.lcov
       - name: Export independent LLVM file segments from the same profiles

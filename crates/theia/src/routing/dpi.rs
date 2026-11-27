@@ -844,6 +844,140 @@ mod tests {
             .is_none());
     }
 
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[tokio::test]
+    async fn udp_evidence_requires_live_scope_consent_and_policy_and_is_bounded() {
+        use crate::quic_core::wire::Version;
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = peer.local_addr().unwrap();
+        let network = (0..16).find_map(|_| network_scope::observe(address)).unwrap();
+        let engine = Arc::new(Engine::default());
+        let policy = [1; 32];
+        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(policy)));
+        engine.set_enabled(true);
+        engine.set_stun_enabled(true);
+        let key = Key { name: "example.org".into(), address, policy, network };
+        let socket = scoped_udp(address, network).await.unwrap();
+        let verified = VerifiedUdp {
+            socket, strategy: UdpStrategy::StunBinding(udp::BindingStrategy::Fingerprint),
+            engine: engine.clone(), key: key.clone(),
+        };
+        assert!(!verified.admissible().unwrap());
+        engine.remember_udp(key.clone(), UdpProbe::Stun, true);
+        assert!(verified.admissible().unwrap());
+        engine.set_stun_enabled(false);
+        assert!(!verified.admissible().unwrap());
+        engine.set_stun_enabled(true);
+        verified.failed();
+        assert_eq!(engine.cached_udp(&key, UdpProbe::Stun), Some(false));
+        assert!(!verified.admissible().unwrap());
+        engine.remember_udp(key.clone(), UdpProbe::Quic(Version::V2), true);
+        assert_eq!(engine.cached_udp(&key, UdpProbe::Quic(Version::V1)), None);
+        for i in 0..129 {
+            let mut other = key.clone();
+            other.name = format!("host{i}.example.org");
+            engine.remember_udp(other, UdpProbe::Stun, true);
+        }
+        assert_eq!(engine.udp_cache.lock().unwrap().len(), 128);
+        assert_eq!(engine.cached_udp(&key, UdpProbe::Stun), None);
+        for item in engine.udp_cache.lock().unwrap().iter_mut() {
+            item.expiry = std::time::Instant::now();
+        }
+        assert_eq!(engine.cached_udp(&key, UdpProbe::Stun), None);
+        assert!(engine.udp_cache.lock().unwrap().is_empty());
+        let fallback = verified.fallback_policy();
+        engine.retire();
+        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(policy)));
+        assert!(verified.admissible().is_err());
+        assert!(fallback.check().is_err());
+        assert!(peer.try_recv_from(&mut [0; 1]).is_err(), "scope/cache checks must not send");
+    }
+
+    #[tokio::test]
+    async fn authorized_engine_rejects_invalid_scope_before_network_io() {
+        let engine = Arc::new(Engine::default());
+        let policy = [1; 32];
+        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(policy)));
+        engine.set_enabled(true);
+        engine.set_stun_enabled(true);
+        let public: IpAddr = "8.8.8.8".parse().unwrap();
+        let local: IpAddr = "127.0.0.1".parse().unwrap();
+        for (name, ips) in [
+            ("invalid/name", vec![public]),
+            ("example.org", vec![]),
+            ("example.org", vec![public, local]),
+            ("example.org", vec![public; 65]),
+        ] {
+            assert!(engine.open(name, 443, &ips, policy).await.is_none());
+            assert!(engine.open_quic_udp(name, 443, &ips, policy).await.is_none());
+            assert!(engine.open_stun_udp(name, 3478, &ips, policy).await.is_none());
+        }
+        assert!(engine.open("example.org", 80, &[public], policy).await.is_none());
+        assert!(engine.open_quic_udp("example.org", 80, &[public], policy).await.is_none());
+        assert!(engine.open_stun_udp("example.org", 443, &[public], policy).await.is_none());
+        engine.retire();
+        assert!(engine.open_stun_udp("example.org", 3478, &[public], policy).await.is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[tokio::test]
+    async fn guarded_relay_preserves_exact_first_flight_and_never_replays_after_alert() {
+        use tokio::io::AsyncReadExt;
+        async fn pair() -> (TcpStream, TcpStream) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (a, b) = tokio::join!(TcpStream::connect(listener.local_addr().unwrap()), listener.accept());
+            (a.unwrap(), b.unwrap().0)
+        }
+        for alert in [true, false] {
+            timeout(Duration::from_secs(8), async {
+                let (app, client) = pair().await;
+                let (target, mut origin) = pair().await;
+                let mut tunnel = Tunnel::fixture(target, "example.org");
+                tunnel.key.network = (0..16).find_map(|_| network_scope::observe(tunnel.key.address)).unwrap();
+                tunnel.engine.set_enabled(true);
+                tunnel.engine.cache.remember(&tunnel.key, Verdict::Verified(Strategy::Header));
+                let expected = tls::transform(&tls::fixture("example.org"), "example.org", Strategy::Header).unwrap();
+                let mut app = app;
+                app.write_all(&tls::fixture("example.org")).await.unwrap();
+                let wire = if alert { vec![21, 3, 3, 0, 2, 2, 40] } else {
+                    let mut message = vec![2, 0, 0, 38, 3, 3];
+                    message.extend([1; 32]);
+                    message.extend([0, 0x13, 1, 0]);
+                    let mut wire = vec![22, 3, 3, 0, message.len() as u8];
+                    wire.extend(message);
+                    wire
+                };
+                let io = async {
+                    let mut got = vec![0; expected.len()];
+                    origin.read_exact(&mut got).await.unwrap();
+                    assert_eq!(got, expected);
+                    origin.write_all(&wire).await.unwrap();
+                    let mut actual = vec![0; wire.len()];
+                    app.read_exact(&mut actual).await.unwrap();
+                    assert_eq!(actual, wire);
+                    if !alert {
+                        app.write_all(b"upload").await.unwrap();
+                        let mut up = [0; 6];
+                        origin.read_exact(&mut up).await.unwrap();
+                        assert_eq!(&up, b"upload");
+                        origin.write_all(b"download").await.unwrap();
+                        let mut down = [0; 8];
+                        app.read_exact(&mut down).await.unwrap();
+                        assert_eq!(&down, b"download");
+                        app.shutdown().await.unwrap();
+                        origin.shutdown().await.unwrap();
+                    }
+                };
+                let (result, ()) = tokio::join!(tunnel.relay_guarded(client, None), io);
+                if alert {
+                    assert!(matches!(result, Err(ClientError::Tls)));
+                } else {
+                    assert!(matches!(result, Ok(RelayOutcome::Finished)));
+                }
+            }).await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn real_tls_peer_accepts_native_record_strategies_and_rejects_wrong_name() {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
