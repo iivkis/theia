@@ -89,7 +89,10 @@ impl Anchor {
             return None;
         }
         let mut bytes = [0; 32];
-        for (byte, pair) in bytes.iter_mut().zip(hex.as_bytes().as_chunks::<2>().0.iter()) {
+        for (byte, pair) in bytes
+            .iter_mut()
+            .zip(hex.as_bytes().as_chunks::<2>().0.iter())
+        {
             *byte =
                 (pair[0] as char).to_digit(16)? as u8 * 16 + (pair[1] as char).to_digit(16)? as u8;
         }

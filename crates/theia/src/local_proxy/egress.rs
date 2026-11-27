@@ -339,11 +339,12 @@ async fn open_local_modify(
     match (request, strategy) {
         (EgressRequest::Tcp { .. }, None) => {
             let tunnel = carrier
-                .warm_during(
-                    Box::pin(cache
-                        .dpi
-                        .open_checked_pinned(name, port, &ips, authorization)),
-                )
+                .warm_during(Box::pin(cache.dpi.open_checked_pinned(
+                    name,
+                    port,
+                    &ips,
+                    authorization,
+                )))
                 .await?;
             authorization.check()?;
             Ok(tunnel.map(|tunnel| {

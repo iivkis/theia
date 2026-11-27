@@ -1325,7 +1325,8 @@ pub struct ReverseDatagram {
 fn word_sum(bytes: &[u8]) -> u32 {
     let (chunks, remainder) = bytes.as_chunks::<2>();
     let tail = remainder.first().copied().unwrap_or(0);
-    chunks.iter()
+    chunks
+        .iter()
         .map(|w| u32::from(u16::from_be_bytes(*w)))
         .sum::<u32>()
         + (u32::from(tail) << 8)

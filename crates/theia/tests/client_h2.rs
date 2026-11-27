@@ -643,9 +643,7 @@ async fn imported_server_invitation_reaches_real_connect_and_socks5_without_env_
         let confidential = invitation.encode().unwrap();
         let decoded = theia::client_import::read_source(&confidential).unwrap();
         let mut editor = Editor::load(Role::Client, &config_path).unwrap();
-        editor
-            .import_invitation(&decoded, None, None)
-            .unwrap();
+        editor.import_invitation(&decoded, None, None).unwrap();
         let Config::Client(mut client) = config::read_file(&config_path).unwrap() else {
             panic!("client");
         };
