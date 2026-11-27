@@ -642,65 +642,7 @@ pub(crate) fn windows_route_binding(remote: SocketAddr) -> Option<(SocketAddr,u3
         .then_some((SocketAddr::new(ip, 0),interface))
 }
 
-#[derive(Default)]
-struct NegativeCache {
-    route: Option<crate::network_scope::Scope>,
-    generation: u64,
-    expires: Option<Instant>,
-}
-
-impl NegativeCache {
-    fn observe(&mut self, route: Option<crate::network_scope::Scope>, now: Instant) -> (u64, bool) {
-        if route.is_none() || self.route != route {
-            self.route = route;
-            self.invalidate();
-        }
-        if self.expires.is_some_and(|until| now >= until) {
-            // A foreground request may win the expiry race. Retire the
-            // previous generation so a sleeping maintenance task cannot
-            // publish evidence for it later.
-            self.invalidate();
-        }
-        (self.generation, self.expires.is_some())
-    }
-
-    fn invalidate(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
-        self.expires = None;
-    }
-
-    fn record(&mut self, generation: u64, now: Instant, ttl: Duration) -> bool {
-        if self.generation != generation
-            || self.route.is_none()
-            || ttl.is_zero()
-            || self.expires.is_some()
-        {
-            return false;
-        }
-        // Concurrent failures must not push the first recheck further away.
-        self.expires = now.checked_add(ttl);
-        self.expires.is_some()
-    }
-
-    fn begin_recheck(
-        &mut self,
-        generation: u64,
-        deadline: Instant,
-        route: Option<crate::network_scope::Scope>,
-        now: Instant,
-    ) -> Option<u64> {
-        if self.generation != generation || self.expires != Some(deadline) || now < deadline {
-            return None;
-        }
-        if route.is_none() || self.route != route {
-            self.route = route;
-            self.invalidate();
-            return None;
-        }
-        self.invalidate();
-        Some(self.generation)
-    }
-}
+use crate::net::evidence::ScopedDecision as NegativeCache;
 
 struct AutoClient {
     h2: Arc<H2Client>,

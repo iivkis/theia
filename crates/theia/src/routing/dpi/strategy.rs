@@ -4,7 +4,7 @@ use super::UdpProbe;
 use std::{
     collections::VecDeque,
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::Mutex,
     time::{Duration, Instant},
 };
 const CACHE_LIMIT: usize = 128;
@@ -42,20 +42,8 @@ pub(super) enum Verdict {
     Unavailable,
     Avoid { strategy: Strategy, until: Instant },
 }
-// A lease identifies one publication, not just a strategy or a key. Holding
-// it prevents ABA even after eviction, expiry or re-publication.
-#[derive(Clone, Debug)]
-pub(super) struct Lease(Arc<()>);
-
-impl Lease {
-    pub(super) fn new() -> Self {
-        Self(Arc::new(()))
-    }
-
-    pub(super) fn same(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
+pub(super) use crate::net::evidence::Publication as Lease;
+use crate::net::evidence::{expiry, live, push_bounded};
 
 struct Entry {
     key: Key,
@@ -97,7 +85,7 @@ impl Cache {
     pub(super) fn ranked(&self, key: &Key) -> [Strategy; 3] {
         let mut order = Strategy::ALL;
         if let Ok(mut history) = self.1.lock() {
-            history.retain(|entry| entry.expires > Instant::now());
+            history.retain(|entry| live(entry.expires, Instant::now()));
             if let Some(entry) = history.iter().find(|entry| &entry.key == key) {
                 order.sort_by_key(|strategy| {
                     let sample = entry.samples[strategy.index()];
@@ -115,7 +103,7 @@ impl Cache {
     /// never exceed the established per-protocol hard deadline.
     fn budget(&self, key: &Key, index: usize, cap: Duration) -> Duration {
         let sample = self.1.lock().ok().and_then(|mut history| {
-            history.retain(|entry| entry.expires > Instant::now());
+            history.retain(|entry| live(entry.expires, Instant::now()));
             history.iter().find(|entry| &entry.key == key).map(|entry| entry.samples[index])
         }).unwrap_or_default();
         if !sample.observed { return cap; }
@@ -143,7 +131,7 @@ impl Cache {
         let Ok(mut entries) = self.0.lock() else { return };
         let now = Instant::now();
         if let Some(entry) = entries.iter_mut().find(|e| &e.key == key && e.probe.is_none()
-            && e.expires > now && e.lease.same(lease) && matches!(e.verdict, Verdict::Verified(_))) {
+            && live(e.expires, now) && e.lease.same(lease) && matches!(e.verdict, Verdict::Verified(_))) {
             entry.last_use = Some(now);
         }
     }
@@ -154,7 +142,7 @@ impl Cache {
         let mut entries = self.0.lock().ok()?;
         let now = Instant::now();
         let entry = entries.iter_mut().filter(|e| e.probe.is_none()
-            && e.expires > now && e.expires.saturating_duration_since(now) <= Duration::from_secs(12)
+            && live(e.expires, now) && e.expires.saturating_duration_since(now) <= Duration::from_secs(12)
             && e.last_use.is_some_and(|t| now.duration_since(t) <= Duration::from_secs(90))
             && e.refresh_attempt.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(15))
             && matches!(e.verdict, Verdict::Verified(_)))
@@ -172,9 +160,9 @@ impl Cache {
         let Ok(mut entries) = self.0.lock() else { return };
         let now = Instant::now();
         if let Some(entry) = entries.iter_mut().find(|e| &e.key == key && e.probe.is_none()
-            && e.expires > now && e.lease.same(lease) && matches!(e.verdict, Verdict::Verified(_))) {
+            && live(e.expires, now) && e.lease.same(lease) && matches!(e.verdict, Verdict::Verified(_))) {
             entry.verdict = Verdict::Denied;
-            entry.expires = now + NEGATIVE_TTL;
+            entry.expires = expiry(now, NEGATIVE_TTL);
         }
     }
 
@@ -184,11 +172,11 @@ impl Cache {
         let Ok(mut entries) = self.0.lock() else { return false };
         let now = Instant::now();
         let Some(entry) = entries.iter_mut().find(|e| &e.key == key && e.probe.is_none()
-            && e.expires > now && e.lease.same(lease) && e.verdict == Verdict::Verified(strategy))
+            && live(e.expires, now) && e.lease.same(lease) && e.verdict == Verdict::Verified(strategy))
         else { return false };
         // Same immutable strategy and scope; do not invalidate a pending
         // flow solely because its evidence was independently refreshed.
-        entry.expires = now + POSITIVE_TTL;
+        entry.expires = expiry(now, POSITIVE_TTL);
         true
     }
 
@@ -211,13 +199,13 @@ impl Cache {
             return;
         };
         let now = Instant::now();
-        history.retain(|entry| entry.expires > now);
+        history.retain(|entry| live(entry.expires, now));
         let mut entry = match history.iter().position(|entry| &entry.key == key) {
             Some(index) => history.remove(index).expect("position exists"),
             None => History {
                 key: key.clone(),
                 samples: [Sample::default(); 6],
-                expires: now + HISTORY_TTL,
+                expires: expiry(now, HISTORY_TTL),
             },
         };
         let sample = &mut entry.samples[index];
@@ -244,7 +232,7 @@ impl Cache {
         } else {
             sample.failures = sample.failures.saturating_add(1).min(8);
         }
-        entry.expires = now + HISTORY_TTL;
+        entry.expires = expiry(now, HISTORY_TTL);
         if history.len() >= CACHE_LIMIT {
             history.pop_front();
         }
@@ -262,7 +250,7 @@ impl Cache {
     fn evidence_kind(&self, key: &Key, probe: Option<UdpProbe>) -> Option<(Verdict, Lease)> {
         let mut cache = self.0.lock().ok()?;
         let now = Instant::now();
-        cache.retain(|entry| entry.expires > now);
+        cache.retain(|entry| live(entry.expires, now));
         cache.iter().find(|entry| &entry.key == key && entry.probe == probe).map(|entry| {
             let verdict = match entry.verdict {
                 Verdict::Avoid { until, .. } if until > now => Verdict::Unavailable,
@@ -293,24 +281,21 @@ impl Cache {
     fn insert_kind(&self, key: &Key, probe: Option<UdpProbe>, verdict: Verdict) -> Option<Lease> {
         let mut cache = self.0.lock().ok()?;
         let now = Instant::now();
-        cache.retain(|entry| entry.expires > now && (&entry.key != key || entry.probe != probe));
-        if cache.len() >= CACHE_LIMIT {
-            cache.pop_front();
-        }
+        cache.retain(|entry| live(entry.expires, now) && (&entry.key != key || entry.probe != probe));
         let ttl = match verdict {
             Verdict::Verified(_) | Verdict::UdpVerified | Verdict::Avoid { .. } => POSITIVE_TTL,
             Verdict::Unavailable | Verdict::Denied => NEGATIVE_TTL,
         };
         let lease = Lease::new();
-        cache.push_back(Entry {
+        push_bounded(&mut cache, Entry {
             key: key.clone(),
             probe,
             lease: lease.clone(),
             verdict,
-            expires: now + ttl,
+            expires: expiry(now, ttl),
             last_use: None,
             refresh_attempt: None,
-        });
+        }, CACHE_LIMIT);
         Some(lease)
     }
 
@@ -332,7 +317,7 @@ impl Cache {
 
     pub(super) fn udp_score(&self, key: &Key, probe: UdpProbe) -> u32 {
         let sample = self.1.lock().ok().and_then(|mut history| {
-            history.retain(|entry| entry.expires > Instant::now());
+            history.retain(|entry| live(entry.expires, Instant::now()));
             history.iter().find(|entry| &entry.key == key).map(|entry| entry.samples[probe.index()])
         }).unwrap_or_default();
         sample.failures.saturating_mul(2000).saturating_add(sample.millis)
@@ -342,14 +327,14 @@ impl Cache {
         if network_scope::observe(key.address) != Some(key.network) { return; }
         let Ok(mut cache) = self.0.lock() else { return };
         let now = Instant::now();
-        cache.retain(|entry| entry.expires > now);
+        cache.retain(|entry| live(entry.expires, now));
         if let Some(entry) = cache.iter_mut().find(|entry| {
             &entry.key == key && entry.probe == Some(probe)
                 && entry.verdict == Verdict::UdpVerified && entry.lease.same(lease)
         }) {
             self.sample_index(key, probe.index(), false, Duration::ZERO);
             entry.verdict = Verdict::Unavailable;
-            entry.expires = now + NEGATIVE_TTL;
+            entry.expires = expiry(now, NEGATIVE_TTL);
         }
     }
 
@@ -399,7 +384,7 @@ impl Cache {
             return;
         };
         let now = Instant::now();
-        cache.retain(|entry| entry.expires > now);
+        cache.retain(|entry| live(entry.expires, now));
         if let Some(entry) = cache.iter_mut().find(|entry| {
             &entry.key == key
                 && entry.probe.is_none()
@@ -413,9 +398,9 @@ impl Cache {
             if !good {
                 entry.verdict = Verdict::Avoid {
                     strategy,
-                    until: now + NEGATIVE_TTL,
+                    until: expiry(now, NEGATIVE_TTL),
                 };
-                entry.expires = now + POSITIVE_TTL;
+                entry.expires = expiry(now, POSITIVE_TTL);
             }
         }
     }

@@ -33,6 +33,7 @@ pub mod local_proxy;
 mod own_tls;
 pub mod management;
 mod network_scope;
+mod net;
 mod padding;
 pub mod protocol;
 mod qr_import;
