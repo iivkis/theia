@@ -626,14 +626,31 @@ impl Handshake {
     // encryption level, with no identity, certificate or error text.
     async fn reject(&mut self, socket: &SessionIo, peer: SocketAddr) {
         let index = if self.epochs[1].is_some() { 1 } else { 0 };
-        let Some(epoch) = self.epochs[index].as_mut() else { return; };
-        let token = if self.server { &[][..] } else { self.token.as_slice() };
+        let Some(epoch) = self.epochs[index].as_mut() else {
+            return;
+        };
+        let token = if self.server {
+            &[][..]
+        } else {
+            self.token.as_slice()
+        };
         // CONNECTION_CLOSE (transport), PROTOCOL_VIOLATION, no trigger/reason.
         let mut payload = vec![0x1c, 0x0a, 0, 0];
         let minimum = if !self.server && index == 0 { MTU } else { 0 };
-        let Ok(head) = header(self.version, index, &self.local, &self.remote,
-            token, &mut payload, minimum) else { return; };
-        let Ok((_, packet)) = epoch.writer.seal(&head, &payload) else { return; };
+        let Ok(head) = header(
+            self.version,
+            index,
+            &self.local,
+            &self.remote,
+            token,
+            &mut payload,
+            minimum,
+        ) else {
+            return;
+        };
+        let Ok((_, packet)) = epoch.writer.seal(&head, &payload) else {
+            return;
+        };
         if !self.server || self.budget.reserve_send(packet.len() as u64) {
             let _ = socket.send_to(&packet, peer).await;
         }

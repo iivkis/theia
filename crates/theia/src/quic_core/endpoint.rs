@@ -1303,7 +1303,8 @@ impl LabSession {
                     // Fixed-key fixtures and server-side peers cannot use
                     // this path; unexpected TLS output is a protocol error.
                     let driver = self.post_handshake.as_mut().ok_or(Error::Protocol)?;
-                    driver.receive(super::handshake::Level::Application, offset, data)
+                    driver
+                        .receive(super::handshake::Level::Application, offset, data)
                         .map_err(|_| Error::Protocol)?;
                     if driver.poll_output().map_err(|_| Error::Protocol)?.is_some() {
                         return Err(Error::Protocol);

@@ -12,7 +12,10 @@ fn main() {
     // per worker; ordinary allocation and queue limits remain unchanged.
     #[cfg(windows)]
     runtime.thread_stack_size(8 * 1024 * 1024);
-    runtime.build().expect("create Theia runtime").block_on(Box::pin(run()));
+    runtime
+        .build()
+        .expect("create Theia runtime")
+        .block_on(Box::pin(run()));
 }
 
 async fn run() {

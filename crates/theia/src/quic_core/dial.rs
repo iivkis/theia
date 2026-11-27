@@ -133,8 +133,12 @@ pub(crate) async fn connect(
                 E::Schedule(_) => "recovery",
                 E::Endpoint(_) => "endpoint",
             };
-            crate::diag!(Warn, "quic.dial", "handshake_failed",
-                "category" = crate::diagnostics::Value::Label(category));
+            crate::diag!(
+                Warn,
+                "quic.dial",
+                "handshake_failed",
+                "category" = crate::diagnostics::Value::Label(category)
+            );
             match error {
                 E::Timeout => observation.failure(true),
                 E::Io(_) => observation.failure(false),
@@ -176,8 +180,12 @@ pub(crate) async fn confirm(session: &mut LabSession) -> Result<(), Error> {
                 E::Receive(_) => "receive_flow",
                 E::Schedule(_) => "recovery",
             };
-            crate::diag!(Warn, "quic.dial", "confirmation_failed",
-                "category" = crate::diagnostics::Value::Label(category));
+            crate::diag!(
+                Warn,
+                "quic.dial",
+                "confirmation_failed",
+                "category" = crate::diagnostics::Value::Label(category)
+            );
             Error::Handshake
         })?;
     }
