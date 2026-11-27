@@ -1189,7 +1189,7 @@ mod tests {
                 CheckKind::Policy,
                 Outcome::Route(Action::Blocked),
                 false,
-                "blocked",
+                "blackhole",
             ),
             (
                 CheckKind::Strategy("Header IPv4".into()),
