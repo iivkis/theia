@@ -415,7 +415,7 @@ impl LabRules {
         self.current()
     }
 
-    fn current(&self) -> io::Result<bool> {
+    pub(crate) fn current(&self) -> io::Result<bool> {
         if self.poisoned { return Ok(false); }
         let meta = fs::metadata("/proc/thread-self/ns/net")?;
         if (meta.dev(), meta.ino()) != (self.journal.scope.dev, self.journal.scope.ino) { return Ok(false); }

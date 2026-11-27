@@ -1636,6 +1636,7 @@ pub(crate) struct ClientRuntime {
     // Bound one staging operation per process, with no commit on cancellation.
     stage: tokio::sync::Mutex<()>,
     native_attached: std::sync::atomic::AtomicBool,
+    capture_state: std::sync::atomic::AtomicU8,
     stopped: tokio::sync::watch::Sender<bool>,
 }
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1658,6 +1659,7 @@ impl ClientRuntime {
             slot,
             stage: tokio::sync::Mutex::new(()),
             native_attached: std::sync::atomic::AtomicBool::new(false),
+            capture_state: std::sync::atomic::AtomicU8::new(0),
             stopped,
         })
     }
@@ -1674,6 +1676,7 @@ impl ClientRuntime {
         crate::routing::carrier_socket::scope(registrar.clone(), view.client.routing_policy()).await?;
         saved_client_bytes(&self.path, view.digest)?;
         if *self.stopped.borrow() { return Err(ClientError::Configuration); }
+        self.capture_state.store(1, std::sync::atomic::Ordering::Release);
         self.native_attached.store(true, std::sync::atomic::Ordering::Release);
         Ok(NativeIngress {
             runtime: self.clone(),
@@ -1688,6 +1691,11 @@ impl ClientRuntime {
     }
 
     fn stop(&self) {
+        if self.native_attached.load(std::sync::atomic::Ordering::Acquire) {
+            // Capture rules may remain after the queue stops. Never publish
+            // inactive/connected until the owner has finished recovery.
+            self.capture_state.store(3, std::sync::atomic::Ordering::Release);
+        }
         self.stopped.send_replace(true);
         self.slot.borrow().client.routing_cache().dpi.retire();
     }
@@ -1697,7 +1705,7 @@ impl ClientRuntime {
         if !*stop.borrow() { let _ = stop.wait_for(|stopped| *stopped).await; }
     }
 
-    pub(crate) async fn status(&self) -> (u64, [u8; 32], u64, u8, u8, bool, (u64, u8), [u64; 38], Option<[u16; 4]>) {
+    pub(crate) async fn status(&self) -> (u64, [u8; 32], u64, u8, u8, bool, (u64, u8), [u64; 38], Option<[u16; 4]>, u8) {
         let view = self.slot.borrow().clone();
         let (desc, observed, fallback) = match &view.client {
             ProxyClient::Reality(r) => {
@@ -1732,6 +1740,7 @@ impl ClientRuntime {
             view.client.routing_cache().observation(),
             crate::traffic::routing_totals(),
             view.client.routing_cache().flows.counts(),
+            self.capture_state.load(std::sync::atomic::Ordering::Acquire),
         )
     }
     async fn candidate(
@@ -2106,9 +2115,22 @@ impl NativeIngress {
         self.ensure_running()?;
         if !rules.lock().map_err(|_| ClientError::Configuration)?.owns_queue(&queue).map_err(|_| ClientError::Io)? { return Err(ClientError::Configuration); }
         let mut queue = queue.into_async().map_err(|_| ClientError::Io)?;
+        self.runtime.capture_state.compare_exchange(1,2,std::sync::atomic::Ordering::AcqRel,std::sync::atomic::Ordering::Acquire)
+            .map_err(|_| ClientError::Configuration)?;
         let consume = async {
+            let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                let packet = queue.next().await.map_err(|_| ClientError::Io)?;
+                let packet = tokio::select! {
+                    biased;
+                    _ = heartbeat.tick() => {
+                        if !rules.lock().map_err(|_| ClientError::Configuration)?.current().map_err(|_| ClientError::Io)? {
+                            return Err(ClientError::Open(ErrorCode::PolicyDenied));
+                        }
+                        continue;
+                    }
+                    packet=queue.next()=>packet.map_err(|_| ClientError::Io)?,
+                };
                 if !rules.lock().map_err(|_| ClientError::Configuration)?.owns_packet(&packet).map_err(|_| ClientError::Io)? {
                     return Err(ClientError::Open(ErrorCode::PolicyDenied));
                 }

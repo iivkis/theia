@@ -1104,6 +1104,7 @@ impl RoutingObservation {
                     routing_state,
                     routing_totals,
                     flow_counts,
+                    capture_state,
                     ..
                 })) if config_sha256 == self.digest => {
                     let status = match routing_state {
@@ -1112,7 +1113,13 @@ impl RoutingObservation {
                         3 => "Синхронизация выполняется".into(),
                         _ => "Правила ещё не подтверждены".into(),
                     };
-                    self.report = format!("Источник: защищённый IPC фонового клиента\n{status}\nСистемный перехват: не активирован\n{}\n{}\nСчётчики всего процесса, не отдельного профиля; полезные TCP/UDP-байты.", crate::routing::flow::summary(flow_counts), crate::traffic::routing_summary_from(*routing_totals));
+                    let capture = match capture_state {
+                        0 => "не активирован",
+                        1 => "подготовка",
+                        2 => "изолированный тестовый захват (не production)",
+                        _ => "остановлен или ошибка; требуется проверка восстановления",
+                    };
+                    self.report = format!("Источник: защищённый IPC фонового клиента\n{status}\nСистемный перехват: {capture}\n{}\n{}\nСчётчики всего процесса, не отдельного профиля; полезные TCP/UDP-байты.", crate::routing::flow::summary(flow_counts), crate::traffic::routing_summary_from(*routing_totals));
                     self.observed = Some(std::time::Instant::now());
                 }
                 Err(TryRecvError::Empty) => return,
@@ -9030,12 +9037,14 @@ mod tests {
                 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             ]),
             flow_counts: Some([1, 2, 3, 4]),
+            capture_state: 2,
         }))
         .unwrap();
         observation.poll();
         client.routing_observation = Some(observation);
         let screen = rendered_interaction(120, 40, &Model::new(Some(Role::Client)), &client);
         assert!(screen.contains("ревизия 5"));
+        assert!(screen.contains("изолированный тестовый захват"));
         assert!(screen.contains("IPC"));
         assert!(screen.contains("Anti-DPI"));
         assert!(screen.contains("резерв VPS"));
