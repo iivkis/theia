@@ -70,49 +70,141 @@ pub fn stun_fingerprint(packet: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Candidate TCP/TLS segmentation. Does not change the TLS byte stream,
-/// ACK number or window; PSH stays on the last segment. A real backend must
-/// own both emissions, retransmission and cancellation before enabling it.
-/// IPv4 DF and no IP/TCP options, IPv6 without extension headers only.
-/// Never use the expected name as proof of the application's identity.
-pub fn tcp_tls_segments(packet: &[u8], expected_name: &str) -> Option<[Vec<u8>; 2]> {
-    let name = super::domain_name(expected_name).ok()?;
+/// Complete TCP packets with only the options whose semantics survive
+/// copying onto both contiguous segments. In particular, never split
+/// authenticated TCP (MD5/AO), MPTCP, SACK blocks or unknown options.
+fn tcp_view(packet: &[u8]) -> Option<(PacketMeta, usize, usize)> {
     let meta = PacketMeta::parse(packet, 0).ok()?;
-    if meta.flow.transport != Transport::Tcp || meta.flow.destination.port() != 443
-        || meta.flow.destination.ip().is_multicast() || meta.flow.destination.ip().is_unspecified()
-        || !matches!(meta.tcp_flags, Some(0x10 | 0x18)) { return None; }
+    if meta.flow.transport != Transport::Tcp || !matches!(meta.tcp_flags, Some(0x10 | 0x18)) {
+        return None;
+    }
     let off = match packet[0] >> 4 {
-        4 if packet[0] == 0x45 && packet[9] == 6
-            && packet[6..8] == [0x40,0] && checksum(words(&packet[..20])) == 0 => 20,
+        4 if packet[0] == 0x45 && packet[9] == 6 && packet[6..8] == [0x40,0]
+            && checksum(words(&packet[..20])) == 0 => 20,
         6 if packet[6] == 6 => 40,
         _ => return None,
     };
-    if packet[off+12] != 0x50 || tcp_checksum(packet, off) != 0 { return None; }
-    let payload = &packet[off+20..];
-    if payload.len() <= 5 || !super::dpi::complete_packet_hello(payload, &name) { return None; }
-    let seq = u32::from_be_bytes(packet[off+4..off+8].try_into().ok()?);
-    let mut first = packet[..off+20].to_vec();
-    first.extend_from_slice(&payload[..5]);
-    first[off+13] &= !0x08; // PSH only on last segment
-    let mut second = packet[..off+20].to_vec();
-    second.extend_from_slice(&payload[5..]);
-    second[off+4..off+8].copy_from_slice(&seq.wrapping_add(5).to_be_bytes());
-    for out in [&mut first, &mut second] {
-        let len = out.len();
-        if off == 20 {
-            out[2..4].copy_from_slice(&u16::try_from(len).ok()?.to_be_bytes());
-            out[10..12].fill(0);
-            let sum = checksum(words(&out[..20]));
-            out[10..12].copy_from_slice(&sum.to_be_bytes());
-        } else {
-            out[4..6].copy_from_slice(&u16::try_from(len-40).ok()?.to_be_bytes());
+    if packet[off+12] & 0x0f != 0 || tcp_checksum(packet, off) != 0 { return None; }
+    let end = off + usize::from(packet[off+12] >> 4) * 4;
+    let mut options = packet.get(off+20..end)?;
+    let mut timestamp = false;
+    while let Some(&kind) = options.first() {
+        match kind {
+            0 if options.iter().all(|&b| b == 0) => break,
+            1 => options = &options[1..],
+            8 if !timestamp && options.get(1) == Some(&10) && options.len() >= 10 => {
+                timestamp = true;
+                options = &options[10..];
+            }
+            _ => return None,
         }
-        out[off+16..off+18].fill(0);
-        let sum = tcp_checksum(out, off);
-        out[off+16..off+18].copy_from_slice(&sum.to_be_bytes());
-        if PacketMeta::parse(out, 0).ok()?.flow != meta.flow || tcp_checksum(out, off) != 0 { return None; }
+    }
+    Some((meta, off, end))
+}
+
+fn fix_tcp_lengths_and_checksums(packet: &mut [u8], off: usize) -> Option<()> {
+    let len = packet.len();
+    if off == 20 {
+        packet[2..4].copy_from_slice(&u16::try_from(len).ok()?.to_be_bytes());
+        packet[10..12].fill(0);
+        let sum = checksum(words(&packet[..20]));
+        packet[10..12].copy_from_slice(&sum.to_be_bytes());
+    } else {
+        packet[4..6].copy_from_slice(&u16::try_from(len.checked_sub(40)?).ok()?.to_be_bytes());
+    }
+    packet[off+16..off+18].fill(0);
+    let sum = tcp_checksum(packet, off);
+    packet[off+16..off+18].copy_from_slice(&sum.to_be_bytes());
+    Some(())
+}
+
+fn split_tcp(packet: &[u8], meta: PacketMeta, off: usize, end: usize, boundary: usize) -> Option<[Vec<u8>; 2]> {
+    let payload = packet.get(end..)?;
+    if boundary == 0 || boundary >= payload.len() { return None; }
+    let seq = u32::from_be_bytes(packet[off+4..off+8].try_into().ok()?);
+    let mut first = packet[..end].to_vec();
+    first.extend_from_slice(&payload[..boundary]);
+    first[off+13] &= !0x08; // PSH only on last segment
+    let mut second = packet[..end].to_vec();
+    second.extend_from_slice(&payload[boundary..]);
+    second[off+4..off+8].copy_from_slice(&seq.wrapping_add(u32::try_from(boundary).ok()?).to_be_bytes());
+    for out in [&mut first, &mut second] {
+        fix_tcp_lengths_and_checksums(out, off)?;
+        if tcp_view(out)?.0.flow != meta.flow { return None; }
     }
     Some([first,second])
+}
+
+/// Candidate TCP/TLS segmentation. Does not change the TLS byte stream,
+/// ACK number or window; PSH stays on the last segment. A real backend must
+/// own both emissions, retransmission and cancellation before enabling it.
+/// IPv4 DF, IPv6 without extensions, TCP timestamp/NOP/padding options only.
+/// Never use the expected name as proof of the application's identity.
+pub fn tcp_tls_segments(packet: &[u8], expected_name: &str) -> Option<[Vec<u8>; 2]> {
+    let name = super::domain_name(expected_name).ok()?;
+    let (meta, off, end) = tcp_view(packet)?;
+    if meta.flow.destination.port() != 443 || meta.flow.destination.ip().is_multicast()
+        || meta.flow.destination.ip().is_unspecified() { return None; }
+    let payload = &packet[end..];
+    if payload.len() <= 5 || !super::dpi::complete_packet_hello(payload, &name) { return None; }
+    split_tcp(packet, meta, off, end, 5)
+}
+
+/// Bounded retransmission plan for one already-authorized split flight.
+/// The owner must bind it to a live, unique kernel socket/flow generation.
+/// It is not a raw sender, policy credential, or permission to replay data.
+/// Retransmitted bytes must agree with the exact original sequence interval;
+/// an observed cumulative ACK can only advance, and retirement is terminal.
+pub struct TcpSplitPlan {
+    key: super::packet::FlowKey,
+    sequence: u32,
+    payload: Vec<u8>,
+    acknowledged: usize,
+}
+
+impl TcpSplitPlan {
+    pub fn begin(packet: &[u8], expected_name: &str) -> Option<(Self, [Vec<u8>; 2])> {
+        let (meta, off, end) = tcp_view(packet)?;
+        let payload = packet.get(end..)?;
+        if payload.len() > crate::reality_admission::MAX_HELLO { return None; }
+        let outputs = tcp_tls_segments(packet, expected_name)?;
+        let sequence = u32::from_be_bytes(packet[off+4..off+8].try_into().ok()?);
+        Some((Self { key: meta.flow, sequence, payload: payload.to_vec(), acknowledged: 0 }, outputs))
+    }
+
+    /// Called only on a retransmission captured from the owning connection.
+    /// No proactive retransmission timer: the native TCP stack owns RTO,
+    /// congestion control, sequence allocation and retransmit scheduling.
+    pub fn retransmission(&self, packet: &[u8]) -> Option<Vec<Vec<u8>>> {
+        if self.acknowledged == self.payload.len() { return None; }
+        let (meta, off, end) = tcp_view(packet)?;
+        if meta.flow != self.key || meta.payload_len == 0 { return None; }
+        let sequence = u32::from_be_bytes(packet[off+4..off+8].try_into().ok()?);
+        let offset = sequence.wrapping_sub(self.sequence) as usize;
+        let limit = offset.checked_add(meta.payload_len)?;
+        if self.payload.get(offset..limit)? != packet.get(end..)? { return None; }
+        // A retransmission crossing the original boundary must be split
+        // there again. An already-segmented range remains byte exact.
+        if offset < 5 && limit > 5 {
+            Some(split_tcp(packet, meta, off, end, 5-offset)?.into_iter().collect())
+        } else {
+            Some(vec![packet.to_vec()])
+        }
+    }
+
+    /// Observe an exact reverse-flow ACK after kernel-side corroboration.
+    /// Wire checksum alone never authenticates the peer. Future ACKs outside
+    /// the sent interval, wrong tuples and malformed headers cannot retire it.
+    pub fn acknowledge(&mut self, packet: &[u8]) -> Option<bool> {
+        let (meta, off, _) = tcp_view(packet)?;
+        if meta.flow.source != self.key.destination || meta.flow.destination != self.key.source
+            || meta.flow.transport != Transport::Tcp { return None; }
+        let ack = u32::from_be_bytes(packet[off+8..off+12].try_into().ok()?);
+        let progress = ack.wrapping_sub(self.sequence) as usize;
+        if progress > self.payload.len() { return None; }
+        self.acknowledged = self.acknowledged.max(progress);
+        Some(self.acknowledged == self.payload.len())
+    }
 }
 fn tcp_checksum(packet: &[u8], off: usize) -> u16 {
     let len = (packet.len()-off) as u32;
@@ -211,12 +303,47 @@ mod tests {
             original.extend_from_slice(&hello);
             let sum = tcp_checksum(&original,off);
             original[off+16..off+18].copy_from_slice(&sum.to_be_bytes());
-            let [a,b] = tcp_tls_segments(&original,"example.org").unwrap();
+            let (mut plan, [a,b]) = TcpSplitPlan::begin(&original,"example.org").unwrap();
             assert_eq!([&a[off+20..], &b[off+20..]].concat(),hello);
             assert_eq!(a[off+13],0x10); assert_eq!(b[off+13],0x18);
             assert_eq!(u32::from_be_bytes(b[off+4..off+8].try_into().unwrap()),2);
             assert_eq!(tcp_checksum(&a,off),0); assert_eq!(tcp_checksum(&b,off),0);
             assert!(tcp_tls_segments(&original,"other.example").is_none());
+            assert_eq!(plan.retransmission(&original).unwrap(), vec![a.clone(),b.clone()]);
+            assert_eq!(plan.retransmission(&b).unwrap(), vec![b.clone()]);
+            let mut altered = b.clone();
+            *altered.last_mut().unwrap() ^= 1;
+            fix_tcp_lengths_and_checksums(&mut altered,off).unwrap();
+            assert!(plan.retransmission(&altered).is_none());
+            let mut ack = original[..off+20].to_vec();
+            if ipv6 {
+                let src = ack[8..24].to_vec();
+                ack.copy_within(24..40,8);
+                ack[24..40].copy_from_slice(&src);
+            } else {
+                let src = ack[12..16].to_vec();
+                ack.copy_within(16..20,12);
+                ack[16..20].copy_from_slice(&src);
+            }
+            ack[off..off+2].copy_from_slice(&443u16.to_be_bytes());
+            ack[off+2..off+4].copy_from_slice(&1234u16.to_be_bytes());
+            ack[off+13] = 0x10;
+            let base = u32::MAX-2;
+            ack[off+8..off+12].copy_from_slice(&base.wrapping_add(5).to_be_bytes());
+            fix_tcp_lengths_and_checksums(&mut ack,off).unwrap();
+            assert_eq!(plan.acknowledge(&ack),Some(false));
+            assert_eq!(plan.acknowledged,5);
+            ack[off+8..off+12].copy_from_slice(&base.wrapping_add(1).to_be_bytes());
+            fix_tcp_lengths_and_checksums(&mut ack,off).unwrap();
+            assert_eq!(plan.acknowledge(&ack),Some(false));
+            assert_eq!(plan.acknowledged,5);
+            ack[off+8..off+12].copy_from_slice(&base.wrapping_add(hello.len() as u32+1).to_be_bytes());
+            fix_tcp_lengths_and_checksums(&mut ack,off).unwrap();
+            assert_eq!(plan.acknowledge(&ack),None);
+            ack[off+8..off+12].copy_from_slice(&base.wrapping_add(hello.len() as u32).to_be_bytes());
+            fix_tcp_lengths_and_checksums(&mut ack,off).unwrap();
+            assert_eq!(plan.acknowledge(&ack),Some(true));
+            assert!(plan.retransmission(&original).is_none());
         }
     }
 
@@ -293,6 +420,115 @@ mod tests {
                 seen.extend_from_slice(&bytes[40..]);
             }
             assert_eq!(seen,hello);
+        }).join().unwrap();
+    }
+
+    /// Exercise an established Linux TCP connection, not a synthetic raw
+    /// four-tuple. Suppress the real first payload in NFQUEUE, emit only the
+    /// first transformed segment and require the native stack to retransmit.
+    /// The test uses an isolated loopback namespace and test-only raw sender;
+    /// no production socket mark or unrestricted packet API is installed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires isolated Linux namespace, nftables, CAP_NET_ADMIN/CAP_NET_RAW"]
+    fn kernel_live_tcp_split_retransmission_and_ack() {
+        std::thread::spawn(|| {
+            use crate::routing::{nfqueue::Queue, PacketAction};
+            use std::{io::{self,Read,Write}, mem, net::{TcpListener,TcpStream}, os::fd::{AsRawFd,FromRawFd,OwnedFd}, os::unix::fs::MetadataExt, process::{Command,Stdio},time::{Duration,Instant}};
+            let host = std::fs::metadata("/proc/thread-self/ns/net").unwrap();
+            assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) },0);
+            let current = std::fs::metadata("/proc/thread-self/ns/net").unwrap();
+            assert_ne!((host.dev(),host.ino()),(current.dev(),current.ino()));
+            assert!(Command::new("ip").args(["link","set","lo","up"]).status().unwrap().success());
+
+            let listener = TcpListener::bind("127.0.0.2:443").unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            client.set_nodelay(true).unwrap();
+            let (mut peer,remote) = listener.accept().unwrap();
+            assert_eq!(remote,client.local_addr().unwrap());
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let client_port = remote.port();
+
+            // The namespace contains only this fixture. A single raw socket
+            // with a test-only mark avoids re-capture of the emitted segments.
+            let mark = 0x54484941i32;
+            let raw = unsafe { libc::socket(libc::AF_INET,libc::SOCK_RAW | libc::SOCK_CLOEXEC,libc::IPPROTO_RAW) };
+            assert!(raw >= 0);
+            let sender = unsafe { OwnedFd::from_raw_fd(raw) };
+            assert_eq!(unsafe { libc::setsockopt(raw,libc::SOL_SOCKET,libc::SO_MARK,(&mark as *const i32).cast(),mem::size_of_val(&mark) as libc::socklen_t) },0);
+            let mut target: libc::sockaddr_in = unsafe { mem::zeroed() };
+            target.sin_family = libc::AF_INET as libc::sa_family_t;
+            target.sin_addr.s_addr = u32::from_ne_bytes([127,0,0,2]);
+            let emit = |part: &[u8]| {
+                assert_eq!(part[12..20],[127,0,0,1,127,0,0,2]);
+                let sent = unsafe { libc::sendto(sender.as_raw_fd(),part.as_ptr().cast(),part.len(),0,
+                    (&target as *const libc::sockaddr_in).cast(),mem::size_of_val(&target) as libc::socklen_t) };
+                assert_eq!(sent,part.len() as isize,"raw send: {}",io::Error::last_os_error());
+            };
+            let mut queue = Queue::bind(49012,128).unwrap();
+            let mut nft = Command::new("nft").args(["-f","-"]).stdin(Stdio::piped()).spawn().unwrap();
+            {
+                let mut stdin = nft.stdin.take().unwrap();
+                writeln!(stdin,"add table inet theia_tcp_live_lab").unwrap();
+                writeln!(stdin,"add chain inet theia_tcp_live_lab output {{ type filter hook output priority -150; policy accept; }}").unwrap();
+                writeln!(stdin,"add rule inet theia_tcp_live_lab output ip saddr 127.0.0.1 ip daddr 127.0.0.2 tcp sport {client_port} tcp dport 443 meta mark != {mark} queue num 49012").unwrap();
+                writeln!(stdin,"add rule inet theia_tcp_live_lab output ip saddr 127.0.0.2 ip daddr 127.0.0.1 tcp sport 443 tcp dport {client_port} queue num 49012").unwrap();
+            }
+            assert!(nft.wait().unwrap().success());
+            let hello = super::super::dpi::packet_test_hello("example.org");
+            client.write_all(&hello).unwrap();
+            let deadline = Instant::now()+Duration::from_secs(12);
+            let mut plan: Option<TcpSplitPlan> = None;
+            let mut retransmitted = false;
+            let mut complete = false;
+            while Instant::now() < deadline {
+                let packet = match queue.receive() {
+                    Ok(packet)=>packet,
+                    Err(error) if matches!(error.kind(),io::ErrorKind::WouldBlock|io::ErrorKind::TimedOut|io::ErrorKind::Interrupted)=>continue,
+                    Err(error)=>panic!("NFQUEUE: {error}"),
+                };
+                assert!(packet.local_output());
+                let meta = packet.metadata().expect("complete non-GSO TCP packet");
+                let mut bytes = packet.bytes().to_vec();
+                // LOCAL_OUT may carry partial checksums before software or
+                // device offload. Normalize ONLY inside this owned test.
+                // The production candidate still requires verified checksum.
+                assert_eq!(bytes[0],0x45);
+                if packet.checksum_pending() {
+                    fix_tcp_lengths_and_checksums(&mut bytes,20).unwrap();
+                }
+                if meta.flow.source == client.local_addr().unwrap() && meta.payload_len != 0 {
+                    packet.finish(PacketAction::Drop).unwrap();
+                    if let Some(plan) = &plan {
+                        let parts = plan.retransmission(&bytes).expect("native retransmission must match original sequence bytes");
+                        for part in &parts { emit(part); }
+                        retransmitted = true;
+                    } else {
+                        let (new,[first,_lost]) = TcpSplitPlan::begin(&bytes,"example.org").expect("real TLS payload split");
+                        emit(&first); // intentionally lose second segment
+                        plan = Some(new);
+                    }
+                } else {
+                    if meta.flow.source == peer.local_addr().unwrap() {
+                        if let Some(plan) = &mut plan {
+                            complete = plan.acknowledge(&bytes).unwrap_or(false);
+                        }
+                    }
+                    assert_eq!(packet.finish(PacketAction::Pass).unwrap(),PacketAction::Pass);
+                    if complete { break; }
+                }
+            }
+            assert!(retransmitted,"native TCP did not retransmit the lost sequence range");
+            assert!(complete,"peer did not acknowledge the entire split payload");
+            let mut received = vec![0;hello.len()];
+            peer.read_exact(&mut received).unwrap();
+            assert_eq!(received,hello);
+            peer.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+            let mut extra = [0;1];
+            let error = peer.read(&mut extra).unwrap_err();
+            assert!(matches!(error.kind(),io::ErrorKind::WouldBlock|io::ErrorKind::TimedOut),"duplicate application bytes");
+            // Closing the queue cannot bypass its non-bypass rule; the
+            // disposable namespace and all its rules vanish on thread exit.
         }).join().unwrap();
     }
 

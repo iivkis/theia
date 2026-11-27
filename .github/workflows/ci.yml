@@ -411,8 +411,8 @@ jobs:
           python-version: '3.12'
       - name: Install pinned CI-only VT screen driver for real Linux PTY
         run: python -m pip install pyte==0.8.2
-      - name: Install native eBPF linker dependency
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libbpf-dev
+      - name: Install native eBPF linker and isolated kernel test dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libbpf-dev nftables iproute2
       - name: Native Linux tests
         run: cargo nextest run --workspace --all-targets --locked --no-fail-fast
       - name: F-15 isolated kernel capture and hard-kill recovery (mandatory)

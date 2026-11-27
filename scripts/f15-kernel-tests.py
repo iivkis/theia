@@ -15,6 +15,7 @@ TESTS = (
     "routing::linux_rules::tests::kernel_hard_kill_keeps_capture_fail_closed_until_explicit_recovery",
     "routing::linux_rules::tests::kernel_socket_queue_proves_descriptor_not_just_destination",
     "routing::packet_modify::tests::kernel_tcp_split_emits_two_real_ipv4_packets",
+    "routing::packet_modify::tests::kernel_live_tcp_split_retransmission_and_ack",
 )
 
 
