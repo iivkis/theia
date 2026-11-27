@@ -408,6 +408,7 @@ mod tests {
             geodata_directory: None,
             rules: vec![],
             datasets: None,
+            diagnostic_domains: crate::routing::snapshot::default_diagnostic_domains(),
         });
         let (_, staged_routing) = live.prepare_tls_rebase(&routed, 1).unwrap();
         assert_eq!(

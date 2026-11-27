@@ -18,11 +18,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 09db26490ec2086c11a0a8dea4fa73b6d257d9b4
+          ref: dd5eaa854aa67138d5d84cf3e3fef2e6364b6571
           persist-credentials: false
       - name: Verify tested source
         shell: bash
-        run: test "$(git rev-parse HEAD)" = "09db26490ec2086c11a0a8dea4fa73b6d257d9b4"
+        run: test "$(git rev-parse HEAD)" = "dd5eaa854aa67138d5d84cf3e3fef2e6364b6571"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
