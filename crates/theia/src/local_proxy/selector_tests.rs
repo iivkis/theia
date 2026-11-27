@@ -103,7 +103,10 @@ async fn udp_socks_fixture(client: &ProxyClient) {
     use crate::udp_relay::{encode_socks, parse_socks};
     let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let port = target.local_addr().unwrap().port();
-    let app = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    // Keep the UDP client endpoint alive until the SOCKS control session
+    // closes. Dropping it with pending QUIC replies can generate an ICMP
+    // port-unreachable and a Winsock UDP reset on the proxy socket.
+    let app = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let app_port = app.local_addr().unwrap().port();
     let (mut control, local) = paired().await;
     let client = (*client).clone();
@@ -190,7 +193,7 @@ async fn udp_socks_fixture(client: &ProxyClient) {
             Some((address.clone(), port, response.as_slice()))
         );
     }
-    udp_quic_fixture(app, relay).await;
+    udp_quic_fixture(app.clone(), relay).await;
     control.shutdown().await.unwrap();
     timeout(Duration::from_secs(3), task)
         .await
@@ -200,7 +203,7 @@ async fn udp_socks_fixture(client: &ProxyClient) {
 }
 
 #[cfg(test)]
-async fn udp_quic_fixture(app: tokio::net::UdpSocket, relay: SocketAddr) {
+async fn udp_quic_fixture(app: Arc<tokio::net::UdpSocket>, relay: SocketAddr) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let der = cert.cert.der().clone();
     let mut roots = rustls::RootCertStore::empty();
