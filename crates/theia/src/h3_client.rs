@@ -18,8 +18,8 @@ use tokio::{
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
-type Tx = RequestStream<crate::h3_carrier::Tx, Bytes>;
-type Rx = RequestStream<crate::h3_carrier::Rx, Bytes>;
+type Tx = RequestStream<h3_adapter::SendSide, Bytes>;
+type Rx = RequestStream<h3_adapter::RecvSide, Bytes>;
 
 pub struct H3Client {
     remote: SocketAddr,
@@ -972,7 +972,7 @@ fn dial_error(error: dial::Error) -> ClientError {
 }
 
 struct H3Connection {
-    sender: std::sync::Mutex<h3::client::SendRequest<crate::h3_carrier::Opener, Bytes>>,
+    sender: std::sync::Mutex<h3::client::SendRequest<h3_adapter::Opener, Bytes>>,
     driver: Driver,
     binding: Option<crate::channel_binding::Key>,
     #[cfg(test)]

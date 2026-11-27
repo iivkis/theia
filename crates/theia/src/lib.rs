@@ -22,7 +22,6 @@ pub mod descriptor_cli;
 pub mod diagnostics;
 #[cfg(feature = "experimental-btls-h2")]
 mod h2_btls;
-mod h3_carrier;
 pub mod h3_client;
 pub mod h3_server;
 pub mod identity_data;
