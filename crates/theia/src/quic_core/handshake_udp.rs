@@ -1340,6 +1340,7 @@ async fn establish_inner(
             tail,
             scheduler: handshake.application_schedule,
             early_application: handshake.early_application,
+            post_handshake: (!server).then(|| Box::new(handshake.driver)),
         },
     )
     .await
