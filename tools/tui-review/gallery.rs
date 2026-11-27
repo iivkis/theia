@@ -79,7 +79,8 @@ fn visual_review_gallery() {
         assert!(screen.contains("Подключение REALITY создано") && screen.contains("Выпустить ключ доступа"));
         ui.update(&mut model, press(KeyCode::Right));
         ui.update(&mut model, press(KeyCode::Enter));
-        assert!(matches!(&ui.issuance, Some(IssueFlow::Input(id)) if id == "phone"));
+        assert!(matches!(&ui.issuance, Some(IssueFlow::Confirm(id)) if id == "phone"));
+        assert_eq!(ui.issue_kind, IssueKind::FirstKey);
         assert!(!ui.editor.as_ref().unwrap().dirty() && !ui.server_process.running());
         assert_eq!(std::fs::read(&saved).unwrap(), before);
         review_capture("state-reality-step6-key-handoff", &model, &ui);
@@ -328,10 +329,12 @@ fn visual_review_gallery() {
             ui.select_workspace_page(role, 7);
             let mut panel = RoutingPanel::new(ui.editor.as_ref().unwrap());
             panel.settings.rules = vec![
-                crate::routing::Rule { name: "Локальная сеть".into(), action: crate::routing::Action::Direct, domains: vec!["domain:example.test".into()], ips: vec![] },
-                crate::routing::Rule { name: "Заблокированные адреса".into(), action: crate::routing::Action::Blocked, domains: vec!["full:blocked.invalid".into()], ips: vec![] },
+                crate::routing::Rule { name: "Локальная сеть".into(), action: crate::routing::Action::Direct, domains: vec!["domain:example.test".into()], ips: vec![], applications: vec![] },
+                crate::routing::Rule { name: "Заблокированные адреса".into(), action: crate::routing::Action::Blocked, domains: vec!["full:blocked.invalid".into()], ips: vec![], applications: vec![] },
             ];
             ui.routing_panel = Some(panel);
+            ui.workspace_focus = WorkspaceFocus::Fields;
+            ui.routing_panel.as_mut().unwrap().action_focus = Some(0);
             review_capture("server-routing-rules", &model, &ui);
             ui.routing_panel.as_mut().unwrap().edit(Some(0));
             review_capture("server-routing-edit", &model, &ui);
@@ -375,9 +378,14 @@ fn visual_review_gallery() {
         // Capture the actual monitor, not merely the navigation page.
         let mut ui = Interaction::new(Some(Editor::load(role, path).unwrap()));
         ui.update(&mut model, press(KeyCode::F(4)));
-        assert!(ui.traffic_monitor.is_some());
-        review_capture(&format!("{prefix}-traffic-monitor-idle"), &model, &ui);
-        ui.update(&mut model, press(KeyCode::Esc));
+        if role == Role::Server {
+            assert!(ui.traffic_monitor.is_none() && ui.workspace_monitor.is_some());
+            assert_eq!(ui.workspace_page, 4);
+        } else {
+            assert!(ui.traffic_monitor.is_some());
+            review_capture(&format!("{prefix}-traffic-monitor-idle"), &model, &ui);
+            ui.update(&mut model, press(KeyCode::Esc));
+        }
         if role == Role::Server {
             let mut ui = Interaction::new(Some(Editor::load(role, path).unwrap()));
             ui.update(&mut model, press(KeyCode::F(5)));
@@ -425,8 +433,7 @@ fn visual_review_gallery() {
             &[(1,'N',"new-connection"),(2,'G',"grant-picker"),(2,'u',"new-user"),
               (2,'t',"rotate-token"),(2,'x',"disable-user"),
               (5,'Q',"limits"),(1,'E',"certificate"),(3,'s',"server-process"),
-              (3,'v',"runtime-status"),(6,'p',"network-diagnostics"),
-              (3,'a',"apply-rights"),(3,'R',"restart-preflight")]
+              (3,'v',"runtime-status"),(6,'p',"network-diagnostics")]
         } else {
             &[(1,'N',"new-profile"),(2,'i',"invitation-import"),
               (1,'E',"trust-material"),(3,'V',"connection-status")]
@@ -449,8 +456,11 @@ fn visual_review_gallery() {
             }
             if role == Role::Server && *key == 's' {
                 assert!(ui.show_server_process);
+                assert_eq!(ui.server_process.confirmation(), Some(true));
+                // Captured once as server-start-confirmation, not another view.
+            } else {
+                review_capture(&format!("{prefix}-action-{label}"), &model, &ui);
             }
-            review_capture(&format!("{prefix}-action-{label}"), &model, &ui);
             if role == Role::Server && *key == 'N' {
                 ui.update(&mut model, press(KeyCode::Char('2')));
                 assert!(ui.reality_provision.is_some());
