@@ -1048,7 +1048,7 @@ impl RoutedTcp {
         let local = HttpOnce { socket, request: request.into() };
         let flow = Some(&self.flow);
         match self.tunnel {
-            ProxyTunnel::Direct(target) => client_state::relay_direct_guarded(local, target, flow).await,
+            ProxyTunnel::Direct(target) => client_state::relay_http_direct_guarded(local, target, flow).await,
             ProxyTunnel::H2(tunnel) => tunnel.relay_guarded(local, flow).await,
             ProxyTunnel::H3(tunnel) => tunnel.relay_guarded(local, flow).await,
             // Plain HTTP is known not to be a TLS ClientHello before OPEN.
@@ -7153,6 +7153,43 @@ mod selector_tests {
                 let proxy_client = load_client(&profile).await.unwrap();
                 let snapshot = proxy_client.routing_policy().await.unwrap();
                 assert_eq!(snapshot.manifest().revision, 2);
+
+                // The same production request handler, not a parser-only
+                // fixture, must route absolute-form over H2/H3 and Pass.
+                for host in ["127.0.0.1", "localhost"] {
+                    let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let port = origin.local_addr().unwrap().port();
+                    let (mut app, local) = paired().await;
+                    let proxy = proxy_client.clone();
+                    let exchange = tokio::spawn(async move {
+                        handle(local, true, &proxy, 0).await
+                    });
+                    app.write_all(format!(
+                        "POST http://{host}:{port}/path?q=1 HTTP/1.1\r\nHost: {host}:{port}\r\nProxy-Authorization: Basic not-for-origin\r\nContent-Length: 3\r\n\r\nabc"
+                    ).as_bytes()).await.unwrap();
+                    let (mut peer, _) = origin.accept().await.unwrap();
+                    let mut wire = Vec::new();
+                    peer.read_to_end(&mut wire).await.unwrap();
+                    assert_eq!(wire, format!(
+                        "POST /path?q=1 HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nContent-Length: 3\r\n\r\nabc"
+                    ).into_bytes());
+                    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+                    peer.write_all(response).await.unwrap();
+                    peer.shutdown().await.unwrap();
+                    let mut actual = Vec::new();
+                    app.read_to_end(&mut actual).await.unwrap();
+                    assert_eq!(actual, response);
+                    exchange.await.unwrap().unwrap();
+                }
+
+                let (mut app, local) = paired().await;
+                let proxy = proxy_client.clone();
+                let denied = tokio::spawn(async move { handle(local, true, &proxy, 0).await });
+                app.write_all(b"GET http://blocked.invalid/ HTTP/1.1\r\nHost: blocked.invalid\r\n\r\n").await.unwrap();
+                let mut reply = Vec::new();
+                app.read_to_end(&mut reply).await.unwrap();
+                assert_eq!(reply, HTTP_DENIED);
+                assert!(matches!(denied.await.unwrap(), Err(ClientError::Open(ErrorCode::PolicyDenied))));
                 assert_eq!(
                     snapshot
                         .policy()

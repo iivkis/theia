@@ -445,7 +445,7 @@ pub(crate) async fn relay_direct(client: TcpStream, target: TcpStream) -> Result
 }
 
 pub(crate) async fn relay_direct_guarded(
-    client: impl AsyncRead + AsyncWrite + Unpin,
+    client: TcpStream,
     target: TcpStream,
     flow: Option<&super::flow::FlowLease>,
 ) -> Result<(), ClientError> {
@@ -463,12 +463,35 @@ pub(crate) async fn relay_direct_after_first(
 }
 
 async fn relay_direct_inner(
-    client: impl AsyncRead + AsyncWrite + Unpin,
+    client: TcpStream,
     target: TcpStream,
     upload: usize,
     download: usize,
     flow: Option<&super::flow::FlowLease>,
     action:super::PacketAction,
+) -> (Result<(), ClientError>, bool, bool) {
+    relay_direct_parts(client.into_split(), target, upload, download, flow, action).await
+}
+
+/// Plain HTTP exposes one bounded request rather than the underlying socket
+/// as upload input. Keep the existing owned TCP split for opaque tunnels.
+pub(crate) async fn relay_http_direct_guarded(
+    client: impl AsyncRead + AsyncWrite + Unpin,
+    target: TcpStream,
+    flow: Option<&super::flow::FlowLease>,
+) -> Result<(), ClientError> {
+    relay_direct_parts(
+        tokio::io::split(client), target, 0, 0, flow, super::PacketAction::Pass,
+    ).await.0
+}
+
+async fn relay_direct_parts(
+    (cr, cw): (impl AsyncRead + Unpin, impl AsyncWrite + Unpin),
+    target: TcpStream,
+    upload: usize,
+    download: usize,
+    flow: Option<&super::flow::FlowLease>,
+    action: super::PacketAction,
 ) -> (Result<(), ClientError>, bool, bool) {
     let meter = crate::traffic::enter_direct();
     meter.upload(upload);
@@ -476,7 +499,6 @@ async fn relay_direct_inner(
     let activity = crate::relay_liveness::Activity::new();
     let evidence = (upload != 0 && download != 0)
         .then(|| ExchangeEvidence(std::sync::atomic::AtomicU8::new(0)));
-    let (cr, cw) = tokio::io::split(client);
     let (tr, tw) = target.into_split();
     let result = activity
         .run(
