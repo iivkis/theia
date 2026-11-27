@@ -260,7 +260,39 @@ pub(crate) async fn next_datagram(
 async fn relay_local(
     socket: &UdpSocket,
     verification_deadline: Option<Duration>,
+    first: Option<Vec<u8>>,
+    upload: mpsc::Receiver<Vec<u8>>,
+    download: mpsc::Sender<Vec<u8>>,
+    flow: Option<&crate::routing::flow::FlowLease>,
+) -> Result<(), LocalRelayError> {
+    relay_local_batch(socket, verification_deadline, first, None, upload, download, flow).await
+}
+
+/// Explicit native lab only. Ordinary proxy relay still refuses
+/// reachability-only QUIC as Modify. The actual first datagram must split.
+#[cfg(target_os = "linux")]
+pub(crate) async fn relay_quic_lab(
+    verified: &crate::routing::dpi::VerifiedUdp,
+    first: Vec<u8>,
+    upload: mpsc::Receiver<Vec<u8>>,
+    download: mpsc::Sender<Vec<u8>>,
+    flow: &crate::routing::flow::FlowLease,
+) -> Result<(), ClientError> {
+    if !verified.admissible()? {
+        return Err(ClientError::Open(ErrorCode::PolicyDenied));
+    }
+    let parts = verified.quic_batch(&first).ok_or(ClientError::Open(ErrorCode::PolicyDenied))?;
+    let result = relay_local_batch(&verified.socket, Some(FIRST_RESPONSE), Some(first), Some(parts), upload, download, Some(flow)).await;
+    if matches!(&result, Err(LocalRelayError::Peer(_))) { verified.failed(); }
+    result.map_err(LocalRelayError::into_client)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn relay_local_batch(
+    socket: &UdpSocket,
+    verification_deadline: Option<Duration>,
     mut first: Option<Vec<u8>>,
+    first_batch: Option<Vec<Vec<u8>>>,
     mut upload: mpsc::Receiver<Vec<u8>>,
     download: mpsc::Sender<Vec<u8>>,
     flow: Option<&crate::routing::flow::FlowLease>,
@@ -275,9 +307,23 @@ async fn relay_local(
         let data = first
             .take()
             .ok_or(LocalRelayError::Application(ClientError::Protocol))?;
+        let parts = match first_batch {
+            Some(parts) => {
+                if parts.len() < 2 || parts.len() > 3 || parts.iter().any(|p| p.is_empty() || p.len() > protocol::MAX_DATAGRAM)
+                    || parts.concat() != data {
+                    return Err(LocalRelayError::Application(ClientError::Protocol));
+                }
+                parts
+            }
+            None => vec![data.clone()],
+        };
         first_send.attempt().map_err(LocalRelayError::Application)?;
-        timeout(deadline, send_datagram(socket, &data))
-            .await
+        // One deadline for the entire actual emission. Failure/cancellation
+        // after any attempt is terminal; no replay of the original flight.
+        timeout(deadline, async {
+            for part in &parts { send_datagram(socket, part).await?; }
+            Ok::<(), io::Error>(())
+        }).await
             .map_err(|_| LocalRelayError::Peer(ClientError::Timeout))?
             .map_err(|_| LocalRelayError::Peer(ClientError::Io))?;
         traffic.upload(data.len());
@@ -628,6 +674,25 @@ mod tests {
         assert_eq!(n, 0);
         drop(up);
         assert!(task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn multipacket_first_emission_preserves_order_and_datagram_boundaries() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = connect(peer.local_addr().unwrap()).await.unwrap();
+        let (up_tx, up_rx) = mpsc::channel(QUEUE);
+        let (down_tx, _down_rx) = mpsc::channel(QUEUE);
+        let relay = tokio::spawn(async move {
+            relay_local_batch(&socket, Some(Duration::from_secs(2)), Some(b"abcdef".to_vec()),
+                Some(vec![b"abc".to_vec(), b"def".to_vec()]), up_rx, down_tx, None).await
+        });
+        let mut bytes = [0;16];
+        for expected in [b"abc",b"def"] {
+            let (n, _) = timeout(Duration::from_secs(2),peer.recv_from(&mut bytes)).await.unwrap().unwrap();
+            assert_eq!(&bytes[..n],expected);
+        }
+        drop(up_tx);
+        relay.await.unwrap().unwrap();
     }
 
     #[tokio::test]

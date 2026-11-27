@@ -2423,6 +2423,7 @@ impl NativeIngress {
                 let (carrier, flow, address) = self.redirect(key).await?;
                 let tunnel = crate::routing::carrier_socket::scope(self.registrar()?, carrier.open_udp(address, key.destination.port())).await?;
                 let reply = crate::routing::linux_ingress::UdpReply::open(&first).map_err(|_| ClientError::Io)?;
+                let _reply_admission = self.registrar()?.map(|r| reply.admit_reply(r.as_ref())).transpose().map_err(|_| ClientError::Io)?;
                 let (tx, up) = tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
                 let (down, mut rx) = tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
                 tx.send(first.payload).await.map_err(|_| ClientError::Io)?;
@@ -2450,6 +2451,81 @@ impl NativeIngress {
                     result = async { tokio::try_join!(feed, replies).map(|_| ()) } => result,
                 }
             } => result,
+        }
+    }
+
+    /// Actual multi-datagram QUIC Modify in the isolated Linux lab.
+    /// The caller supplies only kernel-captured UDP and an untrusted
+    /// probe-name hint. Domain and application evidence remain Unknown;
+    /// the authenticated policy must conclusively authorize Modify without
+    /// that hint. No ordinary proxy or production native activation.
+    #[cfg(target_os = "linux")]
+    pub async fn relay_linux_quic_lab(
+        &self,
+        first: crate::routing::linux_ingress::CapturedDatagram,
+        mut subsequent: tokio::sync::mpsc::Receiver<crate::routing::linux_ingress::CapturedDatagram>,
+        domain: &str,
+    ) -> Result<(), ClientError> {
+        use crate::routing::{Evidence, PacketAction, packet::Transport, carrier_socket};
+        let denied = || ClientError::Open(ErrorCode::PolicyDenied);
+        let key = first.key;
+        if key.transport != Transport::Udp || key.destination.port() != 443
+            || subsequent.max_capacity() > crate::udp_relay::QUEUE
+            || !crate::server::allowed_destination(key.destination.ip(), false) { return Err(denied()); }
+        let registrar = self.registrar()?.ok_or_else(denied)?;
+        tokio::select! {
+            biased;
+            () = self.stopped() => Err(denied()),
+            result = carrier_socket::scope(Some(registrar.clone()), async {
+                self.ensure_running()?;
+                let name = crate::routing::domain_name(domain).map_err(|_| denied())?;
+                if crate::routing::packet_modify::quic_initial_datagrams(&first.payload, &name).is_none() {
+                    return Err(denied());
+                }
+                let (carrier, cache) = match &self.client {
+                    ProxyClient::Direct(c) => (c.carrier.clone(), &c.routing),
+                    ProxyClient::Reality(c) => (c.generation().await?.carrier.clone(), &c.routing),
+                };
+                let snapshot = cache.get(|known| carrier.fetch_routing(known)).await?;
+                let digest = snapshot.digest();
+                for evidence in [Evidence::Unknown, Evidence::Known(name.as_str())] {
+                    if snapshot.policy().classify_with_application(evidence,Evidence::Known(key.destination.ip()),Evidence::Unknown)
+                        .map_err(|_| denied())?.action() != Some(Action::DirectDpi) { return Err(denied()); }
+                }
+                let ips = carrier.resolve_routing(&name,digest).await?;
+                if !ips.contains(&key.destination.ip()) { return Err(denied()); }
+                let verified = cache.dpi.open_quic_udp(&name,443,&[key.destination.ip()],digest).await.ok_or_else(denied)?;
+                if verified.quic_batch(&first.payload).is_none() || verified.socket.peer_addr().ok() != Some(key.destination)
+                    || !verified.socket.local_addr().is_ok_and(|a| a.ip() == key.source.ip())
+                    || !verified.admissible()? { return Err(denied()); }
+                let flow = cache.flows.begin_native(cache.dpi.clone(),key,digest,PacketAction::Modify)?;
+                let _local_admission = registrar.udp(&verified.socket,key.destination).map_err(|_| denied())?;
+                let reply = crate::routing::linux_ingress::UdpReply::open(&first).map_err(|_| ClientError::Io)?;
+                let _reply_admission = reply.admit_reply(registrar.as_ref()).map_err(|_| denied())?;
+                let (tx,up) = tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
+                let (down,mut rx) = tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
+                let relay = crate::udp_relay::relay_quic_lab(&verified,first.payload,up,down,&flow);
+                let feed = async move {
+                    while let Some(datagram) = subsequent.recv().await {
+                        if datagram.key != key || datagram.payload.len() > crate::protocol::MAX_DATAGRAM {
+                            return Err(ClientError::Protocol);
+                        }
+                        tx.send(datagram.payload).await.map_err(|_| ClientError::Io)?;
+                    }
+                    Ok::<(),ClientError>(())
+                };
+                let replies = async {
+                    while let Some(bytes) = rx.recv().await {
+                        if !flow.committed(PacketAction::Modify) { return Err(denied()); }
+                        reply.send(&bytes).await.map_err(|_| ClientError::Io)?;
+                    }
+                    Ok::<(),ClientError>(())
+                };
+                tokio::select! {
+                    result=relay=>result,
+                    result=async { tokio::try_join!(feed,replies).map(|_| ()) }=>result,
+                }
+            }) => result,
         }
     }
 

@@ -107,6 +107,17 @@ impl VerifiedUdp {
                 .is_ok_and(|local| self.key.network.matches_local(local))
             && self.engine.cached_udp(&self.key) == Some(true))
     }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn quic_batch(&self, first: &[u8]) -> Option<Vec<Vec<u8>>> {
+        // Current independent reachability preflight authenticates v1
+        // only. A v2 candidate must not inherit that evidence.
+        if self.strategy != UdpStrategy::QuicV1
+            || crate::reality_quic_wire::long(first)?.version != crate::reality_quic_wire::V1 {
+            return None;
+        }
+        super::packet_modify::quic_initial_datagrams(first, &self.key.name)
+    }
+
     pub(crate) fn failed(&self) {
         self.engine.remember_udp(self.key.clone(), false);
     }

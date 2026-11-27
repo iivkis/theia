@@ -309,6 +309,11 @@ impl UdpReply {
         Ok(Self { socket: tokio::net::UdpSocket::from_std(socket)?, key })
     }
 
+    pub(crate) fn admit_reply(&self, registrar: &dyn super::carrier_socket::Registrar) -> io::Result<super::carrier_socket::Lease> {
+        // Only this connected reverse-path socket and original local peer.
+        registrar.udp(&self.socket, self.key.source)
+    }
+
     pub(crate) async fn send(&self, bytes: &[u8]) -> io::Result<()> {
         if bytes.len() > crate::protocol::MAX_DATAGRAM || self.socket.local_addr()? != self.key.destination
             || self.socket.peer_addr()? != self.key.source {
