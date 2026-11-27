@@ -401,10 +401,14 @@ require("ref: 917417b09f209334939c38551112081c480eb958" in f19_performance
         and "--require-comparison --policy tests/benchmark/f19-diagnostic-policy.json" in f19_performance,
         "isolated exact pre-batch overhead comparison remains mandatory")
 for name in ("browser-e2e", "f14-build", "native-performance", "f19-performance"):
-    require("os: [ubuntu-latest, windows-latest]" in job(name)
+    # The Linux ELF must target the exact WSL guest release for F-14.
+    linux = "ubuntu-24.04" if name == "f14-build" else "ubuntu-latest"
+    require(f"os: [{linux}, windows-latest]" in job(name)
             and "fail-fast: false" in job(name)
             and "continue-on-error" not in job(name),
             f"{name}: both native OS jobs remain mandatory")
+require("distribution: Ubuntu-24.04" in cross_host,
+        "F-14 Linux builder and WSL guest must use the same release")
 require("f14-linux-server" not in browser and "f14-windows-compiled" not in browser,
         "F-14 artifacts must not depend on browser or measurements")
 require("THEIA_PERF_BASELINE_SHA: abbb89834a406b4c53be0f1ac0b3ab1a65e66f8d" in performance
