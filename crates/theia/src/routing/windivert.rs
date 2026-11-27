@@ -157,6 +157,7 @@ struct EndpointHistory {
     connect: Option<EndpointCandidate>,
     flow: Option<EndpointCandidate>,
     terminal: bool,
+    closed_tuple: Option<EndpointTuple>,
 }
 pub struct CandidateLedger {
     entries: std::collections::HashMap<u64,EndpointHistory>,
@@ -181,7 +182,13 @@ impl CandidateLedger {
         let history=self.entries.entry(event.endpoint).or_default();
         if history.terminal { return; }
         if matches!((event.layer,event.event),(2,2)|(3,7)) {
-            history.terminal=true;return;
+            history.closed_tuple=event.tuple();
+            if history.closed_tuple.is_none() && history.connect.is_none() && history.flow.is_none() {
+                self.invalidate();
+            } else {
+                history.terminal=true;
+            }
+            return;
         }
         // Bind/listen may not yet have a remote. They cannot establish
         // or refresh an exact candidate. Incoming flows are not admitted.
@@ -191,13 +198,13 @@ impl CandidateLedger {
         }
         let slot=if event.layer==2 { &mut history.flow } else { &mut history.connect };
         if let Some(previous)=slot {
-            if *previous!=event { history.terminal=true; }
+            if *previous!=event { self.invalidate(); }
             return;
         }
         *slot=Some(event);
         if let (Some(a),Some(b))=(history.connect,history.flow) {
             if a.pid!=b.pid || a.tuple()!=b.tuple() || a.timestamp>b.timestamp {
-                history.terminal=true;
+                self.invalidate();
             }
         }
     }
@@ -211,7 +218,7 @@ impl CandidateLedger {
         for history in self.entries.values() {
             // Keep terminal matching records as ambiguity tombstones for
             // the entire epoch. A tuple reused after close isn't trusted.
-            let related=[history.connect,history.flow].into_iter().flatten().any(|e|e.tuple()==Some(wanted));
+            let related=history.closed_tuple==Some(wanted) || [history.connect,history.flow].into_iter().flatten().any(|e|e.tuple()==Some(wanted));
             if !related { continue; }
             if history.terminal || matched.is_some() { return None; }
             let (a,b)=(history.connect?,history.flow?);
@@ -222,6 +229,72 @@ impl CandidateLedger {
             matched=Some(b);
         }
         matched
+    }
+}
+
+/// Bound registry for the existing H2/H3 registrar hooks. A lease records
+/// only the actual owned socket endpoint, exact concrete local/remote tuple
+/// and process. It is not a process-wide or destination-wide filter permit.
+/// Packet-level agreement remains a candidate; no production injector
+/// consumes it until the independent guard and attribution gates pass.
+#[derive(Clone,Default)]
+pub struct CarrierRegistry {
+    state:std::sync::Arc<std::sync::Mutex<CarrierState>>,
+}
+#[derive(Default)]
+struct CarrierState {
+    entries:std::collections::HashMap<u64,CarrierEntry>,
+    retired:bool,
+    next:u64,
+}
+#[derive(Clone,Copy)]
+struct CarrierEntry {
+    generation:u64,
+    pid:u32,
+    tuple:EndpointTuple,
+    live:bool,
+}
+struct CarrierLease {
+    registry:CarrierRegistry,
+    endpoint:u64,
+    generation:u64,
+}
+impl Drop for CarrierLease {
+    fn drop(&mut self) {
+        if let Ok(mut state)=self.registry.state.lock() {
+            if let Some(entry)=state.entries.get_mut(&self.endpoint) {
+                if entry.generation==self.generation { entry.live=false; }
+            }
+        }
+    }
+}
+impl CarrierRegistry {
+    fn register(&self,endpoint:u64,pid:u32,tuple:EndpointTuple)->Option<CarrierLease> {
+        if endpoint==0 || pid==0 || tuple.local.port()==0 || tuple.remote.port()==0
+            || tuple.local.ip().is_unspecified() || tuple.remote.ip().is_unspecified()
+            || tuple.local.ip().is_multicast() || tuple.remote.ip().is_multicast()
+            || tuple.local.is_ipv4()!=tuple.remote.is_ipv4() || tuple.local==tuple.remote
+            || matches!(tuple.local,std::net::SocketAddr::V6(v) if v.scope_id()!=0 || v.ip().to_ipv4_mapped().is_some() || v.ip().is_unicast_link_local())
+            || matches!(tuple.remote,std::net::SocketAddr::V6(v) if v.scope_id()!=0 || v.ip().to_ipv4_mapped().is_some() || v.ip().is_unicast_link_local())
+        { return None; }
+        let mut state=self.state.lock().ok()?;
+        if state.retired { return None; }
+        // Never reuse a retired kernel endpoint in the same epoch.
+        if state.entries.len()>=4096 || state.entries.contains_key(&endpoint)
+            || state.entries.values().any(|e|e.tuple==tuple)
+        { state.retired=true;return None; }
+        state.next=state.next.checked_add(1)?;
+        let generation=state.next;
+        state.entries.insert(endpoint,CarrierEntry {generation,pid,tuple,live:true});
+        Some(CarrierLease {registry:self.clone(),endpoint,generation})
+    }
+    pub fn retire(&self) {
+        if let Ok(mut state)=self.state.lock() { state.retired=true; }
+    }
+    pub fn matches_candidate(&self,event:&EndpointCandidate)->bool {
+        self.state.lock().ok().is_some_and(|state|!state.retired &&
+            state.entries.get(&event.endpoint).is_some_and(|entry|entry.live && entry.pid==event.pid &&
+                event.outbound && event.tuple()==Some(entry.tuple) && matches!((event.layer,event.event),(2,1)|(3,4))))
     }
 }
 
@@ -789,6 +862,21 @@ mod native {
         Ok(endpoint)
     }
 
+    impl crate::routing::carrier_socket::Registrar for CarrierRegistry {
+        fn tcp(&self,socket:&tokio::net::TcpSocket,peer:std::net::SocketAddr)->io::Result<crate::routing::carrier_socket::Lease> {
+            let lease=self.register(socket_endpoint(socket)?,std::process::id(),EndpointTuple {
+                local:socket.local_addr()?,remote:peer,transport:super::super::packet::Transport::Tcp
+            }).ok_or(io::ErrorKind::PermissionDenied)?;
+            Ok(crate::routing::carrier_socket::Lease::retain(lease))
+        }
+        fn udp(&self,socket:&tokio::net::UdpSocket,peer:std::net::SocketAddr)->io::Result<crate::routing::carrier_socket::Lease> {
+            let lease=self.register(socket_endpoint(socket)?,std::process::id(),EndpointTuple {
+                local:socket.local_addr()?,remote:peer,transport:super::super::packet::Transport::Udp
+            }).ok_or(io::ErrorKind::PermissionDenied)?;
+            Ok(crate::routing::carrier_socket::Lease::retain(lease))
+        }
+    }
+
     fn guarded_lab(api:&Api,cancelled:&AtomicBool)->io::Result<()> {
         use std::os::windows::io::AsRawHandle;
         use std::process::{Child,Command,Stdio};
@@ -876,6 +964,14 @@ mod native {
         api.bounded(&handle)?;
         api.bounded(&flow)?;
         let endpoint=socket_endpoint(&sender)?;
+        let registry=CarrierRegistry::default();
+        let tuple=EndpointTuple {local:src,remote:dst,transport:super::super::packet::Transport::Udp};
+        let lease=registry.register(endpoint,pid,tuple).ok_or(io::ErrorKind::PermissionDenied)?;
+        let network_filter=std::ffi::CString::new(format!(
+            "outbound and loopback and !impostor and udp and ip.SrcAddr == 127.0.0.1 and ip.DstAddr == 127.0.0.1 and udp.SrcPort == {} and udp.DstPort == {}",src.port(),dst.port()
+        )).map_err(|_|io::ErrorKind::InvalidInput)?;
+        let network=api.open_handle(&network_filter,0,0x10)?;
+        api.bounded(&network)?;
         sender.connect(dst)?;
         sender.send(b"correlation-lab")?;
         let deadline=Instant::now()+Duration::from_secs(3);
@@ -888,17 +984,35 @@ mod native {
         if established.layer!=2 || established.event!=1 || established.endpoint!=endpoint
             || established.pid!=pid || established.tuple()!=event.tuple()
             || socket_endpoint(&sender)?!=endpoint { return Err(io::ErrorKind::InvalidData.into()); }
-        let mut ledger=CandidateLedger::new(8,i64::MAX).ok_or(io::ErrorKind::InvalidData)?;
+        let mut frequency=0i64;
+        if unsafe { windows_sys::Win32::System::Performance::QueryPerformanceFrequency(&mut frequency) }==0 || frequency<=0 {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        let max_age=frequency.checked_mul(3).ok_or(io::ErrorKind::InvalidData)?;
+        let mut ledger=CandidateLedger::new(8,max_age).ok_or(io::ErrorKind::InvalidData)?;
         ledger.observe(event);
         ledger.observe(established);
-        // No real NETWORK packet is authenticated by event agreement.
-        // The separate lab capture verifies byte-level transport.
+        let (packet,address)=api.receive(&network,cancelled,deadline)?;
+        let observed=address.network_inner(&packet,true).map_err(|_|io::ErrorKind::InvalidData)?;
+        let candidate=ledger.correlate(&observed).ok_or(io::ErrorKind::PermissionDenied)?;
+        if candidate!=established || !registry.matches_candidate(&candidate) || !packet.ends_with(b"correlation-lab")
+            || socket_endpoint(&sender)?!=endpoint { return Err(io::ErrorKind::PermissionDenied.into()); }
+        api.send(&network,&packet,&address,cancelled,deadline)?;
+        receiver.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let mut bytes=[0u8;32];
+        let (n,from)=receiver.recv_from(&mut bytes)?;
+        if from!=src || &bytes[..n]!=b"correlation-lab" { return Err(io::ErrorKind::InvalidData.into()); }
+        drop(lease);
+        if registry.matches_candidate(&candidate) { return Err(io::ErrorKind::PermissionDenied.into()); }
         drop(sender);
         let closed=api.receive_event(&handle,cancelled,deadline)?;
         if closed.pid!=pid || closed.endpoint!=event.endpoint || closed.event!=7 || closed.timestamp<event.timestamp {
             return Err(io::ErrorKind::InvalidData.into());
         }
         ledger.observe(closed);
+        if ledger.correlate(&observed).is_some() { return Err(io::ErrorKind::PermissionDenied.into()); }
+        registry.retire();
+        api.retire(network)?;
         api.retire(flow)?;
         api.retire(handle)
     }
@@ -1067,6 +1181,27 @@ mod tests {
         let mut small=CandidateLedger::new(1,20).unwrap();
         small.observe(event);small.observe(flow);small.observe(EndpointCandidate {endpoint:5,..event});
         assert!(small.correlate(&packet).is_none());
+    }
+    #[test]
+    fn carrier_registry_is_exact_and_lease_retirement_is_terminal() {
+        let local="192.0.2.1:1000".parse().unwrap();
+        let remote="198.51.100.2:443".parse().unwrap();
+        let tuple=EndpointTuple {local,remote,transport:super::super::packet::Transport::Udp};
+        let registry=CarrierRegistry::default();
+        let lease=registry.register(9,42,tuple).unwrap();
+        let words=|v:&str| u128::from(v.parse::<std::net::Ipv6Addr>().unwrap()).to_le_bytes();
+        let event=EndpointCandidate {endpoint:9,pid:42,timestamp:100,event:1,layer:2,protocol:17,outbound:true,
+            local_port:1000,remote_port:443,local_words:words("::ffff:192.0.2.1"),remote_words:words("::ffff:198.51.100.2")};
+        assert!(registry.matches_candidate(&event));
+        assert!(!registry.matches_candidate(&EndpointCandidate {pid:43,..event}));
+        assert!(!registry.matches_candidate(&EndpointCandidate {endpoint:10,..event}));
+        assert!(!registry.matches_candidate(&EndpointCandidate {remote_port:444,..event}));
+        assert!(!registry.matches_candidate(&EndpointCandidate {event:2,..event}));
+        drop(lease);
+        assert!(!registry.matches_candidate(&event));
+        assert!(registry.register(9,42,tuple).is_none());
+        assert!(registry.register(10,42,EndpointTuple {remote:"198.51.100.2:444".parse().unwrap(),..tuple}).is_none());
+        registry.retire();
     }
     #[test]
     fn flow_event_is_candidate_only_and_wrong_event_is_denied() {
