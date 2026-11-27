@@ -62,6 +62,9 @@ impl WfpLabSession {
     pub fn open(compartment: u32, port: u16) -> io::Result<Self> {
         use windows_sys::Win32::{Foundation::INVALID_HANDLE_VALUE, Storage::FileSystem::{CreateFileW, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL}};
         if compartment <= 1 || port == 0 { return Err(io::Error::from(io::ErrorKind::InvalidInput)); }
+        if unsafe { windows_sys::Win32::NetworkManagement::IpHelper::GetCurrentThreadCompartmentId() } != compartment {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
         let name: Vec<u16> = r"\\.\TheiaWfpLab".encode_utf16().chain([0]).collect();
         let raw = unsafe { CreateFileW(name.as_ptr(), 0x4000_0000, 0, ptr::null(), OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, ptr::null_mut()) };
         if raw == INVALID_HANDLE_VALUE || raw.is_null() { return Err(io::Error::last_os_error()); }
@@ -78,9 +81,16 @@ impl WfpLabSession {
 
     /// Register the actual ALE endpoint handle before the TCP connect.
     /// The kernel consumes one exact (process, endpoint, target) permit.
-    /// It is not a process-wide exemption. H3 and production carrier
-    /// construction are not connected to this experimental API yet.
+    /// It is not a process-wide exemption.
     pub fn authorize_tcp_carrier(&self, socket: &tokio::net::TcpSocket, target: SocketAddr) -> io::Result<()> {
+        self.authorize_carrier(socket, target, 6)
+    }
+
+    fn authorize_carrier(&self, socket: &impl AsRawSocket, target: SocketAddr, protocol: u8) -> io::Result<()> {
+        use windows_sys::Win32::NetworkManagement::IpHelper::GetCurrentThreadCompartmentId;
+        if unsafe { GetCurrentThreadCompartmentId() } != self.compartment || !matches!(protocol,6|17) {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
         if target.port() == 0 || target.ip().is_unspecified() || target.ip().is_multicast()
             || matches!(target, SocketAddr::V6(v6) if v6.scope_id() != 0 || v6.ip().to_ipv4_mapped().is_some() || v6.ip().is_unicast_link_local()) {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
@@ -92,6 +102,7 @@ impl WfpLabSession {
         let mut request = [0u8;28];
         request[..8].copy_from_slice(&endpoint.to_be_bytes());
         request[8] = if target.is_ipv4() { 4 } else { 6 };
+        request[9] = protocol;
         request[10..12].copy_from_slice(&target.port().to_be_bytes());
         match target.ip() {
             std::net::IpAddr::V4(ip) => request[12..16].copy_from_slice(&ip.octets()),
@@ -135,9 +146,11 @@ impl super::carrier_socket::Registrar for WfpLabSession {
         self.authorize_tcp_carrier(socket, peer)?;
         Ok(super::carrier_socket::Lease::default())
     }
-    fn udp(&self, _: &tokio::net::UdpSocket, _: SocketAddr) -> io::Result<super::carrier_socket::Lease> {
-        // No Windows UDP carrier exemption is proven yet. A local
-        // policy failure must not look like network unreachability.
-        Err(io::ErrorKind::PermissionDenied.into())
+    fn udp(&self, socket: &tokio::net::UdpSocket, peer: SocketAddr) -> io::Result<super::carrier_socket::Lease> {
+        // A connected, pinned H3 socket uses one ALE admission before
+        // any datagram; no user UDP or process-wide permit is granted.
+        if socket.peer_addr().is_ok() { return Err(io::ErrorKind::PermissionDenied.into()); }
+        self.authorize_carrier(socket, peer, 17)?;
+        Ok(super::carrier_socket::Lease::default())
     }
 }

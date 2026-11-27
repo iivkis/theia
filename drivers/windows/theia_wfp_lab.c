@@ -31,6 +31,7 @@ typedef struct _ENDPOINT_PERMIT {
     UINT64 endpoint;
     UINT64 expires;
     UCHAR family;
+    UCHAR protocol;
     USHORT port;
     UCHAR address[16];
 } ENDPOINT_PERMIT;
@@ -153,7 +154,7 @@ static NTSTATUS control(PDEVICE_OBJECT dev, PIRP irp) {
         status = STATUS_SUCCESS;
     } else if (code == IOCTL_ENDPOINT && len == ENDPOINT_SIZE && State.active
         && State.file == stack->FileObject && State.process == PsGetCurrentProcess()
-        && read64(bytes) != 0 && bytes[9] == 0 && read16(bytes + 10) != 0
+        && read64(bytes) != 0 && (bytes[9] == IPPROTO_TCP || bytes[9] == IPPROTO_UDP) && read16(bytes + 10) != 0
         && valid_ip(bytes[8], bytes + 12, FALSE)) {
         UINT64 now = KeQueryInterruptTime();
         LONG slot = -1;
@@ -169,6 +170,7 @@ static NTSTATUS control(PDEVICE_OBJECT dev, PIRP irp) {
             p->endpoint = read64(bytes);
             p->expires = now + 10ull * 10000000ull;
             p->family = bytes[8];
+            p->protocol = bytes[9];
             p->port = read16(bytes + 10);
             RtlCopyMemory(p->address, bytes + 12, 16);
             status = STATUS_SUCCESS;
@@ -231,7 +233,7 @@ static VOID NTAPI classify(
         protocol = values->incomingValue[FWPS_FIELD_ALE_CONNECT_REDIRECT_V6_IP_PROTOCOL].value.uint8;
         compartment = values->incomingValue[FWPS_FIELD_ALE_CONNECT_REDIRECT_V6_COMPARTMENT_ID].value.uint32;
     } else goto done;
-    if (protocol != IPPROTO_TCP || classifyContext == NULL
+    if ((protocol != IPPROTO_TCP && protocol != IPPROTO_UDP) || classifyContext == NULL
         || !(meta->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID)) goto done;
 
     KeAcquireSpinLock(&StateLock, &irql);
@@ -261,7 +263,7 @@ static VOID NTAPI classify(
         || dstPort == 0) goto apply;
 
     if (redirectState == FWPS_CONNECTION_REDIRECTED_BY_SELF) {
-        if (dstPort == listenPort && equal(src, dst, 16) && request->localRedirectTargetPID == pid
+        if (protocol == IPPROTO_TCP && dstPort == listenPort && equal(src, dst, 16) && request->localRedirectTargetPID == pid
             && request->localRedirectHandle == Redirect) permitted = TRUE;
         goto apply;
     }
@@ -276,7 +278,7 @@ static VOID NTAPI classify(
             for (ULONG i = 0; i < MAX_ENDPOINTS; ++i) {
                 ENDPOINT_PERMIT *p = &State.permits[i];
                 if (p->endpoint == meta->transportEndpointHandle && p->expires > now
-                    && p->family == family && p->port == dstPort && equal(p->address, dst, 16)) {
+                    && p->family == family && p->protocol == protocol && p->port == dstPort && equal(p->address, dst, 16)) {
                     RtlZeroMemory(p, sizeof(*p));
                     permitted = TRUE;
                     break;
@@ -286,6 +288,10 @@ static VOID NTAPI classify(
         KeReleaseSpinLock(&StateLock, irql);
         goto apply;
     }
+
+    // UDP permits apply ONLY to exact service endpoints. User UDP is
+    // still denied until transport-layer reverse injection is implemented.
+    if (protocol != IPPROTO_TCP) goto apply;
 
     // v1 supports only an already assigned concrete source tuple, to
     // preserve and verify the accepted peer exactly. No guessed identity.

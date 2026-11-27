@@ -51,6 +51,7 @@ pub(crate) enum SessionIo {
         scope: NetworkScope,
         options: Options,
         _carrier: crate::routing::carrier_socket::Lease,
+        pinned: Option<SocketAddr>,
     },
     Routed {
         socket: Arc<UdpSocket>,
@@ -71,16 +72,17 @@ impl From<UdpSocket> for SessionIo {
 
 impl SessionIo {
     pub(crate) fn direct(socket: UdpSocket, scope: NetworkScope) -> Self {
-        Self::direct_carrier(socket, scope, Default::default())
+        Self::direct_carrier(socket, scope, Default::default(), None)
     }
 
-    pub(crate) fn direct_carrier(socket: UdpSocket, scope: NetworkScope, carrier: crate::routing::carrier_socket::Lease) -> Self {
+    pub(crate) fn direct_carrier(socket: UdpSocket, scope: NetworkScope, carrier: crate::routing::carrier_socket::Lease, pinned: Option<SocketAddr>) -> Self {
         let options = Options::configure(&socket);
         Self::Direct {
             socket,
             scope,
             options,
             _carrier: carrier,
+            pinned,
         }
     }
 
@@ -158,6 +160,10 @@ impl SessionIo {
 
     pub(crate) async fn send_to(&self, bytes: &[u8], peer: SocketAddr) -> io::Result<usize> {
         match self {
+            Self::Direct { socket: s, pinned: Some(target), .. } => {
+                if peer != *target || s.peer_addr()? != *target { return Err(io::ErrorKind::PermissionDenied.into()); }
+                s.send(bytes).await
+            }
             Self::Direct { socket: s, .. } => s.send_to(bytes, peer).await,
             Self::Routed {
                 socket, incoming, local, options, ..
@@ -177,6 +183,12 @@ impl SessionIo {
         ect: bool,
     ) -> io::Result<(usize, Mark)> {
         match self {
+            Self::Direct { socket, pinned: Some(target), .. } => {
+                if peer != *target || socket.peer_addr()? != *target { return Err(io::ErrorKind::PermissionDenied.into()); }
+                // Connected scoped sockets never send ancillary destination
+                // overrides. ECN is not claimed for these lab emissions.
+                Ok((socket.send(bytes).await?, Mark::NotEct))
+            }
             Self::Direct {
                 socket, options, ..
             } => options.send(socket, bytes, peer, ect).await,

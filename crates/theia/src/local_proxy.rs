@@ -538,6 +538,10 @@ impl RealityClient {
 /// Preserve IPv6 scope, discard the ephemeral local port. A failed observation
 /// must never authorize reuse of an earlier negative cache entry.
 pub(crate) fn route_source(remote: SocketAddr) -> Option<SocketAddr> {
+    #[cfg(target_os = "windows")]
+    if crate::routing::carrier_socket::active() {
+        return windows_route_source(remote);
+    }
     let bind = if remote.is_ipv4() {
         SocketAddr::from(([0, 0, 0, 0], 0))
     } else {
@@ -551,6 +555,42 @@ pub(crate) fn route_source(remote: SocketAddr) -> Option<SocketAddr> {
     }
     local.set_port(0);
     Some(local)
+}
+
+// Read-only route query, not a throwaway UDP connect (which would itself
+// require WFP ALE permission while capture is active).
+#[cfg(target_os = "windows")]
+fn windows_route_source(remote: SocketAddr) -> Option<SocketAddr> {
+    use std::{mem, ptr};
+    use windows_sys::Win32::{NetworkManagement::IpHelper::{GetBestInterfaceEx, GetBestRoute2, MIB_IPFORWARD_ROW2}, Networking::WinSock::{SOCKADDR_INET, AF_INET, AF_INET6}};
+    if remote.ip().is_unspecified() || remote.ip().is_multicast() { return None; }
+    let mut dst: SOCKADDR_INET = unsafe { mem::zeroed() };
+    let mut source: SOCKADDR_INET = unsafe { mem::zeroed() };
+    if mem::size_of::<SOCKADDR_INET>() != 28 { return None; }
+    let raw = unsafe { std::slice::from_raw_parts_mut((&mut dst as *mut SOCKADDR_INET).cast::<u8>(),28) };
+    match remote {
+        SocketAddr::V4(v4) => {
+            raw[..2].copy_from_slice(&AF_INET.to_ne_bytes());
+            raw[4..8].copy_from_slice(&v4.ip().octets());
+        }
+        SocketAddr::V6(v6) => {
+            if v6.scope_id() != 0 || v6.ip().to_ipv4_mapped().is_some() { return None; }
+            raw[..2].copy_from_slice(&AF_INET6.to_ne_bytes());
+            raw[8..24].copy_from_slice(&v6.ip().octets());
+        }
+    }
+    let mut interface = 0u32;
+    if unsafe { GetBestInterfaceEx((&dst as *const SOCKADDR_INET).cast(), &mut interface) } != 0 || interface == 0 { return None; }
+    let mut route: MIB_IPFORWARD_ROW2 = unsafe { mem::zeroed() };
+    if unsafe { GetBestRoute2(ptr::null(), interface, ptr::null(), &dst, 0, &mut route, &mut source) } != 0 { return None; }
+    let raw = unsafe { std::slice::from_raw_parts((&source as *const SOCKADDR_INET).cast::<u8>(),28) };
+    let family = u16::from_ne_bytes(raw[..2].try_into().ok()?);
+    let ip = match (remote, family) {
+        (SocketAddr::V4(_), AF_INET) => IpAddr::V4(Ipv4Addr::from(<[u8;4]>::try_from(&raw[4..8]).ok()?)),
+        (SocketAddr::V6(_), AF_INET6) if raw[24..28] == [0;4] => IpAddr::V6(Ipv6Addr::from(<[u8;16]>::try_from(&raw[8..24]).ok()?)),
+        _ => return None,
+    };
+    (!ip.is_unspecified() && !ip.is_multicast()).then_some(SocketAddr::new(ip,0))
 }
 
 #[derive(Default)]
