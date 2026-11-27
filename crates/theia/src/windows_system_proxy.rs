@@ -1018,6 +1018,7 @@ impl OwnedProxy {
         ReservedProxy::acquire()?.apply(bind, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn apply_reviewed(bind: SocketAddr, review: ApplyReview) -> Result<Self, ProxyError> {
         ReservedProxy::acquire()?.apply(bind, Some(review))
     }

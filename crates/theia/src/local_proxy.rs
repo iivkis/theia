@@ -1954,6 +1954,9 @@ pub(crate) struct ClientRuntime {
     capture_state: CaptureLifecycle,
     stopped: tokio::sync::watch::Sender<bool>,
     admission: std::sync::atomic::AtomicBool,
+    publication: Mutex<()>,
+    #[cfg(windows)]
+    proxy_instance: std::sync::OnceLock<[u8; 32]>,
     #[cfg(windows)]
     system_proxy_phase: std::sync::atomic::AtomicU8,
     #[cfg(windows)]
@@ -1981,6 +1984,9 @@ impl ClientRuntime {
             capture_state: CaptureLifecycle::default(),
             stopped,
             admission: std::sync::atomic::AtomicBool::new(true),
+            publication: Mutex::new(()),
+            #[cfg(windows)]
+            proxy_instance: std::sync::OnceLock::new(),
             #[cfg(windows)]
             system_proxy_phase: std::sync::atomic::AtomicU8::new(0),
             #[cfg(windows)]
@@ -2037,9 +2043,16 @@ impl ClientRuntime {
         self.admission.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    fn quiesce(&self) {
+    fn quiesce_locked(&self) {
         self.admission.store(false, std::sync::atomic::Ordering::Release);
         self.slot.borrow().client.routing_cache().dpi.retire();
+    }
+
+    fn quiesce(&self) {
+        // Serialize admission retirement with exact-generation publication.
+        // On poison still close admission and retire the last visible owner.
+        let _publication = self.publication.lock().unwrap_or_else(|e| e.into_inner());
+        self.quiesce_locked();
     }
 
     fn stop(&self) {
@@ -2199,7 +2212,9 @@ impl ClientRuntime {
             return Ok(expected);
         }
         let revision = expected.checked_add(1).ok_or(ClientError::Configuration)?;
-        // No await between final exact-byte recheck and publication.
+        // Disconnect and publication cannot cross each other between the
+        // final admission check and the new generation becoming visible.
+        let _publication = self.publication.lock().map_err(|_| ClientError::Configuration)?;
         saved_client_bytes(&self.path, digest)?;
         if !self.admitting() || *self.stopped.borrow() {
             return Err(ClientError::Configuration);
@@ -2300,8 +2315,35 @@ impl ClientRuntime {
     }
 
     fn request_disconnect(&self) {
-        self.quiesce();
+        let _publication = self.publication.lock().unwrap_or_else(|e| e.into_inner());
+        self.quiesce_locked();
+        if self.proxy_phase() == 2 { self.set_proxy_phase(3); }
         self.disconnect_requested.send_replace(true);
+    }
+
+    /// The nonsecret instance nonce changes on every Connect, including
+    /// reconnect to the same TOML at the same revision.
+    pub(crate) fn proxy_lifecycle(&self) -> Option<(u64, [u8; 32], [u8; 32], u8)> {
+        let _publication = self.publication.lock().ok()?;
+        let view = self.slot.borrow();
+        Some((view.revision, view.digest, *self.proxy_instance.get()?, self.proxy_phase()))
+    }
+
+    pub(crate) fn request_disconnect_bound(
+        &self, revision: u64, digest: [u8; 32], instance: [u8; 32],
+    ) -> Result<(), ClientError> {
+        let _publication = self.publication.lock().map_err(|_| ClientError::Configuration)?;
+        let view = self.slot.borrow();
+        if self.proxy_phase() != 2 || !self.admitting()
+            || view.revision != revision || view.digest != digest
+            || self.proxy_instance.get() != Some(&instance) {
+            return Err(ClientError::Configuration);
+        }
+        drop(view);
+        self.quiesce_locked();
+        self.set_proxy_phase(3);
+        self.disconnect_requested.send_replace(true);
+        Ok(())
     }
 }
 
@@ -2327,6 +2369,10 @@ impl SystemProxySession {
             std::path::absolute(path).map_err(|_| ClientError::Configuration)?,
             document, expected, client,
         );
+        use ring::rand::{SecureRandom, SystemRandom};
+        let mut instance = [0; 32];
+        SystemRandom::new().fill(&mut instance).map_err(|_| ClientError::Configuration)?;
+        runtime.proxy_instance.set(instance).map_err(|_| ClientError::Configuration)?;
         runtime.set_proxy_phase(1); // preparing, not ready
         let control = crate::management::client_server(runtime.clone())
             .map_err(|_| ClientError::Configuration)?;
@@ -2348,15 +2394,15 @@ impl SystemProxySession {
             tokio::pin!(management);
             // Inspect the exact journal and current WinINet snapshot even
             // when no traffic or UI action occurs.
-            let (result, worker_ended) = loop {
+            let (result, worker_ended, management_ended) = loop {
                 tokio::select! {
                     biased;
-                    () = owner.disconnect_requested() => break (Ok(()), false),
-                    result = &mut serving => break (result, true),
-                    result = &mut management => break (result, false),
+                    () = owner.disconnect_requested() => break (Ok(()), false, false),
+                    result = &mut serving => break (result, true, false),
+                    result = &mut management => break (result, false, true),
                     () = tokio::time::sleep(Duration::from_secs(1)) => {
                         if lease.verify().is_err() {
-                            break (Err(ClientError::SystemProxy), false);
+                            break (Err(ClientError::SystemProxy), false, false);
                         }
                     }
                 }
@@ -2368,10 +2414,20 @@ impl SystemProxySession {
             owner.quiesce();
             let restored = lease.restore().map_err(|_| ClientError::SystemProxy);
             owner.stop();
-            if !worker_ended {
-                let _ = timeout(Duration::from_secs(5), &mut serving).await;
-            }
             owner.set_proxy_phase(if restored.is_ok() { 0 } else { 4 });
+            let drain = async {
+                if !worker_ended {
+                    let _ = timeout(Duration::from_secs(5), &mut serving).await;
+                }
+            };
+            let replies = async {
+                if !management_ended {
+                    // Let the already-admitted IPC Disconnect handler return
+                    // its acknowledgement; never claim restore from that ack.
+                    let _ = timeout(Duration::from_millis(250), &mut management).await;
+                }
+            };
+            tokio::join!(drain, replies);
             restored.and(result)
         });
         Ok(Self { runtime, task: Some(task) })
@@ -2392,11 +2448,11 @@ impl SystemProxySession {
 
     pub(crate) async fn ended(&mut self) -> Result<(), ClientError> {
         let result = match self.task.as_mut() {
-            Some(task) => task.await.map_err(|_| ClientError::Io)?,
+            Some(task) => task.await,
             None => return Ok(()),
         };
         self.task.take();
-        result
+        result.map_err(|_| ClientError::Io)?
     }
 
     pub(crate) async fn disconnect(&mut self) -> Result<(), ClientError> {
@@ -4875,6 +4931,53 @@ impl Drop for NativeIngress {
     }
 }
 
+#[cfg(windows)]
+async fn bind_proxy_listener(address: &str) -> Result<TcpListener, ClientError> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::{
+        Foundation::{SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT},
+        Networking::WinSock::{setsockopt, SOL_SOCKET, SO_EXCLUSIVEADDRUSE},
+    };
+    let address: SocketAddr = address.parse().map_err(|_| ClientError::Configuration)?;
+    if !matches!(address.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST) | IpAddr::V6(Ipv6Addr::LOCALHOST)) {
+        return Err(ClientError::Configuration);
+    }
+    let socket = if address.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()
+    } else {
+        tokio::net::TcpSocket::new_v6()
+    }.map_err(|_| ClientError::Io)?;
+    let raw = socket.as_raw_socket() as usize;
+    let enabled: i32 = 1;
+    // SAFETY: socket is uniquely owned; the option is a live i32 for
+    // synchronous Winsock, and the handle is valid for this lifetime.
+    if unsafe { setsockopt(raw, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (&enabled as *const i32).cast(), 4) } != 0
+        || unsafe { SetHandleInformation(raw as HANDLE, HANDLE_FLAG_INHERIT, 0) } == 0 {
+        return Err(ClientError::Io);
+    }
+    socket.bind(address).map_err(|_| ClientError::Io)?;
+    socket.listen(128).map_err(|_| ClientError::Io)
+}
+
+#[cfg(not(windows))]
+async fn bind_proxy_listener(address: &str) -> Result<TcpListener, ClientError> {
+    TcpListener::bind(address).await.map_err(|_| ClientError::Io)
+}
+
+#[cfg(all(test, windows))]
+#[tokio::test]
+async fn product_proxy_listener_is_exclusive_and_loopback_only() {
+    let owned = bind_proxy_listener("127.0.0.1:0").await.unwrap();
+    let address = owned.local_addr().unwrap();
+    let foreign = tokio::net::TcpSocket::new_v4().unwrap();
+    foreign.set_reuseaddr(true).unwrap();
+    assert!(foreign.bind(address).is_err());
+    assert!(bind_proxy_listener("0.0.0.0:0").await.is_err());
+    drop(owned);
+    let replacement = bind_proxy_listener(&address.to_string()).await.unwrap();
+    assert_eq!(replacement.local_addr().unwrap(), address);
+}
+
 /// Shared startup preflight: never changes the OS proxy or claims an
 /// authenticated remote tunnel merely because the listeners bind.
 async fn prepare_proxy(
@@ -4883,12 +4986,8 @@ async fn prepare_proxy(
 ) -> Result<(TcpListener, TcpListener, ProxyClient), ClientError> {
     let client = prepare_client(document, path).await?;
     // All startup validation and both binds must succeed before accepting.
-    let http = TcpListener::bind(&document.client.proxy.http_listen)
-        .await
-        .map_err(|_| ClientError::Io)?;
-    let socks = TcpListener::bind(&document.client.proxy.socks5_listen)
-        .await
-        .map_err(|_| ClientError::Io)?;
+    let http = bind_proxy_listener(&document.client.proxy.http_listen).await?;
+    let socks = bind_proxy_listener(&document.client.proxy.socks5_listen).await?;
     crate::diag!(
         Info,
         "client.proxy",

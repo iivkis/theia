@@ -249,12 +249,33 @@ async fn run() {
                 Err(error)=>Err(CliError::Management(error)),
             }
         }
+        Ok(Command::ClientLifecycle) => {
+            match management::query_client_environment(management::StatusCommand::ClientLifecycle).await {
+                Ok(management::StatusReply::ClientLifecycle { revision, config_sha256, instance, phase }) => {
+                    let digest = config_sha256.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                    let instance = instance.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                    let lifecycle = match phase { 0=>"inactive", 1=>"preparing", 2=>"connected", 3=>"stopping", _=>"recovery_required" };
+                    let actual = if phase == 2 { "system_proxy" } else { "none" };
+                    Ok(format!("configured_mode=system_proxy; actual_mode={actual}; lifecycle={lifecycle}; scope=proxy_requests; guard=not_applicable; revision={revision}; config_sha256={digest}; instance={instance}"))
+                }
+                Ok(_) => Err(CliError::Management(management::ManagementError::InvalidReply)),
+                Err(error) => Err(CliError::Management(error)),
+            }
+        }
+        Ok(Command::ClientDisconnect { expected_revision, config_sha256, instance }) => {
+            match management::query_client_environment(management::StatusCommand::ClientDisconnect { expected_revision, config_sha256, instance }).await {
+                Ok(management::StatusReply::ClientDisconnectAccepted { revision, .. }) =>
+                    Ok(format!("disconnect accepted; revision={revision}; restoration not yet confirmed; inspect client proxy --status")),
+                Ok(_) => Err(CliError::Management(management::ManagementError::InvalidReply)),
+                Err(error) => Err(CliError::Management(error)),
+            }
+        }
         Ok(Command::ClientApply{expected_revision,candidate_sha256,apply})=>{
             let command=if apply{management::StatusCommand::ClientApply{expected_revision,candidate_sha256}}
                 else{management::StatusCommand::ClientPreview{expected_revision,candidate_sha256}};
             match management::query_client_environment(command).await{
                 Ok(management::StatusReply::ClientReady{revision})=>Ok(format!("client candidate ready; revision={revision}; nothing applied")),
-                Ok(management::StatusReply::ClientApplied{revision})=>Ok(format!("client carrier applied; revision={revision}; existing tunnels retained")),
+                Ok(management::StatusReply::ClientApplied{revision})=>Ok(format!("client carrier applied; revision={revision}; previous routing generation retired")),
                 Ok(_)=>Err(CliError::Management(management::ManagementError::InvalidReply)),
                 Err(error)=>Err(CliError::Management(error)),
             }

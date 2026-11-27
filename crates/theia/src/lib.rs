@@ -172,6 +172,8 @@ pub enum Command {
         config: String,
     },
     ClientStatus,
+    ClientLifecycle,
+    ClientDisconnect { expected_revision: u64, config_sha256: [u8; 32], instance: [u8; 32] },
     ClientLinuxRedirectLab { config:String,journal:String,port:u16 },
     ClientLinuxRecoverLab { journal:String },
     ClientLinuxHostLab {config:String,port:u16},
@@ -412,6 +414,14 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
             })
         }
         ["client", "status"] => Ok(Command::ClientStatus),
+        ["client", "lifecycle"] => Ok(Command::ClientLifecycle),
+        ["client", "disconnect", "--expected-revision", revision, "--sha256", digest, "--instance", instance, "--confirm"] => {
+            Ok(Command::ClientDisconnect {
+                expected_revision: expected_revision(revision)?,
+                config_sha256: parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?,
+                instance: parse_restart_digest(instance).ok_or(CliError::InvalidArguments)?,
+            })
+        }
         ["client","linux","--redirect-lab","--config",config,"--journal",journal,"--port",port,"--confirm-isolated"]=>{
             Ok(Command::ClientLinuxRedirectLab{config:config_path(config)?,journal:config_path(journal)?,
                 port:port.parse::<u16>().ok().filter(|n|*n>=1024).ok_or(CliError::InvalidArguments)?})
@@ -549,7 +559,7 @@ pub fn help(topic: Option<&str>) -> Result<&'static str, CliError> {
             Ok("Usage: theia server run --config <path> | theia server status | theia server reload --check | theia server restart --check | theia server tls fingerprint --config <path> | theia server tls rollback --check | theia server tls rollback --apply --expected-revision N --confirm | theia server restart --apply --expected-revision N --sha256 HEX --tls-sha256 PEMHEX --confirm | theia server quota --check | theia server quota --apply --expected-revision N --sha256 HEX --confirm | theia server reload --apply --expected-revision N --sha256 HEX --confirm | theia server auth rollback --check | theia server auth rollback --apply --expected-revision N --confirm\nQuota CAS resizes only two session/connection caps, retaining all held permits and denying new admissions while over the decreased cap. All other config, TLS identity bytes, grants, user roster and listener addresses must remain unchanged. Requires private Linux/Windows IPC and exact saved SHA256 TOML; lost ACK is indeterminate, query status. Restart-only fresh-port/TLS cutover uses a separate confirmed dual-digest command; the old TOML-only restart syntax is rejected.")
         }
         Some("client") => {
-            Ok("Usage: theia client run --config <path> [--system-proxy --confirm]\ntheia client status\ntheia client reload --check --expected-revision N --sha256 HEX\ntheia client reload --apply --expected-revision N --sha256 HEX --confirm\ntheia client windivert --check --directory DIR --dll-sha256 HEX --sys-sha256 HEX [--install-lab --confirm]\ntheia client windivert --loopback-lab --directory DIR --dll-sha256 HEX --sys-sha256 HEX --confirm\ntheia client windivert --scope-drop-lab --directory DIR --dll-sha256 HEX --sys-sha256 HEX --interface-index N --seconds 1..30 --confirm-block (isolated local console only; drops all outbound IP on interface)\ntheia client windivert --redirect-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --targets IP:PORT[,IP:PORT] --seconds 5..120 --confirm-isolated\ntheia client windivert --tcp-relay-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --target IP:PORT --confirm\ntheia client windivert --udp-relay-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --target IP:PORT [--flows 1..8] --confirm\ntheia client windivert --interface-redirect-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --capture-interface N --carrier-interface N --seconds 5..120 --confirm-isolated-two-interface\ntheia client linux --host-redirect-lab --config PATH --port N --confirm-disposable-local-console\ntheia client linux --host-guard-rearm --confirm-disposable-host\ntheia client linux --host-guard-recover --confirm-disposable-local-console\ntheia client proxy --status\ntheia client proxy --recover --confirm\nWindows only: explicitly opt in to user WinINet HTTP(S) proxy after binding local HTTP/SOCKS5 listeners. system_proxy=manual in TOML required. Snapshot+durable journal, conditional restore on Ctrl+C/normal stop, explicit CAS recovery after crash. Never overwrites foreign proxy changes. CLI flags and TUI import alone never apply OS changes.")
+            Ok("Usage: theia client run --config <path> [--system-proxy --confirm]\ntheia client status\ntheia client lifecycle\ntheia client disconnect --expected-revision N --sha256 HEX --instance HEX --confirm\ntheia client reload --check --expected-revision N --sha256 HEX\ntheia client reload --apply --expected-revision N --sha256 HEX --confirm\ntheia client windivert --check --directory DIR --dll-sha256 HEX --sys-sha256 HEX [--install-lab --confirm]\ntheia client windivert --loopback-lab --directory DIR --dll-sha256 HEX --sys-sha256 HEX --confirm\ntheia client windivert --scope-drop-lab --directory DIR --dll-sha256 HEX --sys-sha256 HEX --interface-index N --seconds 1..30 --confirm-block (isolated local console only; drops all outbound IP on interface)\ntheia client windivert --redirect-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --targets IP:PORT[,IP:PORT] --seconds 5..120 --confirm-isolated\ntheia client windivert --tcp-relay-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --target IP:PORT --confirm\ntheia client windivert --udp-relay-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --target IP:PORT [--flows 1..8] --confirm\ntheia client windivert --interface-redirect-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --capture-interface N --carrier-interface N --seconds 5..120 --confirm-isolated-two-interface\ntheia client linux --host-redirect-lab --config PATH --port N --confirm-disposable-local-console\ntheia client linux --host-guard-rearm --confirm-disposable-host\ntheia client linux --host-guard-recover --confirm-disposable-local-console\ntheia client proxy --status\ntheia client proxy --recover --confirm\nWindows only: explicitly opt in to user WinINet HTTP(S) proxy after binding local HTTP/SOCKS5 listeners. Saved ingress_mode=system_proxy alone never starts a connection. Snapshot+durable journal, conditional restore on Ctrl+C/normal stop, explicit CAS recovery after crash. Never overwrites foreign proxy changes. CLI flags and TUI import alone never apply OS changes.")
         }
         Some("trust") => Ok(descriptor_cli::HELP),
         Some("reference") => Ok(reference_cli::HELP),
@@ -994,6 +1004,16 @@ mod tests {
             command(&["tui", "--role", "server", "--role", "client"]),
             Err(CliError::InvalidArguments)
         );
+    }
+
+    #[test]
+    fn client_disconnect_requires_explicit_instance_revision_and_confirmation() {
+        let digest = "ab".repeat(32);
+        let nonce = "cd".repeat(32);
+        let args = ["client", "disconnect", "--expected-revision", "1", "--sha256", &digest, "--instance", &nonce, "--confirm"];
+        assert_eq!(command(&args), Ok(Command::ClientDisconnect { expected_revision: 1, config_sha256: [0xab; 32], instance: [0xcd; 32] }));
+        assert!(command(&args[..8]).is_err());
+        assert_eq!(command(&["client", "lifecycle"]), Ok(Command::ClientLifecycle));
     }
 
     #[test]

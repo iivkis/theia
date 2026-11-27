@@ -380,7 +380,7 @@ impl StatusPanel {
                 rt.block_on(async{
                     if let Some(expected_revision)=apply{
                         return Ok(match management::query_client_environment(StatusCommand::ClientApply{expected_revision,candidate_sha256:digest}).await{
-                            Ok(StatusReply::ClientApplied{revision})=>Update::Report(format!("Настройки фонового клиента применены (версия {revision}). Прежние туннели сохранены.")),
+                            Ok(StatusReply::ClientApplied{revision})=>Update::Report(format!("Настройки фонового клиента применены (версия {revision}). Прежнее поколение маршрутизации отозвано.")),
                             Err(management::ManagementError::CandidateRejected)=>Update::Report("Фоновый клиент отклонил настройки. Изменения не подтверждены.".into()),
                             _=>Update::Report("Применение настроек фонового клиента не подтверждено. Обновите состояние перед повтором.".into()),
                         });

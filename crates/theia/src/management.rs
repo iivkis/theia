@@ -79,6 +79,8 @@ impl std::error::Error for ManagementError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusCommand {
     ClientStatus,
+    ClientLifecycle,
+    ClientDisconnect { expected_revision: u64, config_sha256: [u8; 32], instance: [u8; 32] },
     ClientPreview {
         expected_revision: u64,
         candidate_sha256: [u8; 32],
@@ -147,6 +149,15 @@ pub enum StatusCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatusReply {
+    ClientLifecycle {
+        revision: u64,
+        config_sha256: [u8; 32],
+        instance: [u8; 32],
+        /// 0 inactive, 1 preparing, 2 connected, 3 stopping, 4 recovery required.
+        phase: u8,
+    },
+    /// Acknowledges admission closure, NOT completed CAS restoration.
+    ClientDisconnectAccepted { revision: u64, instance: [u8; 32] },
     ClientRunning {
         revision: u64,
         config_sha256: [u8; 32],
@@ -998,6 +1009,19 @@ fn parse_bound_command(command: &[u8], prefix: &[u8]) -> Option<(u64, [u8; 32])>
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+fn encode_client_hex(value: [u8; 32]) -> String {
+    value.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(any(windows, test))]
+fn parse_disconnect(command: &[u8]) -> Option<(u64, [u8; 32], [u8; 32])> {
+    let line = std::str::from_utf8(command.strip_prefix(b"client-disconnect rev=")?).ok()?;
+    let (revision, tail) = line.split_once(" sha256=")?;
+    let (digest, instance) = tail.split_once(" instance=")?;
+    Some((positive_decimal(revision)?, decode_digest(digest)?, decode_digest(instance)?))
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) async fn handle_client<S>(
     mut stream: S,
     client: Arc<crate::local_proxy::ClientRuntime>,
@@ -1050,6 +1074,30 @@ where
             "theia-client-v1 r={revision} sha256={hex} d={descriptor} t={transport} x={xhttp} f={} rr={routing_revision} rs={routing_state} rt={totals} fs={flows} cap={capture_state}\n",
             u8::from(fallback)
         )
+    } else if command == b"client-lifecycle" {
+        #[cfg(windows)]
+        {
+            match client.proxy_lifecycle() {
+                Some((revision, digest, instance, phase)) => format!(
+                    "theia-client-v1 lifecycle r={revision} sha256={} instance={} phase={phase}\n",
+                    encode_client_hex(digest), encode_client_hex(instance)
+                ),
+                None => "ERR unsupported\n".into(),
+            }
+        }
+        #[cfg(not(windows))]
+        { "ERR unsupported\n".into() }
+    } else if command.starts_with(b"client-disconnect ") {
+        #[cfg(windows)]
+        {
+            match parse_disconnect(&command) {
+                Some((revision, digest, instance)) if client.request_disconnect_bound(revision, digest, instance).is_ok() =>
+                    format!("theia-client-v1 disconnect-accepted r={revision} instance={}\n", encode_client_hex(instance)),
+                _ => "theia-client-v1 rejected\n".into(),
+            }
+        }
+        #[cfg(not(windows))]
+        { "ERR unsupported\n".into() }
     } else {
         let candidate = parse_bound_command(&command, b"client-preview rev=")
             .map(|(r, d)| (r, d, false))
@@ -1084,6 +1132,12 @@ where
 {
     let request = match command {
         StatusCommand::ClientStatus => b"client-status\n".to_vec(),
+        StatusCommand::ClientLifecycle => b"client-lifecycle\n".to_vec(),
+        StatusCommand::ClientDisconnect { expected_revision, config_sha256, instance } => {
+            if expected_revision == 0 { return Err(ManagementError::InvalidReply); }
+            format!("client-disconnect rev={expected_revision} sha256={} instance={}\n",
+                encode_client_hex(config_sha256), encode_client_hex(instance)).into_bytes()
+        }
         StatusCommand::ClientPreview {
             expected_revision,
             candidate_sha256,
@@ -1228,6 +1282,8 @@ where
     if matches!(
         command,
         StatusCommand::ClientStatus
+            | StatusCommand::ClientLifecycle
+            | StatusCommand::ClientDisconnect { .. }
             | StatusCommand::ClientPreview { .. }
             | StatusCommand::ClientApply { .. }
     ) {
@@ -1243,6 +1299,25 @@ where
             .and_then(|s| s.strip_suffix('\n'))
             .ok_or(ManagementError::InvalidReply)?;
         let parsed = (|| match command {
+            StatusCommand::ClientLifecycle => {
+                let mut fields = line.strip_prefix("lifecycle r=")?.split(' ');
+                let revision = positive_decimal(fields.next()?)?;
+                let config_sha256 = decode_digest(fields.next()?.strip_prefix("sha256=")?)?;
+                let instance = decode_digest(fields.next()?.strip_prefix("instance=")?)?;
+                let phase = match fields.next()?.strip_prefix("phase=")? {
+                    "0" => 0, "1" => 1, "2" => 2, "3" => 3, "4" => 4,
+                    _ => return None,
+                };
+                if fields.next().is_some() { return None; }
+                Some(StatusReply::ClientLifecycle { revision, config_sha256, instance, phase })
+            }
+            StatusCommand::ClientDisconnect { expected_revision, instance, .. } => {
+                let (revision, nonce) = line.strip_prefix("disconnect-accepted r=")?.split_once(" instance=")?;
+                let revision = positive_decimal(revision)?;
+                let nonce = decode_digest(nonce)?;
+                (revision == expected_revision && nonce == instance)
+                    .then_some(StatusReply::ClientDisconnectAccepted { revision, instance })
+            }
             StatusCommand::ClientStatus => {
                 let mut fields = line.split(' ');
                 let revision = positive_decimal(fields.next()?.strip_prefix("r=")?)?;
@@ -1703,6 +1778,8 @@ pub async fn query_client_environment(
     if !matches!(
         command,
         StatusCommand::ClientStatus
+            | StatusCommand::ClientLifecycle
+            | StatusCommand::ClientDisconnect { .. }
             | StatusCommand::ClientPreview { .. }
             | StatusCommand::ClientApply { .. }
     ) {
@@ -1737,6 +1814,8 @@ pub async fn query_client_environment(
 pub async fn query_environment(command: StatusCommand) -> Result<StatusReply, ManagementError> {
     let kind = match command {
         StatusCommand::ClientStatus
+        | StatusCommand::ClientLifecycle
+        | StatusCommand::ClientDisconnect { .. }
         | StatusCommand::ClientPreview { .. }
         | StatusCommand::ClientApply { .. } => return Err(ManagementError::Unsupported),
         StatusCommand::Health => "health",
@@ -1949,6 +2028,26 @@ mod strict_wire_matrix_tests {
         .await
         .unwrap();
         actual
+    }
+
+    #[tokio::test]
+    async fn lifecycle_ipc_requires_canonical_instance_and_never_treats_ack_as_restore() {
+        let digest = "ab".repeat(32);
+        let nonce = "cd".repeat(32);
+        let lifecycle = format!("theia-client-v1 lifecycle r=1 sha256={digest} instance={nonce} phase=2\n");
+        assert_eq!(peer(StatusCommand::ClientLifecycle, "client-lifecycle\n", lifecycle.as_bytes()).await,
+            Ok(StatusReply::ClientLifecycle { revision: 1, config_sha256: [0xab; 32], instance: [0xcd; 32], phase: 2 }));
+        let command = StatusCommand::ClientDisconnect { expected_revision: 1, config_sha256: [0xab; 32], instance: [0xcd; 32] };
+        let request = format!("client-disconnect rev=1 sha256={digest} instance={nonce}\n");
+        assert_eq!(parse_disconnect(request.trim_end().as_bytes()), Some((1, [0xab; 32], [0xcd; 32])));
+        assert!(parse_disconnect(format!("client-disconnect rev=01 sha256={digest} instance={nonce}").as_bytes()).is_none());
+        let reply = format!("theia-client-v1 disconnect-accepted r=1 instance={nonce}\n");
+        assert_eq!(peer(command, &request, reply.as_bytes()).await,
+            Ok(StatusReply::ClientDisconnectAccepted { revision: 1, instance: [0xcd; 32] }));
+        let bad = format!("theia-client-v1 disconnect-accepted r=1 instance={digest}\n");
+        assert_eq!(peer(command, &request, bad.as_bytes()).await, Err(ManagementError::InvalidReply));
+        let bad = lifecycle.replace("phase=2", "phase=5");
+        assert_eq!(peer(StatusCommand::ClientLifecycle, "client-lifecycle\n", bad.as_bytes()).await, Err(ManagementError::InvalidReply));
     }
 
     #[tokio::test]
