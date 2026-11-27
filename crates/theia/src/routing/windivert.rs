@@ -61,7 +61,7 @@ impl Address {
         }
         let interface = u32::from_le_bytes(self.data[..4].try_into().unwrap());
         let sub_interface = u32::from_le_bytes(self.data[4..8].try_into().unwrap());
-        if interface == 0 { return Err(ParseError::Invalid); }
+        if interface == 0 && !loopback_lab { return Err(ParseError::Invalid); }
         let meta = PacketMeta::parse(packet, interface)?;
         if meta.flow.source.is_ipv6() != (self.flags & (1 << 20) != 0) {
             return Err(ParseError::Invalid);
@@ -512,9 +512,8 @@ mod native {
     // buffer on a timeout or future drop.
     fn transfer(raw: HANDLE, cancelled: &AtomicBool, deadline: Instant,
         start: impl FnOnce(*mut OVERLAPPED, *mut u32) -> i32) -> io::Result<u32> {
-        if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
-            return Err(io::ErrorKind::Interrupted.into());
-        }
+        if cancelled.load(Ordering::Acquire) { return Err(io::ErrorKind::Interrupted.into()); }
+        if Instant::now() >= deadline { return Err(io::ErrorKind::TimedOut.into()); }
         let event = Event::new()?;
         let mut operation: OVERLAPPED = unsafe { std::mem::zeroed() };
         operation.hEvent = event.0;
@@ -751,21 +750,21 @@ mod native {
 
     fn tcp_lab(api:&Api,v6:bool,cancelled:&AtomicBool) -> io::Result<()> {
         use tokio::io::{AsyncReadExt,AsyncWriteExt};
-        use std::net::{TcpListener,SocketAddr};
+        use std::net::SocketAddr;
         let loopback=if v6 { "[::1]:0" } else { "127.0.0.1:0" };
-        let original=TcpListener::bind(loopback)?;
-        original.set_nonblocking(true)?;
-        let relay=TcpListener::bind(loopback)?;
-        relay.set_nonblocking(true)?;
+        let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        let (original,relay,client)={
+            let _entered=runtime.enter();
+            let bind=||->io::Result<tokio::net::TcpSocket> {
+                let socket=if v6 { tokio::net::TcpSocket::new_v6()? } else { tokio::net::TcpSocket::new_v4()? };
+                exclusive(&socket)?;
+                socket.bind(loopback.parse::<SocketAddr>().map_err(|_|io::ErrorKind::InvalidInput)?)?;
+                Ok(socket)
+            };
+            (bind()?.listen(4)?.into_std()?,bind()?.listen(4)?.into_std()?,bind()?)
+        };
         let original_addr=original.local_addr()?;
         let relay_addr=relay.local_addr()?;
-        let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        let client={
-            let _entered=runtime.enter();
-            let socket=if v6 { tokio::net::TcpSocket::new_v6()? } else { tokio::net::TcpSocket::new_v4()? };
-            socket.bind(loopback.parse::<SocketAddr>().map_err(|_|io::ErrorKind::InvalidInput)?)?;
-            socket
-        };
         let client_addr=client.local_addr()?;
         let mapping=TcpLoopbackMap::new(client_addr,original_addr,relay_addr).ok_or(io::ErrorKind::InvalidData)?;
         let address=if v6 { "ipv6.SrcAddr == ::1 and ipv6.DstAddr == ::1" }

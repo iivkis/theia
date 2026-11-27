@@ -510,6 +510,22 @@ mod tests {
     }
 
     #[test]
+    fn windivert_relay_lab_requires_confirm_and_literal_target() {
+        let dll="ab".repeat(32);
+        let sys="cd".repeat(32);
+        let args=["client","windivert","--udp-relay-lab","--config","client.toml","--directory","C:/Theia/WinDivert",
+            "--dll-sha256",&dll,"--sys-sha256",&sys,"--target","192.0.2.1:443","--confirm"];
+        assert!(matches!(command(&args),Ok(Command::ClientWinDivertUdpRelayLab {target,..}) if target=="192.0.2.1:443".parse().unwrap()));
+        assert!(command(&args[..13]).is_err());
+        let mut bad=args;
+        bad[12]="example.org:443";
+        assert!(command(&bad).is_err());
+        let local=["client","windivert","--loopback-lab","--directory","C:/Theia/WinDivert","--dll-sha256",&dll,"--sys-sha256",&sys,"--confirm"];
+        assert!(matches!(command(&local),Ok(Command::ClientWinDivertLoopback {..})));
+        assert!(command(&local[..9]).is_err());
+    }
+
+    #[test]
     fn windivert_check_requires_explicit_pins_and_install_confirmation() {
         let dll = "ab".repeat(32);
         let sys = "cd".repeat(32);

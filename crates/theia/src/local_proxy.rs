@@ -2325,6 +2325,10 @@ impl NativeIngress {
     /// Preflight only; the caller owns an isolated network namespace/rule
     /// transaction. No new CLI or second system interception mode.
     pub async fn prepare(path: &Path) -> Result<Self, ClientError> {
+        Self::prepare_with_registrar(path,None).await
+    }
+
+    async fn prepare_with_registrar(path:&Path, registrar:Option<Arc<dyn crate::routing::carrier_socket::Registrar>>)->Result<Self,ClientError> {
         let owner = Arc::new(NativeOwner::acquire()?);
         let raw = zeroize::Zeroizing::new(
             config::editor_bytes(path).map_err(|_| ClientError::Configuration)?,
@@ -2337,7 +2341,7 @@ impl NativeIngress {
         };
         use sha2::{Digest, Sha256};
         let digest: [u8; 32] = Sha256::digest(raw.as_slice()).into();
-        let client = prepare_client(&document, path).await?;
+        let client = crate::routing::carrier_socket::scope(registrar.clone(),prepare_client(&document,path)).await?;
         saved_client_bytes(path, digest)?;
         let runtime = ClientRuntime::new(
             std::path::absolute(path).map_err(|_| ClientError::Configuration)?,
@@ -2345,7 +2349,7 @@ impl NativeIngress {
             digest,
             client,
         );
-        runtime.attach_native(owner, None).await
+        runtime.attach_native(owner, registrar).await
     }
 
     /// Cancels all native relay operations, retires the policy lease and
@@ -2593,19 +2597,21 @@ impl NativeIngress {
     pub async fn run_windows_udp_relay_lab(
         path:&Path, directory:std::path::PathBuf, dll:[u8;32], sys:[u8;32], target:SocketAddr,
     )->Result<(),ClientError> {
-        use crate::routing::PacketAction;
-        let ingress=Self::prepare(path).await?;
-        struct Stop<'a>(&'a NativeIngress);
-        impl Drop for Stop<'_> { fn drop(&mut self) { self.0.shutdown(); } }
-        let _stop=Stop(&ingress);
+        use crate::routing::{carrier_socket,windivert::CarrierRegistry,PacketAction};
+        let registry=Arc::new(CarrierRegistry::default());
+        let registrar:Arc<dyn carrier_socket::Registrar>=registry.clone();
+        let ingress=Self::prepare_with_registrar(path,Some(registrar.clone())).await?;
+        struct Stop<'a>(&'a NativeIngress,&'a CarrierRegistry);
+        impl Drop for Stop<'_> { fn drop(&mut self) { self.0.shutdown();self.1.retire(); } }
+        let _stop=Stop(&ingress,&registry);
         let lab=crate::routing::windivert::begin_udp_relay_lab(directory,dll,sys,target).await
             .map_err(|_|ClientError::Io)?;
         // The worker has captured the actual datagram and installed its
         // narrow guard. No other application's traffic is admitted here.
         ingress.runtime.capture_state.ready()?;
         let key=lab.key;
-        let (carrier,flow,address)=ingress.redirect(key).await?;
-        let tunnel=carrier.open_udp(address,key.destination.port()).await?;
+        let (carrier,flow,address)=carrier_socket::scope(Some(registrar.clone()),ingress.redirect(key)).await?;
+        let tunnel=carrier_socket::scope(Some(registrar),carrier.open_udp(address,key.destination.port())).await?;
         let (tx,up)=tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
         let (down,mut rx)=tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
         tx.send(lab.payload.clone()).await.map_err(|_|ClientError::Io)?;

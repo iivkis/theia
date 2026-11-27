@@ -57,6 +57,9 @@ UDP echo origin and a configured authenticated Theia server:
 
 Use a concrete non-loopback echo target which the configured policy routes
 via authenticated VPS Redirect (or its permitted pre-payload Modify fallback).
+The configured carrier endpoint must be a literal socket address; native
+carrier scope does not resolve an untrusted local hostname. The registry is
+attached before carrier preparation and retained by H2/H3 socket leases.
 The original application socket is created with SO_EXCLUSIVEADDRUSE and bound
 to the observed source. Only its exact tuple is intercepted and guarded.
 The captured nonce is relayed using NativeIngress, FlowLease and H2/H3 XHTTP;
@@ -81,10 +84,10 @@ and inbound interface still need verified correlation.
   registrar are implemented, but are not an authorization to inject.
   NETWORK lacks PID/endpoint identity. PID reuse, shared sockets, event
   loss and ambiguous tuples must not authorize bypass.
-- Integration of TCP/UDP transparent relay and reverse delivery with
-  authenticated NativeIngress/FlowLease, actual XHTTP H2/H3 egress, general
-  non-loopback routes and first-payload commitment. Local laboratory
-  translation does not demonstrate remote application acceptance.
+- General TCP/UDP transparent relay, non-loopback TCP mapping, arbitrary
+  application lifetimes and independent physical H2/H3 egress. The one
+  exact UDP echo flow uses NativeIngress/FlowLease and XHTTP; this does not
+  demonstrate arbitrary application acceptance.
 - Persistent independent fail-closed guard across both process deaths,
   reboot, non-loopback traffic and explicit owner/CAS recovery. WinDivert
   alone is not a kill switch; the scoped guard test is only one proof case.
