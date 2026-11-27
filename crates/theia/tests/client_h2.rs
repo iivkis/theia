@@ -629,6 +629,7 @@ async fn imported_server_invitation_reaches_real_connect_and_socks5_without_env_
         };
         let endpoint_port = endpoint.rsplit(':').next().unwrap().parse::<u16>().unwrap();
         source.server.inbounds[0].server_name = "localhost".into();
+        source.server.inbounds[0].tls_cert = ca_ref.clone();
         source.server.inbounds[0].h2_listen = format!("127.0.0.1:{endpoint_port}");
         source.server.inbounds[0].quic_listen = format!("127.0.0.1:{endpoint_port}");
         source.server.inbounds[0].allowed_user_ids = vec!["client".into()];

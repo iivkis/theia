@@ -459,7 +459,7 @@ async fn copy_direction(
     scope: Option<&(dyn Fn() -> Result<(), ClientError> + Sync)>,
 ) -> Result<(), DirectRelayError> {
     let mut first_send = super::flow::FirstSend::new(flow, action);
-    let mut bytes = [0u8; 16 * 1024];
+    let mut bytes = vec![0u8; 16 * 1024];
     loop {
         let count = input
             .read(&mut bytes)

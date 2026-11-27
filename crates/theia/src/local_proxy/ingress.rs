@@ -421,7 +421,7 @@ pub(super) async fn handle(
         {
             SocksRequest::Connect(address, port) => (address, port),
             SocksRequest::Associate(address, port) => {
-                return udp_association(socket, client, address, port).await
+                return Box::pin(udp_association(socket, client, address, port)).await
             }
         }
     };
@@ -432,9 +432,9 @@ pub(super) async fn handle(
         "session" = Value::Count(session_id)
     );
     let opened = if plain.is_some() {
-        client.open_for(address, port, false).await
+        Box::pin(client.open_for(address, port, false)).await
     } else {
-        client.open(address, port).await
+        Box::pin(client.open(address, port)).await
     };
     let opened = opened.and_then(|tunnel| {
         tunnel.flow.check_pending()?;
@@ -459,7 +459,7 @@ pub(super) async fn handle(
             }
             // Plain HTTP receives the actual origin response, never a CONNECT 200.
             if let Some(request) = plain {
-                return tunnel.relay_http(socket, request).await;
+                return Box::pin(tunnel.relay_http(socket, request)).await;
             }
             // A direct socket is already connected; proxied routes verified OPEN_OK.
             if is_http {
@@ -472,7 +472,7 @@ pub(super) async fn handle(
                     .await
                     .map_err(|_| ClientError::Timeout)??;
             }
-            tunnel.relay(socket).await
+            Box::pin(tunnel.relay(socket)).await
         }
         Err(error) => {
             crate::diag!(
