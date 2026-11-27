@@ -379,6 +379,7 @@ async fn compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "mandatory dedicated native coverage shard: real startup replay guard"]
 async fn compiled_dual_mode_tui_invitation_import_apply_and_rollback() {
     use theia::{
         client_import::PrivateBearer,

@@ -183,8 +183,10 @@ class SpecContractTests(unittest.TestCase):
             self.assertIn(required, live_tests)
         workflow = read(".github/workflows/ci.yml")
         self.assertNotIn("actions/setup-go", workflow)
-        self.assertIn("--test independent_h2_loopback -- --ignored", workflow)
-        self.assertIn("run_f13_observations.py f13-observations", workflow)
+        extended = read(".github/workflows/extended-validation.yml")
+        self.assertIn("--test independent_h2_loopback -- --ignored", extended)
+        self.assertIn("run_f13_observations.py f13-observations", extended)
+        self.assertNotIn("run_f13_observations.py f13-observations", workflow)
         runner = read("tests/benchmark/run_f13_observations.py")
         self.assertIn("actual_chromium_h2_settings_and_pseudo_order_reference", runner)
         self.assertIn("actual_chromium_h3_initial_reference", runner)
@@ -320,8 +322,8 @@ class SpecContractTests(unittest.TestCase):
     def test_ci_only_acceptance_contract(self):
         workflow = read(".github/workflows/ci.yml")
         gate = workflow.split("\n  ci-gate:\n", 1)[1]
-        for job in ("specification", "m0-1-api-spike", "m0-1-windows-spike",
-                    "rust-tests", "windows-smoke"):
+        for job in ("specification", "rust-tests", "windows-smoke",
+                    "f14-build", "f14-cross-host", "coverage-native", "coverage-gate"):
             self.assertIn(job, gate.split("if:", 1)[0])
         self.assertIn("always()", gate)
         self.assertIn('get("result") != "success"', gate)
@@ -362,9 +364,10 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("CARGO_BIN_EXE_theia", tests)
         self.assertIn("client_binary_chromium_socks5", tests)
         workflow = read(".github/workflows/ci.yml")
-        self.assertIn("browser-e2e", workflow.split("\n  ci-gate:\n", 1)[1])
-        self.assertIn("client_binary_chromium_socks5 -- --ignored --exact", workflow)
-        self.assertIn("client_binary_chromium_socks5_over_h3 -- --ignored --exact", workflow)
+        self.assertIn("coverage-native", workflow.split("\n  ci-gate:\n", 1)[1])
+        self.assertIn("name = 'client_binary_chromium_socks5'; shard = 4", workflow)
+        self.assertIn("name = 'client_binary_chromium_socks5_over_h3'; shard = 4", workflow)
+        self.assertIn("$name --ignored --exact", workflow)
         self.assertIn("production_h3_client_refuses_incompatible_alpn_before_application_data",
                       read("crates/theia/tests/h3_server.rs"))
         self.assertIn("browser bypassed the Theia SOCKS5 path", read("tests/e2e/chromium_socks.py"))
@@ -503,13 +506,16 @@ class SpecContractTests(unittest.TestCase):
                      "auto_denied_h3_bearer_never_retries_working_h2"):
             self.assertIn(name, tests)
 
-    def test_m33_quic_congestion_comparison_is_mandatory(self):
-        workflow = read(".github/workflows/ci.yml")
-        gate = workflow.split("\n  ci-gate:\n", 1)[1]
-        # Native BBR evidence is mandatory inside the existing Linux/Windows
-        # M0.1 jobs, not via another pair of identical Cargo builds.
+    def test_m33_quic_congestion_comparison_is_extended_acceptance(self):
+        fast = read(".github/workflows/ci.yml")
+        workflow = read(".github/workflows/extended-validation.yml")
+        gate = workflow.split("\n  extended-gate:\n", 1)[1]
+        # Native BBR comparison stays in explicit extended acceptance, not
+        # ordinary per-merge MVP CI. Production QUIC regressions remain.
         self.assertIn("m0-1-api-spike", gate)
         self.assertIn("m0-1-windows-spike", gate)
+        self.assertNotIn("m0-1-api-spike", fast)
+        self.assertNotIn("m0-1-windows-spike", fast)
         self.assertNotIn("\n  m3-3-bbr-comparison:\n", workflow)
         bbr = ("comparison_records_all_controller_scenarios_ci_only "
                "-- --ignored --exact --nocapture")

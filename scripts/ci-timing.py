@@ -34,6 +34,18 @@ SHARDED_MERGED_JOBS = MERGED_JOBS | frozenset({
     "F-19 native performance (ubuntu-latest)", "F-19 native performance (windows-latest)",
 })
 
+# The fast MVP matrix still contains every native test partition and every
+# exact-SHA coverage producer. Historical matrices remain diagnostic only.
+MVP_MERGED_JOBS = frozenset({
+    "specification", "ci-gate", "Production line coverage >= 80%",
+    "F-14 Linux VM server to native Windows client",
+    "F-14 native build (ubuntu-24.04)", "F-14 native build (windows-latest)",
+    *(f"rust-tests (Linux, shard {n}/2)" for n in (1, 2)),
+    *(f"windows-smoke (shard {n}/2)" for n in (1, 2)),
+    *(f"Coverage instrumented ({os}, shard {n}/6)"
+      for os in ("ubuntu-latest", "windows-latest") for n in range(1, 7)),
+})
+
 
 class EvidenceError(ValueError):
     """Incomplete or incomparable timing evidence."""
@@ -81,8 +93,13 @@ def summarize(run: dict, response: dict) -> dict:
     require(created <= started <= updated, "inconsistent run timestamps")
 
     jobs = response.get("jobs")
-    if merged and isinstance(jobs, list) and len(jobs) == len(SHARDED_MERGED_JOBS):
-        expected_jobs = SHARDED_MERGED_JOBS
+    if merged and isinstance(jobs, list):
+        names = {job.get("name") for job in jobs if isinstance(job, dict)
+                 and isinstance(job.get("name"), str)}
+        if names == MVP_MERGED_JOBS:
+            expected_jobs = MVP_MERGED_JOBS
+        elif len(jobs) == len(SHARDED_MERGED_JOBS):
+            expected_jobs = SHARDED_MERGED_JOBS
     require(isinstance(jobs, list) and response.get("total_count") == len(jobs)
             and len(jobs) in ({len(expected_jobs)} if merged else
                               {len(expected_jobs), len(expected_jobs) + 1}),

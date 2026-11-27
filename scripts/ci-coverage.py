@@ -396,23 +396,38 @@ def read_report(path: Path) -> dict:
 
 def combine(reports: list[dict], expected: dict[str, str], sha: str,
             excluded: dict[str, set[int]], lengths: dict[str, int],
-            zero_executable: set[str] | None = None) -> dict:
+            zero_executable: set[str] | None = None, shards: int = 1) -> dict:
     zero_executable = zero_executable or set()
     if not zero_executable <= set(expected):
         raise EvidenceError("Unknown zero-executable source")
-    if len(reports) != 2:
-        raise EvidenceError("Exactly two native reports are required")
+    if type(shards) is not int or not 1 <= shards <= 32:
+        raise EvidenceError("Invalid native shard count")
+    required = {(platform, shard) for platform in PLATFORMS for shard in range(1, shards + 1)}
+    if len(reports) != len(required):
+        raise EvidenceError("Every native platform and shard report is required")
     seen = set()
     combined = {name: {} for name in expected}
     for report in reports:
-        if not isinstance(report, dict) or set(report) != {"schema", "sha", "platform", "inventory", "files"}:
+        fields = {"schema", "sha", "platform", "inventory", "files"}
+        if shards > 1:
+            fields.update({"shard", "shards"})
+        if not isinstance(report, dict) or set(report) != fields:
             raise EvidenceError("Unknown or missing native evidence fields")
         platform = report["platform"]
-        if type(report["schema"]) is not int or report["schema"] != 1 or report["sha"] != sha:
+        if (type(report["schema"]) is not int or report["schema"] != (2 if shards > 1 else 1)
+                or report["sha"] != sha):
             raise EvidenceError("Stale or incompatible coverage evidence")
-        if platform not in PLATFORMS or platform in seen or report["inventory"] != expected:
-            raise EvidenceError("Wrong platform, duplicate platform or source inventory mismatch")
-        seen.add(platform)
+        shard = 1
+        if shards > 1:
+            shard = report["shard"]
+            if type(shard) is not int or type(report["shards"]) is not int or report["shards"] != shards:
+                raise EvidenceError("Invalid shard identity")
+        if not isinstance(platform, str):
+            raise EvidenceError("Invalid platform")
+        identity = (platform, shard)
+        if identity not in required or identity in seen or report["inventory"] != expected:
+            raise EvidenceError("Wrong or duplicate native shard or source inventory mismatch")
+        seen.add(identity)
         files = report["files"]
         if not isinstance(files, dict) or not files or not set(files) <= set(expected):
             raise EvidenceError("Missing or unexpected native coverage source")
@@ -426,8 +441,8 @@ def combine(reports: list[dict], expected: dict[str, str], sha: str,
                     raise EvidenceError("Malformed coverage line identity")
                 if int(number) not in excluded[name]:
                     combined[name][number] = max(combined[name].get(number, 0), hits)
-    if seen != PLATFORMS:
-        raise EvidenceError("Both native platforms must be measured")
+    if seen != required:
+        raise EvidenceError("All native platform shards must be measured")
     missing = [name for name, lines in combined.items() if not lines and name not in zero_executable]
     if missing:
         raise EvidenceError("Production sources missing executable evidence: " + ", ".join(sorted(missing)))
@@ -437,9 +452,34 @@ def combine(reports: list[dict], expected: dict[str, str], sha: str,
     total = sum(value["total"] for value in files.values())
     if not total:
         raise EvidenceError("No production executable lines measured")
-    return {"schema": 1, "sha": sha, "platforms": sorted(seen), "minimum_percent": MIN_PERCENT,
+    return {"schema": 1, "sha": sha, "platforms": sorted(PLATFORMS), "shards_per_platform": shards,
+            "minimum_percent": MIN_PERCENT,
             "covered": covered, "total": total, "percent": covered * 100 / total,
             "passed": covered * 100 >= MIN_PERCENT * total, "files": files}
+
+
+def read_shards(directory: Path, shards: int) -> list[dict]:
+    """Require the complete artifact matrix and bind each report to its artifact name."""
+    names = {f"coverage-shard-{platform}-{shard}": (platform, shard)
+             for platform in PLATFORMS for shard in range(1, shards + 1)}
+    if not directory.is_dir() or directory.is_symlink():
+        raise EvidenceError("Missing coverage shard artifact directory")
+    actual = {entry.name: entry for entry in directory.iterdir()}
+    if set(actual) != set(names):
+        raise EvidenceError("Missing or unexpected coverage shard artifacts")
+    reports = []
+    for name, (platform, shard) in sorted(names.items()):
+        folder = actual[name]
+        path = folder / "coverage.json"
+        if (not folder.is_dir() or folder.is_symlink() or not path.is_file()
+                or path.is_symlink() or {entry.name for entry in folder.iterdir()} != {"coverage.json"}):
+            raise EvidenceError("Invalid coverage shard artifact contents")
+        report = read_report(path)
+        if (not isinstance(report, dict) or report.get("platform") != platform
+                or report.get("shard") != shard or report.get("shards") != shards):
+            raise EvidenceError("Coverage artifact identity mismatch")
+        reports.append(report)
+    return reports
 
 
 def write_json(path: Path, value: dict) -> None:
@@ -453,9 +493,13 @@ def main() -> int:
     collect.add_argument("--lcov", type=Path, required=True)
     collect.add_argument("--llvm-json", type=Path, required=True)
     collect.add_argument("--platform", choices=sorted(PLATFORMS), required=True)
+    collect.add_argument("--shard", type=int, default=1)
+    collect.add_argument("--shards", type=int, default=1)
     gate = commands.add_parser("gate")
-    gate.add_argument("--linux", type=Path, required=True)
-    gate.add_argument("--windows", type=Path, required=True)
+    gate.add_argument("--linux", type=Path)
+    gate.add_argument("--windows", type=Path)
+    gate.add_argument("--reports-dir", type=Path)
+    gate.add_argument("--shards", type=int, default=1)
     for command in (collect, gate):
         command.add_argument("--sha", required=True)
         command.add_argument("--output", type=Path, required=True)
@@ -465,15 +509,28 @@ def main() -> int:
     if args.command == "collect":
         llvm = read_llvm_export(read_report(args.llvm_json), ROOT, expected)
         files = read_lcov(args.lcov.read_text(encoding="utf-8"), ROOT, expected, llvm)
-        write_json(args.output, {"schema": 1, "sha": args.sha, "platform": args.platform,
-                                 "inventory": expected, "files": files})
+        if not 1 <= args.shard <= args.shards <= 32:
+            raise EvidenceError("Invalid shard identity")
+        report = {"schema": 1, "sha": args.sha, "platform": args.platform,
+                  "inventory": expected, "files": files}
+        if args.shards > 1:
+            report.update(schema=2, shard=args.shard, shards=args.shards)
+        write_json(args.output, report)
         return 0
+    if args.reports_dir is not None:
+        if args.linux is not None or args.windows is not None or not 2 <= args.shards <= 32:
+            raise EvidenceError("Sharded gate requires only an explicit directory and shard count")
+        reports = read_shards(args.reports_dir, args.shards)
+    else:
+        if args.shards != 1 or args.linux is None or args.windows is None:
+            raise EvidenceError("Unsharded evidence requires both native reports")
+        reports = [read_report(args.linux), read_report(args.windows)]
     sources = {name: (ROOT / name).read_bytes() for name in expected}
     excluded = {name: test_only_lines(source) for name, source in sources.items()}
     lengths = {name: len(source.splitlines()) for name, source in sources.items()}
-    summary = combine([read_report(args.linux), read_report(args.windows)], expected,
-                      args.sha, excluded, lengths,
-                      {name for name, source in sources.items() if zero_executable_source(source)})
+    summary = combine(reports, expected, args.sha, excluded, lengths,
+                      {name for name, source in sources.items() if zero_executable_source(source)},
+                      shards=args.shards)
     write_json(args.output, summary)
     print(f'Production line coverage: {summary["covered"]}/{summary["total"]} '
           f'({summary["percent"]:.2f}%), required {MIN_PERCENT}%')

@@ -1,0 +1,666 @@
+name: Extended research and post-MVP acceptance
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Independent, explicitly requested diagnostics. Never gate ordinary MVP CI.
+cache-mode: read
+
+jobs:
+  specification:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tested_sha: ${{ steps.source.outputs.tested_sha }}
+      rust_ready: 'true'
+      native_required: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require exact immutable main source
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/main
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -f Cargo.lock
+          echo "tested_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+      - name: Extended offline evidence contracts
+        run: |
+          python3 -m unittest discover -s tests/ci -p 'test_performance_evidence.py'
+          python3 -m unittest discover -s tests/ci -p 'test_benchmark_ports.py'
+          python3 -m unittest discover -s tests/ci -p 'test_native_performance.py'
+          python3 -m unittest discover -s tests/ci -p 'test_classifier_evidence.py'
+          python3 -m unittest discover -s tests/ci -p 'test_f19_bundle.py'
+          python3 -m unittest discover -s tests/ci -p 'test_f13_observations.py'
+
+  m0-1-api-spike:
+    name: m0-1-api-spike (Linux)
+    needs: specification
+    if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      THEIA_TRACE_DIR: ${{ github.workspace }}/theia-traces
+      THEIA_BBR_RESULTS_PATH: ${{ github.workspace }}/theia-bbr-ubuntu-latest.csv
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.specification.outputs.tested_sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          save-if: false
+          cache-workspace-crates: false
+          workspaces: "spikes/m0_1 -> target"
+          key: "m0-1"
+      - name: Test actual HTTP/2 and HTTP/3 TLS transports
+        run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked
+      # Reuse this already-built isolated Cargo workspace instead of
+      # provisioning another Linux/Windows BBR-only matrix.
+      - name: Compare verified QUIC BBR and CUBIC with deterministic UDP impairment
+        shell: pwsh
+        run: |
+          cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test quic_congestion_comparison comparison_records_all_controller_scenarios_ci_only -- --ignored --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'QUIC comparison failed' }
+      - name: Validate reproducibility and evidence coverage
+        shell: pwsh
+        run: |
+          python tests/benchmark/check_bbr_comparison.py $env:THEIA_BBR_RESULTS_PATH
+          if ($LASTEXITCODE -ne 0) { throw 'QUIC comparison validation failed' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: m3-3-quic-comparison-${{ runner.os }}
+          path: ${{ env.THEIA_BBR_RESULTS_PATH }}
+          if-no-files-found: error
+      - name: Report synthetic BBR loss recovery diagnostics (not a benchmark)
+        run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test quic_bbr_loss -- --nocapture
+      - name: Fingerprint baseline diagnostics (default rustls, NOT browser profile)
+        run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test client_hello_baseline -- --nocapture
+      - name: Check all targets
+        run: cargo check --manifest-path spikes/m0_1/Cargo.toml --all-targets --locked
+      - name: Validate pinned dependency tree
+        run: cargo metadata --manifest-path spikes/m0_1/Cargo.toml --locked --format-version 1 --no-deps > /dev/null
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Independent OpenSSL TLS1.3 H2 and strict certificate checks
+        run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test independent_h2_loopback -- --ignored --nocapture
+      - name: Upload sanitized trace logs on CI failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic-traces-m3-3-bbr-comparison-ubuntu-latest
+          path: ${{ env.THEIA_TRACE_DIR }}/*.log*
+          if-no-files-found: ignore
+          retention-days: 3
+
+  m0-1-windows-spike:
+    name: m0-1-api-spike (Windows)
+    needs: specification
+    if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      THEIA_TRACE_DIR: ${{ github.workspace }}/theia-traces
+      THEIA_BBR_RESULTS_PATH: ${{ github.workspace }}/theia-bbr-windows-latest.csv
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.specification.outputs.tested_sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          save-if: false
+          cache-workspace-crates: false
+          workspaces: "spikes/m0_1 -> target"
+          key: "m0-1-windows"
+      - name: Native Windows TLS/H2 and QUIC/H3 tests
+        run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked
+      # Reuse this already-built isolated Cargo workspace instead of
+      # provisioning another Linux/Windows BBR-only matrix.
+      - name: Compare verified QUIC BBR and CUBIC with deterministic UDP impairment
+        shell: pwsh
+        run: |
+          cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test quic_congestion_comparison comparison_records_all_controller_scenarios_ci_only -- --ignored --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'QUIC comparison failed' }
+      - name: Validate reproducibility and evidence coverage
+        shell: pwsh
+        run: |
+          python tests/benchmark/check_bbr_comparison.py $env:THEIA_BBR_RESULTS_PATH
+          if ($LASTEXITCODE -ne 0) { throw 'QUIC comparison validation failed' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: m3-3-quic-comparison-${{ runner.os }}
+          path: ${{ env.THEIA_BBR_RESULTS_PATH }}
+          if-no-files-found: error
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Independent OpenSSL TLS1.3 H2 and strict certificate checks
+        run: cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test independent_h2_loopback -- --ignored --nocapture
+      - name: Upload sanitized trace logs on CI failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic-traces-m3-3-bbr-comparison-windows-latest
+          path: ${{ env.THEIA_TRACE_DIR }}/*.log*
+          if-no-files-found: ignore
+          retention-days: 3
+
+  native-performance:
+    name: Native performance (${{ matrix.os }})
+    needs: specification
+    if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    env:
+      THEIA_TRACE_DIR: ${{ github.workspace }}/theia-traces
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.specification.outputs.tested_sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: native-default-deps-v4
+          cache-workspace-crates: false
+          cache-bin: false
+          save-if: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Checkout immutable stage-3 benchmark reference
+        uses: actions/checkout@v4
+        with:
+          ref: abbb89834a406b4c53be0f1ac0b3ab1a65e66f8d
+          path: .perf-baseline
+          persist-credentials: false
+      - name: Build exact native baseline before candidate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $actual = (git -C .perf-baseline rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -ne 'abbb89834a406b4c53be0f1ac0b3ab1a65e66f8d') { throw 'Wrong benchmark reference SHA' }
+          if ($IsWindows) {
+            # Same bounded main-thread stack reserve as the candidate's
+            # binary, without modifying the immutable reference source.
+            cargo rustc --manifest-path .perf-baseline/Cargo.toml --locked -p theia --bin theia --target-dir target -- -C link-arg=/STACK:8388608
+          } else {
+            cargo build --manifest-path .perf-baseline/Cargo.toml --locked --bin theia --target-dir target
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Native baseline build failed' }
+          $name = if ($IsWindows) { 'theia.exe' } else { 'theia' }
+          Copy-Item (Join-Path 'target/debug' $name) (Join-Path $env:RUNNER_TEMP "perf-baseline-$name")
+          "THEIA_PERF_BASELINE_BIN=$(Join-Path $env:RUNNER_TEMP "perf-baseline-$name")" >> $env:GITHUB_ENV
+      - name: Install pinned native benchmark measurement dependency
+        run: python -m pip install psutil==7.0.0
+      - name: Verify native benchmark port reservations on this OS
+        run: python -m unittest discover -s tests/ci -p 'test_benchmark_ports.py' -v
+      - name: Measure controlled native H2/H3 benchmark smoke
+        env:
+          THEIA_PERF_TESTED_SHA: ${{ needs.specification.outputs.tested_sha }}
+          THEIA_PERF_OUTPUT: ${{ github.workspace }}/native-performance.json
+        run: cargo test --workspace --locked --test performance_evidence native_binary_performance_evidence_smoke -- --ignored --exact --nocapture
+      - name: Check complete native measurement matrix without claiming release acceptance
+        run: python tests/benchmark/check_native_performance.py native-performance.json --expected-revision "${{ needs.specification.outputs.tested_sha }}" --expected-platform "${{ runner.os }}" --require-smoke
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-performance-${{ matrix.os }}
+          path: native-performance.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Measure paired baseline and candidate H2/H3 native binaries
+        env:
+          THEIA_PERF_TESTED_SHA: ${{ needs.specification.outputs.tested_sha }}
+          THEIA_PERF_BASELINE_SHA: abbb89834a406b4c53be0f1ac0b3ab1a65e66f8d
+          THEIA_PERF_OUTPUT: ${{ github.workspace }}/native-comparison.json
+        run: cargo test --workspace --locked --test performance_evidence native_binary_performance_comparison -- --ignored --exact --nocapture
+      - name: Evaluate paired measurements against predeclared diagnostic policy
+        run: python tests/benchmark/check_native_performance.py native-comparison.json --expected-revision "${{ needs.specification.outputs.tested_sha }}" --expected-platform "${{ runner.os }}" --require-comparison --policy tests/benchmark/native-diagnostic-policy.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-comparison-${{ matrix.os }}
+          path: native-comparison.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload sanitized trace logs on CI failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic-traces-native-performance-${{ matrix.os }}
+          path: ${{ env.THEIA_TRACE_DIR }}/*.log*
+          if-no-files-found: ignore
+          retention-days: 3
+
+  f19-performance:
+    name: F-19 native performance (${{ matrix.os }})
+    needs: specification
+    if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    env:
+      THEIA_TRACE_DIR: ${{ github.workspace }}/theia-traces
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.specification.outputs.tested_sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: native-default-deps-v4
+          cache-workspace-crates: false
+          cache-bin: false
+          save-if: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Checkout exact pre-batch F-19 comparison reference
+        uses: actions/checkout@v4
+        with:
+          ref: 917417b09f209334939c38551112081c480eb958
+          path: .f19-baseline
+          persist-credentials: false
+      - name: Build exact pre-batch native reference
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $actual = (git -C .f19-baseline rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -ne '917417b09f209334939c38551112081c480eb958') { throw 'Wrong F-19 reference SHA' }
+          if ($IsWindows) {
+            # Same bounded main-thread stack reserve as the candidate's
+            # binary, without modifying the immutable reference source.
+            cargo rustc --manifest-path .f19-baseline/Cargo.toml --locked -p theia --bin theia --target-dir target -- -C link-arg=/STACK:8388608
+          } else {
+            cargo build --manifest-path .f19-baseline/Cargo.toml --locked --bin theia --target-dir target
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'F-19 baseline build failed' }
+          $name = if ($IsWindows) { 'theia.exe' } else { 'theia' }
+          Copy-Item (Join-Path 'target/debug' $name) (Join-Path $env:RUNNER_TEMP "f19-baseline-$name")
+          "THEIA_F19_BASELINE_BIN=$(Join-Path $env:RUNNER_TEMP "f19-baseline-$name")" >> $env:GITHUB_ENV
+      - name: Install pinned native benchmark measurement dependency
+        run: python -m pip install psutil==7.0.0
+      - name: Measure isolated pre-batch vs candidate native overhead
+        env:
+          THEIA_PERF_TESTED_SHA: ${{ needs.specification.outputs.tested_sha }}
+          THEIA_PERF_BASELINE_SHA: 917417b09f209334939c38551112081c480eb958
+          THEIA_PERF_OUTPUT: ${{ github.workspace }}/f19-comparison.json
+        shell: pwsh
+        run: |
+          $env:THEIA_PERF_BASELINE_BIN = $env:THEIA_F19_BASELINE_BIN
+          cargo test --workspace --locked --test performance_evidence native_binary_performance_comparison -- --ignored --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'F-19 controlled measurement failed' }
+      - name: Evaluate isolated overhead without claiming classification or release acceptance
+        run: python tests/benchmark/check_native_performance.py f19-comparison.json --expected-revision "${{ needs.specification.outputs.tested_sha }}" --expected-platform "${{ runner.os }}" --require-comparison --policy tests/benchmark/f19-diagnostic-policy.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: f19-comparison-${{ matrix.os }}
+          path: f19-comparison.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload sanitized trace logs on CI failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic-traces-f19-performance-${{ matrix.os }}
+          path: ${{ env.THEIA_TRACE_DIR }}/*.log*
+          if-no-files-found: ignore
+          retention-days: 3
+
+  m3-4-btls-spike:
+    name: m3-4-btls-spike (${{ matrix.os }})
+    needs: specification
+    if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.specification.outputs.tested_sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          save-if: false
+          cache-workspace-crates: false
+          workspaces: "spikes/m3_4 -> target"
+          key: "m3-4-btls"
+      - name: Real BoringSSL TCP first flight and strict TLS certificate matrix
+        shell: pwsh
+        run: |
+          cargo test --manifest-path spikes/m3_4/Cargo.toml --locked
+          if ($LASTEXITCODE -ne 0) { throw 'BoringSSL candidate regressions failed' }
+      - name: Isolated Clippy warnings as errors
+        shell: pwsh
+        run: |
+          cargo clippy --manifest-path spikes/m3_4/Cargo.toml --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw 'M3.4 clippy failed' }
+
+  m3-4e-btls-production-feature:
+    name: m3-4e-btls-production-feature (${{ matrix.os }})
+    needs: specification
+    if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      THEIA_TRACE_DIR: ${{ github.workspace }}/theia-traces
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.specification.outputs.tested_sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          save-if: false
+          cache-workspace-crates: false
+          key: "m3-4e-feature"
+      - name: Verify production H2Client using optional BoringSSL TLS and real SmartTheia
+        shell: pwsh
+        run: |
+          cargo test --workspace --locked --features experimental-btls-h2 --test client_btls_h2 -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'Production BoringSSL H2/OPEN_OK regressions failed' }
+          cargo test --workspace --locked --features experimental-btls-h2 --test h2_wire_fingerprint -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'M3.4i actual H2 SETTINGS, WINDOW_UPDATE and pseudo capture failed' }
+          cargo test --workspace --locked --features experimental-btls-h2 --test h2_settings_feasibility -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'M3.4i bounded H2 flow-window API feasibility failed' }
+          cargo test --workspace --locked --features experimental-btls-h2 --test h2_client_shape -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'M3.4j H2 request order and parameterized credit research failed' }
+      - name: Feature Clippy fails on warnings
+        shell: pwsh
+        run: |
+          cargo clippy --workspace --all-targets --features experimental-btls-h2 -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw 'M3.4e feature Clippy failed' }
+      - name: Upload sanitized trace logs on CI failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic-traces-m3-4e-btls-production-feature-${{ matrix.os }}
+          path: ${{ env.THEIA_TRACE_DIR }}/*.log*
+          if-no-files-found: ignore
+          retention-days: 3
+
+  browser-e2e:
+    name: Extended browser and reference observations (${{ matrix.os }})
+    needs: specification
+    if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    env:
+      THEIA_TRACE_DIR: ${{ github.workspace }}/theia-traces
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.specification.outputs.tested_sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: native-default-deps-v4
+          cache-workspace-crates: false
+          cache-bin: false
+          save-if: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned test-only Playwright
+        run: python -m pip install playwright==1.65.2
+      - name: Provision Chromium on Linux
+        if: runner.os == 'Linux'
+        run: python -m playwright install --with-deps chromium
+      - name: Provision Chromium on Windows
+        if: runner.os == 'Windows'
+        run: python -m playwright install chromium
+      - name: Verify Chromium navigation through the built Theia client
+        run: cargo test --workspace --locked --test client_h2 client_binary_chromium_socks5 -- --ignored --exact --nocapture
+      - name: Verify Chromium navigation over the explicit Theia H3 transport
+        run: cargo test --workspace --locked --test client_h2 client_binary_chromium_socks5_over_h3 -- --ignored --exact --nocapture
+      - name: Measure repeated actual native and Chromium H2/H3 loopback sessions
+        run: python tests/benchmark/run_f13_observations.py f13-observations --revision "${{ needs.specification.outputs.tested_sha }}" --samples 3
+      - name: Validate exact-revision observation inventory and report differences
+        run: python tests/benchmark/check_f13_observations.py f13-observations --expected-revision "${{ needs.specification.outputs.tested_sha }}" --expected-platform "${{ runner.os }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: f13-observations-${{ matrix.os }}
+          path: f13-observations/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Install pinned independent REALITY reference implementations
+        run: python -m pip install h2==4.2.0 aioquic==1.2.0
+      - name: Independent native client PKI and ALPN matrix over H2/H3
+        run: cargo test --workspace --locked --test independent_native_tls native_clients_require_pki_and_exact_alpn -- --ignored --exact --nocapture
+      - name: Independent aioquic v1/v2 against native QUIC core (laboratory)
+        run: cargo test --workspace --locked --test independent_native_quic independent_aioquic_v1_v2_bidirectional_h3 -- --ignored --exact --nocapture
+      - name: Independent aioquic authentication of v1/v2 Modify output (laboratory)
+        run: cargo test --workspace --locked --lib routing::packet_modify::tests::independent_aioquic_initial_modify_v1_v2 -- --ignored --exact --nocapture
+      - name: Independent live QUIC v1/v2 TLS resumption and H3 after Modify
+        run: cargo test --workspace --locked --test independent_quic_modify independent_aioquic_live_modify_v1_v2 -- --ignored --exact --nocapture
+      - name: Independent live QUIC v1/v2 through production UDP relay
+        run: cargo test --workspace --locked --lib udp_relay::tests::independent_quic_product_relay_v1_v2 -- --ignored --exact --nocapture
+      - name: Measure matched native and Quinn loopback samples (diagnostic)
+        run: python tests/benchmark/run_native_quic_comparison.py --revision "${{ needs.specification.outputs.tested_sha }}" --output native-quic-comparison.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-quic-comparison-${{ matrix.os }}
+          path: native-quic-comparison.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Independent external TLS and QUIC through registered REALITY dispatchers
+        run: cargo test --workspace --locked --lib server::hardening_tests::independent_external_reference_through_registered_reality_dispatchers -- --ignored --exact --nocapture
+      - name: Upload sanitized trace logs on CI failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic-traces-browser-e2e-${{ matrix.os }}
+          path: ${{ env.THEIA_TRACE_DIR }}/*.log*
+          if-no-files-found: ignore
+          retention-days: 3
+
+  f15-driver-build:
+    name: F-15 native backend prerequisites (${{ matrix.os }})
+    needs: specification
+    if: needs.specification.outputs.rust_ready == 'true' && needs.specification.outputs.native_required == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.specification.outputs.tested_sha }}
+          persist-credentials: false
+      - name: Compile the CO-RE collector against the runner kernel BTF
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm libbpf-dev linux-tools-generic
+          uname -r
+          # Runner sysfs may be readable only to root. Keep the actual
+          # kernel's BTF, not a synthetic or unrelated vmlinux.h.
+          btf="$RUNNER_TEMP/theia-vmlinux.btf"
+          sudo install -m 0644 /sys/kernel/btf/vmlinux "$btf"
+          test -s "$btf"
+          bpftool_path="$(find -L /usr/lib/linux-tools -type f -name bpftool -print | sort -V | tail -n 1)"
+          if [[ ! -x "$bpftool_path" ]]; then
+            echo "::error::No executable bpftool in installed Linux tools packages"
+            exit 1
+          fi
+          "$bpftool_path" version
+          sha256sum "$btf"
+          make -C drivers/linux CLANG=/usr/bin/clang BPFTOOL="$bpftool_path" BTF="$btf"
+          llvm-objdump -h drivers/linux/theia_flow_events.bpf.o
+          mkdir f15-build-evidence
+          cp drivers/linux/theia_flow_events.bpf.o f15-build-evidence/
+          sha256sum f15-build-evidence/theia_flow_events.bpf.o
+      - name: Validate WinDivert package staging without installing a driver
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./drivers/windows/windivert/test-package.ps1
+          Get-ChildItem drivers/windows/windivert -Filter '*.ps1' | ForEach-Object {
+            $tokens=$null; $errors=$null
+            $null=[System.Management.Automation.Language.Parser]::ParseFile($_.FullName,[ref]$tokens,[ref]$errors)
+            if ($errors.Count -ne 0) { throw "PowerShell parser rejected $($_.Name): $errors" }
+          }
+      - name: Compile WFP guard and validate native BFE transactions (abort only)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./drivers/windows/windivert/build-wfp-guard-lab.ps1 -OutputDirectory "$env:RUNNER_TEMP/theia-wfp-guard" -TestBfeTransaction
+      - name: Verify independent dual-stack external socket fixture (loopback only)
+        run: python drivers/windows/windivert/test-redirect-apps.py self-test
+      - name: Record Windows package validation scope
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory f15-build-evidence | Out-Null
+          [pscustomobject]@{SourceSha='${{ needs.specification.outputs.tested_sha }}';Backend='WinDivert';UpstreamVersion='2.2.2';PackageFixtureTests=$true;OfficialPackageVerified=$false;Installed=$false;CaptureReady=$false} | ConvertTo-Json | Set-Content f15-build-evidence/build-evidence.json
+      - name: Publish exact-source native prerequisite evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: f15-driver-build-${{ runner.os }}-${{ needs.specification.outputs.tested_sha }}
+          path: |
+            f15-build-evidence/*.o
+            f15-build-evidence/hashes.json
+            f15-build-evidence/build-evidence.json
+          if-no-files-found: error
+          retention-days: 3
+
+  f15-kernel:
+    name: Post-MVP isolated kernel acceptance and coverage
+    needs: specification
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.specification.outputs.tested_sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.9.1
+      - name: Install isolated kernel dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libbpf-dev nftables iproute2
+      - name: Purge previous profile counters
+        run: cargo llvm-cov clean --profraw-only
+      - name: Instrument actual F-15 isolated kernel tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n unshare -n true
+          export CARGO_TARGET_DIR="$PWD/target/llvm-cov-target"
+          export CARGO_LLVM_COV_TARGET_DIR="$CARGO_TARGET_DIR"
+          source <(cargo llvm-cov show-env --sh)
+          cargo test --locked -p theia --all-features --lib --no-run --message-format=json > f15-coverage-build.json
+          python3 scripts/f15-kernel-tests.py f15-coverage-build.json --coverage
+      - name: Export and verify actual privileged coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo llvm-cov report --lcov --include-build-script --output-path coverage.lcov
+          cargo llvm-cov report --json --include-build-script --output-path coverage-segments.json
+          python3 scripts/ci-coverage.py collect --lcov coverage.lcov --llvm-json coverage-segments.json --platform Linux --sha "${{ needs.specification.outputs.tested_sha }}" --output coverage.json
+          python3 scripts/f15-kernel-tests.py --verify-coverage coverage.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: post-mvp-kernel-coverage
+          path: coverage.json
+          if-no-files-found: error
+          retention-days: 7
+
+  release-profile:
+    needs: specification
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.specification.outputs.tested_sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Compile real release profile
+        run: cargo build --workspace --release --locked
+
+  extended-gate:
+    needs: [specification, m0-1-api-spike, m0-1-windows-spike, native-performance, f19-performance, m3-4-btls-spike, m3-4e-btls-production-feature, browser-e2e, f15-driver-build, f15-kernel, release-profile]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every requested extended job
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          results = json.loads(os.environ["JOB_RESULTS"])
+          expected = {"specification", "m0-1-api-spike", "m0-1-windows-spike", "native-performance", "f19-performance", "m3-4-btls-spike", "m3-4e-btls-production-feature", "browser-e2e", "f15-driver-build", "f15-kernel", "release-profile"}
+          if set(results) != expected or any(value["result"] != "success" for value in results.values()):
+              raise SystemExit("Extended acceptance incomplete")
+          PY

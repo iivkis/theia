@@ -86,6 +86,46 @@ class CoverageTests(unittest.TestCase):
             with self.subTest(reports=reports), self.assertRaises(cov.EvidenceError):
                 cov.combine(reports, FILES, SHA, EXCLUDED, LENGTHS)
 
+    def test_shard_matrix_union_and_artifact_identity(self):
+        from copy import deepcopy
+        reports = []
+        for platform in sorted(cov.PLATFORMS):
+            for shard in (1, 2):
+                value = report(platform, {A: {"1": int(shard == 1), "2": int(shard == 2)},
+                                          B: {"1": int(platform == "Windows")}})
+                value.update(schema=2, shard=shard, shards=2)
+                reports.append(value)
+        result = cov.combine(reports, FILES, SHA, EXCLUDED, LENGTHS, shards=2)
+        self.assertEqual((result["covered"], result["total"]), (3, 3))
+        self.assertEqual(result["shards_per_platform"], 2)
+        for mutate in ("missing", "duplicate", "stale", "wrong-count", "boolean", "inventory"):
+            broken = deepcopy(reports)
+            if mutate == "missing":
+                broken.pop()
+            elif mutate == "duplicate":
+                broken[-1] = deepcopy(broken[0])
+            elif mutate == "stale":
+                broken[0]["sha"] = "2" * 40
+            elif mutate == "wrong-count":
+                broken[0]["shards"] = 3
+            elif mutate == "boolean":
+                broken[0]["shard"] = True
+            else:
+                broken[0]["inventory"].pop(A)
+            with self.subTest(mutate=mutate), self.assertRaises(cov.EvidenceError):
+                cov.combine(broken, FILES, SHA, EXCLUDED, LENGTHS, shards=2)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for value in reports:
+                folder = root / f"coverage-shard-{value['platform']}-{value['shard']}"
+                folder.mkdir()
+                (folder / "coverage.json").write_text(json.dumps(value), encoding="utf-8")
+            self.assertEqual(len(cov.read_shards(root, 2)), 4)
+            wrong = root / "coverage-shard-Linux-1" / "coverage.json"
+            wrong.write_text(json.dumps(reports[1]), encoding="utf-8")
+            with self.assertRaises(cov.EvidenceError):
+                cov.read_shards(root, 2)
+
     def test_lcov_rejects_truncation_wrong_counts_and_duplicate_lines(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
