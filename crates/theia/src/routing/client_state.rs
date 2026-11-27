@@ -128,6 +128,7 @@ pub(crate) struct Cache {
     scope: String,
     checkpoint: Option<PathBuf>,
     state: tokio::sync::Mutex<State>,
+    pub(crate) policy: Arc<super::policy_lease::PolicyState>,
     pub(crate) dpi: Arc<super::dpi::Engine>,
     pub(crate) flows: Arc<super::flow::FlowTable>,
 }
@@ -153,10 +154,12 @@ fn read_floor(bytes: &[u8], scope: &str) -> Result<Floor, ClientError> {
 
 impl Cache {
     pub(crate) fn new(scope: String, checkpoint: Option<PathBuf>) -> Self {
+        let policy = Arc::new(super::policy_lease::PolicyState::default());
         Self {
             scope,
             checkpoint,
-            dpi: Arc::new(super::dpi::Engine::default()),
+            dpi: Arc::new(super::dpi::Engine::new(policy.clone())),
+            policy,
             flows: super::flow::FlowTable::shared(),
             state: tokio::sync::Mutex::new(State {
                 snapshot: None,
@@ -201,7 +204,7 @@ impl Cache {
     }
 
     fn authorize_local(&self, snapshot: &Snapshot, deadline: Instant) {
-        self.dpi.authorize_policy(Some(LocalPolicy {
+        self.policy.authorize_policy(Some(LocalPolicy {
             checkpoint: snapshot.checkpoint(),
             deadline,
             floor: self
@@ -233,8 +236,8 @@ impl Cache {
         Fut: Future<Output = Result<Vec<u8>, ClientError>>,
     {
         let mut state = self.state.lock().await;
-        if self.dpi.retired() {
-            return Err(super::dpi::stale_policy());
+        if self.policy.retired() {
+            return Err(super::policy_lease::stale_policy());
         }
         let now = Instant::now();
         let mut keep_lease = false;
@@ -260,7 +263,7 @@ impl Cache {
                 }
                 Ok(false) => {}
                 Err(error) => {
-                    self.dpi.authorize_policy(None);
+                    self.policy.authorize_policy(None);
                     return Err(error);
                 }
             }
@@ -268,7 +271,7 @@ impl Cache {
         // A proactive unchanged refresh may retain the unexpired lease
         // while in flight. Expired, mismatched and failed refreshes revoke it.
         if !keep_lease {
-            self.dpi.authorize_policy(None);
+            self.policy.authorize_policy(None);
         }
         if state.retry.is_some_and(|until| now < until) {
             return Err(ClientError::Open(ErrorCode::PolicyDenied));
@@ -291,8 +294,8 @@ impl Cache {
                         .map_err(|_| ClientError::Protocol)?,
                 )
             };
-            if self.dpi.retired() {
-                return Err(super::dpi::stale_policy());
+            if self.policy.retired() {
+                return Err(super::policy_lease::stale_policy());
             }
             self.persist(&snapshot, state.snapshot.as_deref())?;
             Ok::<_, ClientError>(snapshot)
@@ -300,7 +303,7 @@ impl Cache {
         let snapshot = match refreshed {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                self.dpi.authorize_policy(None);
+                self.policy.authorize_policy(None);
                 return Err(error);
             }
         };
@@ -308,8 +311,8 @@ impl Cache {
         let deadline = Instant::now() + TTL;
         state.expires = Some(deadline);
         self.authorize_local(&snapshot, deadline);
-        if self.dpi.retired() {
-            return Err(super::dpi::stale_policy());
+        if self.policy.retired() {
+            return Err(super::policy_lease::stale_policy());
         }
         state.retry = None;
         Ok(snapshot)
@@ -322,19 +325,19 @@ impl Cache {
         let state = self
             .state
             .try_lock()
-            .map_err(|_| super::dpi::stale_policy())?;
+            .map_err(|_| super::policy_lease::stale_policy())?;
         let deadline = state
             .expires
             .filter(|deadline| *deadline > Instant::now())
-            .ok_or_else(super::dpi::stale_policy)?;
+            .ok_or_else(super::policy_lease::stale_policy)?;
         if !state
             .snapshot
             .as_ref()
             .is_some_and(|snapshot| snapshot.digest() == digest)
         {
-            return Err(super::dpi::stale_policy());
+            return Err(super::policy_lease::stale_policy());
         }
-        self.dpi.check_policy(digest)?;
+        self.policy.check_policy(digest)?;
         Ok(deadline)
     }
 
@@ -589,16 +592,16 @@ mod tests {
         let (_, wire) = Snapshot::build("scope", 1, &[], &[], &[]).unwrap();
         let first = cache.get(|_| async { Ok(wire) }).await.unwrap();
         let digest = first.digest();
-        assert!(cache.dpi.policy_current(digest));
-        assert!(!cache.dpi.policy_current([0; 32]));
+        assert!(cache.policy.policy_current(digest));
+        assert!(!cache.policy.policy_current([0; 32]));
         cache.state.lock().await.expires = None;
         assert!(cache.get(|_| async { Err(ClientError::Io) }).await.is_err());
-        assert!(!cache.dpi.policy_current(digest));
+        assert!(!cache.policy.policy_current(digest));
         cache.state.lock().await.retry = None;
         let (_, wire) = Snapshot::build("scope", 2, &[], &[], &[]).unwrap();
         let second = cache.get(|_| async { Ok(wire) }).await.unwrap();
-        assert!(!cache.dpi.policy_current(digest));
-        assert!(cache.dpi.policy_current(second.digest()));
+        assert!(!cache.policy.policy_current(digest));
+        assert!(cache.policy.policy_current(second.digest()));
         let expired = LocalPolicy {
             checkpoint: second.checkpoint(),
             deadline: Instant::now(),
@@ -628,7 +631,7 @@ mod tests {
             .await
             .unwrap();
         assert!(cache.observation_deadline(digest).unwrap() >= original);
-        cache.dpi.retire();
+        cache.policy.retire();
         assert!(cache.observation_deadline(digest).is_err());
     }
 
@@ -640,7 +643,7 @@ mod tests {
         let snapshot = cache.get(|_| async { Ok(wire) }).await.unwrap();
         let digest = snapshot.digest();
         let flow = cache.flows.begin(
-            cache.dpi.clone(),
+            cache.policy.clone(),
             Protocol::Tcp,
             crate::protocol::Address::V4([192, 0, 2, 1]),
             443,

@@ -7,6 +7,7 @@ pub mod dns_attribution;
 pub(crate) mod dpi;
 pub(crate) mod exchange;
 pub(crate) mod flow;
+pub(crate) mod policy_lease;
 pub mod geodata;
 #[cfg(target_os = "linux")]
 pub mod linux_attribution;

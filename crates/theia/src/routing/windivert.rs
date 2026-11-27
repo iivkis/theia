@@ -1610,7 +1610,7 @@ mod native {
     struct ScopeReply {
         flow:Arc<ScopeUdpFlow>,
         payload:Vec<u8>,
-        engine:Arc<crate::routing::dpi::Engine>,
+        engine:Arc<crate::routing::policy_lease::PolicyState>,
         digest:[u8;32],
         sent:oneshot::Sender<io::Result<()>>,
     }
@@ -1618,7 +1618,7 @@ mod native {
     pub(crate) struct ScopeReplies(mpsc::Sender<ScopeReply>);
     impl ScopeReplies {
         pub(crate) async fn send(&self,flow:Arc<ScopeUdpFlow>,payload:Vec<u8>,
-            engine:Arc<crate::routing::dpi::Engine>,digest:[u8;32])->io::Result<()> {
+            engine:Arc<crate::routing::policy_lease::PolicyState>,digest:[u8;32])->io::Result<()> {
             if !flow.live() || payload.len()>crate::protocol::MAX_DATAGRAM || engine.check_policy(digest).is_err() {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }

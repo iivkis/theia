@@ -1125,7 +1125,7 @@ impl Carrier {
         let policy = snapshot.policy();
         let address = target.address();
         let digest = target.digest();
-        let Ok(pin) = cache.dpi.pin_policy(digest) else { return };
+        let Ok(pin) = cache.policy.pin(digest) else { return };
         // Refresh never trusts old DNS pins. Bound control-plane delay,
         // refuse any mixed rules or non-public IPs, and keep the exact IP.
         let Ok(Ok(ips)) = timeout(Duration::from_secs(2), self.resolve_routing(name, digest)).await else {
@@ -1272,7 +1272,7 @@ async fn route_decision(
     address: &Address,
 ) -> Result<(Arc<Snapshot>, Action, Option<Vec<IpAddr>>), ClientError> {
     let snapshot = cache.get(|known| carrier.fetch_routing(known)).await?;
-    let authorization = cache.dpi.pin_policy(snapshot.digest())?;
+    let authorization = cache.policy.pin(snapshot.digest())?;
     let policy = snapshot.policy();
     let denied = || ClientError::Open(ErrorCode::PolicyDenied);
     use crate::routing::Evidence;
@@ -1344,7 +1344,7 @@ async fn routed_open(
         return Err(ClientError::Open(ErrorCode::PolicyDenied));
     }
     let flow = cache.flows.begin(
-        cache.dpi.clone(),
+        cache.policy.clone(),
         crate::routing::flow::Protocol::Tcp,
         address.clone(),
         port,
@@ -1368,7 +1368,7 @@ async fn routed_open_selected(
     pinned: Option<Vec<IpAddr>>,
     allow_dpi: bool,
 ) -> Result<ProxyTunnel, ClientError> {
-    let authorization = cache.dpi.pin_policy(snapshot.digest())?;
+    let authorization = cache.policy.pin(snapshot.digest())?;
     let policy = snapshot.policy();
     let denied = || ClientError::Open(ErrorCode::PolicyDenied);
     match action.packet_action() {
@@ -1458,7 +1458,7 @@ async fn routed_udp(
         return Err(ClientError::Open(ErrorCode::PolicyDenied));
     }
     let flow = cache.flows.begin(
-        cache.dpi.clone(),
+        cache.policy.clone(),
         crate::routing::flow::Protocol::Udp,
         address.clone(),
         port,
@@ -1486,7 +1486,7 @@ async fn routed_udp_selected(
     action: Action,
     pinned: Option<Vec<IpAddr>>,
 ) -> Result<crate::udp_relay::Tunnel, ClientError> {
-    let authorization = cache.dpi.pin_policy(snapshot.digest())?;
+    let authorization = cache.policy.pin(snapshot.digest())?;
     match action.packet_action() {
         crate::routing::PacketAction::Drop => {
             crate::traffic::blocked();
@@ -2123,7 +2123,7 @@ impl ClientRuntime {
 
     fn quiesce_locked(&self) {
         self.admission.store(false, std::sync::atomic::Ordering::Release);
-        self.slot.borrow().client.routing_cache().dpi.retire();
+        self.slot.borrow().client.routing_cache().policy.retire();
     }
 
     fn quiesce(&self) {
@@ -2297,7 +2297,7 @@ impl ClientRuntime {
         if !self.admitting() || *self.stopped.borrow() {
             return Err(ClientError::Configuration);
         }
-        previous.client.routing_cache().dpi.retire();
+        previous.client.routing_cache().policy.retire();
         self.slot.send_replace(Arc::new(ClientView {
             document,
             digest,
@@ -2770,7 +2770,7 @@ impl NativeIngress {
     pub fn shutdown(&self) {
         let _gate = self.verdict_gate.lock();
         self.runtime.stop();
-        self.client.routing_cache().dpi.retire();
+        self.client.routing_cache().policy.retire();
         if let Ok(mut registrar) = self.registrar.lock() {
             if let Some(registrar)=registrar.take() {
                 // Other tasks may still hold Arc clones and carrier
@@ -3305,7 +3305,7 @@ impl NativeIngress {
                 let relay=async {
                     self.ensure_accepting()?;
                     if !source.live() {return Err(ClientError::Open(ErrorCode::PolicyDenied));}
-                    self.client.routing_cache().dpi.check_policy(snapshot.digest())?;
+                    self.client.routing_cache().policy.check_policy(snapshot.digest())?;
                     if let Some(verified)=local {
                         self.check_native_modify(key,snapshot.digest())?;
                         return crate::udp_relay::relay_native_modify_lab(&verified,
@@ -3334,7 +3334,7 @@ impl NativeIngress {
                         // Acknowledged by the sole packet worker only
                         // after exact reverse injection; no echo matching
                         // and no one-request/one-response assumption.
-                        replies.send(source.clone(),bytes,self.client.routing_cache().dpi.clone(),
+                        replies.send(source.clone(),bytes,self.client.routing_cache().policy.clone(),
                             snapshot.digest()).await.map_err(|_|ClientError::Io)?;
                     }
                     Ok::<(),ClientError>(())
@@ -3360,7 +3360,7 @@ impl NativeIngress {
             let answer=self.protected_dns_answer(key,&current.payload,false,Some((&flow,digest))).await?;
             self.check_native_modify(key,digest)?;
             if !source.live() {return Err(denied());}
-            replies.send(source.clone(),answer.wire.clone(),self.client.routing_cache().dpi.clone(),
+            replies.send(source.clone(),answer.wire.clone(),self.client.routing_cache().policy.clone(),
                 digest).await.map_err(|_|ClientError::Io)?;
             if !source.live() {return Err(denied());}
             self.record_dns_delivery(key,answer)?;
@@ -3613,7 +3613,7 @@ impl NativeIngress {
                 .min(requested + Duration::from_secs(30));
             self.ensure_running()?;
             validate_source()?;
-            cache.dpi.check_policy(digest)?;
+            cache.policy.check_policy(digest)?;
             candidates
                 .record(flow, link, digest, &ips, deadline)
                 .map_err(|_| ClientError::Protocol)
@@ -3695,7 +3695,7 @@ impl NativeIngress {
         let flow =
             cache
                 .flows
-                .begin_native(cache.dpi.clone(), key, digest, PacketAction::Modify)?;
+                .begin_native(cache.policy.clone(), key, digest, PacketAction::Modify)?;
         Ok(LabStunPermit {
             key,
             flow,
@@ -3821,7 +3821,7 @@ impl NativeIngress {
                     if self
                         .client
                         .routing_cache()
-                        .dpi
+                        .policy
                         .check_policy(entry.digest)
                         .is_err()
                     {
@@ -3882,7 +3882,7 @@ impl NativeIngress {
                 let key=crate::routing::packet::FlowKey{interface:0,..m.flow};
                 self.raw.lock().ok().is_some_and(|raw|raw.get(&key).is_some_and(|entry|
                     !entry.denied && entry.action==action &&
-                    self.client.routing_cache().dpi.check_policy(entry.digest).is_ok()))
+                    self.client.routing_cache().policy.check_policy(entry.digest).is_ok()))
             });
             let action=if current && gate.is_ok() && self.ensure_accepting().is_ok(){action}else{PacketAction::Drop};
             if action==PacketAction::Redirect {
@@ -3895,7 +3895,7 @@ impl NativeIngress {
                     let mut raw=self.raw.lock().map_err(|_|ClientError::Io)?;
                     let entry=raw.get_mut(&key).ok_or(ClientError::Open(ErrorCode::PolicyDenied))?;
                     let allowed=!entry.denied && entry.action==PacketAction::Redirect &&
-                        self.client.routing_cache().dpi.check_policy(entry.digest).is_ok() &&
+                        self.client.routing_cache().policy.check_policy(entry.digest).is_ok() &&
                         packet.bytes().len().checked_sub(meta.payload_len)
                             .and_then(|offset|packet.bytes().get(offset..))
                             .is_some_and(|payload|entry.dns_capture.record(payload));
@@ -3981,7 +3981,7 @@ impl NativeIngress {
         let action=if meta.flow.destination.port()==53 {
             if unified {PacketAction::Redirect} else {PacketAction::Drop}
         } else {action};
-        let current=action!=PacketAction::Drop && cache.dpi.check_policy(digest).is_ok();
+        let current=action!=PacketAction::Drop && cache.policy.check_policy(digest).is_ok();
         if let Some(entry) = raw.get_mut(&meta.flow) {
             entry.last = now;
             if !current || entry.digest!=digest || entry.socket_cookie!=socket_cookie || entry.action!=action {
@@ -4003,7 +4003,7 @@ impl NativeIngress {
             return PacketAction::Drop;
         }
         let flow=if action==PacketAction::Pass {
-            let Ok(flow)=cache.flows.begin_native(cache.dpi.clone(),meta.flow,digest,PacketAction::Pass)
+            let Ok(flow)=cache.flows.begin_native(cache.policy.clone(),meta.flow,digest,PacketAction::Pass)
                 else {return PacketAction::Drop;};
             if flow.commit(PacketAction::Pass).is_err(){return PacketAction::Drop;}
             Some(flow)
@@ -4079,7 +4079,7 @@ impl NativeIngress {
             let denied=||ClientError::Open(ErrorCode::PolicyDenied);
             let registry=self.windows_modify.lock().map_err(|_|denied())?;
             registry.as_ref().ok_or_else(denied)?.check_modify_scope(key).map_err(|_|denied())?;
-            self.client.routing_cache().dpi.check_policy(digest)
+            self.client.routing_cache().policy.check_policy(digest)
         }
     }
 
@@ -4357,7 +4357,7 @@ impl NativeIngress {
                 }
                 let relay = async {
                     self.ensure_accepting()?;
-                    self.client.routing_cache().dpi.check_policy(snapshot.digest())?;
+                    self.client.routing_cache().policy.check_policy(snapshot.digest())?;
                     if self.unified.load(std::sync::atomic::Ordering::Acquire) {
                         self.check_unified_redirect(key, snapshot.digest())?;
                     }
@@ -4412,7 +4412,7 @@ impl NativeIngress {
         let cache = self.client.routing_cache();
         let digest = snapshot.digest();
         self.check_native_modify(key, digest)?;
-        cache.dpi.check_policy(digest)?;
+        cache.policy.check_policy(digest)?;
         if !cache.dpi.enabled() || key.transport != Transport::Udp
             || !crate::server::allowed_destination(key.destination.ip(), false)
         {
@@ -4447,14 +4447,14 @@ impl NativeIngress {
         let ips = match carrier.resolve_routing(&name, digest).await {
             Ok(ips) => ips,
             Err(ClientError::Rejected(502 | 504)) => {
-                cache.dpi.check_policy(digest)?;
+                cache.policy.check_policy(digest)?;
                 self.check_native_modify(key, digest)?;
                 return Ok(None);
             }
             Err(error) => return Err(error),
         };
         if !ips.contains(&key.destination.ip()) { return Err(denied()); }
-        cache.dpi.check_policy(digest)?;
+        cache.policy.check_policy(digest)?;
         self.check_native_modify(key, digest)?;
         // The probe API returns None for both transport and security
         // failures. Until it has a typed failure contract, do not treat
@@ -4504,7 +4504,7 @@ impl NativeIngress {
             let snapshot=cache.get(|known|carrier.fetch_routing(known)).await?;
             let digest=snapshot.digest();
             self.check_native_modify(key,digest)?;
-            let flow=cache.flows.begin_native(cache.dpi.clone(),key,digest,crate::routing::PacketAction::Redirect)?;
+            let flow=cache.flows.begin_native(cache.policy.clone(),key,digest,crate::routing::PacketAction::Redirect)?;
             Ok((flow,digest))
         }).await
     }
@@ -4698,7 +4698,7 @@ impl NativeIngress {
                 if verified.quic_batch(&first.payload).is_none() || verified.socket.peer_addr().ok() != Some(key.destination)
                     || !verified.socket.local_addr().is_ok_and(|a| a.ip() == key.source.ip())
                     || !verified.admissible()? { return Err(denied()); }
-                let flow = cache.flows.begin_native(cache.dpi.clone(),key,digest,PacketAction::Modify)?;
+                let flow = cache.flows.begin_native(cache.policy.clone(),key,digest,PacketAction::Modify)?;
                 // VerifiedUdp retains its own exact pre-connect admission.
                 let reply = crate::routing::linux_ingress::UdpReply::open(&first).map_err(|_| ClientError::Io)?;
                 let _reply_admission = reply.admit_reply(registrar.as_ref()).map_err(|_| denied())?;
@@ -4772,7 +4772,7 @@ impl NativeIngress {
         {
             return Err(denied());
         }
-        self.client.routing_cache().dpi.check_policy(digest)
+        self.client.routing_cache().policy.check_policy(digest)
     }
 
     async fn redirect_selection(
@@ -4823,7 +4823,7 @@ impl NativeIngress {
         let flow =
             cache
                 .flows
-                .begin_native(cache.dpi.clone(), key, snapshot.digest(), configured)?;
+                .begin_native(cache.policy.clone(), key, snapshot.digest(), configured)?;
         let address = match key.destination.ip() {
             IpAddr::V4(ip) => Address::V4(ip.octets()),
             IpAddr::V6(ip) => Address::V6(ip.octets()),

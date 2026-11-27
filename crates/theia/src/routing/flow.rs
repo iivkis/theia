@@ -1,7 +1,7 @@
 //! Shared client flow lifetime and irreversible first-payload authorization.
 //! Compatibility ingress uses synthetic IDs; native backends must bind their
 //! platform flow identities to this same table before forwarding any payload.
-use super::{dpi::Engine, packet::FlowKey, PacketAction};
+use super::{policy_lease::{PolicyLease, PolicyState}, packet::FlowKey, PacketAction};
 use crate::{
     client::ClientError,
     protocol::{Address, ErrorCode},
@@ -81,19 +81,26 @@ impl FlowTable {
 
     pub(crate) fn begin(
         self: &Arc<Self>,
-        engine: Arc<Engine>,
+        engine: Arc<PolicyState>,
         protocol: Protocol,
         target: Address,
         port: u16,
         digest: [u8; 32],
         configured: PacketAction,
     ) -> Result<FlowLease, ClientError> {
-        self.begin_inner(engine, protocol, target, port, digest, configured, None)
+        self.begin_pinned(engine.pin(digest)?, protocol, target, port, configured)
+    }
+
+    pub(crate) fn begin_pinned(
+        self: &Arc<Self>, policy: PolicyLease, protocol: Protocol, target: Address,
+        port: u16, configured: PacketAction,
+    ) -> Result<FlowLease, ClientError> {
+        self.begin_inner(policy, protocol, target, port, configured, None)
     }
 
     pub(crate) fn begin_native(
         self: &Arc<Self>,
-        engine: Arc<Engine>,
+        engine: Arc<PolicyState>,
         mut key: FlowKey,
         digest: [u8; 32],
         configured: PacketAction,
@@ -113,11 +120,10 @@ impl FlowTable {
             std::net::IpAddr::V6(ip) => Address::V6(ip.octets()),
         };
         self.begin_inner(
-            engine,
+            engine.pin(digest)?,
             protocol,
             target,
             key.destination.port(),
-            digest,
             configured,
             Some(key),
         )
@@ -126,18 +132,18 @@ impl FlowTable {
     #[allow(clippy::too_many_arguments)]
     fn begin_inner(
         self: &Arc<Self>,
-        engine: Arc<Engine>,
+        policy: PolicyLease,
         protocol: Protocol,
         target: Address,
         port: u16,
-        digest: [u8; 32],
         configured: PacketAction,
         native: Option<FlowKey>,
     ) -> Result<FlowLease, ClientError> {
         if port == 0 || configured == PacketAction::Drop {
             return Err(denied());
         }
-        let epoch = engine.policy_epoch(digest)?;
+        policy.check()?;
+        let digest = policy.digest();
         let identity = Identity {
             protocol,
             target,
@@ -172,8 +178,7 @@ impl FlowTable {
             table: self.clone(),
             id,
             identity,
-            engine,
-            epoch,
+            policy,
         })
     }
 }
@@ -196,23 +201,19 @@ pub(crate) struct FlowLease {
     table: Arc<FlowTable>,
     id: u64,
     identity: Identity,
-    engine: Arc<Engine>,
-    epoch: u64,
+    policy: PolicyLease,
 }
 
 impl FlowLease {
     /// Every ingress, including explicit proxy requests, pins the same
     /// policy generation. A reaccepted digest cannot revive revoked flows.
     pub(crate) fn check_pending(&self) -> Result<(), ClientError> {
-        if self.engine.policy_epoch(self.identity.digest)? != self.epoch {
-            return Err(denied());
-        }
-        Ok(())
+        self.policy.check()
     }
 
     pub(crate) fn check_live(&self, action: PacketAction) -> Result<(), ClientError> {
         self.check_pending()?;
-        if action == PacketAction::Modify && !self.engine.enabled() {
+        if action == PacketAction::Modify && !self.policy.modify_enabled() {
             return Err(denied());
         }
         Ok(())
@@ -350,9 +351,9 @@ impl<'a> FirstSend<'a> {
 mod tests {
     use super::*;
 
-    fn setup() -> (Arc<FlowTable>, Arc<Engine>) {
+    fn setup() -> (Arc<FlowTable>, Arc<PolicyState>) {
         let table = Arc::new(FlowTable::new(1));
-        let engine = Arc::new(Engine::default());
+        let engine = Arc::new(PolicyState::default());
         engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(
             [1; 32],
         )));
@@ -362,7 +363,7 @@ mod tests {
 
     fn begin(
         table: &Arc<FlowTable>,
-        engine: &Arc<Engine>,
+        engine: &Arc<PolicyState>,
         action: PacketAction,
     ) -> Result<FlowLease, ClientError> {
         table.begin(
@@ -373,6 +374,22 @@ mod tests {
             [1; 32],
             action,
         )
+    }
+
+    #[test]
+    fn redirect_and_pass_do_not_depend_on_modify_consent() {
+        let (table, policy) = setup();
+        policy.set_enabled(false);
+        let flow = begin(&table, &policy, PacketAction::Redirect).unwrap();
+        flow.commit(PacketAction::Redirect).unwrap();
+        assert!(flow.check_delivery().is_ok());
+        drop(flow);
+        let flow = begin(&table, &policy, PacketAction::Pass).unwrap();
+        flow.commit(PacketAction::Pass).unwrap();
+        drop(flow);
+        let flow = begin(&table, &policy, PacketAction::Modify).unwrap();
+        assert!(flow.commit(PacketAction::Modify).is_err());
+        flow.commit(PacketAction::Redirect).unwrap();
     }
 
     #[test]

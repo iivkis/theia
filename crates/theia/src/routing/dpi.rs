@@ -35,10 +35,7 @@ pub(super) fn packet_test_quic_hello(name: &str) -> Vec<u8> {
 use crate::{client::ClientError, network_scope};
 use std::{
     net::{IpAddr, SocketAddr},
-    sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::Duration,
 };
 use strategy::{Key, Lease, Strategy, Verdict};
@@ -49,19 +46,13 @@ const PROBE_WAVE: usize = 2;
 const OPEN_BUDGET: Duration = Duration::from_secs(6);
 const FIRST_FLIGHT: Duration = Duration::from_secs(5);
 
-pub(crate) fn stale_policy() -> ClientError {
-    crate::traffic::dpi_policy_stale();
-    ClientError::Open(crate::protocol::ErrorCode::PolicyDenied)
-}
+pub(crate) use super::policy_lease::stale_policy;
+use super::policy_lease::PolicyState;
 
 /// Profile-local, bounded strategy evidence. No state on disk or in logs.
 /// Consent is local configuration, not a command in the server snapshot.
 pub(crate) struct Engine {
-    enabled: AtomicBool,
-    retired: AtomicBool,
-    stun_enabled: AtomicBool,
-    policy: std::sync::Mutex<Option<super::client_state::LocalPolicy>>,
-    policy_epoch: AtomicU64,
+    policy: Arc<PolicyState>,
     cache: strategy::Cache,
     probes: Semaphore,
     // Bounded lock stripes coalesce simultaneous probes without an unbounded map.
@@ -196,7 +187,7 @@ impl VerifiedUdp {
         let key = Key { name: name.into(), address, policy, epoch: engine.policy_epoch(policy).unwrap(), network };
         let lease = engine.remember_udp(key.clone(), strategy.probe(), true).unwrap();
         let flow = super::flow::FlowTable::shared().begin(
-            engine.clone(), super::flow::Protocol::Udp,
+            engine.policy.clone(), super::flow::Protocol::Udp,
             crate::protocol::Address::Dns(name.into()), address.port(), policy, super::PacketAction::Modify,
         ).unwrap();
         (Self { socket, strategy, engine, key, lease, _admission: Default::default() }, flow)
@@ -253,86 +244,27 @@ async fn scoped_udp_checked(
 }
 
 impl Default for Engine {
-    fn default() -> Self {
+    fn default() -> Self { Self::new(Arc::new(PolicyState::default())) }
+}
+
+impl Engine {
+    pub(crate) fn new(policy: Arc<PolicyState>) -> Self {
         Self {
-            enabled: AtomicBool::new(false),
-            retired: AtomicBool::new(false),
-            stun_enabled: AtomicBool::new(false),
-            policy: std::sync::Mutex::new(None),
-            policy_epoch: AtomicU64::new(0),
+            policy,
             cache: strategy::Cache::default(),
             probes: Semaphore::new(4),
             probe_slots: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
         }
     }
-}
-
-impl Engine {
-    pub(crate) fn set_enabled(&self, enabled: bool) {
-        self.enabled.store(enabled, Ordering::Relaxed);
-    }
-
-    pub(crate) fn set_stun_enabled(&self, enabled: bool) {
-        self.stun_enabled.store(enabled, Ordering::Relaxed);
-    }
-
-    pub(crate) fn stun_enabled(&self) -> bool {
-        self.enabled() && self.stun_enabled.load(Ordering::Relaxed)
-    }
-
-    pub(super) fn authorize_policy(&self, lease: Option<super::client_state::LocalPolicy>) {
-        if let Ok(mut policy) = self.policy.lock() {
-            let next = if self.retired() { None } else { lease };
-            let continuous = match (&*policy, &next) {
-                (Some(old), Some(new)) => old.continues(new),
-                (None, None) => true,
-                _ => false,
-            };
-            if !continuous {
-                self.policy_epoch.fetch_add(1, Ordering::AcqRel);
-            }
-            *policy = next;
-        }
-    }
-
-    pub(crate) fn retired(&self) -> bool {
-        self.retired.load(Ordering::Acquire)
-    }
-
-    /// Retired client generations cannot authorize any more user payload.
-    /// Server auth-only Apply is a separate admission contract.
-    pub(crate) fn retire(&self) {
-        self.retired.store(true, Ordering::Release);
-        self.authorize_policy(None);
-    }
-
-    pub(crate) fn policy_current(&self, digest: [u8; 32]) -> bool {
-        self.current_epoch(digest).is_some()
-    }
-
-    fn current_epoch(&self, digest: [u8; 32]) -> Option<u64> {
-        let mut policy = self.policy.lock().ok()?;
-        if self.retired() { return None; }
-        if policy.as_ref().is_some_and(|lease| !lease.valid_current()) {
-            *policy = None;
-            self.policy_epoch.fetch_add(1, Ordering::AcqRel);
-            return None;
-        }
-        policy.as_ref().filter(|lease| lease.matches_digest(digest))?;
-        Some(self.policy_epoch.load(Ordering::Acquire))
-    }
-
-    pub(super) fn policy_epoch(&self, digest: [u8; 32]) -> Result<u64, ClientError> {
-        self.current_epoch(digest).ok_or_else(stale_policy)
-    }
-
-    pub(crate) fn check_policy(&self, digest: [u8; 32]) -> Result<(), ClientError> {
-        if self.policy_current(digest) {
-            Ok(())
-        } else {
-            Err(stale_policy())
-        }
-    }
+    pub(crate) fn set_enabled(&self, enabled: bool) { self.policy.set_enabled(enabled); }
+    pub(crate) fn set_stun_enabled(&self, enabled: bool) { self.policy.set_stun_enabled(enabled); }
+    pub(crate) fn stun_enabled(&self) -> bool { self.policy.stun_enabled() }
+    #[cfg(test)]
+    pub(super) fn authorize_policy(&self, lease: Option<super::client_state::LocalPolicy>) { self.policy.authorize_policy(lease); }
+    pub(crate) fn retired(&self) -> bool { self.policy.retired() }
+    #[cfg(test)]
+    pub(crate) fn retire(&self) { self.policy.retire(); }
+    pub(super) fn policy_epoch(&self, digest: [u8; 32]) -> Result<u64, ClientError> { self.policy.policy_epoch(digest) }
 
     pub(crate) fn pin_policy(self: &Arc<Self>, digest: [u8; 32]) -> Result<FallbackPolicy, ClientError> {
         Ok(FallbackPolicy { engine: self.clone(), digest, epoch: self.policy_epoch(digest)?, scope: None, require_stun: false, tcp_evidence: None })
@@ -348,9 +280,7 @@ impl Engine {
             && network_scope::observe(key.address) == Some(key.network)
     }
 
-    pub(crate) fn enabled(&self) -> bool {
-        self.enabled.load(Ordering::Relaxed)
-    }
+    pub(crate) fn enabled(&self) -> bool { self.policy.enabled() }
 
     fn probe_slot(&self, name: &str, address: SocketAddr, policy: [u8; 32]) -> usize {
         use std::hash::{Hash, Hasher};
@@ -1523,7 +1453,7 @@ mod tests {
             tunnel.engine.set_enabled(true);
             tunnel.lease = tunnel.engine.cache.remember(&tunnel.key, Verdict::Verified(strategy)).unwrap();
             let flow = super::super::flow::FlowTable::shared().begin(
-                tunnel.engine.clone(), super::super::flow::Protocol::Tcp,
+                tunnel.engine.policy.clone(), super::super::flow::Protocol::Tcp,
                 crate::protocol::Address::Dns("localhost".into()), port, tunnel.key.policy,
                 super::super::PacketAction::Modify,
             ).unwrap();
