@@ -141,15 +141,26 @@ impl Drop for Scratch {
 }
 
 async fn bind() -> TcpListener {
-    // TCP/UDP port availability is not identical on all native platforms.
-    for _ in 0..16 {
-        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        if let Ok(udp) = std::net::UdpSocket::bind(tcp.local_addr().unwrap()) {
-            drop(udp);
-            return tcp;
+    // Windows can reserve an entire UDP-only exclusion range (Hyper-V).
+    // Asking TCP for successive ephemeral ports can remain in that range.
+    // Allocate UDP first, and retain rejected candidates until selection so
+    // the kernel cannot hand us the same unavailable port repeatedly.
+    let mut rejected = Vec::new();
+    let mut last = None;
+    for _ in 0..256 {
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0")
+            .expect("allocate an ephemeral UDP fixture port");
+        let address = udp.local_addr().unwrap();
+        match TcpListener::bind(address).await {
+            Ok(tcp) => return tcp,
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied) => {
+                last = Some(error);
+                rejected.push(udp);
+            }
+            Err(error) => panic!("unexpected TCP fixture bind error: {error}"),
         }
     }
-    panic!("unable to reserve a loopback fixture port");
+    panic!("unable to reserve a shared TCP/UDP loopback fixture port: {last:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
