@@ -2080,10 +2080,60 @@ impl NativeIngress {
         }
     }
 
+    /// One terminated Linux UDP flow from UdpCapture. The platform owner
+    /// demultiplexes subsequent captured datagrams by the exact key. The
+    /// connected reply socket uses the original remote address as source
+    /// and refuses nonlocal peers. Requires isolated, correctly provisioned
+    /// reverse-path routing; does not exempt sockets from system capture.
+    #[cfg(target_os = "linux")]
+    pub async fn relay_linux_udp(
+        &self,
+        first: crate::routing::linux_ingress::CapturedDatagram,
+        mut subsequent: tokio::sync::mpsc::Receiver<crate::routing::linux_ingress::CapturedDatagram>,
+    ) -> Result<(), ClientError> {
+        use crate::routing::PacketAction;
+        let key = first.key;
+        if subsequent.max_capacity() > crate::udp_relay::QUEUE { return Err(ClientError::Protocol); }
+        tokio::select! {
+            biased;
+            () = self.stopped() => Err(ClientError::Open(ErrorCode::PolicyDenied)),
+            result = async {
+                let (carrier, flow, address) = self.redirect(key).await?;
+                let tunnel = carrier.open_udp(address, key.destination.port()).await?;
+                let reply = crate::routing::linux_ingress::UdpReply::open(&first).map_err(|_| ClientError::Io)?;
+                let (tx, up) = tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
+                let (down, mut rx) = tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
+                tx.send(first.payload).await.map_err(|_| ClientError::Io)?;
+                let relay = tunnel.relay_guarded(up, down, Some(&flow));
+                let feed = async move {
+                    while let Some(datagram) = subsequent.recv().await {
+                        if datagram.key != key || datagram.payload.len() > crate::protocol::MAX_DATAGRAM {
+                            return Err(ClientError::Protocol);
+                        }
+                        tx.send(datagram.payload).await.map_err(|_| ClientError::Io)?;
+                    }
+                    Ok::<(), ClientError>(())
+                };
+                let replies = async {
+                    while let Some(bytes) = rx.recv().await {
+                        if !flow.committed(PacketAction::Redirect) {
+                            return Err(ClientError::Open(ErrorCode::PolicyDenied));
+                        }
+                        reply.send(&bytes).await.map_err(|_| ClientError::Io)?;
+                    }
+                    Ok::<(), ClientError>(())
+                };
+                tokio::select! {
+                    result = relay => result,
+                    result = async { tokio::try_join!(feed, replies).map(|_| ()) } => result,
+                }
+            } => result,
+        }
+    }
+
     /// Common UDP handoff for a trusted platform adapter with a terminated
-    /// datagram flow. The OS-specific receiver/response injection is not
-    /// supplied by the platform adapter. Linux UdpCapture retrieves the
-    /// original destination; reverse-path injection remains external.
+    /// datagram flow. The OS-specific receiver/response routing is owned
+    /// by the platform adapter; use relay_linux_udp on Linux.
     pub async fn relay_terminated_udp(
         &self,
         key: crate::routing::packet::FlowKey,

@@ -194,6 +194,7 @@ fn configure(fd: RawFd, queue: u16, seq: u32, attrs: &[u8], buffer: &mut [u8]) -
 pub struct Queue {
     fd: Option<OwnedFd>,
     number: u16,
+    namespace: (u64, u64),
     buffer: Vec<u8>,
 }
 impl Queue {
@@ -237,11 +238,18 @@ impl Queue {
         attr(&mut attrs, 4, &5u32.to_be_bytes()); // mask FAIL_OPEN | GSO
         attr(&mut attrs, 5, &0u32.to_be_bytes());
         configure(raw, number, 2, &attrs, &mut buffer)?;
-        Ok(Self { fd: Some(fd), number, buffer })
+        Ok(Self { fd: Some(fd), number, namespace: Self::namespace()?, buffer })
+    }
+
+    fn namespace() -> io::Result<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata("/proc/thread-self/ns/net")?;
+        Ok((meta.dev(), meta.ino()))
     }
 
     pub(super) fn number(&self) -> io::Result<u16> {
         self.descriptor()?;
+        if self.namespace != Self::namespace()? { return Err(io::Error::from(io::ErrorKind::PermissionDenied)); }
         Ok(self.number)
     }
 

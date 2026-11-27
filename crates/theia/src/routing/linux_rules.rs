@@ -44,6 +44,9 @@ impl Scope {
     fn current(host_namespace: &File) -> io::Result<Self> {
         let own = fs::metadata("/proc/thread-self/ns/net")?;
         let host = host_namespace.metadata()?;
+        let mut stat: libc::statfs = unsafe { mem::zeroed() };
+        if unsafe { libc::fstatfs(host_namespace.as_raw_fd(), &mut stat) } != 0 { return Err(io::Error::last_os_error()); }
+        if stat.f_type as u64 != 0x6e736673 { return Err(refused()); } // NSFS_MAGIC
         if own.dev() == host.dev() && own.ino() == host.ino() { return Err(refused()); }
         let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim().to_owned();
         if boot.len() != 36 || !boot.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') { return Err(invalid()); }
@@ -348,6 +351,33 @@ mod tests {
         assert!(j.validate(&changed).is_err());
         assert_eq!(parse_journal(toml::to_string(&j).unwrap().as_bytes(), &j.scope).unwrap(), j);
     }
+    #[test]
+    #[ignore = "requires Linux CAP_SYS_ADMIN and CAP_NET_ADMIN; isolated network namespace only"]
+    fn kernel_install_and_recovery_in_new_namespace() {
+        std::thread::spawn(|| {
+            use std::os::unix::fs::DirBuilderExt;
+            let host = File::open("/proc/thread-self/ns/net").unwrap();
+            assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) }, 0);
+            let mut random = [0;16];
+            SystemRandom::new().fill(&mut random).unwrap();
+            let suffix: String = random.iter().map(|n| format!("{n:02x}")).collect();
+            let dir = std::env::temp_dir().join(format!("theia-nft-lab-{suffix}"));
+            fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+            let path = dir.join("journal.toml");
+            let queue = Queue::bind(49000, 64).unwrap();
+            let lease = LabRules::install(&queue, &host, &path).unwrap();
+            let scope = Scope::current(&host).unwrap();
+            let journal = parse_journal(&journal_bytes(&path).unwrap().unwrap(), &scope).unwrap();
+            assert!(Netlink::open().unwrap().table(&journal).unwrap());
+            assert!(recover(&host, &path).is_err()); // live owner
+            drop(lease);
+            recover(&host, &path).unwrap();
+            assert!(!Netlink::open().unwrap().table(&journal).unwrap());
+            recover(&host, &path).unwrap();
+            fs::remove_dir_all(dir).unwrap();
+        }).join().unwrap();
+    }
+
     #[test]
     fn batch_objects_have_exclusive_creation_and_no_queue_bypass() {
         let j = journal();

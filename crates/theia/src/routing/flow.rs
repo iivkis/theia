@@ -160,6 +160,11 @@ pub(crate) struct FlowLease {
 }
 
 impl FlowLease {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn committed(&self, action: PacketAction) -> bool {
+        self.table.state.lock().ok().and_then(|state| state.entries.get(&self.id).map(|entry| entry.identity == self.identity && entry.committed == Some(action))).unwrap_or(false)
+    }
+
     /// Called immediately before the first attempted payload write, not
     /// after a successful write. A partial write is never permission to retry.
     pub(crate) fn commit(&self, action: PacketAction) -> Result<(), ClientError> {

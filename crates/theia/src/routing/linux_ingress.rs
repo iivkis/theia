@@ -5,7 +5,7 @@ use std::{
     io,
     mem,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
-    os::fd::AsRawFd,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
 };
 use tokio::{io::unix::AsyncFd, net::TcpStream};
 
@@ -65,13 +65,17 @@ fn validate_redirect(local: SocketAddr, source: SocketAddr, destination: SocketA
 /// One datagram and its original destination, as supplied by Linux ancillary
 /// data. No domain or application identity is inferred from this tuple.
 pub struct CapturedDatagram {
-    pub key: FlowKey,
-    pub payload: Vec<u8>,
+    pub(crate) key: FlowKey,
+    pub(crate) payload: Vec<u8>,
+}
+impl CapturedDatagram {
+    pub fn key(&self) -> FlowKey { self.key }
+    pub fn payload(&self) -> &[u8] { &self.payload }
 }
 
 /// Receiver for an already provisioned transparent UDP listener. It does
-/// not install policy routing or send spoofed responses. The platform owner
-/// must verify reverse-path injection and carrier socket isolation separately.
+/// not install policy routing. Reverse-path routing and carrier socket
+/// isolation remain the responsibility of the isolated platform owner.
 pub struct UdpCapture {
     socket: AsyncFd<std::net::UdpSocket>,
 }
@@ -210,6 +214,112 @@ fn receive_udp(socket: &std::net::UdpSocket) -> io::Result<CapturedDatagram> {
     Ok(CapturedDatagram { key, payload: data })
 }
 
+/// Return path for one kernel-captured UDP flow only. No raw packet
+/// injection, wildcard peer, arbitrary send_to or source override.
+pub(crate) struct UdpReply {
+    socket: tokio::net::UdpSocket,
+    key: FlowKey,
+}
+
+fn set_int(fd: &OwnedFd, level: libc::c_int, option: libc::c_int) -> io::Result<()> {
+    let value: libc::c_int = 1;
+    let rc = unsafe { libc::setsockopt(fd.as_raw_fd(), level, option, (&value as *const libc::c_int).cast(), mem::size_of_val(&value) as libc::socklen_t) };
+    if rc != 0 { return Err(io::Error::last_os_error()); }
+    Ok(())
+}
+
+fn is_local_ip(ip: std::net::IpAddr) -> io::Result<bool> {
+    let mut list = std::ptr::null_mut();
+    let rc = unsafe { libc::getifaddrs(&mut list) };
+    if rc != 0 { return Err(io::Error::last_os_error()); }
+    struct Addresses(*mut libc::ifaddrs);
+    impl Drop for Addresses {
+        fn drop(&mut self) { unsafe { libc::freeifaddrs(self.0); } }
+    }
+    let guard = Addresses(list);
+    let mut p = guard.0;
+    for _ in 0..4096 {
+        if p.is_null() { return Ok(false); }
+        let item = unsafe { &*p };
+        if !item.ifa_addr.is_null() {
+            let addr = match unsafe { (*item.ifa_addr).sa_family } as libc::c_int {
+                libc::AF_INET => {
+                    let a = unsafe { &*item.ifa_addr.cast::<libc::sockaddr_in>() };
+                    Some(std::net::IpAddr::V4(Ipv4Addr::from(a.sin_addr.s_addr.to_ne_bytes())))
+                }
+                libc::AF_INET6 => {
+                    let a = unsafe { &*item.ifa_addr.cast::<libc::sockaddr_in6>() };
+                    Some(std::net::IpAddr::V6(Ipv6Addr::from(a.sin6_addr.s6_addr)))
+                }
+                _ => None,
+            };
+            if addr == Some(ip) { return Ok(true); }
+        }
+        p = item.ifa_next;
+    }
+    Err(invalid())
+}
+
+fn bind_reply(fd: &OwnedFd, address: SocketAddr) -> io::Result<()> {
+    let rc = match address {
+        SocketAddr::V4(v4) => {
+            let mut raw: libc::sockaddr_in = unsafe { mem::zeroed() };
+            raw.sin_family = libc::AF_INET as libc::sa_family_t;
+            raw.sin_port = v4.port().to_be();
+            raw.sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
+            unsafe { libc::bind(fd.as_raw_fd(), (&raw as *const libc::sockaddr_in).cast(), mem::size_of_val(&raw) as libc::socklen_t) }
+        }
+        SocketAddr::V6(v6) => {
+            let mut raw: libc::sockaddr_in6 = unsafe { mem::zeroed() };
+            raw.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            raw.sin6_port = v6.port().to_be();
+            raw.sin6_addr.s6_addr = v6.ip().octets();
+            unsafe { libc::bind(fd.as_raw_fd(), (&raw as *const libc::sockaddr_in6).cast(), mem::size_of_val(&raw) as libc::socklen_t) }
+        }
+    };
+    if rc != 0 { return Err(io::Error::last_os_error()); }
+    Ok(())
+}
+
+impl UdpReply {
+    pub(crate) fn open(first: &CapturedDatagram) -> io::Result<Self> {
+        let key = first.key;
+        if key.transport != Transport::Udp || key.source.is_ipv4() != key.destination.is_ipv4()
+            || key.source.ip().is_unspecified() || key.source.ip().is_multicast()
+            || key.source.port() == 0 || key.destination.port() == 0
+            || matches!(key.source, SocketAddr::V6(v6) if v6.scope_id() != 0 || v6.ip().is_unicast_link_local() || v6.ip().to_ipv4_mapped().is_some())
+            || !is_local_ip(key.source.ip())? {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+        let family = if key.source.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+        let raw = unsafe { libc::socket(family, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) };
+        if raw < 0 { return Err(io::Error::last_os_error()); }
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        if key.source.is_ipv4() {
+            set_int(&fd, libc::SOL_IP, 19)?; // IP_TRANSPARENT
+        } else {
+            set_int(&fd, libc::SOL_IPV6, libc::IPV6_V6ONLY)?;
+            set_int(&fd, libc::SOL_IPV6, 75)?; // IPV6_TRANSPARENT
+        }
+        // Do not enable SO_REUSEADDR/SO_REUSEPORT: conflicts are refusal.
+        bind_reply(&fd, key.destination)?;
+        let socket = std::net::UdpSocket::from(fd);
+        socket.connect(key.source)?;
+        if socket.local_addr()? != key.destination || socket.peer_addr()? != key.source { return Err(invalid()); }
+        Ok(Self { socket: tokio::net::UdpSocket::from_std(socket)?, key })
+    }
+
+    pub(crate) async fn send(&self, bytes: &[u8]) -> io::Result<()> {
+        if bytes.len() > crate::protocol::MAX_DATAGRAM || self.socket.local_addr()? != self.key.destination
+            || self.socket.peer_addr()? != self.key.source {
+            return Err(invalid());
+        }
+        let n = self.socket.send(bytes).await?;
+        if n != bytes.len() { return Err(io::Error::from(io::ErrorKind::WriteZero)); }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +338,12 @@ mod tests {
             std::ptr::write_unaligned(bytes.as_mut_ptr().add(header).cast::<libc::sockaddr_in>(), address);
         }
         bytes
+    }
+
+    #[test]
+    fn local_peer_address_is_checked_against_kernel_interfaces() {
+        assert!(is_local_ip("127.0.0.1".parse().unwrap()).unwrap());
+        assert!(!is_local_ip("0.0.0.0".parse().unwrap()).unwrap());
     }
 
     #[test]
