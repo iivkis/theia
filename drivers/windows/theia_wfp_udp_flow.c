@@ -130,13 +130,24 @@ VOID TheiaUdpStop(VOID) {
     ApplicationUdp=FALSE;
     RtlSecureZeroMemory(Pending,sizeof(Pending));
     for (ULONG i=0;i<FLOW_LIMIT;++i) if (Flows[i].tuple.generation) Flows[i].closed=TRUE;
-    while (!IsListEmpty(&Queue)) {
-        PACKET *p=CONTAINING_RECORD(RemoveHeadList(&Queue),PACKET,link);
+    KeReleaseSpinLock(&Lock,irql);
+}
+VOID TheiaUdpDrain(VOID) {
+    // Deactivation is immediate; potentially megabytes of payload are
+    // wiped outside the spin lock and outside the ALE state lock.
+    for (;;) {
+        KIRQL irql;
+        PACKET *p=NULL;
+        KeAcquireSpinLock(&Lock,&irql);
+        if (!Active&&!IsListEmpty(&Queue)) {
+            p=CONTAINING_RECORD(RemoveHeadList(&Queue),PACKET,link);
+            --Queued;
+        }
+        KeReleaseSpinLock(&Lock,irql);
+        if (!p) break;
         RtlSecureZeroMemory(p->bytes,p->length);
         ExFreePoolWithTag(p,UDP_TAG);
     }
-    Queued=0;
-    KeReleaseSpinLock(&Lock,irql);
 }
 BOOLEAN TheiaUdpAdmit(UINT64 endpoint,UCHAR family,const UCHAR *remote,USHORT port,BOOLEAN carrier) {
     KIRQL irql;
@@ -429,6 +440,7 @@ static NTSTATUS notify_udp(FWPS_CALLOUT_NOTIFY_TYPE type,const GUID *key,const G
     } else if (type==FWPS_CALLOUT_NOTIFY_DELETE_FILTER) {
         InterlockedExchange(count,0);
         TheiaUdpStop();
+        TheiaUdpDrain();
     }
     return STATUS_SUCCESS;
 }
@@ -465,6 +477,7 @@ NTSTATUS TheiaUdpRegister(PDEVICE_OBJECT dev) {
 VOID TheiaUdpUnregister(VOID) {
     TheiaUdpStop();
     ExWaitForRundownProtectionRelease(&Classification);
+    TheiaUdpDrain();
     // No new associations after rundown. Remove the exact live contexts.
     for (ULONG i=0;i<FLOW_LIMIT;++i) {
         KIRQL irql;

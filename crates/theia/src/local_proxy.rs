@@ -2585,10 +2585,8 @@ impl NativeIngress {
         recovered
     }
 
-    /// Managed Windows TCP/UDP Redirect laboratory. Requires a disposable
-    /// non-default, non-IPsec compartment, signed installed driver and
-    /// verified UDP-inclusive BFE filters. No production Connect or
-    /// automatic host recovery is enabled by this entry point.
+    /// Existing TCP-only laboratory entry point. User UDP remains denied;
+    /// the datagram callouts still constrain exact H3 carrier endpoints.
     #[cfg(target_os = "windows")]
     pub async fn run_windows_lab(
         path: &Path,
@@ -2596,6 +2594,39 @@ impl NativeIngress {
         port: u16,
         controller: &Path,
         controller_sha256: [u8; 32],
+        stop: impl std::future::Future<Output = std::io::Result<()>>,
+    ) -> Result<(), ClientError> {
+        Self::run_windows_lab_inner(path, compartment, port, controller, controller_sha256, false, stop).await
+    }
+
+    /// Explicit UDP reverse-injection acceptance entry point. Caller must
+    /// own a disposable non-default compartment with no IPsec requirements,
+    /// signed driver and the exact six-filter BFE transaction. This is not
+    /// a production Connect path or authorization to bypass IPsec policy.
+    #[cfg(target_os = "windows")]
+    pub async fn run_windows_udp_lab(
+        path: &Path,
+        compartment: u32,
+        port: u16,
+        controller: &Path,
+        controller_sha256: [u8; 32],
+        confirmed_non_ipsec_lab: bool,
+        stop: impl std::future::Future<Output = std::io::Result<()>>,
+    ) -> Result<(), ClientError> {
+        if !confirmed_non_ipsec_lab {
+            return Err(ClientError::Configuration);
+        }
+        Self::run_windows_lab_inner(path, compartment, port, controller, controller_sha256, true, stop).await
+    }
+
+    #[cfg(target_os = "windows")]
+    async fn run_windows_lab_inner(
+        path: &Path,
+        compartment: u32,
+        port: u16,
+        controller: &Path,
+        controller_sha256: [u8; 32],
+        udp: bool,
         stop: impl std::future::Future<Output = std::io::Result<()>>,
     ) -> Result<(), ClientError> {
         use crate::routing::{
@@ -2630,8 +2661,11 @@ impl NativeIngress {
             .await
             .map_err(|_| ClientError::Configuration)?;
         let [v4, v6] = bind_tcp_listeners(compartment, port).map_err(|_| ClientError::Io)?;
-        let session =
-            Arc::new(WfpLabSession::open_udp_lab(compartment, port).map_err(|_| ClientError::Io)?);
+        let session = Arc::new(if udp {
+            WfpLabSession::open_udp_lab(compartment, port)
+        } else {
+            WfpLabSession::open(compartment, port)
+        }.map_err(|_| ClientError::Io)?);
         // Even if preflight or the owning future is cancelled, retire the
         // kernel session before releasing listeners. Persistent filters stay.
         struct StopDriver(Arc<WfpLabSession>);
@@ -2705,7 +2739,7 @@ impl NativeIngress {
             tokio::select! {
                 biased;
                 result = consume => result,
-                result = ingress.serve_windows_udp(session.clone()) => result,
+                result = ingress.serve_windows_udp(session.clone()), if udp => result,
                 result = carrier_socket::scope(Some(registrar.clone()),runtime.maintain()) => {
                     result?;
                     Err(ClientError::Io)

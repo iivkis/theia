@@ -114,8 +114,10 @@ static VOID NTAPI process_notify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE
     UNREFERENCED_PARAMETER(ProcessId);
     if (Info != NULL) return;
     KeAcquireSpinLock(&StateLock, &irql);
-    if (State.process == Process) deactivate_locked();
+    BOOLEAN owner = State.process == Process;
+    if (owner) deactivate_locked();
     KeReleaseSpinLock(&StateLock, irql);
+    if (owner) TheiaUdpDrain();
 }
 
 static NTSTATUS finish_irp(PIRP Irp, NTSTATUS status) {
@@ -136,11 +138,13 @@ static NTSTATUS cleanup(PDEVICE_OBJECT dev, PIRP irp) {
     KIRQL irql;
     UNREFERENCED_PARAMETER(dev);
     KeAcquireSpinLock(&StateLock, &irql);
-    if (State.file == IoGetCurrentIrpStackLocation(irp)->FileObject) {
+    BOOLEAN owner = State.file == IoGetCurrentIrpStackLocation(irp)->FileObject;
+    if (owner) {
         deactivate_locked();
         State.file = NULL;
     }
     KeReleaseSpinLock(&StateLock, irql);
+    if (owner) TheiaUdpDrain();
     return finish_irp(irp, STATUS_SUCCESS);
 }
 
@@ -232,6 +236,7 @@ static NTSTATUS control(PDEVICE_OBJECT dev, PIRP irp) {
     // Once acknowledged, no in-flight callback can publish a new permit.
     if (waitForClassify) {
         ExWaitForRundownProtectionRelease(&ClassifyRundown);
+        TheiaUdpDrain();
         if (ReplyInitialized) TheiaReplyRetire(&ReplyEngine);
     }
     if (((code == IOCTL_CONFIG || code == IOCTL_STATUS || code == IOCTL_STOP) && len == CONFIG_SIZE)

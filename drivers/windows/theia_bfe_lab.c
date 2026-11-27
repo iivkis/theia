@@ -113,6 +113,24 @@ static DWORD install(HANDLE engine, UINT32 scope, UINT8 data[12]) {
     return ERROR_SUCCESS;
 }
 
+/* BFE may canonicalize condition order. Require the exact multiset,
+ * rejecting duplicate or additional conditions instead of assuming order. */
+static BOOL conditions(const FWPM_FILTER0 *f, UINT32 scope, BOOL udp) {
+    BOOL compartment=FALSE, protocol=FALSE;
+    if (f->numFilterConditions!=(udp?2u:1u)||!f->filterCondition) return FALSE;
+    for (UINT32 i=0;i<f->numFilterConditions;++i) {
+        const FWPM_FILTER_CONDITION0 *c=&f->filterCondition[i];
+        if (c->matchType!=FWP_MATCH_EQUAL) return FALSE;
+        if (same(&c->fieldKey,&FWPM_CONDITION_COMPARTMENT_ID)
+            && !compartment && c->conditionValue.type==FWP_UINT32
+            && c->conditionValue.uint32==scope) compartment=TRUE;
+        else if (udp && same(&c->fieldKey,&FWPM_CONDITION_IP_PROTOCOL)
+            && !protocol && c->conditionValue.type==FWP_UINT8
+            && c->conditionValue.uint8==17) protocol=TRUE;
+        else return FALSE;
+    }
+    return compartment && (!udp||protocol);
+}
 static DWORD verify(HANDLE e, UINT32 scope, const UINT8 data[12]) {
     FWPM_PROVIDER0 *p = NULL;
     FWPM_SUBLAYER0 *s = NULL;
@@ -144,15 +162,7 @@ static DWORD verify(HANDLE e, UINT32 scope, const UINT8 data[12]) {
             f->flags == FWPM_FILTER_FLAG_PERSISTENT && same(&f->layerKey, layers[i]) &&
             same(&f->subLayerKey, &sublayer) && f->weight.type == FWP_UINT8 && f->weight.uint8 == 8 &&
             f->action.type == (i<4?FWP_ACTION_CALLOUT_TERMINATING:FWP_ACTION_CALLOUT_INSPECTION) && same(&f->action.calloutKey, &callouts[i]) &&
-            f->numFilterConditions == (i<2?1:2) && f->filterCondition &&
-            same(&f->filterCondition[0].fieldKey, &FWPM_CONDITION_COMPARTMENT_ID) &&
-            f->filterCondition[0].matchType == FWP_MATCH_EQUAL &&
-            f->filterCondition[0].conditionValue.type == FWP_UINT32 &&
-            f->filterCondition[0].conditionValue.uint32 == scope &&
-            (i<2 || (same(&f->filterCondition[1].fieldKey,&FWPM_CONDITION_IP_PROTOCOL) &&
-                f->filterCondition[1].matchType==FWP_MATCH_EQUAL &&
-                f->filterCondition[1].conditionValue.type==FWP_UINT8 &&
-                f->filterCondition[1].conditionValue.uint8==17));
+            conditions(f,scope,i>=2);
         FwpmFreeMemory0((void **)&f);
         if (!ok) return ERROR_INVALID_DATA;
     }

@@ -8,6 +8,7 @@ NTSTATUS TheiaUdpRegister(PDEVICE_OBJECT device);
 VOID TheiaUdpUnregister(VOID);
 BOOLEAN TheiaUdpStart(ULONG scope, BOOLEAN applicationUdp);
 VOID TheiaUdpStop(VOID);
+VOID TheiaUdpDrain(VOID);
 BOOLEAN TheiaUdpReady(VOID);
 BOOLEAN TheiaUdpAdmit(UINT64 endpoint, UCHAR family, const UCHAR *remote, USHORT port, BOOLEAN carrier);
 NTSTATUS TheiaUdpRead(UCHAR *buffer, ULONG capacity, ULONG_PTR *written);
