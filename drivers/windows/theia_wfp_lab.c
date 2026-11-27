@@ -18,6 +18,8 @@
 #define MAX_ENDPOINTS 64
 #define IOCTL_CONFIG CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_WRITE_DATA)
 #define IOCTL_ENDPOINT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_WRITE_DATA)
+#define IOCTL_STATUS CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_WRITE_DATA)
+#define IOCTL_STOP CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_WRITE_DATA)
 
 static const GUID Provider = {0x172b0eba,0xc223,0x4ab6,{0x8c,0x52,0xa9,0x5e,0x08,0x2d,0x11,0x72}};
 static const GUID CalloutV4 = {0x172b0ebb,0xc223,0x4ab6,{0x8c,0x52,0xa9,0x5e,0x08,0x2d,0x11,0x72}};
@@ -152,6 +154,15 @@ static NTSTATUS control(PDEVICE_OBJECT dev, PIRP irp) {
         RtlCopyMemory(State.token, bytes + 8, 32);
         State.configured = State.active = TRUE;
         status = STATUS_SUCCESS;
+    } else if ((code == IOCTL_STATUS || code == IOCTL_STOP) && len == CONFIG_SIZE
+        && State.active && State.file == stack->FileObject && State.process == PsGetCurrentProcess()
+        && read32(bytes) == State.compartment && read16(bytes + 4) == State.port
+        && zero(bytes + 6, 2) && equal(bytes + 8, State.token, 32)) {
+        // The same protected file, process, exact compartment, listener and
+        // session token must agree. STATUS does not disclose the token.
+        // STOP retires admission before userspace cancels its relay tasks.
+        if (code == IOCTL_STOP) deactivate_locked();
+        status = STATUS_SUCCESS;
     } else if (code == IOCTL_ENDPOINT && len == ENDPOINT_SIZE && State.active
         && State.file == stack->FileObject && State.process == PsGetCurrentProcess()
         && read64(bytes) != 0 && (bytes[9] == IPPROTO_TCP || bytes[9] == IPPROTO_UDP) && read16(bytes + 10) != 0
@@ -177,7 +188,8 @@ static NTSTATUS control(PDEVICE_OBJECT dev, PIRP irp) {
         } else status = STATUS_INSUFFICIENT_RESOURCES;
     }
     KeReleaseSpinLock(&StateLock, irql);
-    if ((code == IOCTL_CONFIG && len == CONFIG_SIZE) || (code == IOCTL_ENDPOINT && len == ENDPOINT_SIZE))
+    if (((code == IOCTL_CONFIG || code == IOCTL_STATUS || code == IOCTL_STOP) && len == CONFIG_SIZE)
+        || (code == IOCTL_ENDPOINT && len == ENDPOINT_SIZE))
         RtlSecureZeroMemory(bytes, len);
     return finish_irp(irp, status);
 }

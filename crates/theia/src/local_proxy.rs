@@ -2217,6 +2217,120 @@ impl NativeIngress {
         recovered
     }
 
+    /// Managed Windows TCP Redirect laboratory. Requires a disposable
+    /// non-default compartment, signed installed driver and already-owned
+    /// BFE filters, provisioned outside this process. No production Connect,
+    /// user UDP or auto recovery is enabled by this entry point.
+    #[cfg(target_os = "windows")]
+    pub async fn run_windows_lab(
+        path: &Path,
+        compartment: u32,
+        port: u16,
+        controller: &Path,
+        controller_sha256: [u8;32],
+        stop: impl std::future::Future<Output = std::io::Result<()>>,
+    ) -> Result<(), ClientError> {
+        use crate::routing::{carrier_socket, wfp_ingress::{BfeInspector, WfpLabSession, bind_tcp_listeners}};
+        use sha2::{Digest,Sha256};
+        if tokio::runtime::Handle::current().runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread {
+            return Err(ClientError::Configuration);
+        }
+        let owner = Arc::new(NativeOwner::acquire()?);
+        let path = std::path::absolute(path).map_err(|_| ClientError::Configuration)?;
+        let raw = zeroize::Zeroizing::new(config::editor_bytes(&path).map_err(|_| ClientError::Configuration)?);
+        let Config::Client(document) = config::parse(std::str::from_utf8(&raw).map_err(|_| ClientError::Configuration)?)
+            .map_err(|_| ClientError::Configuration)? else { return Err(ClientError::Configuration); };
+        let digest: [u8;32] = Sha256::digest(raw.as_slice()).into();
+        saved_client_bytes(&path, digest)?;
+        let proof = Arc::new(BfeInspector::open(controller, controller_sha256, compartment).map_err(|_| ClientError::Configuration)?);
+        proof.inspect().await.map_err(|_| ClientError::Configuration)?;
+        let [v4,v6] = bind_tcp_listeners(compartment,port).map_err(|_| ClientError::Io)?;
+        let session = Arc::new(WfpLabSession::open(compartment,port).map_err(|_| ClientError::Io)?);
+        // Even if preflight or the owning future is cancelled, retire the
+        // kernel session before releasing listeners. Persistent filters stay.
+        struct StopDriver(Arc<WfpLabSession>);
+        impl Drop for StopDriver {
+            fn drop(&mut self) { let _ = self.0.deactivate(); }
+        }
+        let _stop_driver = StopDriver(session.clone());
+        let registrar: Arc<dyn carrier_socket::Registrar> = session.clone();
+        let client = carrier_socket::scope(Some(registrar.clone()), prepare_client(&document,&path)).await?;
+        saved_client_bytes(&path,digest)?;
+        let runtime = ClientRuntime::new(path,document,digest,client);
+        let ingress = Arc::new(runtime.attach_native(owner.clone(),Some(registrar.clone())).await?);
+        let control = crate::management::client_server(runtime.clone()).map_err(|_| ClientError::Configuration)?;
+        let management = async move {
+            match control {
+                Some(server) => server.serve().await.map_err(|_| ClientError::Io),
+                None => std::future::pending::<Result<(),ClientError>>().await,
+            }
+        };
+        proof.inspect().await.map_err(|_| ClientError::Configuration)?;
+        session.check().map_err(|_| ClientError::Io)?;
+        ingress.runtime.capture_state.compare_exchange(1,2,std::sync::atomic::Ordering::AcqRel,std::sync::atomic::Ordering::Acquire)
+            .map_err(|_| ClientError::Configuration)?;
+        let mut relays = JoinSet::new();
+        let result = {
+            let consume = async {
+                let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
+                heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    let stream = tokio::select! {
+                        biased;
+                        _ = heartbeat.tick() => {
+                            session.check().map_err(|_| ClientError::Io)?;
+                            proof.inspect().await.map_err(|_| ClientError::Io)?;
+                            session.check().map_err(|_| ClientError::Io)?;
+                            continue;
+                        }
+                        finished = relays.join_next(), if !relays.is_empty() => {
+                            // Individual denial/transport failure closes that
+                            // flow; a panicked relay is a supervisor failure.
+                            if finished.is_some_and(|r| r.is_err()) { return Err(ClientError::Io); }
+                            continue;
+                        }
+                        result = v4.accept() => result.map_err(|_| ClientError::Io)?.0,
+                        result = v6.accept() => result.map_err(|_| ClientError::Io)?.0,
+                    };
+                    session.check().map_err(|_| ClientError::Io)?;
+                    if relays.len() >= LOCAL_LIMIT { drop(stream); continue; }
+                    let ingress = ingress.clone();
+                    let session = session.clone();
+                    // The current-thread runtime keeps these socket operations
+                    // in the verified compartment; no detached worker owns a
+                    // listener or receives a process-wide exemption.
+                    relays.spawn(async move { ingress.relay_windows_tcp(stream,session).await });
+                }
+            };
+            tokio::select! {
+                biased;
+                result = consume => result,
+                result = carrier_socket::scope(Some(registrar.clone()),runtime.maintain()) => {
+                    result?;
+                    Err(ClientError::Io)
+                },
+                result = management => { result?; Err(ClientError::Io) },
+                result = stop => result.map_err(|_| ClientError::Io),
+            }
+        };
+        let retired = session.deactivate();
+        ingress.shutdown();
+        relays.shutdown().await;
+        drop(v4);
+        drop(v6);
+        drop(ingress);
+        drop(runtime);
+        drop(registrar);
+        result?;
+        retired.map_err(|_| ClientError::Io)?;
+        // A successful explicit stop proves driver retirement, not BFE
+        // restoration. Require the persistent filters to still be exact;
+        // the administrator must unload/recover them using signed tooling.
+        proof.inspect().await.map_err(|_| ClientError::Io)?;
+        drop(owner);
+        Ok(())
+    }
+
     /// Correlate a laboratory resolver link with protected DNS from the
     /// exact active policy generation. This does not grant routing
     /// authorization: neither the BPF reader nor resolver event source
@@ -2439,9 +2553,15 @@ impl NativeIngress {
     /// point does not install callouts or trust a client-supplied header.
     #[cfg(target_os = "windows")]
     pub async fn relay_windows_tcp(&self, stream: TcpStream, session: Arc<crate::routing::wfp_ingress::WfpLabSession>) -> Result<(), ClientError> {
+        self.ensure_running()?;
+        let expected = self.registrar()?.ok_or(ClientError::Open(ErrorCode::PolicyDenied))?;
+        let registrar: Arc<dyn crate::routing::carrier_socket::Registrar> = session.clone();
+        if !Arc::ptr_eq(&expected, &registrar) {
+            return Err(ClientError::Open(ErrorCode::PolicyDenied));
+        }
         let key = session.original_tcp(&stream)
             .map_err(|_| ClientError::Open(ErrorCode::PolicyDenied))?;
-        crate::routing::carrier_socket::scope(Some(session), self.relay_terminated_tcp(key, stream)).await
+        crate::routing::carrier_socket::scope(Some(registrar), self.relay_terminated_tcp(key, stream)).await
     }
 
     async fn relay_terminated_tcp(&self, key: crate::routing::packet::FlowKey, stream: TcpStream) -> Result<(), ClientError> {
