@@ -264,6 +264,7 @@ fn visual_review_gallery() {
     for (role, prefix, path) in [(Role::Server, "server", &server), (Role::Client, "client", &client)] {
         let mut model = Model::new(Some(role));
         let mut ui = Interaction::new(None);
+        if role == Role::Server { ui.welcome_choice = 1; }
         review_capture(&format!("{prefix}-welcome"), &model, &ui);
         ui.update(&mut model, press(KeyCode::Enter));
         assert!(ui.config_dialog.is_some());
@@ -272,7 +273,7 @@ fn visual_review_gallery() {
         let dialog = ui.config_dialog.as_mut().unwrap();
         dialog.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         dialog.paste(new_path.to_str().unwrap());
-        ui.update(&mut model, press(KeyCode::Down));
+        if role == Role::Client { ui.update(&mut model, press(KeyCode::Down)); }
         ui.update(&mut model, press(KeyCode::Enter));
         assert!(ui.config_dialog.is_some());
         review_capture(&format!("{prefix}-first-run-{}", if role == Role::Server { "reality" } else { "key-import" }), &model, &ui);
@@ -519,9 +520,7 @@ fn visual_review_gallery() {
             ui.workspace_action = items.iter().position(|a| a.key == 'U').unwrap();
             review_capture("server-page-users-ungranted", &model, &ui);
             ui.update(&mut model, press(KeyCode::Enter));
-            assert!(matches!(&ui.records, Some(RecordFlow::Input { action: RecordAction::DeleteUser, fields, .. }) if fields[0] == "review-ungranted"));
-            review_capture("server-action-delete-user", &model, &ui);
-            ui.update(&mut model, press(KeyCode::Enter));
+            assert!(matches!(&ui.records, Some(RecordFlow::Confirm(review)) if review.body().contains("review-ungranted")));
             assert_eq!(ui.confirmation_choice(), Some(('y', "Удалить пользователя")));
             assert!(!ui.confirm_selected);
             review_capture("server-action-delete-user-confirm", &model, &ui);
@@ -667,7 +666,7 @@ fn visual_review_gallery() {
         ui.workspace_action = items.iter().position(|a| a.key == 'b').unwrap();
         review_capture("server-page-users-disabled", &model, &ui);
         ui.update(&mut model, press(KeyCode::Enter));
-        assert!(matches!(&ui.issuance, Some(IssueFlow::Input(id)) if id == "device-a"));
+        assert!(matches!(&ui.issuance, Some(IssueFlow::Confirm(id)) if id == "device-a"));
         assert!(!ui.owned_running(Role::Server));
         review_capture("server-action-recover-user", &model, &ui);
     }
