@@ -2233,10 +2233,16 @@ impl NativeIngress {
         let snapshot = cache.get(|known| carrier.fetch_routing(known)).await?;
         let digest = snapshot.digest();
         let name = crate::routing::domain_name(&link.domain).map_err(|_| ClientError::Protocol)?;
+        // The current wire response contains addresses, not authoritative
+        // DNS TTLs. Bound this diagnostic to the original policy lease and
+        // a short window beginning BEFORE the authenticated request.
+        let original_deadline = cache.observation_deadline(digest)?;
+        let requested = Instant::now();
         let ips = carrier.resolve_routing(&name, digest).await?;
-        cache.dpi.check_policy(digest)?;
+        let deadline = original_deadline.min(cache.observation_deadline(digest)?)
+            .min(requested + Duration::from_secs(30));
         self.ensure_running()?;
-        candidates.record(flow, link, digest, &ips).map_err(|_| ClientError::Protocol)
+        candidates.record(flow, link, digest, &ips, deadline).map_err(|_| ClientError::Protocol)
     }
 
     /// Prepare a narrowly scoped laboratory Modify permit. The route must

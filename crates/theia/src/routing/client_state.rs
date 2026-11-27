@@ -268,6 +268,21 @@ impl Cache {
         state.retry = None;
         Ok(snapshot)
     }
+    /// Exact current policy lease for a diagnostic observation. Do not
+    /// start a new refresh here: an in-flight DNS request must not inherit
+    /// a later deadline merely because the same digest was republished.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn observation_deadline(&self, digest: [u8; 32]) -> Result<Instant, ClientError> {
+        let state = self.state.try_lock().map_err(|_| super::dpi::stale_policy())?;
+        let deadline = state.expires.filter(|deadline| *deadline > Instant::now())
+            .ok_or_else(super::dpi::stale_policy)?;
+        if !state.snapshot.as_ref().is_some_and(|snapshot| snapshot.digest() == digest) {
+            return Err(super::dpi::stale_policy());
+        }
+        self.dpi.check_policy(digest)?;
+        Ok(deadline)
+    }
+
     /// (revision, state): 0 unknown, 1 fresh, 2 expired, 3 synchronizing.
     pub(crate) fn observation(&self) -> (u64, u8) {
         let Ok(state) = self.state.try_lock() else {

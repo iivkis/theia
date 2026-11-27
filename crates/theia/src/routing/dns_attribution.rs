@@ -32,19 +32,20 @@ impl DnsCandidates {
     /// Returns false for missing/ambiguous association, stale/different flow
     /// or quota failure. The protected resolver response must be fetched
     /// for the exact policy digest and requested domain by the caller.
-    /// Its monotonic expiry is mandatory; neither repetition nor the local
-    /// candidate TTL may prolong an expired DNS pin.
+    /// A caller-provided monotonic observation deadline is mandatory.
+    /// The current protected DNS wire format carries no authoritative TTL;
+    /// this limit is not proof of DNS freshness or sender identity.
     pub fn record(&mut self, flow: CorroboratedFlow, link: &ResolverLink,
-        digest: [u8;32], protected_ips: &[IpAddr], pin_deadline: Instant) -> Result<bool, RoutingError> {
-        self.record_at(flow, link, digest, protected_ips, pin_deadline, Instant::now())
+        digest: [u8;32], protected_ips: &[IpAddr], observation_deadline: Instant) -> Result<bool, RoutingError> {
+        self.record_at(flow, link, digest, protected_ips, observation_deadline, Instant::now())
     }
 
     fn record_at(&mut self, flow: CorroboratedFlow, link: &ResolverLink,
-        digest: [u8;32], protected_ips: &[IpAddr], pin_deadline: Instant, now: Instant) -> Result<bool, RoutingError> {
+        digest: [u8;32], protected_ips: &[IpAddr], observation_deadline: Instant, now: Instant) -> Result<bool, RoutingError> {
         self.entries.retain(|_, entry| entry.deadline > now);
         let name = super::domain_name(&link.domain)?;
         if link.key != flow.key || link.cookie != flow.cookie || link.process_start != flow.process_start
-            || flow.cookie == 0 || flow.process_start == 0 || pin_deadline <= now
+            || flow.cookie == 0 || flow.process_start == 0 || observation_deadline <= now
             || link.request_id == [0;16] || digest == [0;32] || protected_ips.len() > 64
             || !protected_ips.contains(&flow.key.destination.ip()) {
             return Ok(false);
@@ -54,14 +55,14 @@ impl DnsCandidates {
                 entry.ambiguous = true;
             }
             // Re-observation must not extend an existing candidate or
-            // outlive the shortest authenticated resolver pin.
-            entry.deadline = entry.deadline.min(pin_deadline);
+            // outlive the shortest accepted observation deadline.
+            entry.deadline = entry.deadline.min(observation_deadline);
             return Ok(!entry.ambiguous);
         }
         if self.entries.len() >= MAX_ENTRIES { return Ok(false); }
         self.entries.insert(flow.key, Entry {
             flow, digest, request_id: link.request_id, domain: name,
-            deadline: now.checked_add(TTL).unwrap_or(now).min(pin_deadline), ambiguous: false,
+            deadline: now.checked_add(TTL).unwrap_or(now).min(observation_deadline), ambiguous: false,
         });
         Ok(true)
     }
@@ -112,7 +113,7 @@ mod tests {
     }
 
     #[test]
-    fn candidate_never_outlives_pin_or_refreshes_by_replay() {
+    fn candidate_never_outlives_observation_or_refreshes_by_replay() {
         let flow = CorroboratedFlow {
             key: FlowKey { source: "192.0.2.2:1234".parse().unwrap(), destination: "198.51.100.1:443".parse().unwrap(), transport: Transport::Udp, interface: 0 },
             cookie: 7, process_start: 8, application: ApplicationId::from_sha256([1;32]),
