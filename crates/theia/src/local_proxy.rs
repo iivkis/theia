@@ -920,6 +920,16 @@ impl AutoClient {
         self.h2.resolve_routing(name, digest).await
     }
 
+    #[cfg(target_os="linux")]
+    async fn resolve_native_dns(&self,name:&str,digest:[u8;32])->Result<Vec<IpAddr>,ClientError> {
+        let (generation,cached)=self.prepare().await?;
+        if !cached {
+            if let Some(value)=self.attempt_h3(generation,||self.h3.resolve_native_dns(name,digest)).await? {return Ok(value);}
+        }
+        if !self.same_scope(generation)? {return Err(ClientError::QuicUnreachable);}
+        self.h2.resolve_native_dns(name,digest).await
+    }
+
     async fn fetch_identity_document(&self, successor: bool) -> Result<String, ClientError> {
         let (generation, cached) = self.prepare().await?;
         if !cached {
@@ -1083,6 +1093,14 @@ impl Carrier {
             Self::H2(c) => c.resolve_routing(name, digest).await,
             Self::H3(c) => c.resolve_routing(name, digest).await,
             Self::Auto(c) => c.resolve_routing(name, digest).await,
+        }
+    }
+    #[cfg(target_os="linux")]
+    async fn resolve_native_dns(&self,name:&str,digest:[u8;32])->Result<Vec<IpAddr>,ClientError> {
+        match self {
+            Self::H2(c)=>c.resolve_native_dns(name,digest).await,
+            Self::H3(c)=>c.resolve_native_dns(name,digest).await,
+            Self::Auto(c)=>c.resolve_native_dns(name,digest).await,
         }
     }
     fn profile_budget(&self) -> Arc<Semaphore> {
@@ -3460,9 +3478,10 @@ impl NativeIngress {
             Some(PacketAction::Redirect|PacketAction::Modify) if unified=>PacketAction::Redirect,
             _=>PacketAction::Drop,
         };
-        // Raw DNS never goes direct or to an arbitrary resolver in the
-        // unified backend; the protected resolver adapter is separate.
-        let action=if unified && meta.flow.destination.port()==53 {PacketAction::Drop}else{action};
+        // Port 53 is locally terminated for protected resolution; this
+        // does not authorize the original resolver or infer a domain
+        // for subsequent application flows.
+        let action=if unified && meta.flow.destination.port()==53 {PacketAction::Redirect}else{action};
         let current=action!=PacketAction::Drop && cache.dpi.check_policy(digest).is_ok();
         if let Some(entry) = raw.get_mut(&meta.flow) {
             entry.last = now;
@@ -3517,6 +3536,13 @@ impl NativeIngress {
     ) -> Result<(), ClientError> {
         if key.transport != crate::routing::packet::Transport::Tcp {
             return Err(ClientError::Protocol);
+        }
+        #[cfg(target_os="linux")]
+        if key.destination.port()==53 && self.unified.load(std::sync::atomic::Ordering::Acquire) {
+            return tokio::select! {
+                ()=self.stopped()=>Err(ClientError::Open(ErrorCode::PolicyDenied)),
+                result=self.relay_native_dns_tcp(key,stream)=>result,
+            };
         }
         tokio::select! {
             biased;
@@ -3698,6 +3724,12 @@ impl NativeIngress {
         if subsequent.max_capacity() > crate::udp_relay::QUEUE {
             return Err(ClientError::Protocol);
         }
+        if key.destination.port()==53 && self.unified.load(std::sync::atomic::Ordering::Acquire) {
+            return tokio::select! {
+                ()=self.stopped()=>Err(ClientError::Open(ErrorCode::PolicyDenied)),
+                result=self.relay_native_dns_udp(first,subsequent,registrar)=>result,
+            };
+        }
         tokio::select! {
             biased;
             () = self.stopped() => Err(ClientError::Open(ErrorCode::PolicyDenied)),
@@ -3731,6 +3763,97 @@ impl NativeIngress {
                 supervise_native_udp(relay, feed, replies).await
             } => result,
         }
+    }
+
+    #[cfg(target_os="linux")]
+    async fn protected_dns_answer(&self,key:crate::routing::packet::FlowKey,query:&[u8],tcp:bool)
+        ->Result<Vec<u8>,ClientError> {
+        use crate::routing::{Evidence,PacketAction,native_dns::Question};
+        let denied=||ClientError::Open(ErrorCode::PolicyDenied);
+        self.ensure_accepting()?;
+        let key=crate::routing::packet::FlowKey{interface:0,..key};
+        let question=Question::parse(query).ok_or(ClientError::Protocol)?;
+        let registrar=self.registrar()?.ok_or_else(denied)?;
+        crate::routing::carrier_socket::scope(Some(registrar),async {
+            let (carrier,cache)=match &self.client {
+                ProxyClient::Direct(c)=>(c.carrier.clone(),&c.routing),
+                ProxyClient::Reality(c)=>(c.generation().await?.carrier.clone(),&c.routing),
+            };
+            let snapshot=cache.get(|known|carrier.fetch_routing(known)).await?;
+            let digest=snapshot.digest();
+            let allowed=||->Result<(),ClientError>{
+                self.ensure_accepting()?;
+                cache.dpi.check_policy(digest)?;
+                if !self.raw.lock().map_err(|_|denied())?.get(&key).is_some_and(|entry|
+                    !entry.denied && entry.action==PacketAction::Redirect && entry.digest==digest) {return Err(denied());}
+                Ok(())
+            };
+            allowed()?;
+            if snapshot.policy().classify_with_application(Evidence::Known(question.name()),Evidence::Unknown,Evidence::Unknown)
+                .map_err(|_|denied())?.action()==Some(Action::Blocked) {
+                return Ok(question.failure());
+            }
+            let ips=match carrier.resolve_native_dns(question.name(),digest).await {
+                Ok(ips)=>ips,
+                Err(_)=>{allowed()?;return Ok(question.failure());}
+            };
+            allowed()?;
+            let mut selected=None;
+            for ip in &ips {
+                let action=snapshot.policy().classify_with_application(Evidence::Known(question.name()),Evidence::Known(*ip),Evidence::Unknown)
+                    .map_err(|_|denied())?.action();
+                let Some(action)=action else {return Ok(question.failure());};
+                if action==Action::Blocked || selected.is_some_and(|old|old!=action) {
+                    return Ok(question.failure());
+                }
+                selected=Some(action);
+            }
+            allowed()?;
+            Ok(question.answer(&ips,tcp))
+        }).await
+    }
+
+    #[cfg(target_os="linux")]
+    async fn relay_native_dns_tcp(&self,key:crate::routing::packet::FlowKey,mut stream:TcpStream)->Result<(),ClientError> {
+        for _ in 0..64 {
+            let len=match timeout(NEGOTIATE_TIMEOUT,stream.read_u16()).await {
+                Ok(Ok(len))=>usize::from(len),
+                Ok(Err(e)) if e.kind()==std::io::ErrorKind::UnexpectedEof=>return Ok(()),
+                Ok(Err(_))=>return Err(ClientError::Io),
+                Err(_)=>return Err(ClientError::Timeout),
+            };
+            if !(12..=crate::routing::native_dns::MAX_QUERY).contains(&len) {return Err(ClientError::Protocol);}
+            let mut query=vec![0u8;len];
+            timeout(NEGOTIATE_TIMEOUT,stream.read_exact(&mut query)).await.map_err(|_|ClientError::Timeout)?.map_err(|_|ClientError::Io)?;
+            let answer=self.protected_dns_answer(key,&query,true).await?;
+            self.ensure_accepting()?;
+            timeout(REPLY_TIMEOUT,async {
+                stream.write_u16(answer.len() as u16).await?;
+                stream.write_all(&answer).await
+            }).await.map_err(|_|ClientError::Timeout)?.map_err(|_|ClientError::Io)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os="linux")]
+    async fn relay_native_dns_udp(&self,first:crate::routing::linux_ingress::CapturedDatagram,
+        mut subsequent:tokio::sync::mpsc::Receiver<crate::routing::linux_ingress::CapturedDatagram>,
+        registrar:Arc<dyn crate::routing::carrier_socket::Registrar>)->Result<(),ClientError> {
+        let key=first.key;
+        let reply=crate::routing::linux_ingress::UdpReply::open(&first).map_err(|_|ClientError::Io)?;
+        let _lease=reply.admit_reply(registrar.as_ref()).map_err(|_|ClientError::Io)?;
+        let mut current=first;
+        for _ in 0..64 {
+            if current.key!=key {return Err(ClientError::Protocol);}
+            let answer=self.protected_dns_answer(key,&current.payload,false).await?;
+            self.ensure_accepting()?;
+            reply.send(&answer).await.map_err(|_|ClientError::Io)?;
+            match timeout(Duration::from_secs(10),subsequent.recv()).await {
+                Ok(Some(next))=>current=next,
+                _=>return Ok(()),
+            }
+        }
+        Ok(())
     }
 
     /// Actual multi-datagram QUIC Modify in the isolated Linux lab.

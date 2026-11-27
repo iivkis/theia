@@ -1,0 +1,113 @@
+//! Bounded DNS wire adapter. No DNSSEC assertion or flow attribution.
+use std::net::IpAddr;
+pub(crate) const MAX_QUERY:usize=4096;
+const MAX_UDP:usize=1232;
+const MAX_TCP:usize=4096;
+pub(crate) struct Question {
+    id:[u8;2],rd:u16,name:String,wire:Vec<u8>,kind:u16,limit:usize,edns:bool,
+}
+fn word(bytes:&[u8],offset:usize)->Option<u16> {
+    Some(u16::from_be_bytes(bytes.get(offset..offset+2)?.try_into().ok()?))
+}
+impl Question {
+    pub(crate) fn parse(bytes:&[u8])->Option<Self> {
+        if !(12..=MAX_QUERY).contains(&bytes.len()) || word(bytes,4)!=Some(1) ||
+            word(bytes,6)!=Some(0) || word(bytes,8)!=Some(0) {return None;}
+        let flags=word(bytes,2)?;
+        if flags&!0x0100!=0 {return None;}
+        let mut offset=12usize;
+        let mut labels=Vec::new();
+        loop {
+            let len=usize::from(*bytes.get(offset)?);offset+=1;
+            if len==0 {break;}
+            if len>63 || offset.checked_add(len)?-12>254 {return None;}
+            let label=std::str::from_utf8(bytes.get(offset..offset+len)?).ok()?;
+            if label.contains('.') {return None;}
+            labels.push(label);offset+=len;
+        }
+        let name=super::domain_name(&labels.join(".")).ok()?;
+        let kind=word(bytes,offset)?;
+        if ![1,28].contains(&kind) || word(bytes,offset+2)!=Some(1) {return None;}
+        offset+=4;
+        let (edns,limit)=match word(bytes,10)? {
+            0 if offset==bytes.len()=>(false,512),
+            1 if bytes.len()==offset+11 && bytes[offset]==0 && word(bytes,offset+1)==Some(41)
+                && bytes[offset+5..offset+11]==[0;6]=>{
+                (true,usize::from(word(bytes,offset+3)?).clamp(512,MAX_UDP))
+            }
+            _=>return None,
+        };
+        Some(Self{id:bytes[..2].try_into().ok()?,rd:flags,name,wire:bytes[12..offset].to_vec(),kind,limit,edns})
+    }
+    pub(crate) fn name(&self)->&str {&self.name}
+    fn header(&self,flags:u16,count:u16)->Vec<u8> {
+        let mut out=Vec::with_capacity(512);
+        out.extend_from_slice(&self.id);
+        out.extend_from_slice(&(0x8080|self.rd|flags).to_be_bytes());
+        for v in [1u16,count,0,u16::from(self.edns)] {out.extend_from_slice(&v.to_be_bytes());}
+        out.extend_from_slice(&self.wire);out
+    }
+    fn opt(&self,out:&mut Vec<u8>) {
+        if self.edns {
+            out.extend_from_slice(&[0,0,41]);
+            out.extend_from_slice(&(self.limit as u16).to_be_bytes());
+            out.extend_from_slice(&[0;6]);
+        }
+    }
+    pub(crate) fn failure(&self)->Vec<u8> {
+        let mut out=self.header(2,0); // SERVFAIL; never synthesize NXDOMAIN
+        self.opt(&mut out);out
+    }
+    pub(crate) fn answer(&self,ips:&[IpAddr],tcp:bool)->Vec<u8> {
+        if ips.len()>64 {return self.failure();}
+        let addresses=ips.iter().filter(|ip|if self.kind==1 {ip.is_ipv4()}else{ip.is_ipv6()}).collect::<Vec<_>>();
+        let mut out=self.header(0,addresses.len() as u16);
+        for ip in addresses {
+            let bytes=match ip {IpAddr::V4(v)=>v.octets().to_vec(),IpAddr::V6(v)=>v.octets().to_vec()};
+            out.extend_from_slice(&[0xc0,0x0c]);
+            out.extend_from_slice(&self.kind.to_be_bytes());
+            out.extend_from_slice(&1u16.to_be_bytes());
+            out.extend_from_slice(&0u32.to_be_bytes()); // no authoritative TTL
+            out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+            out.extend_from_slice(&bytes);
+        }
+        self.opt(&mut out);
+        if out.len()>(if tcp {MAX_TCP}else{self.limit}) {
+            out=self.header(0x0200,0);self.opt(&mut out);
+        }
+        out
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn query()->Vec<u8>{
+        let mut q=vec![0x12,0x34,1,0,0,1,0,0,0,0,0,0];
+        q.extend_from_slice(b"\x07Example\x03org\x00\x00\x01\x00\x01");q
+    }
+    #[test]
+    fn exact_question_zero_ttl_family_and_truncation() {
+        let raw=query();
+        let q=Question::parse(&raw).unwrap();
+        assert_eq!(q.name(),"example.org");
+        let answer=q.answer(&["192.0.2.1".parse().unwrap(),"2001:db8::1".parse().unwrap()],false);
+        assert_eq!(&answer[..2],&raw[..2]);assert_eq!(word(&answer,6),Some(1));
+        assert_eq!(&answer[12..raw.len()],&raw[12..]);
+        assert_eq!(&answer[raw.len()+6..raw.len()+10],&[0;4]);
+        let ips=(1..=64).map(|n|IpAddr::from([192,0,2,n])).collect::<Vec<_>>();
+        let short=q.answer(&ips,false);
+        assert_eq!(word(&short,2).unwrap()&0x0200,0x0200);assert_eq!(word(&short,6),Some(0));
+        assert_eq!(word(&q.answer(&ips,true),6),Some(64));
+        assert_eq!(word(&q.failure(),2).unwrap()&15,2);
+    }
+    #[test]
+    fn rejects_compression_multiple_questions_and_unsupported_edns() {
+        let raw=query();
+        for end in 0..raw.len(){assert!(Question::parse(&raw[..end]).is_none());}
+        let mut q=raw.clone();q[12]=0xc0;assert!(Question::parse(&q).is_none());
+        let mut q=raw.clone();q[5]=2;assert!(Question::parse(&q).is_none());
+        let mut q=raw;q[11]=1;q.extend_from_slice(&[0,0,41,4,208,0,0,0,0,0,0]);
+        assert!(Question::parse(&q).is_some());
+        let n=q.len();q[n-4]=0x80;assert!(Question::parse(&q).is_none());
+    }
+}

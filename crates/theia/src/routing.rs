@@ -18,6 +18,8 @@ pub mod linux_carrier;
 pub mod linux_events;
 #[cfg(target_os = "linux")]
 pub mod linux_ingress;
+#[cfg(target_os="linux")]
+pub(crate) mod native_dns;
 #[cfg(target_os = "linux")]
 pub mod linux_rules;
 #[cfg(target_os = "linux")]

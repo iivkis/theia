@@ -346,7 +346,13 @@ impl H2Client {
         name: &str,
         digest: [u8; 32],
     ) -> Result<Vec<std::net::IpAddr>, ClientError> {
-        let bytes = self.routing_resource(Some((name, digest)), None).await?;
+        let bytes = self.routing_resource(Some((name,digest,false)),None).await?;
+        crate::routing::exchange::decode_ips(&bytes)
+    }
+
+    #[cfg(target_os="linux")]
+    pub(crate) async fn resolve_native_dns(&self,name:&str,digest:[u8;32])->Result<Vec<std::net::IpAddr>,ClientError> {
+        let bytes=self.routing_resource(Some((name,digest,true)),None).await?;
         crate::routing::exchange::decode_ips(&bytes)
     }
 
@@ -360,7 +366,7 @@ impl H2Client {
 
     async fn routing_resource(
         &self,
-        domain: Option<(&str, [u8; 32])>,
+        domain: Option<(&str,[u8;32],bool)>,
         known: Option<[u8; 32]>,
     ) -> Result<Vec<u8>, ClientError> {
         let routes = self
@@ -419,8 +425,9 @@ impl H2Client {
                 .header(header::AUTHORIZATION, self.authorization.clone())
                 .body(())
                 .map_err(|_| ClientError::Configuration)?;
-            if let Some((name, digest)) = domain {
-                crate::routing::exchange::request_domain(&mut request, name, digest)?;
+            if let Some((name,digest,native))=domain {
+                crate::routing::exchange::request_domain(&mut request,name,digest)?;
+                if native {request.headers_mut().insert(crate::routing::exchange::NATIVE_DNS_HEADER,http::HeaderValue::from_static("1"));}
             } else if let Some(digest) = known {
                 crate::routing::exchange::request_digest(&mut request, digest)?;
             }
