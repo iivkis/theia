@@ -43,6 +43,17 @@ pub struct Packet<'a> {
 /// An Initial's 1200-byte minimum applies to the whole UDP datagram,
 /// not each individual packet.
 pub fn split(datagram: &[u8]) -> Result<Vec<Packet<'_>>, Error> {
+    split_inner(datagram, true)
+}
+
+/// The 1200-byte receive floor is required at the server for client
+/// Initials. A server may send a smaller non-ack-eliciting Initial
+/// (e.g. CONNECTION_CLOSE for a TLS alert). Client parsing must retain it.
+pub(crate) fn split_from_server(datagram: &[u8]) -> Result<Vec<Packet<'_>>, Error> {
+    split_inner(datagram, false)
+}
+
+fn split_inner(datagram: &[u8], require_client_initial: bool) -> Result<Vec<Packet<'_>>, Error> {
     if datagram.is_empty() || datagram.len() > MAX_DATAGRAM {
         return Err(Error::Limit);
     }
@@ -90,7 +101,7 @@ pub fn split(datagram: &[u8]) -> Result<Vec<Packet<'_>>, Error> {
             if kind != PacketKind::VersionNegotiation && first & 0x40 == 0 {
                 return Err(Error::Malformed);
             }
-            if kind == PacketKind::Initial && datagram.len() < 1200 {
+            if require_client_initial && kind == PacketKind::Initial && datagram.len() < 1200 {
                 return Err(Error::Malformed);
             }
             if matches!(kind, PacketKind::Retry | PacketKind::VersionNegotiation) && !out.is_empty()
