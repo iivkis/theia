@@ -6,7 +6,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bytes::Bytes;
 use http::{header, HeaderValue, Request, StatusCode};
 use rustls::{pki_types::ServerName, RootCertStore};
-use std::{collections::VecDeque, fmt, sync::Arc, time::Duration};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     task::JoinHandle,
@@ -17,67 +17,9 @@ use tokio_rustls::TlsConnector;
 const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClientError {
-    Configuration,
-    Io,
-    TcpControllerUnavailable,
-    Tls,
-    Http2,
-    Http3,
-    QuicUnreachable,
-    QuicEndpointNetworkRefused,
-    Unauthorized,
-    SystemProxy,
-    Rejected(u16),
-    Protocol,
-    Open(ErrorCode),
-    Timeout,
-}
-
-impl fmt::Display for ClientError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Never display credential, request headers, endpoint or target values.
-        match self {
-            Self::Configuration => f.write_str("invalid client configuration"),
-            Self::Io => f.write_str("client TCP operation failed"),
-            Self::TcpControllerUnavailable => f.write_str("TCP BBR/CUBIC controller unavailable"),
-            Self::Tls => f.write_str("TLS identity or ALPN verification failed"),
-            Self::Http2 => f.write_str("HTTP/2 transport failed"),
-            Self::Http3 => f.write_str("HTTP/3 transport failed"),
-            Self::QuicUnreachable => f.write_str("quic_unreachable"),
-            Self::QuicEndpointNetworkRefused => f.write_str("quic_endpoint_network_refused"),
-            Self::Unauthorized => f.write_str("server rejected authentication"),
-            Self::SystemProxy => f.write_str("Windows user proxy CAS/recovery failed; inspect client proxy --status and recover explicitly"),
-            Self::Rejected(status) => write!(f, "server rejected request (HTTP {status})"),
-            Self::Protocol => f.write_str("SmartTheia protocol violation"),
-            Self::Open(code) => write!(f, "target connection rejected ({code:?})"),
-            Self::Timeout => f.write_str("client operation timed out"),
-        }
-    }
-}
-
-impl std::error::Error for ClientError {}
-
-/// Sanitized, stable error categories: never format a remote-controlled value.
-pub(crate) fn error_kind(error: &ClientError) -> &'static str {
-    match error {
-        ClientError::Configuration => "configuration",
-        ClientError::Io => "io",
-        ClientError::TcpControllerUnavailable => "tcp_controller_unavailable",
-        ClientError::Tls => "tls",
-        ClientError::Http2 => "h2",
-        ClientError::Http3 => "h3",
-        ClientError::QuicUnreachable => "quic_unreachable",
-        ClientError::QuicEndpointNetworkRefused => "quic_endpoint_network_refused",
-        ClientError::Unauthorized => "unauthorized",
-        ClientError::SystemProxy => "system_proxy",
-        ClientError::Rejected(_) => "http_rejected",
-        ClientError::Protocol => "protocol",
-        ClientError::Open(_) => "open_rejected",
-        ClientError::Timeout => "timeout",
-    }
-}
+// Preserve the public client error API; the implementation is transport-neutral.
+pub use crate::net::error::ClientError;
+pub(crate) use crate::net::error::error_kind;
 
 pub(crate) fn bearer_header(token: &str) -> Result<HeaderValue, ClientError> {
     if token.len() != 43 || token.contains('=') {

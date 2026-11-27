@@ -739,8 +739,9 @@ impl AutoClient {
                     self.complete(generation, false)?;
                     return Ok(Some(value));
                 }
-                Err(ClientError::QuicUnreachable) if index + 1 < AUTO_QUIC_ATTEMPTS => {}
-                Err(ClientError::QuicUnreachable | ClientError::QuicEndpointNetworkRefused) => {
+                Err(error) if crate::net::error::endpoint_unavailable(error) == Some(crate::net::error::EndpointUnavailable::NoResponse)
+                    && index + 1 < AUTO_QUIC_ATTEMPTS => {}
+                Err(error) if crate::net::error::endpoint_unavailable(error).is_some() => {
                     if self.complete(generation, true)? {
                         return Ok(None);
                     }

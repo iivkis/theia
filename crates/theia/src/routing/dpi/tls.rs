@@ -287,14 +287,7 @@ pub(super) fn native_config() -> Option<Arc<rustls::ClientConfig>> {
 
 // A separate authenticated TLS probe to the exact policy-pinned address.
 // Never send application data or disable hostname/certificate validation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ProbeVerdict {
-    Verified,
-    StrategyFailed,
-    Unavailable,
-    IdentityRejected,
-    Denied,
-}
+pub(super) use crate::net::error::ProbeVerdict;
 
 #[cfg(test)]
 pub(super) async fn probe(

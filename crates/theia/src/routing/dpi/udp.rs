@@ -416,9 +416,16 @@ pub(super) async fn probe_quic_checked(
         scope.map(|scope| scope.bind_address()), VersionPolicy::exact(version), budget,
     ).await {
         Ok(value) => value,
-        Err(dial::Error::Unreachable | dial::Error::EndpointNetworkRefused) => return Ok(None),
-        Err(dial::Error::Configuration | dial::Error::Bind) => return Err(super::stale_policy()),
-        Err(_) => return Err(ClientError::Tls),
+        Err(error) => {
+            use crate::net::error::FailureClass;
+            // Direct probe fallback requires actual endpoint evidence.
+            // Ambiguous/authentication failures remain terminal here.
+            return match error.class() {
+                FailureClass::EndpointUnavailable(_) => Ok(None),
+                FailureClass::Configuration | FailureClass::LocalSetup => Err(super::stale_policy()),
+                _ => Err(ClientError::Tls),
+            };
+        }
     };
     if negotiated != version { return Err(ClientError::Protocol); }
     let rtt = session.measured_rtt();

@@ -986,13 +986,14 @@ impl H3Client {
 }
 
 fn dial_error(error: dial::Error) -> ClientError {
-    match error {
-        dial::Error::Configuration => ClientError::Configuration,
-        dial::Error::Bind => ClientError::Io,
-        dial::Error::Timeout => ClientError::Timeout,
-        dial::Error::Unreachable => ClientError::QuicUnreachable,
-        dial::Error::EndpointNetworkRefused => ClientError::QuicEndpointNetworkRefused,
-        dial::Error::Handshake => ClientError::Tls,
+    use crate::net::error::{EndpointUnavailable, FailureClass};
+    match error.class() {
+        FailureClass::Configuration => ClientError::Configuration,
+        FailureClass::LocalSetup => ClientError::Io,
+        FailureClass::AmbiguousTimeout => ClientError::Timeout,
+        FailureClass::EndpointUnavailable(EndpointUnavailable::NoResponse) => ClientError::QuicUnreachable,
+        FailureClass::EndpointUnavailable(EndpointUnavailable::Refused) => ClientError::QuicEndpointNetworkRefused,
+        _ => ClientError::Tls,
     }
 }
 

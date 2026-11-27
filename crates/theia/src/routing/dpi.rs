@@ -573,9 +573,10 @@ impl Engine {
                             use tls::ProbeVerdict::*;
                             let outcomes = [first, second];
                             for (_, verdict, _, _) in outcomes.iter().flatten() {
-                                match verdict {
-                                    IdentityRejected => return Err(ClientError::Tls),
-                                    Denied => return Err(stale_policy()),
+                                use crate::net::error::FailureClass;
+                                match verdict.failure() {
+                                    Some(FailureClass::IdentityRejected) => return Err(ClientError::Tls),
+                                    Some(FailureClass::PolicyDenied) => return Err(stale_policy()),
                                     _ => {}
                                 }
                             }
