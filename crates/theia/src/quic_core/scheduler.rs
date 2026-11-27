@@ -720,7 +720,10 @@ impl Scheduler {
             Duration::from_micros(ack.delay.saturating_mul(1u64 << self.ack_delay_exponent));
         let limit = self.ack_delay_limit();
         let confirmed = self.confirmed;
-        let largest_sent_at = ack.ranges.first().and_then(|range| self.ledger.sent_at(range.last));
+        let largest_sent_at = ack
+            .ranges
+            .first()
+            .and_then(|range| self.ledger.sent_at(range.last));
         let outcome = {
             let mut path = self.path.lock().expect("path lock");
             self.ledger

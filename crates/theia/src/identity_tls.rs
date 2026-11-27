@@ -317,10 +317,10 @@ impl Identity {
 
     pub fn server_tls(&self, name: &str, branch: Branch) -> Result<ServerConfig, Error> {
         let resolver = Arc::new(RenewingLeaf::new(self, name, branch)?);
-        let mut config =
-            crate::net::tls::server_tls13_builder().map_err(|_| Error::Tls)?
-                .with_no_client_auth()
-                .with_cert_resolver(resolver);
+        let mut config = crate::net::tls::server_tls13_builder()
+            .map_err(|_| Error::Tls)?
+            .with_no_client_auth()
+            .with_cert_resolver(resolver);
         branch.carrier().configure_server(&mut config);
         config.send_tls13_tickets = 0;
         Ok(config)
@@ -334,11 +334,11 @@ impl Identity {
         now: OffsetDateTime,
     ) -> Result<ServerConfig, Error> {
         let (leaf, key) = self.leaf(name, branch, now)?;
-        let mut config =
-            crate::net::tls::server_tls13_builder().map_err(|_| Error::Tls)?
-                .with_no_client_auth()
-                .with_single_cert(vec![leaf], key)
-                .map_err(|_| Error::Tls)?;
+        let mut config = crate::net::tls::server_tls13_builder()
+            .map_err(|_| Error::Tls)?
+            .with_no_client_auth()
+            .with_single_cert(vec![leaf], key)
+            .map_err(|_| Error::Tls)?;
         branch.carrier().configure_server(&mut config);
         config.send_tls13_tickets = 0;
         Ok(config)

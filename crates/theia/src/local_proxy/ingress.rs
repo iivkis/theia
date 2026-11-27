@@ -1,8 +1,20 @@
 //! Explicit loopback HTTP/SOCKS5 ingress, framing and association lifecycle.
 use super::{ProxyClient, RoutedUdp, NEGOTIATE_TIMEOUT, REPLY_TIMEOUT};
-use crate::{client::{ClientError, error_kind}, diagnostics::Value, protocol::{self, Address, ErrorCode, Frame}};
-use std::{net::{Ipv4Addr, Ipv6Addr, SocketAddr}, sync::Arc};
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, task::JoinSet, time::timeout};
+use crate::{
+    client::{error_kind, ClientError},
+    diagnostics::Value,
+    protocol::{self, Address, ErrorCode, Frame},
+};
+use std::{
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    task::JoinSet,
+    time::timeout,
+};
 
 pub(super) const HEADER_LIMIT: usize = 8192;
 const HTTP_BODY_LIMIT: usize = 1024 * 1024;
@@ -140,7 +152,8 @@ async fn plain_http<'a>(
     let mut length = None;
     for line in lines {
         let (raw_name, raw_value) = line.split_once(':').ok_or(HTTP_BAD)?;
-        let name = http::header::HeaderName::from_bytes(raw_name.as_bytes()).map_err(|_| HTTP_BAD)?;
+        let name =
+            http::header::HeaderName::from_bytes(raw_name.as_bytes()).map_err(|_| HTTP_BAD)?;
         let value = raw_value.trim_matches([' ', '\t']);
         http::HeaderValue::from_str(value).map_err(|_| HTTP_BAD)?;
         match name.as_str() {
@@ -151,7 +164,10 @@ async fn plain_http<'a>(
                 host_seen = true;
             }
             "content-length" => {
-                if length.is_some() || value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                if length.is_some()
+                    || value.is_empty()
+                    || !value.bytes().all(|b| b.is_ascii_digit())
+                {
                     return Err(HTTP_BAD);
                 }
                 let n = value.parse::<usize>().map_err(|_| HTTP_BAD)?;
@@ -165,8 +181,12 @@ async fn plain_http<'a>(
             "connection" | "proxy-connection" => {
                 for token in value.split(',') {
                     let token = token.trim_matches([' ', '\t']);
-                    let field = http::header::HeaderName::from_bytes(token.as_bytes()).map_err(|_| HTTP_BAD)?;
-                    if matches!(field.as_str(), "host" | "content-length" | "transfer-encoding" | "upgrade") {
+                    let field = http::header::HeaderName::from_bytes(token.as_bytes())
+                        .map_err(|_| HTTP_BAD)?;
+                    if matches!(
+                        field.as_str(),
+                        "host" | "content-length" | "transfer-encoding" | "upgrade"
+                    ) {
                         return Err(HTTP_BAD);
                     }
                     nominated.insert(field);
@@ -180,7 +200,9 @@ async fn plain_http<'a>(
         return Err(HTTP_BAD);
     }
 
-    let mut request = format!("{method} {origin} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n").into_bytes();
+    let mut request =
+        format!("{method} {origin} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n")
+            .into_bytes();
     if let Some(n) = length {
         request.extend_from_slice(format!("Content-Length: {n}\r\n").as_bytes());
     }
@@ -195,7 +217,10 @@ async fn plain_http<'a>(
     }
     let head_len = request.len();
     request.resize(head_len + length.unwrap_or(0), 0);
-    socket.read_exact(&mut request[head_len..]).await.map_err(|_| HTTP_BAD)?;
+    socket
+        .read_exact(&mut request[head_len..])
+        .await
+        .map_err(|_| HTTP_BAD)?;
     Ok(HttpRequest::Plain(address, port, request))
 }
 
@@ -362,7 +387,12 @@ pub(super) async fn handle(
         "negotiation_started",
         "session" = Value::Count(session_id)
     );
-    if !socket.peer_addr().map_err(|_| ClientError::Io)?.ip().is_loopback() {
+    if !socket
+        .peer_addr()
+        .map_err(|_| ClientError::Io)?
+        .ip()
+        .is_loopback()
+    {
         return Err(ClientError::Open(ErrorCode::PolicyDenied));
     }
     let mut plain = None;
@@ -372,7 +402,7 @@ pub(super) async fn handle(
             Ok(Ok(HttpRequest::Plain(address, port, request))) => {
                 plain = Some(request);
                 (address, port)
-            },
+            }
             Ok(Err(reply)) => {
                 let _ = timeout(REPLY_TIMEOUT, socket.write_all(reply)).await;
                 crate::diag!(
@@ -635,4 +665,3 @@ async fn udp_association(
         }
     }
 }
-

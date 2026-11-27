@@ -80,7 +80,9 @@ pub(super) struct LocalPolicy {
 
 impl LocalPolicy {
     pub(super) fn continues(&self, next: &Self) -> bool {
-        self.checkpoint == next.checkpoint && self.floor == next.floor && Instant::now() < self.deadline
+        self.checkpoint == next.checkpoint
+            && self.floor == next.floor
+            && Instant::now() < self.deadline
     }
 
     pub(super) fn matches_digest(&self, digest: [u8; 32]) -> bool {
@@ -230,7 +232,11 @@ impl Cache {
         self.get_inner(fetch, true).await
     }
 
-    async fn get_inner<F, Fut>(&self, fetch: F, proactive: bool) -> Result<Arc<Snapshot>, ClientError>
+    async fn get_inner<F, Fut>(
+        &self,
+        fetch: F,
+        proactive: bool,
+    ) -> Result<Arc<Snapshot>, ClientError>
     where
         F: FnOnce(Option<[u8; 32]>) -> Fut,
         Fut: Future<Output = Result<Vec<u8>, ClientError>>,
@@ -299,7 +305,8 @@ impl Cache {
             }
             self.persist(&snapshot, state.snapshot.as_deref())?;
             Ok::<_, ClientError>(snapshot)
-        }.await;
+        }
+        .await;
         let snapshot = match refreshed {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -448,7 +455,7 @@ async fn copy_direction(
     upload: bool,
     evidence: Option<&ExchangeEvidence>,
     flow: Option<&super::flow::FlowLease>,
-    action:super::PacketAction,
+    action: super::PacketAction,
     scope: Option<&(dyn Fn() -> Result<(), ClientError> + Sync)>,
 ) -> Result<(), DirectRelayError> {
     let mut first_send = super::flow::FirstSend::new(flow, action);
@@ -472,9 +479,16 @@ async fn copy_direction(
             if let Some(check) = scope {
                 check().map_err(|error| DirectRelayError { error, peer: false })?;
             }
-            first_send.attempt().map_err(|error| DirectRelayError { error, peer: false })?;
-            let n = output.write(pending).await.map_err(|_| DirectRelayError::io(upload))?;
-            if n == 0 { return Err(DirectRelayError::io(upload)); }
+            first_send
+                .attempt()
+                .map_err(|error| DirectRelayError { error, peer: false })?;
+            let n = output
+                .write(pending)
+                .await
+                .map_err(|_| DirectRelayError::io(upload))?;
+            if n == 0 {
+                return Err(DirectRelayError::io(upload));
+            }
             pending = &pending[n..];
         }
         activity.data(count);
@@ -499,7 +513,9 @@ pub(crate) async fn relay_direct_guarded(
     target: TcpStream,
     flow: Option<&super::flow::FlowLease>,
 ) -> Result<(), ClientError> {
-    relay_direct_inner(client,target,0,0,flow,super::PacketAction::Pass,None).await.0
+    relay_direct_inner(client, target, 0, 0, flow, super::PacketAction::Pass, None)
+        .await
+        .0
 }
 
 pub(crate) async fn relay_direct_after_first(
@@ -507,10 +523,19 @@ pub(crate) async fn relay_direct_after_first(
     target: TcpStream,
     upload: usize,
     download: usize,
-    flow:Option<&super::flow::FlowLease>,
+    flow: Option<&super::flow::FlowLease>,
     scope: &(dyn Fn() -> Result<(), ClientError> + Sync),
 ) -> (Result<(), ClientError>, bool, bool) {
-    relay_direct_inner(client,target,upload,download,flow,super::PacketAction::Modify,Some(scope)).await
+    relay_direct_inner(
+        client,
+        target,
+        upload,
+        download,
+        flow,
+        super::PacketAction::Modify,
+        Some(scope),
+    )
+    .await
 }
 
 async fn relay_direct_inner(
@@ -519,10 +544,19 @@ async fn relay_direct_inner(
     upload: usize,
     download: usize,
     flow: Option<&super::flow::FlowLease>,
-    action:super::PacketAction,
+    action: super::PacketAction,
     scope: Option<&(dyn Fn() -> Result<(), ClientError> + Sync)>,
 ) -> (Result<(), ClientError>, bool, bool) {
-    relay_direct_parts(client.into_split(), target, upload, download, flow, action, scope).await
+    relay_direct_parts(
+        client.into_split(),
+        target,
+        upload,
+        download,
+        flow,
+        action,
+        scope,
+    )
+    .await
 }
 
 /// Plain HTTP exposes one bounded request rather than the underlying socket
@@ -533,8 +567,16 @@ pub(crate) async fn relay_http_direct_guarded(
     flow: Option<&super::flow::FlowLease>,
 ) -> Result<(), ClientError> {
     relay_direct_parts(
-        tokio::io::split(client), target, 0, 0, flow, super::PacketAction::Pass, None,
-    ).await.0
+        tokio::io::split(client),
+        target,
+        0,
+        0,
+        flow,
+        super::PacketAction::Pass,
+        None,
+    )
+    .await
+    .0
 }
 
 async fn relay_direct_parts(
@@ -553,19 +595,40 @@ async fn relay_direct_parts(
     let evidence = (upload != 0 && download != 0)
         .then(|| ExchangeEvidence(std::sync::atomic::AtomicU8::new(0)));
     let (tr, tw) = target.into_split();
-    let relay = activity
-        .run(
-            copy_direction(cr, tw, &activity, &meter, true, evidence.as_ref(), flow,action,scope),
-            copy_direction(tr, cw, &activity, &meter, false, evidence.as_ref(), flow,action,scope),
-            DirectRelayError {
-                error: ClientError::Timeout,
-                peer: false,
-            },
-        );
+    let relay = activity.run(
+        copy_direction(
+            cr,
+            tw,
+            &activity,
+            &meter,
+            true,
+            evidence.as_ref(),
+            flow,
+            action,
+            scope,
+        ),
+        copy_direction(
+            tr,
+            cw,
+            &activity,
+            &meter,
+            false,
+            evidence.as_ref(),
+            flow,
+            action,
+            scope,
+        ),
+        DirectRelayError {
+            error: ClientError::Timeout,
+            peer: false,
+        },
+    );
     let watchdog = async {
         if let Some(check) = scope {
             loop {
-                if let Err(error) = check() { break DirectRelayError { error, peer: false }; }
+                if let Err(error) = check() {
+                    break DirectRelayError { error, peer: false };
+                }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         } else {
@@ -642,27 +705,39 @@ mod tests {
         let (_, wire) = Snapshot::build("scope", 1, &[], &[], &[]).unwrap();
         let snapshot = cache.get(|_| async { Ok(wire) }).await.unwrap();
         let digest = snapshot.digest();
-        let flow = cache.flows.begin(
-            cache.policy.clone(),
-            Protocol::Tcp,
-            crate::protocol::Address::V4([192, 0, 2, 1]),
-            443,
-            digest,
-            PacketAction::Redirect,
-        ).unwrap();
+        let flow = cache
+            .flows
+            .begin(
+                cache.policy.clone(),
+                Protocol::Tcp,
+                crate::protocol::Address::V4([192, 0, 2, 1]),
+                443,
+                digest,
+                PacketAction::Redirect,
+            )
+            .unwrap();
         flow.commit(PacketAction::Redirect).unwrap();
         cache.state.lock().await.expires = Some(Instant::now() + Duration::from_secs(5));
-        cache.refresh(|known| async {
-            assert_eq!(known, Some(digest));
-            assert!(flow.check_delivery().is_ok());
-            Ok(super::super::exchange::unchanged_receipt(digest).to_vec())
-        }).await.unwrap();
+        cache
+            .refresh(|known| async {
+                assert_eq!(known, Some(digest));
+                assert!(flow.check_delivery().is_ok());
+                Ok(super::super::exchange::unchanged_receipt(digest).to_vec())
+            })
+            .await
+            .unwrap();
         assert!(flow.check_delivery().is_ok());
         cache.state.lock().await.expires = Some(Instant::now() + Duration::from_secs(5));
-        assert!(cache.refresh(|_| async { Err(ClientError::Io) }).await.is_err());
+        assert!(cache
+            .refresh(|_| async { Err(ClientError::Io) })
+            .await
+            .is_err());
         assert!(flow.check_delivery().is_err());
         cache.state.lock().await.retry = None;
-        cache.get(|_| async { Ok(super::super::exchange::unchanged_receipt(digest).to_vec()) }).await.unwrap();
+        cache
+            .get(|_| async { Ok(super::super::exchange::unchanged_receipt(digest).to_vec()) })
+            .await
+            .unwrap();
         assert!(flow.check_delivery().is_err());
     }
 

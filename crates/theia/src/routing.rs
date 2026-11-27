@@ -7,7 +7,6 @@ pub mod dns_attribution;
 pub(crate) mod dpi;
 pub(crate) mod exchange;
 pub(crate) mod flow;
-pub(crate) mod policy_lease;
 pub mod geodata;
 #[cfg(target_os = "linux")]
 pub mod linux_attribution;
@@ -19,18 +18,22 @@ pub mod linux_carrier;
 pub mod linux_events;
 #[cfg(target_os = "linux")]
 pub mod linux_ingress;
-#[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
-pub(crate) mod native_dns;
 #[cfg(target_os = "linux")]
 pub mod linux_rules;
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "windows", target_arch = "x86_64")
+))]
+pub(crate) mod native_dns;
 #[cfg(target_os = "linux")]
 pub mod nfqueue;
 pub mod packet;
 pub mod packet_modify;
-#[cfg(any(target_os = "windows", test))]
-pub mod windivert;
+pub(crate) mod policy_lease;
 mod settings;
 pub mod snapshot;
+#[cfg(any(target_os = "windows", test))]
+pub mod windivert;
 pub use settings::Settings;
 
 use regex::{Regex, RegexBuilder};

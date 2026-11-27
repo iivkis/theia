@@ -32,6 +32,7 @@ pub(super) fn packet_test_quic_hello(name: &str) -> Vec<u8> {
     record[5..].to_vec()
 }
 
+use crate::net::probe::{self, ProbeScheduler};
 use crate::{client::ClientError, network_scope};
 use std::{
     net::{IpAddr, SocketAddr},
@@ -40,7 +41,6 @@ use std::{
 };
 use strategy::{Key, Lease, Strategy, Verdict};
 use tokio::{io::AsyncWriteExt, net::TcpStream, time::timeout};
-use crate::net::probe::{self, ProbeScheduler};
 
 const ATTEMPT: Duration = Duration::from_secs(2);
 const PROBE_WAVE: usize = 2;
@@ -67,7 +67,11 @@ enum UdpProbe {
 impl UdpProbe {
     fn index(self) -> usize {
         use crate::quic_core::wire::Version;
-        match self { Self::Quic(Version::V1) => 3, Self::Quic(Version::V2) => 4, Self::Stun => 5 }
+        match self {
+            Self::Quic(Version::V1) => 3,
+            Self::Quic(Version::V2) => 4,
+            Self::Stun => 5,
+        }
     }
 }
 
@@ -88,10 +92,19 @@ impl UdpStrategy {
 
     pub(crate) fn capability_summary() -> String {
         use crate::quic_core::wire::Version;
-        let status = |strategy: Self| if strategy.accepted_for_proxy() { "принят" } else { "ожидает приёмки" };
-        format!("QUIC v1: {}; QUIC v2: {}; STUN: {}",
-            status(Self::Quic(Version::V1)), status(Self::Quic(Version::V2)),
-            status(Self::StunBinding(udp::BindingStrategy::Fingerprint)))
+        let status = |strategy: Self| {
+            if strategy.accepted_for_proxy() {
+                "принят"
+            } else {
+                "ожидает приёмки"
+            }
+        };
+        format!(
+            "QUIC v1: {}; QUIC v2: {}; STUN: {}",
+            status(Self::Quic(Version::V1)),
+            status(Self::Quic(Version::V2)),
+            status(Self::StunBinding(udp::BindingStrategy::Fingerprint))
+        )
     }
 
     fn probe(self) -> UdpProbe {
@@ -120,7 +133,10 @@ impl VerifiedUdp {
             engine: self.engine.clone(),
             digest: self.key.policy,
             epoch: self.key.epoch,
-            scope: self.engine.enabled().then_some((self.key.address, self.key.network)),
+            scope: self
+                .engine
+                .enabled()
+                .then_some((self.key.address, self.key.network)),
             require_stun: matches!(self.strategy, UdpStrategy::StunBinding(_)),
             tcp_evidence: None,
         }
@@ -136,7 +152,9 @@ impl VerifiedUdp {
                 .socket
                 .local_addr()
                 .is_ok_and(|local| self.key.network.matches_local(local))
-            && self.engine.udp_current(&self.key, self.strategy.probe(), &self.lease))
+            && self
+                .engine
+                .udp_current(&self.key, self.strategy.probe(), &self.lease))
     }
     pub(crate) fn quic_batch(&self, first: &[u8]) -> Option<Vec<Vec<u8>>> {
         let UdpStrategy::Quic(version) = self.strategy else {
@@ -155,8 +173,13 @@ impl VerifiedUdp {
         if !self.engine.key_live(&self.key)
             || (matches!(self.strategy, UdpStrategy::StunBinding(_)) && !self.engine.stun_enabled())
             || self.socket.peer_addr().ok() != Some(self.key.address)
-            || !self.socket.local_addr().is_ok_and(|local| self.key.network.matches_local(local))
-        { return Err(stale_policy()); }
+            || !self
+                .socket
+                .local_addr()
+                .is_ok_and(|local| self.key.network.matches_local(local))
+        {
+            return Err(stale_policy());
+        }
         Ok(())
     }
 
@@ -174,22 +197,50 @@ impl VerifiedUdp {
 
     #[cfg(test)]
     pub(crate) fn active_fixture(
-        socket: tokio::net::UdpSocket, strategy: UdpStrategy, name: &str,
+        socket: tokio::net::UdpSocket,
+        strategy: UdpStrategy,
+        name: &str,
     ) -> (Self, super::flow::FlowLease) {
         let address = socket.peer_addr().unwrap();
-        let network = (0..16).find_map(|_| network_scope::observe(address)).unwrap();
+        let network = (0..16)
+            .find_map(|_| network_scope::observe(address))
+            .unwrap();
         let engine = Arc::new(Engine::default());
         let policy = [1; 32];
         engine.authorize_policy(Some(super::client_state::LocalPolicy::fixture(policy)));
         engine.set_enabled(true);
         engine.set_stun_enabled(true);
-        let key = Key { name: name.into(), address, policy, epoch: engine.policy_epoch(policy).unwrap(), network };
-        let lease = engine.remember_udp(key.clone(), strategy.probe(), true).unwrap();
-        let flow = super::flow::FlowTable::shared().begin(
-            engine.policy.clone(), super::flow::Protocol::Udp,
-            crate::protocol::Address::Dns(name.into()), address.port(), policy, super::PacketAction::Modify,
-        ).unwrap();
-        (Self { socket, strategy, engine, key, lease, _admission: Default::default() }, flow)
+        let key = Key {
+            name: name.into(),
+            address,
+            policy,
+            epoch: engine.policy_epoch(policy).unwrap(),
+            network,
+        };
+        let lease = engine
+            .remember_udp(key.clone(), strategy.probe(), true)
+            .unwrap();
+        let flow = super::flow::FlowTable::shared()
+            .begin(
+                engine.policy.clone(),
+                super::flow::Protocol::Udp,
+                crate::protocol::Address::Dns(name.into()),
+                address.port(),
+                policy,
+                super::PacketAction::Modify,
+            )
+            .unwrap();
+        (
+            Self {
+                socket,
+                strategy,
+                engine,
+                key,
+                lease,
+                _admission: Default::default(),
+            },
+            flow,
+        )
     }
 
     #[cfg(test)]
@@ -223,22 +274,41 @@ async fn scoped_udp(
 }
 
 async fn scoped_udp_checked(
-    address: SocketAddr, scope: network_scope::Scope,
+    address: SocketAddr,
+    scope: network_scope::Scope,
 ) -> Result<Option<(tokio::net::UdpSocket, super::carrier_socket::Lease)>, ClientError> {
     fn network_error(error: std::io::Error) -> Result<Option<()>, ClientError> {
-        if error.kind() == std::io::ErrorKind::PermissionDenied { Err(stale_policy()) }
-        else { Ok(None) }
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            Err(stale_policy())
+        } else {
+            Ok(None)
+        }
     }
-    let (socket, admission) = match super::carrier_socket::dial_udp(scope.bind_address(), address, true, |local| scope.matches_local(local)).await {
-        Ok(value) => value,
-        Err(error) => { network_error(error.into_io())?; return Ok(None); }
-    };
-    if !socket.local_addr().is_ok_and(|local| scope.matches_local(local)) { return Err(stale_policy()); }
+    let (socket, admission) =
+        match super::carrier_socket::dial_udp(scope.bind_address(), address, true, |local| {
+            scope.matches_local(local)
+        })
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                network_error(error.into_io())?;
+                return Ok(None);
+            }
+        };
+    if !socket
+        .local_addr()
+        .is_ok_and(|local| scope.matches_local(local))
+    {
+        return Err(stale_policy());
+    }
     Ok(Some((socket, admission)))
 }
 
 impl Default for Engine {
-    fn default() -> Self { Self::new(Arc::new(PolicyState::default())) }
+    fn default() -> Self {
+        Self::new(Arc::new(PolicyState::default()))
+    }
 }
 
 impl Engine {
@@ -249,18 +319,36 @@ impl Engine {
             scheduler: ProbeScheduler::new(4),
         }
     }
-    pub(crate) fn set_enabled(&self, enabled: bool) { self.policy.set_enabled(enabled); }
-    pub(crate) fn set_stun_enabled(&self, enabled: bool) { self.policy.set_stun_enabled(enabled); }
-    pub(crate) fn stun_enabled(&self) -> bool { self.policy.stun_enabled() }
+    pub(crate) fn set_enabled(&self, enabled: bool) {
+        self.policy.set_enabled(enabled);
+    }
+    pub(crate) fn set_stun_enabled(&self, enabled: bool) {
+        self.policy.set_stun_enabled(enabled);
+    }
+    pub(crate) fn stun_enabled(&self) -> bool {
+        self.policy.stun_enabled()
+    }
     #[cfg(test)]
-    pub(super) fn authorize_policy(&self, lease: Option<super::client_state::LocalPolicy>) { self.policy.authorize_policy(lease); }
-    pub(crate) fn retired(&self) -> bool { self.policy.retired() }
+    pub(super) fn authorize_policy(&self, lease: Option<super::client_state::LocalPolicy>) {
+        self.policy.authorize_policy(lease);
+    }
+    pub(crate) fn retired(&self) -> bool {
+        self.policy.retired()
+    }
     #[cfg(test)]
-    pub(crate) fn retire(&self) { self.policy.retire(); }
-    pub(super) fn policy_epoch(&self, digest: [u8; 32]) -> Result<u64, ClientError> { self.policy.policy_epoch(digest) }
+    pub(crate) fn retire(&self) {
+        self.policy.retire();
+    }
+    pub(super) fn policy_epoch(&self, digest: [u8; 32]) -> Result<u64, ClientError> {
+        self.policy.policy_epoch(digest)
+    }
 
     fn check_key_policy(&self, key: &Key) -> Result<(), ClientError> {
-        if self.policy_epoch(key.policy)? == key.epoch { Ok(()) } else { Err(stale_policy()) }
+        if self.policy_epoch(key.policy)? == key.epoch {
+            Ok(())
+        } else {
+            Err(stale_policy())
+        }
     }
 
     fn key_live(&self, key: &Key) -> bool {
@@ -269,7 +357,9 @@ impl Engine {
             && network_scope::observe(key.address) == Some(key.network)
     }
 
-    pub(crate) fn enabled(&self) -> bool { self.policy.enabled() }
+    pub(crate) fn enabled(&self) -> bool {
+        self.policy.enabled()
+    }
 
     fn udp_evidence(&self, key: &Key, probe: UdpProbe) -> Option<(bool, Lease)> {
         self.cache.udp_evidence(key, probe)
@@ -281,48 +371,95 @@ impl Engine {
     }
 
     fn udp_current(&self, key: &Key, probe: UdpProbe, lease: &Lease) -> bool {
-        self.udp_evidence(key, probe).is_some_and(|(good, current)| good && current.same(lease))
+        self.udp_evidence(key, probe)
+            .is_some_and(|(good, current)| good && current.same(lease))
     }
 
     fn remember_udp(&self, key: Key, probe: UdpProbe, good: bool) -> Option<Lease> {
-        if !self.key_live(&key) { return None; }
+        if !self.key_live(&key) {
+            return None;
+        }
         self.cache.remember_udp(&key, probe, good)
     }
 
     fn fail_udp(&self, key: &Key, probe: UdpProbe, lease: &Lease) {
-        if self.key_live(key) { self.cache.fail_udp(key, probe, lease); }
+        if self.key_live(key) {
+            self.cache.fail_udp(key, probe, lease);
+        }
     }
 
-    fn ranked_udp_keys(&self, name: &str, port: u16, ips: &[IpAddr], policy: [u8; 32],
-        epoch: u64, probe: UdpProbe) -> Vec<Key> {
-        let mut keys: Vec<_> = ips.iter().take(2).filter_map(|ip| {
-            let address = SocketAddr::new(*ip, port);
-            let network = network_scope::observe(address)?;
-            Some(Key { name: name.to_owned(), address, policy, epoch, network })
-        }).collect();
+    fn ranked_udp_keys(
+        &self,
+        name: &str,
+        port: u16,
+        ips: &[IpAddr],
+        policy: [u8; 32],
+        epoch: u64,
+        probe: UdpProbe,
+    ) -> Vec<Key> {
+        let mut keys: Vec<_> = ips
+            .iter()
+            .take(2)
+            .filter_map(|ip| {
+                let address = SocketAddr::new(*ip, port);
+                let network = network_scope::observe(address)?;
+                Some(Key {
+                    name: name.to_owned(),
+                    address,
+                    policy,
+                    epoch,
+                    network,
+                })
+            })
+            .collect();
         keys.sort_by_key(|key| self.cache.udp_score(key, probe));
         keys
     }
 
     #[cfg(test)]
     pub(crate) async fn open_quic_udp(
-        self: &Arc<Self>, name: &str, port: u16, ips: &[IpAddr], policy: [u8; 32],
+        self: &Arc<Self>,
+        name: &str,
+        port: u16,
+        ips: &[IpAddr],
+        policy: [u8; 32],
     ) -> Option<VerifiedUdp> {
-        self.open_quic_udp_version(name, port, ips, policy, crate::quic_core::wire::Version::V1).await
+        self.open_quic_udp_version(name, port, ips, policy, crate::quic_core::wire::Version::V1)
+            .await
     }
 
     // Native lab callers intentionally retain their fail-closed Option API.
     pub(crate) async fn open_quic_udp_version(
-        self: &Arc<Self>, name: &str, port: u16, ips: &[IpAddr], policy: [u8; 32],
+        self: &Arc<Self>,
+        name: &str,
+        port: u16,
+        ips: &[IpAddr],
+        policy: [u8; 32],
         version: crate::quic_core::wire::Version,
     ) -> Option<VerifiedUdp> {
-        self.open_udp_checked(name, port, ips, policy, UdpStrategy::Quic(version)).await.ok().flatten()
+        self.open_udp_checked(name, port, ips, policy, UdpStrategy::Quic(version))
+            .await
+            .ok()
+            .flatten()
     }
 
     pub(crate) async fn open_stun_udp(
-        self: &Arc<Self>, name: &str, port: u16, ips: &[IpAddr], policy: [u8; 32],
+        self: &Arc<Self>,
+        name: &str,
+        port: u16,
+        ips: &[IpAddr],
+        policy: [u8; 32],
     ) -> Option<VerifiedUdp> {
-        self.open_udp_checked(name, port, ips, policy, UdpStrategy::StunBinding(udp::BindingStrategy::Fingerprint)).await.ok().flatten()
+        self.open_udp_checked(
+            name,
+            port,
+            ips,
+            policy,
+            UdpStrategy::StunBinding(udp::BindingStrategy::Fingerprint),
+        )
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Product selection must not confuse ordinary QUIC reachability
@@ -331,22 +468,35 @@ impl Engine {
     /// the required independently originated coalesced first flight.
     #[cfg(test)]
     pub(crate) async fn open_proxy_udp_checked(
-        self: &Arc<Self>, name: &str, port: u16, ips: &[IpAddr], policy: [u8;32],
+        self: &Arc<Self>,
+        name: &str,
+        port: u16,
+        ips: &[IpAddr],
+        policy: [u8; 32],
         strategy: UdpStrategy,
     ) -> Result<Option<VerifiedUdp>, ClientError> {
         let pin = self.policy.pin(policy)?;
-        self.open_proxy_udp_pinned(name, port, ips, &pin, strategy).await
+        self.open_proxy_udp_pinned(name, port, ips, &pin, strategy)
+            .await
     }
 
     pub(crate) async fn open_proxy_udp_pinned(
-        self: &Arc<Self>, name: &str, port: u16, ips: &[IpAddr], pin: &PolicyLease,
+        self: &Arc<Self>,
+        name: &str,
+        port: u16,
+        ips: &[IpAddr],
+        pin: &PolicyLease,
         strategy: UdpStrategy,
     ) -> Result<Option<VerifiedUdp>, ClientError> {
         pin.check_owner(&self.policy)?;
         if matches!(strategy, UdpStrategy::Quic(_)) {
             // Fail closed to an authorized pre-send XHTTP fallback, without
             // probing the target or reusing lab-only reachability evidence.
-            if ips.len() > 64 || !ips.iter().all(|ip| crate::server::allowed_destination(*ip, false)) {
+            if ips.len() > 64
+                || !ips
+                    .iter()
+                    .all(|ip| crate::server::allowed_destination(*ip, false))
+            {
                 return Err(stale_policy());
             }
             pin.check()?;
@@ -359,7 +509,11 @@ impl Engine {
     /// refusal. Probe evidence authenticates QUIC reachability only; the
     /// product route must separately require accepted active transformation.
     pub(crate) async fn open_udp_checked(
-        self: &Arc<Self>, name: &str, port: u16, ips: &[IpAddr], policy: [u8; 32],
+        self: &Arc<Self>,
+        name: &str,
+        port: u16,
+        ips: &[IpAddr],
+        policy: [u8; 32],
         strategy: UdpStrategy,
     ) -> Result<Option<VerifiedUdp>, ClientError> {
         let pin = self.policy.pin(policy)?;
@@ -367,7 +521,11 @@ impl Engine {
     }
 
     async fn open_udp_pinned(
-        self: &Arc<Self>, name: &str, port: u16, ips: &[IpAddr], pin: &PolicyLease,
+        self: &Arc<Self>,
+        name: &str,
+        port: u16,
+        ips: &[IpAddr],
+        pin: &PolicyLease,
         strategy: UdpStrategy,
     ) -> Result<Option<VerifiedUdp>, ClientError> {
         pin.check_owner(&self.policy)?;
@@ -377,8 +535,14 @@ impl Engine {
             UdpStrategy::StunBinding(udp::BindingStrategy::Fingerprint) if port == 3478 => true,
             _ => return Ok(None),
         };
-        if !self.enabled() || (stun && !self.stun_enabled()) || ips.is_empty() { return Ok(None); }
-        if ips.len() > 64 || !ips.iter().all(|ip| crate::server::allowed_destination(*ip, false)) {
+        if !self.enabled() || (stun && !self.stun_enabled()) || ips.is_empty() {
+            return Ok(None);
+        }
+        if ips.len() > 64
+            || !ips
+                .iter()
+                .all(|ip| crate::server::allowed_destination(*ip, false))
+        {
             return Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied));
         }
         let name = super::domain_name(name).map_err(|_| ClientError::Protocol)?;
@@ -392,8 +556,16 @@ impl Engine {
                 let live = || self.key_live(&key) && (!stun || self.stun_enabled());
                 // Contention before a probe is a safe budget fallback, not
                 // a negative strategy result or an ambiguous handshake.
-                let Some(_guard) = self.scheduler.lock((name, address, policy), Duration::from_millis(250)).await else { return Ok(None) };
-                if !live() { return Err(stale_policy()); }
+                let Some(_guard) = self
+                    .scheduler
+                    .lock((name, address, policy), Duration::from_millis(250))
+                    .await
+                else {
+                    return Ok(None);
+                };
+                if !live() {
+                    return Err(stale_policy());
+                }
                 let cached = self.udp_evidence(&key, probe);
                 let lease = match cached {
                     Some((false, _)) => return Ok(None),
@@ -402,8 +574,14 @@ impl Engine {
                         lease
                     }
                     _ => {
-                        let Ok(_permit) = self.scheduler.try_acquire() else { return Ok(None) };
-                        let ceiling = if stun { Duration::from_millis(1200) } else { ATTEMPT };
+                        let Ok(_permit) = self.scheduler.try_acquire() else {
+                            return Ok(None);
+                        };
+                        let ceiling = if stun {
+                            Duration::from_millis(1200)
+                        } else {
+                            ATTEMPT
+                        };
                         let budget = self.cache.udp_budget(&key, probe, ceiling);
                         if !probe::fits(deadline, budget, ATTEMPT) {
                             return Ok(None);
@@ -411,14 +589,24 @@ impl Engine {
                         let started = std::time::Instant::now();
                         let result = match strategy {
                             UdpStrategy::Quic(version) => {
-                                let Ok(Some(config)) = tokio::task::spawn_blocking(tls::native_config).await else { return Ok(None) };
-                                if !live() { return Err(stale_policy()); }
+                                let Ok(Some(config)) =
+                                    tokio::task::spawn_blocking(tls::native_config).await
+                                else {
+                                    return Ok(None);
+                                };
+                                if !live() {
+                                    return Err(stale_policy());
+                                }
                                 // A shorter outer budget must not mask a
                                 // received but unauthenticated QUIC handshake.
-                                if !probe::fits(deadline, budget, ATTEMPT) { return Ok(None); }
+                                if !probe::fits(deadline, budget, ATTEMPT) {
+                                    return Ok(None);
+                                }
                                 let revoked = async {
                                     loop {
-                                        if !live() { return Err(stale_policy()); }
+                                        if !live() {
+                                            return Err(stale_policy());
+                                        }
                                         tokio::time::sleep(Duration::from_millis(50)).await;
                                     }
                                 };
@@ -429,30 +617,71 @@ impl Engine {
                                 }
                             }
                             UdpStrategy::StunBinding(binding) => {
-                                let Some((socket, _admission)) = scoped_udp_checked(address, key.network).await? else { return Ok(None) };
-                                if !live() { return Err(stale_policy()); }
-                                match timeout(budget, udp::probe_stun_checked(&socket, binding, &live)).await {
+                                let Some((socket, _admission)) =
+                                    scoped_udp_checked(address, key.network).await?
+                                else {
+                                    return Ok(None);
+                                };
+                                if !live() {
+                                    return Err(stale_policy());
+                                }
+                                match timeout(
+                                    budget,
+                                    udp::probe_stun_checked(&socket, binding, &live),
+                                )
+                                .await
+                                {
                                     Ok(result) => result?,
                                     Err(_) => None,
                                 }
                             }
                         };
-                        if !live() { return Err(stale_policy()); }
+                        if !live() {
+                            return Err(stale_policy());
+                        }
                         let good = result.is_some();
-                        self.cache.observe_udp(&key, probe, good, started.elapsed(), result.and_then(|sample| sample.rtt));
-                        if stun { crate::traffic::udp_stun_probe(good); } else { crate::traffic::dpi_probe(good); }
-                        let Some(lease) = self.remember_udp(key.clone(), probe, good) else { return Err(stale_policy()) };
-                        if !good { return Ok(None); }
+                        self.cache.observe_udp(
+                            &key,
+                            probe,
+                            good,
+                            started.elapsed(),
+                            result.and_then(|sample| sample.rtt),
+                        );
+                        if stun {
+                            crate::traffic::udp_stun_probe(good);
+                        } else {
+                            crate::traffic::dpi_probe(good);
+                        }
+                        let Some(lease) = self.remember_udp(key.clone(), probe, good) else {
+                            return Err(stale_policy());
+                        };
+                        if !good {
+                            return Ok(None);
+                        }
                         lease
                     }
                 };
-                if !live() { return Err(stale_policy()); }
-                if !self.udp_current(&key, probe, &lease) { return Ok(None); }
-                let Some((socket, admission)) = scoped_udp_checked(address, key.network).await? else { return Ok(None) };
-                if !live() { return Err(stale_policy()); }
+                if !live() {
+                    return Err(stale_policy());
+                }
+                if !self.udp_current(&key, probe, &lease) {
+                    return Ok(None);
+                }
+                let Some((socket, admission)) = scoped_udp_checked(address, key.network).await?
+                else {
+                    return Ok(None);
+                };
+                if !live() {
+                    return Err(stale_policy());
+                }
                 if self.udp_current(&key, probe, &lease) {
                     return Ok(Some(VerifiedUdp {
-                        socket, strategy, lease, _admission: admission, engine: self.clone(), key,
+                        socket,
+                        strategy,
+                        lease,
+                        _admission: admission,
+                        engine: self.clone(),
+                        key,
                     }));
                 }
                 Ok(None)
@@ -460,27 +689,43 @@ impl Engine {
         };
         let result = timeout(OPEN_BUDGET, async {
             let mut keys = keys.into_iter();
-            let Some(first) = keys.next() else { return Ok(None) };
+            let Some(first) = keys.next() else {
+                return Ok(None);
+            };
             let second = keys.next();
-            let (left, right) = tokio::join!(
-                probe_key(first),
-                async { match second { Some(key) => probe_key(key).await, None => Ok(None) } }
-            );
+            let (left, right) = tokio::join!(probe_key(first), async {
+                match second {
+                    Some(key) => probe_key(key).await,
+                    None => Ok(None),
+                }
+            });
             // Never use a positive peer to mask an identity or policy error
             // from the other completed probe. Both share the global cap.
             let left = left?;
             let right = right?;
             Ok(left.or(right))
-        }).await;
+        })
+        .await;
         pin.check()?;
-        if !self.enabled() || (stun && !self.stun_enabled()) { return Err(stale_policy()); }
+        if !self.enabled() || (stun && !self.stun_enabled()) {
+            return Err(stale_policy());
+        }
         // An unknown outcome of an in-progress probe is not a fallback.
         result.unwrap_or_else(|_| Err(ClientError::Timeout))
     }
 
     #[cfg(test)]
-    async fn open(self: &Arc<Self>, name: &str, port: u16, ips: &[IpAddr], policy: [u8; 32]) -> Option<Tunnel> {
-        self.open_checked(name, port, ips, policy).await.ok().flatten()
+    async fn open(
+        self: &Arc<Self>,
+        name: &str,
+        port: u16,
+        ips: &[IpAddr],
+        policy: [u8; 32],
+    ) -> Option<Tunnel> {
+        self.open_checked(name, port, ips, policy)
+            .await
+            .ok()
+            .flatten()
     }
 
     pub(crate) async fn open_checked(
@@ -495,14 +740,22 @@ impl Engine {
     }
 
     pub(crate) async fn open_checked_pinned(
-        self: &Arc<Self>, name: &str, port: u16, ips: &[IpAddr], pin: &PolicyLease,
+        self: &Arc<Self>,
+        name: &str,
+        port: u16,
+        ips: &[IpAddr],
+        pin: &PolicyLease,
     ) -> Result<Option<Tunnel>, ClientError> {
         pin.check_owner(&self.policy)?;
         let policy = pin.digest();
         if !self.enabled() || !matches!(port, 443 | 8443) || ips.is_empty() {
             return Ok(None);
         }
-        if ips.len() > 64 || !ips.iter().all(|ip| crate::server::allowed_destination(*ip, false)) {
+        if ips.len() > 64
+            || !ips
+                .iter()
+                .all(|ip| crate::server::allowed_destination(*ip, false))
+        {
             return Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied));
         }
         let epoch = pin.epoch();
@@ -511,10 +764,26 @@ impl Engine {
         let result = timeout(OPEN_BUDGET, async {
             for ip in ips.iter().take(2) {
                 let address = SocketAddr::new(*ip, port);
-                let Some(network) = network_scope::observe(address) else { continue };
-                let key = Key { name: name.clone(), address, policy, epoch, network };
-                let Some(guard) = self.scheduler.lock((&key.name, address, policy), Duration::from_millis(250)).await else { return Ok(None) };
-                if !self.key_live(&key) { return Err(stale_policy()); }
+                let Some(network) = network_scope::observe(address) else {
+                    continue;
+                };
+                let key = Key {
+                    name: name.clone(),
+                    address,
+                    policy,
+                    epoch,
+                    network,
+                };
+                let Some(guard) = self
+                    .scheduler
+                    .lock((&key.name, address, policy), Duration::from_millis(250))
+                    .await
+                else {
+                    return Ok(None);
+                };
+                if !self.key_live(&key) {
+                    return Err(stale_policy());
+                }
                 let (strategy, lease) = match self.cache.evidence(&key) {
                     Some((Verdict::Verified(strategy), lease)) => {
                         crate::traffic::dpi_cache_hit();
@@ -523,18 +792,30 @@ impl Engine {
                     Some((Verdict::Unavailable, _)) => continue,
                     Some((Verdict::Denied, _)) => return Err(stale_policy()),
                     previous => {
-                        let Ok(Some(config)) = tokio::task::spawn_blocking(tls::native_config).await else { return Ok(None) };
+                        let Ok(Some(config)) =
+                            tokio::task::spawn_blocking(tls::native_config).await
+                        else {
+                            return Ok(None);
+                        };
                         let mut verified = None;
                         let mut attempted = 0;
                         let mut order = self.cache.ranked(&key);
-                        if let Some((Verdict::Avoid { strategy: failed, .. }, _)) = previous {
+                        if let Some((
+                            Verdict::Avoid {
+                                strategy: failed, ..
+                            },
+                            _,
+                        )) = previous
+                        {
                             order.sort_by_key(|strategy| *strategy == failed);
                         }
                         // Parallel bounded waves. Collect both completed
                         // outcomes before selection so a protective refusal
                         // cannot be hidden behind a faster positive probe.
                         for wave in order.chunks(PROBE_WAVE) {
-                            if !self.key_live(&key) { return Err(stale_policy()); }
+                            if !self.key_live(&key) {
+                                return Err(stale_policy());
+                            }
                             let probe = |strategy: Strategy| {
                                 let key = &key;
                                 let name = &name;
@@ -548,29 +829,43 @@ impl Engine {
                                     let started = std::time::Instant::now();
                                     let mut rtt = None;
                                     let verdict = tls::probe_measured(
-                                        name, address, Some(network), strategy, config, budget,
-                                        || self.key_live(key), &mut rtt,
-                                    ).await;
+                                        name,
+                                        address,
+                                        Some(network),
+                                        strategy,
+                                        config,
+                                        budget,
+                                        || self.key_live(key),
+                                        &mut rtt,
+                                    )
+                                    .await;
                                     Some((strategy, verdict, started.elapsed(), rtt))
                                 }
                             };
-                            let (first, second) = tokio::join!(
-                                probe(wave[0]),
-                                async { match wave.get(1) { Some(&strategy) => probe(strategy).await, None => None } }
-                            );
-                            if !self.key_live(&key) { return Err(stale_policy()); }
+                            let (first, second) = tokio::join!(probe(wave[0]), async {
+                                match wave.get(1) {
+                                    Some(&strategy) => probe(strategy).await,
+                                    None => None,
+                                }
+                            });
+                            if !self.key_live(&key) {
+                                return Err(stale_policy());
+                            }
                             use tls::ProbeVerdict::*;
                             let outcomes = [first, second];
                             for (_, verdict, _, _) in outcomes.iter().flatten() {
                                 use crate::net::error::FailureClass;
                                 match verdict.failure() {
-                                    Some(FailureClass::IdentityRejected) => return Err(ClientError::Tls),
+                                    Some(FailureClass::IdentityRejected) => {
+                                        return Err(ClientError::Tls)
+                                    }
                                     Some(FailureClass::PolicyDenied) => return Err(stale_policy()),
                                     _ => {}
                                 }
                             }
                             let mut best = None;
-                            for (strategy, verdict, elapsed, rtt) in outcomes.into_iter().flatten() {
+                            for (strategy, verdict, elapsed, rtt) in outcomes.into_iter().flatten()
+                            {
                                 if matches!(verdict, Verified | StrategyFailed) {
                                     let good = verdict == Verified;
                                     attempted += 1;
@@ -586,33 +881,49 @@ impl Engine {
                                 break;
                             }
                         }
-                        if !self.key_live(&key) { return Err(stale_policy()); }
+                        if !self.key_live(&key) {
+                            return Err(stale_policy());
+                        }
                         let Some(strategy) = verified else {
                             if attempted == Strategy::ALL.len() {
                                 let _ = self.cache.remember(&key, Verdict::Unavailable);
                             }
                             continue;
                         };
-                        let Some(lease) = self.cache.remember(&key, Verdict::Verified(strategy)) else {
+                        let Some(lease) = self.cache.remember(&key, Verdict::Verified(strategy))
+                        else {
                             return Err(stale_policy());
                         };
                         (strategy, lease)
                     }
                 };
                 drop(guard);
-                if !self.key_live(&key) { return Err(stale_policy()); }
-                if self.cache.denied_tcp(&key) { return Err(stale_policy()); }
-                if !self.cache.current(&key, strategy, &lease) { continue; }
+                if !self.key_live(&key) {
+                    return Err(stale_policy());
+                }
+                if self.cache.denied_tcp(&key) {
+                    return Err(stale_policy());
+                }
+                if !self.cache.current(&key, strategy, &lease) {
+                    continue;
+                }
                 match timeout(ATTEMPT, tcp::connect(address)).await {
                     Ok(Ok((target, admission))) => {
                         if !self.key_live(&key)
-                            || !target.local_addr().is_ok_and(|local| network.matches_local(local)) {
+                            || !target
+                                .local_addr()
+                                .is_ok_and(|local| network.matches_local(local))
+                        {
                             return Err(stale_policy());
                         }
                         if self.cache.current(&key, strategy, &lease) {
                             return Ok(Some(Tunnel {
-                                target, _admission: admission, strategy, lease,
-                                engine: self.clone(), key,
+                                target,
+                                _admission: admission,
+                                strategy,
+                                lease,
+                                engine: self.clone(),
+                                key,
                             }));
                         }
                     }
@@ -621,44 +932,86 @@ impl Engine {
                     }
                     _ => {}
                 }
-                if !self.key_live(&key) { return Err(stale_policy()); }
+                if !self.key_live(&key) {
+                    return Err(stale_policy());
+                }
             }
             Ok(None)
-        }).await;
+        })
+        .await;
         pin.check()?;
-        if !self.enabled() { return Err(stale_policy()); }
+        if !self.enabled() {
+            return Err(stale_policy());
+        }
         result.unwrap_or(Ok(None))
     }
 
     pub(crate) fn due_tcp_refresh(&self) -> Option<RefreshTarget> {
-        if !self.enabled() || self.retired() { return None; }
+        if !self.enabled() || self.retired() {
+            return None;
+        }
         let (key, strategy, lease) = self.cache.due_tcp()?;
-        self.key_live(&key).then_some(RefreshTarget { key, strategy, lease })
+        self.key_live(&key).then_some(RefreshTarget {
+            key,
+            strategy,
+            lease,
+        })
     }
 
     /// Caller must freshly resolve protected DNS and classify all pins
     /// against the current snapshot before invoking this background probe.
     pub(crate) fn invalidate_refresh(&self, target: RefreshTarget) {
-        if self.key_live(&target.key) { self.cache.deny_tcp(&target.key, &target.lease); }
+        if self.key_live(&target.key) {
+            self.cache.deny_tcp(&target.key, &target.lease);
+        }
     }
 
     pub(crate) async fn refresh_tcp(&self, target: RefreshTarget) {
-        let RefreshTarget { key, strategy, lease } = target;
-        if !self.key_live(&key) { return; }
-        let Some(_guard) = self.scheduler.try_lock((&key.name, key.address, key.policy)) else { return };
-        let Ok(_permit) = self.scheduler.try_acquire() else { return };
-        if !self.key_live(&key) || !self.cache.current(&key, strategy, &lease) { return; }
-        let Ok(Some(config)) = tokio::task::spawn_blocking(tls::native_config).await else { return };
+        let RefreshTarget {
+            key,
+            strategy,
+            lease,
+        } = target;
+        if !self.key_live(&key) {
+            return;
+        }
+        let Some(_guard) = self
+            .scheduler
+            .try_lock((&key.name, key.address, key.policy))
+        else {
+            return;
+        };
+        let Ok(_permit) = self.scheduler.try_acquire() else {
+            return;
+        };
+        if !self.key_live(&key) || !self.cache.current(&key, strategy, &lease) {
+            return;
+        }
+        let Ok(Some(config)) = tokio::task::spawn_blocking(tls::native_config).await else {
+            return;
+        };
         let budget = self.cache.tcp_budget(&key, strategy, ATTEMPT);
         let started = std::time::Instant::now();
         let mut rtt = None;
-        let verdict = tls::probe_measured(&key.name, key.address, Some(key.network), strategy,
-            config, budget, || self.key_live(&key) && self.cache.current(&key, strategy, &lease), &mut rtt).await;
-        if !self.key_live(&key) || !self.cache.current(&key, strategy, &lease) { return; }
+        let verdict = tls::probe_measured(
+            &key.name,
+            key.address,
+            Some(key.network),
+            strategy,
+            config,
+            budget,
+            || self.key_live(&key) && self.cache.current(&key, strategy, &lease),
+            &mut rtt,
+        )
+        .await;
+        if !self.key_live(&key) || !self.cache.current(&key, strategy, &lease) {
+            return;
+        }
         match verdict {
             tls::ProbeVerdict::Verified => {
                 if self.cache.renew_tcp(&key, strategy, &lease) {
-                    self.cache.observe(&key, strategy, true, started.elapsed(), rtt);
+                    self.cache
+                        .observe(&key, strategy, true, started.elapsed(), rtt);
                     crate::traffic::dpi_probe(true);
                 }
             }
@@ -668,12 +1021,12 @@ impl Engine {
             }
             // Never convert a protective refusal to a cached fallback.
             // Expire the original evidence, forcing fresh foreground validation.
-            tls::ProbeVerdict::IdentityRejected | tls::ProbeVerdict::Denied =>
-                self.cache.deny_tcp(&key, &lease),
+            tls::ProbeVerdict::IdentityRejected | tls::ProbeVerdict::Denied => {
+                self.cache.deny_tcp(&key, &lease)
+            }
             tls::ProbeVerdict::Unavailable => {}
         }
     }
-
 }
 
 pub(crate) struct RefreshTarget {
@@ -682,9 +1035,15 @@ pub(crate) struct RefreshTarget {
     lease: Lease,
 }
 impl RefreshTarget {
-    pub(crate) fn name(&self) -> &str { &self.key.name }
-    pub(crate) fn address(&self) -> SocketAddr { self.key.address }
-    pub(crate) fn digest(&self) -> [u8;32] { self.key.policy }
+    pub(crate) fn name(&self) -> &str {
+        &self.key.name
+    }
+    pub(crate) fn address(&self) -> SocketAddr {
+        self.key.address
+    }
+    pub(crate) fn digest(&self) -> [u8; 32] {
+        self.key.policy
+    }
 }
 
 pub(crate) struct Tunnel {
@@ -713,12 +1072,22 @@ pub(crate) struct FallbackPolicy {
 }
 impl FallbackPolicy {
     pub(crate) fn check(&self) -> Result<(), ClientError> {
-        if self.engine.policy_epoch(self.digest)? != self.epoch { return Err(stale_policy()); }
-        if self.require_stun && !self.engine.stun_enabled() { return Err(stale_policy()); }
-        if self.tcp_evidence.as_ref().is_some_and(|key| self.engine.cache.denied_tcp(key)) {
+        if self.engine.policy_epoch(self.digest)? != self.epoch {
             return Err(stale_policy());
         }
-        if self.scope.is_some_and(|(address, scope)| !self.engine.enabled() || network_scope::observe(address) != Some(scope)) {
+        if self.require_stun && !self.engine.stun_enabled() {
+            return Err(stale_policy());
+        }
+        if self
+            .tcp_evidence
+            .as_ref()
+            .is_some_and(|key| self.engine.cache.denied_tcp(key))
+        {
+            return Err(stale_policy());
+        }
+        if self.scope.is_some_and(|(address, scope)| {
+            !self.engine.enabled() || network_scope::observe(address) != Some(scope)
+        }) {
             return Err(stale_policy());
         }
         Ok(())
@@ -732,7 +1101,9 @@ impl FallbackPolicy {
 
 /// Consume only the bounded initial flight. The name is a probe hint,
 /// never authenticated domain evidence. Preserve partial bytes on timeout.
-pub(crate) async fn read_tcp_hint(client: &mut TcpStream) -> Result<(Vec<u8>, Option<String>), ClientError> {
+pub(crate) async fn read_tcp_hint(
+    client: &mut TcpStream,
+) -> Result<(Vec<u8>, Option<String>), ClientError> {
     let mut prefix = Vec::new();
     let ready = match timeout(FIRST_FLIGHT, tcp::read_hello(client, &mut prefix)).await {
         Ok(Ok(ready)) => ready,
@@ -744,7 +1115,9 @@ pub(crate) async fn read_tcp_hint(client: &mut TcpStream) -> Result<(Vec<u8>, Op
             tls::Flight::Complete { name, .. } => Some(name),
             _ => None,
         }
-    } else { None };
+    } else {
+        None
+    };
     Ok((prefix, name))
 }
 
@@ -754,7 +1127,10 @@ impl Tunnel {
             engine: self.engine.clone(),
             digest: self.key.policy,
             epoch: self.key.epoch,
-            scope: self.engine.enabled().then_some((self.key.address, self.key.network)),
+            scope: self
+                .engine
+                .enabled()
+                .then_some((self.key.address, self.key.network)),
             require_stun: false,
             tcp_evidence: Some(self.key.clone()),
         }
@@ -766,11 +1142,19 @@ impl Tunnel {
         flow: Option<&super::flow::FlowLease>,
     ) -> Result<RelayOutcome, ClientError> {
         let (prefix, name) = read_tcp_hint(&mut client).await?;
-        self.relay_prefix(client, prefix, name.is_some(), flow).await
+        self.relay_prefix(client, prefix, name.is_some(), flow)
+            .await
     }
 
-    #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
-    pub(crate) fn matches_native_target(&self, key: super::packet::FlowKey, source: IpAddr) -> bool {
+    #[cfg(any(
+        target_os = "linux",
+        all(target_os = "windows", target_arch = "x86_64")
+    ))]
+    pub(crate) fn matches_native_target(
+        &self,
+        key: super::packet::FlowKey,
+        source: IpAddr,
+    ) -> bool {
         self.target.peer_addr().ok() == Some(key.destination)
             && self.target.local_addr().is_ok_and(|a| a.ip() == source)
     }
@@ -784,8 +1168,12 @@ impl Tunnel {
     ) -> Result<RelayOutcome, ClientError> {
         // A superseded/expired policy is not permission for VPS fallback.
         self.engine.check_key_policy(&self.key)?;
-        if flow.is_some() && !self.engine.key_live(&self.key) { return Err(stale_policy()); }
-        if self.engine.cache.denied_tcp(&self.key) { return Err(stale_policy()); }
+        if flow.is_some() && !self.engine.key_live(&self.key) {
+            return Err(stale_policy());
+        }
+        if self.engine.cache.denied_tcp(&self.key) {
+            return Err(stale_policy());
+        }
         let transformed = if ready {
             tls::transform(&prefix, &self.key.name, self.strategy)
         } else {
@@ -800,18 +1188,30 @@ impl Tunnel {
         let key = &self.key;
         let check_scope = || {
             if engine.key_live(key) {
-                if let Some(flow) = flow { flow.check_live(super::PacketAction::Modify)?; }
+                if let Some(flow) = flow {
+                    flow.check_live(super::PacketAction::Modify)?;
+                }
                 Ok(())
             } else {
                 Err(stale_policy())
             }
         };
         check_scope()?;
-        if !self.target.local_addr().is_ok_and(|local| self.key.network.matches_local(local)) {
+        if !self
+            .target
+            .local_addr()
+            .is_ok_and(|local| self.key.network.matches_local(local))
+        {
             return Err(stale_policy());
         }
-        if self.engine.cache.denied_tcp(&self.key) { return Err(stale_policy()); }
-        if !self.engine.cache.current(&self.key, self.strategy, &self.lease) {
+        if self.engine.cache.denied_tcp(&self.key) {
+            return Err(stale_policy());
+        }
+        if !self
+            .engine
+            .cache
+            .current(&self.key, self.strategy, &self.lease)
+        {
             return Ok(RelayOutcome::Fallback { client, prefix });
         }
         self.engine.check_key_policy(&self.key)?;
@@ -825,8 +1225,14 @@ impl Tunnel {
             let mut pending = transformed.as_slice();
             while !pending.is_empty() {
                 check_scope()?;
-                let count = self.target.write(pending).await.map_err(|_| ClientError::Io)?;
-                if count == 0 { return Err(ClientError::Io); }
+                let count = self
+                    .target
+                    .write(pending)
+                    .await
+                    .map_err(|_| ClientError::Io)?;
+                if count == 0 {
+                    return Err(ClientError::Io);
+                }
                 pending = &pending[count..];
             }
             tcp::read_server_hello(&mut self.target).await
@@ -836,34 +1242,49 @@ impl Tunnel {
         let response = match response {
             Ok(Ok(tcp::ServerFlight::Hello(response))) => response,
             Ok(Ok(tcp::ServerFlight::Alert(alert))) => {
-                self.engine.cache.failed(&self.key, self.strategy, &self.lease);
+                self.engine
+                    .cache
+                    .failed(&self.key, self.strategy, &self.lease);
                 crate::traffic::dpi_first_failure();
                 crate::traffic::dpi_tls_alert();
                 // Forward the genuine alert; do not retry or manufacture a
                 // replacement response on a different connection.
                 check_scope()?;
-                timeout(FIRST_FLIGHT, tcp::write_checked(&mut client, &alert, &check_scope))
-                    .await
-                    .map_err(|_| ClientError::Timeout)??;
+                timeout(
+                    FIRST_FLIGHT,
+                    tcp::write_checked(&mut client, &alert, &check_scope),
+                )
+                .await
+                .map_err(|_| ClientError::Timeout)??;
                 return Err(ClientError::Tls);
             }
             Ok(Err(error)) => {
-                self.engine.cache.failed(&self.key, self.strategy, &self.lease);
+                self.engine
+                    .cache
+                    .failed(&self.key, self.strategy, &self.lease);
                 crate::traffic::dpi_first_failure();
                 return Err(error);
             }
             Err(_) => {
-                self.engine.cache.failed(&self.key, self.strategy, &self.lease);
+                self.engine
+                    .cache
+                    .failed(&self.key, self.strategy, &self.lease);
                 crate::traffic::dpi_first_failure();
                 crate::traffic::dpi_timeout();
                 return Err(ClientError::Timeout);
             }
         };
         check_scope()?;
-        timeout(FIRST_FLIGHT, tcp::write_checked(&mut client, &response, &check_scope))
-            .await.map_err(|_| ClientError::Timeout)??;
+        timeout(
+            FIRST_FLIGHT,
+            tcp::write_checked(&mut client, &response, &check_scope),
+        )
+        .await
+        .map_err(|_| ClientError::Timeout)??;
         let hello_elapsed = started.elapsed();
-        if flow.is_some() { self.engine.cache.touch_tcp(&self.key, &self.lease); }
+        if flow.is_some() {
+            self.engine.cache.touch_tcp(&self.key, &self.lease);
+        }
         crate::traffic::dpi_first_response();
         let (result, exchanged, peer_failure) = super::client_state::relay_direct_after_first(
             client,
@@ -877,7 +1298,9 @@ impl Tunnel {
         // A ServerHello alone is insufficient evidence of usable application
         // traffic. Do not penalize a clean early application disconnect.
         if peer_failure && check_scope().is_ok() {
-            self.engine.cache.failed(&self.key, self.strategy, &self.lease);
+            self.engine
+                .cache
+                .failed(&self.key, self.strategy, &self.lease);
             crate::traffic::dpi_post_hello_failure();
         } else if exchanged && result.is_ok() && check_scope().is_ok() {
             self.engine
@@ -915,7 +1338,10 @@ mod native_admission_tests {
     use super::*;
     use crate::routing::carrier_socket::{self, Registrar};
     use std::io;
-    use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpSocket, UdpSocket}};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpSocket, UdpSocket},
+    };
 
     struct Refuse;
     impl Registrar for Refuse {
@@ -925,7 +1351,9 @@ mod native_admission_tests {
         fn udp(&self, _: &UdpSocket, _: SocketAddr) -> io::Result<carrier_socket::Lease> {
             Err(io::ErrorKind::PermissionDenied.into())
         }
-        fn retire(&self) -> io::Result<()> { Ok(()) }
+        fn retire(&self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -937,54 +1365,74 @@ mod native_admission_tests {
             if let Some(scope) = network_scope::observe(target) {
                 assert!(scoped_udp(target, scope).await.is_none());
             }
-        }).await;
-        assert!(timeout(Duration::from_millis(50), listener.accept()).await.is_err());
+        })
+        .await;
+        assert!(timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err());
     }
 
-    #[cfg(any(target_os="linux",all(target_os="windows",target_arch="x86_64")))]
+    #[cfg(any(
+        target_os = "linux",
+        all(target_os = "windows", target_arch = "x86_64")
+    ))]
     #[tokio::test]
     async fn native_udp_socket_retains_exact_preconnect_lease() {
-        use std::sync::atomic::{AtomicUsize,Ordering as AtomicOrdering};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
         struct Count(Arc<AtomicUsize>);
         impl Drop for Count {
-            fn drop(&mut self) {self.0.fetch_sub(1,AtomicOrdering::SeqCst);}
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, AtomicOrdering::SeqCst);
+            }
         }
         struct Admit {
-            count:Arc<AtomicUsize>,
-            peer:SocketAddr,
+            count: Arc<AtomicUsize>,
+            peer: SocketAddr,
         }
         impl Registrar for Admit {
-            fn tcp(&self,_:&TcpSocket,_:SocketAddr)->io::Result<carrier_socket::Lease> {
+            fn tcp(&self, _: &TcpSocket, _: SocketAddr) -> io::Result<carrier_socket::Lease> {
                 Err(io::ErrorKind::PermissionDenied.into())
             }
-            fn udp(&self,socket:&UdpSocket,peer:SocketAddr)->io::Result<carrier_socket::Lease> {
-                assert_eq!(peer,self.peer);
+            fn udp(
+                &self,
+                socket: &UdpSocket,
+                peer: SocketAddr,
+            ) -> io::Result<carrier_socket::Lease> {
+                assert_eq!(peer, self.peer);
                 assert!(socket.peer_addr().is_err());
-                assert_eq!(socket.local_addr().unwrap().ip(),peer.ip());
-                assert_ne!(socket.local_addr().unwrap().port(),0);
-                self.count.fetch_add(1,AtomicOrdering::SeqCst);
+                assert_eq!(socket.local_addr().unwrap().ip(), peer.ip());
+                assert_ne!(socket.local_addr().unwrap().port(), 0);
+                self.count.fetch_add(1, AtomicOrdering::SeqCst);
                 Ok(carrier_socket::Lease::retain(Count(self.count.clone())))
             }
-            fn retire(&self)->io::Result<()> {Ok(())}
+            fn retire(&self) -> io::Result<()> {
+                Ok(())
+            }
         }
-        let receiver=UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let peer=receiver.local_addr().unwrap();
-        let network=network_scope::Scope::fixture(peer,0);
-        let count=Arc::new(AtomicUsize::new(0));
-        let owner=Arc::new(Admit{count:count.clone(),peer});
-        let (socket,lease)=carrier_socket::scope(Some(owner),scoped_udp(peer,network)).await.unwrap();
-        assert_eq!(socket.peer_addr().unwrap(),peer);
-        assert_eq!(count.load(AtomicOrdering::SeqCst),1);
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = receiver.local_addr().unwrap();
+        let network = network_scope::Scope::fixture(peer, 0);
+        let count = Arc::new(AtomicUsize::new(0));
+        let owner = Arc::new(Admit {
+            count: count.clone(),
+            peer,
+        });
+        let (socket, lease) = carrier_socket::scope(Some(owner), scoped_udp(peer, network))
+            .await
+            .unwrap();
+        assert_eq!(socket.peer_addr().unwrap(), peer);
+        assert_eq!(count.load(AtomicOrdering::SeqCst), 1);
         drop(socket);
         drop(lease);
-        assert_eq!(count.load(AtomicOrdering::SeqCst),0);
+        assert_eq!(count.load(AtomicOrdering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn native_tcp_hint_preserves_exact_consumed_prefix() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (sender, receiver) = tokio::join!(
-            TcpStream::connect(listener.local_addr().unwrap()), listener.accept()
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
         );
         let mut sender = sender.unwrap();
         let (mut receiver, _) = receiver.unwrap();
@@ -1030,8 +1478,13 @@ mod tests {
         assert!(authorization.check().is_err());
         engine.authorize_policy(None);
         assert!(authorization.check().is_err());
-        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(digest)));
-        assert!(authorization.check().is_err(), "same digest must not revive fallback");
+        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(
+            digest,
+        )));
+        assert!(
+            authorization.check().is_err(),
+            "same digest must not revive fallback"
+        );
     }
 
     #[test]
@@ -1046,14 +1499,18 @@ mod tests {
             epoch: 1,
             network: network_scope::Scope::fixture(address, 1),
         };
-        let _ = engine.cache.fixture_udp(&key, UdpProbe::Quic(Version::V1), true);
+        let _ = engine
+            .cache
+            .fixture_udp(&key, UdpProbe::Quic(Version::V1), true);
         assert_eq!(
             engine.cached_udp(&key, UdpProbe::Quic(Version::V1)),
             Some(true)
         );
         assert_eq!(engine.cached_udp(&key, UdpProbe::Quic(Version::V2)), None);
         assert_eq!(engine.cached_udp(&key, UdpProbe::Stun), None);
-        let _ = engine.cache.fixture_udp(&key, UdpProbe::Quic(Version::V2), false);
+        let _ = engine
+            .cache
+            .fixture_udp(&key, UdpProbe::Quic(Version::V2), false);
         assert_eq!(
             engine.cached_udp(&key, UdpProbe::Quic(Version::V2)),
             Some(false)
@@ -1068,20 +1525,43 @@ mod tests {
     async fn product_quic_requires_active_probe_not_reachability_cache() {
         let engine = Arc::new(Engine::default());
         let policy = [1; 32];
-        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(policy)));
+        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(
+            policy,
+        )));
         engine.set_enabled(true);
         let public: IpAddr = "8.8.8.8".parse().unwrap();
-        for version in [crate::quic_core::wire::Version::V1, crate::quic_core::wire::Version::V2] {
+        for version in [
+            crate::quic_core::wire::Version::V1,
+            crate::quic_core::wire::Version::V2,
+        ] {
             // The product path must exit before any local target network I/O
             // while native active first-flight generation is unavailable.
-            assert!(matches!(engine.open_proxy_udp_checked(
-                "example.org", 443, &[public], policy, UdpStrategy::Quic(version)
-            ).await, Ok(None)));
+            assert!(matches!(
+                engine
+                    .open_proxy_udp_checked(
+                        "example.org",
+                        443,
+                        &[public],
+                        policy,
+                        UdpStrategy::Quic(version)
+                    )
+                    .await,
+                Ok(None)
+            ));
         }
         let private: IpAddr = "127.0.0.1".parse().unwrap();
-        assert!(matches!(engine.open_proxy_udp_checked("localhost", 443, &[private], policy,
-            UdpStrategy::Quic(crate::quic_core::wire::Version::V1)).await,
-            Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied))));
+        assert!(matches!(
+            engine
+                .open_proxy_udp_checked(
+                    "localhost",
+                    443,
+                    &[private],
+                    policy,
+                    UdpStrategy::Quic(crate::quic_core::wire::Version::V1)
+                )
+                .await,
+            Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied))
+        ));
     }
 
     #[tokio::test]
@@ -1155,15 +1635,22 @@ mod tests {
             key: key.clone(),
         };
         assert!(!verified.admissible().unwrap());
-        verified.lease = engine.remember_udp(key.clone(), UdpProbe::Stun, true).unwrap();
+        verified.lease = engine
+            .remember_udp(key.clone(), UdpProbe::Stun, true)
+            .unwrap();
         assert!(verified.admissible().unwrap());
         engine.set_stun_enabled(false);
         assert!(!verified.admissible().unwrap());
         engine.set_stun_enabled(true);
         let old = verified.lease.clone();
-        verified.lease = engine.remember_udp(key.clone(), UdpProbe::Stun, true).unwrap();
+        verified.lease = engine
+            .remember_udp(key.clone(), UdpProbe::Stun, true)
+            .unwrap();
         engine.fail_udp(&key, UdpProbe::Stun, &old);
-        assert!(verified.admissible().unwrap(), "late failure must not invalidate fresh UDP evidence");
+        assert!(
+            verified.admissible().unwrap(),
+            "late failure must not invalidate fresh UDP evidence"
+        );
         verified.failed();
         assert_eq!(engine.cached_udp(&key, UdpProbe::Stun), Some(false));
         assert!(!verified.admissible().unwrap());
@@ -1201,14 +1688,27 @@ mod tests {
         )));
         engine.set_enabled(true);
         engine.set_stun_enabled(true);
-        assert!(matches!(engine.open_checked("localhost", 443, &["127.0.0.1".parse().unwrap()], policy).await,
-            Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied))));
+        assert!(matches!(
+            engine
+                .open_checked("localhost", 443, &["127.0.0.1".parse().unwrap()], policy)
+                .await,
+            Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied))
+        ));
         let public: IpAddr = "8.8.8.8".parse().unwrap();
         let local: IpAddr = "127.0.0.1".parse().unwrap();
         let v2 = UdpStrategy::Quic(crate::quic_core::wire::Version::V2);
-        assert!(matches!(engine.open_udp_checked("example.org", 443, &[local], policy, v2).await,
-            Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied))));
-        assert!(matches!(engine.open_udp_checked("example.org", 80, &[public], policy, v2).await, Ok(None)));
+        assert!(matches!(
+            engine
+                .open_udp_checked("example.org", 443, &[local], policy, v2)
+                .await,
+            Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied))
+        ));
+        assert!(matches!(
+            engine
+                .open_udp_checked("example.org", 80, &[public], policy, v2)
+                .await,
+            Ok(None)
+        ));
         assert!(!UdpStrategy::StunBinding(udp::BindingStrategy::Plain).accepted_for_proxy());
         for (name, ips) in [
             ("invalid/name", vec![public]),
@@ -1239,8 +1739,12 @@ mod tests {
             .await
             .is_none());
         engine.retire();
-        assert!(matches!(engine.open_udp_checked("example.org", 443, &[public], policy, v2).await,
-            Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied))));
+        assert!(matches!(
+            engine
+                .open_udp_checked("example.org", 443, &[public], policy, v2)
+                .await,
+            Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied))
+        ));
         assert!(engine
             .open_stun_udp("example.org", 3478, &[public], policy)
             .await
@@ -1369,10 +1873,16 @@ mod tests {
     /// deliberately narrow synthetic record filter. This exercises the
     /// actual Rust probe AND actual proxy relay, not the transform helper
     /// in isolation. No real network or public-IP exception is required.
-    #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
+    #[cfg(any(
+        target_os = "linux",
+        all(target_os = "windows", target_arch = "x86_64")
+    ))]
     #[tokio::test]
     async fn independent_openssl_record_filter_and_application_exchange() {
-        use std::{io::{BufRead, BufReader}, process::{Child, Command, Stdio}};
+        use std::{
+            io::{BufRead, BufReader},
+            process::{Child, Command, Stdio},
+        };
         use tokio::io::AsyncReadExt;
         const PING: &[u8] = b"theia-dpi-ping";
         const PONG: &[u8] = b"theia-dpi-pong";
@@ -1385,7 +1895,9 @@ mod tests {
         }
         struct FixtureDir(std::path::PathBuf);
         impl Drop for FixtureDir {
-            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
         }
         use ring::rand::{SecureRandom, SystemRandom};
         let mut random = [0; 16];
@@ -1403,17 +1915,33 @@ mod tests {
         let config = tls::tls_config(roots).unwrap();
         let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../scripts/anti-dpi-tls-peer.py");
-        let python = std::env::var_os("THEIA_DPI_PYTHON").unwrap_or_else(||
-            if cfg!(windows) { "python".into() } else { "python3".into() });
-        let mut peer = ChildGuard(Command::new(python).arg(script)
-            .arg("--cert").arg(&cert_path).arg("--key").arg(&key_path)
-            .stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn().unwrap());
+        let python = std::env::var_os("THEIA_DPI_PYTHON").unwrap_or_else(|| {
+            if cfg!(windows) {
+                "python".into()
+            } else {
+                "python3".into()
+            }
+        });
+        let mut peer = ChildGuard(
+            Command::new(python)
+                .arg(script)
+                .arg("--cert")
+                .arg(&cert_path)
+                .arg("--key")
+                .arg(&key_path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
         let stdout = peer.0.stdout.take().unwrap();
         let (events, incoming) = std::sync::mpsc::channel();
         let reader = std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
-                if events.send(line).is_err() { break; }
+                if events.send(line).is_err() {
+                    break;
+                }
             }
         });
         let ready = incoming.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -1421,10 +1949,13 @@ mod tests {
         let address: SocketAddr = ([127, 0, 0, 1], port).into();
 
         async fn application(
-            socket: TcpStream, config: Arc<rustls::ClientConfig>,
+            socket: TcpStream,
+            config: Arc<rustls::ClientConfig>,
         ) -> std::io::Result<()> {
             let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-            let mut tls = tokio_rustls::TlsConnector::from(config).connect(name, socket).await?;
+            let mut tls = tokio_rustls::TlsConnector::from(config)
+                .connect(name, socket)
+                .await?;
             tls.write_all(PING).await?;
             let mut reply = [0; PONG.len()];
             tls.read_exact(&mut reply).await?;
@@ -1438,34 +1969,70 @@ mod tests {
 
         // Ordinary TLS reaches the peer without the filter, and the same
         // ordinary TLS fails once the synthetic filter is enabled.
-        timeout(Duration::from_secs(10), application(TcpStream::connect(address).await.unwrap(), config.clone()))
-            .await.unwrap().unwrap();
-        let blocked = timeout(Duration::from_secs(10), application(TcpStream::connect(address).await.unwrap(), config.clone()))
-            .await.unwrap();
+        timeout(
+            Duration::from_secs(10),
+            application(TcpStream::connect(address).await.unwrap(), config.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let blocked = timeout(
+            Duration::from_secs(10),
+            application(TcpStream::connect(address).await.unwrap(), config.clone()),
+        )
+        .await
+        .unwrap();
         assert!(blocked.is_err(), "unmodified control must fail");
 
         for strategy in Strategy::ALL {
-            let verdict = tls::probe_guarded("localhost", address, None, strategy, config.clone(),
-                ATTEMPT, || true).await;
+            let verdict = tls::probe_guarded(
+                "localhost",
+                address,
+                None,
+                strategy,
+                config.clone(),
+                ATTEMPT,
+                || true,
+            )
+            .await;
             assert_eq!(verdict, tls::ProbeVerdict::Verified);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let (app, accepted) = tokio::join!(TcpStream::connect(listener.local_addr().unwrap()), listener.accept());
+            let (app, accepted) = tokio::join!(
+                TcpStream::connect(listener.local_addr().unwrap()),
+                listener.accept()
+            );
             let app = app.unwrap();
             let local = accepted.unwrap().0;
             let target = TcpStream::connect(address).await.unwrap();
             let mut tunnel = Tunnel::fixture(target, "localhost");
             tunnel.strategy = strategy;
-            tunnel.key.network = (0..16).find_map(|_| network_scope::observe(address)).unwrap();
+            tunnel.key.network = (0..16)
+                .find_map(|_| network_scope::observe(address))
+                .unwrap();
             tunnel.engine.set_enabled(true);
-            tunnel.lease = tunnel.engine.cache.remember(&tunnel.key, Verdict::Verified(strategy)).unwrap();
-            let flow = super::super::flow::FlowTable::shared().begin(
-                tunnel.engine.policy.clone(), super::super::flow::Protocol::Tcp,
-                crate::protocol::Address::Dns("localhost".into()), port, tunnel.key.policy,
-                super::super::PacketAction::Modify,
-            ).unwrap();
+            tunnel.lease = tunnel
+                .engine
+                .cache
+                .remember(&tunnel.key, Verdict::Verified(strategy))
+                .unwrap();
+            let flow = super::super::flow::FlowTable::shared()
+                .begin(
+                    tunnel.engine.policy.clone(),
+                    super::super::flow::Protocol::Tcp,
+                    crate::protocol::Address::Dns("localhost".into()),
+                    port,
+                    tunnel.key.policy,
+                    super::super::PacketAction::Modify,
+                )
+                .unwrap();
             let (relay, application_result) = timeout(Duration::from_secs(10), async {
-                tokio::join!(tunnel.relay_guarded(local, Some(&flow)), application(app, config.clone()))
-            }).await.unwrap();
+                tokio::join!(
+                    tunnel.relay_guarded(local, Some(&flow)),
+                    application(app, config.clone())
+                )
+            })
+            .await
+            .unwrap();
             assert!(matches!(relay, Ok(RelayOutcome::Finished)));
             application_result.unwrap();
             assert!(flow.committed(super::super::PacketAction::Modify));
@@ -1491,5 +2058,4 @@ mod tests {
         assert!(peer.0.wait().unwrap().success());
         reader.join().unwrap();
     }
-
 }

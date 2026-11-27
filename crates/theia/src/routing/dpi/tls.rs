@@ -265,9 +265,7 @@ pub(super) fn tls_config(roots: rustls::RootCertStore) -> Option<Arc<rustls::Cli
 pub(super) fn native_config() -> Option<Arc<rustls::ClientConfig>> {
     static CONFIG: OnceLock<Option<Arc<rustls::ClientConfig>>> = OnceLock::new();
     CONFIG
-        .get_or_init(|| {
-            tls_config(crate::net::tls::native_roots())
-        })
+        .get_or_init(|| tls_config(crate::net::tls::native_roots()))
         .clone()
 }
 
@@ -283,8 +281,18 @@ pub(super) async fn probe(
     strategy: Strategy,
     config: Arc<rustls::ClientConfig>,
 ) -> Option<()> {
-    (probe_guarded(name, address, scope, strategy, config, std::time::Duration::from_secs(2), || true).await
-        == ProbeVerdict::Verified).then_some(())
+    (probe_guarded(
+        name,
+        address,
+        scope,
+        strategy,
+        config,
+        std::time::Duration::from_secs(2),
+        || true,
+    )
+    .await
+        == ProbeVerdict::Verified)
+        .then_some(())
 }
 
 #[cfg(test)]
@@ -298,7 +306,10 @@ pub(super) async fn probe_guarded(
     live: impl Fn() -> bool,
 ) -> ProbeVerdict {
     let mut rtt = None;
-    probe_measured(name, address, scope, strategy, config, budget, live, &mut rtt).await
+    probe_measured(
+        name, address, scope, strategy, config, budget, live, &mut rtt,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -312,11 +323,17 @@ pub(super) async fn probe_measured(
     live: impl Fn() -> bool,
     rtt: &mut Option<std::time::Duration>,
 ) -> ProbeVerdict {
-    use ProbeVerdict::*;
     use tokio::time::{timeout_at, Instant};
-    if !live() { return Denied; }
-    let Ok(server_name) = rustls::pki_types::ServerName::try_from(name.to_owned()) else { return Denied };
-    let Ok(mut tls) = rustls::ClientConnection::new(config, server_name) else { return Unavailable };
+    use ProbeVerdict::*;
+    if !live() {
+        return Denied;
+    }
+    let Ok(server_name) = rustls::pki_types::ServerName::try_from(name.to_owned()) else {
+        return Denied;
+    };
+    let Ok(mut tls) = rustls::ClientConnection::new(config, server_name) else {
+        return Unavailable;
+    };
     let deadline = Instant::now() + budget;
     *rtt = None;
     let connected_at = std::time::Instant::now();
@@ -325,9 +342,13 @@ pub(super) async fn probe_measured(
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => return Denied,
         _ => return if live() { Unavailable } else { Denied },
     };
-    if !live() || scope.is_some_and(|scope| {
-        !socket.local_addr().is_ok_and(|local| scope.matches_local(local))
-    }) {
+    if !live()
+        || scope.is_some_and(|scope| {
+            !socket
+                .local_addr()
+                .is_ok_and(|local| scope.matches_local(local))
+        })
+    {
         return Denied;
     }
     // TCP connect duration is a portable SYN round-trip estimate, not
@@ -340,16 +361,24 @@ pub(super) async fn probe_measured(
         loop {
             while tls.wants_write() {
                 let mut output = Vec::new();
-                if !matches!(tls.write_tls(&mut output), Ok(n) if n != 0) { return Unavailable; }
+                if !matches!(tls.write_tls(&mut output), Ok(n) if n != 0) {
+                    return Unavailable;
+                }
                 if first {
-                    let Some(transformed) = transform(&output, name, strategy) else { return Unavailable };
-                    if transformed == output { return Unavailable; }
+                    let Some(transformed) = transform(&output, name, strategy) else {
+                        return Unavailable;
+                    };
+                    if transformed == output {
+                        return Unavailable;
+                    }
                     output = transformed;
                     first = false;
                 }
                 let mut pending = output.as_slice();
                 while !pending.is_empty() {
-                    if !live() { return Denied; }
+                    if !live() {
+                        return Denied;
+                    }
                     attempted = true;
                     match socket.write(pending).await {
                         Ok(n) if n > 0 => pending = &pending[n..],
@@ -358,16 +387,26 @@ pub(super) async fn probe_measured(
                 }
             }
             if !tls.is_handshaking() {
-                return if !live() { Denied } else if attempted { Verified } else { Unavailable };
+                return if !live() {
+                    Denied
+                } else if attempted {
+                    Verified
+                } else {
+                    Unavailable
+                };
             }
-            if !tls.wants_read() { return StrategyFailed; }
+            if !tls.wants_read() {
+                return StrategyFailed;
+            }
             let count = match socket.read(&mut input).await {
                 Ok(n) if n > 0 => n,
                 _ => return StrategyFailed,
             };
             let mut bytes = &input[..count];
             while !bytes.is_empty() {
-                if !matches!(tls.read_tls(&mut bytes), Ok(n) if n != 0) { return StrategyFailed; }
+                if !matches!(tls.read_tls(&mut bytes), Ok(n) if n != 0) {
+                    return StrategyFailed;
+                }
                 if let Err(error) = tls.process_new_packets() {
                     return match error {
                         rustls::Error::InvalidCertificate(_)
@@ -380,8 +419,11 @@ pub(super) async fn probe_measured(
                 }
             }
         }
-    }).await;
-    if !live() { return Denied; }
+    })
+    .await;
+    if !live() {
+        return Denied;
+    }
     match result {
         Ok(value) => value,
         Err(_) if attempted => StrategyFailed,

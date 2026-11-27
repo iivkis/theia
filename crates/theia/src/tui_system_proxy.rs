@@ -75,7 +75,10 @@ impl Worker {
     fn view(&self) -> View {
         let observed = native::observed_proxy();
         let known = observed.is_ok();
-        let applied = self.session.as_ref().is_some_and(SystemProxySession::applied)
+        let applied = self
+            .session
+            .as_ref()
+            .is_some_and(SystemProxySession::applied)
             && matches!(
                 &observed,
                 Ok(ObservedProxy::Journal(ProxyStatus::PendingOwned))
@@ -108,7 +111,10 @@ impl Worker {
             Err(error) => format!("Неизвестно: {error}"),
         };
         View {
-            running: self.session.as_ref().is_some_and(SystemProxySession::running),
+            running: self
+                .session
+                .as_ref()
+                .is_some_and(SystemProxySession::running),
             owned: self.session.is_some(),
             applied,
             recovery,
@@ -123,13 +129,18 @@ impl Worker {
             Action::Enable if self.session.is_none() => {
                 let bytes = saved_client_bytes(&self.path, self.digest)
                     .map_err(|error| error.to_string())?;
-                let source = std::str::from_utf8(&bytes).map_err(|_| "Некорректный файл клиента.")?;
+                let source =
+                    std::str::from_utf8(&bytes).map_err(|_| "Некорректный файл клиента.")?;
                 let crate::config::Config::Client(document) =
                     crate::config::parse(source).map_err(|_| "Некорректные настройки клиента.")?
                 else {
                     return Err("Требуется клиентский профиль.".into());
                 };
-                let address: SocketAddr = document.client.proxy.http_listen.parse()
+                let address: SocketAddr = document
+                    .client
+                    .proxy
+                    .http_listen
+                    .parse()
                     .map_err(|_| "Некорректный адрес локального HTTP-прокси.")?;
                 let review = native::review_apply(address).map_err(|error| error.to_string())?;
                 let message = format!(
@@ -142,9 +153,10 @@ impl Worker {
                 let review = native::review_recovery().map_err(|error| error.to_string())?;
                 (Pending::Recover(review), "Восстановить проверенный журнал? Чужие изменения и активный владелец блокируют операцию.".into())
             }
-            Action::Stop if self.session.is_some() => {
-                (Pending::Stop, "Отключиться? Остановить локальный клиент и условно восстановить WinINet.".into())
-            }
+            Action::Stop if self.session.is_some() => (
+                Pending::Stop,
+                "Отключиться? Остановить локальный клиент и условно восстановить WinINet.".into(),
+            ),
             _ => return Err("Действие недоступно в текущем состоянии.".into()),
         };
         self.pending = Some(pending);
@@ -156,8 +168,13 @@ impl Worker {
         match pending {
             Pending::Enable(review) => {
                 self.unchanged()?;
-                let session = Box::pin(SystemProxySession::connect(&self.path, self.digest, Some(review)))
-                    .await.map_err(|error| error.to_string())?;
+                let session = Box::pin(SystemProxySession::connect(
+                    &self.path,
+                    self.digest,
+                    Some(review),
+                ))
+                .await
+                .map_err(|error| error.to_string())?;
                 self.session = Some(session);
                 Ok("Системный прокси включён. Удалённый туннель проверяется отдельно.".into())
             }
@@ -175,7 +192,10 @@ impl Worker {
     async fn stop(&mut self) -> Result<(), String> {
         self.pending = None;
         if let Some(mut session) = self.session.take() {
-            session.disconnect().await.map_err(|error| error.to_string())?;
+            session
+                .disconnect()
+                .await
+                .map_err(|error| error.to_string())?;
         }
         Ok(())
     }
@@ -206,7 +226,9 @@ impl Worker {
     }
 }
 
-async fn local_ended(session: &mut Option<SystemProxySession>) -> Result<(), crate::client::ClientError> {
+async fn local_ended(
+    session: &mut Option<SystemProxySession>,
+) -> Result<(), crate::client::ClientError> {
     match session {
         Some(session) => session.ended().await,
         None => std::future::pending().await,
@@ -680,7 +702,8 @@ pub(crate) mod tests {
         // A real SID-protected IPC request must bind to the exact instance.
         use crate::management::{ManagementError, StatusCommand as C, StatusReply as R};
         use std::io::{Read, Write};
-        let query = |command| runtime.block_on(crate::windows_control::query_client_pipe(&pipe, command));
+        let query =
+            |command| runtime.block_on(crate::windows_control::query_client_pipe(&pipe, command));
         action(&mut panel, 'e');
         assert!(panel.view.owned);
         let R::ClientLifecycle(first_instance) = query(C::ClientLifecycle).unwrap() else {
@@ -694,11 +717,14 @@ pub(crate) mod tests {
             config_sha256: first_instance.config_sha256,
             instance: first_instance.instance,
         };
-        assert_eq!(query(C::ClientDisconnect {
-            expected_revision: first_instance.revision,
-            config_sha256: first_instance.config_sha256,
-            instance: [0; 32],
-        }), Err(ManagementError::CandidateRejected));
+        assert_eq!(
+            query(C::ClientDisconnect {
+                expected_revision: first_instance.revision,
+                config_sha256: first_instance.config_sha256,
+                instance: [0; 32],
+            }),
+            Err(ManagementError::CandidateRejected)
+        );
         assert_eq!(native::status().unwrap(), ProxyStatus::PendingOwned);
 
         // Real active TCP CONNECT and UDP ASSOCIATE control socket, both
@@ -713,12 +739,15 @@ pub(crate) mod tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut bytes = [0; 4];
             while stream.read_exact(&mut bytes).await.is_ok() {
-                if stream.write_all(&bytes).await.is_err() { break; }
+                if stream.write_all(&bytes).await.is_err() {
+                    break;
+                }
             }
         });
         let mut tcp = TcpStream::connect_timeout(&http, Duration::from_secs(2)).unwrap();
         tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        tcp.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes()).unwrap();
+        tcp.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
+            .unwrap();
         let mut response = Vec::new();
         while !response.ends_with(b"\r\n\r\n") && response.len() < 1024 {
             let mut byte = [0; 1];
@@ -732,17 +761,26 @@ pub(crate) mod tests {
         assert_eq!(&echoed, b"ping");
 
         let mut udp_control = TcpStream::connect_timeout(&socks, Duration::from_secs(2)).unwrap();
-        udp_control.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        udp_control
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         udp_control.write_all(&[5, 1, 0]).unwrap();
         let mut selection = [0; 2];
         udp_control.read_exact(&mut selection).unwrap();
         assert_eq!(selection, [5, 0]);
-        udp_control.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+        udp_control
+            .write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+            .unwrap();
         let mut association = [0; 10];
         udp_control.read_exact(&mut association).unwrap();
         assert_eq!(&association[..4], &[5, 0, 0, 1]);
         let relay = std::net::SocketAddr::from((
-            [association[4], association[5], association[6], association[7]],
+            [
+                association[4],
+                association[5],
+                association[6],
+                association[7],
+            ],
             u16::from_be_bytes([association[8], association[9]]),
         ));
         assert!(relay.ip().is_loopback());
@@ -754,11 +792,15 @@ pub(crate) mod tests {
             let socket = tokio::net::UdpSocket::from_std(udp_origin).unwrap();
             let mut buf = [0; 256];
             while let Ok((n, from)) = socket.recv_from(&mut buf).await {
-                if socket.send_to(&buf[..n], from).await.is_err() { break; }
+                if socket.send_to(&buf[..n], from).await.is_err() {
+                    break;
+                }
             }
         });
         let app_udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        app_udp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        app_udp
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let mut packet = vec![0, 0, 0, 1, 127, 0, 0, 1];
         packet.extend_from_slice(&origin_port.to_be_bytes());
         packet.extend_from_slice(b"udp-live");
@@ -768,9 +810,13 @@ pub(crate) mod tests {
         assert_eq!(source, relay);
         assert_eq!(&datagram[..received], packet.as_slice());
 
-        assert_eq!(query(disconnect), Ok(R::ClientDisconnectAccepted {
-            revision: first_instance.revision, instance: first_instance.instance
-        }));
+        assert_eq!(
+            query(disconnect),
+            Ok(R::ClientDisconnectAccepted {
+                revision: first_instance.revision,
+                instance: first_instance.instance
+            })
+        );
         let deadline = Instant::now() + Duration::from_secs(10);
         while panel.view.running || panel.view.owned {
             assert!(Instant::now() < deadline, "IPC disconnect did not finish");
@@ -781,12 +827,20 @@ pub(crate) mod tests {
         for stream in [&mut tcp, &mut udp_control] {
             let mut byte = [0; 1];
             match stream.read(&mut byte) {
-                Ok(0) => {},
-                Err(error) if matches!(error.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::BrokenPipe) => {},
+                Ok(0) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::BrokenPipe
+                    ) => {}
                 result => panic!("session still live after disconnect: {result:?}"),
             }
         }
-        app_udp.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+        app_udp
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
         let _ = app_udp.send_to(&packet, relay);
         assert!(app_udp.recv_from(&mut datagram).is_err());
         echo_task.abort();

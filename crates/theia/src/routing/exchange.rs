@@ -13,7 +13,7 @@ use std::{
 
 pub(crate) const DOMAIN_HEADER: &str = "theia-routing-domain";
 pub(crate) const DIGEST_HEADER: &str = "theia-routing-digest";
-pub(crate) const NATIVE_DNS_HEADER:&str="theia-native-dns";
+pub(crate) const NATIVE_DNS_HEADER: &str = "theia-native-dns";
 pub(crate) const DNS_LIMIT: usize = 1 + 64 * 17;
 // Exact-digest receipt for an authenticated conditional refresh.
 const UNCHANGED_MAGIC: &[u8; 8] = b"THEIANC1";
@@ -145,9 +145,12 @@ pub(crate) async fn response_data(
     use http::StatusCode;
     let domain_count = headers.get_all(DOMAIN_HEADER).iter().count();
     let digest_count = headers.get_all(DIGEST_HEADER).iter().count();
-    let native_count=headers.get_all(NATIVE_DNS_HEADER).iter().count();
-    let native=native_count==1 && headers.get(NATIVE_DNS_HEADER).is_some_and(|v|v.as_bytes()==b"1");
-    if native_count!=0 && (!native || domain_count!=1 || digest_count!=1) {
+    let native_count = headers.get_all(NATIVE_DNS_HEADER).iter().count();
+    let native = native_count == 1
+        && headers
+            .get(NATIVE_DNS_HEADER)
+            .is_some_and(|v| v.as_bytes() == b"1");
+    if native_count != 0 && (!native || domain_count != 1 || digest_count != 1) {
         return Err(StatusCode::BAD_REQUEST);
     }
     if domain_count == 0 {
@@ -186,9 +189,18 @@ pub(crate) async fn response_data(
     // An explicitly selected direct_dpi route may request authenticated
     // DNS pins even when its domain decision is already conclusive.
     if native {
-        if publication.snapshot.policy().classify_with_application(
-            super::Evidence::Known(domain.as_str()),super::Evidence::Unknown,super::Evidence::Unknown)
-            .map_err(|_|StatusCode::BAD_REQUEST)?.action()==Some(super::Action::Blocked) {
+        if publication
+            .snapshot
+            .policy()
+            .classify_with_application(
+                super::Evidence::Known(domain.as_str()),
+                super::Evidence::Unknown,
+                super::Evidence::Unknown,
+            )
+            .map_err(|_| StatusCode::BAD_REQUEST)?
+            .action()
+            == Some(super::Action::Blocked)
+        {
             return Err(StatusCode::FORBIDDEN);
         }
     } else if matches!(
@@ -221,15 +233,23 @@ pub(crate) async fn response_data(
     ips.sort_unstable();
     ips.dedup();
     if native {
-        let mut selected=None;
+        let mut selected = None;
         for ip in &ips {
-            let action=publication.snapshot.policy().classify_with_application(
-                super::Evidence::Known(domain.as_str()),super::Evidence::Known(*ip),super::Evidence::Unknown)
-                .map_err(|_|StatusCode::BAD_REQUEST)?.action().ok_or(StatusCode::FORBIDDEN)?;
-            if action==super::Action::Blocked || selected.is_some_and(|old|old!=action) {
+            let action = publication
+                .snapshot
+                .policy()
+                .classify_with_application(
+                    super::Evidence::Known(domain.as_str()),
+                    super::Evidence::Known(*ip),
+                    super::Evidence::Unknown,
+                )
+                .map_err(|_| StatusCode::BAD_REQUEST)?
+                .action()
+                .ok_or(StatusCode::FORBIDDEN)?;
+            if action == super::Action::Blocked || selected.is_some_and(|old| old != action) {
                 return Err(StatusCode::FORBIDDEN);
             }
-            selected=Some(action);
+            selected = Some(action);
         }
     }
     encode_ips(&ips)
@@ -389,24 +409,59 @@ mod tests {
 
     #[tokio::test]
     async fn native_dns_has_explicit_mode_and_preserves_acl_and_policy() {
-        use crate::routing::{Action,Rule};
-        let deadline=Duration::from_secs(2);
-        let mut request=http::Request::new(());
-        request.headers_mut().insert(NATIVE_DNS_HEADER,http::HeaderValue::from_static("1"));
-        for action in [Action::Direct,Action::Blocked] {
-            let (snapshot,wire)=snapshot::Snapshot::build("scope",2,&[Rule{
-                name:"native dns".into(),action,domains:vec!["full:localhost".into()],
-                ips:vec![],applications:vec![],
-            }],&[],&[]).unwrap();
-            let published=Published{snapshot,wire:wire.into()};
-            request_domain(&mut request,"localhost",published.snapshot.digest()).unwrap();
-            assert_eq!(response_data(&published,request.headers(),false,deadline).await.unwrap_err(),http::StatusCode::FORBIDDEN);
-            let result=response_data(&published,request.headers(),true,deadline).await;
-            if action==Action::Blocked {assert_eq!(result.unwrap_err(),http::StatusCode::FORBIDDEN);}
-            else {assert!(decode_ips(&result.unwrap()).unwrap().iter().all(IpAddr::is_loopback));}
-            request.headers_mut().append(NATIVE_DNS_HEADER,http::HeaderValue::from_static("1"));
-            assert_eq!(response_data(&published,request.headers(),true,deadline).await.unwrap_err(),http::StatusCode::BAD_REQUEST);
-            request.headers_mut().insert(NATIVE_DNS_HEADER,http::HeaderValue::from_static("1"));
+        use crate::routing::{Action, Rule};
+        let deadline = Duration::from_secs(2);
+        let mut request = http::Request::new(());
+        request
+            .headers_mut()
+            .insert(NATIVE_DNS_HEADER, http::HeaderValue::from_static("1"));
+        for action in [Action::Direct, Action::Blocked] {
+            let (snapshot, wire) = snapshot::Snapshot::build(
+                "scope",
+                2,
+                &[Rule {
+                    name: "native dns".into(),
+                    action,
+                    domains: vec!["full:localhost".into()],
+                    ips: vec![],
+                    applications: vec![],
+                }],
+                &[],
+                &[],
+            )
+            .unwrap();
+            let published = Published {
+                snapshot,
+                wire: wire.into(),
+            };
+            request_domain(&mut request, "localhost", published.snapshot.digest()).unwrap();
+            assert_eq!(
+                response_data(&published, request.headers(), false, deadline)
+                    .await
+                    .unwrap_err(),
+                http::StatusCode::FORBIDDEN
+            );
+            let result = response_data(&published, request.headers(), true, deadline).await;
+            if action == Action::Blocked {
+                assert_eq!(result.unwrap_err(), http::StatusCode::FORBIDDEN);
+            } else {
+                assert!(decode_ips(&result.unwrap())
+                    .unwrap()
+                    .iter()
+                    .all(IpAddr::is_loopback));
+            }
+            request
+                .headers_mut()
+                .append(NATIVE_DNS_HEADER, http::HeaderValue::from_static("1"));
+            assert_eq!(
+                response_data(&published, request.headers(), true, deadline)
+                    .await
+                    .unwrap_err(),
+                http::StatusCode::BAD_REQUEST
+            );
+            request
+                .headers_mut()
+                .insert(NATIVE_DNS_HEADER, http::HeaderValue::from_static("1"));
         }
     }
 

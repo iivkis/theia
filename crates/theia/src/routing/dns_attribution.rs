@@ -125,8 +125,10 @@ impl DnsCandidates {
             entry.deadline = entry.deadline.min(observation_deadline);
             return Ok(!entry.ambiguous);
         }
-        if self.entries.len() >= MAX_ENTRIES || self.used_requests.len() >= MAX_ENTRIES
-            || !self.used_requests.insert(link.request_id) {
+        if self.entries.len() >= MAX_ENTRIES
+            || self.used_requests.len() >= MAX_ENTRIES
+            || !self.used_requests.insert(link.request_id)
+        {
             return Ok(false);
         }
         self.entries.insert(
@@ -227,12 +229,12 @@ mod tests {
         link.domain = "example.org".into();
         link.request_id = [3; 16];
         assert!(!table.record(flow, &link, [1; 32], &ips, deadline).unwrap());
-        let mut other=flow;
+        let mut other = flow;
         other.key.source.set_port(1235);
-        other.cookie=9;
-        link.key=other.key;
-        link.cookie=other.cookie;
-        assert!(!table.record(other,&link,[1;32],&ips,deadline).unwrap());
+        other.cookie = 9;
+        link.key = other.key;
+        link.cookie = other.cookie;
+        assert!(!table.record(other, &link, [1; 32], &ips, deadline).unwrap());
     }
 
     #[test]
@@ -265,7 +267,9 @@ mod tests {
         let mut copied = link.clone();
         copied.key = other.key;
         copied.cookie = other.cookie;
-        assert!(!table.record(other, &copied, [1; 32], &ips, deadline).unwrap());
+        assert!(!table
+            .record(other, &copied, [1; 32], &ips, deadline)
+            .unwrap());
         assert!(table.candidate(flow, [1; 32]).is_none());
         assert!(table.candidate(other, [1; 32]).is_none());
         let mut table = DnsCandidates::default();

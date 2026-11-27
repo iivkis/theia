@@ -657,7 +657,10 @@ fn recommended_step(editor: &Editor, owned_running: bool) -> (char, &'static str
             "Получите приглашение у администратора и импортируйте его.",
         )
     } else if owned_running {
-        (if cfg!(windows) { 'p' } else { 'V' }, "Клиент запущен или запускается. Откройте его состояние для проверки туннеля.")
+        (
+            if cfg!(windows) { 'p' } else { 'V' },
+            "Клиент запущен или запускается. Откройте его состояние для проверки туннеля.",
+        )
     } else if !editor.selected_record_is_active() {
         (
             'A',
@@ -1504,8 +1507,10 @@ impl Interaction {
 
     fn owned_running(&self, role: Role) -> bool {
         #[cfg(windows)]
-        if role == Role::Client && (self.system_proxy.as_ref().is_some_and(|p| p.running())
-            || self.proxy_background.as_ref().is_some_and(|p| p.running())) {
+        if role == Role::Client
+            && (self.system_proxy.as_ref().is_some_and(|p| p.running())
+                || self.proxy_background.as_ref().is_some_and(|p| p.running()))
+        {
             return true;
         }
         if role == Role::Server {
@@ -1834,7 +1839,9 @@ impl Interaction {
             background.poll();
         }
         #[cfg(windows)]
-        if let Some(background) = self.proxy_background.as_mut() { background.poll(); }
+        if let Some(background) = self.proxy_background.as_mut() {
+            background.poll();
+        }
         if let Some(dialog) = self.config_dialog.as_mut() {
             if let Some(editor) = dialog.poll() {
                 if dialog.imported() {
@@ -2995,7 +3002,9 @@ impl Interaction {
                     && key.modifiers.contains(KeyModifiers::CONTROL));
             #[cfg(windows)]
             if self.proxy_background.as_ref().is_some_and(|p| p.running())
-                && (exiting || (role == Some(Role::Client) && matches!(key.code, KeyCode::Char('p' | 'V')))) {
+                && (exiting
+                    || (role == Some(Role::Client) && matches!(key.code, KeyCode::Char('p' | 'V'))))
+            {
                 self.system_proxy = self.proxy_background.take();
                 self.modal_action = 0;
                 return false;
@@ -6810,14 +6819,33 @@ fn client_mode_lines(editor: &Editor, running: bool) -> Vec<Line<'static>> {
         ),
         Line::raw(format!("Активный профиль: {active}")),
         Line::raw(if editor.selected_record_is_active() {
-            format!("Защита: {}", if editor.selected_reality() { "REALITY" } else { "Own-TLS" })
+            format!(
+                "Защита: {}",
+                if editor.selected_reality() {
+                    "REALITY"
+                } else {
+                    "Own-TLS"
+                }
+            )
         } else {
-            format!("Выбран: {} · {}", editor.client_profile_label(editor.selected_record_id()).unwrap_or_else(|| "Нет профиля".into()), if editor.selected_reality() { "REALITY" } else { "Own-TLS" })
+            format!(
+                "Выбран: {} · {}",
+                editor
+                    .client_profile_label(editor.selected_record_id())
+                    .unwrap_or_else(|| "Нет профиля".into()),
+                if editor.selected_reality() {
+                    "REALITY"
+                } else {
+                    "Own-TLS"
+                }
+            )
         }),
         Line::raw(""),
         Line::styled(
             "Системный прокси",
-            Style::default().fg(if cfg!(windows) { TEXT } else { MUTED }).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(if cfg!(windows) { TEXT } else { MUTED })
+                .add_modifier(Modifier::BOLD),
         ),
         Line::raw(if cfg!(windows) {
             "Основной режим MVP. Для приложений, использующих прокси Windows. Подключение требует подтверждения."
@@ -8084,7 +8112,10 @@ mod tests {
                 assert_eq!(editor.selected_record_id(), "backup");
                 assert!(!editor.selected_record_is_active());
                 assert_eq!(recommended_step(editor, false).0, 'A');
-                assert_eq!(recommended_step(editor, true).0, if cfg!(windows) { 'p' } else { 'V' });
+                assert_eq!(
+                    recommended_step(editor, true).0,
+                    if cfg!(windows) { 'p' } else { 'V' }
+                );
                 let view = rendered_interaction(160, 42, &model, &ui);
                 assert!(view.contains("Активный профиль: №1 · edge.example.org:443"));
                 assert_eq!(ui.workspace_focus, WorkspaceFocus::Records);
@@ -8475,7 +8506,9 @@ mod tests {
         assert!(!ui.owned_running(Role::Client));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         // Saved ingress selection is not an OS mutation or activation.
-        let Config::Client(doc) = config::read_file(&path).unwrap() else { panic!("client") };
+        let Config::Client(doc) = config::read_file(&path).unwrap() else {
+            panic!("client")
+        };
         assert_eq!(doc.client.ingress_mode, config::IngressMode::SystemProxy);
         assert!(!ui.owned_running(Role::Client));
         std::fs::remove_dir_all(root).unwrap();

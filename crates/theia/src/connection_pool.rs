@@ -252,20 +252,29 @@ impl<C: Send + Sync + 'static> Pool<C> {
         create: impl Future<Output = Result<C, ClientError>>,
         still_current: impl Fn() -> bool,
     ) -> Result<(), ClientError> {
-        if route.is_none() || !still_current() { return Ok(()); }
+        if route.is_none() || !still_current() {
+            return Ok(());
+        }
         {
-            let Ok(entries) = self.entries.try_lock() else { return Ok(()) };
-            if entries.iter().any(|entry| entry.route == route
-                && !entry.retired.load(Ordering::Acquire) && Instant::now() < entry.deadline
-                && entry.bytes.load(Ordering::Acquire) < entry.byte_limit
-                && alive(&entry.connection)) {
+            let Ok(entries) = self.entries.try_lock() else {
+                return Ok(());
+            };
+            if entries.iter().any(|entry| {
+                entry.route == route
+                    && !entry.retired.load(Ordering::Acquire)
+                    && Instant::now() < entry.deadline
+                    && entry.bytes.load(Ordering::Acquire) < entry.byte_limit
+                    && alive(&entry.connection)
+            }) {
                 return Ok(());
             }
         }
         // Acquire must still enforce all ordinary bounds. Do not warm if
         // another dial is in progress or permits are already exhausted.
-        if self.dial.try_lock().is_err() || self.connections.available_permits() == 0
-            || self.profile.available_permits() == 0 {
+        if self.dial.try_lock().is_err()
+            || self.connections.available_permits() == 0
+            || self.profile.available_permits() == 0
+        {
             return Ok(());
         }
         let mut lease = self.acquire_inner(route, true, alive, create, true).await?;
@@ -286,7 +295,8 @@ impl<C: Send + Sync + 'static> Pool<C> {
         alive: impl Fn(&C) -> bool,
         create: impl Future<Output = Result<C, ClientError>>,
     ) -> Result<Lease<C>, ClientError> {
-        self.acquire_inner(route, reusable, alive, create, false).await
+        self.acquire_inner(route, reusable, alive, create, false)
+            .await
     }
 
     async fn acquire_inner(
@@ -307,14 +317,21 @@ impl<C: Send + Sync + 'static> Pool<C> {
         // cannot hold the entries lock or block reuse/retirement of a
         // different already verified connection.
         let _dial = if speculative {
-            self.dial.try_lock().map_err(|_| ClientError::Open(crate::protocol::ErrorCode::ResourceLimit))?
-        } else { self.dial.lock().await };
+            self.dial
+                .try_lock()
+                .map_err(|_| ClientError::Open(crate::protocol::ErrorCode::ResourceLimit))?
+        } else {
+            self.dial.lock().await
+        };
         let (permit, profile_permit) = {
             let mut entries = self.entries.lock().await;
             if let Some(lease) = Self::reuse(&mut entries, route, reusable, &alive) {
                 return Ok(lease);
             }
-            if !speculative && (self.connections.available_permits() == 0 || self.profile.available_permits() == 0) {
+            if !speculative
+                && (self.connections.available_permits() == 0
+                    || self.profile.available_permits() == 0)
+            {
                 if let Some(index) = entries
                     .iter()
                     .position(|entry| entry.active.load(Ordering::Acquire) == 0)
@@ -395,18 +412,39 @@ mod tests {
     async fn speculative_warm_retains_verified_connection_without_stream_admission() {
         let pool = Pool::default();
         let route = Some("127.0.0.1:0".parse().unwrap());
-        pool.warm(route, |_| true, async { Ok(7u32) }, || true).await.unwrap();
+        pool.warm(route, |_| true, async { Ok(7u32) }, || true)
+            .await
+            .unwrap();
         assert_eq!(pool.entries.lock().await.len(), 1);
-        assert_eq!(pool.entries.lock().await[0].active.load(Ordering::Acquire), 0);
-        pool.warm(route, |_| true, async { panic!("warm already has a verified carrier") }, || true)
-            .await.unwrap();
-        let mut lease = pool.acquire(route, true, |_| true, async { panic!("warm carrier should be reused") })
-            .await.unwrap();
+        assert_eq!(
+            pool.entries.lock().await[0].active.load(Ordering::Acquire),
+            0
+        );
+        pool.warm(
+            route,
+            |_| true,
+            async { panic!("warm already has a verified carrier") },
+            || true,
+        )
+        .await
+        .unwrap();
+        let mut lease = pool
+            .acquire(route, true, |_| true, async {
+                panic!("warm carrier should be reused")
+            })
+            .await
+            .unwrap();
         assert_eq!(*lease.connection(), 7);
         lease.admitted();
         assert_eq!(pool.connections.available_permits(), MAX_CONNECTIONS - 1);
-        pool.warm(None, |_| true, async { panic!("unscoped warm must not dial") }, || true)
-            .await.unwrap();
+        pool.warm(
+            None,
+            |_| true,
+            async { panic!("unscoped warm must not dial") },
+            || true,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -414,11 +452,24 @@ mod tests {
         let pool = Pool::default();
         let route = Some("127.0.0.1:0".parse().unwrap());
         let live = AtomicBool::new(true);
-        assert!(pool.warm(route, |_| true, async {
-            live.store(false, Ordering::Release);
-            Ok(7u32)
-        }, || live.load(Ordering::Acquire)).await.is_err());
-        assert!(pool.entries.lock().await.iter().all(|e| e.retired.load(Ordering::Acquire)));
+        assert!(pool
+            .warm(
+                route,
+                |_| true,
+                async {
+                    live.store(false, Ordering::Release);
+                    Ok(7u32)
+                },
+                || live.load(Ordering::Acquire)
+            )
+            .await
+            .is_err());
+        assert!(pool
+            .entries
+            .lock()
+            .await
+            .iter()
+            .all(|e| e.retired.load(Ordering::Acquire)));
     }
 
     #[tokio::test(start_paused = true)]

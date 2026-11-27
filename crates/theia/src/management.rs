@@ -80,7 +80,11 @@ impl std::error::Error for ManagementError {}
 pub enum StatusCommand {
     ClientStatus,
     ClientLifecycle,
-    ClientDisconnect { expected_revision: u64, config_sha256: [u8; 32], instance: [u8; 32] },
+    ClientDisconnect {
+        expected_revision: u64,
+        config_sha256: [u8; 32],
+        instance: [u8; 32],
+    },
     ClientPreview {
         expected_revision: u64,
         candidate_sha256: [u8; 32],
@@ -164,7 +168,10 @@ pub struct ProxyLifecycle {
 pub enum StatusReply {
     ClientLifecycle(ProxyLifecycle),
     /// Acknowledges admission closure, NOT completed CAS restoration.
-    ClientDisconnectAccepted { revision: u64, instance: [u8; 32] },
+    ClientDisconnectAccepted {
+        revision: u64,
+        instance: [u8; 32],
+    },
     ClientRunning {
         revision: u64,
         config_sha256: [u8; 32],
@@ -1025,7 +1032,11 @@ fn parse_disconnect(command: &[u8]) -> Option<(u64, [u8; 32], [u8; 32])> {
     let line = std::str::from_utf8(command.strip_prefix(b"client-disconnect rev=")?).ok()?;
     let (revision, tail) = line.split_once(" sha256=")?;
     let (digest, instance) = tail.split_once(" instance=")?;
-    Some((positive_decimal(revision)?, decode_digest(digest)?, decode_digest(instance)?))
+    Some((
+        positive_decimal(revision)?,
+        decode_digest(digest)?,
+        decode_digest(instance)?,
+    ))
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1096,20 +1107,31 @@ where
             }
         }
         #[cfg(not(windows))]
-        { "ERR unsupported\n".into() }
+        {
+            "ERR unsupported\n".into()
+        }
     } else if command.starts_with(b"client-disconnect ") {
         #[cfg(windows)]
         {
             match parse_disconnect(&command) {
-                Some((revision, digest, instance)) if client.request_disconnect_bound(revision, digest, instance).is_ok() => {
+                Some((revision, digest, instance))
+                    if client
+                        .request_disconnect_bound(revision, digest, instance)
+                        .is_ok() =>
+                {
                     disconnect_accepted = true;
-                    format!("theia-client-v1 disconnect-accepted r={revision} instance={}\n", encode_client_hex(instance))
+                    format!(
+                        "theia-client-v1 disconnect-accepted r={revision} instance={}\n",
+                        encode_client_hex(instance)
+                    )
                 }
                 _ => "theia-client-v1 rejected\n".into(),
             }
         }
         #[cfg(not(windows))]
-        { "ERR unsupported\n".into() }
+        {
+            "ERR unsupported\n".into()
+        }
     } else {
         let candidate = parse_bound_command(&command, b"client-preview rev=")
             .map(|(r, d)| (r, d, false))
@@ -1128,11 +1150,17 @@ where
         }
     };
     let written = async {
-        stream.write_all(response.as_bytes()).await.map_err(|_| ManagementError::Io)?;
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .map_err(|_| ManagementError::Io)?;
         stream.shutdown().await.map_err(|_| ManagementError::Io)
-    }.await;
+    }
+    .await;
     #[cfg(windows)]
-    if disconnect_accepted { client.mark_disconnect_reply_done(); }
+    if disconnect_accepted {
+        client.mark_disconnect_reply_done();
+    }
     written
 }
 
@@ -1147,10 +1175,20 @@ where
     let request = match command {
         StatusCommand::ClientStatus => b"client-status\n".to_vec(),
         StatusCommand::ClientLifecycle => b"client-lifecycle\n".to_vec(),
-        StatusCommand::ClientDisconnect { expected_revision, config_sha256, instance } => {
-            if expected_revision == 0 { return Err(ManagementError::InvalidReply); }
-            format!("client-disconnect rev={expected_revision} sha256={} instance={}\n",
-                encode_client_hex(config_sha256), encode_client_hex(instance)).into_bytes()
+        StatusCommand::ClientDisconnect {
+            expected_revision,
+            config_sha256,
+            instance,
+        } => {
+            if expected_revision == 0 {
+                return Err(ManagementError::InvalidReply);
+            }
+            format!(
+                "client-disconnect rev={expected_revision} sha256={} instance={}\n",
+                encode_client_hex(config_sha256),
+                encode_client_hex(instance)
+            )
+            .into_bytes()
         }
         StatusCommand::ClientPreview {
             expected_revision,
@@ -1319,23 +1357,47 @@ where
                 let config_sha256 = decode_digest(fields.next()?.strip_prefix("sha256=")?)?;
                 let instance = decode_digest(fields.next()?.strip_prefix("instance=")?)?;
                 let phase = match fields.next()?.strip_prefix("phase=")? {
-                    "0" => 0, "1" => 1, "2" => 2, "3" => 3, "4" => 4,
+                    "0" => 0,
+                    "1" => 1,
+                    "2" => 2,
+                    "3" => 3,
+                    "4" => 4,
                     _ => return None,
                 };
                 let listeners_ready = match fields.next()?.strip_prefix("listeners=")? {
-                    "0" => false, "1" => true, _ => return None,
+                    "0" => false,
+                    "1" => true,
+                    _ => return None,
                 };
                 let proxy_applied = match fields.next()?.strip_prefix("applied=")? {
-                    "0" => 0, "1" => 1, "2" => 2, _ => return None,
+                    "0" => 0,
+                    "1" => 1,
+                    "2" => 2,
+                    _ => return None,
                 };
                 if fields.next().is_some()
                     || (phase == 2 && (!listeners_ready || proxy_applied != 1))
                     || (phase != 2 && listeners_ready)
-                { return None; }
-                Some(StatusReply::ClientLifecycle(ProxyLifecycle { revision, config_sha256, instance, phase, listeners_ready, proxy_applied }))
+                {
+                    return None;
+                }
+                Some(StatusReply::ClientLifecycle(ProxyLifecycle {
+                    revision,
+                    config_sha256,
+                    instance,
+                    phase,
+                    listeners_ready,
+                    proxy_applied,
+                }))
             }
-            StatusCommand::ClientDisconnect { expected_revision, instance, .. } => {
-                let (revision, nonce) = line.strip_prefix("disconnect-accepted r=")?.split_once(" instance=")?;
+            StatusCommand::ClientDisconnect {
+                expected_revision,
+                instance,
+                ..
+            } => {
+                let (revision, nonce) = line
+                    .strip_prefix("disconnect-accepted r=")?
+                    .split_once(" instance=")?;
                 let revision = positive_decimal(revision)?;
                 let nonce = decode_digest(nonce)?;
                 (revision == expected_revision && nonce == instance)
@@ -2058,19 +2120,59 @@ mod strict_wire_matrix_tests {
         let digest = "ab".repeat(32);
         let nonce = "cd".repeat(32);
         let lifecycle = format!("theia-client-v1 lifecycle r=1 sha256={digest} instance={nonce} phase=2 listeners=1 applied=1\n");
-        assert_eq!(peer(StatusCommand::ClientLifecycle, "client-lifecycle\n", lifecycle.as_bytes()).await,
-            Ok(StatusReply::ClientLifecycle(ProxyLifecycle { revision: 1, config_sha256: [0xab; 32], instance: [0xcd; 32], phase: 2, listeners_ready: true, proxy_applied: 1 })));
-        let command = StatusCommand::ClientDisconnect { expected_revision: 1, config_sha256: [0xab; 32], instance: [0xcd; 32] };
+        assert_eq!(
+            peer(
+                StatusCommand::ClientLifecycle,
+                "client-lifecycle\n",
+                lifecycle.as_bytes()
+            )
+            .await,
+            Ok(StatusReply::ClientLifecycle(ProxyLifecycle {
+                revision: 1,
+                config_sha256: [0xab; 32],
+                instance: [0xcd; 32],
+                phase: 2,
+                listeners_ready: true,
+                proxy_applied: 1
+            }))
+        );
+        let command = StatusCommand::ClientDisconnect {
+            expected_revision: 1,
+            config_sha256: [0xab; 32],
+            instance: [0xcd; 32],
+        };
         let request = format!("client-disconnect rev=1 sha256={digest} instance={nonce}\n");
-        assert_eq!(parse_disconnect(request.trim_end().as_bytes()), Some((1, [0xab; 32], [0xcd; 32])));
-        assert!(parse_disconnect(format!("client-disconnect rev=01 sha256={digest} instance={nonce}").as_bytes()).is_none());
+        assert_eq!(
+            parse_disconnect(request.trim_end().as_bytes()),
+            Some((1, [0xab; 32], [0xcd; 32]))
+        );
+        assert!(parse_disconnect(
+            format!("client-disconnect rev=01 sha256={digest} instance={nonce}").as_bytes()
+        )
+        .is_none());
         let reply = format!("theia-client-v1 disconnect-accepted r=1 instance={nonce}\n");
-        assert_eq!(peer(command, &request, reply.as_bytes()).await,
-            Ok(StatusReply::ClientDisconnectAccepted { revision: 1, instance: [0xcd; 32] }));
+        assert_eq!(
+            peer(command, &request, reply.as_bytes()).await,
+            Ok(StatusReply::ClientDisconnectAccepted {
+                revision: 1,
+                instance: [0xcd; 32]
+            })
+        );
         let bad = format!("theia-client-v1 disconnect-accepted r=1 instance={digest}\n");
-        assert_eq!(peer(command, &request, bad.as_bytes()).await, Err(ManagementError::InvalidReply));
+        assert_eq!(
+            peer(command, &request, bad.as_bytes()).await,
+            Err(ManagementError::InvalidReply)
+        );
         let bad = lifecycle.replace("phase=2", "phase=5");
-        assert_eq!(peer(StatusCommand::ClientLifecycle, "client-lifecycle\n", bad.as_bytes()).await, Err(ManagementError::InvalidReply));
+        assert_eq!(
+            peer(
+                StatusCommand::ClientLifecycle,
+                "client-lifecycle\n",
+                bad.as_bytes()
+            )
+            .await,
+            Err(ManagementError::InvalidReply)
+        );
     }
 
     #[tokio::test]

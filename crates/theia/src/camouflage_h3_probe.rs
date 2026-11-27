@@ -4,6 +4,7 @@
 //! browser fingerprint, REALITY authentication, ownership or DPI resistance.
 //! No DNS, HTTP requests, seed-domain scans or implicit H2 fallback.
 //! Active network I/O only after exact per-target ProbeApproval.
+use crate::net::probe::REFERENCE_PROBES;
 use crate::{
     camouflage_discovery::{Observation, TlsEvidence},
     camouflage_probe::{ProbeApproval, ProbeRequest},
@@ -15,7 +16,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::time::timeout;
-use crate::net::probe::REFERENCE_PROBES;
 
 const MAX_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(5);
 

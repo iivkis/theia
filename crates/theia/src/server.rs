@@ -904,7 +904,14 @@ async fn connect_target(
     policy: &ServerPolicy,
     routing: &crate::routing::Policy,
 ) -> Result<TcpStream, ErrorCode> {
-    connect_target_with(address, port, policy, routing, crate::routing::carrier_socket::connect_plain_tcp).await
+    connect_target_with(
+        address,
+        port,
+        policy,
+        routing,
+        crate::routing::carrier_socket::connect_plain_tcp,
+    )
+    .await
 }
 
 async fn connect_target_with<T, F, Fut>(

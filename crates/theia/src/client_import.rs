@@ -58,9 +58,9 @@ pub(crate) fn read_product_source(raw: &str) -> Result<ProductSource, ImportErro
     };
     let wire = crate::invite::decode_wire(&uri).map_err(|_| ImportError::InvalidSource)?;
     if !inline && wire.token.is_some() {
-        let protected = crate::reality_bootstrap::read_text(
-            Path::new(raw), crate::invite::MAX_URI, true,
-        ).map_err(|_| ImportError::InvalidSource)?;
+        let protected =
+            crate::reality_bootstrap::read_text(Path::new(raw), crate::invite::MAX_URI, true)
+                .map_err(|_| ImportError::InvalidSource)?;
         if protected.trim_end_matches(['\r', '\n']) != uri.as_str() {
             return Err(ImportError::InvalidSource);
         }
@@ -105,9 +105,9 @@ pub fn read_source(raw: &str) -> Result<Invitation, ImportError> {
     let uri = value.trim_end_matches(['\r', '\n']);
     let invite = Invitation::decode(uri).map_err(|_| ImportError::InvalidSource)?;
     if invite.has_token() {
-        let protected = crate::reality_bootstrap::read_text(
-            Path::new(raw), crate::invite::MAX_URI, true,
-        ).map_err(|_| ImportError::InvalidSource)?;
+        let protected =
+            crate::reality_bootstrap::read_text(Path::new(raw), crate::invite::MAX_URI, true)
+                .map_err(|_| ImportError::InvalidSource)?;
         if protected.trim_end_matches(['\r', '\n']) != uri {
             return Err(ImportError::InvalidSource);
         }
@@ -708,8 +708,10 @@ mod storage_tests {
     #[test]
     fn confidential_own_tls_file_requires_protected_storage() {
         let scratch = Scratch::new();
-        let server = crate::config::parse(&crate::invite::fixture_server_source(&[0x42; 32])).unwrap();
-        let invite = Invitation::issued_from_server(&server, "public", "device-a", &[0x42; 32]).unwrap();
+        let server =
+            crate::config::parse(&crate::invite::fixture_server_source(&[0x42; 32])).unwrap();
+        let invite =
+            Invitation::issued_from_server(&server, "public", "device-a", &[0x42; 32]).unwrap();
         let uri = Zeroizing::new(invite.encode().unwrap());
 
         let broad = scratch.0.join("unprotected.txt");
@@ -731,7 +733,10 @@ mod storage_tests {
         let imported = read_source(file.to_str().unwrap()).unwrap();
         assert_eq!(imported.trust_reference(), invite.trust_reference());
         assert_eq!(imported.token_bytes(), invite.token_bytes());
-        assert!(matches!(read_product_source(file.to_str().unwrap()), Ok(ProductSource::OwnTls(_))));
+        assert!(matches!(
+            read_product_source(file.to_str().unwrap()),
+            Ok(ProductSource::OwnTls(_))
+        ));
     }
 
     #[test]

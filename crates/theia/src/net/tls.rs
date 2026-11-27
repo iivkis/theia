@@ -3,18 +3,22 @@
 use rustls::{ClientConfig, ConfigBuilder, RootCertStore, ServerConfig, WantsVerifier};
 use std::sync::Arc;
 
-pub(crate) fn client_tls13_builder() -> Result<ConfigBuilder<ClientConfig, WantsVerifier>, rustls::Error> {
+pub(crate) fn client_tls13_builder(
+) -> Result<ConfigBuilder<ClientConfig, WantsVerifier>, rustls::Error> {
     ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13])
 }
 
-pub(crate) fn server_tls13_builder() -> Result<ConfigBuilder<ServerConfig, WantsVerifier>, rustls::Error> {
+pub(crate) fn server_tls13_builder(
+) -> Result<ConfigBuilder<ServerConfig, WantsVerifier>, rustls::Error> {
     ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13])
 }
 
 fn nonempty(roots: &RootCertStore) -> Result<(), rustls::Error> {
-    if roots.is_empty() { return Err(rustls::Error::General("empty explicit trust store".into())); }
+    if roots.is_empty() {
+        return Err(rustls::Error::General("empty explicit trust store".into()));
+    }
     Ok(())
 }
 
@@ -30,9 +34,14 @@ pub(crate) fn require_full_handshake(config: &mut ClientConfig) {
     config.enable_early_data = false;
 }
 
-pub(crate) fn roots_tls13(roots: RootCertStore, alpn: &[u8]) -> Result<ClientConfig, rustls::Error> {
+pub(crate) fn roots_tls13(
+    roots: RootCertStore,
+    alpn: &[u8],
+) -> Result<ClientConfig, rustls::Error> {
     nonempty(&roots)?;
-    let mut config = client_tls13_builder()?.with_root_certificates(roots).with_no_client_auth();
+    let mut config = client_tls13_builder()?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
     configure_client(&mut config, alpn);
     Ok(config)
 }
@@ -42,11 +51,16 @@ pub(crate) fn roots_tls13(roots: RootCertStore, alpn: &[u8]) -> Result<ClientCon
 pub(crate) fn reference_h2(roots: RootCertStore) -> Result<ClientConfig, rustls::Error> {
     nonempty(&roots)?;
     let mut provider = rustls::crypto::ring::default_provider();
-    provider.kx_groups.retain(|group| group.name() == rustls::NamedGroup::X25519);
-    if provider.kx_groups.is_empty() { return Err(rustls::Error::General("X25519 unavailable".into())); }
+    provider
+        .kx_groups
+        .retain(|group| group.name() == rustls::NamedGroup::X25519);
+    if provider.kx_groups.is_empty() {
+        return Err(rustls::Error::General("X25519 unavailable".into()));
+    }
     let mut config = ClientConfig::builder_with_provider(Arc::new(provider))
         .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_root_certificates(roots).with_no_client_auth();
+        .with_root_certificates(roots)
+        .with_no_client_auth();
     configure_client(&mut config, b"h2");
     require_full_handshake(&mut config);
     Ok(config)
@@ -56,9 +70,11 @@ pub(crate) fn reference_h2(roots: RootCertStore) -> Result<ClientConfig, rustls:
 /// supported TLS versions and do not inherit an XHTTP ALPN.
 pub(crate) fn application_probe(roots: RootCertStore) -> Result<ClientConfig, rustls::Error> {
     nonempty(&roots)?;
-    let mut config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()?
-        .with_root_certificates(roots).with_no_client_auth();
+    let mut config =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
     require_full_handshake(&mut config);
     Ok(config)
 }
@@ -89,6 +105,8 @@ mod tests {
         assert_eq!(carrier.alpn_protocols, vec![b"h3".to_vec()]);
         assert_eq!(reference.alpn_protocols, vec![b"h2".to_vec()]);
         assert!(probe.alpn_protocols.is_empty());
-        assert!(!carrier.enable_early_data && !reference.enable_early_data && !probe.enable_early_data);
+        assert!(
+            !carrier.enable_early_data && !reference.enable_early_data && !probe.enable_early_data
+        );
     }
 }

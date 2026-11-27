@@ -215,10 +215,7 @@ impl TcpSplitPlan {
     /// The backend must own the live socket generation, hold all original
     /// packets, verify policy and commit once before emission. This method
     /// never transmits or authorizes packets, and rejects gaps/overlaps.
-    pub fn begin_flight(
-        packets: &[&[u8]],
-        expected_name: &str,
-    ) -> Option<(Self, Vec<Vec<u8>>)> {
+    pub fn begin_flight(packets: &[&[u8]], expected_name: &str) -> Option<(Self, Vec<Vec<u8>>)> {
         const MAX_PACKETS: usize = 32;
         const BOUNDARY: usize = 5;
         if packets.is_empty() || packets.len() > MAX_PACKETS {
@@ -345,7 +342,7 @@ pub(crate) struct TcpSplitExecution {
     state: SplitState,
 }
 #[cfg(test)]
-#[derive(Clone,Copy,PartialEq,Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum SplitState {
     Pending,
     Active,
@@ -354,9 +351,13 @@ enum SplitState {
 }
 #[cfg(test)]
 impl TcpSplitExecution {
-    pub(crate) fn prepare(packets:&[&[u8]],name:&str)->Option<Self> {
-        let (plan,initial)=TcpSplitPlan::begin_flight(packets,name)?;
-        Some(Self{plan,initial:Some(initial),state:SplitState::Pending})
+    pub(crate) fn prepare(packets: &[&[u8]], name: &str) -> Option<Self> {
+        let (plan, initial) = TcpSplitPlan::begin_flight(packets, name)?;
+        Some(Self {
+            plan,
+            initial: Some(initial),
+            state: SplitState::Pending,
+        })
     }
 
     /// The commit callback must irreversibly authorize Modify for the
@@ -364,40 +365,52 @@ impl TcpSplitExecution {
     /// terminal for this execution (no original packet is returned).
     pub(crate) fn emit_initial(
         &mut self,
-        commit:impl FnOnce()->std::io::Result<()>,
-        mut emit:impl FnMut(&[u8])->std::io::Result<()>,
-    )->std::io::Result<()> {
-        if self.state!=SplitState::Pending {
+        commit: impl FnOnce() -> std::io::Result<()>,
+        mut emit: impl FnMut(&[u8]) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        if self.state != SplitState::Pending {
             return Err(std::io::ErrorKind::PermissionDenied.into());
         }
         // Default to terminal before invoking any callback, including on
         // panic or partial write. Active is published only on full return.
-        self.state=SplitState::Failed;
-        let initial=self.initial.take().ok_or(std::io::ErrorKind::InvalidData)?;
+        self.state = SplitState::Failed;
+        let initial = self.initial.take().ok_or(std::io::ErrorKind::InvalidData)?;
         commit()?;
-        for part in &initial {emit(part)?;}
-        self.state=SplitState::Active;
+        for part in &initial {
+            emit(part)?;
+        }
+        self.state = SplitState::Active;
         Ok(())
     }
 
     pub(crate) fn emit_retransmission(
-        &mut self, packet:&[u8],
-        mut emit:impl FnMut(&[u8])->std::io::Result<()>,
-    )->std::io::Result<()> {
-        if self.state!=SplitState::Active {
+        &mut self,
+        packet: &[u8],
+        mut emit: impl FnMut(&[u8]) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        if self.state != SplitState::Active {
             return Err(std::io::ErrorKind::PermissionDenied.into());
         }
-        self.state=SplitState::Failed;
-        let outputs=self.plan.retransmission(packet).ok_or(std::io::ErrorKind::InvalidData)?;
-        for part in &outputs {emit(part)?;}
-        self.state=SplitState::Active;
+        self.state = SplitState::Failed;
+        let outputs = self
+            .plan
+            .retransmission(packet)
+            .ok_or(std::io::ErrorKind::InvalidData)?;
+        for part in &outputs {
+            emit(part)?;
+        }
+        self.state = SplitState::Active;
         Ok(())
     }
 
-    pub(crate) fn acknowledge(&mut self,packet:&[u8])->Option<bool> {
-        if self.state!=SplitState::Active {return None;}
-        let complete=self.plan.acknowledge(packet)?;
-        if complete {self.state=SplitState::Complete;}
+    pub(crate) fn acknowledge(&mut self, packet: &[u8]) -> Option<bool> {
+        if self.state != SplitState::Active {
+            return None;
+        }
+        let complete = self.plan.acknowledge(packet)?;
+        if complete {
+            self.state = SplitState::Complete;
+        }
         Some(complete)
     }
 }
@@ -456,7 +469,10 @@ pub fn quic_initial_datagrams(data: &[u8], expected_name: &str) -> Option<Vec<Ve
 /// An untrusted probe hint, never a domain identity. The lab accepts
 /// complete v1/v2 H3 Initials only if an actual transformation is possible.
 /// The caller must independently verify the exact version, not downgrade.
-#[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "windows", target_arch = "x86_64")
+))]
 pub(crate) fn unified_quic_hint(data: &[u8]) -> Option<(String, crate::quic_core::wire::Version)> {
     use super::dpi::udp::{Candidate, Observer};
     use crate::quic_core::wire::Version;
@@ -557,35 +573,66 @@ mod tests {
             let [prefix, tail] = split_tcp(&original, meta, off, end, 2).unwrap();
             let (tail_meta, _, tail_end) = tcp_view(&tail).unwrap();
             let [middle, last] = split_tcp(&tail, tail_meta, off, tail_end, 10).unwrap();
-            let (flight, outputs) = TcpSplitPlan::begin_flight(
-                &[&prefix, &middle, &last], "example.org"
-            ).unwrap();
+            let (flight, outputs) =
+                TcpSplitPlan::begin_flight(&[&prefix, &middle, &last], "example.org").unwrap();
             assert_eq!(outputs.len(), 4);
-            let restored: Vec<u8> = outputs.iter().flat_map(|packet| {
-                let (_, _, end) = tcp_view(packet).unwrap();
-                packet[end..].iter().copied()
-            }).collect();
+            let restored: Vec<u8> = outputs
+                .iter()
+                .flat_map(|packet| {
+                    let (_, _, end) = tcp_view(packet).unwrap();
+                    packet[end..].iter().copied()
+                })
+                .collect();
             assert_eq!(restored, hello);
             assert_eq!(flight.retransmission(&middle).unwrap(), outputs[1..3]);
             assert!(TcpSplitPlan::begin_flight(&[&prefix, &last], "example.org").is_none());
-            assert!(TcpSplitPlan::begin_flight(&[&prefix, &prefix, &middle, &last], "example.org").is_none());
-            assert!(TcpSplitPlan::begin_flight(&[&prefix, &middle, &last], "wrong.invalid").is_none());
+            assert!(
+                TcpSplitPlan::begin_flight(&[&prefix, &prefix, &middle, &last], "example.org")
+                    .is_none()
+            );
+            assert!(
+                TcpSplitPlan::begin_flight(&[&prefix, &middle, &last], "wrong.invalid").is_none()
+            );
             // A partial injection or commit denial permanently consumes
             // the batch. Neither retry nor kernel retransmission is valid
             // after the writer itself reports an ambiguous failure.
-            let mut execution=TcpSplitExecution::prepare(&[&prefix,&middle,&last],"example.org").unwrap();
-            let mut writes=0;
-            assert!(execution.emit_initial(||Ok(()),|_|{
-                writes+=1;
-                if writes==2 {Err(std::io::ErrorKind::BrokenPipe.into())} else {Ok(())}
-            }).is_err());
-            assert_eq!(writes,2);
-            assert!(execution.emit_initial(||panic!("must not recommit"),|_|panic!("must not replay")).is_err());
-            assert!(execution.emit_retransmission(&middle,|_|panic!("must not inject")).is_err());
-            let mut denied=TcpSplitExecution::prepare(&[&prefix,&middle,&last],"example.org").unwrap();
-            assert!(denied.emit_initial(||Err(std::io::ErrorKind::PermissionDenied.into()),
-                |_|panic!("commit denied")).is_err());
-            assert!(denied.emit_initial(||Ok(()),|_|panic!("must not replay")).is_err());
+            let mut execution =
+                TcpSplitExecution::prepare(&[&prefix, &middle, &last], "example.org").unwrap();
+            let mut writes = 0;
+            assert!(execution
+                .emit_initial(
+                    || Ok(()),
+                    |_| {
+                        writes += 1;
+                        if writes == 2 {
+                            Err(std::io::ErrorKind::BrokenPipe.into())
+                        } else {
+                            Ok(())
+                        }
+                    }
+                )
+                .is_err());
+            assert_eq!(writes, 2);
+            assert!(execution
+                .emit_initial(
+                    || panic!("must not recommit"),
+                    |_| panic!("must not replay")
+                )
+                .is_err());
+            assert!(execution
+                .emit_retransmission(&middle, |_| panic!("must not inject"))
+                .is_err());
+            let mut denied =
+                TcpSplitExecution::prepare(&[&prefix, &middle, &last], "example.org").unwrap();
+            assert!(denied
+                .emit_initial(
+                    || Err(std::io::ErrorKind::PermissionDenied.into()),
+                    |_| panic!("commit denied")
+                )
+                .is_err());
+            assert!(denied
+                .emit_initial(|| Ok(()), |_| panic!("must not replay"))
+                .is_err());
 
             let (mut plan, [a, b]) = TcpSplitPlan::begin(&original, "example.org").unwrap();
             assert!(TcpSplitPlan::begin_flight(&[&a, &b], "example.org").is_none());
@@ -639,13 +686,29 @@ mod tests {
             fix_tcp_lengths_and_checksums(&mut ack, off).unwrap();
             assert_eq!(plan.acknowledge(&ack), Some(true));
             assert!(plan.retransmission(&original).is_none());
-            let mut active=TcpSplitExecution::prepare(&[&prefix,&middle,&last],"example.org").unwrap();
-            let mut written=Vec::new();
-            active.emit_initial(||Ok(()),|part|{written.push(part.to_vec());Ok(())}).unwrap();
-            assert_eq!(written,outputs);
-            assert!(active.emit_initial(||panic!("must not recommit"),|_|panic!("must not replay")).is_err());
-            assert_eq!(active.acknowledge(&ack),Some(true));
-            assert!(active.emit_retransmission(&middle,|_|panic!("already acknowledged")).is_err());
+            let mut active =
+                TcpSplitExecution::prepare(&[&prefix, &middle, &last], "example.org").unwrap();
+            let mut written = Vec::new();
+            active
+                .emit_initial(
+                    || Ok(()),
+                    |part| {
+                        written.push(part.to_vec());
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            assert_eq!(written, outputs);
+            assert!(active
+                .emit_initial(
+                    || panic!("must not recommit"),
+                    |_| panic!("must not replay")
+                )
+                .is_err());
+            assert_eq!(active.acknowledge(&ack), Some(true));
+            assert!(active
+                .emit_retransmission(&middle, |_| panic!("already acknowledged"))
+                .is_err());
         }
     }
 
@@ -942,14 +1005,20 @@ mod tests {
                 assert!(unified_quic_hint(&initial).is_none());
                 assert_eq!(
                     unified_quic_hint(&data),
-                    Some(("example.org".to_owned(), crate::quic_core::wire::Version::from_wire(version).unwrap()))
+                    Some((
+                        "example.org".to_owned(),
+                        crate::quic_core::wire::Version::from_wire(version).unwrap()
+                    ))
                 );
             }
             assert_eq!(split, vec![initial, tail]);
             assert_eq!(split.concat(), data);
             data[100] ^= 1;
             assert!(quic_initial_datagrams(&data, "example.org").is_none());
-            #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
+            #[cfg(any(
+                target_os = "linux",
+                all(target_os = "windows", target_arch = "x86_64")
+            ))]
             assert!(unified_quic_hint(&data).is_none());
         }
     }

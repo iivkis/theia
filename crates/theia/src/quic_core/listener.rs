@@ -93,8 +93,14 @@ impl SessionIo {
 
     /// Native admission pins the underlying socket and the peer.
     /// A new CID or same-IP rebinding does not transfer that admission.
-    pub(crate) fn native_pinned(&self)->bool {
-        matches!(self,Self::Direct{pinned:Some(_),..})
+    pub(crate) fn native_pinned(&self) -> bool {
+        matches!(
+            self,
+            Self::Direct {
+                pinned: Some(_),
+                ..
+            }
+        )
     }
 
     pub(crate) fn scope(&self) -> NetworkScope {
@@ -584,19 +590,40 @@ mod native_socket_tests {
     use super::*;
     #[tokio::test]
     async fn pinned_socket_rejects_alternate_peer_even_in_same_scope() {
-        let peer=UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let other=UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let socket=UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let target=peer.local_addr().unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let other = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = peer.local_addr().unwrap();
         socket.connect(target).await.unwrap();
-        let io=SessionIo::direct_carrier(socket,NetworkScope::loopback(),Default::default(),Some(target));
+        let io = SessionIo::direct_carrier(
+            socket,
+            NetworkScope::loopback(),
+            Default::default(),
+            Some(target),
+        );
         assert!(io.native_pinned());
-        assert_eq!(io.send_to(b"wrong",other.local_addr().unwrap()).await.unwrap_err().kind(),std::io::ErrorKind::PermissionDenied);
-        assert!(io.send_marked(b"wrong",other.local_addr().unwrap(),true).await.is_err());
-        assert_eq!(io.send_to(b"right",target).await.unwrap(),5);
-        let mut bytes=[0u8;16];
-        let (n,_)=tokio::time::timeout(Duration::from_secs(2),peer.recv_from(&mut bytes)).await.unwrap().unwrap();
-        assert_eq!(&bytes[..n],b"right");
-        assert!(!SessionIo::direct(UdpSocket::bind("127.0.0.1:0").await.unwrap(),NetworkScope::loopback()).native_pinned());
+        assert_eq!(
+            io.send_to(b"wrong", other.local_addr().unwrap())
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(io
+            .send_marked(b"wrong", other.local_addr().unwrap(), true)
+            .await
+            .is_err());
+        assert_eq!(io.send_to(b"right", target).await.unwrap(), 5);
+        let mut bytes = [0u8; 16];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&bytes[..n], b"right");
+        assert!(!SessionIo::direct(
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            NetworkScope::loopback()
+        )
+        .native_pinned());
     }
 }

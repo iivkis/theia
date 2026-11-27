@@ -1,11 +1,21 @@
 //! Shared publication identity, deadline and bounded-cache primitives.
 //! Consumers keep separate policy/profile/endpoint/protocol namespaces.
-use std::{collections::VecDeque, sync::Arc, time::{Duration, Instant}};
+use std::{
+    collections::VecDeque,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-pub(crate) fn live(expires: Instant, now: Instant) -> bool { expires > now }
+pub(crate) fn live(expires: Instant, now: Instant) -> bool {
+    expires > now
+}
 
 pub(crate) fn deadline(now: Instant, ttl: Duration) -> Option<Instant> {
-    if ttl.is_zero() { None } else { now.checked_add(ttl) }
+    if ttl.is_zero() {
+        None
+    } else {
+        now.checked_add(ttl)
+    }
 }
 
 pub(crate) fn expiry(now: Instant, ttl: Duration) -> Instant {
@@ -14,8 +24,12 @@ pub(crate) fn expiry(now: Instant, ttl: Duration) -> Instant {
 }
 
 pub(crate) fn push_bounded<T>(items: &mut VecDeque<T>, item: T, capacity: usize) {
-    if capacity == 0 { return; }
-    while items.len() >= capacity { items.pop_front(); }
+    if capacity == 0 {
+        return;
+    }
+    while items.len() >= capacity {
+        items.pop_front();
+    }
     items.push_back(item);
 }
 
@@ -34,7 +48,6 @@ impl Publication {
     }
 }
 
-
 /// A single transport/mode decision scoped to the network. The owner
 /// decides the meaning of a positive publication; this is not a shared verdict.
 #[derive(Default)]
@@ -45,7 +58,11 @@ pub(crate) struct ScopedDecision {
 }
 
 impl ScopedDecision {
-    pub(crate) fn observe(&mut self, route: Option<crate::network_scope::Scope>, now: Instant) -> (u64, bool) {
+    pub(crate) fn observe(
+        &mut self,
+        route: Option<crate::network_scope::Scope>,
+        now: Instant,
+    ) -> (u64, bool) {
         if route.is_none() || self.route != route {
             self.route = route;
             self.invalidate();
@@ -101,7 +118,6 @@ impl ScopedDecision {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,7 +131,10 @@ mod tests {
     fn scoped_decisions_expire_and_reject_late_publication() {
         let now = Instant::now();
         let ttl = Duration::from_secs(2);
-        let scope = Some(crate::network_scope::Scope::fixture("127.0.0.1:0".parse().unwrap(), 1));
+        let scope = Some(crate::network_scope::Scope::fixture(
+            "127.0.0.1:0".parse().unwrap(),
+            1,
+        ));
         let mut cache = ScopedDecision::default();
         let (generation, _) = cache.observe(scope, now);
         assert!(cache.record(generation, now, ttl));
@@ -131,7 +150,9 @@ mod tests {
         let now = Instant::now();
         assert!(!live(expiry(now, Duration::ZERO), now));
         let mut values = VecDeque::new();
-        for n in 0..5 { push_bounded(&mut values, n, 2); }
-        assert_eq!(values.into_iter().collect::<Vec<_>>(), vec![3,4]);
+        for n in 0..5 {
+            push_bounded(&mut values, n, 2);
+        }
+        assert_eq!(values.into_iter().collect::<Vec<_>>(), vec![3, 4]);
     }
 }

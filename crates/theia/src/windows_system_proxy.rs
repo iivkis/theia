@@ -862,7 +862,12 @@ struct NativeOwner {
 }
 
 impl NativeOwner {
-    fn apply_locked(lock: Mutex, before: Snapshot, bind: SocketAddr, review: Option<ApplyReview>) -> Result<Self, ProxyError> {
+    fn apply_locked(
+        lock: Mutex,
+        before: Snapshot,
+        bind: SocketAddr,
+        review: Option<ApplyReview>,
+    ) -> Result<Self, ProxyError> {
         if read_journal()?.is_some() {
             return Err(ProxyError::RecoveryRequired);
         }
@@ -889,7 +894,11 @@ impl NativeOwner {
         // Construct the owner before the first potentially mutating call.
         // On an uncertain apply Drop performs only exact-state CAS; partial
         // or foreign states retain the journal for explicit recovery.
-        let owner = Self { _lock: lock, journal, active: true };
+        let owner = Self {
+            _lock: lock,
+            journal,
+            active: true,
+        };
         set(&owner.journal.applied)?;
         if query()? != owner.journal.applied {
             return Err(ProxyError::Conflict);
@@ -958,8 +967,12 @@ impl ReservedProxy {
                         return;
                     }
                 };
-                if reserved_tx.send(Ok(())).is_err() { return; }
-                let Ok((bind, review)) = start_rx.recv() else { return };
+                if reserved_tx.send(Ok(())).is_err() {
+                    return;
+                }
+                let Ok((bind, review)) = start_rx.recv() else {
+                    return;
+                };
                 let mut owner = match NativeOwner::apply_locked(lock, before, bind, review) {
                     Ok(owner) => owner,
                     Err(error) => {
@@ -967,7 +980,9 @@ impl ReservedProxy {
                         return;
                     }
                 };
-                if ready_tx.send(Ok(owner.journal.clone())).is_err() { return; }
+                if ready_tx.send(Ok(owner.journal.clone())).is_err() {
+                    return;
+                }
                 while let Ok(command) = commands_rx.recv() {
                     match command {
                         OwnerCommand::Restore(reply) => {
@@ -985,18 +1000,31 @@ impl ReservedProxy {
             .map_err(|_| ProxyError::Unavailable)?;
         match reserved_rx.recv() {
             Ok(Ok(())) => Ok(Self {
-                start: Some(start_tx), ready, commands: Some(commands), thread: Some(thread),
+                start: Some(start_tx),
+                ready,
+                commands: Some(commands),
+                thread: Some(thread),
             }),
             result => {
                 let _ = thread.join();
-                Err(match result { Ok(Err(error)) => error, _ => ProxyError::Unavailable })
+                Err(match result {
+                    Ok(Err(error)) => error,
+                    _ => ProxyError::Unavailable,
+                })
             }
         }
     }
 
-    pub(crate) fn apply(mut self, bind: SocketAddr, review: Option<ApplyReview>) -> Result<OwnedProxy, ProxyError> {
-        self.start.take().ok_or(ProxyError::Unavailable)?
-            .send((bind, review)).map_err(|_| ProxyError::Unavailable)?;
+    pub(crate) fn apply(
+        mut self,
+        bind: SocketAddr,
+        review: Option<ApplyReview>,
+    ) -> Result<OwnedProxy, ProxyError> {
+        self.start
+            .take()
+            .ok_or(ProxyError::Unavailable)?
+            .send((bind, review))
+            .map_err(|_| ProxyError::Unavailable)?;
         let journal = self.ready.recv().map_err(|_| ProxyError::Unavailable)??;
         Ok(OwnedProxy {
             commands: self.commands.take(),
@@ -1011,7 +1039,9 @@ impl Drop for ReservedProxy {
     fn drop(&mut self) {
         self.start.take();
         self.commands.take();
-        if let Some(thread) = self.thread.take() { let _ = thread.join(); }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -1030,17 +1060,27 @@ impl OwnedProxy {
     }
 
     #[cfg(test)]
-    pub(crate) fn apply_reviewed(bind: SocketAddr, review: ApplyReview) -> Result<Self, ProxyError> {
+    pub(crate) fn apply_reviewed(
+        bind: SocketAddr,
+        review: ApplyReview,
+    ) -> Result<Self, ProxyError> {
         ReservedProxy::acquire()?.apply(bind, Some(review))
     }
 
     /// A matching current snapshot alone does not establish journal ownership.
     pub(crate) fn verify(&self) -> Result<(), ProxyError> {
-        if !self.active || self.thread.as_ref().is_none_or(|thread| thread.is_finished()) {
+        if !self.active
+            || self
+                .thread
+                .as_ref()
+                .is_none_or(|thread| thread.is_finished())
+        {
             return Err(ProxyError::Unavailable);
         }
         require_journal(&self.journal)?;
-        if query()? != self.journal.applied { return Err(ProxyError::Conflict); }
+        if query()? != self.journal.applied {
+            return Err(ProxyError::Conflict);
+        }
         require_journal(&self.journal)
     }
 
@@ -1051,8 +1091,11 @@ impl OwnedProxy {
             return Ok(Recovery::NothingPending);
         }
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        self.commands.as_ref().ok_or(ProxyError::Unavailable)?
-            .send(OwnerCommand::Restore(tx)).map_err(|_| ProxyError::Unavailable)?;
+        self.commands
+            .as_ref()
+            .ok_or(ProxyError::Unavailable)?
+            .send(OwnerCommand::Restore(tx))
+            .map_err(|_| ProxyError::Unavailable)?;
         let outcome = rx.recv().map_err(|_| ProxyError::Unavailable)??;
         self.active = false;
         Ok(outcome)
@@ -1076,7 +1119,6 @@ impl OwnedProxy {
             let _ = commands.send(OwnerCommand::Abandon);
         }
     }
-
 }
 
 impl Drop for OwnedProxy {
@@ -1362,11 +1404,17 @@ auto_url = "https://pac.invalid/proxy.pac"
         let mut changed_during_preflight = original.clone();
         changed_during_preflight.bypass = "preflight-drift.invalid".into();
         set(&changed_during_preflight).unwrap();
-        assert!(matches!(reservation.apply("127.0.0.1:45991".parse().unwrap(), None), Err(ProxyError::Conflict)));
+        assert!(matches!(
+            reservation.apply("127.0.0.1:45991".parse().unwrap(), None),
+            Err(ProxyError::Conflict)
+        ));
         assert_eq!(query().unwrap(), changed_during_preflight);
         assert_eq!(status().unwrap(), ProxyStatus::NoJournal);
         set(&original).unwrap();
-        let mut held = ReservedProxy::acquire().unwrap().apply("127.0.0.1:45991".parse().unwrap(), None).unwrap();
+        let mut held = ReservedProxy::acquire()
+            .unwrap()
+            .apply("127.0.0.1:45991".parse().unwrap(), None)
+            .unwrap();
         assert_eq!(held.restore_held(), Ok(Recovery::Restored));
         assert_eq!(query().unwrap(), original);
         assert!(matches!(ReservedProxy::acquire(), Err(ProxyError::Busy)));

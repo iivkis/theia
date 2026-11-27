@@ -348,7 +348,9 @@ impl Drop for Driver {
 async fn h2_head(target: &Target, roots: RootCertStore) -> Option<u16> {
     let tls = crate::net::tls::reference_h2(roots).ok()?;
     let name = ServerName::try_from(target.server_name.clone()).ok()?;
-    let tcp = crate::routing::carrier_socket::connect_plain_tcp(target.address).await.ok()?;
+    let tcp = crate::routing::carrier_socket::connect_plain_tcp(target.address)
+        .await
+        .ok()?;
     if tcp.peer_addr().ok()? != target.address {
         return None;
     }

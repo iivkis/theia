@@ -281,10 +281,13 @@ impl RelayGate {
             .try_acquire_owned()
             .map_err(|_| Error::Limit)?;
         let address = lease.address().map_err(|_| Error::Reference)?;
-        let upstream = timeout(CONNECT, crate::routing::carrier_socket::connect_plain_tcp(address))
-            .await
-            .map_err(|_| Error::Deadline)?
-            .map_err(|_| Error::Io)?;
+        let upstream = timeout(
+            CONNECT,
+            crate::routing::carrier_socket::connect_plain_tcp(address),
+        )
+        .await
+        .map_err(|_| Error::Deadline)?
+        .map_err(|_| Error::Io)?;
         if upstream.peer_addr().map_err(|_| Error::Io)? != address
             || lease.address().map_err(|_| Error::Reference)? != address
         {

@@ -6,6 +6,7 @@
 //! Caller approval is required for every socket and never inferred from
 //! ASN, provider prefix or the candidate's popularity.
 use crate::camouflage_discovery::{plausible_public_address, Observation, TlsEvidence};
+use crate::net::probe::REFERENCE_PROBES;
 use rustls::{pki_types::ServerName, RootCertStore};
 use std::{
     io,
@@ -14,7 +15,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::time::timeout;
-use crate::net::probe::REFERENCE_PROBES;
 use tokio_rustls::TlsConnector;
 
 const MAX_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(5);

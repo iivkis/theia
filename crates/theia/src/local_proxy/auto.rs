@@ -1,8 +1,17 @@
 //! Conservative H3/H2 transport selection. A negative decision is scoped
 //! to one profile and network generation, never a permission to replay OPEN.
 use super::ProxyTunnel;
-use crate::{client::{ClientError, H2Client, error_kind}, h3_client::H3Client, diagnostics::Value, protocol::Address};
-use std::{net::IpAddr, sync::{Arc, Mutex}, time::{Duration, Instant}};
+use crate::{
+    client::{error_kind, ClientError, H2Client},
+    diagnostics::Value,
+    h3_client::H3Client,
+    protocol::Address,
+};
+use std::{
+    net::IpAddr,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 use tokio::sync::Notify;
 
 pub(super) const AUTO_QUIC_ATTEMPTS: usize = 2;
@@ -20,7 +29,14 @@ pub(super) struct AutoClient {
 
 impl AutoClient {
     pub(super) fn new(h2: Arc<H2Client>, h3: Arc<H3Client>, ttl: Duration) -> Self {
-        Self { h2, h3, ttl, negative: Mutex::new(NegativeCache::default()), cache_changed: Notify::new(), recheck_gate: tokio::sync::Mutex::new(()) }
+        Self {
+            h2,
+            h3,
+            ttl,
+            negative: Mutex::new(NegativeCache::default()),
+            cache_changed: Notify::new(),
+            recheck_gate: tokio::sync::Mutex::new(()),
+        }
     }
 
     pub(super) fn observe(&self) -> Result<(u64, bool), ClientError> {
@@ -108,8 +124,10 @@ impl AutoClient {
                     self.complete(generation, false)?;
                     return Ok(Some(value));
                 }
-                Err(error) if crate::net::error::endpoint_unavailable(error) == Some(crate::net::error::EndpointUnavailable::NoResponse)
-                    && index + 1 < AUTO_QUIC_ATTEMPTS => {}
+                Err(error)
+                    if crate::net::error::endpoint_unavailable(error)
+                        == Some(crate::net::error::EndpointUnavailable::NoResponse)
+                        && index + 1 < AUTO_QUIC_ATTEMPTS => {}
                 Err(error) if crate::net::error::endpoint_unavailable(error).is_some() => {
                     if self.complete(generation, true)? {
                         return Ok(None);
@@ -202,7 +220,10 @@ impl AutoClient {
         }
     }
 
-    pub(super) async fn fetch_routing(&self, known: Option<[u8; 32]>) -> Result<Vec<u8>, ClientError> {
+    pub(super) async fn fetch_routing(
+        &self,
+        known: Option<[u8; 32]>,
+    ) -> Result<Vec<u8>, ClientError> {
         let (generation, cached) = self.prepare().await?;
         if !cached {
             if let Some(value) = self
@@ -238,17 +259,34 @@ impl AutoClient {
         self.h2.resolve_routing(name, digest).await
     }
 
-    #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
-    pub(super) async fn resolve_native_dns(&self,name:&str,digest:[u8;32])->Result<Vec<IpAddr>,ClientError> {
-        let (generation,cached)=self.prepare().await?;
+    #[cfg(any(
+        target_os = "linux",
+        all(target_os = "windows", target_arch = "x86_64")
+    ))]
+    pub(super) async fn resolve_native_dns(
+        &self,
+        name: &str,
+        digest: [u8; 32],
+    ) -> Result<Vec<IpAddr>, ClientError> {
+        let (generation, cached) = self.prepare().await?;
         if !cached {
-            if let Some(value)=self.attempt_h3(generation,||self.h3.resolve_native_dns(name,digest)).await? {return Ok(value);}
+            if let Some(value) = self
+                .attempt_h3(generation, || self.h3.resolve_native_dns(name, digest))
+                .await?
+            {
+                return Ok(value);
+            }
         }
-        if !self.same_scope(generation)? {return Err(ClientError::QuicUnreachable);}
-        self.h2.resolve_native_dns(name,digest).await
+        if !self.same_scope(generation)? {
+            return Err(ClientError::QuicUnreachable);
+        }
+        self.h2.resolve_native_dns(name, digest).await
     }
 
-    pub(super) async fn fetch_identity_document(&self, successor: bool) -> Result<String, ClientError> {
+    pub(super) async fn fetch_identity_document(
+        &self,
+        successor: bool,
+    ) -> Result<String, ClientError> {
         let (generation, cached) = self.prepare().await?;
         if !cached {
             if let Some(value) = self
@@ -288,7 +326,11 @@ impl AutoClient {
             .map(crate::udp_relay::Tunnel::H2)
     }
 
-    pub(super) async fn open(&self, address: Address, port: u16) -> Result<ProxyTunnel, ClientError> {
+    pub(super) async fn open(
+        &self,
+        address: Address,
+        port: u16,
+    ) -> Result<ProxyTunnel, ClientError> {
         let (generation, cached) = self.prepare().await?;
         crate::diag!(
             Debug,
@@ -339,4 +381,3 @@ impl AutoClient {
             .map(ProxyTunnel::H2)
     }
 }
-

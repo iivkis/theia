@@ -65,9 +65,11 @@ pub(crate) fn error_kind(error: &ClientError) -> &'static str {
     }
 }
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum EndpointUnavailable { NoResponse, Refused }
+pub(crate) enum EndpointUnavailable {
+    NoResponse,
+    Refused,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FailureClass {
@@ -92,7 +94,6 @@ pub(crate) enum QuicDialError {
     EndpointNetworkRefused,
 }
 
-
 impl QuicDialError {
     pub(crate) fn class(self) -> FailureClass {
         match self {
@@ -101,7 +102,9 @@ impl QuicDialError {
             Self::Handshake => FailureClass::AmbiguousHandshake,
             Self::Timeout => FailureClass::AmbiguousTimeout,
             Self::Unreachable => FailureClass::EndpointUnavailable(EndpointUnavailable::NoResponse),
-            Self::EndpointNetworkRefused => FailureClass::EndpointUnavailable(EndpointUnavailable::Refused),
+            Self::EndpointNetworkRefused => {
+                FailureClass::EndpointUnavailable(EndpointUnavailable::Refused)
+            }
         }
     }
 }
@@ -114,7 +117,6 @@ pub(crate) enum ProbeVerdict {
     IdentityRejected,
     Denied,
 }
-
 
 impl ProbeVerdict {
     pub(crate) fn failure(self) -> Option<FailureClass> {
@@ -143,16 +145,41 @@ mod tests {
     use super::*;
     #[test]
     fn ambiguous_and_security_failures_are_not_availability_evidence() {
-        for error in [ClientError::Configuration, ClientError::Io, ClientError::Tls,
-            ClientError::Timeout, ClientError::Unauthorized, ClientError::Protocol,
-            ClientError::Open(ErrorCode::PolicyDenied), ClientError::Open(ErrorCode::DialTimeout)] {
+        for error in [
+            ClientError::Configuration,
+            ClientError::Io,
+            ClientError::Tls,
+            ClientError::Timeout,
+            ClientError::Unauthorized,
+            ClientError::Protocol,
+            ClientError::Open(ErrorCode::PolicyDenied),
+            ClientError::Open(ErrorCode::DialTimeout),
+        ] {
             assert_eq!(endpoint_unavailable(error), None);
         }
-        assert_eq!(endpoint_unavailable(ClientError::QuicUnreachable), Some(EndpointUnavailable::NoResponse));
-        assert_eq!(endpoint_unavailable(ClientError::QuicEndpointNetworkRefused), Some(EndpointUnavailable::Refused));
-        assert_eq!(QuicDialError::Handshake.class(), FailureClass::AmbiguousHandshake);
-        assert_eq!(QuicDialError::Timeout.class(), FailureClass::AmbiguousTimeout);
-        assert_eq!(ProbeVerdict::IdentityRejected.failure(), Some(FailureClass::IdentityRejected));
-        assert_eq!(ProbeVerdict::Denied.failure(), Some(FailureClass::PolicyDenied));
+        assert_eq!(
+            endpoint_unavailable(ClientError::QuicUnreachable),
+            Some(EndpointUnavailable::NoResponse)
+        );
+        assert_eq!(
+            endpoint_unavailable(ClientError::QuicEndpointNetworkRefused),
+            Some(EndpointUnavailable::Refused)
+        );
+        assert_eq!(
+            QuicDialError::Handshake.class(),
+            FailureClass::AmbiguousHandshake
+        );
+        assert_eq!(
+            QuicDialError::Timeout.class(),
+            FailureClass::AmbiguousTimeout
+        );
+        assert_eq!(
+            ProbeVerdict::IdentityRejected.failure(),
+            Some(FailureClass::IdentityRejected)
+        );
+        assert_eq!(
+            ProbeVerdict::Denied.failure(),
+            Some(FailureClass::PolicyDenied)
+        );
     }
 }

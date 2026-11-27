@@ -5,13 +5,13 @@
 //! dies, the kernel queue closes and the table remains fail closed.
 //! Recovery deletes ONLY our table, using the kernel ruleset generation CAS.
 //! Any unrelated ruleset change after installation requires manual review.
-#[path="linux_policy_routes.rs"]
+#[path = "linux_policy_routes.rs"]
 mod policy_routes;
-pub(crate) use policy_routes::PolicyRoutes;
 use super::linux_carrier::LabCarrierSocket;
 use super::nfqueue::{
     align4, attr, checked_header, kernel_address, message, next_attr, receive, send, Queue,
 };
+pub(crate) use policy_routes::PolicyRoutes;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -35,8 +35,10 @@ const MAX_CARRIERS: usize = 16;
 const MAX_RULE_OPERATIONS: usize = 96;
 /// Reserved skb routing mark. It is never a carrier socket mark.
 pub const REDIRECT_MARK: u32 = 0x5449;
-pub(crate) const PASS_MARK:u32=0x544a;
-pub(super) fn reserved_mark(mark:u32)->bool {matches!(mark,REDIRECT_MARK|PASS_MARK)}
+pub(crate) const PASS_MARK: u32 = 0x544a;
+pub(super) fn reserved_mark(mark: u32) -> bool {
+    matches!(mark, REDIRECT_MARK | PASS_MARK)
+}
 const MAX_CARRIER_EPOCH: usize = 65_536;
 const NESTED: u16 = 0x8000;
 const FAMILY_INET: u8 = 1;
@@ -57,43 +59,58 @@ fn invalid() -> io::Error {
 }
 
 fn valid_boot_id(boot: &str) -> bool {
-    boot.len() == 36 && boot.bytes().enumerate().all(|(index, b)| {
-        if matches!(index, 8 | 13 | 18 | 23) {
-            b == b'-'
-        } else {
-            b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
-        }
-    })
+    boot.len() == 36
+        && boot.bytes().enumerate().all(|(index, b)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                b == b'-'
+            } else {
+                b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
+            }
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Scope {
-    boot:String,dev:u64,ino:u64,
+    boot: String,
+    dev: u64,
+    ino: u64,
     /// Present only for explicit PID-1 namespace laboratory activation.
-    #[serde(default,skip_serializing_if="Option::is_none")]
-    machine:Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    machine: Option<String>,
 }
-pub const HOST_GUARD_JOURNAL:&str="/var/lib/theia/guard/host.toml";
-fn host_path(path:&Path)->io::Result<()> {
-    if path!=Path::new(HOST_GUARD_JOURNAL) {return Err(refused());}
+pub const HOST_GUARD_JOURNAL: &str = "/var/lib/theia/guard/host.toml";
+fn host_path(path: &Path) -> io::Result<()> {
+    if path != Path::new(HOST_GUARD_JOURNAL) {
+        return Err(refused());
+    }
     check_parent(path)
 }
-pub(super) fn verify_host_scope(host:&File)->io::Result<()> {
-    Scope::current_mode(host,true).map(|_|())
+pub(super) fn verify_host_scope(host: &File) -> io::Result<()> {
+    Scope::current_mode(host, true).map(|_| ())
 }
-fn machine_id()->io::Result<String> {
-    let path=Path::new("/etc/machine-id");
-    let meta=fs::symlink_metadata(path)?;
-    if !meta.is_file() || meta.uid()!=0 || meta.mode()&0o022!=0 || meta.len()>64 {return Err(refused());}
-    let id=fs::read_to_string(path)?.trim().to_owned();
-    if id.len()!=32 || !id.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) ||
-        id.bytes().all(|b|b==b'0') {return Err(refused());}
+fn machine_id() -> io::Result<String> {
+    let path = Path::new("/etc/machine-id");
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.is_file() || meta.uid() != 0 || meta.mode() & 0o022 != 0 || meta.len() > 64 {
+        return Err(refused());
+    }
+    let id = fs::read_to_string(path)?.trim().to_owned();
+    if id.len() != 32
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || id.bytes().all(|b| b == b'0')
+    {
+        return Err(refused());
+    }
     Ok(id)
 }
 impl Scope {
-    fn current(host_namespace:&File)->io::Result<Self> {Self::current_mode(host_namespace,false)}
-    fn current_mode(host_namespace: &File,host_mode:bool) -> io::Result<Self> {
+    fn current(host_namespace: &File) -> io::Result<Self> {
+        Self::current_mode(host_namespace, false)
+    }
+    fn current_mode(host_namespace: &File, host_mode: bool) -> io::Result<Self> {
         let own = fs::metadata("/proc/thread-self/ns/net")?;
         let host = host_namespace.metadata()?;
         let mut stat: libc::statfs = unsafe { mem::zeroed() };
@@ -108,15 +125,20 @@ impl Scope {
         if unsafe { libc::ioctl(host_namespace.as_raw_fd(), 0xb703 as _) } != libc::CLONE_NEWNET {
             return Err(refused());
         }
-        let same=(own.dev(),own.ino())==(host.dev(),host.ino());
-        let machine=if host_mode {
-            let init=fs::metadata("/proc/1/ns/net")?;
-            if !same || unsafe {libc::geteuid()}!=0 || (init.dev(),init.ino())!=(host.dev(),host.ino()) {
+        let same = (own.dev(), own.ino()) == (host.dev(), host.ino());
+        let machine = if host_mode {
+            let init = fs::metadata("/proc/1/ns/net")?;
+            if !same
+                || unsafe { libc::geteuid() } != 0
+                || (init.dev(), init.ino()) != (host.dev(), host.ino())
+            {
                 return Err(refused());
             }
             Some(machine_id()?)
         } else {
-            if same {return Err(refused());}
+            if same {
+                return Err(refused());
+            }
             None
         };
         let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?
@@ -128,7 +150,7 @@ impl Scope {
         Ok(Self {
             boot,
             dev: own.dev(),
-            ino:own.ino(),
+            ino: own.ino(),
             machine,
         })
     }
@@ -139,8 +161,8 @@ impl Scope {
 struct RedirectScope {
     port: u16,
     loopback: u32,
-    #[serde(default,skip_serializing_if="Option::is_none")]
-    policy_queue:Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    policy_queue: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,11 +177,11 @@ struct Journal {
     // Old journals without this field retain the stricter recovery rule.
     #[serde(default)]
     previous_present: bool,
-    #[serde(default, skip_serializing_if="Option::is_none")]
-    redirect:Option<RedirectScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    redirect: Option<RedirectScope>,
     #[serde(default)]
-    boot_rearmed:bool,
-    restored:bool,
+    boot_rearmed: bool,
+    restored: bool,
 }
 impl Journal {
     fn name(&self) -> String {
@@ -172,9 +194,12 @@ impl Journal {
             || self.nonce == [0; 16]
             || self.before == 0
             || self.before.checked_add(1) != Some(self.installed)
-            || self.redirect.is_some_and(|scope|scope.port==0 || scope.loopback==0)
-            || (scope.machine.is_some() && self.redirect.and_then(|s|s.policy_queue).is_none())
-            || (self.boot_rearmed && (scope.machine.is_none() || self.previous_present || self.restored))
+            || self
+                .redirect
+                .is_some_and(|scope| scope.port == 0 || scope.loopback == 0)
+            || (scope.machine.is_some() && self.redirect.and_then(|s| s.policy_queue).is_none())
+            || (self.boot_rearmed
+                && (scope.machine.is_none() || self.previous_present || self.restored))
         {
             return Err(refused());
         }
@@ -338,7 +363,7 @@ impl Netlink {
         let expected = journal.name() + "\0";
         if name != Some(expected.as_bytes())
             || nonce != Some(journal.nonce.as_slice())
-            || use_count != Some(if journal.redirect.is_some() {5} else {1})
+            || use_count != Some(if journal.redirect.is_some() { 5 } else { 1 })
         {
             return Err(refused());
         }
@@ -356,8 +381,8 @@ impl Netlink {
         }
         bytes.extend_from_slice(&message(17, REQUEST, operations.len() as u32 + 2, 10, &[]));
         send(self.0.as_raw_fd(), &bytes)?;
-        let mut seen=vec![false;operations.len()];
-        let mut received=0usize;
+        let mut seen = vec![false; operations.len()];
+        let mut received = 0usize;
         let mut buffer = vec![0u8; 65536];
         for _ in 0..MAX_RULE_OPERATIONS {
             let n = receive(self.0.as_raw_fd(), &mut buffer)?;
@@ -379,10 +404,12 @@ impl Netlink {
                 if seq < 2 || seq > operations.len() as u32 + 1 {
                     return Err(invalid());
                 }
-                let slot=&mut seen[(seq-2) as usize];
-                if *slot {return Err(invalid());}
-                *slot=true;
-                received+=1;
+                let slot = &mut seen[(seq - 2) as usize];
+                if *slot {
+                    return Err(invalid());
+                }
+                *slot = true;
+                received += 1;
                 rest = &rest[align4(len)..];
             }
             if received == operations.len() {
@@ -507,20 +534,20 @@ fn payload_cmp(out: &mut Vec<u8>, base: u32, offset: u32, value: &[u8]) {
     cmp(out, value);
 }
 fn socket_matches(key: super::packet::FlowKey, mark: u32) -> Vec<u8> {
-    let mut out=Vec::new();
+    let mut out = Vec::new();
     let mut socket = Vec::new();
     attr(&mut socket, 1, &1u32.to_be_bytes()); // NFT_SOCKET_MARK
     attr(&mut socket, 2, &1u32.to_be_bytes()); // NFT_REG_1
     expression(&mut out, "socket", &socket);
     // Socket mark is a native-endian register value, not skb metadata.
     cmp(&mut out, &mark.to_ne_bytes());
-    tuple_matches(&mut out,key);
+    tuple_matches(&mut out, key);
     out
 }
 
 /// L3/L4 checks used after a route change. A tuple alone never authorizes
 /// egress: LOCAL_OUT must first have authenticated the actual socket mark.
-fn tuple_matches(out:&mut Vec<u8>,key:super::packet::FlowKey) {
+fn tuple_matches(out: &mut Vec<u8>, key: super::packet::FlowKey) {
     use std::net::IpAddr;
     match (key.source.ip(), key.destination.ip()) {
         (IpAddr::V4(src), IpAddr::V4(dst)) => {
@@ -558,7 +585,7 @@ fn tuple_matches(out:&mut Vec<u8>,key:super::packet::FlowKey) {
     ports[2..].copy_from_slice(&key.destination.port().to_be_bytes());
     payload_cmp(out, 2, 0, &ports);
 }
-fn verdict_expression(out:&mut Vec<u8>,code:u32) {
+fn verdict_expression(out: &mut Vec<u8>, code: u32) {
     let mut verdict = Vec::new();
     attr(&mut verdict, 1, &code.to_be_bytes());
     let mut data = Vec::new();
@@ -569,215 +596,306 @@ fn verdict_expression(out:&mut Vec<u8>,code:u32) {
     expression(out, "immediate", &immediate);
 }
 fn carrier_expressions(key: super::packet::FlowKey, mark: u32) -> Vec<u8> {
-    let mut out=socket_matches(key,mark);
-    verdict_expression(&mut out,1);
+    let mut out = socket_matches(key, mark);
+    verdict_expression(&mut out, 1);
     out
 }
 
-fn register_value(out:&mut Vec<u8>,value:&[u8]) {
-    let mut data=Vec::new();
-    attr(&mut data,1,&1u32.to_be_bytes()); // NFT_REG_1
-    let mut nested=Vec::new();
-    attr(&mut nested,1,value);
-    attr(&mut data,2|NESTED,&nested);
-    expression(out,"immediate",&data);
+fn register_value(out: &mut Vec<u8>, value: &[u8]) {
+    let mut data = Vec::new();
+    attr(&mut data, 1, &1u32.to_be_bytes()); // NFT_REG_1
+    let mut nested = Vec::new();
+    attr(&mut nested, 1, value);
+    attr(&mut data, 2 | NESTED, &nested);
+    expression(out, "immediate", &data);
 }
-fn set_skb_mark(out:&mut Vec<u8>,mark:u32) {
-    register_value(out,&mark.to_ne_bytes());
-    let mut data=Vec::new();
-    attr(&mut data,2,&3u32.to_be_bytes()); // NFT_META_MARK
-    attr(&mut data,3,&1u32.to_be_bytes()); // NFTA_META_SREG
-    expression(out,"meta",&data);
+fn set_skb_mark(out: &mut Vec<u8>, mark: u32) {
+    register_value(out, &mark.to_ne_bytes());
+    let mut data = Vec::new();
+    attr(&mut data, 2, &3u32.to_be_bytes()); // NFT_META_MARK
+    attr(&mut data, 3, &1u32.to_be_bytes()); // NFTA_META_SREG
+    expression(out, "meta", &data);
 }
-fn redirect_chain(journal:&Journal,name:&str,kind:&str,hook:u32,priority:i32,policy:u32,sequence:u32)->Vec<u8> {
-    let mut chain=Vec::new();
-    name_attr(&mut chain,1,&journal.name());
-    name_attr(&mut chain,3,name);
-    name_attr(&mut chain,7,kind);
-    let mut hook_data=Vec::new();
-    attr(&mut hook_data,1,&hook.to_be_bytes());
-    attr(&mut hook_data,2,&priority.to_be_bytes());
-    attr(&mut chain,4|NESTED,&hook_data);
-    attr(&mut chain,5,&policy.to_be_bytes());
-    nft_message(NEW_CHAIN,REQUEST|ACK|CREATE_EXCLUSIVE,sequence,&chain)
+fn redirect_chain(
+    journal: &Journal,
+    name: &str,
+    kind: &str,
+    hook: u32,
+    priority: i32,
+    policy: u32,
+    sequence: u32,
+) -> Vec<u8> {
+    let mut chain = Vec::new();
+    name_attr(&mut chain, 1, &journal.name());
+    name_attr(&mut chain, 3, name);
+    name_attr(&mut chain, 7, kind);
+    let mut hook_data = Vec::new();
+    attr(&mut hook_data, 1, &hook.to_be_bytes());
+    attr(&mut hook_data, 2, &priority.to_be_bytes());
+    attr(&mut chain, 4 | NESTED, &hook_data);
+    attr(&mut chain, 5, &policy.to_be_bytes());
+    nft_message(
+        NEW_CHAIN,
+        REQUEST | ACK | CREATE_EXCLUSIVE,
+        sequence,
+        &chain,
+    )
 }
-fn push_rule(messages:&mut Vec<Vec<u8>>,journal:&Journal,chain:&str,expressions:&[u8]) {
-    let mut attrs=Vec::new();
-    name_attr(&mut attrs,1,&journal.name());
-    name_attr(&mut attrs,2,chain);
-    attr(&mut attrs,4|NESTED,expressions);
-    messages.push(nft_message(NEW_RULE,REQUEST|ACK|CREATE_EXCLUSIVE|APPEND,
-        messages.len() as u32+2,&attrs));
+fn push_rule(messages: &mut Vec<Vec<u8>>, journal: &Journal, chain: &str, expressions: &[u8]) {
+    let mut attrs = Vec::new();
+    name_attr(&mut attrs, 1, &journal.name());
+    name_attr(&mut attrs, 2, chain);
+    attr(&mut attrs, 4 | NESTED, expressions);
+    messages.push(nft_message(
+        NEW_RULE,
+        REQUEST | ACK | CREATE_EXCLUSIVE | APPEND,
+        messages.len() as u32 + 2,
+        &attrs,
+    ));
 }
-fn redirect_egress_rules(messages:&mut Vec<Vec<u8>>,journal:&Journal,scope:RedirectScope,
-    admissions:&std::collections::BTreeMap<u32,super::packet::FlowKey>) {
+fn redirect_egress_rules(
+    messages: &mut Vec<Vec<u8>>,
+    journal: &Journal,
+    scope: RedirectScope,
+    admissions: &std::collections::BTreeMap<u32, super::packet::FlowKey>,
+) {
     // All three gates are replaced atomically. The postrouting hook sees
     // the effective output interface after the LOCAL_OUT route lookup.
-    for (&mark,&key) in admissions {
-        let mut route=socket_matches(key,mark);
-        set_skb_mark(&mut route,mark);
-        verdict_expression(&mut route,1);
-        push_rule(messages,journal,"route_out",&route);
-        push_rule(messages,journal,"output",&carrier_expressions(key,mark));
-        let mut post=Vec::new();
-        meta_cmp(&mut post,3,&mark.to_ne_bytes());
-        tuple_matches(&mut post,key);
-        verdict_expression(&mut post,1);
-        push_rule(messages,journal,"egress",&post);
+    for (&mark, &key) in admissions {
+        let mut route = socket_matches(key, mark);
+        set_skb_mark(&mut route, mark);
+        verdict_expression(&mut route, 1);
+        push_rule(messages, journal, "route_out", &route);
+        push_rule(messages, journal, "output", &carrier_expressions(key, mark));
+        let mut post = Vec::new();
+        meta_cmp(&mut post, 3, &mark.to_ne_bytes());
+        tuple_matches(&mut post, key);
+        verdict_expression(&mut post, 1);
+        push_rule(messages, journal, "egress", &post);
     }
     // Ordinary traffic to a local service remains in the explicitly
     // excluded local scope. Reset its packet mark, never trust user marks.
-    let mut local=Vec::new();
-    meta_cmp(&mut local,5,&scope.loopback.to_ne_bytes());
-    set_skb_mark(&mut local,0);
-    verdict_expression(&mut local,1);
-    push_rule(messages,journal,"route_out",&local);
-    for protocol in [6u8,17] {
-        let mut route=Vec::new();
-        meta_cmp(&mut route,16,&[protocol]);
-        if let Some(queue)=scope.policy_queue {
+    let mut local = Vec::new();
+    meta_cmp(&mut local, 5, &scope.loopback.to_ne_bytes());
+    set_skb_mark(&mut local, 0);
+    verdict_expression(&mut local, 1);
+    push_rule(messages, journal, "route_out", &local);
+    for protocol in [6u8, 17] {
+        let mut route = Vec::new();
+        meta_cmp(&mut route, 16, &[protocol]);
+        if let Some(queue) = scope.policy_queue {
             // Clear marks before queuing: only the owned userspace
             // verdict can stamp an authorized Pass/Redirect packet.
-            set_skb_mark(&mut route,0);
-            let mut data=Vec::new();
-            attr(&mut data,1,&queue.to_be_bytes());
-            attr(&mut data,2,&1u16.to_be_bytes());
-            attr(&mut data,3,&0u16.to_be_bytes()); // never bypass
-            expression(&mut route,"queue",&data);
+            set_skb_mark(&mut route, 0);
+            let mut data = Vec::new();
+            attr(&mut data, 1, &queue.to_be_bytes());
+            attr(&mut data, 2, &1u16.to_be_bytes());
+            attr(&mut data, 3, &0u16.to_be_bytes()); // never bypass
+            expression(&mut route, "queue", &data);
         } else {
-            set_skb_mark(&mut route,REDIRECT_MARK);
-            verdict_expression(&mut route,1);
+            set_skb_mark(&mut route, REDIRECT_MARK);
+            verdict_expression(&mut route, 1);
         }
-        push_rule(messages,journal,"route_out",&route);
+        push_rule(messages, journal, "route_out", &route);
     }
-    let mut local=Vec::new();
-    meta_cmp(&mut local,5,&scope.loopback.to_ne_bytes());
-    verdict_expression(&mut local,1);
-    push_rule(messages,journal,"output",&local);
-    push_rule(messages,journal,"egress",&local);
+    let mut local = Vec::new();
+    meta_cmp(&mut local, 5, &scope.loopback.to_ne_bytes());
+    verdict_expression(&mut local, 1);
+    push_rule(messages, journal, "output", &local);
+    push_rule(messages, journal, "egress", &local);
     // LOCAL_OUT may still expose its original state->out after reroute.
     // The following is not an external permit: postrouting checks the
     // actual device and admits only loopback or exact carrier traffic.
-    let mut rerouted=Vec::new();
-    meta_cmp(&mut rerouted,3,&REDIRECT_MARK.to_ne_bytes());
-    verdict_expression(&mut rerouted,1);
-    push_rule(messages,journal,"output",&rerouted);
+    let mut rerouted = Vec::new();
+    meta_cmp(&mut rerouted, 3, &REDIRECT_MARK.to_ne_bytes());
+    verdict_expression(&mut rerouted, 1);
+    push_rule(messages, journal, "output", &rerouted);
     if scope.policy_queue.is_some() {
-        let mut passed=Vec::new();
-        meta_cmp(&mut passed,3,&PASS_MARK.to_ne_bytes());
-        verdict_expression(&mut passed,1);
-        push_rule(messages,journal,"output",&passed);
-        push_rule(messages,journal,"egress",&passed);
+        let mut passed = Vec::new();
+        meta_cmp(&mut passed, 3, &PASS_MARK.to_ne_bytes());
+        verdict_expression(&mut passed, 1);
+        push_rule(messages, journal, "output", &passed);
+        push_rule(messages, journal, "egress", &passed);
     }
 }
-fn redirect_install(journal:&Journal,scope:RedirectScope,
-    admissions:&std::collections::BTreeMap<u32,super::packet::FlowKey>)->Vec<Vec<u8>> {
-    let mut table=Vec::new();
-    name_attr(&mut table,1,&journal.name());
-    attr(&mut table,6,&journal.nonce);
-    let mut messages=vec![nft_message(NEW_TABLE,REQUEST|ACK|CREATE_EXCLUSIVE,2,&table)];
+fn redirect_install(
+    journal: &Journal,
+    scope: RedirectScope,
+    admissions: &std::collections::BTreeMap<u32, super::packet::FlowKey>,
+) -> Vec<Vec<u8>> {
+    let mut table = Vec::new();
+    name_attr(&mut table, 1, &journal.name());
+    attr(&mut table, 6, &journal.nonce);
+    let mut messages = vec![nft_message(
+        NEW_TABLE,
+        REQUEST | ACK | CREATE_EXCLUSIVE,
+        2,
+        &table,
+    )];
     // Forwarding is outside desktop ingress. Deny it in this isolated
     // namespace; never allow a failed reroute to forward a packet.
-    for (name,kind,hook,priority,policy) in [
-        ("route_out","route",3,-150,0),("output","filter",3,0,0),
-        ("redirect_in","filter",0,-150,1),("egress","filter",4,0,0),
-        ("forward","filter",2,0,0),
+    for (name, kind, hook, priority, policy) in [
+        ("route_out", "route", 3, -150, 0),
+        ("output", "filter", 3, 0, 0),
+        ("redirect_in", "filter", 0, -150, 1),
+        ("egress", "filter", 4, 0, 0),
+        ("forward", "filter", 2, 0, 0),
     ] {
-        messages.push(redirect_chain(journal,name,kind,hook,priority,policy,messages.len() as u32+2));
+        messages.push(redirect_chain(
+            journal,
+            name,
+            kind,
+            hook,
+            priority,
+            policy,
+            messages.len() as u32 + 2,
+        ));
     }
-    redirect_egress_rules(&mut messages,journal,scope,admissions);
-    for protocol in [6u8,17] {
-        let mut expressions=Vec::new();
-        meta_cmp(&mut expressions,4,&scope.loopback.to_ne_bytes());
-        meta_cmp(&mut expressions,3,&REDIRECT_MARK.to_ne_bytes());
-        meta_cmp(&mut expressions,16,&[protocol]);
-        register_value(&mut expressions,&scope.port.to_be_bytes());
-        let mut tproxy=Vec::new();
-        attr(&mut tproxy,1,&0u32.to_be_bytes()); // NFPROTO_UNSPEC, port only
-        attr(&mut tproxy,3,&1u32.to_be_bytes()); // NFTA_TPROXY_REG_PORT
-        expression(&mut expressions,"tproxy",&tproxy);
-        verdict_expression(&mut expressions,1);
-        push_rule(&mut messages,journal,"redirect_in",&expressions);
+    redirect_egress_rules(&mut messages, journal, scope, admissions);
+    for protocol in [6u8, 17] {
+        let mut expressions = Vec::new();
+        meta_cmp(&mut expressions, 4, &scope.loopback.to_ne_bytes());
+        meta_cmp(&mut expressions, 3, &REDIRECT_MARK.to_ne_bytes());
+        meta_cmp(&mut expressions, 16, &[protocol]);
+        register_value(&mut expressions, &scope.port.to_be_bytes());
+        let mut tproxy = Vec::new();
+        attr(&mut tproxy, 1, &0u32.to_be_bytes()); // NFPROTO_UNSPEC, port only
+        attr(&mut tproxy, 3, &1u32.to_be_bytes()); // NFTA_TPROXY_REG_PORT
+        expression(&mut expressions, "tproxy", &tproxy);
+        verdict_expression(&mut expressions, 1);
+        push_rule(&mut messages, journal, "redirect_in", &expressions);
     }
     // No listener or failed tproxy expression: do not deliver normally.
-    let mut deny=Vec::new();
-    meta_cmp(&mut deny,3,&REDIRECT_MARK.to_ne_bytes());
-    verdict_expression(&mut deny,0);
-    push_rule(&mut messages,journal,"redirect_in",&deny);
+    let mut deny = Vec::new();
+    meta_cmp(&mut deny, 3, &REDIRECT_MARK.to_ne_bytes());
+    verdict_expression(&mut deny, 0);
+    push_rule(&mut messages, journal, "redirect_in", &deny);
     messages
 }
-fn redirect_replace(journal:&Journal,scope:RedirectScope,
-    admissions:&std::collections::BTreeMap<u32,super::packet::FlowKey>)->Vec<Vec<u8>> {
-    let mut messages=Vec::new();
-    for chain in ["route_out","output","egress"] {
-        let mut attrs=Vec::new();
-        name_attr(&mut attrs,1,&journal.name());
-        name_attr(&mut attrs,2,chain);
-        messages.push(nft_message(DEL_RULE,REQUEST|ACK,messages.len() as u32+2,&attrs));
+fn redirect_replace(
+    journal: &Journal,
+    scope: RedirectScope,
+    admissions: &std::collections::BTreeMap<u32, super::packet::FlowKey>,
+) -> Vec<Vec<u8>> {
+    let mut messages = Vec::new();
+    for chain in ["route_out", "output", "egress"] {
+        let mut attrs = Vec::new();
+        name_attr(&mut attrs, 1, &journal.name());
+        name_attr(&mut attrs, 2, chain);
+        messages.push(nft_message(
+            DEL_RULE,
+            REQUEST | ACK,
+            messages.len() as u32 + 2,
+            &attrs,
+        ));
     }
-    redirect_egress_rules(&mut messages,journal,scope,admissions);
+    redirect_egress_rules(&mut messages, journal, scope, admissions);
     messages
 }
 
-fn loopback_index()->io::Result<u32> {
-    let index=unsafe {libc::if_nametoindex(c"lo".as_ptr())};
-    if index==0 {Err(io::Error::last_os_error())} else {Ok(index)}
+fn loopback_index() -> io::Result<u32> {
+    let index = unsafe { libc::if_nametoindex(c"lo".as_ptr()) };
+    if index == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(index)
+    }
 }
 
 /// Verify the pre-provisioned policy routing from the actual kernel,
 /// without making a network connection or writing host routing rules.
 /// These are readiness probes, not authority to bypass the egress guard.
-fn marked_route_is_local(destination:std::net::IpAddr,loopback:u32)->io::Result<bool> {
-    let raw=unsafe {libc::socket(libc::AF_NETLINK,libc::SOCK_RAW|libc::SOCK_CLOEXEC,libc::NETLINK_ROUTE)};
-    if raw<0 {return Err(io::Error::last_os_error());}
-    let fd=unsafe {OwnedFd::from_raw_fd(raw)};
-    let local=kernel_address();
-    if unsafe {libc::bind(fd.as_raw_fd(),(&local as *const libc::sockaddr_nl).cast(),
-        mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t)}!=0 {
+fn marked_route_is_local(destination: std::net::IpAddr, loopback: u32) -> io::Result<bool> {
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            libc::NETLINK_ROUTE,
+        )
+    };
+    if raw < 0 {
         return Err(io::Error::last_os_error());
     }
-    let timeout=libc::timeval{tv_sec:0,tv_usec:250_000};
-    for option in [libc::SO_RCVTIMEO,libc::SO_SNDTIMEO] {
-        if unsafe {libc::setsockopt(fd.as_raw_fd(),libc::SOL_SOCKET,option,
-            (&timeout as *const libc::timeval).cast(),mem::size_of_val(&timeout) as libc::socklen_t)}!=0 {
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let local = kernel_address();
+    if unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            (&local as *const libc::sockaddr_nl).cast(),
+            mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let timeout = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 250_000,
+    };
+    for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+        if unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                (&timeout as *const libc::timeval).cast(),
+                mem::size_of_val(&timeout) as libc::socklen_t,
+            )
+        } != 0
+        {
             return Err(io::Error::last_os_error());
         }
     }
-    let (family,prefix,address)=match destination {
-        std::net::IpAddr::V4(ip)=>(libc::AF_INET as u8,32,ip.octets().to_vec()),
-        std::net::IpAddr::V6(ip)=>(libc::AF_INET6 as u8,128,ip.octets().to_vec()),
+    let (family, prefix, address) = match destination {
+        std::net::IpAddr::V4(ip) => (libc::AF_INET as u8, 32, ip.octets().to_vec()),
+        std::net::IpAddr::V6(ip) => (libc::AF_INET6 as u8, 128, ip.octets().to_vec()),
     };
-    let mut body=vec![family,prefix,0,0,0,0,0,0,0,0,0,0]; // rtmsg
-    attr(&mut body,1,&address); // RTA_DST
-    attr(&mut body,16,&REDIRECT_MARK.to_ne_bytes()); // RTA_MARK
-    let mut request=Vec::new();
-    request.extend_from_slice(&((16+body.len()) as u32).to_ne_bytes());
+    let mut body = vec![family, prefix, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // rtmsg
+    attr(&mut body, 1, &address); // RTA_DST
+    attr(&mut body, 16, &REDIRECT_MARK.to_ne_bytes()); // RTA_MARK
+    let mut request = Vec::new();
+    request.extend_from_slice(&((16 + body.len()) as u32).to_ne_bytes());
     request.extend_from_slice(&26u16.to_ne_bytes()); // RTM_GETROUTE
     request.extend_from_slice(&REQUEST.to_ne_bytes());
     request.extend_from_slice(&1u32.to_ne_bytes());
     request.extend_from_slice(&0u32.to_ne_bytes());
     request.extend_from_slice(&body);
-    send(fd.as_raw_fd(),&request)?;
-    let mut bytes=[0u8;8192];
-    let length=receive(fd.as_raw_fd(),&mut bytes)?;
-    let (kind,sequence,body)=checked_header(&bytes[..length])?;
-    if kind==2 {return Err(ack_error(body)?.ok_or_else(invalid)?);}
-    if kind!=24 || sequence!=1 || body.len()<12 || body[0]!=family {return Err(invalid());}
-    if body[7]!=2 {return Ok(false);} // RTN_LOCAL
-    let mut rest=&body[12..];
-    let mut output=None;
-    while let Some((kind,value))=next_attr(&mut rest)? {
-        if kind==4 {
-            if output.is_some() || value.len()!=4 {return Err(invalid());}
-            output=Some(u32::from_ne_bytes(value.try_into().map_err(|_|invalid())?));
+    send(fd.as_raw_fd(), &request)?;
+    let mut bytes = [0u8; 8192];
+    let length = receive(fd.as_raw_fd(), &mut bytes)?;
+    let (kind, sequence, body) = checked_header(&bytes[..length])?;
+    if kind == 2 {
+        return Err(ack_error(body)?.ok_or_else(invalid)?);
+    }
+    if kind != 24 || sequence != 1 || body.len() < 12 || body[0] != family {
+        return Err(invalid());
+    }
+    if body[7] != 2 {
+        return Ok(false);
+    } // RTN_LOCAL
+    let mut rest = &body[12..];
+    let mut output = None;
+    while let Some((kind, value)) = next_attr(&mut rest)? {
+        if kind == 4 {
+            if output.is_some() || value.len() != 4 {
+                return Err(invalid());
+            }
+            output = Some(u32::from_ne_bytes(value.try_into().map_err(|_| invalid())?));
         }
     }
-    Ok(output==Some(loopback))
+    Ok(output == Some(loopback))
 }
-fn redirect_routes_ready(scope:RedirectScope)->io::Result<bool> {
-    if loopback_index()?!=scope.loopback {return Ok(false);}
-    for address in ["198.51.100.2","203.0.113.2","2001:db8:2::2","2001:db8:3::2"] {
-        if !marked_route_is_local(address.parse().map_err(|_|invalid())?,scope.loopback)? {
+fn redirect_routes_ready(scope: RedirectScope) -> io::Result<bool> {
+    if loopback_index()? != scope.loopback {
+        return Ok(false);
+    }
+    for address in [
+        "198.51.100.2",
+        "203.0.113.2",
+        "2001:db8:2::2",
+        "2001:db8:3::2",
+    ] {
+        if !marked_route_is_local(address.parse().map_err(|_| invalid())?, scope.loopback)? {
             return Ok(false);
         }
     }
@@ -845,12 +963,15 @@ impl LabRules {
         self.current()
     }
 
-    pub(crate) fn owns_capture_queue(&self,queue:&Queue)->io::Result<bool> {
-        let number=queue.number()?;
-        Ok(self.capture.as_ref().is_some_and(|tag|tag.queue_number==number &&
-            tag.queue_identity==queue.identity()) && self.current()?)
+    pub(crate) fn owns_capture_queue(&self, queue: &Queue) -> io::Result<bool> {
+        let number = queue.number()?;
+        Ok(self.capture.as_ref().is_some_and(|tag| {
+            tag.queue_number == number && tag.queue_identity == queue.identity()
+        }) && self.current()?)
     }
-    pub(crate) fn has_capture_queue(&self)->bool { self.capture.is_some() }
+    pub(crate) fn has_capture_queue(&self) -> bool {
+        self.capture.is_some()
+    }
 
     pub(crate) fn current(&self) -> io::Result<bool> {
         if self.poisoned {
@@ -915,14 +1036,25 @@ impl LabRules {
 
     /// The actual private queue, not the tuple alone, establishes the
     /// provenance. Deny a reserved tuple arriving on the catch-all.
-    pub(crate) fn packet_evidence(&self,packet:&super::nfqueue::Packet<'_>)
-        ->io::Result<Option<CapturedSocket>> {
-        if self.journal.redirect.is_some() {return Err(refused());}
-        if packet.queue_identity()==self.queue_identity {
-            if !self.current()? {return Err(refused());}
-            if let (Some(tag),Some(meta))=(&self.capture,packet.metadata()) {
-                let key=super::packet::FlowKey{interface:0,..meta.flow};
-                if tag.socket.key()==key {return Err(refused());}
+    pub(crate) fn packet_evidence(
+        &self,
+        packet: &super::nfqueue::Packet<'_>,
+    ) -> io::Result<Option<CapturedSocket>> {
+        if self.journal.redirect.is_some() {
+            return Err(refused());
+        }
+        if packet.queue_identity() == self.queue_identity {
+            if !self.current()? {
+                return Err(refused());
+            }
+            if let (Some(tag), Some(meta)) = (&self.capture, packet.metadata()) {
+                let key = super::packet::FlowKey {
+                    interface: 0,
+                    ..meta.flow
+                };
+                if tag.socket.key() == key {
+                    return Err(refused());
+                }
             }
             return Ok(None);
         }
@@ -955,7 +1087,8 @@ impl LabRules {
                 queue_number,
                 queue_identity: tagged.identity(),
             }),
-            None,false,
+            None,
+            false,
         )
     }
 
@@ -979,58 +1112,124 @@ impl LabRules {
         path: &Path,
         carriers: Vec<LabCarrierSocket>,
     ) -> io::Result<Self> {
-        Self::install_inner(Some(queue),host_namespace,path,carriers,None,None,false)
+        Self::install_inner(
+            Some(queue),
+            host_namespace,
+            path,
+            carriers,
+            None,
+            None,
+            false,
+        )
     }
 
     /// Managed all-destination TCP/UDP redirect in a dedicated namespace.
     /// The caller provisions and owns policy routes for REDIRECT_MARK;
     /// this transaction changes only its journaled inet table.
-    pub fn install_redirect(host_namespace:&File,path:&Path,port:u16)->io::Result<Self> {
-        let scope=RedirectScope{port,loopback:loopback_index()?,policy_queue:None};
+    pub fn install_redirect(host_namespace: &File, path: &Path, port: u16) -> io::Result<Self> {
+        let scope = RedirectScope {
+            port,
+            loopback: loopback_index()?,
+            policy_queue: None,
+        };
         Scope::current(host_namespace)?;
-        if port==0 || !redirect_routes_ready(scope)? {return Err(refused());}
-        Self::install_inner(None,host_namespace,path,Vec::new(),None,Some(scope),false)
+        if port == 0 || !redirect_routes_ready(scope)? {
+            return Err(refused());
+        }
+        Self::install_inner(
+            None,
+            host_namespace,
+            path,
+            Vec::new(),
+            None,
+            Some(scope),
+            false,
+        )
     }
 
     /// One policy queue decides the physical egress or transparent
     /// termination before the first packet leaves the namespace.
-    pub(crate) fn install_unified(queue:&Queue,host:&File,path:&Path,port:u16,host_mode:bool)->io::Result<Self> {
-        let scope=RedirectScope{port,loopback:loopback_index()?,policy_queue:Some(queue.number()?)};
-        Scope::current_mode(host,host_mode)?;
-        if host_mode {host_path(path)?;}
-        if port==0 || !redirect_routes_ready(scope)? {return Err(refused());}
-        Self::install_inner(Some(queue),host,path,Vec::new(),None,Some(scope),host_mode)
+    pub(crate) fn install_unified(
+        queue: &Queue,
+        host: &File,
+        path: &Path,
+        port: u16,
+        host_mode: bool,
+    ) -> io::Result<Self> {
+        let scope = RedirectScope {
+            port,
+            loopback: loopback_index()?,
+            policy_queue: Some(queue.number()?),
+        };
+        Scope::current_mode(host, host_mode)?;
+        if host_mode {
+            host_path(path)?;
+        }
+        if port == 0 || !redirect_routes_ready(scope)? {
+            return Err(refused());
+        }
+        Self::install_inner(
+            Some(queue),
+            host,
+            path,
+            Vec::new(),
+            None,
+            Some(scope),
+            host_mode,
+        )
     }
 
-    pub(crate) fn owns_policy_queue(&self,queue:&Queue)->io::Result<bool> {
-        Ok(self.journal.redirect.and_then(|scope|scope.policy_queue)==Some(queue.number()?) &&
-            queue.identity()==self.queue_identity && self.current()?)
+    pub(crate) fn owns_policy_queue(&self, queue: &Queue) -> io::Result<bool> {
+        Ok(
+            self.journal.redirect.and_then(|scope| scope.policy_queue) == Some(queue.number()?)
+                && queue.identity() == self.queue_identity
+                && self.current()?,
+        )
     }
 
-    pub(crate) fn owns_policy_packet(&self,packet:&super::nfqueue::Packet<'_>)->io::Result<bool> {
-        Ok(self.journal.redirect.and_then(|scope|scope.policy_queue).is_some() &&
-            packet.local_output() && packet.queue_identity()==self.queue_identity && self.current()?)
+    pub(crate) fn owns_policy_packet(
+        &self,
+        packet: &super::nfqueue::Packet<'_>,
+    ) -> io::Result<bool> {
+        Ok(self
+            .journal
+            .redirect
+            .and_then(|scope| scope.policy_queue)
+            .is_some()
+            && packet.local_output()
+            && packet.queue_identity() == self.queue_identity
+            && self.current()?)
     }
 
     /// Check every retained descriptor against the published admissions,
     /// not merely the existence of the nftables table. A changed socket
     /// is terminal for this epoch; shutdown revokes all marks and rules.
-    pub(crate) fn live_admissions(&self)->io::Result<bool> {
-        if self.carrier_retired || !self.current()? ||
-            self.admissions.len()!=self._carriers.len()+self.dynamic.len() {
+    pub(crate) fn live_admissions(&self) -> io::Result<bool> {
+        if self.carrier_retired
+            || !self.current()?
+            || self.admissions.len() != self._carriers.len() + self.dynamic.len()
+        {
             return Ok(false);
         }
-        for socket in self._carriers.iter().chain(self.dynamic.values().map(Arc::as_ref)) {
-            if socket.verify().is_err() || self.admissions.get(&socket.mark())!=Some(&socket.key()) {
+        for socket in self
+            ._carriers
+            .iter()
+            .chain(self.dynamic.values().map(Arc::as_ref))
+        {
+            if socket.verify().is_err()
+                || self.admissions.get(&socket.mark()) != Some(&socket.key())
+            {
                 return Ok(false);
             }
         }
         Ok(true)
     }
 
-    pub(crate) fn redirect_ready(&self,port:u16)->io::Result<bool> {
-        let Some(scope)=self.journal.redirect else {return Ok(false);};
-        Ok(scope.port==port && self.live_admissions()? && redirect_routes_ready(scope)?)
+    pub(crate) fn redirect_ready(&self, port: u16) -> io::Result<bool> {
+        let Some(scope) = self.journal.redirect else {
+            return Ok(false);
+        };
+        Ok(scope.port == port && self.live_admissions()? && redirect_routes_ready(scope)?)
     }
 
     fn install_inner(
@@ -1039,18 +1238,24 @@ impl LabRules {
         path: &Path,
         carriers: Vec<LabCarrierSocket>,
         capture: Option<SocketCapture>,
-        redirect:Option<RedirectScope>,
-        host_mode:bool,
-    )->io::Result<Self> {
-        let lock=scope_lock()?;
-        let scope=Scope::current_mode(host_namespace,host_mode)?;
-        if host_mode {host_path(path)?;} else {check_parent(path)?;}
-        if carriers.len() > MAX_CARRIERS || (capture.is_some() && (!carriers.is_empty() || redirect.is_some())) {
+        redirect: Option<RedirectScope>,
+        host_mode: bool,
+    ) -> io::Result<Self> {
+        let lock = scope_lock()?;
+        let scope = Scope::current_mode(host_namespace, host_mode)?;
+        if host_mode {
+            host_path(path)?;
+        } else {
+            check_parent(path)?;
+        }
+        if carriers.len() > MAX_CARRIERS
+            || (capture.is_some() && (!carriers.is_empty() || redirect.is_some()))
+        {
             return Err(refused());
         }
         let mut marks = std::collections::HashSet::new();
         let mut cookies = std::collections::HashSet::new();
-        let mut keys=std::collections::HashSet::new();
+        let mut keys = std::collections::HashSet::new();
         if let Some(tag) = &capture {
             tag.socket.verify()?;
             marks.insert(tag.socket.mark());
@@ -1059,7 +1264,10 @@ impl LabRules {
         }
         for socket in &carriers {
             socket.verify()?;
-            if !marks.insert(socket.mark()) || !cookies.insert(socket.cookie()) || !keys.insert(socket.key()) {
+            if !marks.insert(socket.mark())
+                || !cookies.insert(socket.cookie())
+                || !keys.insert(socket.key())
+            {
                 return Err(refused());
             }
         }
@@ -1068,26 +1276,43 @@ impl LabRules {
             .as_deref()
             .map(|bytes| parse_journal(bytes, &scope))
             .transpose()?;
-        let net=Netlink::open()?;
-        let before=net.generation()?;
-        if let Some(previous)=previous.as_ref().filter(|j|!j.restored) {
+        let net = Netlink::open()?;
+        let before = net.generation()?;
+        if let Some(previous) = previous.as_ref().filter(|j| !j.restored) {
             // A new boot's guard has the exact unified layout and no
             // carrier entries. Adopt it without removing the DROP chains.
-            if !host_mode || !previous.boot_rearmed || previous.redirect!=redirect ||
-                !carriers.is_empty() || capture.is_some() || queue.is_none() ||
-                previous.installed!=before || !net.table(previous)? || net.generation()?!=before {
+            if !host_mode
+                || !previous.boot_rearmed
+                || previous.redirect != redirect
+                || !carriers.is_empty()
+                || capture.is_some()
+                || queue.is_none()
+                || previous.installed != before
+                || !net.table(previous)?
+                || net.generation()? != before
+            {
                 return Err(refused());
             }
-            let mut journal=previous.clone();
-            journal.boot_rearmed=false;
-            store(path,&journal,old.as_deref())?;
-            if net.generation()?!=before || !net.table(&journal)? || net.generation()?!=before {return Err(refused());}
-            return Ok(Self{
-                _lock:lock,journal,queue_identity:queue.ok_or_else(refused)?.identity(),
-                _carriers:Vec::new(),capture:None,journal_path:path.to_owned(),
-                admissions:Default::default(),dynamic:Default::default(),used_marks:marks,
-                used_cookies:cookies,queue_number:queue.ok_or_else(refused)?.number()?,
-                poisoned:false,carrier_retired:false,
+            let mut journal = previous.clone();
+            journal.boot_rearmed = false;
+            store(path, &journal, old.as_deref())?;
+            if net.generation()? != before || !net.table(&journal)? || net.generation()? != before {
+                return Err(refused());
+            }
+            return Ok(Self {
+                _lock: lock,
+                journal,
+                queue_identity: queue.ok_or_else(refused)?.identity(),
+                _carriers: Vec::new(),
+                capture: None,
+                journal_path: path.to_owned(),
+                admissions: Default::default(),
+                dynamic: Default::default(),
+                used_marks: marks,
+                used_cookies: cookies,
+                queue_number: queue.ok_or_else(refused)?.number()?,
+                poisoned: false,
+                carrier_retired: false,
             });
         }
         // Never overwrite the only journal for a table that unexpectedly
@@ -1110,21 +1335,28 @@ impl LabRules {
             installed,
             previous_present: false,
             redirect,
-            boot_rearmed:false,
-            restored:false,
+            boot_rearmed: false,
+            restored: false,
         };
         if net.table(&journal)? || net.generation()? != before {
             return Err(refused());
         }
-        let queue_number=queue.map(Queue::number).transpose()?.unwrap_or(0);
+        let queue_number = queue.map(Queue::number).transpose()?.unwrap_or(0);
         match redirect {
-            Some(scope) if scope.policy_queue==queue.map(Queue::number).transpose()?=>{},
-            None if queue.is_some()=>{},
-            _=>return Err(refused()),
+            Some(scope) if scope.policy_queue == queue.map(Queue::number).transpose()? => {}
+            None if queue.is_some() => {}
+            _ => return Err(refused()),
         }
-        let mut operations=match redirect {
-            Some(scope)=>redirect_install(&journal,scope,&carriers.iter().map(|socket|(socket.mark(),socket.key())).collect()),
-            None=>install_messages(&journal,queue_number,&carriers),
+        let mut operations = match redirect {
+            Some(scope) => redirect_install(
+                &journal,
+                scope,
+                &carriers
+                    .iter()
+                    .map(|socket| (socket.mark(), socket.key()))
+                    .collect(),
+            ),
+            None => install_messages(&journal, queue_number, &carriers),
         };
         if let Some(tag) = &capture {
             let mut last = operations.pop().ok_or_else(invalid)?;
@@ -1153,7 +1385,7 @@ impl LabRules {
         Ok(Self {
             _lock: lock,
             journal,
-            queue_identity: queue.map(Queue::identity).unwrap_or([0;16]),
+            queue_identity: queue.map(Queue::identity).unwrap_or([0; 16]),
             _carriers: carriers,
             capture,
             journal_path: path.to_owned(),
@@ -1185,15 +1417,20 @@ impl LabRules {
         next.before = generation;
         next.installed = generation.checked_add(1).ok_or_else(refused)?;
         next.previous_present = true;
-        let mut operations=match next.redirect {
-            Some(scope)=>redirect_replace(&next,scope,&next_admissions),
-            None=>replace_messages(&next,self.queue_number,&next_admissions),
+        let mut operations = match next.redirect {
+            Some(scope) => redirect_replace(&next, scope, &next_admissions),
+            None => replace_messages(&next, self.queue_number, &next_admissions),
         };
-        if let Some(tag)=&self.capture {
-            let mut last=operations.pop().ok_or_else(invalid)?;
-            operations.push(socket_capture_rule(&next,tag.socket.key(),tag.socket.mark(),
-                tag.queue_number,operations.len() as u32+2));
-            last[8..12].copy_from_slice(&(operations.len() as u32+2).to_ne_bytes());
+        if let Some(tag) = &self.capture {
+            let mut last = operations.pop().ok_or_else(invalid)?;
+            operations.push(socket_capture_rule(
+                &next,
+                tag.socket.key(),
+                tag.socket.mark(),
+                tag.queue_number,
+                operations.len() as u32 + 2,
+            ));
+            last[8..12].copy_from_slice(&(operations.len() as u32 + 2).to_ne_bytes());
             operations.push(last);
         }
         self.poisoned = true;
@@ -1212,18 +1449,23 @@ impl LabRules {
         Ok(())
     }
     fn admit(&mut self, socket: Arc<LabCarrierSocket>) -> io::Result<()> {
-        if self.carrier_retired || self.poisoned || self.admissions.len() >= MAX_CARRIERS
+        if self.carrier_retired
+            || self.poisoned
+            || self.admissions.len() >= MAX_CARRIERS
             || self.used_marks.len() >= MAX_CARRIER_EPOCH
             || reserved_mark(socket.mark())
             || self.used_marks.contains(&socket.mark())
             || self.used_cookies.contains(&socket.cookie())
-            || self.admissions.values().any(|key|*key==socket.key())
-            || self.capture.as_ref().is_some_and(|tag|tag.socket.key()==socket.key())
+            || self.admissions.values().any(|key| *key == socket.key())
+            || self
+                .capture
+                .as_ref()
+                .is_some_and(|tag| tag.socket.key() == socket.key())
         {
             return Err(refused());
         }
         socket.verify()?;
-        let mark=socket.mark();
+        let mark = socket.mark();
         // Tombstones precede publication, including uncertain failure.
         // Never allow an old rule to authorize a recycled random mark.
         self.used_marks.insert(mark);
@@ -1231,7 +1473,7 @@ impl LabRules {
         let mut next = self.admissions.clone();
         next.insert(mark, socket.key());
         self.replace_admissions(next)?;
-        self.dynamic.insert(mark,socket);
+        self.dynamic.insert(mark, socket);
         Ok(())
     }
 
@@ -1239,19 +1481,27 @@ impl LabRules {
     /// chain and non-bypass NFQUEUE in place. Rule ownership and mark
     /// reset failures are terminal; never restore or re-admit on error.
     fn retire_carriers(&mut self) -> io::Result<()> {
-        self.carrier_retired=true;
-        let mut cleared=true;
-        for socket in self._carriers.iter().chain(self.dynamic.values().map(Arc::as_ref)) {
-            if socket.clear_mark().is_err() { cleared=false; }
+        self.carrier_retired = true;
+        let mut cleared = true;
+        for socket in self
+            ._carriers
+            .iter()
+            .chain(self.dynamic.values().map(Arc::as_ref))
+        {
+            if socket.clear_mark().is_err() {
+                cleared = false;
+            }
         }
-        let removed=if self.admissions.is_empty() {
+        let removed = if self.admissions.is_empty() {
             Ok(())
         } else {
             self.replace_admissions(Default::default())
         };
-        if removed.is_ok() { self.dynamic.clear(); }
+        if removed.is_ok() {
+            self.dynamic.clear();
+        }
         if !cleared || removed.is_err() {
-            self.poisoned=true;
+            self.poisoned = true;
             return Err(refused());
         }
         Ok(())
@@ -1284,7 +1534,7 @@ impl Drop for LabRules {
         // No implicit rule restoration. If the owner is dropped on a
         // failed start or cancellation, disable retained descriptors
         // before ownership is released. Explicit recovery owns deletion.
-        let _=self.retire_carriers();
+        let _ = self.retire_carriers();
     }
 }
 
@@ -1362,12 +1612,12 @@ impl Drop for DynamicAdmission {
                 // after an uncertain descriptor reset.
                 if !cleared || !revoked {
                     rules.poisoned = true;
-                    rules.carrier_retired=true;
-                    let _=rules.retire_carriers();
+                    rules.carrier_retired = true;
+                    let _ = rules.retire_carriers();
                 }
             } else {
                 // A poisoned mutex must not prevent a mark reset.
-                let _=socket.clear_mark();
+                let _ = socket.clear_mark();
             }
         }
     }
@@ -1383,8 +1633,11 @@ impl LabRegistrar {
         Self { rules, host }
     }
     fn admit(&self, socket: LabCarrierSocket) -> io::Result<super::carrier_socket::Lease> {
-        let socket=Arc::new(socket);
-        self.rules.lock().map_err(|_| refused())?.admit(socket.clone())?;
+        let socket = Arc::new(socket);
+        self.rules
+            .lock()
+            .map_err(|_| refused())?
+            .admit(socket.clone())?;
         // Reset socket mark before releasing the rules ownership lock.
         Ok(super::carrier_socket::Lease::retain(DynamicAdmission {
             socket: Some(socket),
@@ -1398,36 +1651,60 @@ impl super::carrier_socket::Registrar for LabRegistrar {
         socket: &tokio::net::TcpSocket,
         peer: std::net::SocketAddr,
     ) -> io::Result<super::carrier_socket::Lease> {
-        let host_mode=self.rules.lock().map_err(|_|refused())?.journal.scope.machine.is_some();
-        self.admit(LabCarrierSocket::pending_tcp(socket,peer,&self.host,host_mode)?)
+        let host_mode = self
+            .rules
+            .lock()
+            .map_err(|_| refused())?
+            .journal
+            .scope
+            .machine
+            .is_some();
+        self.admit(LabCarrierSocket::pending_tcp(
+            socket, peer, &self.host, host_mode,
+        )?)
     }
     fn udp(
         &self,
         socket: &tokio::net::UdpSocket,
         peer: std::net::SocketAddr,
     ) -> io::Result<super::carrier_socket::Lease> {
-        let host_mode=self.rules.lock().map_err(|_|refused())?.journal.scope.machine.is_some();
-        self.admit(LabCarrierSocket::pending_udp(socket,peer,&self.host,host_mode)?)
+        let host_mode = self
+            .rules
+            .lock()
+            .map_err(|_| refused())?
+            .journal
+            .scope
+            .machine
+            .is_some();
+        self.admit(LabCarrierSocket::pending_udp(
+            socket, peer, &self.host, host_mode,
+        )?)
     }
-    fn udp_reply(&self,socket:&tokio::net::UdpSocket,peer:std::net::SocketAddr)
-        ->io::Result<super::carrier_socket::Lease> {
+    fn udp_reply(
+        &self,
+        socket: &tokio::net::UdpSocket,
+        peer: std::net::SocketAddr,
+    ) -> io::Result<super::carrier_socket::Lease> {
         {
-            let rules=self.rules.lock().map_err(|_|refused())?;
+            let rules = self.rules.lock().map_err(|_| refused())?;
             if rules.journal.redirect.is_some() {
                 // In the managed redirect backend, a reverse socket
                 // belongs only to the local path. Never grant a physical
                 // carrier exception to its nonlocal source address.
-                if rules.carrier_retired || !rules.current()? ||
-                    socket.peer_addr()?!=peer || !super::linux_ingress::is_local_ip(peer.ip())? {
+                if rules.carrier_retired
+                    || !rules.current()?
+                    || socket.peer_addr()? != peer
+                    || !super::linux_ingress::is_local_ip(peer.ip())?
+                {
                     return Err(refused());
                 }
                 return Ok(Default::default());
             }
         }
-        self.udp(socket,peer)
+        self.udp(socket, peer)
     }
     fn retire(&self) -> io::Result<()> {
-        self.rules.lock().map_err(|_|refused())?.retire_carriers()
+        self.rules.lock().map_err(|_| refused())?.retire_carriers()
     }
 }
 
@@ -1442,10 +1719,13 @@ pub fn reconcile_after_reboot(host_namespace: &File, path: &Path) -> io::Result<
     let scope = Scope::current(host_namespace)?;
     check_parent(path)?;
     let raw = journal_bytes(path)?.ok_or_else(refused)?;
-    let mut journal: Journal = toml::from_str(std::str::from_utf8(&raw).map_err(|_| invalid())?)
-        .map_err(|_| invalid())?;
+    let mut journal: Journal =
+        toml::from_str(std::str::from_utf8(&raw).map_err(|_| invalid())?).map_err(|_| invalid())?;
     journal.validate(&journal.scope)?;
-    if journal.scope.machine.is_some() || !valid_boot_id(&journal.scope.boot) || journal.scope.boot==scope.boot {
+    if journal.scope.machine.is_some()
+        || !valid_boot_id(&journal.scope.boot)
+        || journal.scope.boot == scope.boot
+    {
         return Err(refused());
     }
     let net = Netlink::open()?;
@@ -1467,18 +1747,22 @@ pub fn reconcile_after_reboot(host_namespace: &File, path: &Path) -> io::Result<
 /// Explicit recovery, after the previous LabRules lease is dropped. A
 /// foreign change anywhere in this namespace makes deletion fail closed.
 /// No forced flush, no whole-ruleset restoration, no table-name guessing.
-pub fn recover(host_namespace:&File,path:&Path)->io::Result<()> {
-    recover_mode(host_namespace,path,false)
+pub fn recover(host_namespace: &File, path: &Path) -> io::Result<()> {
+    recover_mode(host_namespace, path, false)
 }
-pub fn recover_host_guard(host_namespace:&File)->io::Result<()> {
-    recover_mode(host_namespace,Path::new(HOST_GUARD_JOURNAL),true)
+pub fn recover_host_guard(host_namespace: &File) -> io::Result<()> {
+    recover_mode(host_namespace, Path::new(HOST_GUARD_JOURNAL), true)
 }
-pub(crate) fn recover_mode(host_namespace:&File,path:&Path,host_mode:bool)->io::Result<()> {
-    let _lock=scope_lock()?;
-    let scope=Scope::current_mode(host_namespace,host_mode)?;
-    if host_mode {host_path(path)?;} else {check_parent(path)?;}
-    let Some(raw)=journal_bytes(path)? else {
-        return policy_routes::recover_if_present(host_namespace,path,host_mode);
+pub(crate) fn recover_mode(host_namespace: &File, path: &Path, host_mode: bool) -> io::Result<()> {
+    let _lock = scope_lock()?;
+    let scope = Scope::current_mode(host_namespace, host_mode)?;
+    if host_mode {
+        host_path(path)?;
+    } else {
+        check_parent(path)?;
+    }
+    let Some(raw) = journal_bytes(path)? else {
+        return policy_routes::recover_if_present(host_namespace, path, host_mode);
     };
     let mut journal = parse_journal(&raw, &scope)?;
     let net = Netlink::open()?;
@@ -1490,14 +1774,18 @@ pub(crate) fn recover_mode(host_namespace:&File,path:&Path,host_mode:bool)->io::
     if journal.restored {
         // Idempotence is evidence of absence, not permission to delete
         // an object that appeared after the recorded restoration.
-        if present {return Err(refused());}
-        return policy_routes::recover_if_present(host_namespace,path,host_mode);
+        if present {
+            return Err(refused());
+        }
+        return policy_routes::recover_if_present(host_namespace, path, host_mode);
     }
     let expected = if present {
         journal.recovery_generation(generation)?;
         // Routes are restored before the owned firewall guard is removed.
-        policy_routes::recover_if_present(host_namespace,path,host_mode)?;
-        if net.generation()?!=generation || !net.table(&journal)? {return Err(refused());}
+        policy_routes::recover_if_present(host_namespace, path, host_mode)?;
+        if net.generation()? != generation || !net.table(&journal)? {
+            return Err(refused());
+        }
         let after = generation.checked_add(1).ok_or_else(refused)?;
         crate::config::guarded_trust_assert(path, &raw).map_err(|_| refused())?;
         let mut attrs = Vec::new();
@@ -1508,7 +1796,7 @@ pub(crate) fn recover_mode(host_namespace:&File,path:&Path,host_mode:bool)->io::
         )?;
         after
     } else {
-        policy_routes::recover_if_present(host_namespace,path,host_mode)?;
+        policy_routes::recover_if_present(host_namespace, path, host_mode)?;
         generation
     };
     // A stable absence observation is required even if a prior recovery
@@ -1517,8 +1805,8 @@ pub(crate) fn recover_mode(host_namespace:&File,path:&Path,host_mode:bool)->io::
         return Err(refused());
     }
     journal.restored = true;
-    journal.boot_rearmed=false;
-    store(path,&journal,Some(&raw))?;
+    journal.boot_rearmed = false;
+    store(path, &journal, Some(&raw))?;
     Ok(())
 }
 
@@ -1526,40 +1814,78 @@ pub(crate) fn recover_mode(host_namespace:&File,path:&Path,host_mode:bool)->io::
 /// queue is absent and every nonlocal IP packet is dropped. No carrier,
 /// DNS, rule deletion, user policy fetch or production readiness here.
 /// The unit is separately provisioned by a local administrator.
-pub fn rearm_host_guard(host_namespace:&File)->io::Result<()> {
-    let path=Path::new(HOST_GUARD_JOURNAL);
-    let _lock=scope_lock()?;
-    let scope=Scope::current_mode(host_namespace,true)?;
+pub fn rearm_host_guard(host_namespace: &File) -> io::Result<()> {
+    let path = Path::new(HOST_GUARD_JOURNAL);
+    let _lock = scope_lock()?;
+    let scope = Scope::current_mode(host_namespace, true)?;
     host_path(path)?;
-    let raw=journal_bytes(path)?.ok_or_else(refused)?;
-    let old:Journal=toml::from_str(std::str::from_utf8(&raw).map_err(|_|invalid())?).map_err(|_|invalid())?;
+    let raw = journal_bytes(path)?.ok_or_else(refused)?;
+    let old: Journal =
+        toml::from_str(std::str::from_utf8(&raw).map_err(|_| invalid())?).map_err(|_| invalid())?;
     old.validate(&old.scope)?;
-    if old.scope.machine!=scope.machine || !valid_boot_id(&old.scope.boot) {return Err(refused());}
-    let net=Netlink::open()?;
-    let generation=net.generation()?;
-    let present=net.table(&old)?;
-    if net.generation()?!=generation {return Err(refused());}
-    if old.restored {return if present {Err(refused())}else{Ok(())};}
-    let (journal,intent)=if old.scope.boot==scope.boot {
-        if old.scope!=scope {return Err(refused());}
-        if present && generation==old.installed {return Ok(());}
-        if present || !old.boot_rearmed || generation!=old.before {return Err(refused());}
-        (old,raw) // retry an interrupted create-only boot intent
+    if old.scope.machine != scope.machine || !valid_boot_id(&old.scope.boot) {
+        return Err(refused());
+    }
+    let net = Netlink::open()?;
+    let generation = net.generation()?;
+    let present = net.table(&old)?;
+    if net.generation()? != generation {
+        return Err(refused());
+    }
+    if old.restored {
+        return if present { Err(refused()) } else { Ok(()) };
+    }
+    let (journal, intent) = if old.scope.boot == scope.boot {
+        if old.scope != scope {
+            return Err(refused());
+        }
+        if present && generation == old.installed {
+            return Ok(());
+        }
+        if present || !old.boot_rearmed || generation != old.before {
+            return Err(refused());
+        }
+        (old, raw) // retry an interrupted create-only boot intent
     } else {
-        if present {return Err(refused());} // never delete old-boot objects
-        let mut redirect=old.redirect.ok_or_else(refused)?;
-        redirect.loopback=loopback_index()?;
-        let mut nonce=[0u8;16];SystemRandom::new().fill(&mut nonce).map_err(|_|refused())?;
-        let journal=Journal{version:1,scope,nonce,before:generation,
-            installed:generation.checked_add(1).ok_or_else(refused)?,
-            previous_present:false,redirect:Some(redirect),boot_rearmed:true,restored:false};
-        if net.table(&journal)? || net.generation()?!=generation {return Err(refused());}
-        let intent=store(path,&journal,Some(&raw))?;
-        (journal,intent)
+        if present {
+            return Err(refused());
+        } // never delete old-boot objects
+        let mut redirect = old.redirect.ok_or_else(refused)?;
+        redirect.loopback = loopback_index()?;
+        let mut nonce = [0u8; 16];
+        SystemRandom::new()
+            .fill(&mut nonce)
+            .map_err(|_| refused())?;
+        let journal = Journal {
+            version: 1,
+            scope,
+            nonce,
+            before: generation,
+            installed: generation.checked_add(1).ok_or_else(refused)?,
+            previous_present: false,
+            redirect: Some(redirect),
+            boot_rearmed: true,
+            restored: false,
+        };
+        if net.table(&journal)? || net.generation()? != generation {
+            return Err(refused());
+        }
+        let intent = store(path, &journal, Some(&raw))?;
+        (journal, intent)
     };
-    crate::config::guarded_trust_assert(path,&intent).map_err(|_|refused())?;
-    net.batch(journal.before,&redirect_install(&journal,journal.redirect.ok_or_else(refused)?,&Default::default()))?;
-    if net.generation()?!=journal.installed || !net.table(&journal)? || net.generation()?!=journal.installed {
+    crate::config::guarded_trust_assert(path, &intent).map_err(|_| refused())?;
+    net.batch(
+        journal.before,
+        &redirect_install(
+            &journal,
+            journal.redirect.ok_or_else(refused)?,
+            &Default::default(),
+        ),
+    )?;
+    if net.generation()? != journal.installed
+        || !net.table(&journal)?
+        || net.generation()? != journal.installed
+    {
         return Err(refused());
     }
     Ok(())
@@ -1574,16 +1900,16 @@ mod tests {
             scope: Scope {
                 boot: "test".into(),
                 dev: 1,
-                ino:2,
-                machine:None,
+                ino: 2,
+                machine: None,
             },
             nonce: [7; 16],
             before: 12,
             installed: 13,
             previous_present: false,
-            redirect:None,
-            boot_rearmed:false,
-            restored:false,
+            redirect: None,
+            boot_rearmed: false,
+            restored: false,
         }
     }
     #[test]
@@ -1771,9 +2097,12 @@ mod tests {
             // The four real transparent sockets must be provisioned before
             // rule installation, and must not be bindable by another owner.
             let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all().build().unwrap();
+                .enable_all()
+                .build()
+                .unwrap();
             let _entered = rt.enter();
-            let listeners = super::super::linux_ingress::RedirectListeners::bind(&host, 49001).unwrap();
+            let listeners =
+                super::super::linux_ingress::RedirectListeners::bind(&host, 49001).unwrap();
             assert_eq!(listeners.port(), 49001);
             assert!(super::super::linux_ingress::RedirectListeners::bind(&host, 49001).is_err());
             let lease = LabRules::install(&queue, &host, &path).unwrap();
@@ -1882,21 +2211,24 @@ mod tests {
                 assert_eq!(proof.cookie(), cookie);
                 assert_eq!(proof.key().source, sender.local_addr().unwrap());
                 assert_eq!(proof.key().destination, receiver.local_addr().unwrap());
-                assert_eq!(lease.packet_evidence(&packet).unwrap(),Some(proof));
+                assert_eq!(lease.packet_evidence(&packet).unwrap(), Some(proof));
                 lease.replace_admissions(Default::default()).unwrap();
-                assert_ne!(lease.packet_evidence(&packet).unwrap(),Some(proof));
+                assert_ne!(lease.packet_evidence(&packet).unwrap(), Some(proof));
                 packet.finish(super::super::PacketAction::Drop).unwrap();
             }
             sender.send(b"still-tagged").unwrap();
             {
-                let packet=tagged.receive().unwrap();
-                assert_eq!(lease.packet_evidence(&packet).unwrap().unwrap().cookie(),cookie);
+                let packet = tagged.receive().unwrap();
+                assert_eq!(
+                    lease.packet_evidence(&packet).unwrap().unwrap().cookie(),
+                    cookie
+                );
                 packet.finish(super::super::PacketAction::Drop).unwrap();
             }
             lease.capture.as_ref().unwrap().socket.clear_mark().unwrap();
             sender.send(b"unmarked").unwrap();
             {
-                let packet=queue.receive().unwrap();
+                let packet = queue.receive().unwrap();
                 assert!(lease.packet_evidence(&packet).is_err());
                 packet.finish(super::super::PacketAction::Drop).unwrap();
             }
@@ -1904,7 +2236,7 @@ mod tests {
             {
                 let packet = queue.receive().unwrap();
                 assert!(lease.captured_socket(&packet).is_err());
-                assert_eq!(lease.packet_evidence(&packet).unwrap(),None);
+                assert_eq!(lease.packet_evidence(&packet).unwrap(), None);
                 packet.finish(super::super::PacketAction::Drop).unwrap();
             }
             drop(lease);
@@ -1966,7 +2298,7 @@ mod tests {
                     assert!(rules.lock().unwrap().current().unwrap());
                     // The same live descriptor cannot receive a new lease
                     // in the same epoch even after its original rule is gone.
-                    assert!(registrar.udp(&socket,peer).is_err());
+                    assert!(registrar.udp(&socket, peer).is_err());
                     socket.send(b"revoked").await.unwrap();
                     let packet = queue.receive().unwrap();
                     assert!(rules.lock().unwrap().owns_packet(&packet).unwrap());
@@ -1978,16 +2310,19 @@ mod tests {
                 }
                 // Owner retirement is stronger than dropping one lease:
                 // hold both the original socket and lease alive.
-                let socket=tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-                let held=registrar.udp(&socket,peer).unwrap();
+                let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let held = registrar.udp(&socket, peer).unwrap();
                 socket.connect(peer).await.unwrap();
                 registrar.retire().unwrap();
                 assert!(rules.lock().unwrap().admissions.is_empty());
                 assert!(rules.lock().unwrap().current().unwrap());
-                assert!(registrar.udp(&socket,peer).is_err());
+                assert!(registrar.udp(&socket, peer).is_err());
                 socket.send(b"retired").await.unwrap();
-                let packet=queue.receive().unwrap();
-                assert_eq!(packet.metadata().unwrap().flow.source,socket.local_addr().unwrap());
+                let packet = queue.receive().unwrap();
+                assert_eq!(
+                    packet.metadata().unwrap().flow.source,
+                    socket.local_addr().unwrap()
+                );
                 packet.finish(super::super::PacketAction::Drop).unwrap();
                 drop(held);
                 assert!(rules.lock().unwrap().current().unwrap());
@@ -2015,29 +2350,37 @@ mod tests {
 
     #[test]
     fn redirect_transaction_keeps_all_three_egress_gates_bounded() {
-        let mut j=journal();
-        let scope=RedirectScope{port:49001,loopback:1,policy_queue:Some(49000)};
-        j.redirect=Some(scope);
-        let mut admissions=std::collections::BTreeMap::new();
+        let mut j = journal();
+        let scope = RedirectScope {
+            port: 49001,
+            loopback: 1,
+            policy_queue: Some(49000),
+        };
+        j.redirect = Some(scope);
+        let mut admissions = std::collections::BTreeMap::new();
         for n in 0..MAX_CARRIERS {
-            admissions.insert(100+n as u32,super::super::packet::FlowKey{
-                source:std::net::SocketAddr::from(([192,0,2,1],10000+n as u16)),
-                destination:"198.51.100.2:443".parse().unwrap(),
-                transport:super::super::packet::Transport::Udp,interface:0,
-            });
+            admissions.insert(
+                100 + n as u32,
+                super::super::packet::FlowKey {
+                    source: std::net::SocketAddr::from(([192, 0, 2, 1], 10000 + n as u16)),
+                    destination: "198.51.100.2:443".parse().unwrap(),
+                    transport: super::super::packet::Transport::Udp,
+                    interface: 0,
+                },
+            );
         }
-        let installed=redirect_install(&j,scope,&admissions);
-        let updated=redirect_replace(&j,scope,&admissions);
-        assert!(installed.len()<=MAX_RULE_OPERATIONS);
-        assert!(updated.len()<=MAX_RULE_OPERATIONS);
-        for operations in [&installed,&updated] {
-            for (index,msg) in operations.iter().enumerate() {
-                let (_,sequence,_)=checked_header(msg).unwrap();
-                assert_eq!(sequence,index as u32+2);
+        let installed = redirect_install(&j, scope, &admissions);
+        let updated = redirect_replace(&j, scope, &admissions);
+        assert!(installed.len() <= MAX_RULE_OPERATIONS);
+        assert!(updated.len() <= MAX_RULE_OPERATIONS);
+        for operations in [&installed, &updated] {
+            for (index, msg) in operations.iter().enumerate() {
+                let (_, sequence, _) = checked_header(msg).unwrap();
+                assert_eq!(sequence, index as u32 + 2);
             }
         }
-        let empty=redirect_replace(&j,scope,&Default::default());
-        assert_eq!(updated.len()-empty.len(),3*MAX_CARRIERS);
+        let empty = redirect_replace(&j, scope, &Default::default());
+        assert_eq!(updated.len() - empty.len(), 3 * MAX_CARRIERS);
     }
 
     #[test]

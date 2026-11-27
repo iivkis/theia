@@ -37,7 +37,8 @@ pub enum IpifyConsent {
 const MAX_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_RESPONSE_HEADER: usize = 4096;
 const MAX_RESPONSE_BODY: usize = 64;
-static ACTIVE_EGRESS_REQUESTS: crate::net::probe::ProbeBudget = crate::net::probe::ProbeBudget::new(2);
+static ACTIVE_EGRESS_REQUESTS: crate::net::probe::ProbeBudget =
+    crate::net::probe::ProbeBudget::new(2);
 
 /// Caller-granted scope, not automatically derived from a local interface,
 /// provider CIDR, popular domain, or external service response. Only a single
@@ -289,7 +290,8 @@ pub async fn observe_public_egress(
     if !matches!(server_name, ServerName::DnsName(_)) {
         return Err(EgressError::InvalidRequest);
     }
-    let tls = crate::net::tls::roots_tls13(roots, b"http/1.1").map_err(|_| EgressError::TlsRejected)?;
+    let tls =
+        crate::net::tls::roots_tls13(roots, b"http/1.1").map_err(|_| EgressError::TlsRejected)?;
     let connector = TlsConnector::from(Arc::new(tls));
     let source = EgressSource {
         server_name: request.server_name.clone(),

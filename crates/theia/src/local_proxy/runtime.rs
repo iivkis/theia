@@ -228,7 +228,8 @@ impl ClientRuntime {
     }
 
     pub(super) fn quiesce_locked(&self) {
-        self.admission.store(false, std::sync::atomic::Ordering::Release);
+        self.admission
+            .store(false, std::sync::atomic::Ordering::Release);
         self.slot.borrow().client.routing_cache().policy.retire();
     }
 
@@ -398,7 +399,10 @@ impl ClientRuntime {
         let revision = expected.checked_add(1).ok_or(ClientError::Configuration)?;
         // Disconnect and publication cannot cross each other between the
         // final admission check and the new generation becoming visible.
-        let _publication = self.publication.lock().map_err(|_| ClientError::Configuration)?;
+        let _publication = self
+            .publication
+            .lock()
+            .map_err(|_| ClientError::Configuration)?;
         saved_client_bytes(&self.path, digest)?;
         if !self.admitting() || *self.stopped.borrow() {
             return Err(ClientError::Configuration);
@@ -426,4 +430,3 @@ impl ClientRuntime {
         }
     }
 }
-

@@ -176,9 +176,16 @@ impl Ledger {
     /// Read before ACK processing retires ACK-only timestamps. The caller
     /// must validate the entire ACK before using this evidence.
     pub(crate) fn sent_at(&self, number: u64) -> Option<Instant> {
-        self.congestion_history.get(&number).map(|(at, _)| *at)
+        self.congestion_history
+            .get(&number)
+            .map(|(at, _)| *at)
             .or_else(|| self.ack_only.get(&number).copied())
-            .or_else(|| self.sent.iter().find(|packet| packet.number == number).map(|packet| packet.at))
+            .or_else(|| {
+                self.sent
+                    .iter()
+                    .find(|packet| packet.number == number)
+                    .map(|packet| packet.at)
+            })
             .or_else(|| self.recent_lost.get(&number).map(|packet| packet.at))
     }
 

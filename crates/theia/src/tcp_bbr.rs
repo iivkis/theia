@@ -154,10 +154,16 @@ pub(crate) async fn connect_carrier(
     for address in tokio::net::lookup_host(endpoint).await? {
         let socket = new_socket(address)?;
         let lease = carrier_socket::admit_tcp_dial(&socket, address).map_err(|error| {
-            if error.kind() == io::ErrorKind::PermissionDenied { Error::Unavailable } else { Error::Network }
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                Error::Unavailable
+            } else {
+                Error::Network
+            }
         })?;
         if let Ok(stream) = socket.connect(address).await {
-            if stream.peer_addr().ok() != Some(address) { return Err(Error::Unavailable); }
+            if stream.peer_addr().ok() != Some(address) {
+                return Err(Error::Unavailable);
+            }
             let controller = verify(&stream)?;
             return Ok((stream, controller, lease));
         }

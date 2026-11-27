@@ -1,7 +1,10 @@
 //! Runtime-owned policy publication and consent, independent of any egress.
-use crate::client::ClientError;
-use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
 use super::client_state::LocalPolicy;
+use crate::client::ClientError;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
+};
 
 pub(crate) fn stale_policy() -> ClientError {
     crate::traffic::dpi_policy_stale();
@@ -62,13 +65,17 @@ impl PolicyState {
 
     fn current_epoch(&self, digest: [u8; 32]) -> Option<u64> {
         let mut policy = self.policy.lock().ok()?;
-        if self.retired() { return None; }
+        if self.retired() {
+            return None;
+        }
         if policy.as_ref().is_some_and(|lease| !lease.valid_current()) {
             *policy = None;
             self.policy_epoch.fetch_add(1, Ordering::AcqRel);
             return None;
         }
-        policy.as_ref().filter(|lease| lease.matches_digest(digest))?;
+        policy
+            .as_ref()
+            .filter(|lease| lease.matches_digest(digest))?;
         Some(self.policy_epoch.load(Ordering::Acquire))
     }
 
@@ -89,7 +96,11 @@ impl PolicyState {
     }
 
     pub(crate) fn pin(self: &Arc<Self>, digest: [u8; 32]) -> Result<PolicyLease, ClientError> {
-        Ok(PolicyLease { state: self.clone(), digest, epoch: self.policy_epoch(digest)? })
+        Ok(PolicyLease {
+            state: self.clone(),
+            digest,
+            epoch: self.policy_epoch(digest)?,
+        })
     }
 }
 
@@ -101,17 +112,27 @@ pub(crate) struct PolicyLease {
     epoch: u64,
 }
 impl PolicyLease {
-    pub(crate) fn digest(&self) -> [u8; 32] { self.digest }
-    pub(crate) fn epoch(&self) -> u64 { self.epoch }
+    pub(crate) fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
     pub(crate) fn check_owner(&self, owner: &Arc<PolicyState>) -> Result<(), ClientError> {
-        if !Arc::ptr_eq(&self.state, owner) { return Err(stale_policy()); }
+        if !Arc::ptr_eq(&self.state, owner) {
+            return Err(stale_policy());
+        }
         self.check()
     }
     pub(crate) fn check(&self) -> Result<(), ClientError> {
-        if self.state.policy_epoch(self.digest)? != self.epoch { return Err(stale_policy()); }
+        if self.state.policy_epoch(self.digest)? != self.epoch {
+            return Err(stale_policy());
+        }
         Ok(())
     }
-    pub(crate) fn modify_enabled(&self) -> bool { self.state.enabled() }
+    pub(crate) fn modify_enabled(&self) -> bool {
+        self.state.enabled()
+    }
 }
 
 #[cfg(test)]
@@ -120,7 +141,7 @@ mod tests {
     #[test]
     fn revocation_and_republication_cannot_revive_a_lease() {
         let authority = Arc::new(PolicyState::default());
-        let digest = [7;32];
+        let digest = [7; 32];
         authority.authorize_policy(Some(LocalPolicy::fixture(digest)));
         let lease = authority.pin(digest).unwrap();
         authority.set_enabled(false);

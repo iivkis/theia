@@ -12,10 +12,10 @@ pub(crate) use runtime::ClientRuntime;
 mod native;
 #[cfg(windows)]
 mod system_proxy;
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-pub use native::NativeIngress;
 #[cfg(target_os = "linux")]
 pub use native::LabStunPermit;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub use native::NativeIngress;
 #[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
 use native::NativeOwner;
 #[cfg(windows)]
@@ -115,7 +115,10 @@ async fn load_client_with_budget(
         .path_prefix
         .as_deref()
         .ok_or(ClientError::Configuration)?;
-    let reference = profile.tls_ca.as_deref().ok_or(ClientError::Configuration)?;
+    let reference = profile
+        .tls_ca
+        .as_deref()
+        .ok_or(ClientError::Configuration)?;
     let (trust, identity) = if let Some(anchor) = crate::own_tls::Anchor::parse(reference) {
         (crate::own_tls::Trust::Pinned(anchor), anchor.bytes())
     } else {
@@ -124,7 +127,8 @@ async fn load_client_with_budget(
         let identity = Sha256::digest(cert.as_slice()).into();
         let mut roots = RootCertStore::empty();
         for cert in rustls_pemfile::certs(&mut BufReader::new(cert.as_slice())) {
-            roots.add(cert.map_err(|_| ClientError::Configuration)?)
+            roots
+                .add(cert.map_err(|_| ClientError::Configuration)?)
                 .map_err(|_| ClientError::Configuration)?;
         }
         (crate::own_tls::Trust::Roots(roots), identity)
@@ -185,10 +189,15 @@ async fn load_client_with_budget(
             // Both carriers use the same resolved endpoint. Do not resolve
             // the hostname again during fallback; retain the configured SNI,
             // trust anchors, certificate pin and authorization unchanged.
-            let h2 = H2Client::new_with_trust(&remote.to_string(), &profile.server_name, &token, &trust)?
-                .with_path_prefix(prefix)?
-                .with_own_tls_policy()?
-                .with_stream_up(stream_up)?;
+            let h2 = H2Client::new_with_trust(
+                &remote.to_string(),
+                &profile.server_name,
+                &token,
+                &trust,
+            )?
+            .with_path_prefix(prefix)?
+            .with_own_tls_policy()?
+            .with_stream_up(stream_up)?;
             let h2 = h2.with_connection_pool();
             let h2 = Arc::new(if auto_xhttp {
                 h2.with_auto_stream_up(ttl)?
@@ -208,7 +217,10 @@ async fn resolve_server(profile: &Profile) -> Result<SocketAddr, ClientError> {
     // native owner is preparing or controlling DNS. A literal pinned
     // carrier endpoint is mandatory until protected bootstrap exists.
     if crate::routing::carrier_socket::active() {
-        return profile.server.parse::<SocketAddr>().map_err(|_|ClientError::Configuration);
+        return profile
+            .server
+            .parse::<SocketAddr>()
+            .map_err(|_| ClientError::Configuration);
     }
     timeout(NEGOTIATE_TIMEOUT, tokio::net::lookup_host(&profile.server))
         .await
@@ -394,9 +406,15 @@ impl RealityClient {
         self.open_for(address, port, true).await
     }
 
-    async fn open_for(&self, address: Address, port: u16, allow_dpi: bool) -> Result<RoutedTcp, ClientError> {
+    async fn open_for(
+        &self,
+        address: Address,
+        port: u16,
+        allow_dpi: bool,
+    ) -> Result<RoutedTcp, ClientError> {
         let generation = self.generation().await?;
-        let mut result = routed_open(&generation.carrier, &self.routing, address, port, allow_dpi).await;
+        let mut result =
+            routed_open(&generation.carrier, &self.routing, address, port, allow_dpi).await;
         if let Ok(tunnel) = &mut result {
             if let ProxyTunnel::Dpi(route) = &mut tunnel.tunnel {
                 route.observed = Some(generation.last_open.clone());
@@ -551,7 +569,9 @@ impl RealityClient {
 /// Preserve the established route observation contract for existing callers.
 pub(crate) fn route_source(remote: SocketAddr) -> Option<SocketAddr> {
     let mut local = crate::routing::carrier_socket::selected_source(remote).ok()?;
-    if local.ip().is_unspecified() { return None; }
+    if local.ip().is_unspecified() {
+        return None;
+    }
     local.set_port(0);
     Some(local)
 }
@@ -559,11 +579,11 @@ pub(crate) fn route_source(remote: SocketAddr) -> Option<SocketAddr> {
 #[cfg(target_os = "windows")]
 pub(crate) use crate::routing::carrier_socket::windows_route_binding;
 
+#[cfg(test)]
+use crate::net::evidence::ScopedDecision as NegativeCache;
 use auto::AutoClient;
 #[cfg(test)]
 use auto::AUTO_QUIC_ATTEMPTS;
-#[cfg(test)]
-use crate::net::evidence::ScopedDecision as NegativeCache;
 
 enum ProxyTunnel {
     Direct(TcpStream),
@@ -591,15 +611,20 @@ impl RoutedTcp {
     async fn relay_http(self, socket: TcpStream, request: Vec<u8>) -> Result<(), ClientError> {
         // A single absolute-form request owns this stream. No subsequent
         // request can reuse the selected destination or bypass policy.
-        let local = HttpOnce { socket, request: request.into() };
+        let local = HttpOnce {
+            socket,
+            request: request.into(),
+        };
         let flow = Some(&self.flow);
         let relay = async {
             match self.tunnel {
-            ProxyTunnel::Direct(target) => client_state::relay_http_direct_guarded(local, target, flow).await,
-            ProxyTunnel::H2(tunnel) => tunnel.relay_guarded(local, flow).await,
-            ProxyTunnel::H3(tunnel) => tunnel.relay_guarded(local, flow).await,
-            // Plain HTTP is known not to be a TLS ClientHello before OPEN.
-            ProxyTunnel::Dpi(_) => Err(ClientError::Protocol),
+                ProxyTunnel::Direct(target) => {
+                    client_state::relay_http_direct_guarded(local, target, flow).await
+                }
+                ProxyTunnel::H2(tunnel) => tunnel.relay_guarded(local, flow).await,
+                ProxyTunnel::H3(tunnel) => tunnel.relay_guarded(local, flow).await,
+                // Plain HTTP is known not to be a TLS ClientHello before OPEN.
+                ProxyTunnel::Dpi(_) => Err(ClientError::Protocol),
             }
         };
         tokio::select! {
@@ -637,11 +662,16 @@ impl Carrier {
                 // Speculation never publishes negative evidence and cannot
                 // authorize an H3->H2 transition. Follow a live prior decision.
                 let scope = crate::network_scope::observe(client.h3.remote());
-                let cached = client.negative.lock().ok().is_some_and(|cache|
-                    scope.is_some() && cache.route == scope
-                    && cache.expires.is_some_and(|t| t > Instant::now()));
-                if cached { client.h2.warm_carrier().await }
-                else { client.h3.warm_carrier().await }
+                let cached = client.negative.lock().ok().is_some_and(|cache| {
+                    scope.is_some()
+                        && cache.route == scope
+                        && cache.expires.is_some_and(|t| t > Instant::now())
+                });
+                if cached {
+                    client.h2.warm_carrier().await
+                } else {
+                    client.h3.warm_carrier().await
+                }
             }
         }
     }
@@ -656,23 +686,38 @@ impl Carrier {
     }
 
     async fn refresh_recent_tcp(&self, cache: &Cache, snapshot: &Snapshot) {
-        let Some(target) = cache.dpi.due_tcp_refresh() else { return };
-        if target.digest() != snapshot.digest() { return; }
+        let Some(target) = cache.dpi.due_tcp_refresh() else {
+            return;
+        };
+        if target.digest() != snapshot.digest() {
+            return;
+        }
         let name = target.name();
         let policy = snapshot.policy();
         let address = target.address();
         let digest = target.digest();
-        let Ok(pin) = cache.policy.pin(digest) else { return };
+        let Ok(pin) = cache.policy.pin(digest) else {
+            return;
+        };
         // Refresh never trusts old DNS pins. Bound control-plane delay,
         // refuse any mixed rules or non-public IPs, and keep the exact IP.
-        let Ok(Ok(ips)) = timeout(Duration::from_secs(2), self.resolve_routing(name, digest)).await else {
+        let Ok(Ok(ips)) = timeout(Duration::from_secs(2), self.resolve_routing(name, digest)).await
+        else {
             cache.dpi.invalidate_refresh(target);
             return;
         };
-        if pin.check().is_err() || ips.is_empty() || ips.len() > 64 || !ips.contains(&address.ip())
-            || !ips.iter().all(|ip| crate::server::allowed_destination(*ip, false)
-                && policy.classify(crate::routing::Evidence::Known(name), crate::routing::Evidence::Known(*ip))
-                    == Ok(crate::routing::Classification::Matched(Action::DirectDpi))) {
+        if pin.check().is_err()
+            || ips.is_empty()
+            || ips.len() > 64
+            || !ips.contains(&address.ip())
+            || !ips.iter().all(|ip| {
+                crate::server::allowed_destination(*ip, false)
+                    && policy.classify(
+                        crate::routing::Evidence::Known(name),
+                        crate::routing::Evidence::Known(*ip),
+                    ) == Ok(crate::routing::Classification::Matched(Action::DirectDpi))
+            })
+        {
             cache.dpi.invalidate_refresh(target);
             return;
         }
@@ -704,12 +749,19 @@ impl Carrier {
             Self::Auto(c) => c.resolve_routing(name, digest).await,
         }
     }
-    #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
-    async fn resolve_native_dns(&self,name:&str,digest:[u8;32])->Result<Vec<IpAddr>,ClientError> {
+    #[cfg(any(
+        target_os = "linux",
+        all(target_os = "windows", target_arch = "x86_64")
+    ))]
+    async fn resolve_native_dns(
+        &self,
+        name: &str,
+        digest: [u8; 32],
+    ) -> Result<Vec<IpAddr>, ClientError> {
         match self {
-            Self::H2(c)=>c.resolve_native_dns(name,digest).await,
-            Self::H3(c)=>c.resolve_native_dns(name,digest).await,
-            Self::Auto(c)=>c.resolve_native_dns(name,digest).await,
+            Self::H2(c) => c.resolve_native_dns(name, digest).await,
+            Self::H3(c) => c.resolve_native_dns(name, digest).await,
+            Self::Auto(c) => c.resolve_native_dns(name, digest).await,
         }
     }
     fn profile_budget(&self) -> Arc<Semaphore> {
@@ -865,10 +917,16 @@ impl ProxyClient {
 
     async fn refresh_routing_policy(&self) -> Result<Arc<Snapshot>, ClientError> {
         match self {
-            Self::Direct(c) => c.routing.refresh(|known| c.carrier.fetch_routing(known)).await,
+            Self::Direct(c) => {
+                c.routing
+                    .refresh(|known| c.carrier.fetch_routing(known))
+                    .await
+            }
             Self::Reality(c) => {
                 let generation = c.generation().await?;
-                c.routing.refresh(|known| generation.carrier.fetch_routing(known)).await
+                c.routing
+                    .refresh(|known| generation.carrier.fetch_routing(known))
+                    .await
             }
         }
     }
@@ -924,7 +982,12 @@ impl ProxyClient {
         self.open_for(address, port, true).await
     }
 
-    async fn open_for(&self, address: Address, port: u16, allow_dpi: bool) -> Result<RoutedTcp, ClientError> {
+    async fn open_for(
+        &self,
+        address: Address,
+        port: u16,
+        allow_dpi: bool,
+    ) -> Result<RoutedTcp, ClientError> {
         match self {
             Self::Direct(client) => {
                 let mut tunnel =
@@ -956,10 +1019,18 @@ impl ProxyClient {
                     // owns this future; generation change cancels it.
                     if !crate::routing::carrier_socket::active() {
                         match self {
-                            Self::Direct(client) => client.carrier.refresh_recent_tcp(&client.routing, &snapshot).await,
+                            Self::Direct(client) => {
+                                client
+                                    .carrier
+                                    .refresh_recent_tcp(&client.routing, &snapshot)
+                                    .await
+                            }
                             Self::Reality(client) => {
                                 if let Ok(generation) = client.generation().await {
-                                    generation.carrier.refresh_recent_tcp(&client.routing, &snapshot).await;
+                                    generation
+                                        .carrier
+                                        .refresh_recent_tcp(&client.routing, &snapshot)
+                                        .await;
                                 }
                             }
                         }
@@ -1017,10 +1088,14 @@ impl ProxyTunnel {
                         // The origin received no application bytes. The carrier
                         // repeats server admission/ACL for the original target.
                         authorization.check()?;
-                        if let Some(flow) = flow { flow.check_pending()?; }
+                        if let Some(flow) = flow {
+                            flow.check_pending()?;
+                        }
                         let tunnel = carrier.open(address, port).await?;
                         authorization.check()?;
-                        if let Some(flow) = flow { flow.check_pending()?; }
+                        if let Some(flow) = flow {
+                            flow.check_pending()?;
+                        }
                         if let Some(observed) = observed {
                             observed
                                 .store(tunnel.open_code(), std::sync::atomic::Ordering::Relaxed);
@@ -1051,7 +1126,9 @@ pub async fn run_file(config_path: &Path) -> Result<(), ClientError> {
 #[cfg(windows)]
 pub async fn run_file_with_system_proxy(config_path: &Path) -> Result<(), ClientError> {
     use sha2::{Digest, Sha256};
-    let raw = zeroize::Zeroizing::new(config::editor_bytes(config_path).map_err(|_| ClientError::Configuration)?);
+    let raw = zeroize::Zeroizing::new(
+        config::editor_bytes(config_path).map_err(|_| ClientError::Configuration)?,
+    );
     let digest = Sha256::digest(raw.as_slice()).into();
     let mut session = SystemProxySession::connect(config_path, digest, None).await?;
     tokio::select! {
@@ -1065,11 +1142,7 @@ pub async fn run_file_with_system_proxy(config_path: &Path) -> Result<(), Client
 }
 
 async fn run_file_inner(config_path: &Path) -> Result<(), ClientError> {
-    crate::diag!(
-        Info,
-        "client.proxy",
-        "config_read_begin"
-    );
+    crate::diag!(Info, "client.proxy", "config_read_begin");
     let raw = zeroize::Zeroizing::new(
         config::editor_bytes(config_path).map_err(|_| ClientError::Configuration)?,
     );
@@ -1121,7 +1194,10 @@ async fn bind_proxy_listener(address: &str) -> Result<TcpListener, ClientError> 
         Networking::WinSock::{setsockopt, SOL_SOCKET, SO_EXCLUSIVEADDRUSE},
     };
     let address: SocketAddr = address.parse().map_err(|_| ClientError::Configuration)?;
-    if !matches!(address.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST) | IpAddr::V6(Ipv6Addr::LOCALHOST)) {
+    if !matches!(
+        address.ip(),
+        IpAddr::V4(Ipv4Addr::LOCALHOST) | IpAddr::V6(Ipv6Addr::LOCALHOST)
+    ) {
         return Err(ClientError::Configuration);
     }
     let socket = crate::routing::carrier_socket::new_tcp(address).map_err(|_| ClientError::Io)?;
@@ -1129,8 +1205,17 @@ async fn bind_proxy_listener(address: &str) -> Result<TcpListener, ClientError> 
     let enabled: i32 = 1;
     // SAFETY: socket is uniquely owned; the option is a live i32 for
     // synchronous Winsock, and the handle is valid for this lifetime.
-    if unsafe { setsockopt(raw, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (&enabled as *const i32).cast(), 4) } != 0
-        || unsafe { SetHandleInformation(raw as HANDLE, HANDLE_FLAG_INHERIT, 0) } == 0 {
+    if unsafe {
+        setsockopt(
+            raw,
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            (&enabled as *const i32).cast(),
+            4,
+        )
+    } != 0
+        || unsafe { SetHandleInformation(raw as HANDLE, HANDLE_FLAG_INHERIT, 0) } == 0
+    {
         return Err(ClientError::Io);
     }
     crate::routing::carrier_socket::listen_tcp(socket, address, 128).map_err(|_| ClientError::Io)
@@ -1138,7 +1223,9 @@ async fn bind_proxy_listener(address: &str) -> Result<TcpListener, ClientError> 
 
 #[cfg(not(windows))]
 async fn bind_proxy_listener(address: &str) -> Result<TcpListener, ClientError> {
-    TcpListener::bind(address).await.map_err(|_| ClientError::Io)
+    TcpListener::bind(address)
+        .await
+        .map_err(|_| ClientError::Io)
 }
 
 #[cfg(all(test, windows))]
@@ -1267,8 +1354,6 @@ impl PreparedLocalProxy {
             _=&mut stop=>Ok(()),
         }
     }
-
-
 }
 
 pub(crate) fn saved_client_bytes(
@@ -1312,7 +1397,11 @@ async fn serve_managed_proxy(
     serve_proxy_loop(
         http,
         socks,
-        || runtime.admitting().then(|| runtime.slot.borrow().client.clone()),
+        || {
+            runtime
+                .admitting()
+                .then(|| runtime.slot.borrow().client.clone())
+        },
         runtime.maintain(),
     )
     .await
@@ -1404,7 +1493,10 @@ async fn serve_proxy_loop(
 
 use ingress::{handle, HttpOnce};
 #[cfg(test)]
-use ingress::{http_target, socks_target, HttpRequest, HTTP_OK, HTTP_BAD, HTTP_METHOD, HTTP_DENIED, HEADER_LIMIT};
+use ingress::{
+    http_target, socks_target, HttpRequest, HEADER_LIMIT, HTTP_BAD, HTTP_DENIED, HTTP_METHOD,
+    HTTP_OK,
+};
 
 #[cfg(test)]
 mod selector_tests;

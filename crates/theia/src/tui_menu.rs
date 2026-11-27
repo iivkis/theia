@@ -766,7 +766,12 @@ impl FirstInvite {
                     Some("Ключ слишком длинный. Вставьте его целиком или запросите новый.");
             }
         } else {
-            if self.focus == 0 && self.own.as_ref().is_some_and(|invite| invite.trust_reference().is_some()) {
+            if self.focus == 0
+                && self
+                    .own
+                    .as_ref()
+                    .is_some_and(|invite| invite.trust_reference().is_some())
+            {
                 return;
             }
             let field = if self.focus == 0 {
@@ -951,7 +956,13 @@ impl FirstInvite {
                     return FirstInviteAction::Back;
                 }
             }
-            KeyCode::F(6) if self.focus == 0 && !self.own.as_ref().is_some_and(|invite| invite.trust_reference().is_some()) => {
+            KeyCode::F(6)
+                if self.focus == 0
+                    && !self
+                        .own
+                        .as_ref()
+                        .is_some_and(|invite| invite.trust_reference().is_some()) =>
+            {
                 self.browser = Some(FileBrowser::files(if self.own.is_some() {
                     self.ca.strip_prefix("file:").unwrap_or(&self.ca)
                 } else {
@@ -971,7 +982,9 @@ impl FirstInvite {
                     } else if !self.ca.is_empty() && !self.ca.starts_with("file:") {
                         self.ca = format!("file:{}", self.ca);
                     }
-                    if embedded.is_none() && crate::client_import::checked_ca_ref(Some(&self.ca)).is_err() {
+                    if embedded.is_none()
+                        && crate::client_import::checked_ca_ref(Some(&self.ca)).is_err()
+                    {
                         self.error = Some("Выберите доверенный PEM-сертификат через F6.");
                     } else if !invite.has_token()
                         && !crate::client_import::valid_explicit_reference(&self.reference)

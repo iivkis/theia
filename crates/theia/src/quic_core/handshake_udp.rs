@@ -1054,10 +1054,13 @@ async fn connect_scoped(
     for restarted in [false, true] {
         use crate::routing::carrier_socket::{self, UdpDialError};
         let native = carrier_socket::active();
-        let (socket, carrier_lease) = carrier_socket::dial_udp(local, peer, native, |bound| scope.permits(bound, peer)).await.map_err(|error| match error {
-            UdpDialError::Bind(error) => Error::Io(error),
-            UdpDialError::Denied | UdpDialError::Connect(_) => Error::Scope,
-        })?;
+        let (socket, carrier_lease) =
+            carrier_socket::dial_udp(local, peer, native, |bound| scope.permits(bound, peer))
+                .await
+                .map_err(|error| match error {
+                    UdpDialError::Bind(error) => Error::Io(error),
+                    UdpDialError::Denied | UdpDialError::Connect(_) => Error::Scope,
+                })?;
         let pinned = native.then_some(peer);
         let cid = super::negotiation::random_cid().map_err(|_| Error::Protocol)?;
         let original = super::negotiation::random_cid().map_err(|_| Error::Protocol)?;

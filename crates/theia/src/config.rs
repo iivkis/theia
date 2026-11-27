@@ -625,10 +625,9 @@ impl ClientDocument {
                 "expected env:NAME or absolute file: reference",
             )?;
             ensure(
-                profile
-                    .tls_ca
-                    .as_ref()
-                    .is_none_or(|path| valid_file_ref(path) || crate::own_tls::Anchor::parse(path).is_some()),
+                profile.tls_ca.as_ref().is_none_or(|path| {
+                    valid_file_ref(path) || crate::own_tls::Anchor::parse(path).is_some()
+                }),
                 format!("{field}.tls_ca"),
                 "expected absolute PEM CA reference or canonical pinned anchor",
             )?;
@@ -1130,13 +1129,23 @@ mod tests {
     fn ingress_defaults_and_legacy_proxy_keys_are_rejected() {
         let original = client();
         let omitted = original.replace("ingress_mode = \"system_proxy\"\n", "");
-        let Config::Client(doc) = parse(&omitted).unwrap() else { panic!("client") };
+        let Config::Client(doc) = parse(&omitted).unwrap() else {
+            panic!("client")
+        };
         assert_eq!(doc.client.ingress_mode, IngressMode::SystemProxy);
         for mode in ["tun", "packet", "off", "manual", "system-proxy"] {
-            let input = original.replace("ingress_mode = \"system_proxy\"", &format!("ingress_mode = \"{mode}\""));
+            let input = original.replace(
+                "ingress_mode = \"system_proxy\"",
+                &format!("ingress_mode = \"{mode}\""),
+            );
             assert!(parse(&input).is_err(), "{mode}");
         }
-        for key in ["system_proxy = \"off\"", "system_proxy = \"manual\"", "direct_dpi = true", "direct_dpi_stun = true"] {
+        for key in [
+            "system_proxy = \"off\"",
+            "system_proxy = \"manual\"",
+            "direct_dpi = true",
+            "direct_dpi_stun = true",
+        ] {
             let input = original.replace("[client.proxy]", &format!("[client.proxy]\n{key}"));
             assert!(parse(&input).is_err(), "{key}");
         }

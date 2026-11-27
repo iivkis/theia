@@ -59,10 +59,9 @@ impl Carrier {
         certificates: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> Result<ServerConfig, rustls::Error> {
-        let mut config =
-            crate::net::tls::server_tls13_builder()?
-                .with_no_client_auth()
-                .with_single_cert(certificates, key)?;
+        let mut config = crate::net::tls::server_tls13_builder()?
+            .with_no_client_auth()
+            .with_single_cert(certificates, key)?;
         self.configure_server(&mut config);
         Ok(config)
     }

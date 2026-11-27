@@ -1,7 +1,11 @@
 //! Shared client flow lifetime and irreversible first-payload authorization.
 //! Compatibility ingress uses synthetic IDs; native backends must bind their
 //! platform flow identities to this same table before forwarding any payload.
-use super::{policy_lease::{PolicyLease, PolicyState}, packet::FlowKey, PacketAction};
+use super::{
+    packet::FlowKey,
+    policy_lease::{PolicyLease, PolicyState},
+    PacketAction,
+};
 use crate::{
     client::ClientError,
     protocol::{Address, ErrorCode},
@@ -93,8 +97,12 @@ impl FlowTable {
     }
 
     pub(crate) fn begin_pinned(
-        self: &Arc<Self>, policy: PolicyLease, protocol: Protocol, target: Address,
-        port: u16, configured: PacketAction,
+        self: &Arc<Self>,
+        policy: PolicyLease,
+        protocol: Protocol,
+        target: Address,
+        port: u16,
+        configured: PacketAction,
     ) -> Result<FlowLease, ClientError> {
         self.begin_inner(policy, protocol, target, port, configured, None)
     }
@@ -248,23 +256,43 @@ impl FlowLease {
 
     /// Check a live native flow against its pinned policy and configured
     /// action without committing payload. This is not a kernel identity.
-    #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
-    pub(crate) fn check_native(&self,mut key:FlowKey,digest:[u8;32],configured:PacketAction)->Result<(),ClientError> {
-        key.interface=0;
-        if self.identity.native!=Some(key) || self.identity.digest!=digest || self.identity.configured!=configured {
+    #[cfg(any(
+        target_os = "linux",
+        all(target_os = "windows", target_arch = "x86_64")
+    ))]
+    pub(crate) fn check_native(
+        &self,
+        mut key: FlowKey,
+        digest: [u8; 32],
+        configured: PacketAction,
+    ) -> Result<(), ClientError> {
+        key.interface = 0;
+        if self.identity.native != Some(key)
+            || self.identity.digest != digest
+            || self.identity.configured != configured
+        {
             return Err(denied());
         }
-        let state=self.table.state.lock().map_err(|_|denied())?;
-        if state.native.get(&key)!=Some(&self.id)
-            || !state.entries.get(&self.id).is_some_and(|entry|entry.identity==self.identity) {
+        let state = self.table.state.lock().map_err(|_| denied())?;
+        if state.native.get(&key) != Some(&self.id)
+            || !state
+                .entries
+                .get(&self.id)
+                .is_some_and(|entry| entry.identity == self.identity)
+        {
             return Err(denied());
         }
         self.check_pending()
     }
 
-    #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
+    #[cfg(any(
+        target_os = "linux",
+        all(target_os = "windows", target_arch = "x86_64")
+    ))]
     pub(crate) fn committed(&self, action: PacketAction) -> bool {
-        if self.check_live(action).is_err() {return false;}
+        if self.check_live(action).is_err() {
+            return false;
+        }
         self.table
             .state
             .lock()
@@ -336,14 +364,14 @@ impl<'a> FirstSend<'a> {
         }
     }
     pub(crate) fn attempt(&mut self) -> Result<(), ClientError> {
-        if let Some(flow)=self.flow {
+        if let Some(flow) = self.flow {
             if !self.started {
                 flow.commit(self.action)?;
             } else {
                 flow.check_live(self.action)?;
             }
         }
-        self.started=true;
+        self.started = true;
         Ok(())
     }
 }
@@ -380,10 +408,20 @@ mod tests {
     #[test]
     fn preflight_policy_pin_is_not_reacquired_on_flow_creation() {
         let (table, policy) = setup();
-        let lease = policy.pin([1;32]).unwrap();
+        let lease = policy.pin([1; 32]).unwrap();
         policy.authorize_policy(None);
-        policy.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture([1;32])));
-        assert!(table.begin_pinned(lease, Protocol::Tcp, Address::V4([192,0,2,1]), 443, PacketAction::Redirect).is_err());
+        policy.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(
+            [1; 32],
+        )));
+        assert!(table
+            .begin_pinned(
+                lease,
+                Protocol::Tcp,
+                Address::V4([192, 0, 2, 1]),
+                443,
+                PacketAction::Redirect
+            )
+            .is_err());
     }
 
     #[test]
@@ -452,14 +490,23 @@ mod tests {
             )
             .is_err());
         assert!(begin(&table, &engine, PacketAction::Pass).is_err());
-        #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
+        #[cfg(any(
+            target_os = "linux",
+            all(target_os = "windows", target_arch = "x86_64")
+        ))]
         {
-            assert!(flow.check_native(key,[1;32],PacketAction::Redirect).is_ok());
-            assert!(flow.check_native(key,[2;32],PacketAction::Redirect).is_err());
-            assert!(flow.check_native(key,[1;32],PacketAction::Pass).is_err());
-            let mut wrong=key;
+            assert!(flow
+                .check_native(key, [1; 32], PacketAction::Redirect)
+                .is_ok());
+            assert!(flow
+                .check_native(key, [2; 32], PacketAction::Redirect)
+                .is_err());
+            assert!(flow.check_native(key, [1; 32], PacketAction::Pass).is_err());
+            let mut wrong = key;
             wrong.source.set_port(1235);
-            assert!(flow.check_native(wrong,[1;32],PacketAction::Redirect).is_err());
+            assert!(flow
+                .check_native(wrong, [1; 32], PacketAction::Redirect)
+                .is_err());
         }
         flow.commit(PacketAction::Redirect).unwrap();
         assert!(flow.commit(PacketAction::Pass).is_err());
@@ -471,15 +518,17 @@ mod tests {
 
     #[test]
     fn native_committed_flow_stops_writes_on_policy_revocation() {
-        let (table,engine)=setup();
-        let key=FlowKey {
-            source:"192.0.2.1:1234".parse().unwrap(),
-            destination:"198.51.100.1:443".parse().unwrap(),
-            transport:super::super::packet::Transport::Tcp,
-            interface:1,
+        let (table, engine) = setup();
+        let key = FlowKey {
+            source: "192.0.2.1:1234".parse().unwrap(),
+            destination: "198.51.100.1:443".parse().unwrap(),
+            transport: super::super::packet::Transport::Tcp,
+            interface: 1,
         };
-        let flow=table.begin_native(engine.clone(),key,[1;32],PacketAction::Modify).unwrap();
-        let mut send=FirstSend::new(Some(&flow),PacketAction::Modify);
+        let flow = table
+            .begin_native(engine.clone(), key, [1; 32], PacketAction::Modify)
+            .unwrap();
+        let mut send = FirstSend::new(Some(&flow), PacketAction::Modify);
         send.attempt().unwrap();
         engine.authorize_policy(None);
         assert!(send.attempt().is_err());
@@ -507,14 +556,18 @@ mod tests {
         let flow = begin(&table, &engine, PacketAction::Redirect).unwrap();
         flow.commit(PacketAction::Redirect).unwrap();
         // An unchanged, still-current receipt does not interrupt a relay.
-        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture([1; 32])));
+        engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(
+            [1; 32],
+        )));
         assert!(flow.check_delivery().is_ok());
         let (revoked, ()) = tokio::join!(
             tokio::time::timeout(std::time::Duration::from_secs(2), flow.wait_revoked()),
             async {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 engine.authorize_policy(None);
-                engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture([1; 32])));
+                engine.authorize_policy(Some(super::super::client_state::LocalPolicy::fixture(
+                    [1; 32],
+                )));
             },
         );
         assert_eq!(revoked.unwrap(), Err(denied()));

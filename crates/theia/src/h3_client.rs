@@ -16,7 +16,9 @@ use tokio::{
     time::timeout,
 };
 
-use crate::xhttp::session::{self, CarrierKind, FrameReader, FrameWriter, OpenAdapter, OPEN_TIMEOUT, IO_TIMEOUT};
+use crate::xhttp::session::{
+    self, CarrierKind, FrameReader, FrameWriter, OpenAdapter, IO_TIMEOUT, OPEN_TIMEOUT,
+};
 type Tx = RequestStream<h3_adapter::SendSide, Bytes>;
 type Rx = RequestStream<h3_adapter::RecvSide, Bytes>;
 
@@ -288,13 +290,24 @@ impl H3Client {
         name: &str,
         digest: [u8; 32],
     ) -> Result<Vec<std::net::IpAddr>, ClientError> {
-        let bytes = self.routing_resource(Some((name,digest,false)),None).await?;
+        let bytes = self
+            .routing_resource(Some((name, digest, false)), None)
+            .await?;
         crate::routing::exchange::decode_ips(&bytes)
     }
 
-    #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
-    pub(crate) async fn resolve_native_dns(&self,name:&str,digest:[u8;32])->Result<Vec<std::net::IpAddr>,ClientError> {
-        let bytes=self.routing_resource(Some((name,digest,true)),None).await?;
+    #[cfg(any(
+        target_os = "linux",
+        all(target_os = "windows", target_arch = "x86_64")
+    ))]
+    pub(crate) async fn resolve_native_dns(
+        &self,
+        name: &str,
+        digest: [u8; 32],
+    ) -> Result<Vec<std::net::IpAddr>, ClientError> {
+        let bytes = self
+            .routing_resource(Some((name, digest, true)), None)
+            .await?;
         crate::routing::exchange::decode_ips(&bytes)
     }
 
@@ -308,7 +321,7 @@ impl H3Client {
 
     async fn routing_resource(
         &self,
-        domain: Option<(&str,[u8;32],bool)>,
+        domain: Option<(&str, [u8; 32], bool)>,
         known: Option<[u8; 32]>,
     ) -> Result<Vec<u8>, ClientError> {
         let routes = self
@@ -353,9 +366,14 @@ impl H3Client {
                 .header(header::AUTHORIZATION, self.authorization.clone())
                 .body(())
                 .map_err(|_| ClientError::Configuration)?;
-            if let Some((name,digest,native))=domain {
-                crate::routing::exchange::request_domain(&mut request,name,digest)?;
-                if native {request.headers_mut().insert(crate::routing::exchange::NATIVE_DNS_HEADER,http::HeaderValue::from_static("1"));}
+            if let Some((name, digest, native)) = domain {
+                crate::routing::exchange::request_domain(&mut request, name, digest)?;
+                if native {
+                    request.headers_mut().insert(
+                        crate::routing::exchange::NATIVE_DNS_HEADER,
+                        http::HeaderValue::from_static("1"),
+                    );
+                }
             } else if let Some(digest) = known {
                 crate::routing::exchange::request_digest(&mut request, digest)?;
             }
@@ -636,12 +654,18 @@ impl H3Client {
     }
 
     pub(crate) async fn warm_carrier(&self) -> Result<(), ClientError> {
-        if !self.reuse_connections || self.certificate_pin.is_some() { return Ok(()); }
+        if !self.reuse_connections || self.certificate_pin.is_some() {
+            return Ok(());
+        }
         let route = crate::network_scope::observe(self.remote);
-        self.pool.warm(route, |connection| !connection.driver.0.is_finished(),
-            self.connect_verified(crate::diagnostics::next_id()),
-            || route.is_some() && crate::network_scope::observe(self.remote) == route,
-        ).await
+        self.pool
+            .warm(
+                route,
+                |connection| !connection.driver.0.is_finished(),
+                self.connect_verified(crate::diagnostics::next_id()),
+                || route.is_some() && crate::network_scope::observe(self.remote) == route,
+            )
+            .await
     }
 
     async fn connect_verified(&self, operation: u64) -> Result<H3Connection, ClientError> {
@@ -908,8 +932,12 @@ fn dial_error(error: dial::Error) -> ClientError {
         FailureClass::Configuration => ClientError::Configuration,
         FailureClass::LocalSetup => ClientError::Io,
         FailureClass::AmbiguousTimeout => ClientError::Timeout,
-        FailureClass::EndpointUnavailable(EndpointUnavailable::NoResponse) => ClientError::QuicUnreachable,
-        FailureClass::EndpointUnavailable(EndpointUnavailable::Refused) => ClientError::QuicEndpointNetworkRefused,
+        FailureClass::EndpointUnavailable(EndpointUnavailable::NoResponse) => {
+            ClientError::QuicUnreachable
+        }
+        FailureClass::EndpointUnavailable(EndpointUnavailable::Refused) => {
+            ClientError::QuicEndpointNetworkRefused
+        }
         _ => ClientError::Tls,
     }
 }
@@ -917,9 +945,19 @@ fn dial_error(error: dial::Error) -> ClientError {
 impl OpenAdapter for H3Client {
     type Tunnel = H3Tunnel;
     const KIND: CarrierKind = CarrierKind::H3;
-    fn explicit_stream_up(&self) -> bool { self.stream_up }
-    fn automatic_mode(&self) -> Option<&crate::split_http::AutoMode> { self.auto_mode.as_ref() }
-    async fn open_attempt<'a>(&'a self, open: &'a Frame, operation: u64, stream_up: bool, stage: &'a mut crate::split_http::HelloOutcome) -> Result<H3Tunnel, ClientError> {
+    fn explicit_stream_up(&self) -> bool {
+        self.stream_up
+    }
+    fn automatic_mode(&self) -> Option<&crate::split_http::AutoMode> {
+        self.auto_mode.as_ref()
+    }
+    async fn open_attempt<'a>(
+        &'a self,
+        open: &'a Frame,
+        operation: u64,
+        stream_up: bool,
+        stage: &'a mut crate::split_http::HelloOutcome,
+    ) -> Result<H3Tunnel, ClientError> {
         self.open_inner(open, operation, stream_up, stage).await
     }
 }
@@ -954,11 +992,27 @@ pub struct H3Tunnel {
 
 impl H3Tunnel {
     pub(crate) async fn relay_udp(
-        mut self, first: Option<Vec<u8>>, upload: tokio::sync::mpsc::Receiver<Vec<u8>>,
-        download: tokio::sync::mpsc::Sender<Vec<u8>>, flow: Option<&crate::routing::flow::FlowLease>,
+        mut self,
+        first: Option<Vec<u8>>,
+        upload: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        download: tokio::sync::mpsc::Sender<Vec<u8>>,
+        flow: Option<&crate::routing::flow::FlowLease>,
     ) -> Result<(), ClientError> {
-        let mut reader = H3FrameReader { decoder: &mut self.decoder, stream: &mut self.rx };
-        session::relay_udp(CarrierKind::H3, &self.state, &mut self.tx, &mut reader, first, upload, download, flow).await
+        let mut reader = H3FrameReader {
+            decoder: &mut self.decoder,
+            stream: &mut self.rx,
+        };
+        session::relay_udp(
+            CarrierKind::H3,
+            &self.state,
+            &mut self.tx,
+            &mut reader,
+            first,
+            upload,
+            download,
+            flow,
+        )
+        .await
     }
 
     pub(crate) fn opened_stream_up(&self) -> bool {
@@ -991,13 +1045,29 @@ impl H3Tunnel {
     }
 
     pub(crate) async fn relay_guarded<S>(
-        mut self, local: S, flow: Option<&crate::routing::flow::FlowLease>,
+        mut self,
+        local: S,
+        flow: Option<&crate::routing::flow::FlowLease>,
     ) -> Result<(), ClientError>
-    where S: AsyncRead + AsyncWrite + Unpin,
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
     {
-        let mut reader = H3FrameReader { decoder: &mut self.decoder, stream: &mut self.rx };
+        let mut reader = H3FrameReader {
+            decoder: &mut self.decoder,
+            stream: &mut self.rx,
+        };
         let lease = &self._lease;
-        session::relay_tcp(CarrierKind::H3, self.operation, &mut self.state, &mut self.tx, &mut reader, local, flow, |bytes| lease.record_data(bytes)).await
+        session::relay_tcp(
+            CarrierKind::H3,
+            self.operation,
+            &mut self.state,
+            &mut self.tx,
+            &mut reader,
+            local,
+            flow,
+            |bytes| lease.record_data(bytes),
+        )
+        .await
     }
 }
 
@@ -1007,7 +1077,10 @@ impl FrameWriter for Tx {
     }
     async fn finish(&mut self) -> Result<(), ClientError> {
         send(self, &Frame::Fin).await?;
-        timeout(IO_TIMEOUT, RequestStream::finish(self)).await.map_err(|_| ClientError::Timeout)?.map_err(|_| ClientError::Http3)
+        timeout(IO_TIMEOUT, RequestStream::finish(self))
+            .await
+            .map_err(|_| ClientError::Timeout)?
+            .map_err(|_| ClientError::Http3)
     }
 }
 
@@ -1016,7 +1089,9 @@ struct H3FrameReader<'a> {
     stream: &'a mut Rx,
 }
 impl FrameReader for H3FrameReader<'_> {
-    async fn next(&mut self) -> Result<Option<Frame>, ClientError> { self.decoder.next(self.stream).await }
+    async fn next(&mut self) -> Result<Option<Frame>, ClientError> {
+        self.decoder.next(self.stream).await
+    }
 }
 
 #[derive(Default)]

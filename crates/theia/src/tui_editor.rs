@@ -155,7 +155,8 @@ fn invitation_trust(invite: &Invitation, ca: Option<&str>) -> Result<Option<Stri
         }
         Ok(Some(anchor))
     } else {
-        client_import::checked_ca_ref(ca).map_err(|_| "Explicit TLS CA reference is invalid or unreadable")
+        client_import::checked_ca_ref(ca)
+            .map_err(|_| "Explicit TLS CA reference is invalid or unreadable")
     }
 }
 
@@ -790,11 +791,19 @@ impl Editor {
         }
         if let IssuedInvitation::OwnTls(invitation) = &invite {
             let token = Zeroizing::new(invitation.token_bytes()?);
-            let Config::Server(document) = &self.original else { return None; };
+            let Config::Server(document) = &self.original else {
+                return None;
+            };
             let digest = format!("{:x}", Sha256::digest(&token[..]));
-            let current = document.server.users.iter()
+            let current = document
+                .server
+                .users
+                .iter()
                 .find(|user| !user.disabled && user.token_sha256 == digest)
-                .and_then(|user| Invitation::issued_from_server(&self.original, &invitation.id, &user.id, &token).ok());
+                .and_then(|user| {
+                    Invitation::issued_from_server(&self.original, &invitation.id, &user.id, &token)
+                        .ok()
+                });
             let unchanged = current.as_ref().is_some_and(|value| {
                 let left = invitation.encode().ok().map(Zeroizing::new);
                 let right = value.encode().ok().map(Zeroizing::new);
@@ -1341,16 +1350,23 @@ impl Editor {
     /// Saved local consent belongs to the selected profile, not the backend.
     /// A draft or another profile never grants consent to this one.
     fn saved_selected_profile(&self) -> Option<&config::Profile> {
-        let Config::Client(doc) = &self.original else { return None };
-        doc.client.profiles.iter().find(|p| p.id == self.selected_record_id())
+        let Config::Client(doc) = &self.original else {
+            return None;
+        };
+        doc.client
+            .profiles
+            .iter()
+            .find(|p| p.id == self.selected_record_id())
     }
 
     pub(crate) fn direct_dpi_allowed(&self) -> bool {
-        self.saved_selected_profile().is_some_and(|p| p.direct_dpi == Some(true))
+        self.saved_selected_profile()
+            .is_some_and(|p| p.direct_dpi == Some(true))
     }
 
     pub(crate) fn direct_dpi_stun_allowed(&self) -> bool {
-        self.saved_selected_profile().is_some_and(|p| p.direct_dpi == Some(true) && p.direct_dpi_stun == Some(true))
+        self.saved_selected_profile()
+            .is_some_and(|p| p.direct_dpi == Some(true) && p.direct_dpi_stun == Some(true))
     }
 
     pub(crate) fn review_direct_dpi_permission(&self) -> Result<RecordReview, &'static str> {
@@ -1363,7 +1379,10 @@ impl Editor {
         let Config::Client(doc) = &mut candidate else {
             return Err("Требуется клиентская конфигурация.");
         };
-        let profile = doc.client.profiles.iter_mut()
+        let profile = doc
+            .client
+            .profiles
+            .iter_mut()
             .find(|p| p.id == self.selected_record_id())
             .ok_or("Профиль не найден.")?;
         profile.direct_dpi = Some(enable);
@@ -1404,7 +1423,10 @@ impl Editor {
         let Config::Client(doc) = &mut candidate else {
             return Err("Требуется клиентская конфигурация.");
         };
-        let profile = doc.client.profiles.iter_mut()
+        let profile = doc
+            .client
+            .profiles
+            .iter_mut()
             .find(|p| p.id == self.selected_record_id())
             .ok_or("Профиль не найден.")?;
         profile.direct_dpi_stun = Some(enable);
@@ -1416,7 +1438,11 @@ impl Editor {
             selected: self.selected_record_id().to_owned(),
             candidate,
             next_selection: self.selected_record,
-            confirmation_label: if enable { "Разрешить STUN" } else { "Отозвать согласие STUN" },
+            confirmation_label: if enable {
+                "Разрешить STUN"
+            } else {
+                "Отозвать согласие STUN"
+            },
             body: if enable {
                 format!("Сохранить отдельное согласие на STUN Binding для этого профиля?\nПосле приёмки стратегии публичный STUN-сервер может увидеть IP вашего устройства. Только credential-free Binding; ICE/TURN и неподдерживаемые запросы остаются через VPS.\n{}\nСогласие не заменяет приёмку и не запускает сеть.\n\ny: разрешить · n/Esc: отменить", crate::routing::dpi::UdpStrategy::capability_summary())
             } else {
@@ -1434,8 +1460,7 @@ impl Editor {
             ),
             Config::Client(doc) => format!(
                 "HTTP: {}\nSOCKS5: {}\nРежим: System Proxy (сохранённый выбор, не состояние ОС)",
-                doc.client.proxy.http_listen,
-                doc.client.proxy.socks5_listen
+                doc.client.proxy.http_listen, doc.client.proxy.socks5_listen
             ),
         }
     }
@@ -2628,12 +2653,18 @@ mod tests {
         assert!(editor.refresh_credential(&wrong).is_err());
         wrong.endpoint = initial.endpoint.clone();
         // Same endpoint/name/transport but different trust is not rotation.
-        let mut other_server = config::parse(&crate::invite::fixture_server_source(&[0x43; 32])).unwrap();
-        let Config::Server(document) = &mut other_server else { panic!("server"); };
-        let other_cert = rcgen::generate_simple_self_signed(vec![initial.server_name.clone()]).unwrap();
+        let mut other_server =
+            config::parse(&crate::invite::fixture_server_source(&[0x43; 32])).unwrap();
+        let Config::Server(document) = &mut other_server else {
+            panic!("server");
+        };
+        let other_cert =
+            rcgen::generate_simple_self_signed(vec![initial.server_name.clone()]).unwrap();
         let cert_file = Temp::write(&other_cert.cert.pem());
         document.server.inbounds[0].tls_cert = format!("file:{}", cert_file.0.display());
-        let other_invite = Invitation::issued_from_server(&other_server, "public", "device-a", &[0x43; 32]).unwrap();
+        let other_invite =
+            Invitation::issued_from_server(&other_server, "public", "device-a", &[0x43; 32])
+                .unwrap();
         assert_ne!(other_invite.trust_reference(), initial.trust_reference());
         assert!(editor.refresh_credential(&other_invite).is_err());
         wrong.transport = Transport::H3;

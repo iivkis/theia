@@ -111,7 +111,10 @@ struct ModeCache(crate::net::evidence::ScopedDecision);
 impl ModeCache {
     fn observe(&mut self, route: Option<crate::network_scope::Scope>, now: Instant) -> ModeTicket {
         let (generation, stream_up) = self.0.observe(route, now);
-        ModeTicket { generation, stream_up }
+        ModeTicket {
+            generation,
+            stream_up,
+        }
     }
 
     fn current(&self, ticket: ModeTicket) -> bool {

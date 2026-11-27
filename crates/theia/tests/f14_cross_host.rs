@@ -188,9 +188,7 @@ async fn client_scenario(
             )
             .unwrap();
     } else {
-        editor
-            .import_invitation(&invitation, None, None)
-            .unwrap();
+        editor.import_invitation(&invitation, None, None).unwrap();
     }
     assert!(
         editor
@@ -223,8 +221,11 @@ async fn client_scenario(
         let wrong_ca = std::env::var("THEIA_F14_XHOST_WRONG_CA").unwrap();
         let pem = fs::read(wrong_ca).unwrap();
         let cert = rustls_pemfile::certs(&mut std::io::BufReader::new(pem.as_slice()))
-            .next().unwrap().unwrap();
-        client_doc.client.profiles[1].tls_ca = Some(format!("anchor-sha256:{:x}", Sha256::digest(cert.as_ref())));
+            .next()
+            .unwrap()
+            .unwrap();
+        client_doc.client.profiles[1].tls_ca =
+            Some(format!("anchor-sha256:{:x}", Sha256::digest(cert.as_ref())));
     }
     let successful = !invalid_token && !invalid_ca;
     run_client(&config_path, client_doc, origin, successful).await;
@@ -444,11 +445,18 @@ async fn linux_server_windows_client_f14_h2_h3_open_ok() {
             .try_into()
             .unwrap();
         let mut config = config::read_file(Path::new(&server_config)).unwrap();
-        let Config::Server(server) = &mut config else { panic!("server fixture"); };
+        let Config::Server(server) = &mut config else {
+            panic!("server fixture");
+        };
         // The independently transferred public certificate is the actual
         // server certificate; its private key remains on the Linux node.
-        server.server.inbounds.iter_mut().find(|inbound| inbound.id == "cross")
-            .unwrap().tls_cert = format!("file:{}", trusted_ca.display());
+        server
+            .server
+            .inbounds
+            .iter_mut()
+            .find(|inbound| inbound.id == "cross")
+            .unwrap()
+            .tls_cert = format!("file:{}", trusted_ca.display());
         let fixture = CrossOsFixture {
             source: &config,
             endpoint: &endpoint,

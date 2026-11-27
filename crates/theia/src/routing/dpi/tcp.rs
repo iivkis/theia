@@ -7,7 +7,9 @@ use tokio::{
     net::TcpStream,
 };
 
-pub(super) async fn connect(address: SocketAddr) -> io::Result<(TcpStream, crate::routing::carrier_socket::Lease)> {
+pub(super) async fn connect(
+    address: SocketAddr,
+) -> io::Result<(TcpStream, crate::routing::carrier_socket::Lease)> {
     crate::routing::carrier_socket::connect_tcp(address, true).await
 }
 
@@ -21,7 +23,9 @@ pub(super) async fn write_checked(
     while !bytes.is_empty() {
         check()?;
         let n = socket.write(bytes).await.map_err(|_| ClientError::Io)?;
-        if n == 0 { return Err(ClientError::Io); }
+        if n == 0 {
+            return Err(ClientError::Io);
+        }
         bytes = &bytes[n..];
     }
     Ok(())
@@ -136,11 +140,16 @@ mod tests {
         let (mut output, mut peer) = tokio::io::duplex(1);
         let attempts = AtomicUsize::new(0);
         let check = || {
-            if attempts.fetch_add(1, Ordering::SeqCst) == 0 { Ok(()) }
-            else { Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied)) }
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(())
+            } else {
+                Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied))
+            }
         };
-        assert!(matches!(write_checked(&mut output, b"abc", &check).await,
-            Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied))));
+        assert!(matches!(
+            write_checked(&mut output, b"abc", &check).await,
+            Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied))
+        ));
         drop(output);
         let mut bytes = Vec::new();
         peer.read_to_end(&mut bytes).await.unwrap();

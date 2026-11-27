@@ -62,7 +62,10 @@ fn validates_client_toml_and_rejects_unknown_fields() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("structurally valid"));
     std::fs::write(
         &path,
-        valid.replace("ingress_mode = \"system_proxy\"", "ingress_mode = \"packet\""),
+        valid.replace(
+            "ingress_mode = \"system_proxy\"",
+            "ingress_mode = \"packet\"",
+        ),
     )
     .unwrap();
     let output = invoke(&["config", "validate", "--config", path_str]);
@@ -132,7 +135,6 @@ fn windows_proxy_commands_fail_closed_on_other_platforms() {
     }
 }
 
-
 #[test]
 fn profile_consent_is_local_and_ingress_selection_is_not_activation() {
     use theia::config::{self, Config, IngressMode};
@@ -153,16 +155,27 @@ fn profile_consent_is_local_and_ingress_selection_is_not_activation() {
         panic!("client template");
     };
     assert_eq!(round_trip, doc);
-    let active = round_trip.client.profiles.iter()
-        .find(|p| p.id == round_trip.client.active_profile).unwrap();
+    let active = round_trip
+        .client
+        .profiles
+        .iter()
+        .find(|p| p.id == round_trip.client.active_profile)
+        .unwrap();
     assert!(!active.direct_dpi.unwrap_or(false));
     assert!(!active.direct_dpi_stun.unwrap_or(false));
-    for field in ["system_proxy = \"manual\"", "direct_dpi = true", "direct_dpi_stun = true"] {
+    for field in [
+        "system_proxy = \"manual\"",
+        "direct_dpi = true",
+        "direct_dpi_stun = true",
+    ] {
         let legacy = fixture.replace("[client.proxy]", &format!("[client.proxy]\n{field}"));
         assert!(config::parse(&legacy).is_err());
     }
     for mode in ["tun", "packet"] {
-        let unsupported = fixture.replace("ingress_mode = \"system_proxy\"", &format!("ingress_mode = \"{mode}\""));
+        let unsupported = fixture.replace(
+            "ingress_mode = \"system_proxy\"",
+            &format!("ingress_mode = \"{mode}\""),
+        );
         assert!(config::parse(&unsupported).is_err());
     }
 }

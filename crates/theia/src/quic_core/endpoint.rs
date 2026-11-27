@@ -397,8 +397,12 @@ impl LabSession {
         // Never replace it with an unregistered SessionIo::direct.
         // A fresh admitted connection is required until transactional
         // native socket migration is implemented.
-        if self.server || self.peer_disable_migration || !self.confirmed || !self.active()
-            || self.socket.native_pinned() {
+        if self.server
+            || self.peer_disable_migration
+            || !self.confirmed
+            || !self.active()
+            || self.socket.native_pinned()
+        {
             return Err(Error::Scope);
         }
         let previous = self.socket.local_addr().map_err(Error::Io)?;

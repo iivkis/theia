@@ -112,8 +112,15 @@ mod tests {
 
     #[test]
     fn confidential_own_tls_qr_roundtrip_keeps_anchor_and_bearer() {
-        let server = crate::config::parse(&crate::invite::fixture_server_source(&[0x42; 32])).unwrap();
-        let invite = crate::invite::Invitation::issued_from_server(&server, "public", "device-a", &[0x42; 32]).unwrap();
+        let server =
+            crate::config::parse(&crate::invite::fixture_server_source(&[0x42; 32])).unwrap();
+        let invite = crate::invite::Invitation::issued_from_server(
+            &server,
+            "public",
+            "device-a",
+            &[0x42; 32],
+        )
+        .unwrap();
         let link = Zeroizing::new(invite.encode().unwrap());
         let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("qr-own-tls").unwrap());
         std::fs::create_dir(&dir).unwrap();
@@ -124,7 +131,11 @@ mod tests {
         let decoded = crate::invite::Invitation::decode(&scanned).unwrap();
         assert_eq!(decoded.trust_reference(), invite.trust_reference());
         assert_eq!(decoded.token_bytes(), invite.token_bytes());
-        assert!(decoded.to_profile("env:TEST_TOKEN", None).unwrap().tls_ca.is_some());
+        assert!(decoded
+            .to_profile("env:TEST_TOKEN", None)
+            .unwrap()
+            .tls_ca
+            .is_some());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
