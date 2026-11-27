@@ -159,7 +159,7 @@ impl KernelPacketEvent {
         };
         let source=SocketAddr::new(ip(&bytes[32..48])?,u16::from_ne_bytes(bytes[64..66].try_into().map_err(|_|invalid())?));
         let destination=SocketAddr::new(ip(&bytes[48..64])?,u16::from_ne_bytes(bytes[66..68].try_into().map_err(|_|invalid())?));
-        let minimum=if family==4 {20} else {40} + if transport==Transport::Tcp {20} else {8};
+        let minimum=(if family==4 {20} else {40}) + (if transport==Transport::Tcp {20} else {8});
         if cookie==0 || timestamp==0 || source.port()==0 || destination.port()==0 ||
             source==destination || length<minimum { return Err(invalid()); }
         Ok(Self{cookie,timestamp,key:FlowKey{source,destination,transport,interface},length})

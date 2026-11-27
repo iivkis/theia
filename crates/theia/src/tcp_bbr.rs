@@ -158,6 +158,7 @@ pub(crate) async fn connect_carrier(
     for address in tokio::net::lookup_host(endpoint).await? {
         let socket = new_socket(address)?;
         if carrier_socket::active() {
+            carrier_socket::prepare_tcp(&socket).map_err(|_|Error::Unavailable)?;
             let source = crate::local_proxy::route_source(address).ok_or(Error::Unavailable)?;
             socket.bind(source)?;
         }

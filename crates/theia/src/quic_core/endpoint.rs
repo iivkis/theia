@@ -388,7 +388,12 @@ impl LabSession {
     /// CID and recovery reset. The original socket scope cannot be expanded.
     /// Existing streams and cryptographic packet numbers remain intact.
     pub async fn rebind(&mut self, socket: UdpSocket, now: Instant) -> Result<(), Error> {
-        if self.server || self.peer_disable_migration || !self.confirmed || !self.active() {
+        // The native carrier lease belongs to the old kernel socket.
+        // Never replace it with an unregistered SessionIo::direct.
+        // A fresh admitted connection is required until transactional
+        // native socket migration is implemented.
+        if self.server || self.peer_disable_migration || !self.confirmed || !self.active()
+            || self.socket.native_pinned() {
             return Err(Error::Scope);
         }
         let previous = self.socket.local_addr().map_err(Error::Io)?;

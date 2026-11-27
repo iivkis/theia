@@ -43,6 +43,23 @@ pub(crate) async fn scope<T>(
 pub(crate) fn active() -> bool {
     CURRENT.try_with(|_| ()).is_ok()
 }
+/// Native Windows carriers must reserve an exclusive local endpoint
+/// before bind. A later tuple registration cannot repair shared binding.
+pub(crate) fn prepare_tcp(socket:&TcpSocket)->io::Result<()> {
+    #[cfg(all(target_os="windows",target_arch="x86_64"))]
+    if active() {
+        return super::windivert::prepare_carrier_tcp(socket);
+    }
+    let _=socket;
+    Ok(())
+}
+pub(crate) async fn bind_udp(address:SocketAddr)->io::Result<UdpSocket> {
+    #[cfg(all(target_os="windows",target_arch="x86_64"))]
+    if active() {
+        return super::windivert::bind_carrier_udp(address);
+    }
+    UdpSocket::bind(address).await
+}
 pub(crate) fn tcp(socket: &TcpSocket, peer: SocketAddr) -> io::Result<Lease> {
     CURRENT.try_with(|r| match r {
         Some(r) => r.tcp(socket, peer),

@@ -1255,12 +1255,14 @@ mod native {
 
     impl crate::routing::carrier_socket::Registrar for CarrierRegistry {
         fn tcp(&self,socket:&tokio::net::TcpSocket,peer:std::net::SocketAddr)->io::Result<crate::routing::carrier_socket::Lease> {
+            verify_carrier_socket(socket)?;
             let lease=self.register(socket_endpoint(socket)?,std::process::id(),EndpointTuple {
                 local:socket.local_addr()?,remote:peer,transport:super::super::packet::Transport::Tcp
             },registration_timestamp()?).ok_or(io::ErrorKind::PermissionDenied)?;
             Ok(crate::routing::carrier_socket::Lease::retain(lease))
         }
         fn udp(&self,socket:&tokio::net::UdpSocket,peer:std::net::SocketAddr)->io::Result<crate::routing::carrier_socket::Lease> {
+            verify_carrier_socket(socket)?;
             let lease=self.register(socket_endpoint(socket)?,std::process::id(),EndpointTuple {
                 local:socket.local_addr()?,remote:peer,transport:super::super::packet::Transport::Udp
             },registration_timestamp()?).ok_or(io::ErrorKind::PermissionDenied)?;
@@ -1296,13 +1298,61 @@ mod native {
         if rc!=0 { return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() })); }
         Ok(())
     }
+    fn verify_carrier_socket(socket:&impl std::os::windows::io::AsRawSocket)->io::Result<()> {
+        use windows_sys::Win32::{
+            Foundation::{GetHandleInformation,HANDLE_FLAG_INHERIT,HANDLE},
+            Networking::WinSock::{getsockopt,WSAGetLastError,SOL_SOCKET,SO_EXCLUSIVEADDRUSE,SO_REUSEADDR},
+        };
+        let raw=socket.as_raw_socket() as usize;
+        let mut flags=0u32;
+        if unsafe {GetHandleInformation(raw as HANDLE,&mut flags)}==0 {
+            return Err(io::Error::last_os_error());
+        }
+        if flags&HANDLE_FLAG_INHERIT!=0 {return Err(io::ErrorKind::PermissionDenied.into());}
+        let option=|name:i32|->io::Result<i32>{
+            let mut value=0i32;
+            let mut len=4i32;
+            if unsafe {getsockopt(raw,SOL_SOCKET,name,(&mut value as *mut i32).cast(),&mut len)}!=0 {
+                return Err(io::Error::from_raw_os_error(unsafe {WSAGetLastError()}));
+            }
+            if len!=4 {return Err(io::ErrorKind::InvalidData.into());}
+            Ok(value)
+        };
+        if option(SO_EXCLUSIVEADDRUSE)?==0 || option(SO_REUSEADDR)?!=0 {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        Ok(())
+    }
+    pub(crate) fn prepare_carrier_tcp(socket:&tokio::net::TcpSocket)->io::Result<()> {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Foundation::{SetHandleInformation,HANDLE_FLAG_INHERIT,HANDLE};
+        if unsafe {SetHandleInformation(socket.as_raw_socket() as usize as HANDLE,HANDLE_FLAG_INHERIT,0)}==0 {
+            return Err(io::Error::last_os_error());
+        }
+        exclusive(socket)?;
+        verify_carrier_socket(socket)
+    }
+    pub(crate) fn bind_carrier_udp(address:std::net::SocketAddr)->io::Result<tokio::net::UdpSocket> {
+        // The socket must remain valid beyond this call. Hold one
+        // process-lifetime WSAStartup reference (OS releases it at exit).
+        static WINSOCK:std::sync::OnceLock<Result<WinsockLease,i32>>=std::sync::OnceLock::new();
+        if let Err(code)=WINSOCK.get_or_init(||WinsockLease::start().map_err(|e|e.raw_os_error().unwrap_or(1))) {
+            return Err(io::Error::from_raw_os_error(*code));
+        }
+        let socket=bind_udp(address)?;
+        verify_carrier_socket(&socket)?;
+        socket.set_nonblocking(true)?;
+        tokio::net::UdpSocket::from_std(socket)
+    }
     fn bind_udp(address:std::net::SocketAddr)->io::Result<UdpSocket> {
         use std::os::windows::io::{AsRawSocket,FromRawSocket};
         use windows_sys::Win32::Networking::WinSock::{
-            socket,bind,WSAGetLastError,AF_INET,AF_INET6,SOCK_DGRAM,IPPROTO_UDP,INVALID_SOCKET,SOCKADDR_INET,
+            WSASocketW,bind,WSAGetLastError,AF_INET,AF_INET6,SOCK_DGRAM,IPPROTO_UDP,INVALID_SOCKET,SOCKADDR_INET,
+            WSA_FLAG_OVERLAPPED,WSA_FLAG_NO_HANDLE_INHERIT,
         };
         let family=if address.is_ipv4(){AF_INET}else{AF_INET6};
-        let raw=unsafe { socket(i32::from(family),SOCK_DGRAM,IPPROTO_UDP) };
+        let raw=unsafe { WSASocketW(i32::from(family),SOCK_DGRAM,IPPROTO_UDP,std::ptr::null(),0,
+            WSA_FLAG_OVERLAPPED|WSA_FLAG_NO_HANDLE_INHERIT) };
         if raw==INVALID_SOCKET { return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() })); }
         let socket=unsafe { UdpSocket::from_raw_socket(raw as _) };
         exclusive(&socket)?;
@@ -2260,7 +2310,8 @@ mod native {
 pub use native::{loopback_acceptance, probe, scope_drop_acceptance};
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub(crate) use native::{begin_udp_relay_lab, run_tcp_relay_lab, RelayLab, UDP_LAB_DATAGRAMS,
-    begin_scope_relay_lab, ScopeRelayEvent, ScopeUdpPacket, ScopeReplies};
+    begin_scope_relay_lab, ScopeRelayEvent, ScopeUdpPacket, ScopeReplies,
+    prepare_carrier_tcp,bind_carrier_udp};
 
 #[cfg(test)]
 mod tests {

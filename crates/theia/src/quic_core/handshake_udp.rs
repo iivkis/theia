@@ -1052,7 +1052,7 @@ async fn connect_scoped(
     let (congestion, observation) = options;
     let mut version = versions.preferred();
     for restarted in [false, true] {
-        let socket = UdpSocket::bind(local).await.map_err(Error::Io)?;
+        let socket = crate::routing::carrier_socket::bind_udp(local).await.map_err(Error::Io)?;
         if !scope.permits(socket.local_addr().map_err(Error::Io)?, peer) {
             return Err(Error::Scope);
         }
