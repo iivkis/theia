@@ -53,6 +53,10 @@ TARGET_GROUP_MVP_JOBS = MVP_MERGED_JOBS | frozenset({
     "Native prerequisite (windows-cross-sid)",
 })
 
+# Short native checks reuse the ordinary test runners; the complete
+# prerequisite inventory still includes the Windows production-feature lint.
+COMPACT_MVP_JOBS = MVP_MERGED_JOBS | frozenset({"Native prerequisite (windows-clippy)"})
+
 
 class EvidenceError(ValueError):
     """Incomplete or incomparable timing evidence."""
@@ -103,7 +107,9 @@ def summarize(run: dict, response: dict) -> dict:
     if merged and isinstance(jobs, list):
         names = {job.get("name") for job in jobs if isinstance(job, dict)
                  and isinstance(job.get("name"), str)}
-        if names == TARGET_GROUP_MVP_JOBS:
+        if names == COMPACT_MVP_JOBS:
+            expected_jobs = COMPACT_MVP_JOBS
+        elif names == TARGET_GROUP_MVP_JOBS:
             expected_jobs = TARGET_GROUP_MVP_JOBS
         elif names == MVP_MERGED_JOBS:
             expected_jobs = MVP_MERGED_JOBS

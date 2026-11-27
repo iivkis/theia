@@ -108,6 +108,18 @@ class TimingTests(unittest.TestCase):
             with self.assertRaises(timing.EvidenceError):
                 timing.summarize(run, broken)
 
+    def test_compact_matrix_still_requires_windows_clippy(self):
+        run, jobs = snapshot(merged=True)
+        template = deepcopy(jobs["jobs"][0])
+        jobs["jobs"] = [{**deepcopy(template), "name": name}
+                        for name in sorted(timing.COMPACT_MVP_JOBS)]
+        jobs["total_count"] = len(jobs["jobs"])
+        self.assertEqual(len(timing.summarize(run, jobs)["jobs"]), 23)
+        # Replacing a required job with an arbitrary name is not allowed.
+        jobs["jobs"][0]["name"] = "not-a-required-check"
+        with self.assertRaises(timing.EvidenceError):
+            timing.summarize(run, jobs)
+
     def test_real_sanitized_api_snapshots_match_observed_durations(self):
         path = SOURCE.parents[1] / "tests" / "ci" / "fixtures" / "timing-snapshots.json"
         snapshots = json.loads(path.read_text(encoding="utf-8"))

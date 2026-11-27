@@ -271,6 +271,8 @@ jobs:
           ref: ${{ needs.specification.outputs.tested_sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.140
@@ -291,6 +293,12 @@ jobs:
       - name: Native Linux integration tests
         if: matrix.shard == 2
         run: cargo nextest run --workspace --test '*' --locked --no-fail-fast
+      - name: Install native eBPF linker for all-feature lint
+        if: matrix.shard == 1
+        run: sudo apt-get install -y --no-install-recommends libbpf-dev
+      - name: Linux all-feature Clippy
+        if: matrix.shard == 1
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Upload sanitized trace logs on CI failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -347,6 +355,10 @@ jobs:
       - name: Native Windows integration tests
         if: matrix.shard == 2
         run: cargo nextest run --workspace --test '*' --locked --no-fail-fast
+      - name: Cross-logon Windows pipe kernel-denial E2E (mandatory)
+        if: matrix.shard == 1
+        shell: pwsh
+        run: ./scripts/windows-cross-sid-ci.ps1
       - name: Upload sanitized trace logs on CI failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -365,12 +377,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            check: linux-clippy
           - os: windows-latest
             check: windows-clippy
-          - os: windows-latest
-            check: windows-cross-sid
     runs-on: ${{ matrix.os }}
     timeout-minutes: 5
     env:
@@ -385,35 +393,27 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # Cold check cache: seed from the existing trusted default dependency
+      # cache instead of fetching and recompiling the entire dependency graph.
       - uses: Swatinem/rust-cache@v2
-        if: matrix.check != 'windows-clippy'
-        with:
-          shared-key: native-default-deps-v4
-          cache-workspace-crates: false
-          cache-bin: false
-          save-if: false
-      # cargo check/Clippy uses different dependency fingerprints from cargo test.
-      # Persist only the successful trusted Windows check's dependencies.
-      - uses: Swatinem/rust-cache@v2
-        if: matrix.check == 'windows-clippy'
+        id: clippy-cache
         with:
           shared-key: native-clippy-deps-v1
           cache-workspace-crates: false
           cache-bin: false
           save-if: true
-      - name: Install native eBPF linker for all-feature lint
-        if: matrix.check == 'linux-clippy'
-        run: sudo apt-get install -y --no-install-recommends libbpf-dev
-      - name: Linux all-feature Clippy
-        if: matrix.check == 'linux-clippy'
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - uses: Swatinem/rust-cache@v2
+        if: steps.clippy-cache.outputs.cache-hit != 'true'
+        with:
+          shared-key: native-default-deps-v4
+          cache-workspace-crates: false
+          cache-bin: false
+          save-if: false
       - name: Production feature Clippy (Windows)
         if: matrix.check == 'windows-clippy'
         run: cargo clippy --workspace --all-targets --features experimental-btls-h2 --locked -- -D warnings
-      - name: Cross-logon Windows pipe kernel-denial E2E (mandatory)
-        if: matrix.check == 'windows-cross-sid'
-        shell: pwsh
-        run: ./scripts/windows-cross-sid-ci.ps1
+
+
 
   f14-cross-host:
     name: F-14 Linux VM server to native Windows client
@@ -557,14 +557,6 @@ jobs:
       - name: Instrument all native integration tests
         if: matrix.shard == 2
         run: cargo llvm-cov nextest --workspace --test '*' --all-features --locked --no-report --no-fail-fast
-      - name: Instrument real disposable Windows ConPTY lifecycle
-        if: runner.os == 'Windows' && matrix.shard == 2
-        shell: pwsh
-        env:
-          THEIA_WINDOWS_PROXY_E2E_ALLOWED: "yes"
-        run: |
-          cargo llvm-cov test --workspace --all-features --locked --no-report --test tui_real_terminal -- compiled_client_proxy_conpty_lifecycle --ignored --exact --nocapture 2>&1 | Tee-Object -Variable result
-          if ($LASTEXITCODE -ne 0 -or ($result -join "`n") -notmatch 'test compiled_client_proxy_conpty_lifecycle \.\.\. ok') { throw 'Instrumented real ConPTY lifecycle failed or did not execute' }
       - name: Instrument real dual-mode TUI and startup replay guard
         if: matrix.shard == 3
         shell: pwsh
@@ -595,6 +587,14 @@ jobs:
             cargo llvm-cov test --workspace --all-features --locked --no-report @target -- $name --ignored --exact --nocapture 2>&1 | Tee-Object -Variable result
             if ($LASTEXITCODE -ne 0 -or ($result -join "`n") -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;') { throw "Instrumented fixture failed or did not execute: $name" }
           }
+      - name: Instrument real disposable Windows ConPTY lifecycle
+        if: runner.os == 'Windows' && matrix.shard == 4
+        shell: pwsh
+        env:
+          THEIA_WINDOWS_PROXY_E2E_ALLOWED: "yes"
+        run: |
+          cargo llvm-cov test --workspace --all-features --locked --no-report --test tui_real_terminal -- compiled_client_proxy_conpty_lifecycle --ignored --exact --nocapture 2>&1 | Tee-Object -Variable result
+          if ($LASTEXITCODE -ne 0 -or ($result -join "`n") -notmatch 'test compiled_client_proxy_conpty_lifecycle \.\.\. ok') { throw 'Instrumented real ConPTY lifecycle failed or did not execute' }
       - name: Export LCOV once after all native instrumented tests
         run: cargo llvm-cov report --lcov --include-build-script --output-path coverage.lcov
       - name: Export independent LLVM file segments from the same profiles
