@@ -71,7 +71,13 @@ impl DnsCandidates {
         // fresh deadline just because its diagnostic observation expired.
         // On exhaustion refuse new observations; never evict a tombstone
         // to make room for an uncorroborated request.
-        let name = super::domain_name(&link.domain)?;
+        let name = match super::domain_name(&link.domain) {
+            Ok(name) => name,
+            Err(error) => {
+                self.poison_key(flow.key);
+                return Err(error);
+            }
+        };
         if link.key != flow.key
             || link.cookie != flow.cookie
             || link.process_start != flow.process_start
@@ -83,6 +89,21 @@ impl DnsCandidates {
             || protected_ips.len() > 64
             || !protected_ips.contains(&flow.key.destination.ip())
         {
+            self.poison_key(flow.key);
+            return Ok(false);
+        }
+        // A request identifier is scoped to one exact flow. A conflicting
+        // observation must revoke BOTH candidates, not authorize the
+        // latest caller or leave the original observation usable.
+        let mut reused = false;
+        for (key, entry) in &mut self.entries {
+            if *key != flow.key && entry.request_id == link.request_id {
+                entry.ambiguous = true;
+                reused = true;
+            }
+        }
+        if reused {
+            self.poison_key(flow.key);
             return Ok(false);
         }
         if let Some(entry) = self.entries.get_mut(&flow.key) {
@@ -132,13 +153,16 @@ impl DnsCandidates {
         (entry.flow == flow && entry.digest == digest && !entry.ambiguous && entry.deadline > now)
             .then_some(entry.domain.as_str())
     }
-    /// Poison rather than delete after an uncertain source check. Removing
-    /// a failed candidate would allow the same request to create a fresh TTL.
-    #[cfg(any(test, feature = "linux-ebpf-lab"))]
-    pub(crate) fn invalidate(&mut self, flow: CorroboratedFlow) {
-        if let Some(entry) = self.entries.get_mut(&flow.key) {
+    fn poison_key(&mut self, key: FlowKey) {
+        if let Some(entry) = self.entries.get_mut(&key) {
             entry.ambiguous = true;
         }
+    }
+
+    /// Poison rather than delete after an uncertain source check. Removing
+    /// a failed candidate would allow the same request to create a fresh TTL.
+    pub(crate) fn invalidate(&mut self, flow: CorroboratedFlow) {
+        self.poison_key(flow.key);
     }
 
     pub fn forget(&mut self, flow: CorroboratedFlow) {
@@ -195,6 +219,46 @@ mod tests {
         assert!(table.candidate(flow, [1; 32]).is_none());
         table.forget(flow);
         assert!(table.candidate(flow, [1; 32]).is_none());
+    }
+
+    #[test]
+    fn conflicting_requests_and_invalid_observations_revoke_candidates() {
+        let flow = CorroboratedFlow {
+            key: FlowKey {
+                source: "192.0.2.2:1234".parse().unwrap(),
+                destination: "198.51.100.1:443".parse().unwrap(),
+                transport: Transport::Udp,
+                interface: 0,
+            },
+            cookie: 7,
+            process_start: 8,
+            application: ApplicationId::from_sha256([1; 32]),
+        };
+        let link = ResolverLink {
+            key: flow.key,
+            cookie: flow.cookie,
+            process_start: flow.process_start,
+            request_id: [3; 16],
+            domain: "example.org".into(),
+        };
+        let ips = [flow.key.destination.ip()];
+        let deadline = Instant::now() + TTL;
+        let mut table = DnsCandidates::default();
+        assert!(table.record(flow, &link, [1; 32], &ips, deadline).unwrap());
+        let mut other = flow;
+        other.key.source.set_port(1235);
+        other.cookie = 9;
+        let mut copied = link.clone();
+        copied.key = other.key;
+        copied.cookie = other.cookie;
+        assert!(!table.record(other, &copied, [1; 32], &ips, deadline).unwrap());
+        assert!(table.candidate(flow, [1; 32]).is_none());
+        assert!(table.candidate(other, [1; 32]).is_none());
+        let mut table = DnsCandidates::default();
+        assert!(table.record(flow, &link, [1; 32], &ips, deadline).unwrap());
+        assert!(!table.record(flow, &link, [1; 32], &[], deadline).unwrap());
+        assert!(table.candidate(flow, [1; 32]).is_none());
+        assert!(!table.record(flow, &link, [1; 32], &ips, deadline).unwrap());
     }
 
     #[test]

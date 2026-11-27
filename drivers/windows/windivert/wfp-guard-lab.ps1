@@ -166,28 +166,12 @@ try {
             $null=Read-Pinned $intentLease $IntentSha256
             $captureObserved=$null
             if ($Mode -eq 'CaptureVerify') {
-                if (!$TheiaExe -or !$DriverDirectory -or !$CaptureInterfaceIndex -or $TheiaSha256 -cnotmatch '^[a-f0-9]{64}
-                Interfaces=$seenInterfaces;TransactionalObjectCas=$true;PacketEnforcementVerified=$false;
-                BootTimeObjectsConfigured=($bootConfigured -and $state -ceq 'exact');
-                BootTimeCoverageVerified=$false;ProductionCaptureReady=$false} | ConvertTo-Json -Compress
-        } finally { $intentLease.Dispose() }
-    } finally { $lock.Dispose() }
-} finally { $helperLease.Dispose() }
- -or $DllSha256 -cnotmatch '^[a-f0-9]{64}
-                Interfaces=$seenInterfaces;TransactionalObjectCas=$true;PacketEnforcementVerified=$false;
-                BootTimeObjectsConfigured=($bootConfigured -and $state -ceq 'exact');
-                BootTimeCoverageVerified=$false;ProductionCaptureReady=$false} | ConvertTo-Json -Compress
-        } finally { $intentLease.Dispose() }
-    } finally { $lock.Dispose() }
-} finally { $helperLease.Dispose() }
- -or $SysSha256 -cnotmatch '^[a-f0-9]{64}
-                Interfaces=$seenInterfaces;TransactionalObjectCas=$true;PacketEnforcementVerified=$false;
-                BootTimeObjectsConfigured=($bootConfigured -and $state -ceq 'exact');
-                BootTimeCoverageVerified=$false;ProductionCaptureReady=$false} | ConvertTo-Json -Compress
-        } finally { $intentLease.Dispose() }
-    } finally { $lock.Dispose() }
-} finally { $helperLease.Dispose() }
-) { throw 'Explicit pinned capture inputs required.' }
+                if (!$TheiaExe -or !$DriverDirectory -or !$CaptureInterfaceIndex -or
+                    $TheiaSha256 -cnotmatch '^[a-f0-9]{64}$' -or
+                    $DllSha256 -cnotmatch '^[a-f0-9]{64}$' -or
+                    $SysSha256 -cnotmatch '^[a-f0-9]{64}$') {
+                    throw 'Explicit pinned capture inputs required.'
+                }
                 $adapters=@(Get-NetAdapter -IncludeHidden | Where-Object { $_.ifIndex -eq $CaptureInterfaceIndex })
                 if ($adapters.Count -ne 1 -or (CanonicalGuid ([string]$adapters[0].InterfaceGuid)) -cnotin $seenInterfaces) { throw 'Capture interface is not covered by the pinned guard.' }
                 $exe=Assert-Regular ([IO.Path]::GetFullPath($TheiaExe))
@@ -201,8 +185,11 @@ try {
                     if ($actual -cne $TheiaSha256) { throw 'Capture executable hash mismatch.' }
                     try {
                         $captureOutput=(& $exe.FullName client windivert --scope-drop-lab --directory $driverDir --dll-sha256 $DllSha256 --sys-sha256 $SysSha256 --interface-index $CaptureInterfaceIndex --seconds $CaptureSeconds --confirm-block | Out-String)
-                        if ($LASTEXITCODE -ne 0 -or $captureOutput -notmatch 'observed=(\d+)') { throw 'Capture verification failed.' }
-                        $captureObserved=[uint64]$Matches[1]
+                        $captureExit=$LASTEXITCODE
+                        $observations=[regex]::Matches($captureOutput,'(?m)\bobserved=(\d+)\b')
+                        if ($captureExit -ne 0 -or $observations.Count -ne 1) { throw 'Capture verification failed.' }
+                        $captureObserved=[uint64]$observations[0].Groups[1].Value
+                        if ($captureObserved -eq 0) { throw 'No packets observed; joint capture evidence is inconclusive.' }
                     } finally {
                         $state=(& $helperFile.FullName @native)
                         if ($LASTEXITCODE -ne 0 -or $state -cne 'exact') { throw 'Guard changed during capture; retain journal.' }

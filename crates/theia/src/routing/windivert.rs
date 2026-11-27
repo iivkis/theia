@@ -274,7 +274,17 @@ impl CandidateLedger {
         // or refresh an exact candidate. Incoming flows are not admitted.
         if !matches!((event.layer,event.event),(2,1)|(3,4)) { return; }
         if !event.outbound || event.tuple().is_none() {
-            history.terminal=true;return;
+            // An inbound/unsupported establishment can still conflict with
+            // an outbound tuple. Preserve that tuple as a tombstone; without
+            // an exact tuple the conflict cannot be bounded to one flow.
+            let tuple=event.tuple();
+            if tuple.is_none() || history.connect.is_some() || history.flow.is_some() {
+                self.invalidate();
+            } else {
+                history.closed_tuple=tuple;
+                history.terminal=true;
+            }
+            return;
         }
         let slot=if event.layer==2 { &mut history.flow } else { &mut history.connect };
         if let Some(previous)=slot {
@@ -2808,6 +2818,16 @@ mod tests {
         reuse.observe(EndpointCandidate {event:7,timestamp:111,..event});
         reuse.observe(EndpointCandidate {timestamp:112,local_port:1002,..event});
         assert!(reuse.correlate(&other_packet).is_none());
+        // A terminal inbound establishment with the same exact tuple
+        // must not disappear from the candidate ledger.
+        let mut inbound=CandidateLedger::new(4,20).unwrap();
+        inbound.observe(event);inbound.observe(flow);
+        inbound.observe(EndpointCandidate {endpoint:5,outbound:false,..event});
+        assert!(inbound.correlate(&packet).is_none());
+        let mut malformed=CandidateLedger::new(4,20).unwrap();
+        malformed.observe(event);malformed.observe(flow);
+        malformed.observe(EndpointCandidate {endpoint:5,local_port:0,..event});
+        assert!(malformed.correlate(&packet).is_none());
         let mut small=CandidateLedger::new(1,20).unwrap();
         small.observe(event);small.observe(flow);small.observe(EndpointCandidate {endpoint:5,..event});
         assert!(small.correlate(&packet).is_none());

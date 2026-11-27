@@ -3135,7 +3135,11 @@ impl NativeIngress {
         link: &crate::routing::dns_attribution::ResolverLink,
         candidates: &mut crate::routing::dns_attribution::DnsCandidates,
     ) -> Result<bool, ClientError> {
-        self.corroborate_dns_inner(flow, link, candidates, || Ok(())).await
+        let result = self.corroborate_dns_inner(flow, link, candidates, || Ok(())).await;
+        if !matches!(&result, Ok(true)) {
+            candidates.invalidate(flow);
+        }
+        result
     }
 
     #[cfg(target_os = "linux")]
@@ -3761,14 +3765,37 @@ impl NativeIngress {
             biased;
             () = self.stopped() => Err(ClientError::Open(ErrorCode::PolicyDenied)),
             result = async {
-                let (carrier, flow, address) = self.redirect(key).await?;
-                let tunnel = crate::routing::carrier_socket::scope(self.registrar()?, carrier.open_udp(address, key.destination.port())).await?;
+                let (carrier, flow, address, snapshot, configured) = self.redirect_selection(key).await?;
+                let local = if self.unified.load(std::sync::atomic::Ordering::Acquire)
+                    && configured == PacketAction::Modify {
+                    crate::routing::carrier_socket::scope(Some(registrar.clone()),
+                        self.prepare_unified_quic(key, &first.payload, &carrier, &snapshot, registrar.as_ref())).await?
+                } else { None };
+                let actual = if local.is_some() { PacketAction::Modify } else { PacketAction::Redirect };
                 let reply = crate::routing::linux_ingress::UdpReply::open(&first).map_err(|_| ClientError::Io)?;
                 let _reply_admission = reply.admit_reply(registrar.as_ref()).map_err(|_| ClientError::Io)?;
                 let (tx, up) = tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
                 let (down, mut rx) = tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
-                tx.send(first.payload).await.map_err(|_| ClientError::Io)?;
-                let relay = tunnel.relay_guarded(up, down, Some(&flow));
+                let mut first_payload = Some(first.payload);
+                if actual == PacketAction::Redirect {
+                    tx.send(first_payload.take().ok_or(ClientError::Protocol)?).await.map_err(|_| ClientError::Io)?;
+                }
+                let relay = async {
+                    self.ensure_accepting()?;
+                    self.client.routing_cache().dpi.check_policy(snapshot.digest())?;
+                    if self.unified.load(std::sync::atomic::Ordering::Acquire) {
+                        self.check_unified_redirect(key, snapshot.digest())?;
+                    }
+                    if let Some((verified, _local_admission)) = local {
+                        // This consumes the first datagram exactly once. No
+                        // branch back to Redirect after entering local relay.
+                        return crate::udp_relay::relay_quic_lab(&verified,
+                            first_payload.ok_or(ClientError::Protocol)?, up, down, &flow).await;
+                    }
+                    let tunnel = crate::routing::carrier_socket::scope(Some(registrar.clone()),
+                        carrier.open_udp(address, key.destination.port())).await?;
+                    tunnel.relay_guarded(up, down, Some(&flow)).await
+                };
                 let feed = async move {
                     while let Some(datagram) = subsequent.recv().await {
                         if datagram.key != key || datagram.payload.len() > crate::protocol::MAX_DATAGRAM {
@@ -3780,7 +3807,8 @@ impl NativeIngress {
                 };
                 let replies = async {
                     while let Some(bytes) = rx.recv().await {
-                        if !flow.committed(PacketAction::Redirect) {
+                        self.ensure_accepting()?;
+                        if !flow.committed(actual) {
                             return Err(ClientError::Open(ErrorCode::PolicyDenied));
                         }
                         reply.send(&bytes).await.map_err(|_| ClientError::Io)?;
@@ -3790,6 +3818,75 @@ impl NativeIngress {
                 supervise_native_udp(relay, feed, replies).await
             } => result,
         }
+    }
+
+    /// Select a real QUIC v1 datagram transformation for the unified Linux
+    /// lab. SNI is only a probe hint: unknown domain/application evidence
+    /// must already yield Modify, and the original IP is never replaced.
+    /// No local application bytes are sent during preparation.
+    #[cfg(target_os = "linux")]
+    async fn prepare_unified_quic(
+        &self,
+        key: crate::routing::packet::FlowKey,
+        first: &[u8],
+        carrier: &Carrier,
+        snapshot: &Snapshot,
+        registrar: &dyn crate::routing::carrier_socket::Registrar,
+    ) -> Result<Option<(crate::routing::dpi::VerifiedUdp, crate::routing::carrier_socket::Lease)>, ClientError> {
+        use crate::routing::{Evidence, packet::Transport};
+        let denied = || ClientError::Open(ErrorCode::PolicyDenied);
+        let cache = self.client.routing_cache();
+        let digest = snapshot.digest();
+        self.check_unified_redirect(key, digest)?;
+        cache.dpi.check_policy(digest)?;
+        if !cache.dpi.enabled() || key.transport != Transport::Udp
+            || key.destination.port() != 443
+            || !crate::server::allowed_destination(key.destination.ip(), false)
+        {
+            return Ok(None);
+        }
+        let Some(name) = crate::routing::packet_modify::unified_quic_hint(first) else {
+            // QUIC v2, incomplete flights and non-QUIC remain Redirect.
+            return Ok(None);
+        };
+        for evidence in [Evidence::Unknown, Evidence::Known(name.as_str())] {
+            if snapshot.policy().classify_with_application(evidence,
+                Evidence::Known(key.destination.ip()), Evidence::Unknown)
+                .map_err(|_| denied())?.action() != Some(Action::DirectDpi) {
+                return Err(denied());
+            }
+        }
+        if !route_source(key.destination).is_some_and(|source| source.ip() == key.source.ip()) {
+            return Err(denied());
+        }
+        let ips = match carrier.resolve_routing(&name, digest).await {
+            Ok(ips) => ips,
+            Err(ClientError::Rejected(502 | 504)) => {
+                cache.dpi.check_policy(digest)?;
+                self.check_unified_redirect(key, digest)?;
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        if !ips.contains(&key.destination.ip()) { return Err(denied()); }
+        cache.dpi.check_policy(digest)?;
+        self.check_unified_redirect(key, digest)?;
+        // The probe API returns None for both transport and security
+        // failures. Until it has a typed failure contract, do not treat
+        // that ambiguity as permission to fall back.
+        let verified = cache.dpi.open_quic_udp(&name, 443, &[key.destination.ip()], digest)
+            .await.ok_or_else(denied)?;
+        if verified.quic_batch(first).is_none()
+            || verified.socket.peer_addr().ok() != Some(key.destination)
+            || !verified.socket.local_addr().is_ok_and(|local| local.ip() == key.source.ip())
+            || !verified.admissible()?
+        {
+            return Err(denied());
+        }
+        self.check_unified_redirect(key, digest)?;
+        let lease = registrar.udp(&verified.socket, key.destination).map_err(|_| denied())?;
+        self.check_unified_redirect(key, digest)?;
+        Ok(Some((verified, lease)))
     }
 
     #[cfg(target_os="linux")]
@@ -3994,6 +4091,29 @@ impl NativeIngress {
         &self,
         key: crate::routing::packet::FlowKey,
     ) -> Result<(Carrier, crate::routing::flow::FlowLease, Address), ClientError> {
+        let (carrier, flow, address, _, _) = self.redirect_selection(key).await?;
+        Ok((carrier, flow, address))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn check_unified_redirect(&self, key: crate::routing::packet::FlowKey, digest: [u8; 32]) -> Result<(), ClientError> {
+        use crate::routing::PacketAction;
+        let denied = || ClientError::Open(ErrorCode::PolicyDenied);
+        self.ensure_accepting()?;
+        let key = crate::routing::packet::FlowKey { interface: 0, ..key };
+        if !self.unified.load(std::sync::atomic::Ordering::Acquire)
+            || !self.raw.lock().map_err(|_| denied())?.get(&key).is_some_and(|entry|
+                !entry.denied && entry.action == PacketAction::Redirect && entry.digest == digest)
+        {
+            return Err(denied());
+        }
+        self.client.routing_cache().dpi.check_policy(digest)
+    }
+
+    async fn redirect_selection(
+        &self,
+        key: crate::routing::packet::FlowKey,
+    ) -> Result<(Carrier, crate::routing::flow::FlowLease, Address, Arc<Snapshot>, crate::routing::PacketAction), ClientError> {
         use crate::routing::{Evidence, PacketAction};
         self.ensure_accepting()?;
         let denied = || ClientError::Open(ErrorCode::PolicyDenied);
@@ -4032,11 +4152,7 @@ impl NativeIngress {
         }
         #[cfg(target_os="linux")]
         if self.unified.load(std::sync::atomic::Ordering::Acquire) {
-            let key=crate::routing::packet::FlowKey{interface:0,..key};
-            if !self.raw.lock().map_err(|_|denied())?.get(&key).is_some_and(|entry|
-                !entry.denied && entry.action==PacketAction::Redirect && entry.digest==snapshot.digest()) {
-                return Err(denied());
-            }
+            self.check_unified_redirect(key, snapshot.digest())?;
         }
         self.ensure_accepting()?;
         let flow =
@@ -4047,7 +4163,7 @@ impl NativeIngress {
             IpAddr::V4(ip) => Address::V4(ip.octets()),
             IpAddr::V6(ip) => Address::V6(ip.octets()),
         };
-        Ok((carrier, flow, address))
+        Ok((carrier, flow, address, snapshot, configured))
     }
 }
 

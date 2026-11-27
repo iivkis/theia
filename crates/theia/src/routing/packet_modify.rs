@@ -380,6 +380,19 @@ pub fn quic_initial_datagrams(data: &[u8], expected_name: &str) -> Option<Vec<Ve
     (result.len() > 1).then_some(result)
 }
 
+/// An untrusted probe hint, never a domain identity. The unified Linux
+/// lab accepts only a complete v1 H3 Initial with a real transformation.
+/// v2 remains a separate acceptance boundary.
+#[cfg(target_os = "linux")]
+pub(crate) fn unified_quic_hint(data: &[u8]) -> Option<String> {
+    use super::dpi::udp::{Candidate, Observer};
+    let Candidate::QuicH3(name) = Observer::default().outgoing(data) else {
+        return None;
+    };
+    quic_initial_datagrams(data, &name)?;
+    Some(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -818,10 +831,20 @@ mod tests {
             tail.extend([7; 20]);
             data.extend_from_slice(&tail);
             let split = quic_initial_datagrams(&data, "example.org").unwrap();
+            #[cfg(target_os = "linux")]
+            {
+                assert!(unified_quic_hint(&initial).is_none());
+                assert_eq!(
+                    unified_quic_hint(&data).as_deref(),
+                    (version == wire::V1).then_some("example.org")
+                );
+            }
             assert_eq!(split, vec![initial, tail]);
             assert_eq!(split.concat(), data);
             data[100] ^= 1;
             assert!(quic_initial_datagrams(&data, "example.org").is_none());
+            #[cfg(target_os = "linux")]
+            assert!(unified_quic_hint(&data).is_none());
         }
     }
 
