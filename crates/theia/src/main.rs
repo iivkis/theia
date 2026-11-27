@@ -80,6 +80,38 @@ async fn run() {
                 Err(CliError::NotImplemented("Windows user proxy"))
             }
         }
+        Ok(Command::ClientLinuxHostLab{config,port})=>{
+            #[cfg(target_os="linux")]
+            {
+                tokio::task::spawn_blocking(move || {
+                    let host=std::fs::File::open("/proc/1/ns/net").map_err(|_|theia::client::ClientError::Configuration)?;
+                    let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build()
+                        .map_err(|_|theia::client::ClientError::Io)?;
+                    runtime.block_on(Box::pin(local_proxy::NativeIngress::run_linux_host_lab(
+                        Path::new(&config),host,port,tokio::signal::ctrl_c())))
+                }).await.map_err(|_|CliError::Client(theia::client::ClientError::Io))
+                    .and_then(|result|result.map_err(CliError::Client))
+                    .map(|_|"Linux disposable host lab stopped; owned rules and routes restored".to_owned())
+            }
+            #[cfg(not(target_os="linux"))]
+            {let _=(config,port);Err(CliError::NotImplemented("Linux disposable host lab"))}
+        }
+        Ok(command @ (Command::ClientLinuxHostRearm|Command::ClientLinuxHostRecover))=>{
+            #[cfg(target_os="linux")]
+            {
+                tokio::task::spawn_blocking(move || {
+                    let host=std::fs::File::open("/proc/1/ns/net")?;
+                    match command {
+                        Command::ClientLinuxHostRearm=>theia::routing::linux_rules::rearm_host_guard(&host),
+                        _=>theia::routing::linux_rules::recover_host_guard(&host),
+                    }
+                }).await.map_err(|_|CliError::Client(theia::client::ClientError::Io))
+                    .and_then(|result|result.map_err(|_|CliError::Client(theia::client::ClientError::Io)))
+                    .map(|_|"Linux host guard transaction complete; no physical enforcement or production readiness asserted".to_owned())
+            }
+            #[cfg(not(target_os="linux"))]
+            {let _=command;Err(CliError::NotImplemented("Linux host guard"))}
+        }
         Ok(Command::ClientLinuxRedirectLab{config,journal,port})=>{
             #[cfg(target_os="linux")]
             {
@@ -94,7 +126,7 @@ async fn run() {
                         Path::new(&config),host,Path::new(&journal),port,tokio::signal::ctrl_c())))
                 }).await.map_err(|_|CliError::Client(theia::client::ClientError::Io))
                     .and_then(|result|result.map_err(CliError::Client))
-                    .map(|_|"Linux isolated redirect stopped; owned nftables table restored; policy routes externally owned".to_owned())
+                    .map(|_|"Linux isolated redirect stopped; owned nftables table and policy routes restored".to_owned())
             }
             #[cfg(not(target_os="linux"))]
             {let _=(config,journal,port);Err(CliError::NotImplemented("Linux isolated redirect"))}
@@ -107,7 +139,7 @@ async fn run() {
                     theia::routing::linux_rules::recover(&host,Path::new(&journal))
                 }).await.map_err(|_|CliError::Client(theia::client::ClientError::Io))
                     .and_then(|result|result.map_err(|_|CliError::Client(theia::client::ClientError::Io)))
-                    .map(|_|"Linux isolated guard recovered by exact CAS; policy routes externally owned".to_owned())
+                    .map(|_|"Linux isolated guard recovered; owned policy route objects restored".to_owned())
             }
             #[cfg(not(target_os="linux"))]
             {let _=journal;Err(CliError::NotImplemented("Linux isolated guard recovery"))}

@@ -174,6 +174,9 @@ pub enum Command {
     ClientStatus,
     ClientLinuxRedirectLab { config:String,journal:String,port:u16 },
     ClientLinuxRecoverLab { journal:String },
+    ClientLinuxHostLab {config:String,port:u16},
+    ClientLinuxHostRearm,
+    ClientLinuxHostRecover,
     /// Explicit backend compatibility check, never activates capture.
     /// Internal bounded handle-lifetime fixture, no network operations.
     WinDivertGuardHolder,
@@ -413,6 +416,11 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
             Ok(Command::ClientLinuxRedirectLab{config:config_path(config)?,journal:config_path(journal)?,
                 port:port.parse::<u16>().ok().filter(|n|*n>=1024).ok_or(CliError::InvalidArguments)?})
         },
+        ["client","linux","--host-redirect-lab","--config",config,"--port",port,"--confirm-disposable-local-console"]=>{
+            Ok(Command::ClientLinuxHostLab{config:config_path(config)?,port:port.parse::<u16>().ok().filter(|n|*n>=1024).ok_or(CliError::InvalidArguments)?})
+        },
+        ["client","linux","--host-guard-rearm","--confirm-disposable-host"]=>Ok(Command::ClientLinuxHostRearm),
+        ["client","linux","--host-guard-recover","--confirm-disposable-local-console"]=>Ok(Command::ClientLinuxHostRecover),
         ["client","linux","--recover-lab","--journal",journal,"--confirm-isolated-recovery"]=>{
             Ok(Command::ClientLinuxRecoverLab{journal:config_path(journal)?})
         },

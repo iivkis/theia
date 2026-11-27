@@ -126,12 +126,16 @@ pub struct RedirectListeners {
 impl RedirectListeners {
     /// Bind an isolated, dual-stack transparent ingress before installing
     /// rules. The caller must be on the dedicated namespace worker.
-    pub fn bind(host_namespace: &std::fs::File, port: u16) -> io::Result<Self> {
+    pub fn bind(host_namespace:&std::fs::File,port:u16)->io::Result<Self> {
+        Self::bind_mode(host_namespace,port,false)
+    }
+    pub(crate) fn bind_mode(host_namespace:&std::fs::File,port:u16,host_mode:bool)->io::Result<Self> {
         use std::os::unix::fs::MetadataExt;
+        if host_mode {super::linux_rules::verify_host_scope(host_namespace)?;}
         let host = host_namespace.metadata()?;
         let current = std::fs::metadata("/proc/thread-self/ns/net")?;
         if port == 0
-            || (host.dev(), host.ino()) == (current.dev(), current.ino())
+            || (!host_mode && (host.dev(),host.ino())==(current.dev(),current.ino()))
             || unsafe { libc::ioctl(host_namespace.as_raw_fd(), 0xb703 as _) } != libc::CLONE_NEWNET
         {
             return Err(io::ErrorKind::PermissionDenied.into());

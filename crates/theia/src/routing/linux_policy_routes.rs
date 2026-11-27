@@ -42,15 +42,21 @@ fn lock()->io::Result<UnixDatagram> {
     use std::os::linux::net::SocketAddrExt;
     UnixDatagram::bind_addr(&std::os::unix::net::SocketAddr::from_abstract_name(b"theia-owned-policy-routes-v1")?)
 }
-fn read_intent(path:&Path,scope:&Scope)->io::Result<Option<(Intent,Vec<u8>)>> {
+fn read_intent_mode(path:&Path,scope:&Scope,old_boot:bool)->io::Result<Option<(Intent,Vec<u8>)>> {
     let Some(raw)=journal_bytes(path)? else {return Ok(None);};
     let intent:Intent=toml::from_str(std::str::from_utf8(&raw).map_err(|_|invalid())?).map_err(|_|invalid())?;
-    if intent.version!=1 || &intent.scope!=scope || intent.loopback==0 ||
+    let same=&intent.scope==scope;
+    let previous_boot=old_boot && scope.machine.is_some() && scope.machine==intent.scope.machine &&
+        scope.boot!=intent.scope.boot && super::valid_boot_id(&intent.scope.boot);
+    if intent.version!=1 || (!same && !previous_boot) || intent.loopback==0 ||
         intent.confirmed.len()>4 || intent.confirmed.iter().any(|o|o.body.len()>256 || !exact(o,intent.loopback)) ||
         intent.confirmed.iter().enumerate().any(|(i,o)|intent.confirmed[..i].iter().any(|a|a.kind==o.kind && a.body[0]==o.body[0])) {
         return Err(refused());
     }
     Ok(Some((intent,raw)))
+}
+fn read_intent(path:&Path,scope:&Scope)->io::Result<Option<(Intent,Vec<u8>)>> {
+    read_intent_mode(path,scope,false)
 }
 fn write_intent(path:&Path,intent:&Intent,expected:Option<&[u8]>)->io::Result<Vec<u8>> {
     let value=toml::to_string(intent).map_err(|_|invalid())?;
@@ -185,7 +191,8 @@ fn exact(object:&Object,lo:u32)->bool {
     if b.iter().any(|(key,value)|a.get(key)!=Some(value)) {return false;}
     a.iter().all(|(key,value)|b.contains_key(key) ||
         (object.kind==NEW_RULE && *key==14 && *value==u32::MAX.to_ne_bytes()) ||
-        (object.kind==NEW_ROUTE && family==FAMILIES[1] && *key==20 && *value==[0]))
+        (object.kind==NEW_ROUTE && family==FAMILIES[1] &&
+            ((*key==20 && *value==[0]) || (*key==12 && *value==[0;32]))))
 }
 fn snapshot()->io::Result<Vec<Object>> {
     let mut result=Vec::new();
@@ -206,16 +213,19 @@ pub(crate) struct PolicyRoutes {
     _lock:UnixDatagram,
 }
 impl PolicyRoutes {
-    pub(crate) fn install(host:&File,guard:&Path)->io::Result<Self> {
-        let scope=Scope::current(host)?;
+    pub(crate) fn install(host:&File,guard:&Path,host_mode:bool)->io::Result<Self> {
+        let scope=Scope::current_mode(host,host_mode)?;
+        if host_mode {super::host_path(guard)?;}
         // Serialize against any existing nftables owner before making
         // changes. The route lock then survives the entire capture epoch.
         let _guard_lock=scope_lock()?;
         let owner=lock()?;
         let path=path_for(guard);
         check_parent(&path)?;
-        let old=read_intent(&path,&scope)?;
-        if old.as_ref().is_some_and(|(i,_)|!i.restored) || !snapshot()?.is_empty() {return Err(refused());}
+        let old=read_intent_mode(&path,&scope,host_mode)?;
+        if old.as_ref().is_some_and(|(i,_)|i.scope==scope && !i.restored) || !snapshot()?.is_empty() {return Err(refused());}
+        // Old-boot records have no deletion authority. Stable absence of
+        // all reserved objects is required before a new exclusive create.
         let lo=loopback_index()?;
         let mut intent=Intent{version:1,scope,loopback:lo,confirmed:Vec::new(),restored:false};
         let mut raw=write_intent(&path,&intent,old.as_ref().map(|(_,b)|b.as_slice()))?;
@@ -249,12 +259,18 @@ impl PolicyRoutes {
 // Called only while the nftables ownership lock is held. Remove the
 // routes while the external egress guard is still present. No Drop
 // rollback and no deletion based only on a reserved table number.
-pub(super) fn recover_if_present(host:&File,guard:&Path)->io::Result<()> {
+pub(super) fn recover_if_present(host:&File,guard:&Path,host_mode:bool)->io::Result<()> {
     let path=path_for(guard);
     check_parent(&path)?;
     let _owner=lock()?;
-    let scope=Scope::current(host)?;
-    let Some((mut intent,mut raw))=read_intent(&path,&scope)? else {return Ok(());};
+    let scope=Scope::current_mode(host,host_mode)?;
+    let Some((mut intent,mut raw))=read_intent_mode(&path,&scope,host_mode)? else {return Ok(());};
+    if intent.scope!=scope {
+        if !snapshot()?.is_empty() {return Err(refused());}
+        intent.scope=scope;intent.confirmed.clear();intent.restored=true;
+        write_intent(&path,&intent,Some(&raw))?;
+        return Ok(());
+    }
     if intent.restored {return if snapshot()?.is_empty(){Ok(())}else{Err(refused())};}
     let mut current=snapshot()?;
     if !current.iter().all(|o|intent.confirmed.contains(o)) {return Err(refused());}

@@ -105,7 +105,11 @@ fn current_namespace() -> io::Result<(u64, u64)> {
     let meta = std::fs::metadata("/proc/thread-self/ns/net")?;
     Ok((meta.dev(), meta.ino()))
 }
-fn check_scope(host: &File) -> io::Result<(u64, u64)> {
+fn check_scope(host:&File,host_mode:bool)->io::Result<(u64,u64)> {
+    if host_mode {
+        super::linux_rules::verify_host_scope(host)?;
+        return current_namespace();
+    }
     let host_meta = host.metadata()?;
     let current = current_namespace()?;
     if current == (host_meta.dev(), host_meta.ino())
@@ -141,7 +145,7 @@ impl LabCarrierSocket {
             transport: Transport::Tcp,
             interface: 0,
         };
-        Self::claim(socket.try_clone()?.into(), key, host_namespace, false)
+        Self::claim(socket.try_clone()?.into(),key,host_namespace,false,false)
     }
     pub fn udp(socket: &UdpSocket, host_namespace: &File) -> io::Result<Self> {
         verify_descriptor(socket,Transport::Udp)?;
@@ -151,29 +155,29 @@ impl LabCarrierSocket {
             transport: Transport::Udp,
             interface: 0,
         };
-        Self::claim(socket.try_clone()?.into(), key, host_namespace, false)
+        Self::claim(socket.try_clone()?.into(),key,host_namespace,false,false)
     }
     pub(super) fn pending_tcp(
         socket: &tokio::net::TcpSocket,
         peer: SocketAddr,
-        host: &File,
-    ) -> io::Result<Self> {
-        Self::pending(socket, socket.local_addr()?, peer, Transport::Tcp, host)
+        host:&File,host_mode:bool,
+    )->io::Result<Self> {
+        Self::pending(socket,socket.local_addr()?,peer,Transport::Tcp,host,host_mode)
     }
     pub(super) fn pending_udp(
         socket: &tokio::net::UdpSocket,
         peer: SocketAddr,
-        host: &File,
-    ) -> io::Result<Self> {
-        Self::pending(socket, socket.local_addr()?, peer, Transport::Udp, host)
+        host:&File,host_mode:bool,
+    )->io::Result<Self> {
+        Self::pending(socket,socket.local_addr()?,peer,Transport::Udp,host,host_mode)
     }
     fn pending(
         socket: &impl AsRawFd,
         source: SocketAddr,
         destination: SocketAddr,
-        transport: Transport,
-        host: &File,
-    ) -> io::Result<Self> {
+        transport:Transport,
+        host:&File,host_mode:bool,
+    )->io::Result<Self> {
         verify_descriptor(socket,transport)?;
         let fd = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
         if fd < 0 {
@@ -188,13 +192,12 @@ impl LabCarrierSocket {
                 transport,
                 interface: 0,
             },
-            host,
-            true,
+            host,true,host_mode,
         )
     }
-    fn claim(fd: OwnedFd, key: FlowKey, host_namespace: &File, pending: bool) -> io::Result<Self> {
+    fn claim(fd:OwnedFd,key:FlowKey,host_namespace:&File,pending:bool,host_mode:bool)->io::Result<Self> {
         verify_descriptor(&fd,key.transport)?;
-        let namespace = check_scope(host_namespace)?;
+        let namespace=check_scope(host_namespace,host_mode)?;
         if !valid(key) || get_mark(&fd)? != 0 {
             return Err(denied());
         }

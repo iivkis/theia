@@ -2595,7 +2595,7 @@ impl NativeIngress {
         queue_number: u16,
         stop: impl std::future::Future<Output = std::io::Result<()>>,
     ) -> Result<(), ClientError> {
-        Self::run_linux_managed_lab(path,host_namespace,journal,Some(queue_number),None,stop).await
+        Self::run_linux_managed_lab(path,host_namespace,journal,Some(queue_number),None,false,stop).await
     }
 
     /// The same native Runtime, but transparent TCP and UDP listeners
@@ -2608,13 +2608,23 @@ impl NativeIngress {
         path:&Path,host_namespace:std::fs::File,journal:&Path,port:u16,
         stop:impl std::future::Future<Output=std::io::Result<()>>,
     )->Result<(),ClientError> {
-        Self::run_linux_managed_lab(path,host_namespace,journal,None,Some(port),stop).await
+        Self::run_linux_managed_lab(path,host_namespace,journal,None,Some(port),false,stop).await
+    }
+
+    /// Explicit disposable host test only. The same policy queue and
+    /// transparent adapters, not a second production mode. Fixed journal
+    /// location is the boot guard's only authorized host intent.
+    #[cfg(target_os="linux")]
+    pub async fn run_linux_host_lab(path:&Path,host_namespace:std::fs::File,port:u16,
+        stop:impl std::future::Future<Output=std::io::Result<()>>)->Result<(),ClientError> {
+        let journal=Path::new(crate::routing::linux_rules::HOST_GUARD_JOURNAL);
+        Self::run_linux_managed_lab(path,host_namespace,journal,None,Some(port),true,stop).await
     }
 
     #[cfg(target_os="linux")]
     async fn run_linux_managed_lab(
         path:&Path,host_namespace:std::fs::File,journal:&Path,queue_number:Option<u16>,
-        redirect_port:Option<u16>,stop:impl std::future::Future<Output=std::io::Result<()>>,
+        redirect_port:Option<u16>,host_mode:bool,stop:impl std::future::Future<Output=std::io::Result<()>>,
     )->Result<(),ClientError> {
         use crate::routing::{
             carrier_socket,
@@ -2643,16 +2653,16 @@ impl NativeIngress {
         saved_client_bytes(&path, digest)?;
         // Bind all four listeners before installing the persistent
         // fail-closed table. No network preflight precedes its commit.
-        let listeners=redirect_port.map(|port|crate::routing::linux_ingress::RedirectListeners::bind(&host_namespace,port))
+        let listeners=redirect_port.map(|port|crate::routing::linux_ingress::RedirectListeners::bind_mode(&host_namespace,port,host_mode))
             .transpose().map_err(|_|ClientError::Io)?;
         let queue=queue_number.or_else(||listeners.as_ref().map(|_|49000))
             .map(|number|Queue::bind(number,256)).transpose().map_err(|_|ClientError::Io)?;
         let routes=if listeners.is_some() {
-            Some(linux_rules::PolicyRoutes::install(&host_namespace,journal).map_err(|_|ClientError::Io)?)
+            Some(linux_rules::PolicyRoutes::install(&host_namespace,journal,host_mode).map_err(|_|ClientError::Io)?)
         } else {None};
         let rules=Arc::new(Mutex::new(match (&queue,&listeners) {
             (Some(queue),None)=>LabRules::install(queue,&host_namespace,journal),
-            (Some(queue),Some(listeners))=>LabRules::install_unified(queue,&host_namespace,journal,listeners.port()),
+            (Some(queue),Some(listeners))=>LabRules::install_unified(queue,&host_namespace,journal,listeners.port(),host_mode),
             _=>return Err(ClientError::Configuration),
         }.map_err(|_|ClientError::Io)?));
         let registrar: Arc<dyn carrier_socket::Registrar> = Arc::new(LabRegistrar::new(
@@ -2688,7 +2698,7 @@ impl NativeIngress {
                         return Err(ClientError::Open(ErrorCode::PolicyDenied));
                     }
                     ingress.runtime.capture_state.ready()?;
-                    eprintln!("Theia isolated Linux all-destination TCP/UDP redirect ready; stop applications before explicit Stop");
+                    eprintln!("Theia Linux managed laboratory capture ready (host scope={host_mode}); stop applications before explicit Stop");
                     let monitor=async {
                         let mut tick=tokio::time::interval(Duration::from_secs(1));
                         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2755,7 +2765,7 @@ impl NativeIngress {
         }
         drop(rules);
         drop(routes);
-        let recovered = linux_rules::recover(&host_namespace, journal).map_err(|_| ClientError::Io);
+        let recovered=linux_rules::recover_mode(&host_namespace,journal,host_mode).map_err(|_| ClientError::Io);
         drop(owner);
         recovered
     }

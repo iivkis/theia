@@ -69,12 +69,31 @@ fn valid_boot_id(boot: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Scope {
-    boot: String,
-    dev: u64,
-    ino: u64,
+    boot:String,dev:u64,ino:u64,
+    /// Present only for explicit PID-1 namespace laboratory activation.
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    machine:Option<String>,
+}
+pub const HOST_GUARD_JOURNAL:&str="/var/lib/theia/guard/host.toml";
+fn host_path(path:&Path)->io::Result<()> {
+    if path!=Path::new(HOST_GUARD_JOURNAL) {return Err(refused());}
+    check_parent(path)
+}
+pub(super) fn verify_host_scope(host:&File)->io::Result<()> {
+    Scope::current_mode(host,true).map(|_|())
+}
+fn machine_id()->io::Result<String> {
+    let path=Path::new("/etc/machine-id");
+    let meta=fs::symlink_metadata(path)?;
+    if !meta.is_file() || meta.uid()!=0 || meta.mode()&0o022!=0 || meta.len()>64 {return Err(refused());}
+    let id=fs::read_to_string(path)?.trim().to_owned();
+    if id.len()!=32 || !id.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) ||
+        id.bytes().all(|b|b==b'0') {return Err(refused());}
+    Ok(id)
 }
 impl Scope {
-    fn current(host_namespace: &File) -> io::Result<Self> {
+    fn current(host_namespace:&File)->io::Result<Self> {Self::current_mode(host_namespace,false)}
+    fn current_mode(host_namespace: &File,host_mode:bool) -> io::Result<Self> {
         let own = fs::metadata("/proc/thread-self/ns/net")?;
         let host = host_namespace.metadata()?;
         let mut stat: libc::statfs = unsafe { mem::zeroed() };
@@ -89,9 +108,17 @@ impl Scope {
         if unsafe { libc::ioctl(host_namespace.as_raw_fd(), 0xb703 as _) } != libc::CLONE_NEWNET {
             return Err(refused());
         }
-        if own.dev() == host.dev() && own.ino() == host.ino() {
-            return Err(refused());
-        }
+        let same=(own.dev(),own.ino())==(host.dev(),host.ino());
+        let machine=if host_mode {
+            let init=fs::metadata("/proc/1/ns/net")?;
+            if !same || unsafe {libc::geteuid()}!=0 || (init.dev(),init.ino())!=(host.dev(),host.ino()) {
+                return Err(refused());
+            }
+            Some(machine_id()?)
+        } else {
+            if same {return Err(refused());}
+            None
+        };
         let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?
             .trim()
             .to_owned();
@@ -101,7 +128,8 @@ impl Scope {
         Ok(Self {
             boot,
             dev: own.dev(),
-            ino: own.ino(),
+            ino:own.ino(),
+            machine,
         })
     }
 }
@@ -128,8 +156,10 @@ struct Journal {
     #[serde(default)]
     previous_present: bool,
     #[serde(default, skip_serializing_if="Option::is_none")]
-    redirect: Option<RedirectScope>,
-    restored: bool,
+    redirect:Option<RedirectScope>,
+    #[serde(default)]
+    boot_rearmed:bool,
+    restored:bool,
 }
 impl Journal {
     fn name(&self) -> String {
@@ -143,6 +173,8 @@ impl Journal {
             || self.before == 0
             || self.before.checked_add(1) != Some(self.installed)
             || self.redirect.is_some_and(|scope|scope.port==0 || scope.loopback==0)
+            || (scope.machine.is_some() && self.redirect.and_then(|s|s.policy_queue).is_none())
+            || (self.boot_rearmed && (scope.machine.is_none() || self.previous_present || self.restored))
         {
             return Err(refused());
         }
@@ -923,7 +955,7 @@ impl LabRules {
                 queue_number,
                 queue_identity: tagged.identity(),
             }),
-            None,
+            None,false,
         )
     }
 
@@ -947,7 +979,7 @@ impl LabRules {
         path: &Path,
         carriers: Vec<LabCarrierSocket>,
     ) -> io::Result<Self> {
-        Self::install_inner(Some(queue), host_namespace, path, carriers, None,None)
+        Self::install_inner(Some(queue),host_namespace,path,carriers,None,None,false)
     }
 
     /// Managed all-destination TCP/UDP redirect in a dedicated namespace.
@@ -957,16 +989,17 @@ impl LabRules {
         let scope=RedirectScope{port,loopback:loopback_index()?,policy_queue:None};
         Scope::current(host_namespace)?;
         if port==0 || !redirect_routes_ready(scope)? {return Err(refused());}
-        Self::install_inner(None,host_namespace,path,Vec::new(),None,Some(scope))
+        Self::install_inner(None,host_namespace,path,Vec::new(),None,Some(scope),false)
     }
 
     /// One policy queue decides the physical egress or transparent
     /// termination before the first packet leaves the namespace.
-    pub(crate) fn install_unified(queue:&Queue,host:&File,path:&Path,port:u16)->io::Result<Self> {
+    pub(crate) fn install_unified(queue:&Queue,host:&File,path:&Path,port:u16,host_mode:bool)->io::Result<Self> {
         let scope=RedirectScope{port,loopback:loopback_index()?,policy_queue:Some(queue.number()?)};
-        Scope::current(host)?;
+        Scope::current_mode(host,host_mode)?;
+        if host_mode {host_path(path)?;}
         if port==0 || !redirect_routes_ready(scope)? {return Err(refused());}
-        Self::install_inner(Some(queue),host,path,Vec::new(),None,Some(scope))
+        Self::install_inner(Some(queue),host,path,Vec::new(),None,Some(scope),host_mode)
     }
 
     pub(crate) fn owns_policy_queue(&self,queue:&Queue)->io::Result<bool> {
@@ -1006,11 +1039,12 @@ impl LabRules {
         path: &Path,
         carriers: Vec<LabCarrierSocket>,
         capture: Option<SocketCapture>,
-        redirect: Option<RedirectScope>,
-    ) -> io::Result<Self> {
-        let lock = scope_lock()?;
-        let scope = Scope::current(host_namespace)?;
-        check_parent(path)?;
+        redirect:Option<RedirectScope>,
+        host_mode:bool,
+    )->io::Result<Self> {
+        let lock=scope_lock()?;
+        let scope=Scope::current_mode(host_namespace,host_mode)?;
+        if host_mode {host_path(path)?;} else {check_parent(path)?;}
         if carriers.len() > MAX_CARRIERS || (capture.is_some() && (!carriers.is_empty() || redirect.is_some())) {
             return Err(refused());
         }
@@ -1034,11 +1068,28 @@ impl LabRules {
             .as_deref()
             .map(|bytes| parse_journal(bytes, &scope))
             .transpose()?;
-        if previous.as_ref().is_some_and(|journal| !journal.restored) {
-            return Err(refused());
+        let net=Netlink::open()?;
+        let before=net.generation()?;
+        if let Some(previous)=previous.as_ref().filter(|j|!j.restored) {
+            // A new boot's guard has the exact unified layout and no
+            // carrier entries. Adopt it without removing the DROP chains.
+            if !host_mode || !previous.boot_rearmed || previous.redirect!=redirect ||
+                !carriers.is_empty() || capture.is_some() || queue.is_none() ||
+                previous.installed!=before || !net.table(previous)? || net.generation()?!=before {
+                return Err(refused());
+            }
+            let mut journal=previous.clone();
+            journal.boot_rearmed=false;
+            store(path,&journal,old.as_deref())?;
+            if net.generation()?!=before || !net.table(&journal)? || net.generation()?!=before {return Err(refused());}
+            return Ok(Self{
+                _lock:lock,journal,queue_identity:queue.ok_or_else(refused)?.identity(),
+                _carriers:Vec::new(),capture:None,journal_path:path.to_owned(),
+                admissions:Default::default(),dynamic:Default::default(),used_marks:marks,
+                used_cookies:cookies,queue_number:queue.ok_or_else(refused)?.number()?,
+                poisoned:false,carrier_retired:false,
+            });
         }
-        let net = Netlink::open()?;
-        let before = net.generation()?;
         // Never overwrite the only journal for a table that unexpectedly
         // exists again, even if an earlier recovery was recorded as complete.
         if let Some(previous) = &previous {
@@ -1059,7 +1110,8 @@ impl LabRules {
             installed,
             previous_present: false,
             redirect,
-            restored: false,
+            boot_rearmed:false,
+            restored:false,
         };
         if net.table(&journal)? || net.generation()? != before {
             return Err(refused());
@@ -1346,14 +1398,16 @@ impl super::carrier_socket::Registrar for LabRegistrar {
         socket: &tokio::net::TcpSocket,
         peer: std::net::SocketAddr,
     ) -> io::Result<super::carrier_socket::Lease> {
-        self.admit(LabCarrierSocket::pending_tcp(socket, peer, &self.host)?)
+        let host_mode=self.rules.lock().map_err(|_|refused())?.journal.scope.machine.is_some();
+        self.admit(LabCarrierSocket::pending_tcp(socket,peer,&self.host,host_mode)?)
     }
     fn udp(
         &self,
         socket: &tokio::net::UdpSocket,
         peer: std::net::SocketAddr,
     ) -> io::Result<super::carrier_socket::Lease> {
-        self.admit(LabCarrierSocket::pending_udp(socket, peer, &self.host)?)
+        let host_mode=self.rules.lock().map_err(|_|refused())?.journal.scope.machine.is_some();
+        self.admit(LabCarrierSocket::pending_udp(socket,peer,&self.host,host_mode)?)
     }
     fn udp_reply(&self,socket:&tokio::net::UdpSocket,peer:std::net::SocketAddr)
         ->io::Result<super::carrier_socket::Lease> {
@@ -1391,7 +1445,7 @@ pub fn reconcile_after_reboot(host_namespace: &File, path: &Path) -> io::Result<
     let mut journal: Journal = toml::from_str(std::str::from_utf8(&raw).map_err(|_| invalid())?)
         .map_err(|_| invalid())?;
     journal.validate(&journal.scope)?;
-    if !valid_boot_id(&journal.scope.boot) || journal.scope.boot == scope.boot {
+    if journal.scope.machine.is_some() || !valid_boot_id(&journal.scope.boot) || journal.scope.boot==scope.boot {
         return Err(refused());
     }
     let net = Netlink::open()?;
@@ -1413,12 +1467,18 @@ pub fn reconcile_after_reboot(host_namespace: &File, path: &Path) -> io::Result<
 /// Explicit recovery, after the previous LabRules lease is dropped. A
 /// foreign change anywhere in this namespace makes deletion fail closed.
 /// No forced flush, no whole-ruleset restoration, no table-name guessing.
-pub fn recover(host_namespace: &File, path: &Path) -> io::Result<()> {
-    let _lock = scope_lock()?;
-    let scope = Scope::current(host_namespace)?;
-    check_parent(path)?;
+pub fn recover(host_namespace:&File,path:&Path)->io::Result<()> {
+    recover_mode(host_namespace,path,false)
+}
+pub fn recover_host_guard(host_namespace:&File)->io::Result<()> {
+    recover_mode(host_namespace,Path::new(HOST_GUARD_JOURNAL),true)
+}
+pub(crate) fn recover_mode(host_namespace:&File,path:&Path,host_mode:bool)->io::Result<()> {
+    let _lock=scope_lock()?;
+    let scope=Scope::current_mode(host_namespace,host_mode)?;
+    if host_mode {host_path(path)?;} else {check_parent(path)?;}
     let Some(raw)=journal_bytes(path)? else {
-        return policy_routes::recover_if_present(host_namespace,path);
+        return policy_routes::recover_if_present(host_namespace,path,host_mode);
     };
     let mut journal = parse_journal(&raw, &scope)?;
     let net = Netlink::open()?;
@@ -1431,12 +1491,12 @@ pub fn recover(host_namespace: &File, path: &Path) -> io::Result<()> {
         // Idempotence is evidence of absence, not permission to delete
         // an object that appeared after the recorded restoration.
         if present {return Err(refused());}
-        return policy_routes::recover_if_present(host_namespace,path);
+        return policy_routes::recover_if_present(host_namespace,path,host_mode);
     }
     let expected = if present {
         journal.recovery_generation(generation)?;
         // Routes are restored before the owned firewall guard is removed.
-        policy_routes::recover_if_present(host_namespace,path)?;
+        policy_routes::recover_if_present(host_namespace,path,host_mode)?;
         if net.generation()?!=generation || !net.table(&journal)? {return Err(refused());}
         let after = generation.checked_add(1).ok_or_else(refused)?;
         crate::config::guarded_trust_assert(path, &raw).map_err(|_| refused())?;
@@ -1448,7 +1508,7 @@ pub fn recover(host_namespace: &File, path: &Path) -> io::Result<()> {
         )?;
         after
     } else {
-        policy_routes::recover_if_present(host_namespace,path)?;
+        policy_routes::recover_if_present(host_namespace,path,host_mode)?;
         generation
     };
     // A stable absence observation is required even if a prior recovery
@@ -1456,8 +1516,52 @@ pub fn recover(host_namespace: &File, path: &Path) -> io::Result<()> {
     if net.generation()? != expected || net.table(&journal)? || net.generation()? != expected {
         return Err(refused());
     }
-    journal.restored = true;
-    store(path, &journal, Some(&raw))?;
+    journal.restored=true;
+    journal.boot_rearmed=false;
+    store(path,&journal,Some(&raw))?;
+    Ok(())
+}
+
+/// Re-arm only a previously explicit host guard after a new boot. The
+/// queue is absent and every nonlocal IP packet is dropped. No carrier,
+/// DNS, rule deletion, user policy fetch or production readiness here.
+/// The unit is separately provisioned by a local administrator.
+pub fn rearm_host_guard(host_namespace:&File)->io::Result<()> {
+    let path=Path::new(HOST_GUARD_JOURNAL);
+    let _lock=scope_lock()?;
+    let scope=Scope::current_mode(host_namespace,true)?;
+    host_path(path)?;
+    let raw=journal_bytes(path)?.ok_or_else(refused)?;
+    let old:Journal=toml::from_str(std::str::from_utf8(&raw).map_err(|_|invalid())?).map_err(|_|invalid())?;
+    old.validate(&old.scope)?;
+    if old.scope.machine!=scope.machine || !valid_boot_id(&old.scope.boot) {return Err(refused());}
+    let net=Netlink::open()?;
+    let generation=net.generation()?;
+    let present=net.table(&old)?;
+    if net.generation()?!=generation {return Err(refused());}
+    if old.restored {return if present {Err(refused())}else{Ok(())};}
+    let (journal,intent)=if old.scope.boot==scope.boot {
+        if old.scope!=scope {return Err(refused());}
+        if present && generation==old.installed {return Ok(());}
+        if present || !old.boot_rearmed || generation!=old.before {return Err(refused());}
+        (old,raw) // retry an interrupted create-only boot intent
+    } else {
+        if present {return Err(refused());} // never delete old-boot objects
+        let mut redirect=old.redirect.ok_or_else(refused)?;
+        redirect.loopback=loopback_index()?;
+        let mut nonce=[0u8;16];SystemRandom::new().fill(&mut nonce).map_err(|_|refused())?;
+        let journal=Journal{version:1,scope,nonce,before:generation,
+            installed:generation.checked_add(1).ok_or_else(refused)?,
+            previous_present:false,redirect:Some(redirect),boot_rearmed:true,restored:false};
+        if net.table(&journal)? || net.generation()?!=generation {return Err(refused());}
+        let intent=store(path,&journal,Some(&raw))?;
+        (journal,intent)
+    };
+    crate::config::guarded_trust_assert(path,&intent).map_err(|_|refused())?;
+    net.batch(journal.before,&redirect_install(&journal,journal.redirect.ok_or_else(refused)?,&Default::default()))?;
+    if net.generation()?!=journal.installed || !net.table(&journal)? || net.generation()?!=journal.installed {
+        return Err(refused());
+    }
     Ok(())
 }
 
@@ -1470,14 +1574,16 @@ mod tests {
             scope: Scope {
                 boot: "test".into(),
                 dev: 1,
-                ino: 2,
+                ino:2,
+                machine:None,
             },
             nonce: [7; 16],
             before: 12,
             installed: 13,
             previous_present: false,
-            redirect: None,
-            restored: false,
+            redirect:None,
+            boot_rearmed:false,
+            restored:false,
         }
     }
     #[test]
