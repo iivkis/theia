@@ -5501,6 +5501,21 @@ mod selector_tests {
             ] {
                 profile.transport = transport;
                 profile.server = remote.to_string();
+
+                // The exact same production H2/H3 clients now consume
+                // compact key trust without opening a PEM file.
+                let anchor = crate::own_tls::Anchor::from_bytes(Sha256::digest(cert.cert.der()).into());
+                let mut key_profile = profile.clone();
+                key_profile.tls_ca = Some(anchor.reference());
+                let key_client = load_client(&key_profile).await.unwrap();
+                assert_eq!(key_client.routing_policy().await.unwrap().manifest().revision, 2);
+                drop(key_client);
+
+                key_profile.tls_ca = Some(crate::own_tls::Anchor::from_bytes([0x99; 32]).reference());
+                let wrong = load_client(&key_profile).await.unwrap();
+                assert!(wrong.routing_policy().await.is_err(), "wrong anchor must reject the authenticated exchange");
+                drop(wrong);
+
                 let proxy_client = load_client(&profile).await.unwrap();
                 let snapshot = proxy_client.routing_policy().await.unwrap();
                 assert_eq!(snapshot.manifest().revision, 2);

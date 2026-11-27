@@ -183,7 +183,7 @@ mod tests {
         assert!(pin.verify_server_cert(leaf, &[], &name, &[], UnixTime::now()).is_ok());
         assert!(pin.verify_server_cert(other.cert.der(), &[], &name, &[], UnixTime::now()).is_err());
         assert!(pin.verify_server_cert(leaf, &[], &wrong_name, &[], UnixTime::now()).is_err());
-        assert!(pin.verify_server_cert(leaf, &[], &name, &[], UnixTime::since_unix_epoch(std::time::Duration::from_secs(u64::MAX / 2))).is_err());
+        assert!(pin.verify_server_cert(leaf, &[], &name, &[], UnixTime::since_unix_epoch(std::time::Duration::ZERO)).is_err());
         for carrier in [crate::transport_policy::Carrier::H2, crate::transport_policy::Carrier::H3] {
             let tls = Trust::Pinned(pin).tls(carrier).unwrap();
             assert_eq!(tls.alpn_protocols, vec![carrier.alpn().to_vec()]);

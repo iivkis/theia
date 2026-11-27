@@ -218,8 +218,12 @@ async fn client_scenario(
 
     client_doc.client.active_profile = invitation.id.clone();
     if invalid_ca {
+        use sha2::{Digest, Sha256};
         let wrong_ca = std::env::var("THEIA_F14_XHOST_WRONG_CA").unwrap();
-        client_doc.client.profiles[1].tls_ca = Some(format!("file:{wrong_ca}"));
+        let pem = fs::read(wrong_ca).unwrap();
+        let cert = rustls_pemfile::certs(&mut std::io::BufReader::new(pem.as_slice()))
+            .next().unwrap().unwrap();
+        client_doc.client.profiles[1].tls_ca = Some(format!("anchor-sha256:{:x}", Sha256::digest(cert.as_ref())));
     }
     let successful = !invalid_token && !invalid_ca;
     run_client(&config_path, client_doc, origin, successful).await;

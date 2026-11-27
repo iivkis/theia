@@ -290,7 +290,7 @@ impl Editor {
     /// F-14: commit a completely new client profile from a reviewed invitation.
     /// The source's bearer is never written to TOML; the file is protected by
     /// a fresh owner-only directory and private ACL/mode on both platforms.
-    /// Caller must explicitly review ID/endpoint/SNI/transport and CA trust.
+    /// Caller must explicitly review ID/endpoint/SNI/transport and pinned trust.
     /// First Own-TLS import: create only a real, fully reviewed profile.
     /// A conflicting destination is never replaced; credentials survive an
     /// indeterminate publication but are removed after a pre-commit refusal.
@@ -2657,6 +2657,15 @@ mod tests {
         wrong.endpoint = "other.example.org:443".into();
         assert!(editor.refresh_credential(&wrong).is_err());
         wrong.endpoint = initial.endpoint.clone();
+        // Same endpoint/name/transport but different trust is not rotation.
+        let mut other_server = config::parse(&crate::invite::fixture_server_source(&[0x43; 32])).unwrap();
+        let Config::Server(document) = &mut other_server else { panic!("server"); };
+        let other_cert = rcgen::generate_simple_self_signed(vec![initial.server_name.clone()]).unwrap();
+        let cert_file = Temp::write(&other_cert.cert.pem());
+        document.server.inbounds[0].tls_cert = format!("file:{}", cert_file.0.display());
+        let other_invite = Invitation::issued_from_server(&other_server, "public", "device-a", &[0x43; 32]).unwrap();
+        assert_ne!(other_invite.trust_reference(), initial.trust_reference());
+        assert!(editor.refresh_credential(&other_invite).is_err());
         wrong.transport = Transport::H3;
         assert!(editor.refresh_credential(&wrong).is_err());
         assert_eq!(fs::read(&temp.0).unwrap(), before);
