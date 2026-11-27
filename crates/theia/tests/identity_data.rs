@@ -153,7 +153,12 @@ async fn bind() -> TcpListener {
         let address = udp.local_addr().unwrap();
         match TcpListener::bind(address).await {
             Ok(tcp) => return tcp,
-            Err(error) if matches!(error.kind(), std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied) => {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
                 last = Some(error);
                 rejected.push(udp);
             }
