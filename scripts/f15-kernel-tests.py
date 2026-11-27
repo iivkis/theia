@@ -52,8 +52,9 @@ def verify_coverage(path: Path) -> None:
         ("crates/theia/src/routing/linux_carrier.rs", "set_mark(&lease.fd, mark)?;"),
         ("crates/theia/src/routing/linux_rules.rs", "journal.restored = true;"),
     )
+    root = Path(__file__).resolve().parents[1]
     for source, anchor in sentinels:
-        lines = Path(source).read_text(encoding="utf-8").splitlines()
+        lines = (root / source).read_text(encoding="utf-8").splitlines()
         hits = [str(index) for index, line in enumerate(lines, 1)
                 if line.strip() == anchor]
         if len(hits) != 1 or report["files"].get(source, {}).get(hits[0]) != 1:
