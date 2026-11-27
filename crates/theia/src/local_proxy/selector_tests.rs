@@ -1434,6 +1434,120 @@ fn real_local_proxy_modes_validate_credentials_and_relay_over_both_transports() 
     run_proxy_fixture(real_local_proxy_modes_fixture);
 }
 
+// Drive the real diagnostic session over the authenticated loopback carrier.
+// No target DNS, public I/O or system-proxy mutation is authorized by this fixture.
+async fn blocked_diagnostic_fixture(
+    directory: &std::path::Path,
+    doc: &crate::config::ClientDocument,
+    profile: &crate::config::Profile,
+    server_list: bool,
+) {
+    use crate::local_proxy::profile_diagnostics::{CheckKind, Event, Outcome};
+    use sha2::{Digest, Sha256};
+    let mut doc = doc.clone();
+    let mut selected = profile.clone();
+    selected.id = "diagnostic".into();
+    doc.client.profiles.push(selected.clone());
+    let path = directory.join("diagnostic.toml");
+    crate::config::atomic_write(&path, &Config::Client(doc)).unwrap();
+    let saved = crate::config::editor_bytes(&path).unwrap();
+    let digest: [u8; 32] = Sha256::digest(&saved).into();
+    // Closing consent, editing the saved profile while awaiting consent,
+    // and explicitly accepting are three distinct terminal outcomes.
+    for (consent, changed) in [(false, false), (true, true), (true, false)] {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (confirm, confirmed) = tokio::sync::oneshot::channel();
+        let (_cancel, cancelled) = tokio::sync::watch::channel(false);
+        let custom = (!server_list).then(|| vec!["blocked.invalid".into()]);
+        let work = super::profile_diagnostics::run(
+            path.clone(),
+            digest,
+            selected.id.clone(),
+            custom,
+            tx,
+            confirmed,
+            cancelled,
+        );
+        let driver = async {
+            let mut confirm = Some(confirm);
+            let mut verified = false;
+            let mut domains_seen = false;
+            let mut blocked = false;
+            let mut skipped = false;
+            let mut done = false;
+            loop {
+                let event = match rx.try_recv() {
+                    Ok(event) => event,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        continue;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        panic!("diagnostic session closed without result");
+                    }
+                };
+                match event {
+                    Event::Check(check) => {
+                        if check.domain.is_some() {
+                            assert!(consent && !changed && domains_seen, "target check without live consent");
+                            assert_eq!(check.domain.as_deref(), Some("blocked.invalid"));
+                        }
+                        match (check.kind, check.outcome) {
+                            (CheckKind::Carrier(_), Outcome::Verified(_)) => verified = true,
+                            (CheckKind::Policy, Outcome::Route(Action::Blocked)) => blocked = true,
+                            (CheckKind::Https("штатный"), Outcome::Skipped(_)) => skipped = true,
+                            (_, Outcome::Failure(error)) => panic!("unexpected failure: {error}"),
+                            _ => {}
+                        }
+                    }
+                    Event::Domains(domains) => {
+                        assert!(verified && !domains_seen);
+                        assert_eq!(domains, vec!["blocked.invalid"]);
+                        domains_seen = true;
+                        let confirmation = confirm.take().unwrap();
+                        if changed {
+                            let mut edited = saved.clone();
+                            edited.push(b'\n');
+                            std::fs::write(&path, edited).unwrap();
+                        }
+                        if consent {
+                            confirmation.send(()).unwrap();
+                        }
+                    }
+                    Event::DomainDone(domain) => {
+                        assert!(consent && blocked && skipped);
+                        assert_eq!(domain, "blocked.invalid");
+                        done = true;
+                    }
+                    Event::Done(result) => {
+                        assert!(verified && domains_seen);
+                        if changed {
+                            assert_eq!(result, Err(ClientError::Configuration));
+                            assert!(!blocked && !skipped && !done);
+                        } else if consent {
+                            assert_eq!(result, Ok(()));
+                            assert!(blocked && skipped && done);
+                        } else {
+                            assert_eq!(result, Err(ClientError::Io));
+                            assert!(!blocked && !skipped && !done);
+                        }
+                        break;
+                    }
+                    Event::Line(_) => {}
+                }
+            }
+        };
+        timeout(Duration::from_secs(12), async {
+            tokio::join!(Box::pin(work), driver);
+        })
+        .await
+        .expect("bounded authenticated diagnostic fixture");
+        if changed {
+            std::fs::write(&path, &saved).unwrap();
+        }
+    }
+}
+
 async fn real_local_proxy_modes_fixture() {
     use crate::{
         config::{Inbound, ServerPolicy, User},
@@ -1526,7 +1640,7 @@ async fn real_local_proxy_modes_fixture() {
         routing: Some(crate::routing::Settings {
             revision: 2,
             geodata_directory: None,
-            diagnostic_domains: crate::routing::snapshot::default_diagnostic_domains(),
+            diagnostic_domains: vec!["blocked.invalid".into()],
             datasets: None,
             rules: vec![
                 crate::routing::Rule {
@@ -1598,6 +1712,16 @@ async fn real_local_proxy_modes_fixture() {
             ] {
                 profile.transport = transport;
                 profile.server = remote.to_string();
+
+                if !matches!(transport, Transport::Auto) {
+                    Box::pin(blocked_diagnostic_fixture(
+                        &directory,
+                        &doc,
+                        &profile,
+                        matches!(transport, Transport::H2),
+                    ))
+                    .await;
+                }
 
                 // The exact same production H2/H3 clients now consume
                 // compact key trust without opening a PEM file.
