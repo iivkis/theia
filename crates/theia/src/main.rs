@@ -80,6 +80,19 @@ async fn run() {
                 Err(CliError::NotImplemented("Windows user proxy"))
             }
         }
+        Ok(Command::ClientWinDivertLoopback { directory, dll_sha256, sys_sha256 }) => {
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            {
+                theia::routing::windivert::loopback_acceptance(directory.into(),dll_sha256,sys_sha256).await
+                    .map(|_| "WinDivert isolated IPv4/IPv6 UDP receive/send/reverse loopback verified; capture inactive".to_owned())
+                    .map_err(|_| CliError::Client(theia::client::ClientError::Io))
+            }
+            #[cfg(not(all(windows, target_arch = "x86_64")))]
+            {
+                let _ = (directory,dll_sha256,sys_sha256);
+                Err(CliError::NotImplemented("WinDivert x64 Windows backend"))
+            }
+        }
         Ok(Command::ClientWinDivertCheck { directory, dll_sha256, sys_sha256, install_lab }) => {
             #[cfg(all(windows, target_arch = "x86_64"))]
             {

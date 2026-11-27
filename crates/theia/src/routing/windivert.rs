@@ -47,8 +47,13 @@ impl Address {
     /// Reject unsupported layers, injected/impostor packets and loopback.
     /// This parses a captured observation; it is not an admission ticket.
     pub fn network(&self, packet: &[u8]) -> Result<NetworkObservation, ParseError> {
+        self.network_inner(packet, false)
+    }
+
+    fn network_inner(&self, packet: &[u8], loopback_lab: bool) -> Result<NetworkObservation, ParseError> {
         if self.timestamp <= 0 || self.flags & 0xffff != 0
-            || self.flags & ((1 << 18) | (1 << 19)) != 0
+            || self.flags & (1 << 19) != 0
+            || (self.flags & (1 << 18) != 0) != loopback_lab
             || self.flags >> 24 != 0 || self.reserved != 0
             || packet.len() > MAX_PACKET
         {
@@ -130,19 +135,23 @@ pub struct UdpReversePlan {
 
 impl UdpReversePlan {
     pub fn from_diverted_packet(address: &Address, packet: &[u8]) -> Option<Self> {
+        Self::from_packet(address, packet, false)
+    }
+
+    fn from_packet(address: &Address, packet: &[u8], loopback_lab: bool) -> Option<Self> {
         use super::packet::Transport;
         use std::net::IpAddr;
-        let n = address.network(packet).ok()?;
+        let n = address.network_inner(packet, loopback_lab).ok()?;
         let key = n.meta.flow;
         let valid = |ip: IpAddr| {
-            !ip.is_unspecified() && !ip.is_loopback() && !ip.is_multicast()
+            !ip.is_unspecified() && ip.is_loopback() == loopback_lab && !ip.is_multicast()
                 && match ip {
                     IpAddr::V4(v) => v.octets()[0] != 0 && v.octets()[0] < 224,
                     IpAddr::V6(v) => !v.is_unicast_link_local() && v.to_ipv4_mapped().is_none(),
                 }
         };
         if !n.outbound || n.sniffed || key.transport != Transport::Udp
-            || key.source.ip() == key.destination.ip()
+            || (if loopback_lab { key.source == key.destination } else { key.source.ip() == key.destination.ip() })
             || !valid(key.source.ip()) || !valid(key.destination.ip())
         { return None; }
         // Interface indices are observations only; a separate physical
@@ -245,9 +254,117 @@ mod native {
         path::Path,
     };
     use windows_sys::Win32::{
-        Foundation::{FreeLibrary, HANDLE, HMODULE, INVALID_HANDLE_VALUE},
-        System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32},
+        Foundation::{CloseHandle, FreeLibrary, HANDLE, HMODULE, INVALID_HANDLE_VALUE, ERROR_IO_PENDING, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::{
+            IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
+            LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32},
+            Threading::{CreateEventW, WaitForSingleObject},
+        },
     };
+    use std::{sync::{Arc, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}, net::UdpSocket};
+    type Recv = unsafe extern "C" fn(HANDLE, *mut u8, u32, *mut u32, u64, *mut Address, *mut u32, *mut OVERLAPPED) -> i32;
+    type SendPacket = unsafe extern "C" fn(HANDLE, *const u8, u32, *mut u32, u64, *const Address, u32, *mut OVERLAPPED) -> i32;
+    type Shutdown = unsafe extern "C" fn(HANDLE, u32) -> i32;
+    type SetParam = unsafe extern "C" fn(HANDLE, u32, u64) -> i32;
+    struct Event(HANDLE);
+    impl Drop for Event { fn drop(&mut self) { unsafe { CloseHandle(self.0); } } }
+    impl Event {
+        fn new() -> io::Result<Self> {
+            let raw = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+            if raw.is_null() { Err(io::Error::last_os_error()) } else { Ok(Self(raw)) }
+        }
+    }
+
+    // An overlapped operation owns all buffers on this worker until
+    // completion, including after cancellation. Never release a pending
+    // buffer on a timeout or future drop.
+    fn transfer(raw: HANDLE, cancelled: &AtomicBool, deadline: Instant,
+        start: impl FnOnce(*mut OVERLAPPED, *mut u32) -> i32) -> io::Result<u32> {
+        if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        let event = Event::new()?;
+        let mut operation: OVERLAPPED = unsafe { std::mem::zeroed() };
+        operation.hEvent = event.0;
+        let mut count = 0u32;
+        let result = start(&mut operation, &mut count);
+        if result != 0 { return Ok(count); }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(ERROR_IO_PENDING as i32) { return Err(err); }
+        let failure = loop {
+            if cancelled.load(Ordering::Acquire) { break io::ErrorKind::Interrupted; }
+            if Instant::now() >= deadline { break io::ErrorKind::TimedOut; }
+            match unsafe { WaitForSingleObject(event.0, 20) } {
+                WAIT_OBJECT_0 => {
+                    if unsafe { GetOverlappedResult(raw, &mut operation, &mut count, 0) } != 0 { return Ok(count); }
+                    return Err(io::Error::last_os_error());
+                }
+                WAIT_TIMEOUT => {}
+                _ => break io::ErrorKind::Other,
+            }
+        };
+        unsafe {
+            CancelIoEx(raw, &operation);
+            // Even when cancellation raced with completion, this waits
+            // for the original operation, not a second operation.
+            GetOverlappedResult(raw, &mut operation, &mut count, 1);
+        }
+        Err(failure.into())
+    }
+    struct Api {
+        open: Open,
+        get: GetParam,
+        close: Close,
+        recv: Recv,
+        send: SendPacket,
+        shutdown: Shutdown,
+        set: SetParam,
+        _library: Library,
+        _dll: File,
+        _sys: File,
+    }
+    impl Api {
+        fn open_handle(&self, filter: &std::ffi::CStr, layer: u32, flags: u64) -> io::Result<Handle> {
+            let raw = unsafe { (self.open)(filter.as_ptr(), layer, 0, flags) };
+            if raw.is_null() || raw == INVALID_HANDLE_VALUE { return Err(io::Error::last_os_error()); }
+            let handle = Handle(raw, self.close);
+            for param in [3,4] {
+                let mut value = 0;
+                if unsafe { (self.get)(handle.0,param,&mut value) } == 0 { return Err(io::Error::last_os_error()); }
+                if value != 2 { return Err(io::ErrorKind::Unsupported.into()); }
+            }
+            Ok(handle)
+        }
+        fn receive(&self, handle: &Handle, cancelled: &AtomicBool, deadline: Instant) -> io::Result<(Vec<u8>, Address)> {
+            let mut packet = vec![0u8; MAX_PACKET];
+            let mut address = Address::from_bytes(&[0;80]);
+            let mut address_len = 80;
+            let count = transfer(handle.0,cancelled,deadline,|operation, count| unsafe {
+                (self.recv)(handle.0,packet.as_mut_ptr(),packet.len() as u32,count,0,&mut address,&mut address_len,operation)
+            })? as usize;
+            if address_len != 80 || count == 0 || count > packet.len() { return Err(io::ErrorKind::InvalidData.into()); }
+            packet.truncate(count);
+            Ok((packet,address))
+        }
+        fn send(&self, handle: &Handle, packet: &[u8], address: &Address, cancelled: &AtomicBool, deadline: Instant) -> io::Result<()> {
+            let count = transfer(handle.0,cancelled,deadline,|operation,count| unsafe {
+                (self.send)(handle.0,packet.as_ptr(),packet.len() as u32,count,0,address,80,operation)
+            })? as usize;
+            if count != packet.len() { return Err(io::ErrorKind::WriteZero.into()); }
+            Ok(())
+        }
+        fn bounded(&self, handle: &Handle) -> io::Result<()> {
+            for (param,value) in [(0,64),(1,512),(2,1024*1024)] {
+                if unsafe { (self.set)(handle.0,param,value) } == 0 { return Err(io::Error::last_os_error()); }
+            }
+            Ok(())
+        }
+        fn retire(&self, handle: Handle) -> io::Result<()> {
+            if unsafe { (self.shutdown)(handle.0,3) } == 0 { return Err(io::Error::last_os_error()); }
+            handle.close()
+        }
+    }
+
     type Open = unsafe extern "C" fn(*const c_char, u32, i16, u64) -> HANDLE;
     type GetParam = unsafe extern "C" fn(HANDLE, u32, *mut u64) -> i32;
     type Close = unsafe extern "C" fn(HANDLE) -> i32;
@@ -298,7 +415,7 @@ mod native {
     /// installation permits the official DLL to request its signed driver.
     /// Verify the upstream package and signature before supplying hashes.
     /// Running driver version alone does not attest its on-disk identity.
-    pub fn probe(directory: &Path, dll: [u8;32], sys: [u8;32], install_lab: bool) -> io::Result<()> {
+    fn load(directory: &Path, dll: [u8;32], sys: [u8;32]) -> io::Result<Api> {
         valid_pins(dll,sys)?;
         if !directory.is_absolute() { return Err(io::ErrorKind::InvalidInput.into()); }
         let directory = directory.canonicalize()?;
@@ -314,33 +431,100 @@ mod native {
         let module = unsafe { LoadLibraryExW(wide.as_ptr(),std::ptr::null_mut(),LOAD_LIBRARY_SEARCH_SYSTEM32) };
         if module.is_null() { return Err(io::Error::last_os_error()); }
         let library = Library(module);
-        let open: Open = unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, Open>(GetProcAddress(library.0,c"WinDivertOpen".as_ptr().cast()).ok_or(io::ErrorKind::Unsupported)?) };
-        let get: GetParam = unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, GetParam>(GetProcAddress(library.0,c"WinDivertGetParam".as_ptr().cast()).ok_or(io::ErrorKind::Unsupported)?) };
-        let close: Close = unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, Close>(GetProcAddress(library.0,c"WinDivertClose".as_ptr().cast()).ok_or(io::ErrorKind::Unsupported)?) };
-        // Require ABI symbols needed for later packet and event processing
-        // without exposing a production send/receive path prematurely.
-        for symbol in [c"WinDivertRecvEx",c"WinDivertSendEx",c"WinDivertShutdown",c"WinDivertSetParam",c"WinDivertHelperCalcChecksums"] {
-            if unsafe { GetProcAddress(library.0,symbol.as_ptr().cast()) }.is_none() {
-                return Err(io::ErrorKind::Unsupported.into());
-            }
+        macro_rules! symbol {
+            ($name:literal,$ty:ty) => {{
+                let p = unsafe { GetProcAddress(library.0, concat!($name,"\0").as_ptr()) }.ok_or(io::ErrorKind::Unsupported)?;
+                unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize,$ty>(p) }
+            }}
         }
+        Ok(Api { open: symbol!("WinDivertOpen",Open), get: symbol!("WinDivertGetParam",GetParam),
+            close: symbol!("WinDivertClose",Close), recv: symbol!("WinDivertRecvEx",Recv),
+            send: symbol!("WinDivertSendEx",SendPacket), shutdown: symbol!("WinDivertShutdown",Shutdown),
+            set: symbol!("WinDivertSetParam",SetParam), _library:library, _dll, _sys })
+    }
+
+    pub fn probe(directory: &Path, dll: [u8;32], sys: [u8;32], install_lab: bool) -> io::Result<()> {
+        let api = load(directory,dll,sys)?;
         let flags = 0x1 | 0x4 | if install_lab { 0 } else { 0x10 };
         for layer in [0,2,3] {
-            let raw = unsafe { open(c"false".as_ptr(),layer,0,flags) };
-            if raw == INVALID_HANDLE_VALUE || raw.is_null() { return Err(io::Error::last_os_error()); }
-            let handle = Handle(raw,close);
-            for param in [3,4] {
-                let mut value = 0;
-                if unsafe { get(handle.0,param,&mut value) } == 0 { return Err(io::Error::last_os_error()); }
-                if value != 2 { return Err(io::ErrorKind::Unsupported.into()); }
-            }
-            handle.close()?;
+            api.open_handle(c"false",layer,flags)?.close()?;
         }
         Ok(())
     }
+
+    // Laboratory only: both exact loopback endpoints are bound by this
+    // worker and kept alive across the entire capture. No user-supplied
+    // filter, foreign process, remote target or policy exemption.
+    fn udp_lab(api: &Api, v6: bool, cancelled: &AtomicBool) -> io::Result<()> {
+        use ring::rand::{SecureRandom,SystemRandom};
+        let loopback = if v6 { "[::1]:0" } else { "127.0.0.1:0" };
+        let client = UdpSocket::bind(loopback)?;
+        let peer = UdpSocket::bind(loopback)?;
+        let src = client.local_addr()?;
+        let dst = peer.local_addr()?;
+        client.connect(dst)?;
+        peer.connect(src)?;
+        for socket in [&client,&peer] {
+            socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+            socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+        }
+        let address = if v6 { "ipv6.SrcAddr == ::1 and ipv6.DstAddr == ::1" }
+            else { "ip.SrcAddr == 127.0.0.1 and ip.DstAddr == 127.0.0.1" };
+        let filter = std::ffi::CString::new(format!(
+            "outbound and loopback and !impostor and udp and ({address}) and udp.SrcPort == {} and udp.DstPort == {}",src.port(),dst.port()
+        )).map_err(|_|io::ErrorKind::InvalidInput)?;
+        let handle = api.open_handle(&filter,0,0x10)?;
+        api.bounded(&handle)?;
+        for length in [0, 33, 1200] {
+            let mut nonce = vec![0;length];
+            SystemRandom::new().fill(&mut nonce).map_err(|_|io::Error::other("entropy unavailable"))?;
+            if cancelled.load(Ordering::Acquire) { return Err(io::ErrorKind::Interrupted.into()); }
+            if client.send(&nonce)? != length { return Err(io::ErrorKind::WriteZero.into()); }
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let (packet,addr) = api.receive(&handle,cancelled,deadline)?;
+            let n = addr.network_inner(&packet,true).map_err(|_|io::ErrorKind::InvalidData)?;
+            if n.sniffed || !n.outbound || n.meta.flow.source != src || n.meta.flow.destination != dst
+                || n.meta.payload_len != length || !packet.ends_with(&nonce) {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            // First prove same-packet reinjection on the original peer.
+            api.send(&handle,&packet,&addr,cancelled,deadline)?;
+            let mut received = vec![0;1201];
+            let size = peer.recv(&mut received)?;
+            if size != length || received[..size] != nonce { return Err(io::ErrorKind::InvalidData.into()); }
+            // Reply is generated from the captured tuple, not caller
+            // addresses; loopback must use the outbound direction.
+            let plan = UdpReversePlan::from_packet(&addr,&packet,true).ok_or(io::ErrorKind::InvalidData)?;
+            let reverse = plan.build(&nonce).ok_or(io::ErrorKind::InvalidData)?;
+            let mut reply = addr;
+            reply.flags = (1<<17)|(1<<18)|(1<<23) | if v6 { 1<<20 } else { 1<<21 };
+            api.send(&handle,&reverse.packet,&reply,cancelled,deadline)?;
+            let (size,from) = client.recv_from(&mut received)?;
+            if from != dst || size != length || received[..size] != nonce { return Err(io::ErrorKind::InvalidData.into()); }
+        }
+        api.retire(handle)
+    }
+
+    /// The async owner never runs driver IO on an executor thread.
+    /// Dropping the future requests cancellation, and the worker retains
+    /// the DLL, handles and operation buffers until completion.
+    pub async fn loopback_acceptance(directory: std::path::PathBuf, dll:[u8;32], sys:[u8;32]) -> io::Result<()> {
+        struct Cancel(Arc<AtomicBool>);
+        impl Drop for Cancel { fn drop(&mut self) { self.0.store(true,Ordering::Release); } }
+        let cancel = Cancel(Arc::new(AtomicBool::new(false)));
+        let signal = cancel.0.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let api=load(&directory,dll,sys)?;
+            udp_lab(&api,false,&signal)?;
+            udp_lab(&api,true,&signal)
+        }).await.map_err(|_|io::Error::other("WinDivert worker failed"))?;
+        drop(cancel);
+        result
+
+    }
 }
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-pub use native::probe;
+pub use native::{loopback_acceptance, probe};
 
 #[cfg(test)]
 mod tests {
