@@ -173,7 +173,7 @@ NTSTATUS TheiaReplyInject(THEIA_REPLY_ENGINE *engine, const THEIA_REPLY_FLOW *fl
         goto out;
     }
 
-    status = FwpsInjectTransportReceiveAsync0(engine->injection, NULL, NULL, 0,
+    status = FwpsInjectTransportReceiveAsync0(engine->injection, (HANDLE)(ULONG_PTR)flow->generation, NULL, 0,
         flow->family, flow->compartment, flow->interfaceIndex, flow->subInterfaceIndex,
         nbl, reply_complete, completion);
     if (status == STATUS_SUCCESS) {

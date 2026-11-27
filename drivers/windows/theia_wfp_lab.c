@@ -18,6 +18,7 @@
 #include <fwpsk.h>
 #pragma warning(pop)
 #include "theia_wfp_udp_reply.h"
+#include "theia_wfp_udp_flow.h"
 
 #define THEIA_TAG 'aiHT'
 #define CONTEXT_SIZE 84
@@ -28,6 +29,9 @@
 #define IOCTL_ENDPOINT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_WRITE_DATA)
 #define IOCTL_STATUS CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_WRITE_DATA)
 #define IOCTL_STOP CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_WRITE_DATA)
+#define IOCTL_UDP_READ CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_WRITE_DATA)
+#define IOCTL_UDP_REPLY CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_WRITE_DATA)
+#define IOCTL_UDP_CLOSE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_WRITE_DATA)
 
 static const GUID Provider = {0x172b0eba,0xc223,0x4ab6,{0x8c,0x52,0xa9,0x5e,0x08,0x2d,0x11,0x72}};
 static const GUID CalloutV4 = {0x172b0ebb,0xc223,0x4ab6,{0x8c,0x52,0xa9,0x5e,0x08,0x2d,0x11,0x72}};
@@ -100,6 +104,7 @@ static BOOLEAN valid_ip(UCHAR family, const UCHAR *p, BOOLEAN source) {
 }
 static VOID deactivate_locked(VOID) {
     State.active = FALSE;
+    TheiaUdpStop();
     RtlSecureZeroMemory(State.token, sizeof(State.token));
     RtlSecureZeroMemory(State.permits, sizeof(State.permits));
 }
@@ -146,17 +151,36 @@ static NTSTATUS control(PDEVICE_OBJECT dev, PIRP irp) {
     ULONG code = stack->Parameters.DeviceIoControl.IoControlCode;
     NTSTATUS status = STATUS_ACCESS_DENIED;
     BOOLEAN waitForClassify = FALSE;
+    ULONG_PTR written = 0;
+    ULONG output = stack->Parameters.DeviceIoControl.OutputBufferLength;
     KIRQL irql;
     UNREFERENCED_PARAMETER(dev);
     if (bytes == NULL || irp->RequestorMode != UserMode || KeGetCurrentIrql() != PASSIVE_LEVEL
         || IoGetRequestorProcess(irp) != PsGetCurrentProcess()
-        || stack->Parameters.DeviceIoControl.OutputBufferLength != 0) {
+        || (code != IOCTL_UDP_READ && output != 0)) {
         return finish_irp(irp, status);
     }
     KeAcquireSpinLock(&StateLock, &irql);
+    if ((code==IOCTL_UDP_READ || code==IOCTL_UDP_REPLY || code==IOCTL_UDP_CLOSE)
+        && State.active && State.file==stack->FileObject && State.process==PsGetCurrentProcess()
+        && len>=40 && equal(bytes,State.token,32)) {
+        UINT64 generation=read64(bytes+32);
+        KeReleaseSpinLock(&StateLock,irql);
+        if (code==IOCTL_UDP_READ && len==40 && generation==0 && output==THEIA_UDP_HEADER+THEIA_UDP_MAX)
+            status=TheiaUdpRead(bytes,output,&written);
+        else if (code==IOCTL_UDP_REPLY && generation && len<=40+THEIA_UDP_MAX)
+            status=TheiaUdpReply(generation,bytes+40,len-40);
+        else if (code==IOCTL_UDP_CLOSE && generation && len==40)
+            status=TheiaUdpClose(generation);
+        if (code!=IOCTL_UDP_READ || !NT_SUCCESS(status)) RtlSecureZeroMemory(bytes,len);
+        irp->IoStatus.Status=status;irp->IoStatus.Information=written;
+        IoCompleteRequest(irp,IO_NO_INCREMENT);
+        return status;
+    }
     if (code == IOCTL_CONFIG && len == CONFIG_SIZE && !State.configured
-        && read32(bytes) > 1 && read16(bytes + 4) != 0 && zero(bytes + 6, 2)
-        && !zero(bytes + 8, 32)) {
+        && read32(bytes) > 1 && read16(bytes + 4) != 0 && bytes[6]<=1 && bytes[7]==0
+        && !zero(bytes + 8, 32) && ReplyInitialized
+        && TheiaUdpStart(read32(bytes),bytes[6]==1)) {
         State.compartment = read32(bytes);
         State.port = read16(bytes + 4);
         State.pid = HandleToULong(PsGetCurrentProcessId());
@@ -317,8 +341,8 @@ static VOID NTAPI classify(
                 ENDPOINT_PERMIT *p = &State.permits[i];
                 if (p->endpoint == meta->transportEndpointHandle && p->expires > now
                     && p->family == family && p->protocol == protocol && p->port == dstPort && equal(p->address, dst, 16)) {
+                    permitted = protocol!=IPPROTO_UDP || TheiaUdpAdmit(meta->transportEndpointHandle,family,dst,dstPort,TRUE);
                     RtlZeroMemory(p, sizeof(*p));
-                    permitted = TRUE;
                     break;
                 }
             }
@@ -327,8 +351,14 @@ static VOID NTAPI classify(
         goto apply;
     }
 
-    // UDP permits apply ONLY to exact service endpoints. User UDP is
-    // still denied until transport-layer reverse injection is implemented.
+    // UDP stays on its original socket/peer. The separate mandatory
+    // DATAGRAM_DATA layer absorbs payload and owns reverse injection.
+    if (protocol==IPPROTO_UDP) {
+        if ((meta->currentMetadataValues&FWPS_METADATA_FIELD_TRANSPORT_ENDPOINT_HANDLE)
+            && request->localRedirectHandle==NULL && valid_ip(family,dst,FALSE))
+            permitted=TheiaUdpAdmit(meta->transportEndpointHandle,family,dst,dstPort,FALSE);
+        goto apply;
+    }
     if (protocol != IPPROTO_TCP) goto apply;
 
     // v1 supports only an already assigned concrete source tuple, to
@@ -412,6 +442,7 @@ static VOID unload(PDRIVER_OBJECT driver) {
     KeAcquireSpinLock(&StateLock, &irql);
     deactivate_locked();
     KeReleaseSpinLock(&StateLock, irql);
+    TheiaUdpUnregister();
     if (Id6 != 0) FwpsCalloutUnregisterById0(Id6);
     if (Id4 != 0) FwpsCalloutUnregisterById0(Id4);
     if (ProcessNotifyRegistered) PsSetCreateProcessNotifyRoutineEx(process_notify, TRUE);
@@ -431,6 +462,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry) {
     UNREFERENCED_PARAMETER(registry);
     KeInitializeSpinLock(&StateLock);
     ExInitializeRundownProtection(&ClassifyRundown);
+    TheiaUdpInitialize(&ReplyEngine);
     for (ULONG i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; ++i) driver->MajorFunction[i] = unsupported;
     driver->MajorFunction[IRP_MJ_CREATE] = open_close;
     driver->MajorFunction[IRP_MJ_CLOSE] = open_close;
@@ -455,6 +487,9 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registry) {
     // Prepare the transport injection resource without enabling a UDP
     // capture/IOCTL surface. A missing resource cannot grant UDP egress.
     ReplyInitialized = NT_SUCCESS(TheiaReplyInitialize(&ReplyEngine));
+    if (!ReplyInitialized) { status=STATUS_DEVICE_NOT_READY;goto fail; }
+    status=TheiaUdpRegister(Device);
+    if (!NT_SUCCESS(status)) goto fail;
     status = register_callout(&CalloutV4, &Id4);
     if (!NT_SUCCESS(status)) goto fail;
     status = register_callout(&CalloutV6, &Id6);

@@ -17,16 +17,21 @@
 #pragma comment(lib, "rpcrt4.lib")
 
 static const GUID provider = {0x172b0eba,0xc223,0x4ab6,{0x8c,0x52,0xa9,0x5e,0x08,0x2d,0x11,0x72}};
-static const GUID callouts[2] = {
+static const GUID callouts[4] = {
     {0x172b0ebb,0xc223,0x4ab6,{0x8c,0x52,0xa9,0x5e,0x08,0x2d,0x11,0x72}},
-    {0x172b0ebc,0xc223,0x4ab6,{0x8c,0x52,0xa9,0x5e,0x08,0x2d,0x11,0x72}}
+    {0x172b0ebc,0xc223,0x4ab6,{0x8c,0x52,0xa9,0x5e,0x08,0x2d,0x11,0x72}},
+    {0x172b0ec2,0xc223,0x4ab6,{0x8c,0x52,0xa9,0x5e,0x08,0x2d,0x11,0x72}},
+    {0x172b0ec3,0xc223,0x4ab6,{0x8c,0x52,0xa9,0x5e,0x08,0x2d,0x11,0x72}}
 };
 static const GUID sublayer = {0x172b0ebf,0xc223,0x4ab6,{0x8c,0x52,0xa9,0x5e,0x08,0x2d,0x11,0x72}};
-static const GUID filters[2] = {
+static const GUID filters[4] = {
     {0x172b0ec0,0xc223,0x4ab6,{0x8c,0x52,0xa9,0x5e,0x08,0x2d,0x11,0x72}},
-    {0x172b0ec1,0xc223,0x4ab6,{0x8c,0x52,0xa9,0x5e,0x08,0x2d,0x11,0x72}}
+    {0x172b0ec1,0xc223,0x4ab6,{0x8c,0x52,0xa9,0x5e,0x08,0x2d,0x11,0x72}},
+    {0x172b0ec4,0xc223,0x4ab6,{0x8c,0x52,0xa9,0x5e,0x08,0x2d,0x11,0x72}},
+    {0x172b0ec5,0xc223,0x4ab6,{0x8c,0x52,0xa9,0x5e,0x08,0x2d,0x11,0x72}}
 };
-static const GUID *layers[2] = {&FWPM_LAYER_ALE_CONNECT_REDIRECT_V4, &FWPM_LAYER_ALE_CONNECT_REDIRECT_V6};
+static const GUID *layers[4] = {&FWPM_LAYER_ALE_CONNECT_REDIRECT_V4, &FWPM_LAYER_ALE_CONNECT_REDIRECT_V6,
+    &FWPM_LAYER_DATAGRAM_DATA_V4, &FWPM_LAYER_DATAGRAM_DATA_V6};
 static wchar_t name[] = L"Theia isolated WFP lab v1";
 static BOOL same(const GUID *a, const GUID *b) {
     return a && b && memcmp(a, b, sizeof(*a)) == 0;
@@ -50,7 +55,7 @@ static DWORD install(HANDLE engine, UINT32 scope, UINT8 data[12]) {
     FWP_BYTE_BLOB blob = {12, data};
     FWPM_PROVIDER0 p = {0};
     FWPM_SUBLAYER0 s = {0};
-    FWPM_FILTER_CONDITION0 condition = {0};
+    FWPM_FILTER_CONDITION0 condition[2] = {0};
     p.providerKey = provider;
     p.displayData.name = name;
     p.flags = FWPM_PROVIDER_FLAG_PERSISTENT;
@@ -65,11 +70,15 @@ static DWORD install(HANDLE engine, UINT32 scope, UINT8 data[12]) {
     s.weight = 0x8000;
     err = FwpmSubLayerAdd0(engine, &s, NULL);
     if (err) return err;
-    condition.fieldKey = FWPM_CONDITION_COMPARTMENT_ID;
-    condition.matchType = FWP_MATCH_EQUAL;
-    condition.conditionValue.type = FWP_UINT32;
-    condition.conditionValue.uint32 = scope;
-    for (unsigned i = 0; i < 2; ++i) {
+    condition[0].fieldKey = FWPM_CONDITION_COMPARTMENT_ID;
+    condition[0].matchType = FWP_MATCH_EQUAL;
+    condition[0].conditionValue.type = FWP_UINT32;
+    condition[0].conditionValue.uint32 = scope;
+    condition[1].fieldKey=FWPM_CONDITION_IP_PROTOCOL;
+    condition[1].matchType=FWP_MATCH_EQUAL;
+    condition[1].conditionValue.type=FWP_UINT8;
+    condition[1].conditionValue.uint8=17;
+    for (unsigned i = 0; i < 4; ++i) {
         FWPM_CALLOUT0 c = {0};
         FWPM_FILTER0 f = {0};
         c.calloutKey = callouts[i];
@@ -89,8 +98,8 @@ static DWORD install(HANDLE engine, UINT32 scope, UINT8 data[12]) {
         f.subLayerKey = sublayer;
         f.weight.type = FWP_UINT8;
         f.weight.uint8 = 8;
-        f.numFilterConditions = 1;
-        f.filterCondition = &condition;
+        f.numFilterConditions = i<2?1:2;
+        f.filterCondition = condition;
         f.action.type = FWP_ACTION_CALLOUT_TERMINATING;
         f.action.calloutKey = callouts[i];
         err = FwpmFilterAdd0(engine, &f, NULL, NULL);
@@ -114,7 +123,7 @@ static DWORD verify(HANDLE e, UINT32 scope, const UINT8 data[12]) {
         s->flags == FWPM_SUBLAYER_FLAG_PERSISTENT && s->weight == 0x8000 && marked(&s->providerData, data);
     FwpmFreeMemory0((void **)&s);
     if (!ok) return ERROR_INVALID_DATA;
-    for (unsigned i = 0; i < 2; ++i) {
+    for (unsigned i = 0; i < 4; ++i) {
         FWPM_CALLOUT0 *c = NULL;
         FWPM_FILTER0 *f = NULL;
         err = FwpmCalloutGetByKey0(e, &callouts[i], &c);
@@ -130,11 +139,15 @@ static DWORD verify(HANDLE e, UINT32 scope, const UINT8 data[12]) {
             f->flags == FWPM_FILTER_FLAG_PERSISTENT && same(&f->layerKey, layers[i]) &&
             same(&f->subLayerKey, &sublayer) && f->weight.type == FWP_UINT8 && f->weight.uint8 == 8 &&
             f->action.type == FWP_ACTION_CALLOUT_TERMINATING && same(&f->action.calloutKey, &callouts[i]) &&
-            f->numFilterConditions == 1 && f->filterCondition &&
+            f->numFilterConditions == (i<2?1:2) && f->filterCondition &&
             same(&f->filterCondition[0].fieldKey, &FWPM_CONDITION_COMPARTMENT_ID) &&
             f->filterCondition[0].matchType == FWP_MATCH_EQUAL &&
             f->filterCondition[0].conditionValue.type == FWP_UINT32 &&
-            f->filterCondition[0].conditionValue.uint32 == scope;
+            f->filterCondition[0].conditionValue.uint32 == scope &&
+            (i<2 || (same(&f->filterCondition[1].fieldKey,&FWPM_CONDITION_IP_PROTOCOL) &&
+                f->filterCondition[1].matchType==FWP_MATCH_EQUAL &&
+                f->filterCondition[1].conditionValue.type==FWP_UINT8 &&
+                f->filterCondition[1].conditionValue.uint8==17));
         FwpmFreeMemory0((void **)&f);
         if (!ok) return ERROR_INVALID_DATA;
     }
@@ -144,11 +157,11 @@ static DWORD verify(HANDLE e, UINT32 scope, const UINT8 data[12]) {
 static DWORD recover(HANDLE e, UINT32 scope, const UINT8 data[12]) {
     DWORD err = verify(e, scope, data);
     if (err) return err;
-    for (unsigned i = 0; i < 2; ++i) {
+    for (unsigned i = 0; i < 4; ++i) {
         err = FwpmFilterDeleteByKey0(e, &filters[i]);
         if (err) return err;
     }
-    for (unsigned i = 0; i < 2; ++i) {
+    for (unsigned i = 0; i < 4; ++i) {
         err = FwpmCalloutDeleteByKey0(e, &callouts[i]);
         if (err) return err;
     }
@@ -168,7 +181,7 @@ static DWORD verify_absent(HANDLE e) {
     err = FwpmSubLayerGetByKey0(e, &sublayer, &s);
     if (!err) { FwpmFreeMemory0((void **)&s); return ERROR_ALREADY_EXISTS; }
     if (err != (DWORD)FWP_E_SUBLAYER_NOT_FOUND) return err;
-    for (unsigned i = 0; i < 2; ++i) {
+    for (unsigned i = 0; i < 4; ++i) {
         FWPM_CALLOUT0 *callout = NULL;
         FWPM_FILTER0 *filter = NULL;
         err = FwpmCalloutGetByKey0(e, &callouts[i], &callout);

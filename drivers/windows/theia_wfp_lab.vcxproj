@@ -34,6 +34,8 @@
     <ClCompile Include="theia_wfp_lab.c" />
     <ClCompile Include="theia_wfp_udp_reply.c" />
     <ClInclude Include="theia_wfp_udp_reply.h" />
+    <ClCompile Include="theia_wfp_udp_flow.c" />
+    <ClInclude Include="theia_wfp_udp_flow.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
