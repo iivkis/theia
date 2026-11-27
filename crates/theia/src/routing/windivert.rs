@@ -1142,28 +1142,32 @@ mod native {
 
     /// One explicitly authorized non-loopback echo flow, never a generic
     /// application capture or an externally supplied packet/injection key.
+    /// The worker owns the exact socket, capture, guard and injector. It
+    /// waits for each carrier reply before issuing the next datagram.
+    pub(crate) const UDP_LAB_DATAGRAMS: usize = 3;
     pub(crate) struct RelayLab {
         pub(crate) key:super::super::packet::FlowKey,
-        pub(crate) payloads:Vec<Vec<u8>>,
-        reply:Option<tokio::sync::oneshot::Sender<Vec<Vec<u8>>>>,
+        reply:tokio::sync::mpsc::Sender<Vec<u8>>,
         worker:tokio::task::JoinHandle<io::Result<()>>,
         _cancel:Cancel,
     }
     impl RelayLab {
-        pub(crate) async fn finish(mut self,payloads:Vec<Vec<u8>>)->io::Result<()> {
-            self.reply.take().ok_or(io::ErrorKind::BrokenPipe)?.send(payloads)
-                .map_err(|_|io::ErrorKind::BrokenPipe)?;
+        pub(crate) fn respond(&self,payload:Vec<u8>)->io::Result<()> {
+            self.reply.try_send(payload).map_err(|_|io::ErrorKind::BrokenPipe.into())
+        }
+        pub(crate) async fn finish(mut self)->io::Result<()> {
             (&mut self.worker).await.map_err(|_|io::Error::other("WinDivert relay lab worker failed"))?
         }
     }
 
     pub(crate) async fn begin_udp_relay_lab(directory:std::path::PathBuf,dll:[u8;32],sys:[u8;32],
-        target:std::net::SocketAddr)->io::Result<RelayLab> {
-        use tokio::sync::oneshot;
+        target:std::net::SocketAddr,
+        captured_tx:tokio::sync::mpsc::Sender<(super::super::packet::FlowKey,Vec<u8>)>)->io::Result<RelayLab> {
+        use tokio::sync::{mpsc,oneshot};
         let cancel=Cancel(Arc::new(AtomicBool::new(false)));
         let signal=cancel.0.clone();
         let (ready_tx,ready_rx)=oneshot::channel();
-        let (reply_tx,mut reply_rx)=oneshot::channel::<Vec<Vec<u8>>>();
+        let (reply_tx,mut reply_rx)=mpsc::channel::<Vec<u8>>(1);
         let mut worker=tokio::task::spawn_blocking(move || {
             use ring::rand::{SecureRandom,SystemRandom};
             if target.port()==0 || target.ip().is_loopback() || target.ip().is_unspecified() || target.ip().is_multicast()
@@ -1172,7 +1176,6 @@ mod native {
             { return Err(io::ErrorKind::InvalidInput.into()); }
             let _winsock=WinsockLease::start()?;
             let api=load(&directory,dll,sys)?;
-            // Read-only route observation before sending any application data.
             let scope=crate::network_scope::observe(target).ok_or(io::ErrorKind::PermissionDenied)?;
             let socket=bind_udp(scope.bind_address())?;
             let local=socket.local_addr()?;
@@ -1190,76 +1193,84 @@ mod native {
             let capture=api.open_priority(&filter,0,100,0x10)?;
             api.bounded(&capture)?;
             let injector=api.open_priority(c"false",0,-200,0x18)?;
-            let mut payloads=Vec::new();
-            let mut captured=None;
-            for length in [32,33,1200] {
-                let mut nonce=vec![0u8;length];
-                SystemRandom::new().fill(&mut nonce).map_err(|_|io::Error::other("entropy unavailable"))?;
-                if signal.load(Ordering::Acquire) || crate::network_scope::observe(target)!=Some(scope) {
-                    return Err(io::ErrorKind::PermissionDenied.into());
-                }
-                if socket.send(&nonce)?!=nonce.len() { return Err(io::ErrorKind::WriteZero.into()); }
-                let (packet,address)=api.receive(&capture,&signal,Instant::now()+Duration::from_secs(3))?;
-                let observation=address.network(&packet).map_err(|_|io::ErrorKind::InvalidData)?;
-                if observation.meta.flow.source!=local || observation.meta.flow.destination!=target
-                    || observation.meta.payload_len!=nonce.len() || !packet.ends_with(&nonce)
-                    || socket_endpoint(&socket)?!=endpoint {
-                    return Err(io::ErrorKind::PermissionDenied.into());
-                }
-                let plan=UdpReversePlan::from_diverted_packet(&address,&packet).ok_or(io::ErrorKind::PermissionDenied)?;
-                if let Some((previous,_))=captured {
-                    if previous!=plan { return Err(io::ErrorKind::PermissionDenied.into()); }
-                } else {
-                    captured=Some((plan,address));
-                }
-                payloads.push(nonce);
-            }
-            let (plan,address)=captured.ok_or(io::ErrorKind::InvalidData)?;
-            // No original packet is sent through the native interface.
-            // Retain the exclusive socket and lower DROP handle while the
-            // common authenticated relay processes this bounded batch.
-            ready_tx.send((plan.original_flow(),payloads.clone())).map_err(|_|io::ErrorKind::BrokenPipe)?;
             let deadline=Instant::now()+Duration::from_secs(25);
-            let payload=loop {
-                if signal.load(Ordering::Acquire) || Instant::now()>=deadline { return Err(io::ErrorKind::Interrupted.into()); }
-                match reply_rx.try_recv() {
-                    Ok(bytes)=>break bytes,
-                    Err(oneshot::error::TryRecvError::Empty)=>std::thread::sleep(Duration::from_millis(20)),
-                    Err(oneshot::error::TryRecvError::Closed)=>return Err(io::ErrorKind::BrokenPipe.into()),
+            let result=(||->io::Result<()> {
+                let mut ready=Some(ready_tx);
+                let mut first_plan=None;
+                for length in [32,33,1200] {
+                    let mut nonce=vec![0u8;length];
+                    SystemRandom::new().fill(&mut nonce).map_err(|_|io::Error::other("entropy unavailable"))?;
+                    if signal.load(Ordering::Acquire) || Instant::now()>=deadline
+                        || crate::network_scope::observe(target)!=Some(scope)
+                        || socket_endpoint(&socket)?!=endpoint
+                    { return Err(io::ErrorKind::PermissionDenied.into()); }
+                    if socket.send(&nonce)?!=nonce.len() { return Err(io::ErrorKind::WriteZero.into()); }
+                    let (packet,address)=api.receive(&capture,&signal,
+                        std::cmp::min(deadline,Instant::now()+Duration::from_secs(3)))?;
+                    let observation=address.network(&packet).map_err(|_|io::ErrorKind::InvalidData)?;
+                    if observation.meta.flow.source!=local || observation.meta.flow.destination!=target
+                        || observation.meta.payload_len!=nonce.len() || !packet.ends_with(&nonce)
+                        || socket_endpoint(&socket)?!=endpoint {
+                        return Err(io::ErrorKind::PermissionDenied.into());
+                    }
+                    let plan=UdpReversePlan::from_diverted_packet(&address,&packet).ok_or(io::ErrorKind::PermissionDenied)?;
+                    if let Some(previous)=first_plan {
+                        if previous!=plan { return Err(io::ErrorKind::PermissionDenied.into()); }
+                    } else {
+                        first_plan=Some(plan);
+                        ready.take().ok_or(io::ErrorKind::BrokenPipe)?.send(plan.original_flow())
+                            .map_err(|_|io::ErrorKind::BrokenPipe)?;
+                    }
+                    // Transfer the bytes actually observed by NETWORK.
+                    // Queue full/closed is terminal in this acceptance
+                    // fixture; no original datagram is reinjected.
+                    let start=packet.len().checked_sub(observation.meta.payload_len)
+                        .ok_or(io::ErrorKind::InvalidData)?;
+                    captured_tx.try_send((plan.original_flow(),packet[start..].to_vec()))
+                        .map_err(|_|io::ErrorKind::BrokenPipe)?;
+                    let bytes=loop {
+                        if signal.load(Ordering::Acquire) || Instant::now()>=deadline {
+                            return Err(io::ErrorKind::Interrupted.into());
+                        }
+                        match reply_rx.try_recv() {
+                            Ok(bytes)=>break bytes,
+                            Err(mpsc::error::TryRecvError::Empty)=>std::thread::sleep(Duration::from_millis(10)),
+                            Err(mpsc::error::TryRecvError::Disconnected)=>return Err(io::ErrorKind::BrokenPipe.into()),
+                        }
+                    };
+                    if bytes!=nonce || socket_endpoint(&socket)?!=endpoint
+                        || socket.local_addr()?!=local || socket.peer_addr()?!=target
+                        || crate::network_scope::observe(target)!=Some(scope) {
+                        return Err(io::ErrorKind::PermissionDenied.into());
+                    }
+                    let reverse=plan.build(&bytes).ok_or(io::ErrorKind::InvalidData)?;
+                    let mut incoming=address;
+                    incoming.flags=(1<<23) | if target.is_ipv6(){1<<20}else{1<<21};
+                    api.send(&injector,&reverse.packet,&incoming,&signal,deadline)?;
+                    let mut data=[0u8;1201];
+                    let n=socket.recv(&mut data)?;
+                    if socket.peer_addr()?!=target || &data[..n]!=bytes {
+                        return Err(io::ErrorKind::InvalidData.into());
+                    }
                 }
-            };
-            let mut expected=payloads;
-            if payload.len()!=expected.len() { return Err(io::ErrorKind::InvalidData.into()); }
-            for bytes in payload {
-                let index=expected.iter().position(|v|*v==bytes).ok_or(io::ErrorKind::PermissionDenied)?;
-                expected.swap_remove(index);
-                if socket_endpoint(&socket)?!=endpoint || socket.local_addr()?!=local
-                    || socket.peer_addr()?!=target || crate::network_scope::observe(target)!=Some(scope) {
-                    return Err(io::ErrorKind::PermissionDenied.into());
-                }
-                let reverse=plan.build(&bytes).ok_or(io::ErrorKind::InvalidData)?;
-                let mut incoming=address;
-                incoming.flags=(1<<23) | if target.is_ipv6(){1<<20}else{1<<21};
-                api.send(&injector,&reverse.packet,&incoming,&signal,Instant::now()+Duration::from_secs(3))?;
-                let mut data=[0u8;1201];
-                let n=socket.recv(&mut data)?;
-                if socket.peer_addr()?!=target || &data[..n]!=bytes {
-                    return Err(io::ErrorKind::InvalidData.into());
-                }
-            }
+                Ok(())
+            })();
+            // The owned source must close before removing the exact
+            // capture and lower DROP handle, including on relay errors.
+            drop(socket);
+            result?;
             api.retire(capture)?;
             api.retire(injector)?;
-            drop(socket);
             guard.close()
         });
-        let (key,payloads)=match ready_rx.await {
+        let key=match ready_rx.await {
             Ok(data)=>data,
             Err(_)=>{
                 (&mut worker).await.map_err(|_|io::Error::other("WinDivert relay lab worker failed"))??;
                 return Err(io::ErrorKind::UnexpectedEof.into());
             }
         };
-        Ok(RelayLab { key,payloads,reply:Some(reply_tx),worker,_cancel:cancel })
+        Ok(RelayLab { key,reply:reply_tx,worker,_cancel:cancel })
     }
 
     fn guarded_lab(api:&Api,cancelled:&AtomicBool)->io::Result<()> {
@@ -1502,7 +1513,7 @@ mod native {
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub use native::{loopback_acceptance, probe};
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-pub(crate) use native::{begin_udp_relay_lab, RelayLab};
+pub(crate) use native::{begin_udp_relay_lab, RelayLab, UDP_LAB_DATAGRAMS};
 
 #[cfg(test)]
 mod tests {

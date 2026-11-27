@@ -2590,9 +2590,9 @@ impl NativeIngress {
     }
 
     /// Explicit authorized echo acceptance, never a product Connect.
-    /// The backend captures one exclusively owned socket/target tuple.
-    /// No generic WinDivert filter or caller-supplied injection key is
-    /// accepted. All payload goes through the normal authenticated router.
+    /// All exact owned UDP tuples use one bounded live dispatcher. Each
+    /// worker captures and injects while its authenticated XHTTP flow
+    /// is open. No arbitrary application or caller-supplied injection key.
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     pub async fn run_windows_udp_relay_lab(
         path:&Path, directory:std::path::PathBuf, dll:[u8;32], sys:[u8;32], target:SocketAddr,
@@ -2606,101 +2606,116 @@ impl NativeIngress {
         struct Stop<'a>(&'a NativeIngress,&'a CarrierRegistry);
         impl Drop for Stop<'_> { fn drop(&mut self) { self.0.shutdown();self.1.retire(); } }
         let _stop=Stop(&ingress,&registry);
+        let (capture_tx,mut capture_rx)=tokio::sync::mpsc::channel(flows*crate::udp_relay::QUEUE);
         let mut preparing=JoinSet::new();
         for _ in 0..flows {
             let directory=directory.clone();
+            let capture_tx=capture_tx.clone();
             preparing.spawn(async move {
-                crate::routing::windivert::begin_udp_relay_lab(directory,dll,sys,target).await
+                crate::routing::windivert::begin_udp_relay_lab(directory,dll,sys,target,capture_tx).await
                     .map_err(|_|ClientError::Io)
             });
         }
-        let mut labs:Vec<RelayLab>=Vec::with_capacity(flows);
-        let mut keys=std::collections::HashSet::with_capacity(flows);
+        drop(capture_tx);
+        let mut labs=std::collections::HashMap::<_,RelayLab>::with_capacity(flows);
         while let Some(joined)=preparing.join_next().await {
             let lab=joined.map_err(|_|ClientError::Io)??;
-            if !keys.insert(lab.key) { return Err(ClientError::Open(ErrorCode::PolicyDenied)); }
-            labs.push(lab);
+            if labs.insert(lab.key,lab).is_some() {
+                return Err(ClientError::Open(ErrorCode::PolicyDenied));
+            }
         }
-        // Every own socket must be captured before the same policy
-        // generation can be published as isolated lab ready.
         ingress.runtime.capture_state.ready()?;
         let mut relays=JoinSet::new();
         let mut dispatch=NativeUdpDispatch::default();
-        for lab in labs {
-            if lab.payloads.is_empty() || lab.payloads.len()>crate::udp_relay::QUEUE {
-                return Err(ClientError::Protocol);
-            }
-            let (ticket,first,subsequent)=dispatch.admit(lab.key,lab.payloads[0].clone())
-                .ok_or(ClientError::Configuration)?;
-            for payload in lab.payloads.iter().skip(1) {
-                if dispatch.admit(lab.key,payload.clone()).is_some() {
-                    return Err(ClientError::Protocol);
+        let mut capture_closed=false;
+        let result=loop {
+            if labs.is_empty() && relays.is_empty() { break Ok(()); }
+            if ingress.ensure_accepting().is_err() { break Err(ClientError::Open(ErrorCode::PolicyDenied)); }
+            let (key,payload)=tokio::select! {
+                biased;
+                ()=ingress.stopped()=>break Err(ClientError::Open(ErrorCode::PolicyDenied)),
+                result=relays.join_next(),if !relays.is_empty()=>{
+                    match result {
+                        Some(Ok((ticket,Ok(())))) if dispatch.complete(ticket)=>continue,
+                        Some(Ok((_,Err(error))))=>break Err(error),
+                        _=>break Err(ClientError::Io),
+                    }
                 }
-            }
-            let ingress=ingress.clone();
-            let registrar=registrar.clone();
-            relays.spawn(async move {
-                let result=crate::routing::carrier_socket::scope(Some(registrar),
-                    ingress.relay_windows_udp_lab(lab,first,subsequent)).await;
-                (ticket,result)
-            });
-        }
-        while let Some(result)=relays.join_next().await {
-            let outcome=match result {
-                Ok((ticket,result)) if dispatch.complete(ticket)=>result,
-                _=>Err(ClientError::Io),
+                packet=capture_rx.recv(),if !capture_closed=>{
+                    match packet {
+                        Some(packet)=>packet,
+                        None=>{
+                            capture_closed=true;
+                            if !labs.is_empty() { break Err(ClientError::Io); }
+                            continue;
+                        }
+                    }
+                }
             };
-            if let Err(error)=outcome {
-                ingress.shutdown();
-                relays.shutdown().await;
-                return Err(error);
+            if let Some((ticket,first,subsequent))=dispatch.admit(key,payload) {
+                let Some(lab)=labs.remove(&key) else { break Err(ClientError::Protocol); };
+                let ingress=ingress.clone();
+                let registrar=registrar.clone();
+                relays.spawn(async move {
+                    let result=crate::routing::carrier_socket::scope(Some(registrar),
+                        ingress.relay_windows_udp_lab(lab,first,subsequent)).await;
+                    (ticket,result)
+                });
             }
-        }
-        Ok(())
+        };
+        ingress.shutdown();
+        relays.shutdown().await;
+        result
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     async fn relay_windows_udp_lab(&self,lab:crate::routing::windivert::RelayLab,
         first:Vec<u8>,mut subsequent:tokio::sync::mpsc::Receiver<Vec<u8>>)->Result<(),ClientError> {
-        use crate::routing::{carrier_socket,PacketAction};
+        use crate::routing::{carrier_socket,windivert::UDP_LAB_DATAGRAMS,PacketAction};
         let key=lab.key;
         let (carrier,flow,address)=self.redirect(key).await?;
         let tunnel=carrier_socket::scope(self.registrar()?,carrier.open_udp(address,key.destination.port())).await?;
         let (tx,up)=tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
         let (down,mut rx)=tokio::sync::mpsc::channel(crate::udp_relay::QUEUE);
-        let mut expected=lab.payloads.clone();
-        let count=expected.len();
-        if count==0 || count>crate::udp_relay::QUEUE { return Err(ClientError::Protocol); }
-        if expected.first()!=Some(&first) { return Err(ClientError::Protocol); }
         tx.send(first).await.map_err(|_|ClientError::Io)?;
-        for payload in expected.iter().skip(1) {
-            let next=subsequent.try_recv().map_err(|_|ClientError::Protocol)?;
-            if &next!=payload { return Err(ClientError::Protocol); }
-            tx.send(next).await.map_err(|_|ClientError::Io)?;
-        }
-        if subsequent.try_recv().is_ok() { return Err(ClientError::Protocol); }
         let relay=tunnel.relay_guarded(up,down,Some(&flow));
         tokio::pin!(relay);
-        let deadline=tokio::time::Instant::now()+Duration::from_secs(15);
-        let mut responses=Vec::with_capacity(count);
-        while responses.len()<count {
-            let response=tokio::select! {
+        let deadline=tokio::time::Instant::now()+Duration::from_secs(20);
+        let mut sent=1;
+        let mut received=0;
+        while received<UDP_LAB_DATAGRAMS {
+            tokio::select! {
                 biased;
                 ()=self.stopped()=>return Err(ClientError::Open(ErrorCode::PolicyDenied)),
                 result=&mut relay=>{result?;return Err(ClientError::Io)},
-                data=tokio::time::timeout_at(deadline,rx.recv())=>data.map_err(|_|ClientError::Timeout)?.ok_or(ClientError::Io)?,
-            };
-            let index=expected.iter().position(|v|*v==response).ok_or(ClientError::Protocol)?;
-            expected.swap_remove(index);
-            responses.push(response);
+                ()=tokio::time::sleep_until(deadline)=>return Err(ClientError::Timeout),
+                packet=subsequent.recv(),if sent<UDP_LAB_DATAGRAMS=>{
+                    let bytes=packet.ok_or(ClientError::Io)?;
+                    if sent!=received || bytes.len()>crate::protocol::MAX_DATAGRAM {
+                        return Err(ClientError::Protocol);
+                    }
+                    tx.try_send(bytes).map_err(|_|ClientError::Io)?;
+                    sent+=1;
+                }
+                response=rx.recv()=>{
+                    let bytes=response.ok_or(ClientError::Io)?;
+                    self.ensure_accepting()?;
+                    if !flow.committed(PacketAction::Redirect) || received>=sent {
+                        return Err(ClientError::Open(ErrorCode::PolicyDenied));
+                    }
+                    lab.respond(bytes).map_err(|_|ClientError::Io)?;
+                    received+=1;
+                }
+            }
         }
-        self.ensure_accepting()?;
-        if !flow.committed(PacketAction::Redirect) { return Err(ClientError::Open(ErrorCode::PolicyDenied)); }
+        if sent!=UDP_LAB_DATAGRAMS || subsequent.try_recv().is_ok() { return Err(ClientError::Protocol); }
+        // The worker verifies every exact nonce and actual local receive
+        // before closing the original socket and removing its lab rules.
         tokio::select! {
             biased;
             ()=self.stopped()=>return Err(ClientError::Open(ErrorCode::PolicyDenied)),
             result=&mut relay=>{result?;return Err(ClientError::Io)},
-            result=lab.finish(responses)=>result.map_err(|_|ClientError::Io)?,
+            result=lab.finish()=>result.map_err(|_|ClientError::Io)?,
         }
         drop(tx);
         timeout(Duration::from_secs(3),&mut relay).await.map_err(|_|ClientError::Timeout)??;
