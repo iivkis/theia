@@ -519,6 +519,13 @@ mod tests {
             "--dll-sha256",&dll,"--sys-sha256",&sys,"--target","192.0.2.1:443","--confirm"];
         assert!(matches!(command(&args),Ok(Command::ClientWinDivertUdpRelayLab {target,..}) if target=="192.0.2.1:443".parse().unwrap()));
         assert!(command(&args[..13]).is_err());
+        let mut multi=args[..13].to_vec();
+        multi.extend(["--flows","8","--confirm"]);
+        assert!(matches!(command(&multi),Ok(Command::ClientWinDivertUdpRelayLab {flows:8,..})));
+        multi[14]="9";
+        assert!(command(&multi).is_err());
+        multi[14]="0";
+        assert!(command(&multi).is_err());
         let mut bad=args;
         bad[12]="example.org:443";
         assert!(command(&bad).is_err());

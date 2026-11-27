@@ -1298,10 +1298,86 @@ mod native {
         Ok(())
     }
 
+    // Diagnostic only: a process handle pins the process object, not the
+    // loaded image section. Never turn a pathname hash into Evidence::Known.
+    struct ProcessImage {
+        process: Event,
+        pid: u32,
+        creation: u64,
+        path: std::path::PathBuf,
+        digest: [u8;32],
+        _image: File,
+    }
+    impl ProcessImage {
+        fn identity(handle:HANDLE,pid:u32)->io::Result<(u64,std::path::PathBuf)> {
+            use windows_sys::Win32::{
+                Foundation::FILETIME,
+                System::Threading::{GetProcessId,GetProcessTimes,QueryFullProcessImageNameW},
+            };
+            use std::os::windows::ffi::OsStringExt;
+            if unsafe { GetProcessId(handle) }!=pid || unsafe { WaitForSingleObject(handle,0) }!=WAIT_TIMEOUT {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            let mut creation:FILETIME=unsafe {std::mem::zeroed()};
+            let mut exit=creation;
+            let mut kernel=creation;
+            let mut user=creation;
+            if unsafe {GetProcessTimes(handle,&mut creation,&mut exit,&mut kernel,&mut user)}==0 {
+                return Err(io::Error::last_os_error());
+            }
+            let birth=(u64::from(creation.dwHighDateTime)<<32)|u64::from(creation.dwLowDateTime);
+            let mut buf=vec![0u16;32768];
+            let mut len=buf.len() as u32;
+            if unsafe {QueryFullProcessImageNameW(handle,0,buf.as_mut_ptr(),&mut len)}==0 {
+                return Err(io::Error::last_os_error());
+            }
+            if birth==0 || len==0 || len as usize>=buf.len() || buf[..len as usize].contains(&0) {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            let path=std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf[..len as usize]));
+            if !path.is_absolute() { return Err(io::ErrorKind::InvalidData.into()); }
+            Ok((birth,path))
+        }
+        fn inspect(pid:u32)->io::Result<Self> {
+            use windows_sys::Win32::System::Threading::{OpenProcess,PROCESS_QUERY_LIMITED_INFORMATION};
+            if pid==0 { return Err(io::ErrorKind::InvalidInput.into()); }
+            let raw=unsafe {OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION|0x0010_0000,0,pid)};
+            if raw.is_null() { return Err(io::Error::last_os_error()); }
+            let process=Event(raw);
+            let (creation,path)=Self::identity(process.0,pid)?;
+            let mut image=OpenOptions::new().read(true).share_mode(1).custom_flags(0x0020_0000).open(&path)?;
+            let meta=image.metadata()?;
+            if !meta.is_file() || meta.file_attributes()&0x400!=0 || !(1..=128*1024*1024).contains(&meta.len()) {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            let mut sha=Sha256::new();
+            let mut count=0u64;
+            let mut buffer=[0u8;65536];
+            loop {
+                let n=image.read(&mut buffer)?;
+                if n==0 {break;}
+                count=count.checked_add(n as u64).ok_or(io::ErrorKind::InvalidData)?;
+                if count>meta.len() {return Err(io::ErrorKind::InvalidData.into());}
+                sha.update(&buffer[..n]);
+            }
+            if count!=meta.len() || Self::identity(process.0,pid)?!=(creation,path.clone()) {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            Ok(Self {process,pid,creation,path,digest:sha.finalize().into(),_image:image})
+        }
+        fn revalidate(&self,event:&EndpointCandidate)->io::Result<[u8;32]> {
+            if event.pid!=self.pid || Self::identity(self.process.0,self.pid)?!=(self.creation,self.path.clone()) {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            Ok(self.digest)
+        }
+    }
+
     fn socket_lab(api:&Api,cancelled:&AtomicBool) -> io::Result<()> {
         // Only capture events belonging to the current process. The
         // socket is held open until the observed connect and close.
         let pid=std::process::id();
+        let image=ProcessImage::inspect(pid)?;
         let receiver=loopback_udp("127.0.0.1:0")?;
         let sender=loopback_udp("127.0.0.1:0")?;
         let src=sender.local_addr()?;
@@ -1344,7 +1420,7 @@ mod native {
         let (packet,address)=api.receive(&network,cancelled,deadline)?;
         let observed=address.network_inner(&packet,true).map_err(|_|io::ErrorKind::InvalidData)?;
         let candidate=ledger.correlate(&observed).ok_or(io::ErrorKind::PermissionDenied)?;
-        if candidate!=established || !registry.matches_candidate(&candidate) || !packet.ends_with(b"correlation-lab")
+        if image.revalidate(&candidate)?!=image.digest || candidate!=established || !registry.matches_candidate(&candidate) || !packet.ends_with(b"correlation-lab")
             || socket_endpoint(&sender)?!=endpoint { return Err(io::ErrorKind::PermissionDenied.into()); }
         api.send(&network,&packet,&address,cancelled,deadline)?;
         receiver.set_read_timeout(Some(Duration::from_secs(2)))?;

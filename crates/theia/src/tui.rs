@@ -6829,7 +6829,11 @@ fn client_mode_lines(editor: &Editor, running: bool) -> Vec<Line<'static>> {
             Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
         ),
         Line::styled(
-            "Основной Packet Interception Engine пока не активируется. Прокси ниже — режимы совместимости.",
+            if cfg!(windows) {
+                "WinDivert: системное подключение недоступно до проверки защиты и восстановления. Прокси ниже не защищают весь трафик."
+            } else {
+                "Основной Packet Interception Engine пока не активируется. Прокси ниже — режимы совместимости."
+            },
             Style::default().fg(MUTED),
         ),
         Line::raw(""),

@@ -77,6 +77,18 @@ formats. Unit tests cover empty, odd, and maximum datagrams. These bytes are
 not an injection authorization: the live endpoint, committed policy lease
 and inbound interface still need verified correlation.
 
+## TCP reflection and application observations
+
+The non-loopback reflection table reserves an exact local listener per
+original SYN, validates the SYN/SYN-ACK pair, and never reuses a retired
+tuple/listener within an epoch. It builds inbound packet candidates with
+the original client/remote identity and checksum; no live arbitrary-app
+capture consumes these candidates yet. The local process image diagnostic
+holds a live process handle, creation timestamp and read-pinned executable
+file across socket observations. This still does not prove that the loaded
+image section matches the file, or that a NETWORK packet belongs to that
+process. Do not treat it as trusted application evidence.
+
 ## Remaining production gates
 
 - Production packet/event workers and exact socket/carrier ownership
@@ -84,10 +96,10 @@ and inbound interface still need verified correlation.
   registrar are implemented, but are not an authorization to inject.
   NETWORK lacks PID/endpoint identity. PID reuse, shared sockets, event
   loss and ambiguous tuples must not authorize bypass.
-- General TCP/UDP transparent relay, non-loopback TCP mapping, arbitrary
-  application lifetimes and independent physical H2/H3 egress. The one
-  exact UDP echo flow uses NativeIngress/FlowLease and XHTTP; this does not
-  demonstrate arbitrary application acceptance.
+- Live non-loopback TCP reflection and general TCP/UDP transparent relay,
+  arbitrary application lifetimes and independent physical H2/H3 egress.
+  Up to eight exact UDP echo flows use NativeIngress/FlowLease and XHTTP;
+  this does not demonstrate arbitrary application acceptance.
 - Persistent independent fail-closed guard across both process deaths,
   reboot, non-loopback traffic and explicit owner/CAS recovery. WinDivert
   alone is not a kill switch; the scoped guard test is only one proof case.
