@@ -748,13 +748,18 @@ impl Engine {
         if ips.len() > 64 || !ips.iter().all(|ip| crate::server::allowed_destination(*ip, false)) {
             return Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied));
         }
-        let address = SocketAddr::new(ips[0], 443);
-        let Some(network) = network_scope::observe(address) else { return Ok(Vec::new()); };
+        // Bounded one candidate of each available address family.
+        let mut selected = Vec::new();
+        if let Some(ip) = ips.iter().find(|ip| ip.is_ipv4()) { selected.push(*ip); }
+        if let Some(ip) = ips.iter().find(|ip| ip.is_ipv6()) { selected.push(*ip); }
+        let mut results = Vec::new();
+        for ip in selected {
+        let address = SocketAddr::new(ip, 443);
+        let Some(network) = network_scope::observe(address) else { continue; };
         let name = super::domain_name(name).map_err(|_| ClientError::Protocol)?;
         let key = Key { name: name.clone(), address, policy: pin.digest(), epoch: pin.epoch(), network };
         let Some(_guard) = self.scheduler.lock((&key.name, address, pin.digest()), Duration::from_millis(250)).await else { return Ok(Vec::new()); };
         let Ok(Some(config)) = tokio::task::spawn_blocking(tls::native_config).await else { return Ok(Vec::new()); };
-        let mut results = Vec::new();
         for strategy in Strategy::ALL {
             if !self.key_live(&key) { return Err(stale_policy()); }
             if matches!(self.cache.evidence(&key), Some((Verdict::Denied, _))) { return Err(stale_policy()); }
@@ -769,9 +774,11 @@ impl Engine {
                 Verified => "TLS подтверждён",
                 StrategyFailed => "не сработала",
                 Unavailable => "недоступно",
-                _ => return Err(stale_policy()),
+                IdentityRejected => return Err(ClientError::Tls),
+                Denied => return Err(stale_policy()),
             };
-            results.push((format!("{strategy:?}"), status, started.elapsed().as_millis()));
+            results.push((format!("{strategy:?} {}", if ip.is_ipv4() { "IPv4" } else { "IPv6" }), status, started.elapsed().as_millis()));
+        }
         }
         Ok(results)
     }

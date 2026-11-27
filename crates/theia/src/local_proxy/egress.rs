@@ -174,7 +174,7 @@ async fn route_egress(
         pinned,
         authorization,
     } = route_decision(carrier, cache, &address).await?;
-    if diagnostic_digest.is_some_and(|digest| digest != snapshot.digest() || !matches!(action, Action::Allowed | Action::DirectDpi)) {
+    if diagnostic_digest.is_some_and(|digest| digest != snapshot.digest() || action == Action::Blocked || (action == Action::Direct && matches!(request, EgressRequest::Tcp { allow_dpi: false }))) {
         return Err(ClientError::Open(ErrorCode::PolicyDenied));
     }
     if action.packet_action() == PacketAction::Drop {

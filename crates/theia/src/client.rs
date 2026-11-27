@@ -317,6 +317,10 @@ impl H2Client {
         crate::routing::exchange::decode_ips(&bytes)
     }
 
+    pub(crate) fn diagnostic_remote(&self) -> Result<std::net::SocketAddr, ClientError> {
+        self.endpoint.parse().map_err(|_| ClientError::Configuration)
+    }
+
     pub(crate) fn own_routing_scope(&self) -> Option<&str> {
         self.own_routes
             .as_ref()?

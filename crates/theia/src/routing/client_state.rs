@@ -171,6 +171,8 @@ impl Cache {
         }
     }
 
+    pub(crate) fn scope(&self) -> &str { &self.scope }
+
     fn persist(&self, snapshot: &Snapshot, previous: Option<&Snapshot>) -> Result<(), ClientError> {
         if let Some(previous) = previous {
             previous
