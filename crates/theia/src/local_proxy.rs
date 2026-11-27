@@ -2617,6 +2617,9 @@ impl NativeIngress {
         let listeners=redirect_port.map(|port|crate::routing::linux_ingress::RedirectListeners::bind(&host_namespace,port))
             .transpose().map_err(|_|ClientError::Io)?;
         let queue=queue_number.map(|number|Queue::bind(number,256)).transpose().map_err(|_|ClientError::Io)?;
+        let routes=if listeners.is_some() {
+            Some(linux_rules::PolicyRoutes::install(&host_namespace,journal).map_err(|_|ClientError::Io)?)
+        } else {None};
         let rules=Arc::new(Mutex::new(match (&queue,&listeners) {
             (Some(queue),None)=>LabRules::install(queue,&host_namespace,journal),
             (None,Some(listeners))=>LabRules::install_redirect(&host_namespace,journal,listeners.port()),
@@ -2657,7 +2660,8 @@ impl NativeIngress {
                         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                         loop {
                             tick.tick().await;
-                            if !rules.lock().map_err(|_|ClientError::Configuration)?.redirect_ready(port).map_err(|_|ClientError::Io)? {
+                            if !rules.lock().map_err(|_|ClientError::Configuration)?.redirect_ready(port).map_err(|_|ClientError::Io)? ||
+                                !routes.as_ref().ok_or(ClientError::Configuration)?.current().map_err(|_|ClientError::Io)? {
                                 return Err(ClientError::Open(ErrorCode::PolicyDenied));
                             }
                         }
@@ -2715,6 +2719,7 @@ impl NativeIngress {
             return Err(ClientError::Open(ErrorCode::PolicyDenied));
         }
         drop(rules);
+        drop(routes);
         let recovered = linux_rules::recover(&host_namespace, journal).map_err(|_| ClientError::Io);
         drop(owner);
         recovered

@@ -5,6 +5,9 @@
 //! dies, the kernel queue closes and the table remains fail closed.
 //! Recovery deletes ONLY our table, using the kernel ruleset generation CAS.
 //! Any unrelated ruleset change after installation requires manual review.
+#[path="linux_policy_routes.rs"]
+mod policy_routes;
+pub(crate) use policy_routes::PolicyRoutes;
 use super::linux_carrier::LabCarrierSocket;
 use super::nfqueue::{
     align4, attr, checked_header, kernel_address, message, next_attr, receive, send, Queue,
@@ -1384,6 +1387,9 @@ pub fn recover(host_namespace: &File, path: &Path) -> io::Result<()> {
     }
     let expected = if present {
         journal.recovery_generation(generation)?;
+        // Routes are restored before the owned firewall guard is removed.
+        policy_routes::recover_if_present(host_namespace,path)?;
+        if net.generation()?!=generation || !net.table(&journal)? {return Err(refused());}
         let after = generation.checked_add(1).ok_or_else(refused)?;
         crate::config::guarded_trust_assert(path, &raw).map_err(|_| refused())?;
         let mut attrs = Vec::new();
@@ -1394,6 +1400,7 @@ pub fn recover(host_namespace: &File, path: &Path) -> io::Result<()> {
         )?;
         after
     } else {
+        policy_routes::recover_if_present(host_namespace,path)?;
         generation
     };
     // A stable absence observation is required even if a prior recovery
