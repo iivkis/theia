@@ -8506,10 +8506,10 @@ mod tests {
         assert!(!ui.owned_running(Role::Client));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         // Saved ingress selection is not an OS mutation or activation.
-        let Config::Client(doc) = config::read_file(&path).unwrap() else {
+        let crate::config::Config::Client(doc) = crate::config::read_file(&path).unwrap() else {
             panic!("client")
         };
-        assert_eq!(doc.client.ingress_mode, config::IngressMode::SystemProxy);
+        assert_eq!(doc.client.ingress_mode, crate::config::IngressMode::SystemProxy);
         assert!(!ui.owned_running(Role::Client));
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -549,7 +549,7 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
                 .map(str::parse::<std::net::SocketAddr>)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|_| CliError::InvalidArguments)?;
-            if !routing::windivert::validate_redirect_lab_targets(&targets) {
+            if !routing::packet::validate_redirect_lab_targets(&targets) {
                 return Err(CliError::InvalidArguments);
             }
             Ok(Command::ClientWinDivertRedirectLab {

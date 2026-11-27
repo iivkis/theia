@@ -1,7 +1,7 @@
 //! Authenticated H2 client transport used by the local proxy listeners.
 //! Trust anchors are supplied by the caller; this API never disables PKI.
 use crate::diagnostics::{self, Value};
-use crate::protocol::{self, Address, Decoder, Direction, ErrorCode, Frame, Role, Session};
+use crate::protocol::{self, Address, Decoder, Direction, Frame, Role, Session};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bytes::Bytes;
 use http::{header, HeaderValue, Request, StatusCode};

@@ -719,10 +719,13 @@ mod tests {
         flow.commit(PacketAction::Redirect).unwrap();
         cache.state.lock().await.expires = Some(Instant::now() + Duration::from_secs(5));
         cache
-            .refresh(|known| async {
-                assert_eq!(known, Some(digest));
-                assert!(flow.check_delivery().is_ok());
-                Ok(super::super::exchange::unchanged_receipt(digest).to_vec())
+            .refresh(|known| {
+                let flow = &flow;
+                async move {
+                    assert_eq!(known, Some(digest));
+                    assert!(flow.check_delivery().is_ok());
+                    Ok(super::super::exchange::unchanged_receipt(digest).to_vec())
+                }
             })
             .await
             .unwrap();

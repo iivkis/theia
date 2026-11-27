@@ -2,7 +2,7 @@
 //! independently from the upstream C header, not linked to a custom SYS.
 //! NETWORK metadata never authenticates an application or a socket.
 //! The probe only opens match-none read-only handles; it cannot set ready.
-use super::packet::{PacketMeta, ParseError};
+use super::packet::{reflect_address, validate_redirect_lab_targets, PacketMeta, ParseError};
 #[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
 use std::io;
 
@@ -1301,33 +1301,6 @@ impl TcpRedirectTable {
         })
     }
 }
-/// Explicit isolated fixture destinations. Never use a caller-supplied
-/// filter expression, hostname, wildcard or broad carrier permit.
-pub(crate) fn validate_redirect_lab_targets(targets: &[std::net::SocketAddr]) -> bool {
-    !targets.is_empty()
-        && targets.len() <= 8
-        && targets.iter().all(|target| reflect_address(*target))
-        && targets
-            .iter()
-            .enumerate()
-            .all(|(i, target)| !targets[..i].contains(target))
-}
-fn reflect_address(address: std::net::SocketAddr) -> bool {
-    let ip = address.ip();
-    address.port() != 0
-        && !ip.is_unspecified()
-        && !ip.is_multicast()
-        && !ip.is_loopback()
-        && match address {
-            std::net::SocketAddr::V4(v) => v.ip().octets()[0] > 0 && v.ip().octets()[0] < 224,
-            std::net::SocketAddr::V6(v) => {
-                v.scope_id() == 0
-                    && v.flowinfo() == 0
-                    && v.ip().to_ipv4_mapped().is_none()
-                    && !v.ip().is_unicast_link_local()
-            }
-        }
-}
 fn tcp_numbers(packet: &[u8]) -> Option<(u32, u32, usize)> {
     let off = match packet.first().copied()? {
         0x45 if *packet.get(9)? == 6 => 20,
@@ -1908,7 +1881,7 @@ mod native {
                 let _done = Done(&done);
                 runtime.block_on(async move {
                     let relay = tokio::net::TcpListener::from_std(relay)?;
-                    let (left, right) = tokio::time::timeout(Duration::from_secs(6), async {
+                    let ((), ()) = tokio::time::timeout(Duration::from_secs(6), async {
                         tokio::try_join!(
                             async {
                                 let mut stream = client.connect(original_addr).await?;
@@ -1947,7 +1920,7 @@ mod native {
                     })
                     .await
                     .map_err(|_| io::ErrorKind::TimedOut)??;
-                    Ok::<(), io::Error>((left, right))
+                    Ok::<(), io::Error>(())
                 })
             });
             let pumping = (|| -> io::Result<()> {
@@ -2650,7 +2623,7 @@ mod native {
                                     Instant::now() + Duration::from_millis(100),
                                 ) {
                                     Ok(event) => {
-                                        if event.layer != layer || sender.try_send(event).is_err() {
+                                        if u32::from(event.layer) != layer || sender.try_send(event).is_err() {
                                             return Err(io::ErrorKind::InvalidData.into());
                                         }
                                     }

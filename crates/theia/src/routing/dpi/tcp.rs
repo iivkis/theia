@@ -188,7 +188,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (left, right) =
             tokio::join!(connect(listener.local_addr().unwrap()), listener.accept());
-        let mut client = left.unwrap();
+        let (mut client, _lease) = left.unwrap();
         let (mut server, _) = right.unwrap();
         let mut message = vec![2, 0, 0, 38, 3, 3];
         message.extend([1; 32]);
@@ -218,7 +218,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (client, server) = tokio::join!(connect(address), listener.accept());
-        let client = client.unwrap();
+        let (client, _lease) = client.unwrap();
         let (_server, _) = server.unwrap();
         assert_eq!(client.peer_addr().unwrap(), address);
         assert!(client.nodelay().unwrap());
