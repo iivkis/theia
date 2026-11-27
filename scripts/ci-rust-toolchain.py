@@ -64,7 +64,7 @@ def prepare(expected, components):
         subprocess.run(args, check=True)
         if not ready(chosen, expected, components):
             chosen = release
-            args[3] = chosen
+            args = [*args[:3], chosen, *args[4:]]
             if not ready(chosen, expected, components):
                 subprocess.run(args, check=True)
     if not ready(chosen, expected, components):
