@@ -168,3 +168,19 @@ theia client windivert --redirect-lab --config client.toml --directory $PinnedWi
 Replace the documentation addresses with controlled test servers. TCP dynamically allocates a separate exclusive listener per eligible captured SYN; the actual accepted stream is matched to the reflection generation, then handed to the existing XHTTP stream relay. UDP delivers captured payloads via the shared bounded dispatcher and authenticated XHTTP datagram relay; the sole capture worker injects a reply from the original destination only while its exact flow capability is live, and acknowledges the injection. No nonce/echo requirement or one-request/one-response restriction. No original packet is sent to the destination by the capture worker. Both protocols use the same NativeIngress, policy/FlowLease, existing carrier H2/H3 and first-send authorization. Unknown application/domain evidence is not promoted; unambiguously denied/non-Redirect rules refuse relay. Tuple tombstones, bounded queues and epoch limit restrict reuse but do not prove kernel socket ownership. Each target pins the OS-selected route source, interface index, GUID/LUID and network epoch, rechecked throughout the experiment. Reply operations are acknowledged by the packet worker and cancelled when their flow capability retires. The CLI emits a readiness line only after the actual scoped handles and isolated runtime are ready. Pre-existing TCP sessions and Fast Open are rejected.
 
 The filter is deliberately destination-scoped, not a production carrier exemption or persistent kill switch. Original traffic can resume when handles are removed (including after a crash); this lab cannot guarantee fail-closed outside its active scope. It is not integrated with the separate persistent WFP fixture. Kernel attribution, live socket/UDP reuse handling, physical inbound delivery and arbitration, whole-scope guard, production activation and native acceptance remain open. A successful command exit indicates only that the fixture ran to completion, not that any external application was successfully relayed.
+
+The independent `test-redirect-apps.py` fixture exercises four simultaneous TCP streams and four simultaneous UDP sockets per target from an external process. Each TCP stream sends four independently framed messages, verifies transformed responses, half-closes and receives a final transcript digest. Each UDP socket sends four datagrams (including empty), expects two different responses per request in any order and rejects missing, duplicate or wrong responses. The controlled server checks the peer IP against an explicit expected VPS egress allowlist. It must not be used as evidence of absent direct packets without an independent capture on the client-side network.
+
+On the controlled target host (separate from the Windows client; substitute real authorized addresses):
+
+```text
+python test-redirect-apps.py server --listen TARGET_IP:PORT --expected-peer VPS_EGRESS_IP --seconds 180
+```
+
+Start the Theia redirect lab, wait for the scoped readiness line, then from a separate Windows process:
+
+```text
+python test-redirect-apps.py client --target TARGET_IP:PORT --target [TARGET_IPV6]:PORT
+```
+
+Repeat with distinct pinned H2-only and H3-only client profiles. Save exact source SHA, driver package hashes, the independent client's exit status, target-side peer observations and client-side packet capture showing no original target egress. Run policy-denial controls, concurrent unrelated destinations/ports, connection churn, packet loss, cancellation and carrier failure separately. A loopback-only self-test validates the external fixture itself; it must not be reported as a native capture or XHTTP E2E pass. CI runs only the fixture self-test without changing host capture rules.
