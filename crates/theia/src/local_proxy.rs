@@ -1399,6 +1399,7 @@ async fn routed_udp(
     address: Address,
     port: u16,
     candidate: &crate::routing::dpi::udp::Candidate,
+    first: &[u8],
     observed: &Arc<std::sync::atomic::AtomicU8>,
 ) -> Result<RoutedUdp, ClientError> {
     let (snapshot, action, pinned) = route_decision(carrier, cache, &address).await?;
@@ -1415,7 +1416,7 @@ async fn routed_udp(
         action.packet_action(),
     )?;
     let tunnel = routed_udp_selected(
-        carrier, cache, address, port, candidate, observed, snapshot, action, pinned,
+        carrier, cache, address, port, candidate, first, observed, snapshot, action, pinned,
     )
     .await?;
     flow.check_pending()?;
@@ -1429,7 +1430,8 @@ async fn routed_udp_selected(
     address: Address,
     port: u16,
     candidate: &crate::routing::dpi::udp::Candidate,
-    _observed: &Arc<std::sync::atomic::AtomicU8>,
+    first: &[u8],
+    observed: &Arc<std::sync::atomic::AtomicU8>,
     snapshot: Arc<Snapshot>,
     action: Action,
     pinned: Option<Vec<IpAddr>>,
@@ -1454,9 +1456,68 @@ async fn routed_udp_selected(
         }
         crate::routing::PacketAction::Modify => {
             use crate::routing::dpi::udp::Candidate;
-            // MVP: local UDP Modify has no accepted independent capability.
-            // Consent alone cannot authorize QUIC/STUN probes or user
-            // datagrams. Use the already-authorized XHTTP fallback.
+            use crate::routing::dpi::{UdpStrategy, udp::BindingStrategy};
+            use crate::quic_core::wire::Version;
+            // Do not probe a name inferred from the payload alone. The
+            // explicit SOCKS destination must agree with the classified
+            // name and the actual first datagram must be transformable.
+            let strategy = match (&address, candidate) {
+                (Address::Dns(name), Candidate::QuicH3(sni)) if port == 443
+                    && crate::routing::domain_name(name).as_deref() == Ok(sni.as_str())
+                    && crate::routing::packet_modify::quic_initial_datagrams(first, sni).is_some()
+                    && crate::reality_quic_wire::long(first).is_some_and(|h| h.version == Version::V1.wire())
+                    => Some(UdpStrategy::Quic(Version::V1)),
+                (Address::Dns(name), Candidate::QuicV2H3(sni)) if port == 443
+                    && crate::routing::domain_name(name).as_deref() == Ok(sni.as_str())
+                    && crate::routing::packet_modify::quic_initial_datagrams(first, sni).is_some()
+                    && crate::reality_quic_wire::long(first).is_some_and(|h| h.version == Version::V2.wire())
+                    => Some(UdpStrategy::Quic(Version::V2)),
+                (Address::Dns(_), Candidate::StunBinding) if port == 3478 && cache.dpi.stun_enabled()
+                    && crate::routing::dpi::udp::prepare_binding(first, BindingStrategy::Fingerprint)
+                        .is_some_and(|bytes| bytes.as_ref() != first)
+                    => Some(UdpStrategy::StunBinding(BindingStrategy::Fingerprint)),
+                _ => None,
+            };
+            if let (Address::Dns(name), Some(strategy)) = (&address, strategy) {
+                if strategy.accepted_for_proxy() && cache.dpi.enabled() {
+                    authorization.check()?;
+                    let ips = match pinned {
+                        Some(ips) => ips,
+                        None => match carrier.resolve_routing(name, snapshot.digest()).await {
+                            Ok(ips) => ips,
+                            Err(ClientError::Rejected(502 | 504)) => Vec::new(),
+                            Err(error) => return Err(error),
+                        },
+                    };
+                    authorization.check()?;
+                    if !ips.iter().all(|ip| snapshot.policy().classify(
+                        crate::routing::Evidence::Known(name),
+                        crate::routing::Evidence::Known(*ip),
+                    ) == Ok(crate::routing::Classification::Matched(Action::DirectDpi))) {
+                        return Err(ClientError::Open(ErrorCode::PolicyDenied));
+                    }
+                    if let Some(verified) = cache.dpi.open_udp_checked(
+                        name, port, &ips, snapshot.digest(), strategy,
+                    ).await? {
+                        authorization.check()?;
+                        let carrier = carrier.clone();
+                        let target = address.clone();
+                        let observed = observed.clone();
+                        let stun = matches!(strategy, UdpStrategy::StunBinding(_));
+                        let fallback = Box::pin(async move {
+                            let tunnel = carrier.open_udp(target, port).await?;
+                            tunnel.record_transport(&observed);
+                            crate::traffic::udp_dpi_fallback();
+                            if stun { crate::traffic::udp_stun_fallback(); }
+                            if strategy == UdpStrategy::Quic(Version::V2) {
+                                crate::traffic::udp_quic_v2_fallback();
+                            }
+                            Ok(tunnel)
+                        });
+                        return Ok(crate::udp_relay::Tunnel::VerifiedLocal(Box::new(verified), fallback));
+                    }
+                }
+            }
             authorization.check()?;
             let tunnel = carrier.open_udp(address, port).await?;
             authorization.check()?;
@@ -1506,7 +1567,7 @@ impl ProxyClient {
             }
         };
         format!(
-            "{report}\nСистемный перехват: не активирован (backend не готов)\n{}\n{}\nЛокальный Anti-DPI: {}\nUDP Modify: недоступен в System Proxy; для правила Anti-DPI используется VPS\n{}",
+            "{report}\nСистемный перехват: не активирован (backend не готов)\n{}\n{}\nЛокальный Anti-DPI: {}\nUDP Modify: {}; непринятые стратегии используют VPS\n{}",
             crate::routing::flow::summary(self.routing_cache().flows.counts()),
             self.routing_cache().report(),
             if self.routing_cache().dpi.enabled() {
@@ -1514,6 +1575,7 @@ impl ProxyClient {
             } else {
                 "выключен; резерв VPS"
             },
+            crate::routing::dpi::UdpStrategy::capability_summary(),
             crate::traffic::routing_summary()
         )
     }
@@ -1551,6 +1613,7 @@ impl ProxyClient {
         address: Address,
         port: u16,
         candidate: &crate::routing::dpi::udp::Candidate,
+        first: &[u8],
     ) -> Result<RoutedUdp, ClientError> {
         match self {
             Self::Direct(c) => {
@@ -1560,6 +1623,7 @@ impl ProxyClient {
                     address,
                     port,
                     candidate,
+                    first,
                     &c.last_open,
                 )
                 .await?;
@@ -1574,6 +1638,7 @@ impl ProxyClient {
                     address,
                     port,
                     candidate,
+                    first,
                     &generation.last_open,
                 )
                 .await?;
@@ -5780,6 +5845,7 @@ async fn udp_association(
                 if tasks.len()>=MAX_FLOWS { crate::traffic::udp_queue_drop(); continue; }
                 let (tx,rx)=mpsc::channel(QUEUE);
                 let _=tx.try_send(data.to_vec());
+                let first = data.to_vec(); // parse_socks already bounds the datagram
                 let observer=Arc::new(std::sync::Mutex::new(udp::Observer::default()));
                 let (candidate, deadline) = {
                     let mut observer = observer.lock().unwrap_or_else(|e| e.into_inner());
@@ -5796,7 +5862,9 @@ async fn udp_association(
                     let _completion=completion;
                     let (address,port)=key;
                     let candidate=udp::await_candidate(classified, deadline).await;
-                    let RoutedUdp { tunnel, flow }=proxy.open_udp(address.clone(),port,&candidate).await?;
+                    let RoutedUdp { tunnel, flow }=proxy.open_udp(address.clone(),port,&candidate,&first).await?;
+                    drop(first);
+                    let local_guard = tunnel.local_delivery_guard();
                     let (down_tx,mut down_rx)=mpsc::channel(QUEUE);
                     let relay=tunnel.relay_guarded(rx,down_tx,Some(&flow));
                     let deliver=async {
@@ -5809,6 +5877,9 @@ async fn udp_association(
                                 continue;
                             }
                             flow.check_delivery()?;
+                            if flow.actual_action()? == Some(crate::routing::PacketAction::Modify) {
+                                if let Some(guard) = &local_guard { guard.check()?; }
+                            }
                             let n=timeout(REPLY_TIMEOUT,socket.send_to(&packet,source)).await
                                 .map_err(|_|ClientError::Timeout)?.map_err(|_|ClientError::Io)?;
                             if n!=packet.len(){return Err(ClientError::Io);}
@@ -5940,7 +6011,8 @@ async fn udp_socks_fixture(client: &ProxyClient) {
             .open_udp(
                 Address::Dns("blocked.invalid".into()),
                 443,
-                &crate::routing::dpi::udp::Candidate::Other
+                &crate::routing::dpi::udp::Candidate::Other,
+                b"",
             )
             .await,
         Err(ClientError::Open(ErrorCode::PolicyDenied))

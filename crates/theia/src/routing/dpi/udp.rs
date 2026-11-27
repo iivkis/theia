@@ -158,29 +158,49 @@ pub(crate) fn prepare_binding(
 
 /// One independent CSPRNG Binding request to the connected peer. This is
 /// reachability evidence only; no STUN MESSAGE-INTEGRITY key is available.
+#[cfg(test)]
 pub(super) async fn probe_stun(
     socket: &tokio::net::UdpSocket,
     strategy: BindingStrategy,
 ) -> Option<()> {
+    probe_stun_checked(socket, strategy, || true).await.ok().flatten()
+}
+
+/// An independent STUN request never contains application bytes. An
+/// unavailable response is not proof of modification or peer identity.
+pub(super) async fn probe_stun_checked(
+    socket: &tokio::net::UdpSocket,
+    strategy: BindingStrategy,
+    live: impl Fn() -> bool,
+) -> Result<Option<()>, crate::client::ClientError> {
+    use crate::client::ClientError;
     use ring::rand::{SecureRandom, SystemRandom};
     let mut request = [0u8; 20];
     request[1] = 1;
     request[4..8].copy_from_slice(&COOKIE);
-    SystemRandom::new().fill(&mut request[8..]).ok()?;
-    let expected = plain_binding(&request)?;
-    let packet = prepare_binding(&request, strategy)?;
-    crate::udp_relay::send_datagram(socket, &packet)
-        .await
-        .ok()?;
+    SystemRandom::new().fill(&mut request[8..]).map_err(|_| ClientError::Protocol)?;
+    let expected = plain_binding(&request).ok_or(ClientError::Protocol)?;
+    let packet = prepare_binding(&request, strategy).ok_or(ClientError::Protocol)?;
+    if !live() { return Err(super::stale_policy()); }
+    if let Err(error) = crate::udp_relay::send_datagram(socket, &packet).await {
+        return if error.kind() == std::io::ErrorKind::PermissionDenied {
+            Err(super::stale_policy())
+        } else { Ok(None) };
+    }
     let mut response = [0; 513];
-    // The caller imposes the absolute time budget. Also bound invalid input.
     for _ in 0..8 {
-        let n = socket.recv(&mut response).await.ok()?;
+        if !live() { return Err(super::stale_policy()); }
+        let n = match socket.recv(&mut response).await {
+            Ok(n) => n,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return Err(super::stale_policy()),
+            Err(_) => return Ok(None),
+        };
+        if !live() { return Err(super::stale_policy()); }
         if binding_success(&response[..n]).is_some_and(|actual| expected.matches_response(actual)) {
-            return Some(());
+            return Ok(Some(()));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Correlate only application requests actually admitted to the local
@@ -357,6 +377,7 @@ pub(crate) async fn await_candidate(
 /// Probe independently with an ordinary, strictly verified QUIC connection.
 /// The application flight is never sent by this probe. A successful probe
 /// demonstrates reachability for this name/IP/ALPN, not evasion or app identity.
+#[cfg(test)]
 pub(super) async fn probe_quic(
     name: &str,
     address: std::net::SocketAddr,
@@ -364,25 +385,39 @@ pub(super) async fn probe_quic(
     config: std::sync::Arc<rustls::ClientConfig>,
     version: crate::quic_core::wire::Version,
 ) -> Option<()> {
-    use crate::quic_core::{dial, negotiation::VersionPolicy};
+    probe_quic_checked(name, address, scope, config, version, Duration::from_secs(5))
+        .await.ok().flatten()
+}
+
+/// Only a conclusively unavailable network endpoint permits fallback.
+/// The QUIC dial API does not separate every handshake/identity error;
+/// ambiguous errors are terminal, not permission to reroute.
+pub(super) async fn probe_quic_checked(
+    name: &str,
+    address: std::net::SocketAddr,
+    scope: Option<crate::network_scope::Scope>,
+    config: std::sync::Arc<rustls::ClientConfig>,
+    version: crate::quic_core::wire::Version,
+    budget: Duration,
+) -> Result<Option<()>, crate::client::ClientError> {
+    use crate::{client::ClientError, quic_core::{dial, negotiation::VersionPolicy}};
     let mut tls = (*config).clone();
     tls.alpn_protocols = vec![b"h3".to_vec()];
     tls.enable_early_data = false;
-    let name = rustls::pki_types::ServerName::try_from(name.to_owned()).ok()?;
-    let (negotiated, session) = dial::connect(
-        address,
-        name,
-        std::sync::Arc::new(tls),
-        scope.map(|scope| scope.bind_address()),
-        VersionPolicy::exact(version),
-        Duration::from_secs(5),
-    )
-    .await
-    .ok()?;
-    if negotiated != version {
-        return None;
-    }
-    dial::close_probe(session).await.ok()
+    let name = rustls::pki_types::ServerName::try_from(name.to_owned())
+        .map_err(|_| ClientError::Protocol)?;
+    let (negotiated, session) = match dial::connect(
+        address, name, std::sync::Arc::new(tls),
+        scope.map(|scope| scope.bind_address()), VersionPolicy::exact(version), budget,
+    ).await {
+        Ok(value) => value,
+        Err(dial::Error::Unreachable | dial::Error::EndpointNetworkRefused) => return Ok(None),
+        Err(dial::Error::Configuration | dial::Error::Bind) => return Err(super::stale_policy()),
+        Err(_) => return Err(ClientError::Tls),
+    };
+    if negotiated != version { return Err(ClientError::Protocol); }
+    dial::close_probe(session).await.map_err(|_| ClientError::Tls)?;
+    Ok(Some(()))
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 //! Bounded evidence scoped to profile, policy, network and exact destination.
 use crate::network_scope;
+use super::UdpProbe;
 use std::{
     collections::VecDeque,
     net::SocketAddr,
@@ -36,6 +37,7 @@ pub(super) struct Key {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Verdict {
     Verified(Strategy),
+    UdpVerified,
     Unavailable,
     Avoid { strategy: Strategy, until: Instant },
 }
@@ -56,6 +58,7 @@ impl Lease {
 
 struct Entry {
     key: Key,
+    probe: Option<UdpProbe>,
     lease: Lease,
     verdict: Verdict,
     expires: Instant,
@@ -76,7 +79,7 @@ impl Default for Sample {
 }
 struct History {
     key: Key,
-    samples: [Sample; 3],
+    samples: [Sample; 6],
     expires: Instant,
 }
 #[derive(Default)]
@@ -104,6 +107,10 @@ impl Cache {
         }
     }
     fn sample(&self, key: &Key, strategy: Strategy, good: bool, elapsed: Duration) {
+        self.sample_index(key, strategy.index(), good, elapsed);
+    }
+
+    fn sample_index(&self, key: &Key, index: usize, good: bool, elapsed: Duration) {
         let Ok(mut history) = self.1.lock() else {
             return;
         };
@@ -113,11 +120,11 @@ impl Cache {
             Some(index) => history.remove(index).expect("position exists"),
             None => History {
                 key: key.clone(),
-                samples: [Sample::default(); 3],
+                samples: [Sample::default(); 6],
                 expires: now + HISTORY_TTL,
             },
         };
-        let sample = &mut entry.samples[strategy.index()];
+        let sample = &mut entry.samples[index];
         if good {
             sample.failures = sample.failures.saturating_sub(1);
             let millis = elapsed.as_millis().clamp(1, 2000) as u32;
@@ -137,10 +144,14 @@ impl Cache {
     }
 
     pub(super) fn evidence(&self, key: &Key) -> Option<(Verdict, Lease)> {
+        self.evidence_kind(key, None)
+    }
+
+    fn evidence_kind(&self, key: &Key, probe: Option<UdpProbe>) -> Option<(Verdict, Lease)> {
         let mut cache = self.0.lock().ok()?;
         let now = Instant::now();
         cache.retain(|entry| entry.expires > now);
-        cache.iter().find(|entry| &entry.key == key).map(|entry| {
+        cache.iter().find(|entry| &entry.key == key && entry.probe == probe).map(|entry| {
             let verdict = match entry.verdict {
                 Verdict::Avoid { until, .. } if until > now => Verdict::Unavailable,
                 other => other,
@@ -164,24 +175,82 @@ impl Cache {
     }
 
     fn insert(&self, key: &Key, verdict: Verdict) -> Option<Lease> {
+        self.insert_kind(key, None, verdict)
+    }
+
+    fn insert_kind(&self, key: &Key, probe: Option<UdpProbe>, verdict: Verdict) -> Option<Lease> {
         let mut cache = self.0.lock().ok()?;
         let now = Instant::now();
-        cache.retain(|entry| entry.expires > now && &entry.key != key);
+        cache.retain(|entry| entry.expires > now && (&entry.key != key || entry.probe != probe));
         if cache.len() >= CACHE_LIMIT {
             cache.pop_front();
         }
         let ttl = match verdict {
-            Verdict::Verified(_) | Verdict::Avoid { .. } => POSITIVE_TTL,
+            Verdict::Verified(_) | Verdict::UdpVerified | Verdict::Avoid { .. } => POSITIVE_TTL,
             Verdict::Unavailable => NEGATIVE_TTL,
         };
         let lease = Lease::new();
         cache.push_back(Entry {
             key: key.clone(),
+            probe,
             lease: lease.clone(),
             verdict,
             expires: now + ttl,
         });
         Some(lease)
+    }
+
+    pub(super) fn udp_evidence(&self, key: &Key, probe: UdpProbe) -> Option<(bool, Lease)> {
+        self.evidence_kind(key, Some(probe)).map(|(verdict, lease)| (verdict == Verdict::UdpVerified, lease))
+    }
+
+    pub(super) fn remember_udp(&self, key: &Key, probe: UdpProbe, good: bool) -> Option<Lease> {
+        if network_scope::observe(key.address) != Some(key.network) { return None; }
+        self.insert_kind(key, Some(probe), if good { Verdict::UdpVerified } else { Verdict::Unavailable })
+    }
+
+    pub(super) fn observe_udp(&self, key: &Key, probe: UdpProbe, good: bool, elapsed: Duration) {
+        if network_scope::observe(key.address) == Some(key.network) {
+            self.sample_index(key, probe.index(), good, elapsed);
+        }
+    }
+
+    pub(super) fn udp_score(&self, key: &Key, probe: UdpProbe) -> u32 {
+        let sample = self.1.lock().ok().and_then(|mut history| {
+            history.retain(|entry| entry.expires > Instant::now());
+            history.iter().find(|entry| &entry.key == key).map(|entry| entry.samples[probe.index()])
+        }).unwrap_or_default();
+        sample.failures.saturating_mul(2000).saturating_add(sample.millis)
+    }
+
+    pub(super) fn fail_udp(&self, key: &Key, probe: UdpProbe, lease: &Lease) {
+        if network_scope::observe(key.address) != Some(key.network) { return; }
+        let Ok(mut cache) = self.0.lock() else { return };
+        let now = Instant::now();
+        cache.retain(|entry| entry.expires > now);
+        if let Some(entry) = cache.iter_mut().find(|entry| {
+            &entry.key == key && entry.probe == Some(probe)
+                && entry.verdict == Verdict::UdpVerified && entry.lease.same(lease)
+        }) {
+            self.sample_index(key, probe.index(), false, Duration::ZERO);
+            entry.verdict = Verdict::Unavailable;
+            entry.expires = now + NEGATIVE_TTL;
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn fixture_udp(&self, key: &Key, probe: UdpProbe, good: bool) -> Lease {
+        self.insert_kind(key, Some(probe), if good { Verdict::UdpVerified } else { Verdict::Unavailable }).unwrap()
+    }
+
+    #[cfg(test)]
+    pub(super) fn fixture_size(&self) -> usize { self.0.lock().unwrap().len() }
+
+    #[cfg(test)]
+    pub(super) fn fixture_expire(&self) {
+        for entry in self.0.lock().unwrap().iter_mut() {
+            entry.expires = Instant::now();
+        }
     }
 
     pub(super) fn failed(&self, key: &Key, strategy: Strategy, lease: &Lease) {
@@ -218,6 +287,7 @@ impl Cache {
         cache.retain(|entry| entry.expires > now);
         if let Some(entry) = cache.iter_mut().find(|entry| {
             &entry.key == key
+                && entry.probe.is_none()
                 && entry.verdict == Verdict::Verified(strategy)
                 && entry.lease.same(lease)
         }) {
@@ -257,6 +327,36 @@ mod tests {
         );
         key.policy = [2; 32];
         assert_eq!(cache.ranked(&key), Strategy::ALL);
+    }
+
+    #[test]
+    fn unified_evidence_and_rankings_never_cross_tcp_udp_or_quic_versions() {
+        use crate::quic_core::wire::Version;
+        let cache = Cache::default();
+        let address = "127.0.0.1:443".parse().unwrap();
+        let mut key = Key {
+            name: "example.org".into(), address, policy: [1;32], epoch: 1,
+            network: network_scope::Scope::fixture(address, 0),
+        };
+        let tcp = cache.insert(&key, Verdict::Verified(Strategy::Header)).unwrap();
+        let v1 = UdpProbe::Quic(Version::V1);
+        let v2 = UdpProbe::Quic(Version::V2);
+        let old = cache.fixture_udp(&key, v1, true);
+        let fresh = cache.fixture_udp(&key, v1, true);
+        cache.fixture_udp(&key, v2, false);
+        assert!(cache.current(&key, Strategy::Header, &tcp));
+        assert!(cache.udp_evidence(&key, v1).unwrap().1.same(&fresh));
+        assert!(!cache.udp_evidence(&key, v1).unwrap().1.same(&old));
+        assert_eq!(cache.udp_evidence(&key, v2).unwrap().0, false);
+        assert!(cache.udp_evidence(&key, UdpProbe::Stun).is_none());
+        cache.sample_index(&key, v1.index(), false, Duration::ZERO);
+        cache.sample_index(&key, v2.index(), true, Duration::from_millis(50));
+        assert!(cache.udp_score(&key, v2) < cache.udp_score(&key, v1));
+        assert_eq!(cache.ranked(&key), Strategy::ALL);
+        key.epoch += 1;
+        assert!(cache.evidence(&key).is_none());
+        assert!(cache.udp_evidence(&key, v1).is_none());
+        assert_eq!(cache.udp_score(&key, v1), 1000);
     }
 
     #[test]

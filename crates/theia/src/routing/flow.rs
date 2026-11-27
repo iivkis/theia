@@ -218,7 +218,7 @@ impl FlowLease {
         Ok(())
     }
 
-    fn actual_action(&self) -> Result<Option<PacketAction>, ClientError> {
+    pub(crate) fn actual_action(&self) -> Result<Option<PacketAction>, ClientError> {
         let state = self.table.state.lock().map_err(|_| denied())?;
         let entry = state.entries.get(&self.id).ok_or_else(denied)?;
         if entry.identity != self.identity {
