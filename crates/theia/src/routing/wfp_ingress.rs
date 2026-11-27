@@ -350,7 +350,7 @@ pub(crate) fn bind_tcp_listeners(compartment: u32, port: u16) -> io::Result<[Tcp
     for socket in [&v4, &v6] {
         set_one(socket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE)?;
     }
-    set_one(&v6, IPPROTO_IPV6 as i32, IPV6_V6ONLY as i32)?;
+    set_one(&v6, IPPROTO_IPV6, IPV6_V6ONLY)?;
     v4.bind(SocketAddr::from(([0, 0, 0, 0], port)))?;
     v6.bind(SocketAddr::new(
         std::net::Ipv6Addr::UNSPECIFIED.into(),

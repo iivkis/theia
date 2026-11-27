@@ -404,12 +404,22 @@ def trial(binary, cert, key, transport, workload, condition):
             for role, port, release in (("server", ports.h2, ports.release_server),
                                         ("client", http, ports.release_client)):
                 release()
+                # Keep diagnostics for failed startup of the controlled
+                # fixture, not user traffic. Files avoid pipe backpressure.
+                diagnostics = reservations.enter_context(tempfile.TemporaryFile())
                 child = subprocess.Popen([str(binary), role, "run", "--config",
                                           str(directory / (role + ".toml"))],
                                          env=env, stdin=subprocess.DEVNULL,
-                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                         stdout=diagnostics, stderr=diagnostics)
                 children.append(child)
-                wait_port(port, children)
+                try:
+                    wait_port(port, children)
+                except RuntimeError as error:
+                    diagnostics.seek(0, os.SEEK_END)
+                    diagnostics.seek(max(0, diagnostics.tell() - 2048))
+                    detail = diagnostics.read(2048).decode("utf-8", errors="replace")
+                    detail = detail.replace(env["THEIA_BENCH_TOKEN"], "[redacted]")
+                    raise RuntimeError(f"{role} startup failed (exit={child.poll()}): {detail}") from error
             ps = [psutil.Process(p.pid) for p in children]
             initial_cpu = cpu_seconds(ps)
             peak = [sample_rss(ps)]

@@ -9,12 +9,9 @@ use super::{
 use std::borrow::Cow;
 
 fn words(bytes: &[u8]) -> u32 {
-    let mut chunks = bytes.chunks_exact(2);
-    let sum = chunks
-        .by_ref()
-        .map(|p| u32::from(u16::from_be_bytes([p[0], p[1]])))
-        .sum::<u32>();
-    sum + chunks.remainder().first().map_or(0, |b| u32::from(*b) << 8)
+    let (chunks, tail) = bytes.as_chunks::<2>();
+    let sum = chunks.iter().map(|p| u32::from(u16::from_be_bytes(*p))).sum::<u32>();
+    sum + tail.first().map_or(0, |b| u32::from(*b) << 8)
 }
 fn checksum(mut sum: u32) -> u16 {
     while sum >> 16 != 0 {

@@ -56,15 +56,15 @@ fn controls(mut data: &[u8], ipv4: bool) -> io::Result<(&[u8], &[u8])> {
     let header = aligned(mem::size_of::<CMSGHDR>()).ok_or_else(invalid)?;
     let (level, records, context) = if ipv4 {
         (
-            IPPROTO_IP as i32,
-            IP_WFP_REDIRECT_RECORDS as i32,
-            IP_WFP_REDIRECT_CONTEXT as i32,
+            IPPROTO_IP,
+            IP_WFP_REDIRECT_RECORDS,
+            IP_WFP_REDIRECT_CONTEXT,
         )
     } else {
         (
-            IPPROTO_IPV6 as i32,
-            IPV6_WFP_REDIRECT_RECORDS as i32,
-            IPV6_WFP_REDIRECT_CONTEXT as i32,
+            IPPROTO_IPV6,
+            IPV6_WFP_REDIRECT_RECORDS,
+            IPV6_WFP_REDIRECT_CONTEXT,
         )
     };
     let (mut r, mut c) = (None, None);
@@ -88,12 +88,12 @@ fn controls(mut data: &[u8], ipv4: bool) -> io::Result<(&[u8], &[u8])> {
                 return Err(invalid());
             }
             c = Some(value);
-        } else if (h.cmsg_level == IPPROTO_IP as i32
-            && (h.cmsg_type == IP_WFP_REDIRECT_RECORDS as i32
-                || h.cmsg_type == IP_WFP_REDIRECT_CONTEXT as i32))
-            || (h.cmsg_level == IPPROTO_IPV6 as i32
-                && (h.cmsg_type == IPV6_WFP_REDIRECT_RECORDS as i32
-                    || h.cmsg_type == IPV6_WFP_REDIRECT_CONTEXT as i32))
+        } else if (h.cmsg_level == IPPROTO_IP
+            && (h.cmsg_type == IP_WFP_REDIRECT_RECORDS
+                || h.cmsg_type == IP_WFP_REDIRECT_CONTEXT))
+            || (h.cmsg_level == IPPROTO_IPV6
+                && (h.cmsg_type == IPV6_WFP_REDIRECT_RECORDS
+                    || h.cmsg_type == IPV6_WFP_REDIRECT_CONTEXT))
         {
             return Err(invalid());
         }
@@ -211,7 +211,7 @@ impl WfpUdpCapture {
         if rc != 0 {
             return Err(error());
         }
-        if message.dwFlags & (MSG_TRUNC as u32 | MSG_CTRUNC as u32) != 0
+        if message.dwFlags & (MSG_TRUNC | MSG_CTRUNC) != 0
             || read as usize > crate::protocol::MAX_DATAGRAM
             || message.namelen < 0
             || message.namelen as usize > mem::size_of_val(&peer)
@@ -264,7 +264,7 @@ mod tests {
         let mut bytes = vec![0u8; aligned(size).unwrap()];
         let h = CMSGHDR {
             cmsg_len: size,
-            cmsg_level: IPPROTO_IP as i32,
+            cmsg_level: IPPROTO_IP,
             cmsg_type: kind,
         };
         unsafe {
@@ -276,9 +276,9 @@ mod tests {
 
     #[test]
     fn exact_ancillary_pair_rejects_duplicate_wrong_family_and_trailing_fragment() {
-        let records = control(IP_WFP_REDIRECT_RECORDS as i32, &[1, 2, 3]);
+        let records = control(IP_WFP_REDIRECT_RECORDS, &[1, 2, 3]);
         let context = control(
-            IP_WFP_REDIRECT_CONTEXT as i32,
+            IP_WFP_REDIRECT_CONTEXT,
             &[0; super::super::wfp_context::SIZE],
         );
         let valid = [records.as_slice(), context.as_slice()].concat();
@@ -288,8 +288,8 @@ mod tests {
         let header = aligned(mem::size_of::<CMSGHDR>()).unwrap();
         let h = CMSGHDR {
             cmsg_len: header + 3,
-            cmsg_level: IPPROTO_IPV6 as i32,
-            cmsg_type: IPV6_WFP_REDIRECT_RECORDS as i32,
+            cmsg_level: IPPROTO_IPV6,
+            cmsg_type: IPV6_WFP_REDIRECT_RECORDS,
         };
         unsafe {
             ptr::write_unaligned(foreign.as_mut_ptr().cast::<CMSGHDR>(), h);
