@@ -8,7 +8,7 @@ use std::{
     ffi::{c_char, c_int, c_long, c_void},
     fs::{self, File},
     io, mem,
-    os::{fd::AsRawFd, unix::fs::MetadataExt},
+    os::{fd::{AsRawFd, FromRawFd, OwnedFd}, unix::fs::MetadataExt},
     ptr::{self, NonNull},
     sync::{Arc, atomic::{AtomicBool, Ordering}},
 };
@@ -78,24 +78,68 @@ impl Drop for Link { fn drop(&mut self) { unsafe { bpf_link__destroy(self.0.as_p
 struct Ring(NonNull<c_void>);
 impl Drop for Ring { fn drop(&mut self) { unsafe { ring_buffer__free(self.0.as_ptr()); } } }
 
+// Keep a private duplicate of the kernel loss-map FD alive with each event.
+// A collector poll alone cannot establish that no event was lost since that
+// poll. Recheck around corroboration, and permanently revoke on uncertainty.
+struct LossMonitor {
+    fd: OwnedFd,
+    cpus: usize,
+    live: Arc<AtomicBool>,
+}
+impl LossMonitor {
+    fn new(fd: c_int, cpus: usize, live: Arc<AtomicBool>) -> io::Result<Self> {
+        if cpus == 0 || cpus > MAX_CPUS { return Err(denied()); }
+        let raw = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if raw < 0 { return Err(io::Error::last_os_error()); }
+        Ok(Self { fd: unsafe { OwnedFd::from_raw_fd(raw) }, cpus, live })
+    }
+    fn check(&self) -> io::Result<()> {
+        if !self.live.load(Ordering::Acquire) { return Err(denied()); }
+        let key = 0u32;
+        // The pinned ELF declares a per-CPU u64 counter. libbpf's CPU
+        // count is bounded at attach; the output is aligned and initialized.
+        let mut losses = vec![0u64; self.cpus];
+        let rc = unsafe { bpf_map_lookup_elem(self.fd.as_raw_fd(), (&key as *const u32).cast(), losses.as_mut_ptr().cast()) };
+        if rc != 0 || losses.iter().any(|count| *count != 0) {
+            self.live.store(false, Ordering::Release);
+            return Err(denied());
+        }
+        if !self.live.load(Ordering::Acquire) { return Err(denied()); }
+        Ok(())
+    }
+}
+
 struct Buffer {
     queue: VecDeque<KernelFlowEvent>,
     failed: bool,
+    live: Arc<AtomicBool>,
 }
 impl Buffer {
+    fn poison(&mut self) {
+        self.failed = true;
+        self.live.store(false, Ordering::Release);
+        self.queue.clear();
+    }
     fn push(&mut self, data: &[u8]) -> io::Result<()> {
-        if self.failed || self.queue.len() == MAX_BUFFER { self.failed = true; return Err(denied()); }
+        if self.failed || !self.live.load(Ordering::Acquire) || self.queue.len() == MAX_BUFFER {
+            self.poison();
+            return Err(denied());
+        }
         match KernelFlowEvent::parse(data) {
             Ok(event) => { self.queue.push_back(event); Ok(()) }
-            Err(error) => { self.failed = true; Err(error) }
+            Err(error) => { self.poison(); Err(error) }
         }
     }
 }
 unsafe extern "C" fn sample(context: *mut c_void, data: *mut c_void, len: usize) -> c_int {
     // libbpf invokes the callback synchronously on the collector worker.
     // Reject invalid length before creating a slice, avoid unwinding.
-    if context.is_null() || data.is_null() || len != 88 { return -libc::EINVAL; }
+    if context.is_null() { return -libc::EINVAL; }
     let state = unsafe { &mut *context.cast::<Buffer>() };
+    if data.is_null() || len != 88 {
+        state.poison();
+        return -libc::EINVAL;
+    }
     let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), len) };
     if state.push(bytes).is_ok() { 0 } else { -libc::ENOBUFS }
 }
@@ -104,7 +148,7 @@ unsafe extern "C" fn sample(context: *mut c_void, data: *mut c_void, len: usize)
 /// captured packet. Session close or any lost event invalidates all tokens.
 pub struct CollectedEvent {
     event: KernelFlowEvent,
-    live: Arc<AtomicBool>,
+    loss: Arc<LossMonitor>,
 }
 impl CollectedEvent {
     /// Correlate a live collector event with an actual packet selected
@@ -117,23 +161,26 @@ impl CollectedEvent {
         packet: &super::nfqueue::Packet<'_>,
         fd: i32,
     ) -> io::Result<CorroboratedFlow> {
-        if !self.live.load(Ordering::Acquire) { return Err(denied()); }
+        self.loss.check()?;
         let proof = rules.captured_socket(packet)?;
         if proof.cookie() != self.event.cookie { return Err(denied()); }
         let flow = self.event.corroborate(fd)?;
         if flow.cookie() != proof.cookie() || flow.key() != proof.key()
-            || !self.live.load(Ordering::Acquire) || rules.captured_socket(packet)? != proof {
+            || rules.captured_socket(packet)? != proof {
             return Err(denied());
         }
+        self.loss.check()?;
+        self.event.fresh()?;
         Ok(flow)
     }
 
     pub fn corroborate_socket(&self, fd: i32, socket: &impl AsRawFd) -> io::Result<CorroboratedFlow> {
-        if !self.live.load(Ordering::Acquire) || socket_cookie(socket)? != self.event.cookie {
-            return Err(denied());
-        }
+        self.loss.check()?;
+        if socket_cookie(socket)? != self.event.cookie { return Err(denied()); }
         let flow = self.event.corroborate(fd)?;
-        if !self.live.load(Ordering::Acquire) || socket_cookie(socket)? != flow.cookie() { return Err(denied()); }
+        if socket_cookie(socket)? != flow.cookie() { return Err(denied()); }
+        self.loss.check()?;
+        self.event.fresh()?;
         Ok(flow)
     }
 }
@@ -145,9 +192,7 @@ pub struct Collector {
     _links: Vec<Link>,
     _object: Object,
     buffer: Box<Buffer>,
-    lost_fd: c_int,
-    losses: Vec<u64>,
-    live: Arc<AtomicBool>,
+    loss: Arc<LossMonitor>,
 }
 
 impl Collector {
@@ -169,7 +214,9 @@ impl Collector {
         let ring_fd = map_fd(b"flow_events\0")?;
         let cpus = usize::try_from(unsafe { libbpf_num_possible_cpus() }).map_err(|_| denied())?;
         if cpus == 0 || cpus > MAX_CPUS { return Err(denied()); }
-        let mut buffer = Box::new(Buffer { queue: VecDeque::with_capacity(MAX_BUFFER), failed: false });
+        let live = Arc::new(AtomicBool::new(true));
+        let loss = Arc::new(LossMonitor::new(lost_fd, cpus, live.clone())?);
+        let mut buffer = Box::new(Buffer { queue: VecDeque::with_capacity(MAX_BUFFER), failed: false, live });
         let ring = Ring(checked_pointer(unsafe { ring_buffer__new(ring_fd, sample,
             (&mut *buffer as *mut Buffer).cast(), ptr::null()) })?);
         let mut links = Vec::with_capacity(PROGRAMS.len());
@@ -178,16 +225,13 @@ impl Collector {
             if program.is_null() { return Err(denied()); }
             links.push(Link(checked_pointer(unsafe { bpf_program__attach_cgroup(program, cgroup.as_raw_fd()) })?));
         }
-        let mut owner = Self { ring, _links: links, _object: object, buffer, lost_fd, losses: vec![0; cpus], live: Arc::new(AtomicBool::new(true)) };
+        let mut owner = Self { ring, _links: links, _object: object, buffer, loss };
         owner.check_loss()?;
         Ok(owner)
     }
     fn check_loss(&mut self) -> io::Result<()> {
-        let key = 0u32;
-        let rc = unsafe { bpf_map_lookup_elem(self.lost_fd, (&key as *const u32).cast(), self.losses.as_mut_ptr().cast()) };
-        if rc != 0 || self.losses.iter().any(|count| *count != 0) || self.buffer.failed {
-            self.live.store(false, Ordering::Release);
-            self.buffer.queue.clear();
+        if self.buffer.failed || self.loss.check().is_err() {
+            self.buffer.poison();
             return Err(denied());
         }
         Ok(())
@@ -195,25 +239,24 @@ impl Collector {
     /// Blocking bounded poll; execute only on the dedicated collector worker.
     /// Loss is terminal for the entire session, not just for one event.
     pub fn poll(&mut self, timeout_ms: u32) -> io::Result<Option<CollectedEvent>> {
-        if timeout_ms > 250 || !self.live.load(Ordering::Acquire) { return Err(denied()); }
+        if timeout_ms > 250 || !self.loss.live.load(Ordering::Acquire) { return Err(denied()); }
         self.check_loss()?;
         if self.buffer.queue.is_empty() {
             let rc = unsafe { ring_buffer__poll(self.ring.0.as_ptr(), timeout_ms as c_int) };
             if rc < 0 {
-                self.live.store(false, Ordering::Release);
-                self.buffer.queue.clear();
+                self.buffer.poison();
                 return Err(io::Error::from_raw_os_error(rc.checked_neg().unwrap_or(libc::EINVAL)));
             }
         }
         self.check_loss()?;
         while let Some(event) = self.buffer.queue.pop_front() {
-            if event.fresh().is_ok() { return Ok(Some(CollectedEvent { event, live: self.live.clone() })); }
+            if event.fresh().is_ok() { return Ok(Some(CollectedEvent { event, loss: self.loss.clone() })); }
         }
         Ok(None)
     }
 }
 impl Drop for Collector {
-    fn drop(&mut self) { self.live.store(false, Ordering::Release); }
+    fn drop(&mut self) { self.loss.live.store(false, Ordering::Release); }
 }
 
 #[cfg(test)]
@@ -230,9 +273,32 @@ mod tests {
     }
     #[test]
     fn malformed_ring_record_poison_is_permanent() {
-        let mut buffer = Buffer { queue: VecDeque::with_capacity(MAX_BUFFER), failed: false };
+        let live = Arc::new(AtomicBool::new(true));
+        let mut buffer = Buffer { queue: VecDeque::with_capacity(MAX_BUFFER), failed: false, live: live.clone() };
         assert!(buffer.push(&[0;88]).is_err());
         assert!(buffer.failed);
+        assert!(!live.load(Ordering::Acquire));
         assert!(buffer.push(&[0;88]).is_err());
+    }
+
+    #[test]
+    fn malformed_callback_revokes_already_issued_events() {
+        let live = Arc::new(AtomicBool::new(true));
+        let mut buffer = Buffer { queue: VecDeque::new(), failed: false, live: live.clone() };
+        let rc = unsafe { sample((&mut buffer as *mut Buffer).cast(), ptr::null_mut(), 88) };
+        assert_eq!(rc, -libc::EINVAL);
+        assert!(buffer.failed);
+        assert!(!live.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn unreadable_loss_map_revokes_shared_session() {
+        let live = Arc::new(AtomicBool::new(true));
+        let file = File::open("/dev/null").unwrap();
+        let monitor = LossMonitor::new(file.as_raw_fd(), 1, live.clone()).unwrap();
+        drop(file);
+        assert!(monitor.check().is_err());
+        assert!(!live.load(Ordering::Acquire));
+        assert!(monitor.check().is_err());
     }
 }

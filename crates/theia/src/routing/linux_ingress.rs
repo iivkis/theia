@@ -52,7 +52,10 @@ pub(crate) fn original_tcp(stream: &TcpStream) -> io::Result<FlowKey> {
 
 fn validate_redirect(local: SocketAddr, source: SocketAddr, destination: SocketAddr) -> io::Result<FlowKey> {
     if destination == local || destination == source || destination.port() == 0
-        || source.port() == 0 || destination.ip().is_unspecified()
+        || source.port() == 0 || local.port() == 0 || source.ip().is_unspecified()
+        || source.ip().is_multicast() || local.is_ipv4() != source.is_ipv4()
+        || matches!(source, SocketAddr::V6(v6) if v6.scope_id() != 0 || v6.ip().is_unicast_link_local() || v6.ip().to_ipv4_mapped().is_some())
+        || destination.ip().is_unspecified()
         || destination.ip().is_multicast() || destination.ip().is_loopback()
         || matches!(destination, SocketAddr::V6(v6) if v6.scope_id() != 0 || v6.ip().is_unicast_link_local() || v6.ip().to_ipv4_mapped().is_some())
         || source.is_ipv4() != destination.is_ipv4()
@@ -173,7 +176,8 @@ fn original_ancillary(mut bytes: &[u8], ipv4: bool) -> io::Result<SocketAddr> {
             return Err(invalid());
         }
         let aligned = align_cmsg(len).ok_or_else(invalid)?;
-        if aligned >= bytes.len() { break; }
+        if len == bytes.len() { break; }
+        if aligned > bytes.len() { return Err(invalid()); }
         bytes = &bytes[aligned..];
     }
     destination.ok_or_else(invalid)
@@ -360,6 +364,15 @@ mod tests {
         let mut duplicate = bytes.clone();
         duplicate.extend_from_slice(&bytes);
         assert!(original_ancillary(&duplicate, true).is_err());
+        assert!(original_ancillary(&[bytes.as_slice(), &[0]].concat(), true).is_err());
+
+        // An unknown final control with an incomplete alignment gap must
+        // not turn a malformed receive into a valid original destination.
+        let header = align_cmsg(mem::size_of::<libc::cmsghdr>()).unwrap();
+        let mut partial = vec![0u8; header + 2];
+        let control = libc::cmsghdr { cmsg_len: (header + 1) as _, cmsg_level: libc::SOL_SOCKET, cmsg_type: 0 };
+        unsafe { std::ptr::write_unaligned(partial.as_mut_ptr().cast::<libc::cmsghdr>(), control); }
+        assert!(original_ancillary(&[bytes.as_slice(), &partial].concat(), true).is_err());
     }
 
     #[test]
@@ -369,6 +382,11 @@ mod tests {
         assert!(validate_redirect(local, source, local).is_err());
         assert!(validate_redirect(local, source, source).is_err());
         assert!(validate_redirect(local, source, "127.0.0.2:443".parse().unwrap()).is_err());
+        let target = "198.51.100.4:443".parse().unwrap();
+        for bad in ["0.0.0.0:20000", "224.0.0.1:20000", "[::ffff:127.0.0.1]:20000"] {
+            assert!(validate_redirect(local, bad.parse().unwrap(), target).is_err());
+        }
+        assert!(validate_redirect("[::1]:10000".parse().unwrap(), source, target).is_err());
         assert_eq!(validate_redirect(local, source, "198.51.100.4:443".parse().unwrap()).unwrap().destination, "198.51.100.4:443".parse().unwrap());
     }
 }

@@ -32,7 +32,9 @@ pub(super) fn decode_transport(bytes: &[u8], token: &[u8; 32], peer: SocketAddr,
     };
     let source = SocketAddr::new(ip(&bytes[52..68])?, source_port);
     let destination = SocketAddr::new(ip(&bytes[68..84])?, destination_port);
-    if source != peer || source_port == 0 || destination_port == 0
+    if source != peer || source_port == 0 || destination_port == 0 || local.port() == 0
+        || local.is_ipv4() != source.is_ipv4()
+        || matches!(local, SocketAddr::V6(v6) if v6.scope_id() != 0 || v6.ip().to_ipv4_mapped().is_some())
         || source.ip().is_unspecified() || source.ip().is_multicast()
         || !(local.ip().is_loopback() || local.ip() == source.ip()) || destination == local || destination == source
         || destination.ip().is_loopback() || destination.ip().is_multicast() || destination.ip().is_unspecified() {
@@ -60,6 +62,8 @@ mod tests {
         let local = "127.0.0.1:8080".parse().unwrap();
         assert_eq!(decode(&bytes, &[7; 32], peer, local).unwrap().destination, "192.0.2.1:443".parse().unwrap());
         assert!(decode(&bytes, &[8; 32], peer, local).is_none());
+        assert!(decode(&bytes, &[7; 32], peer, "[::1]:8080".parse().unwrap()).is_none());
+        assert!(decode(&bytes, &[7; 32], peer, "127.0.0.1:0".parse().unwrap()).is_none());
         assert!(decode(&bytes, &[7; 32], "127.0.0.1:1235".parse().unwrap(), local).is_none());
         for len in 0..SIZE { assert!(decode(&bytes[..len], &[7; 32], peer, local).is_none()); }
         bytes[41] = 17;

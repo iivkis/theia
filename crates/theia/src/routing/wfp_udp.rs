@@ -52,6 +52,11 @@ fn controls(mut data: &[u8], ipv4: bool) -> io::Result<(&[u8], &[u8])> {
         } else if h.cmsg_level == level && h.cmsg_type == context {
             if c.is_some() || value.len() != super::wfp_context::SIZE { return Err(invalid()); }
             c = Some(value);
+        } else if (h.cmsg_level == IPPROTO_IP as i32
+            && matches!(h.cmsg_type, x if x == IP_WFP_REDIRECT_RECORDS as i32 || x == IP_WFP_REDIRECT_CONTEXT as i32))
+            || (h.cmsg_level == IPPROTO_IPV6 as i32
+            && matches!(h.cmsg_type, x if x == IPV6_WFP_REDIRECT_RECORDS as i32 || x == IPV6_WFP_REDIRECT_CONTEXT as i32)) {
+            return Err(invalid());
         }
         let next = aligned(len).ok_or_else(invalid)?;
         if len == data.len() { break; }
@@ -162,9 +167,13 @@ mod tests {
         let valid = [records.as_slice(), context.as_slice()].concat();
         assert_eq!(controls(&valid, true).unwrap().0, &[1, 2, 3]);
         assert!(controls(&valid, false).is_err());
+        let mut foreign = records.clone();
+        let header = aligned(mem::size_of::<WSACMSGHDR>()).unwrap();
+        let h = WSACMSGHDR { cmsg_len: header + 3, cmsg_level: IPPROTO_IPV6 as i32, cmsg_type: IPV6_WFP_REDIRECT_RECORDS as i32 };
+        unsafe { ptr::write_unaligned(foreign.as_mut_ptr().cast::<WSACMSGHDR>(), h); }
+        assert!(controls(&[valid.as_slice(), &foreign].concat(), true).is_err());
         assert!(controls(&[valid.as_slice(), records.as_slice()].concat(), true).is_err());
         assert!(controls(&[valid.as_slice(), &[1]].concat(), true).is_err());
-        let header = aligned(mem::size_of::<WSACMSGHDR>()).unwrap();
         let truncated = [context.as_slice(), &records[..header + 2]].concat();
         assert!(controls(&truncated, true).is_err());
     }
