@@ -210,6 +210,7 @@ pub struct Editor {
     write_uncertain: bool,
     selected_record: usize,
     selected_field: usize,
+    compact_server_fields: bool,
     pub input: String,
     pub editing: bool,
     pub error: Option<String>,
@@ -281,6 +282,7 @@ impl Editor {
             write_uncertain: false,
             selected_record,
             selected_field: 0,
+            compact_server_fields: false,
             input: String::new(),
             editing: false,
             error: None,
@@ -1515,8 +1517,30 @@ impl Editor {
         }
     }
 
+    /// Simple presentation only: never collapse different listener addresses.
+    /// The common port edit changes both typed socket addresses atomically.
+    pub(crate) fn set_compact_server_fields(&mut self, compact: bool) {
+        if self.role == Role::Server && !self.editing {
+            self.compact_server_fields = compact;
+            self.selected_field = self.selected_field.min(self.field_count().saturating_sub(1));
+        }
+    }
+
+    pub(crate) fn compact_server_fields(&self) -> bool {
+        self.role == Role::Server && self.compact_server_fields
+    }
+
+    fn common_listener(&self) -> Option<std::net::SocketAddr> {
+        let Config::Server(doc) = &self.draft else { return None; };
+        let inbound = doc.server.inbounds.get(self.selected_record)?;
+        let h2 = inbound.h2_listen.parse::<std::net::SocketAddr>().ok()?;
+        let h3 = inbound.quic_listen.parse::<std::net::SocketAddr>().ok()?;
+        (h2 == h3).then_some(h2)
+    }
+
     pub fn field_count(&self) -> usize {
         match self.role {
+            Role::Server if self.compact_server_fields => if self.common_listener().is_some() { 2 } else { 1 },
             Role::Server => 3,
             Role::Client => 4,
         }
@@ -1576,6 +1600,7 @@ impl Editor {
 
     pub fn field_name(&self) -> String {
         let suffix = match self.role {
+            Role::Server if self.compact_server_fields && self.selected_field == 1 => "common_port",
             Role::Server => ["server_name", "h2_listen", "quic_listen"][self.selected_field],
             Role::Client => {
                 ["server", "server_name", "transport", "xhttp_mode"][self.selected_field]
@@ -1589,6 +1614,9 @@ impl Editor {
     }
 
     pub fn field_value(&self) -> String {
+        if self.compact_server_fields() && self.selected_field == 1 {
+            return self.common_listener().map_or_else(String::new, |address| address.port().to_string());
+        }
         match &self.draft {
             Config::Server(doc) => doc
                 .server
@@ -1622,6 +1650,7 @@ impl Editor {
     /// Never include token refs, TLS key refs, grants, or config file paths.
     pub(crate) fn workspace_fields(&self) -> Vec<(&'static str, String, bool)> {
         let labels: &[&str] = match self.role {
+            Role::Server if self.compact_server_fields => &["Адрес сервера", "Порт подключения"],
             Role::Server => &["TLS DNS", "H2 TCP", "H3 UDP"],
             Role::Client => &["Endpoint", "TLS SNI", "Transport", "XHTTP"],
         };
@@ -1631,6 +1660,11 @@ impl Editor {
                 .inbounds
                 .get(self.selected_record)
                 .map(|inbound| {
+                    if self.compact_server_fields {
+                        let mut fields = vec![inbound.server_name.clone()];
+                        if let Some(address) = self.common_listener() { fields.push(address.port().to_string()); }
+                        return fields;
+                    }
                     vec![
                         inbound.server_name.clone(),
                         inbound.h2_listen.clone(),
@@ -1720,7 +1754,7 @@ impl Editor {
 
     pub fn begin(&mut self) {
         if self.selected_reality() {
-            self.error = Some("Параметры REALITY защищены от обычной правки. Откройте F2 → REALITY: обслуживание для изменения с подтверждением доверия.".into());
+            self.error = Some("Параметры REALITY защищены. Используйте действия выбранного подключения для изменения доверия.".into());
             return;
         }
         if self.write_uncertain {
@@ -1795,6 +1829,8 @@ impl Editor {
         }
         let mut candidate = self.draft.clone();
         let field = self.field_name();
+        let compact = self.compact_server_fields();
+        let common = self.common_listener();
         match &mut candidate {
             Config::Server(doc) => {
                 let Some(inbound) = doc.server.inbounds.get_mut(self.selected_record) else {
@@ -1803,6 +1839,24 @@ impl Editor {
                 };
                 match self.selected_field {
                     0 => inbound.server_name.clone_from(&self.input),
+                    1 if compact => {
+                        let Some(mut address) = common else {
+                            self.error = Some("Раздельные адреса требуют расширенных настроек.".into());
+                            return false;
+                        };
+                        let Ok(port) = self.input.parse::<u16>() else {
+                            self.error = Some("Введите номер порта от 1 до 65535.".into());
+                            return false;
+                        };
+                        if port == 0 {
+                            self.error = Some("Введите номер порта от 1 до 65535.".into());
+                            return false;
+                        }
+                        address.set_port(port);
+                        let value = address.to_string();
+                        inbound.h2_listen.clone_from(&value);
+                        inbound.quic_listen = value;
+                    }
                     1 => inbound.h2_listen.clone_from(&self.input),
                     _ => inbound.quic_listen.clone_from(&self.input),
                 }
@@ -3396,6 +3450,39 @@ mod tests {
         editor.discard();
         assert!(!editor.dirty());
         assert_eq!(fs::read(&temp.0).unwrap(), source);
+    }
+
+    #[test]
+    fn common_server_port_edits_both_listeners_only_after_validation() {
+        let source = server_source();
+        let temp = Temp::write(&source);
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+        editor.set_compact_server_fields(true);
+        assert_eq!(editor.field_count(), 2);
+        editor.workspace_select_field(1);
+        assert_eq!(editor.field_value(), "443");
+        editor.begin();
+        editor.input = "0".into();
+        assert!(!editor.accept());
+        assert!(!editor.dirty());
+        editor.input = "8443".into();
+        assert!(editor.accept());
+        assert!(editor.dirty());
+        assert_eq!(fs::read_to_string(&temp.0).unwrap(), source);
+        editor.set_compact_server_fields(false);
+        let fields = editor.workspace_fields();
+        assert!(fields[1].1.ends_with(":8443") && fields[2].1.ends_with(":8443"));
+        editor.workspace_select_field(2);
+        editor.begin();
+        editor.input = "0.0.0.0:9443".into();
+        assert!(editor.accept());
+        editor.set_compact_server_fields(true);
+        assert_eq!(editor.field_count(), 1);
+        assert_eq!(editor.workspace_fields().len(), 1);
+        assert_eq!(editor.workspace_field_index(), 0);
+        editor.set_compact_server_fields(false);
+        assert_eq!(editor.workspace_fields()[2].1, "0.0.0.0:9443");
+        assert_eq!(fs::read_to_string(&temp.0).unwrap(), source);
     }
 
     #[test]

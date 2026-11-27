@@ -381,6 +381,7 @@ impl Form {
             if picker && g.stride >= 2 {
                 let style = label_style.bg(if selected { FOCUS } else { SURFACE });
                 let grant = matches!(field.label, "[x] Доступ выбран" | "[ ] Нет доступа");
+                let user = matches!(field.label, "Отключённый пользователь" | "Пользователь с доступом");
                 let primary = if grant {
                     format!(
                         "{marker}{} {}",
@@ -391,6 +392,8 @@ impl Form {
                         },
                         field.value
                     )
+                } else if user {
+                    format!("{marker}{}  {}", if selected { "●" } else { "○" }, field.value)
                 } else {
                     label
                 };
@@ -408,6 +411,8 @@ impl Form {
                                 } else {
                                     "Не выбран"
                                 }
+                            } else if user {
+                                field.label
                             } else {
                                 value
                             },
