@@ -147,6 +147,23 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
     #[tokio::test]
+    async fn partial_write_rechecks_before_remaining_bytes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (mut output, mut peer) = tokio::io::duplex(1);
+        let attempts = AtomicUsize::new(0);
+        let check = || {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 { Ok(()) }
+            else { Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied)) }
+        };
+        assert!(matches!(write_checked(&mut output, b"abc", &check).await,
+            Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied))));
+        drop(output);
+        let mut bytes = Vec::new();
+        peer.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"a");
+    }
+
+    #[tokio::test]
     async fn inspection_retains_prefix_on_timeout_and_leaves_tail() {
         let (mut app, mut proxy) = tokio::io::duplex(4096);
         let hello = tls::fixture("example.org");

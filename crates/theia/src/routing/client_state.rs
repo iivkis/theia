@@ -83,8 +83,13 @@ impl LocalPolicy {
         self.checkpoint == next.checkpoint && self.floor == next.floor && Instant::now() < self.deadline
     }
 
+    pub(super) fn matches_digest(&self, digest: [u8; 32]) -> bool {
+        self.checkpoint.digest == digest
+    }
+
+    #[cfg(test)]
     pub(super) fn valid(&self, digest: [u8; 32]) -> bool {
-        self.checkpoint.digest == digest && self.valid_current()
+        self.matches_digest(digest) && self.valid_current()
     }
 
     pub(super) fn valid_current(&self) -> bool {

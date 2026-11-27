@@ -70,6 +70,7 @@ pub(crate) struct Engine {
 
 struct UdpEvidence {
     key: Key,
+    lease: Lease,
     probe: UdpProbe,
     good: bool,
     expiry: std::time::Instant,
@@ -101,6 +102,7 @@ pub(crate) struct VerifiedUdp {
     pub(crate) strategy: UdpStrategy,
     engine: Arc<Engine>,
     key: Key,
+    lease: Lease,
     _admission: super::carrier_socket::Lease,
 }
 impl VerifiedUdp {
@@ -127,7 +129,7 @@ impl VerifiedUdp {
                 .socket
                 .local_addr()
                 .is_ok_and(|local| self.key.network.matches_local(local))
-            && self.engine.cached_udp(&self.key, self.strategy.probe()) == Some(true))
+            && self.engine.udp_current(&self.key, self.strategy.probe(), &self.lease))
     }
     #[cfg(any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64")))]
     pub(crate) fn quic_batch(&self, first: &[u8]) -> Option<Vec<Vec<u8>>> {
@@ -142,7 +144,7 @@ impl VerifiedUdp {
 
     pub(crate) fn failed(&self) {
         self.engine
-            .remember_udp(self.key.clone(), self.strategy.probe(), false);
+            .fail_udp(&self.key, self.strategy.probe(), &self.lease);
     }
 
     #[cfg(test)]
@@ -153,6 +155,7 @@ impl VerifiedUdp {
         Self {
             socket,
             strategy: UdpStrategy::Quic(crate::quic_core::wire::Version::V1),
+            lease: Lease::new(),
             _admission: Default::default(),
             engine,
             key: Key {
@@ -246,7 +249,7 @@ impl Engine {
             self.policy_epoch.fetch_add(1, Ordering::AcqRel);
             return None;
         }
-        policy.as_ref().filter(|lease| lease.valid(digest))?;
+        policy.as_ref().filter(|lease| lease.matches_digest(digest))?;
         Some(self.policy_epoch.load(Ordering::Acquire))
     }
 
@@ -287,33 +290,47 @@ impl Engine {
         (hash.finish() as usize) % self.probe_slots.len()
     }
 
-    fn cached_udp(&self, key: &Key, probe: UdpProbe) -> Option<bool> {
+    fn udp_evidence(&self, key: &Key, probe: UdpProbe) -> Option<(bool, Lease)> {
         let mut cache = self.udp_cache.lock().ok()?;
         cache.retain(|entry| entry.expiry > std::time::Instant::now());
-        cache
-            .iter()
-            .find(|entry| &entry.key == key && entry.probe == probe)
-            .map(|entry| entry.good)
+        cache.iter().find(|entry| &entry.key == key && entry.probe == probe)
+            .map(|entry| (entry.good, entry.lease.clone()))
     }
 
-    fn remember_udp(&self, key: Key, probe: UdpProbe, good: bool) {
-        if !self.key_live(&key) {
-            return;
-        }
-        if let Ok(mut cache) = self.udp_cache.lock() {
-            cache.retain(|entry| {
-                (entry.key != key || entry.probe != probe)
-                    && entry.expiry > std::time::Instant::now()
-            });
-            if cache.len() >= 128 {
-                cache.pop_front();
-            }
-            cache.push_back(UdpEvidence {
-                key,
-                probe,
-                good,
-                expiry: std::time::Instant::now() + Duration::from_secs(if good { 60 } else { 20 }),
-            });
+    fn cached_udp(&self, key: &Key, probe: UdpProbe) -> Option<bool> {
+        self.udp_evidence(key, probe).map(|(good, _)| good)
+    }
+
+    fn udp_current(&self, key: &Key, probe: UdpProbe, lease: &Lease) -> bool {
+        self.udp_evidence(key, probe).is_some_and(|(good, current)| good && current.same(lease))
+    }
+
+    fn remember_udp(&self, key: Key, probe: UdpProbe, good: bool) -> Option<Lease> {
+        if !self.key_live(&key) { return None; }
+        let mut cache = self.udp_cache.lock().ok()?;
+        cache.retain(|entry| {
+            (entry.key != key || entry.probe != probe)
+                && entry.expiry > std::time::Instant::now()
+        });
+        if cache.len() >= 128 { cache.pop_front(); }
+        let lease = Lease::new();
+        cache.push_back(UdpEvidence {
+            key, probe, good, lease: lease.clone(),
+            expiry: std::time::Instant::now() + Duration::from_secs(if good { 60 } else { 20 }),
+        });
+        Some(lease)
+    }
+
+    fn fail_udp(&self, key: &Key, probe: UdpProbe, lease: &Lease) {
+        if !self.key_live(key) { return; }
+        let Ok(mut cache) = self.udp_cache.lock() else { return };
+        let now = std::time::Instant::now();
+        cache.retain(|entry| entry.expiry > now);
+        if let Some(entry) = cache.iter_mut().find(|entry| {
+            &entry.key == key && entry.probe == probe && entry.good && entry.lease.same(lease)
+        }) {
+            entry.good = false;
+            entry.expiry = now + Duration::from_secs(20);
         }
     }
 
@@ -371,9 +388,9 @@ impl Engine {
                 if !self.key_live(&key) {
                     continue;
                 }
-                let good = if let Some(good) = self.cached_udp(&key, probe) {
+                let (good, lease) = if let Some(evidence) = self.udp_evidence(&key, probe) {
                     crate::traffic::dpi_cache_hit();
-                    good
+                    evidence
                 } else {
                     let _permit = self.probes.try_acquire().ok()?;
                     let config = tokio::task::spawn_blocking(tls::native_config)
@@ -388,15 +405,16 @@ impl Engine {
                     .flatten()
                     .is_some();
                     crate::traffic::dpi_probe(good);
-                    self.remember_udp(key.clone(), probe, good);
-                    good
+                    let lease = self.remember_udp(key.clone(), probe, good)?;
+                    (good, lease)
                 };
                 drop(guard);
-                if !good || !self.key_live(&key) {
+                if !good || !self.key_live(&key) || !self.udp_current(&key, probe, &lease) {
                     continue;
                 }
                 if let Some((socket, admission)) = scoped_udp(address, network).await {
                     if self.key_live(&key)
+                        && self.udp_current(&key, probe, &lease)
                         && socket
                             .local_addr()
                             .is_ok_and(|local| network.matches_local(local))
@@ -404,13 +422,13 @@ impl Engine {
                         return Some(VerifiedUdp {
                             socket,
                             strategy: UdpStrategy::Quic(version),
+                            lease,
                             _admission: admission,
                             engine: self.clone(),
                             key,
                         });
                     }
                 }
-                self.remember_udp(key, probe, false);
             }
             None
         })
@@ -493,15 +511,16 @@ impl Engine {
                 if !self.stun_enabled() || !self.key_live(&key) {
                     continue;
                 }
-                self.remember_udp(key.clone(), UdpProbe::Stun, selected.is_some());
+                let lease = self.remember_udp(key.clone(), UdpProbe::Stun, selected.is_some())?;
                 let Some(strategy) = selected else {
                     continue;
                 };
                 if let Some((socket, admission)) = scoped_udp(address, network).await {
-                    if self.stun_enabled() && self.key_live(&key) {
+                    if self.stun_enabled() && self.key_live(&key) && self.udp_current(&key, UdpProbe::Stun, &lease) {
                         return Some(VerifiedUdp {
                             socket,
                             strategy: UdpStrategy::StunBinding(strategy),
+                            lease,
                             _admission: admission,
                             engine: self.clone(),
                             key,
@@ -973,6 +992,7 @@ mod tests {
         let expiry = std::time::Instant::now() + Duration::from_secs(60);
         engine.udp_cache.lock().unwrap().push_back(UdpEvidence {
             key: key.clone(),
+            lease: Lease::new(),
             probe: UdpProbe::Quic(Version::V1),
             good: true,
             expiry,
@@ -985,6 +1005,7 @@ mod tests {
         assert_eq!(engine.cached_udp(&key, UdpProbe::Stun), None);
         engine.udp_cache.lock().unwrap().push_back(UdpEvidence {
             key: key.clone(),
+            lease: Lease::new(),
             probe: UdpProbe::Quic(Version::V2),
             good: false,
             expiry,
@@ -1061,28 +1082,33 @@ mod tests {
             network,
         };
         let (socket, admission) = scoped_udp(address, network).await.unwrap();
-        let verified = VerifiedUdp {
+        let mut verified = VerifiedUdp {
             socket,
+            lease: Lease::new(),
             _admission: admission,
             strategy: UdpStrategy::StunBinding(udp::BindingStrategy::Fingerprint),
             engine: engine.clone(),
             key: key.clone(),
         };
         assert!(!verified.admissible().unwrap());
-        engine.remember_udp(key.clone(), UdpProbe::Stun, true);
+        verified.lease = engine.remember_udp(key.clone(), UdpProbe::Stun, true).unwrap();
         assert!(verified.admissible().unwrap());
         engine.set_stun_enabled(false);
         assert!(!verified.admissible().unwrap());
         engine.set_stun_enabled(true);
+        let old = verified.lease.clone();
+        verified.lease = engine.remember_udp(key.clone(), UdpProbe::Stun, true).unwrap();
+        engine.fail_udp(&key, UdpProbe::Stun, &old);
+        assert!(verified.admissible().unwrap(), "late failure must not invalidate fresh UDP evidence");
         verified.failed();
         assert_eq!(engine.cached_udp(&key, UdpProbe::Stun), Some(false));
         assert!(!verified.admissible().unwrap());
-        engine.remember_udp(key.clone(), UdpProbe::Quic(Version::V2), true);
+        let _ = engine.remember_udp(key.clone(), UdpProbe::Quic(Version::V2), true);
         assert_eq!(engine.cached_udp(&key, UdpProbe::Quic(Version::V1)), None);
         for i in 0..129 {
             let mut other = key.clone();
             other.name = format!("host{i}.example.org");
-            engine.remember_udp(other, UdpProbe::Stun, true);
+            let _ = engine.remember_udp(other, UdpProbe::Stun, true);
         }
         assert_eq!(engine.udp_cache.lock().unwrap().len(), 128);
         assert_eq!(engine.cached_udp(&key, UdpProbe::Stun), None);
