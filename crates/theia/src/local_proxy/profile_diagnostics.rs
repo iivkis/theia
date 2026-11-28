@@ -1103,6 +1103,8 @@ async fn udp_https(
         let app = async {
             let server_name = rustls::pki_types::ServerName::try_from(name.to_owned()).map_err(|_| ClientError::Configuration)?;
             let mut session = Box::pin(handshake_udp::connect_diagnostic_socket(client, peer, tls, server_name, Version::V1)).await.map_err(|error| {
+                #[cfg(test)]
+                eprintln!("diagnostic loopback handshake: {error:?}");
                 match error {
                     handshake_udp::Error::Timeout => ClientError::Timeout,
                     handshake_udp::Error::Scope => ClientError::Configuration,

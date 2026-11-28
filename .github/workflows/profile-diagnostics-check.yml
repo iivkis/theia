@@ -14,15 +14,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: e1b24c9f0a2230f1bba72ec977a07f40bf447f59
+          ref: a0a6d286f4c8797b9e14c1df45d108eef83ebdbe
           persist-credentials: false
       - name: Verify tested source
         shell: bash
-        run: test "$(git rev-parse HEAD)" = "e1b24c9f0a2230f1bba72ec977a07f40bf447f59"
+        run: test "$(git rev-parse HEAD)" = "a0a6d286f4c8797b9e14c1df45d108eef83ebdbe"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: false
+          save-if: true
       - name: Authenticated diagnostic consent and UDP relay regression
         run: |
           cargo test -p theia --lib --locked real_local_proxy_modes_validate_credentials_and_relay_over_both_transports -- --nocapture
