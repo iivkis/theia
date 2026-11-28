@@ -463,7 +463,10 @@ impl Plan {
         }
         // This is the existing per-user System Proxy owner reservation.
         // No apply() call: diagnostics must not change any OS settings.
+        #[cfg(windows)]
         let _owner = reserve()?;
+        #[cfg(not(windows))]
+        reserve()?;
         let candidate = super::authority::Candidate::read(&self.saved.path)?;
         if candidate.digest() != self.policy.digest() || !self.files_current() {
             return Err(invalid(
