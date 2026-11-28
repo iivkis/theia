@@ -1,6 +1,6 @@
 # Theia TUI visual review
 
-Source: 7cec238cc6661a94a88ea6b89d9cdbfc532776bb
+Source: 880714448065a9f32ea2553c16dcf581b504f676
 
 Linux · 120×40 · actual production renderer cells. State fixtures and unavailable actions are not runtime success.
 
@@ -385,6 +385,22 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## server-routing-edit
 
 ![server-routing-edit](server-routing-edit.png)
+
+## server-routing-geodata-added
+
+![server-routing-geodata-added](server-routing-geodata-added.png)
+
+## server-routing-geodata-empty
+
+![server-routing-geodata-empty](server-routing-geodata-empty.png)
+
+## server-routing-geodata-marked
+
+![server-routing-geodata-marked](server-routing-geodata-marked.png)
+
+## server-routing-geodata-missing
+
+![server-routing-geodata-missing](server-routing-geodata-missing.png)
 
 ## server-routing-geodata
 

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "source_sha": "7cec238cc6661a94a88ea6b89d9cdbfc532776bb",
+  "source_sha": "880714448065a9f32ea2553c16dcf581b504f676",
   "platform": "linux",
   "columns": 120,
   "rows": 40,
@@ -36,7 +36,7 @@
     {
       "scenario": "client-action-new-profile",
       "file": "client-action-new-profile.png",
-      "sha256": "aa809b2af932e7b10f845fbb863fd9b58e1d8197ddbe9e51b1e8efa1ccb9e953",
+      "sha256": "28f84d61cb0ffb956959b5a142bd1bc4a87894eb2da2da3bd4f7df34d0620ec2",
       "state_fixture": false
     },
     {
@@ -558,7 +558,7 @@
     {
       "scenario": "server-reality-status-technical",
       "file": "server-reality-status-technical.png",
-      "sha256": "56e5fb558f5506023e916a20259837db5674907de28f25b58fa7a273b80c8f09",
+      "sha256": "c49c5eb02052b78342e9ebde903f08c03ec36ba104231b273745d6708e46df61",
       "state_fixture": false
     },
     {
@@ -576,7 +576,31 @@
     {
       "scenario": "server-routing-edit",
       "file": "server-routing-edit.png",
-      "sha256": "0a323a3679b8019e73ab1a2c5633bb70bd4da1f338ceee0d0e663f046e92677a",
+      "sha256": "d63ac80a65f522b7f1183e5d13df84d0dec0d334da31468e59fcbbfece393a18",
+      "state_fixture": false
+    },
+    {
+      "scenario": "server-routing-geodata-added",
+      "file": "server-routing-geodata-added.png",
+      "sha256": "84c4feafff51075b373ad90a26cb0a2fd8d07c327d9f6e0e1ae6dd7062671e17",
+      "state_fixture": false
+    },
+    {
+      "scenario": "server-routing-geodata-empty",
+      "file": "server-routing-geodata-empty.png",
+      "sha256": "3f2d6477c9575a1461f84a6dd5324e96a23e0411c1391274e20d5c68aa97a5d6",
+      "state_fixture": false
+    },
+    {
+      "scenario": "server-routing-geodata-marked",
+      "file": "server-routing-geodata-marked.png",
+      "sha256": "c4d88e1398695f496ed5ccc63eb9171959b58e3e6fd7d3e8cb3002290c899c78",
+      "state_fixture": false
+    },
+    {
+      "scenario": "server-routing-geodata-missing",
+      "file": "server-routing-geodata-missing.png",
+      "sha256": "0f2dc9e9846c03c90ab988e4feba3cd907f039bdb4bf1020527c66ed4d904e3a",
       "state_fixture": false
     },
     {
@@ -588,13 +612,13 @@
     {
       "scenario": "server-routing-geoip-picker",
       "file": "server-routing-geoip-picker.png",
-      "sha256": "d14ab720991d28588f5ce92825a4b44269936e8b7be45486804d6113c61f35d7",
+      "sha256": "a651c231ebf2e15f962b57459c2b94e10f92ce5df8ecd904dbb24ef743893f4d",
       "state_fixture": false
     },
     {
       "scenario": "server-routing-geosite-picker",
       "file": "server-routing-geosite-picker.png",
-      "sha256": "b9332de67ac8b8240ae9b90abd999c8f535d62d127caf5aa069a68271e170404",
+      "sha256": "53f408285ffe63bdee904019fb8fbd7a1eb28de38012301f57be9046bcf107a7",
       "state_fixture": false
     },
     {
@@ -924,7 +948,7 @@
     {
       "scenario": "state-reality-step6-save-inspection",
       "file": "state-reality-step6-save-inspection.png",
-      "sha256": "21ec5df2d2043069e15c6b003242fa178d4e75f5df75149e6f33c7eb55684f58",
+      "sha256": "276ae9933618cad1c440d5859adf8ece8a342944518310f1cdf5c4433354892e",
       "state_fixture": true
     },
     {
