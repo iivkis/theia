@@ -252,7 +252,9 @@ fn parse(message: &[u8], expected: &str, kind: Kind) -> Result<Answer, DnsError>
         current = next;
         chain.push(current.clone());
     }
-    if !aliases.is_empty() {
+    // Removing an alias while traversing it must not hide a cycle that
+    // returns to an already consumed owner (including a self-reference).
+    if seen.contains(&current) || !aliases.is_empty() {
         return Err(DnsError::Malformed);
     }
     let records = addresses.remove(&current).unwrap_or_default();
@@ -652,6 +654,10 @@ mod tests {
     fn cname_cycle_and_unrelated_answer_fail_closed() {
         let mut bytes = response("example.com", Kind::A, 1);
         rr(&mut bytes, &[0xc0, 12], 5, 10, &[0xc0, 12]);
+        assert_eq!(parse(&bytes, "example.com", Kind::A), Err(DnsError::Malformed));
+        let mut bytes = response("example.com", Kind::A, 2);
+        rr(&mut bytes, &[0xc0, 12], 5, 10, b"\x05alias\x07example\x03com\x00");
+        rr(&mut bytes, b"\x05alias\x07example\x03com\x00", 5, 10, &[0xc0, 12]);
         assert_eq!(parse(&bytes, "example.com", Kind::A), Err(DnsError::Malformed));
         let mut bytes = response("example.com", Kind::A, 1);
         rr(&mut bytes, b"\x05other\x03com\x00", 1, 10, &[1, 1, 1, 1]);
