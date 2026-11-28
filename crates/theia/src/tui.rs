@@ -10627,7 +10627,7 @@ mod tests {
             PreviewScope::PassiveOnly,
         )));
         click_form_field(&mut ui, &mut model, area, 1);
-        assert_eq!(ui.domain.as_ref().unwrap().domain(), Some("samsung.com"));
+        assert_eq!(ui.domain.as_ref().unwrap().domain(), Some(crate::camouflage_discovery::POPULAR_HTTPS_DOMAINS[1]));
         assert_eq!(ui.domain.as_ref().unwrap().selected_count(), 0);
         assert!(!ui.domain.as_ref().unwrap().is_running());
         ui.update(&mut model, press(KeyCode::Char('m')));

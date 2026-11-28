@@ -891,7 +891,7 @@ mod tests {
         panel.confirm_probes_and_start();
         assert!(!panel.is_running());
         panel.next();
-        assert_eq!(panel.domain(), Some("samsung.com"));
+        assert_eq!(panel.domain(), Some(POPULAR_HTTPS_DOMAINS[1]));
         panel.previous();
         assert_eq!(panel.domain(), Some("google.com"));
         assert!(panel
@@ -999,7 +999,7 @@ mod tests {
         assert_eq!(panel.selected_count(), 0);
         assert!(panel.addresses.is_empty());
         panel.next();
-        assert_eq!(panel.domain(), Some("samsung.com"));
+        assert_eq!(panel.domain(), Some(POPULAR_HTTPS_DOMAINS[1]));
         panel.ask_confirmation();
         assert!(panel.is_dns_confirming());
     }
