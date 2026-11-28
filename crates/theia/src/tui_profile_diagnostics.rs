@@ -171,18 +171,18 @@ impl Panel {
             self.input.push_str(input);
         }
     }
+    fn policy_blocked(&self, domain: &str) -> bool {
+        self.checks.iter().any(|check| {
+            check.domain.as_deref() == Some(domain)
+                && matches!(check.outcome, Outcome::Route(crate::routing::Action::Blocked))
+        })
+    }
+
     fn failed_domains(&self) -> Vec<String> {
         self.domains
             .iter()
             .filter(|domain| {
-                let blocked = self.checks.iter().any(|check| {
-                    check.domain.as_ref() == Some(*domain)
-                        && matches!(
-                            check.outcome,
-                            Outcome::Route(crate::routing::Action::Blocked)
-                        )
-                });
-                !blocked
+                !self.policy_blocked(domain)
                     && (!self.finished.contains(domain)
                         || self
                             .checks
@@ -205,8 +205,8 @@ impl Panel {
                 item('d', "Сводка / подробности"),
             ],
             Phase::Confirm => vec![
-                item('y', "Начать проверку указанных ресурсов"),
                 item('c', "Отменить"),
+                item('y', "Начать проверку указанных ресурсов"),
             ],
             Phase::Done => {
                 let mut actions = vec![
@@ -408,7 +408,7 @@ impl Panel {
             .map(|check| check.line(false))
             .collect::<Vec<_>>()
             .join("\n");
-        let body = format!("Профиль: {} · System Proxy\n{}\n{}\n{}\nPgUp/PgDn — прокрутка · Esc — назад/остановить", self.id, self.lead(), general, self.error);
+        let body = format!("Профиль: {}\n{}\n{}\n{}\nPgUp/PgDn — прокрутка · Esc — назад/остановить", self.id, self.lead(), general, self.error);
         let table_mode = !self.details
             && matches!(self.phase, Phase::Running | Phase::Done)
             && !self.domains.is_empty()
@@ -431,6 +431,18 @@ impl Panel {
                 .iter()
                 .skip(usize::from(self.scroll).min(self.domains.len().saturating_sub(1)))
                 .map(|domain| {
+                    if self.policy_blocked(domain) {
+                        return Row::new(vec![
+                            domain.clone(),
+                            "Блок".into(),
+                            "—".into(),
+                            "—".into(),
+                            "—".into(),
+                            "—".into(),
+                            "—".into(),
+                        ])
+                        .style(Style::default().fg(tui_widgets::WARNING));
+                    }
                     Row::new(vec![
                         domain.clone(),
                         self.cell(domain, |k| matches!(k, CheckKind::Https("штатный"))),
@@ -458,7 +470,7 @@ impl Panel {
                     Row::new(["Ресурс", "Авто", "H2", "H3", "UDP авт", "UDP/H2", "UDP/H3"])
                         .style(Style::default().fg(tui_widgets::MUTED)),
                 )
-                .block(tui_widgets::section("HTTP-коды · — не проверено", false)),
+                .block(tui_widgets::section("HTTP-коды · Блок: запрещено политикой · — не проверено", false)),
                 regions[1],
             );
         } else {
@@ -580,7 +592,8 @@ mod tests {
         assert!(panel.phase == Phase::Confirm);
         assert!(confirmation.try_recv().is_err());
         assert!(screen(&panel, 100, 25).contains("discord.com"));
-        panel.key(key(KeyCode::Enter));
+        assert_eq!(panel.actions()[0].key, 'c');
+        panel.key(key(KeyCode::Char('y')));
         assert_eq!(confirmation.try_recv(), Ok(()));
         assert!(panel.phase == Phase::Running);
         tx.send(Event::Check(Check {
@@ -659,6 +672,12 @@ mod tests {
             outcome: Outcome::Route(crate::routing::Action::Blocked),
         });
         assert_eq!(panel.failed_domains(), vec!["failed.test"]);
+        assert!(panel.policy_blocked("blocked.test"));
+        assert!(!panel.policy_blocked("failed.test"));
+        panel.phase = Phase::Done;
+        let view = screen(&panel, 100, 25);
+        assert!(view.contains("Блок"));
+        assert!(view.contains("запрещено политикой"));
         assert!(!panel.checks[0].line(true).contains("failed.test"));
     }
 }
