@@ -20,7 +20,7 @@ use std::{
 
 fn column_label(id: &str) -> &str {
     match id {
-        "direct" => "Direct",
+        "direct" => "Прямой",
         "tcp_header" => "Header",
         "tcp_middle" => "Middle",
         "tcp_balanced" => "Balanced",
@@ -97,6 +97,23 @@ fn status_long(value: CellStatus) -> &'static str {
         CellStatus::Cancelled => "Отменено",
     }
 }
+fn cell_explanation(cell: &CellResult) -> &'static str {
+    if cell.stale { return "Условия изменились. Этот результат больше не актуален; нужна новая проверка."; }
+    match cell.status {
+        CellStatus::Available => if cell.strategy_id == "direct" { "Цель ответила напрямую. Для этой проверки Anti-DPI не требовался." } else { "Цель ответила при проверке стратегии. Это не гарантия обхода DPI." },
+        CellStatus::Redirect => "Цель перенаправила запрос. Новый адрес не проверялся.",
+        CellStatus::HttpError => "Сервер ответил ошибкой или ограничением; содержимое не подтверждено.",
+        CellStatus::Unavailable => "Ответ не получен или проверка завершилась ошибкой. Причина блокировки не доказана.",
+        CellStatus::DnsError => "Не удалось получить адрес сайта через защищённый DNS. Проверьте DNS и сеть.",
+        CellStatus::SecurityError => "Проверка безопасности не пройдена. Не отключайте проверку сертификатов.",
+        CellStatus::PolicyDenied => "Действующие правила или ограничения безопасности запретили проверку.",
+        CellStatus::Unsupported => "Этот способ пока недоступен. Проверка не доказывает недоступность сайта.",
+        CellStatus::NotApplicable => "Этот способ не подходит для данной цели.",
+        CellStatus::NotChecked => "Проверка не выполнена; вывод о доступности сделать нельзя.",
+        CellStatus::Cancelled => "Проверка отменена; вывод о доступности сделать нельзя.",
+    }
+}
+
 fn cell_color(cell: Option<&CellResult>) -> ratatui::style::Color {
     match cell {
         Some(c) if c.stale => MUTED,
@@ -172,18 +189,18 @@ impl Draft {
                 "Anti-DPI помогает проверять доступность сайтов и применять принятые способы изменения трафика.\nРаботает без VPS и ключей. Сейчас стратегии изменения трафика ожидают приёмки.\n\nВыберите способ настройки. Никаких сетевых запросов или изменений Windows пока не будет.".into(),
                 vec![item('1', "Рекомендуемая · выбрать нужные сайты"), item('2', "Ручная · настроить правила позднее")]),
             SetupStep::Domains => ("Шаг 2 из 5 · Какие сайты вам нужны?",
-                format!("Укажите только сайты, для которых хотите использовать Anti-DPI.\nМожно отметить несколько сайтов из встроенного списка или ввести свои.\nОстальные сайты не получают правило Anti-DPI автоматически.\n\nВыбрано: {domains}. Пока это только черновик."),
+                format!("Укажите сайты, для которых хотите использовать Anti-DPI. Остальные не получат это правило.\n\nВыбрано: {domains}\n{}\n\nПока это только черновик. Для продолжения нужен хотя бы один сайт.", if self.values[4].is_empty() { "Пока ничего не выбрано" } else { &self.values[4] }),
                 vec![item('1', "Выбрать сайты из каталога"), item('2', "Ввести свои сайты"), item('3', "Далее · подтвердить выбранные сайты")]),
             SetupStep::Settings => ("Настройки · Что изменить?",
                 format!("DNS: {}\nПрямой выход: {} · Anti-DPI: {} · STUN: {}\n\nВыберите только то, что хотите изменить. Правила сайтов и адреса локальных прокси сохраняются без изменений.", if self.values[0].is_empty() { "не настроен" } else { &self.values[0] }, yes(self.flags[0]), yes(self.flags[1]), yes(self.flags[2])),
                 vec![item('1', "Выбрать защищённый DNS"), item('2', "Изменить разрешения"), item('3', "Расширенные настройки · адреса прокси, STUN")]),
-            SetupStep::Dns => (if self.first_run() { "Шаг 3 из 5 · Кто будет определять адреса сайтов?" } else { "Настройки · Защищённый DNS" },
+            SetupStep::Dns => (if self.first_run() { if self.flags[3] { "Шаг 3 из 5 · Выберите DNS" } else { "Шаг 2 из 4 · Выберите DNS" } } else { "Настройки · Защищённый DNS" },
                 "Защищённый DNS получает адреса сайтов по шифрованному соединению.\nВыберите поставщика самостоятельно: он сможет видеть ваши DNS-запросы и публичный IP.\nCloudflare — обычное разрешение имён; Quad9 фильтрует известные вредоносные домены.\nНи один вариант не гарантирует доступность сайтов. Пока соединение не проверялось.\nБез DNS доменные операции недоступны; системный DNS не используется как запасной.".into(),
-                vec![item('1', "Cloudflare · 1.1.1.1"), item('2', "Quad9 · 9.9.9.9"), item('3', "Другой DNS · ввести параметры"), item('4', "Настроить позднее · без DNS")]),
-            SetupStep::Direct => (if self.first_run() { "Шаг 4 из 5 · Разрешить выход в интернет?" } else { "Разрешения 1 из 2 · Выход в интернет" },
+                vec![item('1', "Cloudflare · обычный DNS без фильтра вредоносных сайтов"), item('2', "Quad9 · с фильтром известных вредоносных сайтов"), item('3', "Другой DNS · ввести параметры"), item('4', "Без DNS · подключение пока недоступно")]),
+            SetupStep::Direct => (if self.first_run() { if self.flags[3] { "Шаг 4 из 5 · Разрешить выход в интернет?" } else { "Шаг 3 из 4 · Разрешить выход в интернет?" } } else { "Разрешения 1 из 2 · Выход в интернет" },
                 "Чтобы проверить сайты или подключаться к ним напрямую, требуется ваше разрешение.\nDNS-провайдер и сайты могут видеть ваш публичный IP. Anti-DPI не является VPN.\nЕсли не разрешить прямой выход, рабочий трафик не будет отправляться.\nЭто не запускает подключение. Разрешение можно изменить в настройках.".into(),
                 vec![item('1', "Пока не разрешать"), item('2', "Разрешить прямое подключение")]),
-            SetupStep::Modify => (if self.first_run() { "Шаг 5 из 5 · Разрешить Anti-DPI?" } else { "Разрешения 2 из 2 · Anti-DPI" },
+            SetupStep::Modify => (if self.first_run() { if self.flags[3] { "Шаг 5 из 5 · Разрешить Anti-DPI?" } else { "Шаг 4 из 4 · Разрешить Anti-DPI?" } } else { "Разрешения 2 из 2 · Anti-DPI" },
                 "Разрешить изменение трафика только для сайтов, указанных в правилах.\nПока стратегии не приняты, это разрешение не включает работающий обход.\nПри невозможности применить Anti-DPI соединение блокируется, а не отправляется напрямую.\nSTUN не включается этим шагом. Его отдельное разрешение доступно в расширенных настройках.".into(),
                 vec![item('1', "Пока не разрешать · Anti-DPI не активен"), item('2', "Разрешить принятые стратегии Anti-DPI")]),
             SetupStep::DomainInput | SetupStep::CustomDns | SetupStep::Advanced => ("", String::new(), Vec::new()),
@@ -214,12 +231,14 @@ impl Draft {
 
     fn render_wizard(&self, frame: &mut Frame<'_>, area: Rect) {
         if matches!(self.step, SetupStep::DomainInput | SetupStep::CustomDns) {
-            self.wizard_form().render(frame, area, if self.step == SetupStep::DomainInput { "Шаг 2 из 5 · Свои сайты" } else if self.first_run() { "Шаг 3 из 5 · Другой DNS" } else { "Настройки · Другой DNS" });
+            self.wizard_form().render(frame, area, if self.step == SetupStep::DomainInput { "Шаг 2 из 5 · Свои сайты" } else if self.first_run() { if self.flags[3] { "Шаг 3 из 5 · Другой DNS" } else { "Шаг 2 из 4 · Другой DNS" } } else { "Настройки · Другой DNS" });
             return;
         }
         let (title, mut text, items) = self.wizard_choices();
         if !self.error.is_empty() { text.push_str("\n\n"); text.push_str(&self.error); }
-        let [content, controls] = tui_widgets::action_layout_rows(area, items.len(), 10).unwrap_or([area, Rect::new(area.x, area.bottom(), area.width, 0)]);
+        let width = usize::from(area.width.saturating_sub(4).max(1));
+        let rows = text.lines().map(|line| line.chars().count().div_ceil(width).max(1)).sum::<usize>() + 2;
+        let [content, controls] = tui_widgets::action_layout_rows(area, items.len(), rows).unwrap_or([area, Rect::new(area.x, area.bottom(), area.width, 0)]);
         super::panel(frame, content, title, &text, true);
         Actions { items: &items, selected: self.choice }.render_with_focus(frame, controls, true);
     }
@@ -276,6 +295,12 @@ impl Draft {
         next.prepare().map_err(|e| e.to_string())?;
         Ok(next)
     }
+}
+
+fn plain_summary(doc: &Document) -> String {
+    let local = &doc.anti_dpi;
+    let modify = local.rules.iter().filter(|r| r.action == crate::routing::Action::DirectDpi).count();
+    format!("Что будет после сохранения?\n• Настройки записаны на диск только после подтверждения.\n• Для работы нужно отдельно применить правила и подключить прокси.\n• Правил Anti-DPI: {modify}. Выход в интернет: {}. Anti-DPI: {}.\n• DNS: {}. Публичный IP виден получателям при выходе в сеть.\n• Если Anti-DPI не сработает, соответствующее соединение будет заблокировано.\n\nТочные параметры и порядок правил:", yes(local.consent.direct_egress), yes(local.consent.direct_dpi), local.resolver.as_ref().map_or("не настроен", |r| r.hostname.as_str()))
 }
 
 fn policy_text(doc: &Document) -> String {
@@ -436,6 +461,8 @@ struct Panel {
     catalog: Catalog,
     selected: BTreeSet<String>,
     results: BTreeMap<(String, &'static str), CellResult>,
+    report_only: bool,
+    report_hosts: BTreeSet<String>,
     row: usize,
     offset: usize,
     filter: String,
@@ -493,7 +520,7 @@ impl Panel {
                 .map_err(|_| TuiError::Configuration("invalid embedded standalone example"))?, None))
         } else { None };
         Ok(Self { path, overlay_path, overlay, overlay_bytes, catalog, selected: BTreeSet::new(),
-            results: BTreeMap::new(), row: 0, offset: 0, filter: String::new(), editing: None,
+            results: BTreeMap::new(), report_only: false, report_hosts: BTreeSet::new(), row: 0, offset: 0, filter: String::new(), editing: None,
             review: None, review_scroll: 0, worker: None, routing: None,
             #[cfg(windows)]
             session: None,
@@ -512,7 +539,8 @@ impl Panel {
     }
 
     fn visible(&self) -> Vec<&crate::anti_dpi::catalog::Entry> {
-        self.catalog.entries().iter().filter(|e| e.hostname.contains(&self.filter)).collect()
+        self.catalog.entries().iter().filter(|e| e.hostname.contains(&self.filter)
+            && (self.catalogue_draft.is_some() || !self.report_only || self.report_hosts.contains(&e.hostname))).collect()
     }
 
     fn set_overlay(&mut self, next: Overlay) {
@@ -1035,6 +1063,9 @@ impl Panel {
                         }
                         Review::Diagnostic(plan) => {
                             self.results.clear();
+                            self.report_hosts = self.selected.clone();
+                            self.report_only = true;
+                            self.filter.clear(); self.row = 0; self.offset = 0;
                             self.report_context = ReportContext::read(&self.path, self.overlay_bytes.clone());
                             #[cfg(windows)]
                             if let Some(session) = &self.session {
@@ -1190,6 +1221,10 @@ impl Panel {
                     }
                 } else { self.notice = "Сначала штатно отключите собственную сессию.".into(); }
             },
+            KeyCode::Char('v') if self.page == DIAGNOSTICS => {
+                if self.report_hosts.is_empty() { self.notice = "Сначала выберите сайты и запустите проверку.".into(); }
+                else { self.report_only = !self.report_only; self.filter.clear(); self.row = 0; self.offset = 0; }
+            }
             KeyCode::Char('/') if self.page == DIAGNOSTICS => self.editing = Some((false, self.filter.clone())),
             KeyCode::Char('i') if self.page == DIAGNOSTICS => self.editing = Some((true, String::new())),
             KeyCode::Up if self.page == DIAGNOSTICS => self.row = self.row.saturating_sub(1),
@@ -1274,6 +1309,7 @@ impl Panel {
         if self.draft.is_some() || self.catalogue_draft.is_some() || self.routing.as_ref().is_some_and(|(p, _, _)| p.settings != p.original || p.fields.is_some()) {
             return "Файл: черновик не сохранён · рабочая политика не заменена".into();
         }
+        if matches!(&self.review, Some(Review::Save(_, _))) { return "Файл: изменения ожидают подтверждения сохранения".into(); }
         let Some(document) = document else {
             return "Файл: отсутствует или не прошёл проверку".into();
         };
@@ -1362,7 +1398,7 @@ impl Panel {
     fn draw_setup_catalogue(&mut self, frame: &mut Frame<'_>, area: Rect) {
         use ratatui::widgets::Cell;
         let body = Layout::vertical([Constraint::Length(4), Constraint::Min(2), Constraint::Length(2)]).split(area);
-        let header = format!("Шаг 2 из 5 · Выберите сайты\nОтмечено: {} из 64 · Поиск: {}\nИсторический список OONI. Выбор не запускает проверку и не сохраняет правила.", self.selected.len(), if self.filter.is_empty() { "нет" } else { &self.filter });
+        let header = format!("Шаг 2 из 5 · Выберите сайты\nОтмечено в каталоге: {} из 64 · Поиск: {}\nИсторический список OONI. Выбор не запускает проверку и не сохраняет правила.", self.selected.len(), if self.filter.is_empty() { "нет" } else { &self.filter });
         frame.render_widget(Paragraph::new(header).style(Style::default().fg(TEXT)).wrap(Wrap { trim: true }), body[0]);
         let height = usize::from(body[1].height.saturating_sub(1)).max(1);
         let len = self.visible().len();
@@ -1372,7 +1408,7 @@ impl Panel {
         self.offset = self.offset.min(len.saturating_sub(1));
         let rows = self.visible().iter().enumerate().skip(self.offset).take(height).map(|(i, entry)| {
             let mark = if entry.excluded { "×" } else if self.selected.contains(&entry.hostname) { "✓" } else { "□" };
-            Row::new(vec![Cell::from(mark), Cell::from(entry.hostname.as_str()), Cell::from(if entry.excluded { "Исключён" } else { "Доступен для выбора" })])
+            Row::new(vec![Cell::from(mark), Cell::from(entry.hostname.as_str()), Cell::from(if entry.excluded { "Исключён" } else if self.selected.contains(&entry.hostname) { "Выбран" } else { "" })])
                 .style(Style::default().fg(if entry.excluded { MUTED } else { TEXT }).bg(if i == self.row { FOCUS } else { SURFACE }))
         }).collect::<Vec<_>>();
         frame.render_widget(Table::new(rows, [Constraint::Length(3), Constraint::Min(16), Constraint::Length(23)])
@@ -1383,7 +1419,8 @@ impl Panel {
     fn draw_diagnostics(&mut self, frame: &mut Frame<'_>, area: Rect) {
         use ratatui::widgets::Cell;
         let groups = ["TCP / HTTPS", "QUIC v1", "QUIC v2", "STUN"];
-        let counts = self.results.values().fold([0usize; 5], |mut acc, c| {
+        let cols = self.columns();
+        let counts = self.results.values().filter(|c| cols.contains(&Some(c.strategy_id))).fold([0usize; 5], |mut acc, c| {
             let i = if c.stale { 4 } else { match c.status {
                 CellStatus::Available => 0,
                 CellStatus::Unsupported | CellStatus::NotApplicable | CellStatus::NotChecked => 2,
@@ -1396,11 +1433,13 @@ impl Panel {
         let progress = self.worker.as_ref().map_or_else(
             || if self.results.is_empty() { "Ожидает запуска".into() } else { "Результаты последнего задания".into() },
             |w| format!("Выполняется: {}/{} ячеек", self.results.len(), w.total));
+        let view = if self.report_only { "Результаты · v: открыть каталог" } else { "Каталог · v: результаты" };
+        let hint = if self.worker.is_some() { "Esc — остановить проверку" } else if self.report_only { "F7 — объяснение выбранного результата; b — повторить неуспешные" } else { "Пробел — отметить сайт; Enter — проверить выбранные" };
         let header = format!(
-            "Каталог: {} · выбрано {}/64 · {} · поиск: {}\nИсторические данные OONI 2024, не текущие блокировки. Правила не меняются.\n{} · [ ] протоколы · ← → ячейка · F7 детали",
-            self.catalog.entries().len(), self.selected.len(), progress, if self.filter.is_empty() { "нет" } else { &self.filter }, groups[self.group]);
-        let header_h = if area.width < 90 { 5 } else { 4 };
-        let details_h = if area.height >= 20 { 5 } else { 2 };
+            "{view} · {progress}\nСайтов: {} · отмечено для следующей проверки {}/64 · поиск: {}\n{} · [ ] протокол · ← → ячейка\n{hint}",
+            self.visible().len(), self.selected.len(), if self.filter.is_empty() { "нет" } else { &self.filter }, groups[self.group]);
+        let header_h = if area.width < 90 { 7 } else { 5 };
+        let details_h = if area.height >= 20 { 7 } else { 3 };
         let body = Layout::vertical([Constraint::Length(header_h), Constraint::Min(2), Constraint::Length(details_h)]).split(area);
         frame.render_widget(Paragraph::new(header).style(Style::default().fg(MUTED)).wrap(Wrap { trim: true }), body[0]);
         let height = usize::from(body[1].height.saturating_sub(1)).max(1);
@@ -1409,7 +1448,6 @@ impl Panel {
         if self.row < self.offset { self.offset = self.row; }
         if self.row >= self.offset + height { self.offset = self.row + 1 - height; }
         self.offset = self.offset.min(visible_len.saturating_sub(1));
-        let cols = self.columns();
         // Keep the domain and focused strategy visible on small terminals;
         // expose every other strategy using the same left/right navigation.
         let max_cols = usize::from(body[1].width.saturating_sub(19) / 11).max(1);
@@ -1434,17 +1472,17 @@ impl Panel {
             Row::new(values).style(Style::default().fg(TEXT).bg(if index == self.row { FOCUS } else { SURFACE }))
         }).collect::<Vec<_>>();
         let widths = std::iter::once(Constraint::Min(16)).chain(window.iter().map(|_| Constraint::Length(10))).collect::<Vec<_>>();
-        let headers = std::iter::once("Домен").chain(window.iter().map(|id| id.map_or("Direct*", column_label))).collect::<Vec<_>>();
+        let headers = std::iter::once("Домен").chain(window.iter().map(|id| id.map_or("Прямой*", column_label))).collect::<Vec<_>>();
         frame.render_widget(Table::new(rows, widths).header(Row::new(headers).style(Style::default().fg(ACCENT))), body[1]);
         let selected = self.visible().get(self.row).map(|entry| {
             let source = entry.provenance.as_ref().map_or_else(|| "Свой домен; нет исторического доказательства".into(),
                 |p| format!("OONI · {} · сетей {}", p.last_confirmed_day, p.confirmed_networks));
             format!("{} · {source}", entry.hostname)
         }).unwrap_or_else(|| "Нет совпадений".into());
-        let legend = if self.group == 0 { "200/2xx доступно · 3xx redirect · 4xx/5xx HTTP-ошибка · н/п не поддерживается · н/пр неприменимо · — не проверено" }
-            else { "Direct* для этого UDP-протокола пока не реализован. Никакого сравнения с TCP. н/п не поддерживается · — не проверено" };
-        let summary = format!("Доступно {} · Ошибки/ограничения {} · Не проверено/не поддерживается {} · Отмена {} · Устарело {}\n{selected}\n{legend}",
-            counts[0], counts[1], counts[2], counts[3], counts[4]);
+        let legend = if self.group == 0 { "2xx — ответ получен · 3xx — перенаправление · 4xx/5xx — HTTP-ошибка\nн/п — не поддерживается · н/пр — неприменимо · — не проверено" }
+            else { "Прямой* — контроль UDP не реализован. Сравнение с TCP недопустимо.\nн/п — не поддерживается · — не проверено" };
+        let totals = if self.results.is_empty() { "Проверка ещё не выполнялась.".to_owned() } else if counts.iter().sum::<usize>() == 0 { "Для этого протокола результатов нет.".to_owned() } else { format!("Ячейки {}: доступно {} · ошибки/ограничения {} · без проверки {}\nОтменено {} · устарело {}", groups[self.group], counts[0], counts[1], counts[2], counts[3], counts[4]) };
+        let summary = format!("{totals}\n{selected}\n{legend}\nКаталог: исторические данные OONI, не текущие блокировки. Правила не меняются.");
         frame.render_widget(Paragraph::new(summary).style(Style::default().fg(MUTED)).wrap(Wrap { trim: true }), body[2]);
     }
 
@@ -1453,13 +1491,13 @@ impl Panel {
         let Some(entry) = visible.get(self.row) else { return "Нет выбранной строки".into(); };
         let cols = self.columns();
         let id = cols.get(self.column).copied().flatten();
-        let name = id.map_or("Direct (UDP)", column_label);
+        let name = id.map_or("Прямой контроль (UDP)", column_label);
         let provenance = entry.provenance.as_ref().map_or_else(|| "Свой домен; без доказательства ограничения".into(),
             |p| format!("Источник: {}\nПоследнее подтверждение: {} · Сетей: {}\nМасштаб ограничения не установлен", p.source, p.last_confirmed_day, p.confirmed_networks));
         let mut text = format!("{} · {name}\n{provenance}\n\n", entry.hostname);
         if let Some(c) = id.and_then(|id| self.results.get(&(entry.hostname.clone(), id))) {
-            text.push_str(&format!("Статус: {}\nАктуальность: {}\nПричина: {}\nПротокол: {:?}\nСеть: {} · TLS: {} · Приложение: {}\nHTTP: {} · Длительность: {} мс · Попыток: {}\nМодификация: {}\nEndpoint: {} · Source: {}\nРешение политики: {:?}",
-                status_long(c.status), if c.stale { "Устарело" } else { "На момент проверки" }, reason(c.reason), c.protocol,
+            text.push_str(&format!("Что это значит: {}\n\nСтатус: {}\nАктуальность: {}\nПричина: {}\nПротокол: {:?}\nСеть: {} · TLS: {} · Приложение: {}\nHTTP: {} · Длительность: {} мс · Попыток: {}\nМодификация: {}\nEndpoint: {} · Source: {}\nРешение политики: {:?}",
+                cell_explanation(c), status_long(c.status), if c.stale { "Устарело" } else { "На момент проверки" }, reason(c.reason), c.protocol,
                 stage(c.network), stage(c.tls), stage(c.application), c.http_status.map_or_else(|| "—".into(), |code| code.to_string()),
                 c.duration_ms, c.attempts, c.actual_modification.map_or("Не подтверждена", |m| if m { "Да" } else { "Нет" }),
                 c.endpoint.map_or_else(|| "—".into(), |e| e.to_string()), c.source.map_or_else(|| "—".into(), |ip| ip.to_string()), c.policy_action));
@@ -1481,7 +1519,8 @@ impl Panel {
         let document = Document::read(&self.path).ok();
         let parts = Layout::vertical([Constraint::Length(2), Constraint::Min(6), Constraint::Length(3)]).split(area);
         tui_widgets::shell_header(frame, parts[0], "THEIA  •  Anti-DPI", self.owner_text(), &self.file_state(document.as_ref()));
-        let body = if let Some([nav, _, details]) = workspace_columns(parts[1]) {
+        let modal = self.draft.is_some() || self.catalogue_draft.is_some() || self.review.is_some();
+        let body = if modal { parts[1] } else if let Some([nav, _, details]) = workspace_columns(parts[1]) {
             tui_widgets::section_navigation(frame, nav, SECTIONS, self.page, self.navigation);
             details
         } else if self.navigation && self.review.is_none() && self.draft.is_none() {
@@ -1501,8 +1540,7 @@ impl Panel {
                 Review::Policy(candidate, enroll) => ("Применение локальной политики", format!("{}\n\n{}\nСеть и настройки ОС не меняются этой операцией.\nСтарые разрешения потоков отзываются при публикации.",
                     if *enroll { "Первичная регистрация локальной ревизии (не регистрация на сервере)." } else { "Применить сохранённую ревизию." },
                     policy_text(candidate.document())), "Применить"),
-                Review::Save(draft, next) => ("Сохранение конфигурации", format!("{}\n{}\n\n{}", if draft.first_run() { "Создать новый файл без перезаписи." } else { "Сохранить новую ревизию (не Apply)." },
-                    "Проверьте выбранные сайты, DNS и разрешения. Сохранение не применяет правила и не запускает подключение.", policy_text(next)), "Сохранить"),
+                Review::Save(draft, next) => ("Проверьте настройки перед сохранением", format!("{}\n\n{}\n\n{}", if draft.first_run() { "Создать новый файл без перезаписи." } else { "Сохранить изменения, не применяя их." }, plain_summary(next), policy_text(next)), "Сохранить"),
                 Review::DiscardRouting => ("Отменить черновик?", "Несохранённые изменения маршрутизации будут потеряны. Рабочая политика не меняется.".into(), "Отменить изменения"),
                 Review::Export(_, path) => ("Обезличенный экспорт", format!("Сохранить агрегированный отчёт в:\n{}\n\nБез доменов, IP, секретов и идентификаторов. Существующий файл не перезаписывается.", path.display()), "Экспортировать"),
                 #[cfg(windows)]
@@ -1547,7 +1585,8 @@ impl Panel {
             } else if self.worker.is_some() {
                 "Esc отменить · ↑ ↓ строки · ← → ячейки · [ ] протокол · F7 детали".into()
             } else {
-                "F2 разделы · Пробел выбор · s все · c очистить · / поиск · i добавить · x исключить · R вернуть · Enter проверка · b повтор · z экспорт".into()
+                if self.report_only { "↑ ↓ сайты · ← → ячейки · F7 объяснение · v каталог · b повтор · z экспорт · F2 разделы".into() }
+                else { "↑ ↓ сайты · Пробел отметить · Enter проверить · / поиск · i свой сайт · F1 помощь · F2 разделы · v результаты".into() }
             };
         } else {
             self.draw_page(frame, body, document.as_ref());
@@ -1555,7 +1594,10 @@ impl Panel {
                 else { "↑ ↓ действия · Enter открыть · F2 разделы · F1 помощь · Esc назад".into() };
         }
         let footer_rects = Layout::vertical([Constraint::Length(1), Constraint::Length(2)]).split(parts[2]);
-        frame.render_widget(Paragraph::new(tui_widgets::fit_value(&self.notice, footer_rects[0].width, false)).style(Style::default().fg(WARNING).bg(SURFACE)), footer_rects[0]);
+        let notice = if let Some(draft) = &self.draft {
+            if draft.error.is_empty() { "Настройки не сохранены. Сеть не запускается." } else { &draft.error }
+        } else { &self.notice };
+        frame.render_widget(Paragraph::new(tui_widgets::fit_value(notice, footer_rects[0].width, false)).style(Style::default().fg(WARNING).bg(SURFACE)), footer_rects[0]);
         frame.render_widget(Paragraph::new(tui_widgets::key_line(&footer)).style(Style::default().bg(SURFACE)).wrap(Wrap { trim: true }), footer_rects[1]);
     }
 }
@@ -1667,6 +1709,7 @@ mod tests {
         assert!(!path.exists());
         std::fs::write(&path, format!("{}\n[anti_dpi.resolver]\nhostname='dns.example.com'\nbootstrap=['1.1.1.1']\n",
             include_str!("../../../../examples/anti-dpi.toml"))).unwrap();
+        panel.notice = "Конфигурация прочитана. Сеть не запускалась.".into();
         capture("anti-dpi-overview", &mut panel);
         panel.open_page(CONNECTION);
         capture("anti-dpi-connection", &mut panel);
@@ -1735,8 +1778,16 @@ mod tests {
                 });
             }
         }
+        panel.report_hosts = panel.selected.clone();
+        panel.report_only = true;
+        panel.row = 0; panel.offset = 0;
         panel.notice = "СИНТЕТИЧЕСКИЙ ОФЛАЙН-ПРИМЕР · сеть не проверялась".into();
         capture("state-anti-dpi-diagnostic-report", &mut panel);
+        assert_eq!(panel.visible().len(), 6);
+        panel.key(KeyCode::Char('v')).unwrap();
+        assert_eq!(panel.visible().len(), 60);
+        panel.key(KeyCode::Char('v')).unwrap();
+        assert_eq!(panel.visible().len(), 6);
         let (_send, updates) = mpsc::channel();
         panel.worker = Some(Worker { cancel: Arc::new(AtomicBool::new(false)), updates, thread: None, total: 60 });
         panel.notice = "СИНТЕТИЧЕСКИЙ ОФЛАЙН-ПРИМЕР · проверка выполняется".into();
@@ -1777,6 +1828,25 @@ mod tests {
         terminal.draw(|frame| panel.draw(frame)).unwrap();
         panel.key(KeyCode::Char('c')).unwrap();
         assert!(panel.selected.is_empty());
+    }
+
+    #[test]
+    fn diagnostic_view_is_separate_from_selection_and_catalogue() {
+        let path = std::env::temp_dir().join(format!("theia-f20-report-view-{}", std::process::id())).join("anti-dpi.toml");
+        let mut panel = Panel::new(path.clone()).unwrap();
+        panel.key(KeyCode::Esc).unwrap();
+        panel.open_page(DIAGNOSTICS);
+        let host = panel.catalog.entries()[0].hostname.clone();
+        panel.report_hosts.insert(host.clone());
+        panel.report_only = true;
+        assert_eq!(panel.visible().len(), 1);
+        panel.key(KeyCode::Char('v')).unwrap();
+        assert_eq!(panel.visible().len(), 60);
+        panel.key(KeyCode::Char('v')).unwrap();
+        assert_eq!(panel.visible()[0].hostname, host);
+        assert!(panel.selected.is_empty());
+        assert!(panel.worker.is_none());
+        assert!(!path.exists());
     }
 
     #[test]
