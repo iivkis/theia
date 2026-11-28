@@ -2825,6 +2825,11 @@ impl Interaction {
             match event.kind {
                 MouseEventKind::ScrollUp => panel.scroll_up(),
                 MouseEventKind::ScrollDown => panel.scroll_down(),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let body = shell_layout(area)[1];
+                    let content = workspace_columns(body).map_or(body, |columns| columns[2]);
+                    panel.select_at(content, event.column, event.row);
+                }
                 _ => {}
             }
             return;
@@ -5878,7 +5883,7 @@ fn workspace_columns(area: Rect) -> Option<[Rect; 3]> {
 
 /// Wrapped rows share the same record-index map for draw and mouse.
 fn record_rows(editor: &Editor, area: Rect) -> Vec<(usize, String)> {
-    let width = usize::from(area.width.saturating_sub(5)).max(1);
+    let width = usize::from(area.width.saturating_sub(4)).max(1);
     let capacity = usize::from(area.height.saturating_sub(2));
     let selected = editor.workspace_selected();
     let mut rows = Vec::new();
@@ -5899,15 +5904,34 @@ fn record_rows(editor: &Editor, area: Rect) -> Vec<(usize, String)> {
         };
         let mut line = String::new();
         let mut used = 0;
-        for ch in label.chars() {
+        // A numeric port is one unit, including its colon. Keep it together
+        // even when a long hostname must wrap across several physical rows.
+        let port_start = if editor.role() == Role::Client {
+            label.rsplit_once(':').and_then(|(host, port)| {
+                (!port.is_empty()
+                    && port.bytes().all(|b| b.is_ascii_digit())
+                    && port.len() + 1 <= width)
+                    .then_some(host.len())
+            })
+        } else {
+            None
+        };
+        for (offset, ch) in label.char_indices() {
+            if port_start.is_some_and(|start| offset > start) {
+                continue;
+            }
             let mut encoded = [0; 4];
-            let encoded: &str = ch.encode_utf8(&mut encoded);
-            let cw = Span::raw(encoded).width();
+            let piece: &str = if port_start == Some(offset) {
+                &label[offset..]
+            } else {
+                ch.encode_utf8(&mut encoded)
+            };
+            let cw = Span::raw(piece).width();
             if used + cw > width && !line.is_empty() {
                 rows.push((index, std::mem::take(&mut line)));
                 used = 0;
             }
-            line.push(ch);
+            line.push_str(piece);
             used += cw;
         }
         rows.push((index, line));
@@ -5987,7 +6011,7 @@ impl Viewport {
 
 /// Soft-wrap into explicit visual rows so every part of a long review or
 /// invitation remains accessible. No screen content is retained by Viewport.
-fn visual_rows(body: &str, width: usize) -> (Vec<Line<'_>>, Option<usize>) {
+pub(crate) fn visual_rows(body: &str, width: usize) -> (Vec<Line<'_>>, Option<usize>) {
     let width = width.max(1);
     let mut rows = Vec::new();
     let mut focus = None;
@@ -7118,6 +7142,8 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     }
     let footer = if interaction.is_some_and(Interaction::inline_import) {
         "Enter проверить · F6 файл / QR · Ctrl+U очистить · Esc отменить"
+    } else if let Some(panel) = interaction.and_then(|ui| ui.profile_diagnostics.as_ref()) {
+        panel.footer()
     } else if viewport.is_some_and(|v| v.guided.get()) {
         ""
     } else if viewport.is_some_and(|v| v.action_rect.get().is_some()) {
@@ -10005,6 +10031,17 @@ mod tests {
             label,
             "№2 long-label-for-testing-profile-address.example.org:443"
         );
+        for width in 12..=40 {
+            let rows = record_rows(editor, Rect::new(0, 0, width, 40));
+            let last = rows.iter().rfind(|(index, _)| *index == 1).unwrap();
+            assert!(last.1.ends_with(":443"), "width={width}: {rows:?}");
+            assert!(rows
+                .iter()
+                .all(|(_, row)| Span::raw(row.as_str()).width() <= usize::from(width - 4)));
+        }
+        let rows = record_rows(editor, Rect::new(0, 0, 28, 20));
+        assert!(rows.iter().any(|(index, row)| *index == 0
+            && row == "*№1 edge.example.org:443"));
         // Both narrow and wide terminal layouts must map continuation rows
         // to the same profile. Re-select the first profile before each click
         // so this also checks that mouse selection actually changes focus.
