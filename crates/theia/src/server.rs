@@ -4255,6 +4255,107 @@ mod hardening_tests {
             status,
             StatusReply::RunningRevision { inbounds: 1, .. }
         ));
+        // Drive the actual protected management endpoint while the same
+        // supervisor owns the listeners. Read-only preflights never change
+        // the revision, and mutations require both the saved digest and CAS.
+        let Config::Server(mut candidate) = config::parse(&contents).unwrap() else { panic!("server fixture"); };
+        let save = |doc: &ServerDocument| {
+            let bytes = Config::Server(doc.clone()).to_toml().unwrap();
+            fs::write(&path, bytes.as_bytes()).unwrap();
+            <[u8; 32]>::from(Sha256::digest(bytes.as_bytes()))
+        };
+        let query = |command| crate::tui_runtime::query_endpoint(&endpoint, command);
+        let access = |user: &str, digest| {
+            let mut inbound = [0; 64];
+            inbound[..6].copy_from_slice(b"edge-a");
+            let mut name = [0; 64];
+            name[..user.len()].copy_from_slice(user.as_bytes());
+            StatusCommand::AccessStatus { inbound, user: name, saved_sha256: digest }
+        };
+        assert_eq!(query(access("alice", expected)).await.unwrap(), StatusReply::AccessObserved { revision: 1, state: 3 });
+        assert_eq!(query(access("bob", expected)).await.unwrap(), StatusReply::AccessObserved { revision: 1, state: 1 });
+        assert!(query(access("alice", [0; 32])).await.is_err());
+        assert_eq!(query(StatusCommand::CheckReload).await.unwrap(), StatusReply::Compatible);
+        assert!(query(StatusCommand::CheckTlsRollback).await.is_err());
+        assert!(query(StatusCommand::CheckRestartRollback).await.is_err());
+        assert!(query(StatusCommand::CheckAuthRollback).await.is_err());
+        candidate.server.policy.max_connections_total += 1;
+        let digest = save(&candidate);
+        assert_eq!(query(StatusCommand::CheckQuota).await.unwrap(), StatusReply::QuotaReady);
+        assert!(query(StatusCommand::ApplyQuotaBound { expected_revision: 1, candidate_sha256: [0; 32] }).await.is_err());
+        assert!(query(StatusCommand::ApplyQuotaBound { expected_revision: 2, candidate_sha256: digest }).await.is_err());
+        assert_eq!(query(StatusCommand::ApplyQuotaBound { expected_revision: 1, candidate_sha256: digest }).await.unwrap(), StatusReply::QuotaApplied { revision: 2 });
+        assert!(query(StatusCommand::ApplyQuotaBound { expected_revision: 1, candidate_sha256: digest }).await.is_err());
+
+        let enabled = candidate.clone();
+        candidate.server.users.iter_mut().find(|user| user.id == "alice").unwrap().disabled = true;
+        let digest = save(&candidate);
+        assert_eq!(query(StatusCommand::CheckReload).await.unwrap(), StatusReply::Compatible);
+        assert_eq!(query(access("alice", digest)).await.unwrap(), StatusReply::AccessObserved { revision: 2, state: 3 });
+        assert!(query(StatusCommand::ApplyReloadBound { expected_revision: 2, candidate_sha256: [0; 32] }).await.is_err());
+        assert_eq!(query(StatusCommand::ApplyReloadBound { expected_revision: 2, candidate_sha256: digest }).await.unwrap(), StatusReply::Applied { revision: 3 });
+        assert_eq!(query(access("alice", digest)).await.unwrap(), StatusReply::AccessObserved { revision: 3, state: 2 });
+        assert!(matches!(query(StatusCommand::CheckAuthRollback).await.unwrap(), StatusReply::AuthRollbackReady { revision: 3, .. }));
+        assert!(query(StatusCommand::ApplyAuthRollback { expected_revision: 2 }).await.is_err());
+        assert_eq!(query(StatusCommand::ApplyAuthRollback { expected_revision: 3 }).await.unwrap(), StatusReply::AuthRollbackApplied { revision: 4 });
+        assert_eq!(query(access("alice", digest)).await.unwrap(), StatusReply::AccessObserved { revision: 4, state: 3 });
+        assert!(query(StatusCommand::ApplyAuthRollback { expected_revision: 3 }).await.is_err());
+        candidate = enabled;
+
+        let next_material = rcgen::generate_simple_self_signed(vec!["a.example.org".into()]).unwrap();
+        let next_cert = directory.join("next-cert.pem");
+        let next_key = directory.join("next-key.pem");
+        fs::write(&next_cert, next_material.cert.pem()).unwrap();
+        #[cfg(not(windows))]
+        fs::write(&next_key, next_material.key_pair.serialize_pem()).unwrap();
+        #[cfg(windows)]
+        crate::bounded_input::write_test_private(&next_key, next_material.key_pair.serialize_pem());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&next_key, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let before_rotation = candidate.clone();
+        candidate.server.inbounds[0].tls_cert = format!("file:{}", next_cert.display());
+        candidate.server.inbounds[0].tls_key = format!("file:{}", next_key.display());
+        let digest = save(&candidate);
+        assert_eq!(query(StatusCommand::CheckRestart).await.unwrap(), StatusReply::RestartSamePortTlsReady);
+        assert!(query(StatusCommand::CheckRestartBound { expected_revision: 3, candidate_sha256: digest }).await.is_err());
+        let StatusReply::RestartPreview { same_port: true, material_sha256 } = query(StatusCommand::CheckRestartBound { expected_revision: 4, candidate_sha256: digest }).await.unwrap() else { panic!("same-port preview"); };
+        assert!(query(StatusCommand::ApplyRestartBound { expected_revision: 4, candidate_sha256: digest, tls_sha256: [0; 32] }).await.is_err());
+        assert_eq!(query(StatusCommand::ApplyRestartBound { expected_revision: 4, candidate_sha256: digest, tls_sha256: material_sha256 }).await.unwrap(), StatusReply::RestartApplied { revision: 5 });
+        assert!(matches!(query(StatusCommand::CheckTlsRollback).await.unwrap(), StatusReply::TlsRollbackReady { revision: 5, .. }));
+        assert!(query(StatusCommand::ApplyTlsRollback { expected_revision: 4 }).await.is_err());
+        assert_eq!(query(StatusCommand::ApplyTlsRollback { expected_revision: 5 }).await.unwrap(), StatusReply::TlsRollbackApplied { revision: 6 });
+        assert!(query(StatusCommand::ApplyTlsRollback { expected_revision: 5 }).await.is_err());
+
+        // A partial layout adds an independent listener pair and preserves
+        // the old pair. Its one-shot structural rollback retires only that
+        // pair; neither operation mutates the saved candidate.
+        candidate = before_rotation;
+        let mut extra = candidate.server.inbounds[0].clone();
+        extra.id = "edge-c".into();
+        let new_tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let new_udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let extra_tcp = new_tcp.local_addr().unwrap();
+        let extra_udp = new_udp.local_addr().unwrap();
+        extra.h2_listen = extra_tcp.to_string();
+        extra.quic_listen = extra_udp.to_string();
+        candidate.server.inbounds.push(extra);
+        let digest = save(&candidate);
+        assert!(query(StatusCommand::CheckRestartBound { expected_revision: 6, candidate_sha256: digest }).await.is_err());
+        drop((new_tcp, new_udp));
+        let StatusReply::RestartPreview { same_port: false, material_sha256 } = query(StatusCommand::CheckRestartBound { expected_revision: 6, candidate_sha256: digest }).await.unwrap() else { panic!("partial restart preview"); };
+        assert_eq!(query(StatusCommand::ApplyRestartBound { expected_revision: 6, candidate_sha256: digest, tls_sha256: material_sha256 }).await.unwrap(), StatusReply::RestartApplied { revision: 7 });
+        assert_eq!(query(StatusCommand::Status).await.unwrap(), StatusReply::RunningRevision { inbounds: 2, revision: 7 });
+        assert!(std::net::TcpListener::bind(extra_tcp).is_err());
+        assert!(std::net::UdpSocket::bind(extra_udp).is_err());
+        assert!(matches!(query(StatusCommand::CheckRestartRollback).await.unwrap(), StatusReply::RestartRollbackReady { revision: 7, .. }));
+        assert!(query(StatusCommand::ApplyRestartRollback { expected_revision: 6 }).await.is_err());
+        assert_eq!(query(StatusCommand::ApplyRestartRollback { expected_revision: 7 }).await.unwrap(), StatusReply::RestartRollbackApplied { revision: 8 });
+        assert_eq!(query(StatusCommand::Status).await.unwrap(), StatusReply::RunningRevision { inbounds: 1, revision: 8 });
+        assert_eq!(<[u8; 32]>::from(Sha256::digest(fs::read(&path).unwrap())), digest);
+        fs::write(&path, &contents).unwrap();
         stop.send(()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(30), task)
             .await
