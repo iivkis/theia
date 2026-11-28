@@ -104,6 +104,7 @@ def main():
     required.update(["state-reality-step5-manual-choice", "state-reality-step5-manual-selected", "server-routing-geosite-picker", "server-routing-geoip-picker"])
     required.update(["anti-dpi-first-run","anti-dpi-overview","anti-dpi-routing","anti-dpi-routing-editor","anti-dpi-geodata","anti-dpi-catalog","anti-dpi-diagnostic-consent","state-anti-dpi-diagnostic-report"])
     required.update(["anti-dpi-first-run-preview","anti-dpi-connection","anti-dpi-statistics","anti-dpi-settings","anti-dpi-settings-editor","state-anti-dpi-diagnostic-progress","state-anti-dpi-diagnostic-cancelled","state-anti-dpi-diagnostic-cell","state-anti-dpi-diagnostic-quic","state-anti-dpi-export-confirm"])
+    required.update(["anti-dpi-setup-domains","anti-dpi-setup-catalog","anti-dpi-setup-dns","anti-dpi-setup-custom-dns","anti-dpi-setup-direct","anti-dpi-setup-modify","anti-dpi-setup-manual"])
     required.update(["server-routing-geodata-marked", "server-routing-geodata-empty", "server-routing-geodata-missing", "server-routing-geodata-added"])
     required.update(["server-routing-geosite-reopened", "server-routing-geoip-reopened", "server-routing-geodata-clear"])
     required.update(["server-routing-geodata-removed", "server-routing-geodata-obsolete"])
