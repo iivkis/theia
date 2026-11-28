@@ -283,7 +283,7 @@ impl WindowsServer {
             tasks.spawn(async move {
                 let _permit = permit;
                 if let Some(endpoint) = standalone {
-                    let _ = timeout(management::CLIENT_TIMEOUT, endpoint.handle(stream)).await;
+                    let _ = endpoint.handle(stream).await;
                 } else if let Some(client) = client {
                     let _ = timeout(
                         management::CLIENT_TIMEOUT,
@@ -324,6 +324,21 @@ pub(crate) async fn query_standalone(request: &str) -> Result<String, Management
             }
         }
     }).await.map_err(|_| ManagementError::TimedOut)?
+}
+
+pub(crate) async fn query_standalone_report(request: &str) -> Result<String, ManagementError> {
+    let name = standalone_name()?;
+    let stream = timeout(management::CLIENT_TIMEOUT, async {
+        loop {
+            match ClientOptions::new().open(&name) {
+                Ok(stream) => return Ok(stream),
+                Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => sleep(Duration::from_millis(15)).await,
+                Err(_) => return Err(ManagementError::SocketUnavailable),
+            }
+        }
+    }).await.map_err(|_| ManagementError::TimedOut)??;
+    timeout(Duration::from_secs(610), crate::anti_dpi::ipc::exchange_report(stream, request))
+        .await.map_err(|_| ManagementError::TimedOut)?
 }
 
 pub async fn query_pipe(id: &str, command: StatusCommand) -> Result<StatusReply, ManagementError> {

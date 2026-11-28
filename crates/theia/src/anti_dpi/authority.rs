@@ -18,6 +18,24 @@ struct Floor {
     digest: [u8; 32],
 }
 
+/// Resolve only a regular, non-reparse leaf. Canonicalizing the existing
+/// object collapses case/short-name aliases before deriving the floor name.
+/// Parent directories must still be trusted (see bounded_input).
+pub(crate) fn canonical_config_path(path: &Path) -> Result<PathBuf, ConfigError> {
+    let path = std::path::absolute(path)
+        .map_err(|_| invalid("anti_dpi", "cannot locate configuration"))?;
+    if !crate::bounded_input::explicit_file_path(&path) ||
+        !std::fs::symlink_metadata(&path).is_ok_and(|m| crate::bounded_input::regular_file(&m)) {
+        return Err(invalid("anti_dpi", "unsafe configuration path"));
+    }
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|_| invalid("anti_dpi", "cannot resolve configuration path"))?;
+    if !crate::bounded_input::explicit_file_path(&canonical) {
+        return Err(invalid("anti_dpi", "unsafe canonical path"));
+    }
+    Ok(canonical)
+}
+
 fn floor_path(path: &Path) -> Result<PathBuf, ConfigError> {
     let name = path.file_name().ok_or_else(|| invalid("anti_dpi.floor", "configuration filename missing"))?;
     let mut hash = Sha256::new();
@@ -34,7 +52,7 @@ fn floor_path(path: &Path) -> Result<PathBuf, ConfigError> {
 
 fn load_floor(path: &Path) -> Result<Option<Vec<u8>>, ConfigError> {
     match std::fs::symlink_metadata(path) {
-        Ok(_) => crate::bounded_input::read(path, 4096, true, false)
+        Ok(_) => crate::bounded_input::read(path, 4096, true, true)
             .map(|b| Some(b.to_vec()))
             .map_err(|_| invalid("anti_dpi.floor", "unsafe or unreadable revision floor")),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -79,8 +97,7 @@ pub struct Candidate {
 
 impl Candidate {
     pub fn read(path: &Path) -> Result<Self, ConfigError> {
-        let path = std::path::absolute(path)
-            .map_err(|_| invalid("anti_dpi", "cannot locate configuration"))?;
+        let path = canonical_config_path(path)?;
         let bytes = config::editor_bytes(&path)?;
         let document = Document::parse(std::str::from_utf8(&bytes)
             .map_err(|_| invalid("anti_dpi", "configuration is not UTF-8"))?)?;
@@ -196,7 +213,10 @@ impl Candidate {
         if decode(&bytes)? != checkpoint(&self.policy) {
             return Err(invalid("anti_dpi.floor", "saved policy is not the applied revision"));
         }
-        let active = Active { candidate: self, floor, floor_bytes: bytes, revoked: AtomicBool::new(false) };
+        let active = Active { candidate: self, floor, floor_bytes: bytes, revoked: AtomicBool::new(false),
+            #[cfg(windows)]
+            evidence: crate::routing::dpi::StandaloneEvidence::new(),
+        };
         if !active.live() {
             return Err(invalid("anti_dpi.floor", "policy changed during activation"));
         }
@@ -211,6 +231,8 @@ pub(crate) struct Active {
     floor: PathBuf,
     floor_bytes: Vec<u8>,
     revoked: AtomicBool,
+    #[cfg(windows)]
+    pub(crate) evidence: crate::routing::dpi::StandaloneEvidence,
 }
 
 impl Active {
@@ -299,19 +321,52 @@ mod tests {
     }
 
     #[test]
+    fn floor_with_untrusted_permissions_is_not_accepted() {
+        let fixture = Fixture::new();
+        let candidate = Candidate::read(&fixture.0).unwrap();
+        candidate.enroll(candidate.digest()).unwrap();
+        let floor = floor_path(&candidate.path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&floor, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(load_floor(&floor).is_err());
+        }
+        #[cfg(windows)]
+        {
+            let bytes = std::fs::read(&floor).unwrap();
+            std::fs::remove_file(&floor).unwrap();
+            std::fs::write(&floor, &bytes).unwrap();
+            assert!(load_floor(&floor).is_err());
+        }
+        #[cfg(any(unix, windows))]
+        assert!(candidate.activate().is_err());
+    }
+
+    #[test]
     fn floor_loss_revokes_and_normal_apply_cannot_recreate_it() {
         let fixture = Fixture::new();
         let first = Candidate::read(&fixture.0).unwrap();
         first.enroll(first.digest()).unwrap();
         let active = first.activate().unwrap();
-        let path = floor_path(&fixture.0).unwrap();
+        let path = floor_path(&canonical_config_path(&fixture.0).unwrap()).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
         assert!(!active.live());
         let candidate = Candidate::read(&fixture.0).unwrap();
         assert!(candidate.apply(candidate.digest()).is_err());
         assert!(candidate.activate().is_err());
-        std::fs::write(path, bytes).unwrap();
+        #[cfg(windows)]
+        crate::bounded_input::write_test_private(&path, bytes);
+        #[cfg(not(windows))]
+        {
+            std::fs::write(&path, bytes).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
         assert!(!active.live());
     }
 }

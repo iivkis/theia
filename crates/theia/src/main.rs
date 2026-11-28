@@ -107,7 +107,14 @@ async fn run() {
                 .map(|catalog| catalog.render())
                 .map_err(CliError::Config)
         }
-        Ok(Command::AntiDpiDiagnostic { config, overlay, domains, confirm, anonymous }) => {
+        Ok(Command::AntiDpiDiagnostic { config, overlay, domains, confirm, anonymous, owned: true }) => {
+            let _ = overlay;
+            #[cfg(windows)]
+            { theia::anti_dpi::ipc::diagnose_owned(Path::new(&config), &domains, confirm, anonymous).await.map_err(CliError::Management) }
+            #[cfg(not(windows))]
+            { let _ = (config, domains, confirm, anonymous); Err(CliError::NotImplemented("standalone Windows IPC")) }
+        }
+        Ok(Command::AntiDpiDiagnostic { config, overlay, domains, confirm, anonymous, owned: false }) => {
             use std::sync::atomic::{AtomicBool, Ordering};
             use theia::anti_dpi::diagnostic::Plan;
             match Plan::prepare(Path::new(&config), overlay.as_deref().map(Path::new), &domains) {

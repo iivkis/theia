@@ -228,7 +228,7 @@ impl Plan {
     pub fn prepare(config_path: &Path, overlay_path: Option<&Path>, hosts: &[String])
         -> Result<Self, ConfigError>
     {
-        let saved = Saved::read(config_path)?;
+        let saved = Saved::read(&super::authority::canonical_config_path(config_path)?)?;
         let document = Document::parse(saved.text()?)?;
         let policy = document.prepare()?;
         if document.anti_dpi.resolver.is_none() {
@@ -355,7 +355,7 @@ impl Plan {
         roots: &rustls::RootCertStore,
         cancel: &AtomicBool,
         ready: &(dyn Fn() -> bool + Sync),
-        permits: &tokio::sync::Semaphore,
+        permits: &crate::net::probe::PriorityBudget,
         mut progress: impl FnMut(&[CellResult]),
     ) -> Result<Report, ConfigError> {
         if self.digest != confirmation || !self.files_current()
@@ -374,7 +374,7 @@ impl Plan {
         roots: &rustls::RootCertStore,
         cancel: &AtomicBool,
         ready: &(dyn Fn() -> bool + Sync),
-        permits: Option<&tokio::sync::Semaphore>,
+        permits: Option<&crate::net::probe::PriorityBudget>,
         progress: &mut (impl FnMut(&[CellResult]) + ?Sized),
     ) -> Result<Report, ConfigError> {
         let state = State {
@@ -429,7 +429,7 @@ struct State<'a> {
     epoch: u64,
     cancel: &'a AtomicBool,
     ready: &'a (dyn Fn() -> bool + Sync),
-    permits: Option<&'a tokio::sync::Semaphore>,
+    permits: Option<&'a crate::net::probe::PriorityBudget>,
     stale: AtomicBool,
     deadline: Instant,
 }
@@ -549,8 +549,7 @@ async fn row(state: &State<'_>, host: &str, roots: &rustls::RootCertStore) -> Ve
         let acquired = tokio::select! {
             biased;
             _ = crate::net::guarded_io::revoked(&live) => None,
-            result = tokio::time::timeout_at(dns_deadline, permits.acquire()) =>
-                result.ok().and_then(Result::ok),
+            result = permits.diagnostic(dns_deadline) => result,
         };
         match acquired {
             Some(permit) => Some(permit),

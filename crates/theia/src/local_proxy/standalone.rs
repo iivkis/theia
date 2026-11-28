@@ -31,7 +31,7 @@ struct Runtime {
     active: RwLock<Arc<Active>>,
     epoch: u64,
     roots: rustls::RootCertStore,
-    resolver_slots: Semaphore,
+    resolver_slots: crate::net::probe::PriorityBudget,
     flows: Arc<FlowTable>,
     control: Arc<Control>,
 }
@@ -97,7 +97,7 @@ impl Runtime {
                 let _permit = tokio::select! {
                     biased;
                     _ = revoked(&live) => return Err(denied()),
-                    result = timeout(Duration::from_secs(6), self.resolver_slots.acquire()) =>
+                    result = timeout(Duration::from_secs(6), self.resolver_slots.production(1)) =>
                         result.map_err(|_| ClientError::Timeout)?
                             .map_err(|_| ClientError::Open(ErrorCode::ResourceLimit))?,
                 };
@@ -177,12 +177,13 @@ fn modify_engine(runtime: &Arc<Runtime>, target: &Arc<Target>) -> Result<(Arc<En
     let digest = target.active.policy().digest();
     let stun = target.active.document().anti_dpi.consent.direct_dpi_stun;
     let runtime = runtime.clone();
+    let evidence_target = target.clone();
     let target = target.clone();
     let authority = PolicyState::standalone(digest, Arc::new(move || {
         target.live(&runtime) && target.active.document().anti_dpi.consent.direct_dpi
     }), stun);
     let pin = authority.pin(digest)?;
-    Ok((Arc::new(Engine::new_standalone(authority)), pin))
+    Ok((Arc::new(Engine::new_standalone(authority, &evidence_target.active.evidence)), pin))
 }
 
 async fn modify_tcp(runtime: Arc<Runtime>, target: Arc<Target>, mut socket: TcpStream,
@@ -192,7 +193,7 @@ async fn modify_tcp(runtime: Arc<Runtime>, target: Arc<Target>, mut socket: TcpS
         let Address::Dns(name) = &address else { return Err(denied()) };
         let (engine, pin) = modify_engine(&runtime, &target)?;
         let flow = runtime.flows.begin_pinned(pin.clone(), Protocol::Tcp, address.clone(), port, PacketAction::Modify)?;
-        let _permit = timeout(Duration::from_secs(6), runtime.resolver_slots.acquire_many(2))
+        let _permit = timeout(Duration::from_secs(6), runtime.resolver_slots.production(2))
             .await.map_err(|_| ClientError::Timeout)?.map_err(|_| denied())?;
         let tunnel = engine.open_checked_pinned(name, port, &[target.peer.ip()], &pin).await?.ok_or_else(denied)?;
         flow.check_pending()?;
@@ -393,7 +394,7 @@ async fn modify_udp(runtime: Arc<Runtime>, target: Arc<Target>, socket: Arc<UdpS
         biased;
         _ = revoked(&live) => return Err(denied()),
         result = async {
-            let _permit = timeout(Duration::from_secs(6), runtime.resolver_slots.acquire())
+            let _permit = timeout(Duration::from_secs(6), runtime.resolver_slots.production(1))
                 .await.map_err(|_| ClientError::Timeout)?.map_err(|_| denied())?;
             engine.open_standalone_udp(name, port, &[target.peer.ip()], &pin, strategy).await
         } => result?.ok_or_else(denied)?,
@@ -478,7 +479,8 @@ async fn association(runtime: Arc<Runtime>, active: Arc<Active>, mut control: Tc
                 let (queue, receiver) = mpsc::channel(udp_relay::QUEUE);
                 if queue.try_send(data.to_vec()).is_err() { continue; }
                 flows.insert(key.clone(), queue);
-                tasks.spawn(udp_flow(runtime.clone(), active.clone(), socket.clone(), source, key.0, key.1, receiver));
+                tasks.spawn(crate::traffic::STANDALONE_METER.scope(runtime.control.modify_meter.clone(),
+                    udp_flow(runtime.clone(), active.clone(), socket.clone(), source, key.0, key.1, receiver)));
             }
         }
     };
@@ -508,7 +510,8 @@ async fn serve(runtime: Arc<Runtime>, http: &TcpListener, socks: &TcpListener) -
             tasks.spawn(async move {
                 let _slot = slot;
                 let counter = runtime.control.enter();
-                if handle(runtime.clone(), socket, is_http).await.is_err() { counter.failure(); }
+                if crate::traffic::STANDALONE_METER.scope(runtime.control.modify_meter.clone(),
+                    handle(runtime.clone(), socket, is_http)).await.is_err() { counter.failure(); }
             });
         }
     };
@@ -570,7 +573,7 @@ async fn run_inner(
     let roots = crate::net::tls::native_roots();
     if roots.is_empty() { return Err(ClientError::Tls); }
     let active = Arc::new(active);
-    let runtime = Arc::new(Runtime { active: RwLock::new(active.clone()), epoch, roots, resolver_slots: Semaphore::new(4), flows: FlowTable::shared(), control: control.clone() });
+    let runtime = Arc::new(Runtime { active: RwLock::new(active.clone()), epoch, roots, resolver_slots: crate::net::probe::PriorityBudget::new(), flows: FlowTable::standalone(), control: control.clone() });
     let config = &active.document().anti_dpi.proxy;
     let http = super::bind_proxy_listener(&config.http_listen).await?;
     let socks = super::bind_proxy_listener(&config.socks5_listen).await?;

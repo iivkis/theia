@@ -560,7 +560,7 @@ impl Panel {
                     Phase::Starting => "подготовка", Phase::Connected => "подключено (readback)",
                     Phase::Stopping => "отключение", Phase::Stopped => "отключено", Phase::Failed => "ошибка",
                 };
-                text.push_str(&format!("\n\nПринадлежащая панели сессия: {phase}\nПрименённая ревизия: {} · Admission: {}\nЛокальные соединения: {} активных / {} принятых · ошибки: {}\nPass: записано к цели {} байт · доставлено приложению {} байт\nДиагностика не входит в эти счётчики.",
+                text.push_str(&format!("\n\nПринадлежащая панели сессия: {phase}\nПрименённая ревизия: {} · Admission: {}\nЛокальные соединения: {} активных / {} принятых · ошибки: {}\nPayload: записано к цели {} байт · принято от цели {} байт\nДиагностика не входит в эти счётчики.",
                     status.revision, if status.admitting { "разрешён" } else { "закрыт" }, status.active, status.accepted, status.errors, status.uploaded, status.downloaded));
             } else {
                 text.push_str("\n\nСобственная сессия отсутствует; состояние внешнего процесса не подтверждено.");
@@ -638,6 +638,94 @@ pub(super) fn run(path: &Path) -> Result<(), TuiError> {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+
+    /// Exercise the actual third-panel renderer. Gallery publication is
+    /// optional; the ordinary test does not require the review environment.
+    #[test]
+    fn standalone_visual_review_gallery() {
+        use crate::anti_dpi::diagnostic::{Protocol, Reason, Stage};
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!("theia-f20-review-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        let root = Scratch(root);
+        let path = root.0.join("anti-dpi.toml");
+        let cells = std::env::var_os("THEIA_REVIEW_CELLS").map(PathBuf::from);
+        let capture = |name: &str, panel: &mut Panel| {
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal.draw(|frame| panel.draw(frame)).unwrap();
+            let buffer = terminal.backend().buffer();
+            assert!(buffer.content().iter().any(|cell| cell.symbol() != " "));
+            if let Some(dir) = &cells {
+                let mut out = std::io::BufWriter::new(std::fs::File::create(dir.join(format!("{name}.cells"))).unwrap());
+                writeln!(out, "120\t40").unwrap();
+                for cell in buffer.content() {
+                    write!(out, "{:?}\t{:?}\t{:?}\t", cell.fg, cell.bg, cell.modifier).unwrap();
+                    for byte in cell.symbol().as_bytes() { write!(out, "{byte:02x}").unwrap(); }
+                    writeln!(out).unwrap();
+                }
+                out.flush().unwrap();
+            }
+        };
+        let mut panel = Panel::new(path.clone()).unwrap();
+        capture("anti-dpi-first-run", &mut panel);
+        std::fs::write(&path, format!("{}\n[anti_dpi.resolver]\nhostname='dns.example.com'\nbootstrap=['1.1.1.1']\n",
+            include_str!("../../../../examples/anti-dpi.toml"))).unwrap();
+        capture("anti-dpi-overview", &mut panel);
+        panel.open_routing();
+        assert!(panel.routing.is_some());
+        capture("anti-dpi-routing", &mut panel);
+        panel.routing_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        capture("anti-dpi-routing-editor", &mut panel);
+        panel.routing_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        panel.routing_key(KeyEvent::new(KeyCode::Char('B'), KeyModifiers::NONE));
+        capture("anti-dpi-geodata", &mut panel);
+        panel.routing = None;
+        panel.overview = false;
+        panel.key(KeyCode::Char('s')).unwrap();
+        capture("anti-dpi-catalog", &mut panel);
+        panel.selected = ["meduza.io".to_owned()].into_iter().collect();
+        panel.begin_review(None);
+        assert!(panel.review.is_some());
+        capture("anti-dpi-diagnostic-consent", &mut panel);
+        panel.review = None;
+        for (index, entry) in panel.catalog.entries().iter().take(6).enumerate() {
+            let host = entry.hostname.clone();
+            let available = index % 2 == 0;
+            let direct = CellResult {
+                domain: host.clone(), protocol: Protocol::TcpHttps, strategy_id: "direct",
+                status: if available { CellStatus::Available } else { CellStatus::Unavailable },
+                network: Stage::Passed, tls: if available { Stage::Passed } else { Stage::Failed },
+                application: if available { Stage::Passed } else { Stage::NotRun },
+                reason: if available { Reason::None } else { Reason::Timeout },
+                actual_modification: Some(false), http_status: available.then_some(200),
+                duration_ms: if available { 120 } else { 6000 }, attempts: 1,
+                endpoint: None, source: None, policy_action: Some(crate::anti_dpi::Decision::Pass), stale: false,
+            };
+            panel.results.insert((host.clone(), "direct"), direct);
+            for strategy_id in strategy_columns().into_iter().filter(|id| *id != "direct") {
+                let protocol = match strategy_id {
+                    "quic_v1_initial_split" => Protocol::QuicV1,
+                    "quic_v2_initial_split" => Protocol::QuicV2,
+                    "stun_fingerprint" => Protocol::Stun,
+                    _ => Protocol::TcpHttps,
+                };
+                panel.results.insert((host.clone(), strategy_id), CellResult {
+                    domain: host.clone(), protocol, strategy_id, status: CellStatus::Unsupported,
+                    network: Stage::NotRun, tls: Stage::NotRun, application: Stage::NotRun,
+                    reason: Reason::AwaitingAcceptance, actual_modification: None, http_status: None,
+                    duration_ms: 0, attempts: 0, endpoint: None, source: None, policy_action: None, stale: false,
+                });
+            }
+        }
+        panel.notice = "СИНТЕТИЧЕСКИЙ ОФЛАЙН-ПРИМЕР · сеть не проверялась".into();
+        capture("state-anti-dpi-diagnostic-report", &mut panel);
+        assert!(panel.worker.is_none());
+        assert!(!panel.results.is_empty());
+    }
 
     #[test]
     fn offline_panel_selects_catalog_without_network_or_configuration() {

@@ -56,9 +56,26 @@ use super::policy_lease::{PolicyLease, PolicyState};
 /// Consent is local configuration, not a command in the server snapshot.
 pub(crate) struct Engine {
     policy: Arc<PolicyState>,
-    cache: strategy::Cache,
-    scheduler: ProbeScheduler,
+    cache: Arc<strategy::Cache>,
+    scheduler: Arc<ProbeScheduler>,
     standalone: bool,
+}
+
+/// Bounded, process-local evidence for one immutable local publication.
+/// The shared cache still keys on the exact name/IP/port, digest and scope.
+/// Never share it with a diagnostic job or another role. Existing positive,
+/// negative and scoring TTLs apply; no disk grant or restart revival.
+#[cfg(windows)]
+pub(crate) struct StandaloneEvidence {
+    cache: Arc<strategy::Cache>,
+    scheduler: Arc<ProbeScheduler>,
+}
+
+#[cfg(windows)]
+impl StandaloneEvidence {
+    pub(crate) fn new() -> Self {
+        Self { cache: Arc::new(strategy::Cache::default()), scheduler: Arc::new(ProbeScheduler::new(4)) }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -335,15 +352,15 @@ impl Engine {
     pub(crate) fn new(policy: Arc<PolicyState>) -> Self {
         Self {
             policy,
-            cache: strategy::Cache::default(),
-            scheduler: ProbeScheduler::new(4),
+            cache: Arc::new(strategy::Cache::default()),
+            scheduler: Arc::new(ProbeScheduler::new(4)),
             standalone: false,
         }
     }
 
     #[cfg(windows)]
-    pub(crate) fn new_standalone(policy: Arc<PolicyState>) -> Self {
-        Self { standalone: true, ..Self::new(policy) }
+    pub(crate) fn new_standalone(policy: Arc<PolicyState>, evidence: &StandaloneEvidence) -> Self {
+        Self { policy, standalone: true, cache: evidence.cache.clone(), scheduler: evidence.scheduler.clone() }
     }
     pub(crate) fn set_enabled(&self, enabled: bool) {
         self.policy.set_enabled(enabled);

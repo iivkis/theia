@@ -16,8 +16,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 tokio::task_local! { pub(crate) static PROFILE_DIAGNOSTIC: (); }
+#[cfg(any(windows, test))]
+tokio::task_local! { pub(crate) static STANDALONE_METER: std::sync::Arc<Counters>; }
+
 fn diagnostic() -> bool {
-    PROFILE_DIAGNOSTIC.try_with(|_| ()).is_ok()
+    if PROFILE_DIAGNOSTIC.try_with(|_| ()).is_ok() { return true; }
+    #[cfg(any(windows, test))]
+    if STANDALONE_METER.try_with(|_| ()).is_ok() { return true; }
+    false
 }
 static DIAGNOSTIC_COUNTERS: Counters = Counters::new();
 
@@ -29,14 +35,14 @@ pub(crate) struct Snapshot {
     pub download: u64,
 }
 
-struct Counters {
+pub(crate) struct Counters {
     active: AtomicU64,
     opened: AtomicU64,
     upload: AtomicU64,
     download: AtomicU64,
 }
 impl Counters {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             active: AtomicU64::new(0),
             opened: AtomicU64::new(0),
@@ -46,17 +52,23 @@ impl Counters {
     }
 
     fn enter(&self) -> Relay<'_> {
-        if diagnostic() {
+        if PROFILE_DIAGNOSTIC.try_with(|_| ()).is_ok() {
             DIAGNOSTIC_COUNTERS.opened.fetch_add(1, Ordering::Relaxed);
             DIAGNOSTIC_COUNTERS.active.fetch_add(1, Ordering::Relaxed);
-            return Relay(&DIAGNOSTIC_COUNTERS);
+            return Relay::Shared(&DIAGNOSTIC_COUNTERS);
+        }
+        #[cfg(any(windows, test))]
+        if let Ok(local) = STANDALONE_METER.try_with(Clone::clone) {
+            local.opened.fetch_add(1, Ordering::Relaxed);
+            local.active.fetch_add(1, Ordering::Relaxed);
+            return Relay::Owned(local);
         }
         self.opened.fetch_add(1, Ordering::Relaxed);
         self.active.fetch_add(1, Ordering::Relaxed);
-        Relay(self)
+        Relay::Shared(self)
     }
 
-    fn snapshot(&self) -> Snapshot {
+    pub(crate) fn snapshot(&self) -> Snapshot {
         Snapshot {
             active: self.active.load(Ordering::Relaxed),
             opened: self.opened.load(Ordering::Relaxed),
@@ -66,19 +78,53 @@ impl Counters {
     }
 }
 
-pub(crate) struct Relay<'a>(&'a Counters);
+pub(crate) enum Relay<'a> {
+    Shared(&'a Counters),
+    #[cfg(any(windows, test))]
+    Owned(std::sync::Arc<Counters>),
+}
 impl Relay<'_> {
+    fn counters(&self) -> &Counters {
+        match self {
+            Self::Shared(counters) => counters,
+            #[cfg(any(windows, test))]
+            Self::Owned(counters) => counters,
+        }
+    }
     pub(crate) fn upload(&self, bytes: usize) {
-        self.0.upload.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.counters().upload.fetch_add(bytes as u64, Ordering::Relaxed);
     }
     pub(crate) fn download(&self, bytes: usize) {
-        self.0.download.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.counters().download.fetch_add(bytes as u64, Ordering::Relaxed);
     }
 }
 impl Drop for Relay<'_> {
     fn drop(&mut self) {
-        self.0.active.fetch_sub(1, Ordering::Relaxed);
+        self.counters().active.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn standalone_meter_is_per_session_and_diagnostics_do_not_enter_it() {
+    use std::sync::Arc;
+    let first = Arc::new(Counters::new());
+    let second = Arc::new(Counters::new());
+    STANDALONE_METER.scope(first.clone(), async {
+        let relay = enter_direct();
+        relay.upload(4);
+        relay.download(8);
+        PROFILE_DIAGNOSTIC.scope((), async {
+            let diagnostic = enter_direct();
+            diagnostic.upload(100);
+        }).await;
+    }).await;
+    STANDALONE_METER.scope(second.clone(), async {
+        let relay = enter_udp(Role::Client, false, true);
+        relay.upload(2);
+    }).await;
+    assert_eq!(first.snapshot(), Snapshot { opened: 1, active: 0, upload: 4, download: 8 });
+    assert_eq!(second.snapshot(), Snapshot { opened: 1, active: 0, upload: 2, download: 0 });
 }
 
 static SERVER_H2: Counters = Counters::new();

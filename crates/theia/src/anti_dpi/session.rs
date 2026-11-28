@@ -64,6 +64,7 @@ pub(crate) struct Control {
     errors: AtomicU64,
     pub(crate) uploaded: AtomicU64,
     pub(crate) downloaded: AtomicU64,
+    pub(crate) modify_meter: Arc<crate::traffic::Counters>,
 }
 
 impl Control {
@@ -78,6 +79,7 @@ impl Control {
             instance, publication: Mutex::new(Publication::default()),
             accepted: AtomicU64::new(0), active: AtomicU64::new(0),
             errors: AtomicU64::new(0), uploaded: AtomicU64::new(0), downloaded: AtomicU64::new(0),
+            modify_meter: Arc::new(crate::traffic::Counters::new()),
         }), receiver))
     }
 
@@ -105,13 +107,15 @@ impl Control {
 
     pub(crate) fn status(&self) -> Status {
         let publication = self.publication.lock().map(|state| *state).unwrap_or_default();
+        let modify = self.modify_meter.snapshot();
         Status {
             phase: self.phase(), revision: publication.revision,
             binding: Binding { instance: self.instance, revision: publication.revision, digest: publication.digest },
             admitting: self.ready() && publication.admitting,
             accepted: self.accepted.load(Ordering::Relaxed),
             active: self.active.load(Ordering::Relaxed), errors: self.errors.load(Ordering::Relaxed),
-            uploaded: self.uploaded.load(Ordering::Relaxed), downloaded: self.downloaded.load(Ordering::Relaxed),
+            uploaded: self.uploaded.load(Ordering::Relaxed).saturating_add(modify.upload),
+            downloaded: self.downloaded.load(Ordering::Relaxed).saturating_add(modify.download),
         }
     }
 

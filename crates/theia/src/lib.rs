@@ -134,6 +134,7 @@ pub enum Command {
         domains: Vec<String>,
         confirm: Option<[u8; 32]>,
         anonymous: bool,
+        owned: bool,
     },
     Trust(descriptor_cli::Command),
     Reference(reference_cli::Command),
@@ -373,7 +374,7 @@ fn expected_revision(raw: &str) -> Result<u64, CliError> {
     raw.parse::<u64>().map_err(|_| CliError::InvalidArguments)
 }
 
-fn parse_anti_dpi_diagnostic(path: &str, mut args: &[&str]) -> Result<Command, CliError> {
+fn parse_anti_dpi_diagnostic(path: &str, mut args: &[&str], owned: bool) -> Result<Command, CliError> {
     let overlay = if let ["--overlay", path, rest @ ..] = args {
         args = rest;
         Some(config_path(path)?)
@@ -402,7 +403,8 @@ fn parse_anti_dpi_diagnostic(path: &str, mut args: &[&str]) -> Result<Command, C
         ),
         _ => return Err(CliError::InvalidArguments),
     };
-    Ok(Command::AntiDpiDiagnostic { config: config_path(path)?, overlay, domains, confirm, anonymous })
+    if owned && overlay.is_some() { return Err(CliError::InvalidArguments); }
+    Ok(Command::AntiDpiDiagnostic { config: config_path(path)?, overlay, domains, confirm, anonymous, owned })
 }
 
 /// Parse arguments excluding argv[0]; reject unknown and duplicate flags.
@@ -456,8 +458,8 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
                 Ok(Command::AntiDpiApply { config, confirm, enroll: *mode == "enroll" })
             }
         },
-        ["anti-dpi", "diagnose", "--config", path, rest @ ..] =>
-            parse_anti_dpi_diagnostic(path, rest),
+        ["anti-dpi", mode @ ("diagnose" | "diagnose-owned"), "--config", path, rest @ ..] =>
+            parse_anti_dpi_diagnostic(path, rest, *mode == "diagnose-owned"),
         ["anti-dpi", "catalog"] => Ok(Command::AntiDpiCatalog { overlay: None }),
         ["anti-dpi", "catalog", "--overlay", path] => Ok(Command::AntiDpiCatalog { overlay: Some(config_path(path)?) }),
         ["anti-dpi", "validate", "--config", path] => Ok(Command::AntiDpiValidate {
@@ -782,7 +784,7 @@ pub fn help(topic: Option<&str>) -> Result<&'static str, CliError> {
         Some("client") => {
             Ok("Usage: theia client run --config <path> [--system-proxy --confirm]\ntheia client status\ntheia client lifecycle\ntheia client disconnect --expected-revision N --sha256 HEX --instance HEX --confirm\ntheia client reload --check --expected-revision N --sha256 HEX\ntheia client reload --apply --expected-revision N --sha256 HEX --confirm\ntheia client windivert --check --directory DIR --dll-sha256 HEX --sys-sha256 HEX [--install-lab --confirm]\ntheia client windivert --loopback-lab --directory DIR --dll-sha256 HEX --sys-sha256 HEX --confirm\ntheia client windivert --scope-drop-lab --directory DIR --dll-sha256 HEX --sys-sha256 HEX --interface-index N --seconds 1..30 --confirm-block (isolated local console only; drops all outbound IP on interface)\ntheia client windivert --redirect-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --targets IP:PORT[,IP:PORT] --seconds 5..120 --confirm-isolated\ntheia client windivert --tcp-relay-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --target IP:PORT --confirm\ntheia client windivert --udp-relay-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --target IP:PORT [--flows 1..8] --confirm\ntheia client windivert --interface-redirect-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --capture-interface N --carrier-interface N --seconds 5..120 --confirm-isolated-two-interface\ntheia client linux --host-redirect-lab --config PATH --port N --confirm-disposable-local-console\ntheia client linux --host-guard-rearm --confirm-disposable-host\ntheia client linux --host-guard-recover --confirm-disposable-local-console\ntheia client proxy --status\ntheia client proxy --recover --confirm\nWindows only: explicitly opt in to user WinINet HTTP(S) proxy after binding local HTTP/SOCKS5 listeners. Saved ingress_mode=system_proxy alone never starts a connection. Snapshot+durable journal, conditional restore on Ctrl+C/normal stop, explicit CAS recovery after crash. Never overwrites foreign proxy changes. CLI flags and TUI import alone never apply OS changes.")
         }
-        Some("anti-dpi") => Ok("Usage: theia anti-dpi validate --config <path> | theia anti-dpi preflight --config <path> | theia anti-dpi catalog [--overlay <path>] | theia anti-dpi diagnose --config PATH [--overlay PATH] --domains HOST[,HOST] [--confirm HEX] [--anonymous]\nCommands: tui [--config PATH]; status --config PATH; live-apply/disconnect require exact --instance HEX --revision N --policy HEX (live-apply also --confirm HEX); enroll/apply/connect --config PATH [--confirm HEX]. Enroll/Apply are offline; Connect requires an applied policy and explicit consent. Windows development Pass/Drop only; Modify is denied until acceptance. Validation, catalogue and unconfirmed diagnostic preview are offline. Use all to select the entire enabled catalogue within limits. Confirm the exact preview digest to run bounded Windows diagnostics without altering OS proxy settings. No VPS; unaccepted strategies remain disabled."),
+        Some("anti-dpi") => Ok("Usage: theia anti-dpi validate --config <path> | theia anti-dpi preflight --config <path> | theia anti-dpi catalog [--overlay <path>] | theia anti-dpi diagnose --config PATH [--overlay PATH] --domains HOST[,HOST] [--confirm HEX] [--anonymous]\nCommands: tui [--config PATH]; status --config PATH; live-apply/disconnect require exact --instance HEX --revision N --policy HEX (live-apply also --confirm HEX); enroll/apply/connect --config PATH [--confirm HEX]. Enroll/Apply are offline; Connect requires an applied policy and explicit consent. Windows development Pass/Drop only; Modify is denied until acceptance. Validation, catalogue and unconfirmed diagnostic preview are offline. Use all to select the entire enabled catalogue within limits. Confirm the exact preview digest to run bounded Windows diagnostics without altering OS proxy settings. Use diagnose-owned instead of diagnose to use the current owner via IPC; uses the owner's fixed overlay and binds confirmation to its instance/revision. No VPS; unaccepted strategies remain disabled."),
         Some("trust") => Ok(descriptor_cli::HELP),
         Some("reference") => Ok(reference_cli::HELP),
         Some("reality") => Ok(reality_cli::HELP),
