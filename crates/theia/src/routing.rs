@@ -22,7 +22,10 @@ pub mod linux_ingress;
 pub mod linux_rules;
 #[cfg(all(
     any(feature = "native-ingress-lab", test),
-    any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64"))
+    any(
+        target_os = "linux",
+        all(target_os = "windows", target_arch = "x86_64")
+    )
 ))]
 pub(crate) mod native_dns;
 #[cfg(all(any(feature = "native-ingress-lab", test), target_os = "linux"))]
@@ -668,6 +671,12 @@ impl Policy {
     /// Syntactic validation; category existence is checked against pinned DAT at prepare time.
     pub fn validate_rules(rules: &[Rule]) -> Result<(), RoutingError> {
         compile_selectors(rules).map(|_| ())
+    }
+
+    /// Check whether syntactically valid rules require a verified DAT pair.
+    pub(crate) fn requires_geodata(rules: &[Rule]) -> Result<bool, RoutingError> {
+        let (_, sites, ips) = compile_selectors(rules)?;
+        Ok(!sites.is_empty() || !ips.is_empty())
     }
 
     pub fn compile(rules: &[Rule], geosite: &[u8], geoip: &[u8]) -> Result<Self, RoutingError> {

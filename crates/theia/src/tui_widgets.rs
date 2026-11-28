@@ -28,6 +28,70 @@ pub(crate) fn canvas(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
+/// Shared role chrome; this deliberately has no dependency on role state or
+/// commands. Server, SmartTheia and standalone all supply verified text.
+pub(crate) fn shell_header(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    brand: &str,
+    status: &str,
+    state: &str,
+) {
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    format!(" {brand} "),
+                    Style::default()
+                        .fg(BG)
+                        .bg(ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("  {status}"), Style::default().fg(TEXT)),
+            ]),
+            Line::styled(state, Style::default().fg(MUTED)),
+        ])
+        .style(Style::default().bg(SURFACE)),
+        area,
+    );
+}
+
+pub(crate) fn section_navigation(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    labels: &[&str],
+    page: usize,
+    focused: bool,
+) {
+    use ratatui::widgets::{List, ListItem};
+    let items = labels
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let current = i == page;
+            let marker = if current && focused {
+                "›"
+            } else if current {
+                "•"
+            } else {
+                " "
+            };
+            let style = if current && focused {
+                Style::default()
+                    .fg(ACCENT)
+                    .bg(FOCUS)
+                    .add_modifier(Modifier::BOLD)
+            } else if current {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(TEXT)
+            };
+            ListItem::new(format!("{marker} {label}")).style(style)
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(List::new(items).block(section(" Разделы ", focused)), area);
+}
+
 /// A flat section with an inset header, preserving the traditional one-cell
 /// inner geometry used by lists and tables. No visible rectangular outline.
 pub(crate) fn section(title: &str, active: bool) -> Block<'_> {
@@ -271,49 +335,135 @@ impl Form {
     fn reference_window(&self, area: Rect) -> (Rect, usize, usize) {
         let top = area.height.min(3);
         let bottom = area.height.saturating_sub(top).min(5);
-        let table = Rect::new(area.x, area.y + top, area.width, area.height.saturating_sub(top + bottom));
+        let table = Rect::new(
+            area.x,
+            area.y + top,
+            area.width,
+            area.height.saturating_sub(top + bottom),
+        );
         let capacity = usize::from(table.height.saturating_sub(1));
-        let start = self.selected.saturating_sub(capacity.saturating_sub(1)).min(self.fields.len().saturating_sub(capacity));
+        let start = self
+            .selected
+            .saturating_sub(capacity.saturating_sub(1))
+            .min(self.fields.len().saturating_sub(capacity));
         (table, start, capacity)
     }
 
     pub(crate) fn hit_reference_choices(&self, area: Rect, x: u16, y: u16) -> Option<usize> {
         let (table, start, capacity) = self.reference_window(area);
-        if x < table.x || x >= table.right() || y <= table.y || y >= table.bottom() { return None; }
+        if x < table.x || x >= table.right() || y <= table.y || y >= table.bottom() {
+            return None;
+        }
         let offset = usize::from(y - table.y - 1);
-        if offset >= capacity { return None; }
+        if offset >= capacity {
+            return None;
+        }
         self.fields.get(start + offset).map(|field| field.id)
     }
 
     pub(crate) fn render_reference_choices(&self, frame: &mut Frame<'_>, area: Rect) {
         canvas(frame, area);
         let (table, start, capacity) = self.reference_window(area);
-        frame.render_widget(Paragraph::new(self.lead.as_str()).wrap(Wrap { trim: true }).style(Style::default().fg(TEXT)),
-            Rect::new(area.x, area.y, area.width, table.y - area.y));
+        frame.render_widget(
+            Paragraph::new(self.lead.as_str())
+                .wrap(Wrap { trim: true })
+                .style(Style::default().fg(TEXT)),
+            Rect::new(area.x, area.y, area.width, table.y - area.y),
+        );
         let wide = area.width >= 78;
         let widths = if wide {
-            vec![Constraint::Min(15), Constraint::Length(25), Constraint::Length(3), Constraint::Length(3), Constraint::Length(8), Constraint::Length(4), Constraint::Length(12)]
+            vec![
+                Constraint::Min(15),
+                Constraint::Length(25),
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Length(8),
+                Constraint::Length(4),
+                Constraint::Length(12),
+            ]
         } else {
-            vec![Constraint::Min(10), Constraint::Length(8), Constraint::Length(4), Constraint::Length(11)]
+            vec![
+                Constraint::Min(10),
+                Constraint::Length(8),
+                Constraint::Length(4),
+                Constraint::Length(11),
+            ]
         };
-        let header = if wide { vec!["Сайт", "Адрес", "H2", "H3", "H2, мс", "Балл", "Назначение"] }
-            else { vec!["Сайт", "H2, мс", "Балл", "Назначение"] };
+        let header = if wide {
+            vec!["Сайт", "Адрес", "H2", "H3", "H2, мс", "Балл", "Назначение"]
+        } else {
+            vec!["Сайт", "H2, мс", "Балл", "Назначение"]
+        };
         let rows = self.fields.iter().skip(start).take(capacity).map(|field| {
             let columns: Vec<_> = field.value.split('\t').collect();
             let cell = |i| columns.get(i).copied().unwrap_or("").to_owned();
-            let cells = if wide { vec![cell(0), cell(1), cell(2), cell(3), cell(4), cell(5), field.label.to_owned()] }
-                else { vec![cell(0), cell(4), cell(5), field.label.to_owned()] };
-            Row::new(cells).style(Style::default().fg(if field.label == "Отказ" { ERROR } else if field.label == "Подходит" { TEXT } else { ACCENT })
-                .bg(if field.id == self.selected { FOCUS } else { BG }))
+            let cells = if wide {
+                vec![
+                    cell(0),
+                    cell(1),
+                    cell(2),
+                    cell(3),
+                    cell(4),
+                    cell(5),
+                    field.label.to_owned(),
+                ]
+            } else {
+                vec![cell(0), cell(4), cell(5), field.label.to_owned()]
+            };
+            Row::new(cells).style(
+                Style::default()
+                    .fg(if field.label == "Отказ" {
+                        ERROR
+                    } else if field.label == "Подходит" {
+                        TEXT
+                    } else {
+                        ACCENT
+                    })
+                    .bg(if field.id == self.selected { FOCUS } else { BG }),
+            )
         });
-        frame.render_widget(Table::new(rows, widths).header(Row::new(header).style(Style::default().fg(MUTED))), table);
-        let info = self.fields.iter().find(|field| field.id == self.selected).map_or(String::new(), |field| {
-            let columns: Vec<_> = field.value.split('\t').collect();
-            format!("{} · {} · H2 {} · H3 {} · {}", columns.first().copied().unwrap_or(""), columns.get(1).copied().unwrap_or(""), columns.get(2).copied().unwrap_or("?"), columns.get(3).copied().unwrap_or("?"), field.label)
-        });
-        let detail = format!("{}–{} / {}\n{}\n{}", if capacity == 0 { 0 } else { start + 1 }, (start + capacity).min(self.fields.len()), self.fields.len(), info, self.error);
-        frame.render_widget(Paragraph::new(detail).wrap(Wrap { trim: true }).style(Style::default().fg(if self.error.is_empty() { MUTED } else { WARNING })),
-            Rect::new(area.x, table.bottom(), area.width, area.bottom().saturating_sub(table.bottom())));
+        frame.render_widget(
+            Table::new(rows, widths).header(Row::new(header).style(Style::default().fg(MUTED))),
+            table,
+        );
+        let info = self
+            .fields
+            .iter()
+            .find(|field| field.id == self.selected)
+            .map_or(String::new(), |field| {
+                let columns: Vec<_> = field.value.split('\t').collect();
+                format!(
+                    "{} · {} · H2 {} · H3 {} · {}",
+                    columns.first().copied().unwrap_or(""),
+                    columns.get(1).copied().unwrap_or(""),
+                    columns.get(2).copied().unwrap_or("?"),
+                    columns.get(3).copied().unwrap_or("?"),
+                    field.label
+                )
+            });
+        let detail = format!(
+            "{}–{} / {}\n{}\n{}",
+            if capacity == 0 { 0 } else { start + 1 },
+            (start + capacity).min(self.fields.len()),
+            self.fields.len(),
+            info,
+            self.error
+        );
+        frame.render_widget(
+            Paragraph::new(detail)
+                .wrap(Wrap { trim: true })
+                .style(Style::default().fg(if self.error.is_empty() {
+                    MUTED
+                } else {
+                    WARNING
+                })),
+            Rect::new(
+                area.x,
+                table.bottom(),
+                area.width,
+                area.bottom().saturating_sub(table.bottom()),
+            ),
+        );
     }
 
     pub(crate) fn render(&self, frame: &mut Frame<'_>, area: Rect, title: &str) {
@@ -738,7 +888,10 @@ impl ReferenceReview {
                         format!("{:<26} {:<25} ", row.name, row.address),
                         Style::default().fg(TEXT),
                     ),
-                    Span::styled(format!("{transports:<14} {latency:<9} "), Style::default().fg(MUTED)),
+                    Span::styled(
+                        format!("{transports:<14} {latency:<9} "),
+                        Style::default().fg(MUTED),
+                    ),
                     Span::styled(
                         format!("{status} · {}", row.score),
                         Style::default().fg(color).add_modifier(Modifier::BOLD),
@@ -759,7 +912,10 @@ impl ReferenceReview {
                 );
                 append_wrapped(
                     lines,
-                    &format!("  {transports} · H2: {latency} мс · {status} · {}", row.score),
+                    &format!(
+                        "  {transports} · H2: {latency} мс · {status} · {}",
+                        row.score
+                    ),
                     width,
                     Style::default().fg(color),
                 );

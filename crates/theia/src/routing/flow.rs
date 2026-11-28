@@ -60,6 +60,11 @@ impl FlowTable {
         }
     }
 
+    #[cfg(windows)]
+    pub(crate) fn standalone() -> Arc<Self> {
+        Arc::new(Self::new(MAX_FLOWS))
+    }
+
     pub(crate) fn shared() -> Arc<Self> {
         static TABLE: OnceLock<Arc<FlowTable>> = OnceLock::new();
         TABLE.get_or_init(|| Arc::new(Self::new(MAX_FLOWS))).clone()

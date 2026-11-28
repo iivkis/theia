@@ -452,7 +452,11 @@ pub(crate) struct SearchObservation {
     pub h2_ms: Option<u64>,
 }
 
-async fn check_target_measured(target: &Target, roots: &RootCertStore, own: &HashSet<IpAddr>) -> SearchObservation {
+async fn check_target_measured(
+    target: &Target,
+    roots: &RootCertStore,
+    own: &HashSet<IpAddr>,
+) -> SearchObservation {
     let mut rounds = [Evidence::default(); 2];
     let mut times = [0u64; 2];
     for (index, round) in rounds.iter_mut().enumerate() {
@@ -465,7 +469,10 @@ async fn check_target_measured(target: &Target, roots: &RootCertStore, own: &Has
             async {
                 let started = std::time::Instant::now();
                 let result = timeout(ATTEMPT, h2_head(target, roots.clone())).await;
-                (result, started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+                (
+                    result,
+                    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                )
             },
             timeout(ATTEMPT, h3_head(target, roots.clone()))
         );
@@ -484,7 +491,9 @@ async fn check_target_measured(target: &Target, roots: &RootCertStore, own: &Has
     };
     SearchObservation {
         evidence,
-        h2_ms: evidence.eligible().then(|| times[0].saturating_add(times[1]) / 2),
+        h2_ms: evidence
+            .eligible()
+            .then(|| times[0].saturating_add(times[1]) / 2),
     }
 }
 

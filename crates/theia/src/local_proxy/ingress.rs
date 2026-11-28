@@ -374,6 +374,107 @@ async fn socks_request(socket: &mut TcpStream) -> Result<SocksRequest, ClientErr
     }
 }
 
+/// Role-neutral negotiation, with exactly the same framing and loopback
+/// boundary for SmartTheia and the standalone client. No egress is opened.
+pub(super) enum Request {
+    Tcp {
+        address: Address,
+        port: u16,
+        plain: Option<Vec<u8>>,
+    },
+    Udp {
+        address: Address,
+        port: u16,
+    },
+}
+
+pub(super) async fn negotiate(
+    socket: &mut TcpStream,
+    is_http: bool,
+) -> Result<Request, ClientError> {
+    if !socket
+        .peer_addr()
+        .map_err(|_| ClientError::Io)?
+        .ip()
+        .is_loopback()
+        || !socket
+            .local_addr()
+            .map_err(|_| ClientError::Io)?
+            .ip()
+            .is_loopback()
+    {
+        return Err(ClientError::Open(ErrorCode::PolicyDenied));
+    }
+    if is_http {
+        match timeout(NEGOTIATE_TIMEOUT, http_target(socket)).await {
+            Ok(Ok(HttpRequest::Connect(address, port))) => Ok(Request::Tcp {
+                address,
+                port,
+                plain: None,
+            }),
+            Ok(Ok(HttpRequest::Plain(address, port, request))) => Ok(Request::Tcp {
+                address,
+                port,
+                plain: Some(request),
+            }),
+            Ok(Err(reply)) => {
+                let _ = timeout(REPLY_TIMEOUT, socket.write_all(reply)).await;
+                Err(ClientError::Protocol)
+            }
+            Err(_) => Err(ClientError::Timeout),
+        }
+    } else {
+        match timeout(NEGOTIATE_TIMEOUT, socks_request(socket))
+            .await
+            .map_err(|_| ClientError::Timeout)??
+        {
+            SocksRequest::Connect(address, port) => Ok(Request::Tcp {
+                address,
+                port,
+                plain: None,
+            }),
+            SocksRequest::Associate(address, port) => Ok(Request::Udp { address, port }),
+        }
+    }
+}
+
+pub(super) async fn success(socket: &mut TcpStream, is_http: bool) -> Result<(), ClientError> {
+    if is_http {
+        timeout(REPLY_TIMEOUT, socket.write_all(HTTP_OK))
+            .await
+            .map_err(|_| ClientError::Timeout)?
+            .map_err(|_| ClientError::Io)
+    } else {
+        timeout(REPLY_TIMEOUT, socks_reply(socket, 0))
+            .await
+            .map_err(|_| ClientError::Timeout)?
+    }
+}
+
+pub(super) async fn failure(socket: &mut TcpStream, is_http: bool, error: &ClientError) {
+    if is_http {
+        let reply = match error {
+            ClientError::Open(ErrorCode::PolicyDenied) | ClientError::Unauthorized => HTTP_DENIED,
+            ClientError::Timeout
+            | ClientError::QuicUnreachable
+            | ClientError::QuicEndpointNetworkRefused
+            | ClientError::Open(ErrorCode::DialTimeout) => HTTP_TIMEOUT,
+            _ => HTTP_FAILED,
+        };
+        let _ = timeout(REPLY_TIMEOUT, socket.write_all(reply)).await;
+    } else {
+        let code = match error {
+            ClientError::Open(ErrorCode::PolicyDenied) | ClientError::Unauthorized => 2,
+            ClientError::Open(ErrorCode::DialFailed) => 4,
+            ClientError::Open(ErrorCode::AddressInvalid) => 8,
+            ClientError::Timeout | ClientError::Open(ErrorCode::DialTimeout) => 6,
+            _ => 1,
+        };
+        let _ = timeout(REPLY_TIMEOUT, socks_reply(socket, code)).await;
+    }
+    let _ = timeout(REPLY_TIMEOUT, socket.shutdown()).await;
+}
+
 pub(super) async fn handle(
     mut socket: TcpStream,
     is_http: bool,
@@ -386,43 +487,23 @@ pub(super) async fn handle(
         "negotiation_started",
         "session" = Value::Count(session_id)
     );
-    if !socket
-        .peer_addr()
-        .map_err(|_| ClientError::Io)?
-        .ip()
-        .is_loopback()
-    {
-        return Err(ClientError::Open(ErrorCode::PolicyDenied));
-    }
-    let mut plain = None;
-    let (address, port) = if is_http {
-        match timeout(NEGOTIATE_TIMEOUT, http_target(&mut socket)).await {
-            Ok(Ok(HttpRequest::Connect(address, port))) => (address, port),
-            Ok(Ok(HttpRequest::Plain(address, port, request))) => {
-                plain = Some(request);
-                (address, port)
-            }
-            Ok(Err(reply)) => {
-                let _ = timeout(REPLY_TIMEOUT, socket.write_all(reply)).await;
-                crate::diag!(
-                    Warn,
-                    "client.proxy",
-                    "http_connect_parse_failed",
-                    "session" = Value::Count(session_id)
-                );
-                return Err(ClientError::Protocol);
-            }
-            Err(_) => return Err(ClientError::Timeout),
+    let (address, port, plain) = match negotiate(&mut socket, is_http).await {
+        Ok(Request::Tcp {
+            address,
+            port,
+            plain,
+        }) => (address, port, plain),
+        Ok(Request::Udp { address, port }) => {
+            return Box::pin(udp_association(socket, client, address, port)).await
         }
-    } else {
-        match timeout(NEGOTIATE_TIMEOUT, socks_request(&mut socket))
-            .await
-            .map_err(|_| ClientError::Timeout)??
-        {
-            SocksRequest::Connect(address, port) => (address, port),
-            SocksRequest::Associate(address, port) => {
-                return Box::pin(udp_association(socket, client, address, port)).await
-            }
+        Err(error) => {
+            crate::diag!(
+                Warn,
+                "client.proxy",
+                "http_connect_parse_failed",
+                "session" = Value::Count(session_id)
+            );
+            return Err(error);
         }
     };
     crate::diag!(
@@ -462,16 +543,7 @@ pub(super) async fn handle(
                 return Box::pin(tunnel.relay_http(socket, request)).await;
             }
             // A direct socket is already connected; proxied routes verified OPEN_OK.
-            if is_http {
-                timeout(REPLY_TIMEOUT, socket.write_all(HTTP_OK))
-                    .await
-                    .map_err(|_| ClientError::Timeout)?
-                    .map_err(|_| ClientError::Io)?;
-            } else {
-                timeout(REPLY_TIMEOUT, socks_reply(&mut socket, 0))
-                    .await
-                    .map_err(|_| ClientError::Timeout)??;
-            }
+            success(&mut socket, is_http).await?;
             Box::pin(tunnel.relay(socket)).await
         }
         Err(error) => {
@@ -482,31 +554,7 @@ pub(super) async fn handle(
                 "session" = Value::Count(session_id),
                 "reason" = Value::Label(error_kind(&error))
             );
-            if is_http {
-                let reply = match error {
-                    ClientError::Open(ErrorCode::PolicyDenied) | ClientError::Unauthorized => {
-                        HTTP_DENIED
-                    }
-                    ClientError::Timeout
-                    | ClientError::QuicUnreachable
-                    | ClientError::QuicEndpointNetworkRefused
-                    | ClientError::Open(ErrorCode::DialTimeout) => HTTP_TIMEOUT,
-                    _ => HTTP_FAILED,
-                };
-                let _ = timeout(REPLY_TIMEOUT, socket.write_all(reply)).await;
-            } else {
-                let code = match error {
-                    ClientError::Open(ErrorCode::PolicyDenied) | ClientError::Unauthorized => 2,
-                    ClientError::Open(ErrorCode::DialFailed) => 4,
-                    ClientError::Open(ErrorCode::AddressInvalid) => 8,
-                    ClientError::Timeout | ClientError::Open(ErrorCode::DialTimeout) => 6,
-                    _ => 1,
-                };
-                let _ = timeout(REPLY_TIMEOUT, socks_reply(&mut socket, code)).await;
-            }
-            // Send an orderly FIN after the terminal denial. Never reopen a
-            // tunnel or retry the rejected remote request.
-            let _ = timeout(REPLY_TIMEOUT, socket.shutdown()).await;
+            failure(&mut socket, is_http, &error).await;
             Err(error)
         }
     }

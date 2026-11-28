@@ -1692,7 +1692,12 @@ impl Editor {
             Role::Server if self.compact_server_fields => &["Адрес сервера", "Порт подключения"],
             Role::Server => &["TLS DNS", "H2 TCP", "H3 UDP"],
             Role::Client if self.compact_server_fields => &["Адрес сервера"],
-            Role::Client => &["Адрес сервера", "Имя сервера (TLS)", "Транспорт", "Режим XHTTP"],
+            Role::Client => &[
+                "Адрес сервера",
+                "Имя сервера (TLS)",
+                "Транспорт",
+                "Режим XHTTP",
+            ],
         };
         let values: Vec<String> = match &self.draft {
             Config::Server(doc) => doc

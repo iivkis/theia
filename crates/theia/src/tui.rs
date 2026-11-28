@@ -2,6 +2,8 @@
 //!
 //! M4.1c edits safe fields; M4.4b adds one-time server issuance and reveal.
 //! Explicit runtime and Windows proxy actions are isolated in confirmed panels.
+mod standalone;
+
 use crate::{
     client_import,
     invite::Invitation,
@@ -37,7 +39,7 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{List, ListItem, Paragraph, Row, Table, Wrap},
     Frame, Terminal,
@@ -124,6 +126,8 @@ enum Screen {
 #[derive(Debug, Clone, Copy)]
 struct Model {
     selected: Role,
+    home_anti_dpi: bool,
+    launch_anti_dpi: bool,
     screen: Screen,
     return_from_help: Screen,
 }
@@ -138,6 +142,8 @@ impl Model {
         };
         Self {
             selected,
+            home_anti_dpi: false,
+            launch_anti_dpi: false,
             screen,
             return_from_help: screen,
         }
@@ -170,29 +176,58 @@ impl Model {
             }
             KeyCode::Char('1') if self.screen != Screen::Help => {
                 self.selected = Role::Server;
+                self.home_anti_dpi = false;
                 self.screen = Screen::Server;
                 false
             }
             KeyCode::Char('2') if self.screen != Screen::Help => {
                 self.selected = Role::Client;
+                self.home_anti_dpi = false;
                 self.screen = Screen::Client;
                 false
             }
+            KeyCode::Char('3') if self.screen == Screen::Home => {
+                self.home_anti_dpi = true;
+                self.launch_anti_dpi = true;
+                false
+            }
             KeyCode::Left if self.screen == Screen::Home => {
-                self.selected = Role::Server;
+                if self.home_anti_dpi {
+                    self.home_anti_dpi = false;
+                    self.selected = Role::Client;
+                } else {
+                    self.selected = Role::Server;
+                }
                 false
             }
             KeyCode::Right if self.screen == Screen::Home => {
-                self.selected = Role::Client;
+                if self.selected == Role::Client {
+                    self.home_anti_dpi = true;
+                } else {
+                    self.selected = Role::Client;
+                }
                 false
             }
             // Tab remains an optional accessibility shortcut, not the primary
             // navigation. Vertical arrows do not move horizontal role cards.
             KeyCode::Tab | KeyCode::BackTab if self.screen == Screen::Home => {
-                self.selected = if self.selected == Role::Server {
-                    Role::Client
+                let current = if self.home_anti_dpi {
+                    2
+                } else if self.selected == Role::Client {
+                    1
                 } else {
+                    0
+                };
+                let next = if key.code == KeyCode::BackTab {
+                    (current + 2) % 3
+                } else {
+                    (current + 1) % 3
+                };
+                self.home_anti_dpi = next == 2;
+                self.selected = if next == 0 {
                     Role::Server
+                } else {
+                    Role::Client
                 };
                 false
             }
@@ -210,6 +245,10 @@ impl Model {
                 false
             }
             KeyCode::Enter if self.screen == Screen::Home => {
+                if self.home_anti_dpi {
+                    self.launch_anti_dpi = true;
+                    return false;
+                }
                 self.screen = match self.selected {
                     Role::Server => Screen::Server,
                     Role::Client => Screen::Client,
@@ -790,6 +829,8 @@ struct GeoPicker {
     query: String,
     codes: Vec<String>,
     marked: std::collections::BTreeSet<String>,
+    original: std::collections::BTreeSet<String>,
+    verified: bool,
     focus: usize,
     marked_only: bool,
     action: Option<usize>,
@@ -813,6 +854,8 @@ impl GeoPicker {
             query: String::new(),
             codes: Vec::new(),
             marked: Default::default(),
+            original: Default::default(),
+            verified: false,
             focus: 0,
             marked_only: false,
             action: None,
@@ -822,7 +865,87 @@ impl GeoPicker {
     }
 
     fn prefix(&self) -> &'static str {
-        if self.field == 2 { "geosite:" } else { "geoip:" }
+        if self.field == 2 {
+            "geosite:"
+        } else {
+            "geoip:"
+        }
+    }
+
+    fn tokens(value: &str) -> impl Iterator<Item = &str> {
+        value
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|s| !s.is_empty())
+    }
+
+    fn code<'a>(&self, token: &'a str) -> Option<&'a str> {
+        let code = token.strip_prefix(self.prefix())?;
+        (!code.is_empty()
+            && code.len() <= 128
+            && code
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b)))
+        .then_some(code)
+    }
+
+    fn seed(&mut self, value: &str) {
+        self.original = Self::tokens(value)
+            .filter_map(|token| self.code(token))
+            .map(str::to_ascii_lowercase)
+            .collect();
+        self.marked = self.original.clone();
+    }
+
+    fn set_catalog(&mut self, mut codes: Vec<String>) {
+        codes.sort_unstable();
+        codes.dedup();
+        self.codes = codes;
+        self.verified = true;
+        self.loading = None;
+        self.action = None;
+    }
+
+    fn in_catalog(&self, code: &str) -> bool {
+        self.codes
+            .binary_search_by(|candidate| candidate.as_str().cmp(code))
+            .is_ok()
+    }
+
+    fn can_apply(&self) -> bool {
+        self.verified && (!self.marked.is_empty() || !self.original.is_empty())
+    }
+
+    fn changes(&self) -> (usize, usize) {
+        (
+            self.marked.difference(&self.original).count(),
+            self.original.difference(&self.marked).count(),
+        )
+    }
+
+    fn removes_all(&self) -> bool {
+        self.verified && self.marked.is_empty() && !self.original.is_empty()
+    }
+
+    fn synced_value(&self, value: &str) -> String {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut next = Vec::new();
+        for token in Self::tokens(value) {
+            if let Some(code) = self.code(token) {
+                let code = code.to_ascii_lowercase();
+                if self.marked.contains(&code) && seen.insert(code) {
+                    // Preserve spelling and position of existing selectors.
+                    next.push(token.to_owned());
+                }
+            } else {
+                // A manual domain/IP/CIDR or an invalid token is not owned
+                // by the picker. Rule validation remains a separate step.
+                next.push(token.to_owned());
+            }
+        }
+        for code in self.marked.difference(&seen) {
+            next.push(format!("{}{code}", self.prefix()));
+        }
+        next.join(", ")
     }
 
     fn matches(&self) -> Vec<&str> {
@@ -831,15 +954,29 @@ impl GeoPicker {
         }
         let query = self.query.to_ascii_lowercase();
         let needle = query.strip_prefix(self.prefix()).unwrap_or(&query);
-        self.codes.iter().map(String::as_str).filter(|code| code.contains(needle)).collect()
+        let mut result: Vec<_> = self
+            .codes
+            .iter()
+            .map(String::as_str)
+            .chain(
+                self.original
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|code| !self.in_catalog(code)),
+            )
+            .filter(|code| code.contains(needle))
+            .collect();
+        result.sort_unstable();
+        result
     }
 
     fn poll(&mut self) {
-        let Some(rx) = &self.loading else { return; };
+        let Some(rx) = &self.loading else {
+            return;
+        };
         match rx.try_recv() {
             Ok(Ok(codes)) => {
-                self.codes = codes;
-                self.loading = None;
+                self.set_catalog(codes);
             }
             Ok(Err(message)) => {
                 self.message = message;
@@ -854,7 +991,9 @@ impl GeoPicker {
     }
 
     fn query(&mut self, text: &str) {
-        if text.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.:".contains(&b))
+        if text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-.:".contains(&b))
             && self.query.len().saturating_add(text.len()) <= 128
         {
             self.query.push_str(text);
@@ -871,17 +1010,49 @@ impl GeoPicker {
     }
 
     fn actions(&self) -> Vec<ActionItem> {
-        let mut items = vec![ActionItem { key: 'c', label: "Отменить" }];
-        if self.loading.is_none() && (!self.codes.is_empty() || self.marked_only) {
+        let mut items = vec![ActionItem {
+            key: 'c',
+            label: "Отменить",
+        }];
+        if self.verified && (!self.marked.is_empty() || self.marked_only) {
             items.push(ActionItem {
                 key: 'm',
-                label: if self.marked_only { "Вернуться к поиску" } else { "Показать отмеченные" },
+                label: if self.marked_only {
+                    "Вернуться к поиску"
+                } else {
+                    "Показать отмеченные"
+                },
             });
         }
-        if self.loading.is_none() && !self.marked.is_empty() {
-            items.push(ActionItem { key: 'a', label: "Добавить отмеченные" });
+        if self.can_apply() {
+            items.push(ActionItem {
+                key: 'a',
+                label: "Применить выбор",
+            });
         }
         items
+    }
+
+    fn enter_action(&self) -> Option<usize> {
+        self.action
+            .or_else(|| self.actions().iter().position(|item| item.key == 'a'))
+    }
+
+    fn row_status(&self, code: &str) -> (&'static str, Color) {
+        if !self.verified {
+            ("Не проверено", MUTED)
+        } else if !self.in_catalog(code) {
+            ("Нет в базе", WARNING)
+        } else {
+            (
+                "",
+                if self.marked.contains(code) {
+                    ACCENT
+                } else {
+                    TEXT
+                },
+            )
+        }
     }
 
     fn info(&self) -> String {
@@ -890,7 +1061,11 @@ impl GeoPicker {
         } else if !self.message.is_empty() {
             self.message.as_str()
         } else if self.matches().is_empty() {
-            if self.marked_only { "Нет отмеченных категорий." } else { "Категории не найдены." }
+            if self.marked_only {
+                "Нет отмеченных категорий."
+            } else {
+                "Категории не найдены."
+            }
         } else {
             ""
         };
@@ -899,26 +1074,59 @@ impl GeoPicker {
         } else {
             ""
         };
-        let full = self.matches().get(self.focus).map(|code| format!("{}{}", self.prefix(), code));
+        let full = self
+            .matches()
+            .get(self.focus)
+            .map(|code| format!("{}{}", self.prefix(), code));
         // Expose long category names without relying on truncation in the table.
         let full = full.filter(|code| code.len() > 56).unwrap_or_default();
-        [state, semantic, full.as_str()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n")
+        let unavailable = if self.verified && self.marked.iter().any(|code| !self.in_catalog(code))
+        {
+            "Отмеченные категории с пометкой «нет в базе» уже были в поле. Можно оставить или снять."
+        } else {
+            ""
+        };
+        let empty = if self.removes_all() {
+            "Внимание: все категории этого типа будут удалены из поля."
+        } else {
+            ""
+        };
+        [state, empty, unavailable, semantic, full.as_str()]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn layout(&self, area: Rect) -> GeoPickerLayout {
         let width = area.width.min(78);
         let inner_width = width.saturating_sub(4);
         let info = self.info();
-        let info_lines = if info.is_empty() { 0 } else {
-            visual_rows(&info, usize::from(inner_width).max(1)).0.len().min(6) as u16
+        let info_lines = if info.is_empty() {
+            0
+        } else {
+            visual_rows(&info, usize::from(inner_width).max(1))
+                .0
+                .len()
+                .min(6) as u16
         };
+        let summary_height = if self.verified { 2 } else { 1 };
+        let top_height = 1 + summary_height;
         let desired_rows = self.matches().len().clamp(1, 12) as u16 + 1;
         let desired_controls = self.actions().len() as u16 + 2;
-        let height = area.height.min(26).min(4 + desired_rows + info_lines + desired_controls);
-        let outer = Rect::new(area.x + (area.width - width) / 2, area.y + (area.height - height) / 2, width, height);
+        let height = area
+            .height
+            .min(26)
+            .min(2 + top_height + desired_rows + info_lines + desired_controls);
+        let outer = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        );
         let x = outer.x.saturating_add(2);
         let inner_h = height.saturating_sub(2);
-        let top = inner_h.min(2);
+        let top = inner_h.min(top_height);
         let control_h = desired_controls.min(inner_h.saturating_sub(top).saturating_sub(2));
         let room = inner_h.saturating_sub(top + control_h);
         let info_h = info_lines.min(room.saturating_sub(2));
@@ -928,11 +1136,20 @@ impl GeoPicker {
         let rows = Rect::new(x, summary.bottom(), inner_width, rows_h);
         let info = Rect::new(x, rows.bottom(), inner_width, info_h);
         let controls = Rect::new(x, info.bottom(), inner_width, control_h);
-        GeoPickerLayout { outer, search, summary, rows, info, controls }
+        GeoPickerLayout {
+            outer,
+            search,
+            summary,
+            rows,
+            info,
+            controls,
+        }
     }
 
     fn window(&self, capacity: usize, total: usize) -> usize {
-        self.focus.saturating_sub(capacity.saturating_sub(1)).min(total.saturating_sub(capacity))
+        self.focus
+            .saturating_sub(capacity.saturating_sub(1))
+            .min(total.saturating_sub(capacity))
     }
 
     fn select_at(&mut self, area: Rect, x: u16, y: u16) {
@@ -940,7 +1157,8 @@ impl GeoPicker {
         let rows = layout.rows;
         if x >= rows.x && x < rows.right() && y > rows.y && y < rows.bottom() {
             let count = self.matches().len();
-            let index = self.window(usize::from(rows.height.saturating_sub(1)), count) + usize::from(y - rows.y - 1);
+            let index = self.window(usize::from(rows.height.saturating_sub(1)), count)
+                + usize::from(y - rows.y - 1);
             if index < count {
                 self.focus = index;
                 self.action = None;
@@ -948,7 +1166,12 @@ impl GeoPicker {
             return;
         }
         let items = self.actions();
-        if let Some(index) = (Actions { items: &items, selected: self.action.unwrap_or(0) }).hit(layout.controls, x, y) {
+        if let Some(index) = (Actions {
+            items: &items,
+            selected: self.enter_action().unwrap_or(0),
+        })
+        .hit(layout.controls, x, y)
+        {
             self.action = Some(index);
         } else if x >= layout.search.x && x < layout.search.right() && y == layout.search.y {
             self.action = None;
@@ -959,48 +1182,173 @@ impl GeoPicker {
         let layout = self.layout(area);
         let outer = layout.outer;
         frame.render_widget(ratatui::widgets::Clear, outer);
-        frame.render_widget(ratatui::widgets::Block::bordered()
-            .title(if self.field == 2 { " Выбор GeoSite " } else { " Выбор GeoIP " })
-            .style(Style::default().fg(ACCENT).bg(BG)), outer);
-        if outer.height < 6 || outer.width < 18 { return; }
+        frame.render_widget(
+            ratatui::widgets::Block::bordered()
+                .title(if self.field == 2 {
+                    " Выбор GeoSite "
+                } else {
+                    " Выбор GeoIP "
+                })
+                .style(Style::default().fg(ACCENT).bg(BG)),
+            outer,
+        );
+        if outer.height < 6 || outer.width < 18 {
+            return;
+        }
         let filtered = self.matches();
         let capacity = usize::from(layout.rows.height.saturating_sub(1));
         let start = self.window(capacity, filtered.len());
         let search = if self.marked_only {
-            format!("Все отмеченные · фильтр сохранён: {}", self.query)
+            if self.query.is_empty() {
+                "Все отмеченные".into()
+            } else {
+                format!("Все отмеченные · поиск: {}", self.query)
+            }
         } else {
-            format!("Поиск: {}{}", self.query, if self.action.is_none() { "▏" } else { "" })
+            format!(
+                "Поиск: {}{}",
+                self.query,
+                if self.action.is_none() { "▏" } else { "" }
+            )
         };
-        frame.render_widget(Paragraph::new(search).style(Style::default().fg(TEXT).bg(INPUT)), layout.search);
+        frame.render_widget(
+            Paragraph::new(search).style(Style::default().fg(TEXT).bg(INPUT)),
+            layout.search,
+        );
         let end = (start + capacity).min(filtered.len());
-        let summary = format!("{}: {} из {} · Отмечено: {} · {}–{}", if self.marked_only { "Выбрано" } else { "Найдено" }, filtered.len(), self.codes.len(), self.marked.len(), if end == 0 { 0 } else { start + 1 }, end);
-        frame.render_widget(Paragraph::new(summary).style(Style::default().fg(MUTED)), layout.summary);
-        let table = filtered.iter().enumerate().skip(start).take(capacity).map(|(index, code)| {
-            let chosen = self.marked.contains(*code);
-            Row::new(vec![if chosen { "[x]" } else { "[ ]" }.to_owned(), format!("{}{code}", self.prefix())])
-                .style(Style::default().fg(if chosen || index == self.focus { ACCENT } else { TEXT })
-                    .bg(if index == self.focus && self.action.is_none() { FOCUS } else { BG }))
-        });
-        frame.render_widget(Table::new(table, [Constraint::Length(5), Constraint::Min(8)])
-            .header(Row::new(["Выбор", "Категория"]).style(Style::default().fg(MUTED))), layout.rows);
+        let summary = if self.verified {
+            let range = if end > 0 && filtered.len() > capacity {
+                format!(" · {}–{}", start + 1, end)
+            } else {
+                String::new()
+            };
+            let (added, removed) = self.changes();
+            let counts = if self.marked_only {
+                format!("Отмечено: {}{range}", self.marked.len())
+            } else {
+                format!(
+                    "Найдено: {} · Отмечено: {}{range}",
+                    filtered.len(),
+                    self.marked.len()
+                )
+            };
+            vec![
+                Line::styled(counts, Style::default().fg(MUTED)),
+                Line::from(vec![
+                    Span::styled(
+                        format!("Добавлено: {added}"),
+                        Style::default().fg(if added > 0 { ACCENT } else { MUTED }),
+                    ),
+                    Span::raw(" · "),
+                    Span::styled(
+                        format!("Удалено: {removed}"),
+                        Style::default().fg(if removed > 0 { WARNING } else { MUTED }),
+                    ),
+                ]),
+            ]
+        } else {
+            vec![Line::styled(
+                format!("Каталог не проверен · В поле: {}", self.original.len()),
+                Style::default().fg(MUTED),
+            )]
+        };
+        frame.render_widget(Paragraph::new(summary), layout.summary);
+        let table = filtered
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(capacity)
+            .map(|(index, code)| {
+                let chosen = self.marked.contains(*code);
+                let (status, color) = self.row_status(code);
+                Row::new(vec![
+                    if chosen { "[x]" } else { "[ ]" }.to_owned(),
+                    format!("{}{code}", self.prefix()),
+                    status.to_owned(),
+                ])
+                .style(Style::default().fg(color).bg(
+                    if self.verified && index == self.focus && self.action.is_none() {
+                        FOCUS
+                    } else {
+                        BG
+                    },
+                ))
+            });
+        frame.render_widget(
+            Table::new(
+                table,
+                [
+                    Constraint::Length(5),
+                    Constraint::Min(8),
+                    Constraint::Length(13),
+                ],
+            )
+            .header(Row::new(["Выбор", "Категория", "Статус"]).style(Style::default().fg(MUTED))),
+            layout.rows,
+        );
         if layout.info.height > 0 {
-            frame.render_widget(Paragraph::new(self.info()).wrap(Wrap { trim: true }).style(Style::default().fg(if self.message.is_empty() { MUTED } else { WARNING })), layout.info);
+            let info = self.info();
+            let lines = info
+                .lines()
+                .map(|line| {
+                    let warning = line == self.message
+                        || line.starts_with("Внимание:")
+                        || line.starts_with("Отмеченные категории с пометкой");
+                    Line::styled(
+                        line.to_owned(),
+                        Style::default().fg(if warning { WARNING } else { MUTED }),
+                    )
+                })
+                .collect::<Vec<_>>();
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), layout.info);
         }
         let items = self.actions();
-        Actions { items: &items, selected: self.action.unwrap_or(0) }
+        let selection = self.enter_action();
+        if let Some(selected) = selection {
+            Actions {
+                items: &items,
+                selected,
+            }
             .render_with_focus(frame, layout.controls, self.action.is_some());
+        } else {
+            // No implicit Enter action in this state: draw a plain list,
+            // without a misleading selection marker on Cancel.
+            let rows = items
+                .iter()
+                .map(|item| {
+                    ratatui::widgets::ListItem::new(format!("   {}", item.label))
+                        .style(Style::default().fg(TEXT))
+                })
+                .collect::<Vec<_>>();
+            frame.render_widget(
+                ratatui::widgets::List::new(rows).block(tui_widgets::section(" Действия ", false)),
+                layout.controls,
+            );
+        }
     }
 
     fn footer(&self) -> &'static str {
-        if self.loading.is_some() {
-            "Esc отменить"
+        if self.action.is_some() {
+            "↑↓ действие · Enter выполнить выбранное · Tab переключить · Esc отменить"
+        } else if !self.verified {
+            "Tab действия · Esc отменить"
+        } else if self.can_apply() {
+            if self.matches().is_empty() {
+                "Поиск · Enter применить выбор · Tab действия · Esc отменить"
+            } else {
+                "↑↓ строка · Пробел отметить/снять · Enter применить выбор · Tab действия · Esc отменить"
+            }
+        } else if self.matches().is_empty() {
+            "Измените поиск · Tab действия · Esc отменить"
         } else {
-            "↑↓ строка · Пробел отметить · Tab действия · Enter выполнить · F4 отмеченные · Esc отменить"
+            "↑↓ строка · Пробел отметить · Tab действия · Esc отменить"
         }
     }
 }
 
 struct RoutingPanel {
+    standalone: bool,
+    save_requested: bool,
     settings: crate::routing::Settings,
     original: crate::routing::Settings,
     search: Option<String>,
@@ -1038,7 +1386,34 @@ impl RoutingPanel {
                     .unwrap_or(Path::new("."))
                     .join("geodata")
             });
+        Self::from_settings(settings, directory, false)
+    }
+
+    fn for_standalone(document: &crate::anti_dpi::Document, path: &Path) -> Self {
+        let local = &document.anti_dpi;
+        let settings = crate::routing::Settings {
+            revision: local.revision,
+            geodata_directory: local.geodata.as_ref().map(|g| g.directory.clone()),
+            diagnostic_domains: crate::routing::snapshot::default_diagnostic_domains(),
+            rules: local.rules.clone(),
+            datasets: local.geodata.as_ref().map(|g| g.manifest.clone()),
+        };
+        let directory = settings
+            .geodata_directory
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| path.parent().unwrap_or(Path::new(".")).join("geodata"));
+        Self::from_settings(settings, directory, true)
+    }
+
+    fn from_settings(
+        settings: crate::routing::Settings,
+        directory: PathBuf,
+        standalone: bool,
+    ) -> Self {
         Self {
+            standalone,
+            save_requested: false,
             original: settings.clone(),
             settings,
             search: None,
@@ -1065,6 +1440,19 @@ impl RoutingPanel {
             None => value,
         }
     }
+    fn display_action(&self, value: &str) -> &str {
+        if self.standalone
+            && crate::routing::Action::from_name(value) == Some(crate::routing::Action::DirectDpi)
+        {
+            "Anti-DPI (без резервного маршрута)"
+        } else {
+            // All canonical action names have static Russian labels.
+            match crate::routing::Action::from_name(value) {
+                Some(action) => Self::action_label(action.name()),
+                None => "Неизвестное действие",
+            }
+        }
+    }
     fn edit(&mut self, index: Option<usize>) {
         let values = index
             .and_then(|i| self.settings.rules.get(i))
@@ -1080,7 +1468,13 @@ impl RoutingPanel {
             .unwrap_or_else(|| {
                 [
                     String::new(),
-                    crate::routing::Action::Allowed.name().into(),
+                    (if self.standalone {
+                        crate::routing::Action::Direct
+                    } else {
+                        crate::routing::Action::Allowed
+                    })
+                    .name()
+                    .into(),
                     String::new(),
                     String::new(),
                     String::new(),
@@ -1107,7 +1501,9 @@ impl RoutingPanel {
         }
         if let Some((_, fields, focus)) = &mut self.fields {
             let input = input.trim_end_matches(['\r', '\n']);
-            if *focus < 4 && *focus != 1 && !input.chars().any(char::is_control)
+            if *focus < 4
+                && *focus != 1
+                && !input.chars().any(char::is_control)
                 && fields[*focus].len().saturating_add(input.len()) <= 8192
             {
                 fields[*focus].push_str(input);
@@ -1116,6 +1512,9 @@ impl RoutingPanel {
     }
     fn open_geo_picker(&mut self, field: usize) {
         let mut picker = GeoPicker::new(field);
+        if let Some((_, fields, _)) = &self.fields {
+            picker.seed(&fields[field]);
+        }
         if let Some(manifest) = self.settings.datasets.clone() {
             let directory = self.directory.clone();
             let (tx, rx) = mpsc::channel();
@@ -1124,9 +1523,11 @@ impl RoutingPanel {
                 let result = (|| {
                     let store = crate::routing::geodata::Store::new(directory)
                         .map_err(|e| format!("GeoData: {e:?}"))?;
-                    let pair = store.load_pinned(&manifest, &[])
+                    let pair = store
+                        .load_pinned(&manifest, &[])
                         .map_err(|e| format!("GeoData: {e:?}"))?;
-                    pair.category_names(field == 2).map_err(|e| format!("GeoData: {e:?}"))
+                    pair.category_names(field == 2)
+                        .map_err(|e| format!("GeoData: {e:?}"))
                 })();
                 let _ = tx.send(result);
             });
@@ -1136,12 +1537,18 @@ impl RoutingPanel {
         self.geo_picker = Some(picker);
     }
     fn geo_key(&mut self, key: KeyEvent) {
-        let Some(mut picker) = self.geo_picker.take() else { return; };
-        if key.code == KeyCode::Esc { return; }
+        let Some(mut picker) = self.geo_picker.take() else {
+            return;
+        };
+        if key.code == KeyCode::Esc {
+            return;
+        }
         let items = picker.actions();
         let action_count = items.len();
         let mut command = None;
-        if key.modifiers.is_empty() {
+        if key.modifiers.is_empty()
+            || (key.code == KeyCode::BackTab && key.modifiers == KeyModifiers::SHIFT)
+        {
             match key.code {
                 KeyCode::Tab => {
                     picker.action = match picker.action {
@@ -1163,20 +1570,25 @@ impl RoutingPanel {
                 }
                 KeyCode::Up | KeyCode::Down if picker.action.is_some() => {
                     let i = picker.action.unwrap_or(0);
-                    picker.action = Some(if key.code == KeyCode::Up { i.saturating_sub(1) } else { (i + 1).min(action_count - 1) });
+                    picker.action = Some(if key.code == KeyCode::Up {
+                        i.saturating_sub(1)
+                    } else {
+                        (i + 1).min(action_count - 1)
+                    });
                     self.geo_picker = Some(picker);
                     return;
                 }
                 KeyCode::Enter => {
-                    command = if let Some(i) = picker.action {
-                        items.get(i).map(|item| item.key)
-                    } else if !picker.marked.is_empty() {
-                        Some('a')
-                    } else {
-                        None
-                    };
+                    command = picker
+                        .enter_action()
+                        .and_then(|i| items.get(i))
+                        .map(|item| item.key);
                 }
-                KeyCode::F(4) if picker.loading.is_none() => command = Some('m'),
+                KeyCode::F(4)
+                    if picker.verified && (!picker.marked.is_empty() || picker.marked_only) =>
+                {
+                    command = Some('m')
+                }
                 _ => {}
             }
         }
@@ -1187,58 +1599,84 @@ impl RoutingPanel {
                 self.geo_picker = Some(picker);
                 return;
             }
-            Some('a') if picker.loading.is_none() && !picker.marked.is_empty() => {
-                if let Some((_, fields, _)) = &mut self.fields {
-                    let current = &fields[picker.field];
-                    let mut existing = current.split(|c: char| c == ',' || c.is_whitespace())
-                        .filter(|s| !s.is_empty()).map(str::to_ascii_lowercase).collect::<std::collections::HashSet<_>>();
-                    let mut next = current.trim_end().to_owned();
-                    for code in &picker.marked {
-                        let token = format!("{}{code}", picker.prefix());
-                        if existing.insert(token.clone()) {
-                            if !next.is_empty() && !next.ends_with(',') { next.push_str(", "); }
-                            else if !next.is_empty() { next.push(' '); }
-                            next.push_str(&token);
-                        }
-                    }
+            Some('a') if picker.can_apply() => {
+                if let Some((_, fields, focus)) = &mut self.fields {
+                    let next = picker.synced_value(&fields[picker.field]);
                     if next.len() > 8192 {
                         picker.message = "Превышен размер поля. Снимите часть отметок.".into();
                         self.geo_picker = Some(picker);
                         return;
                     }
                     fields[picker.field] = next;
+                    *focus = picker.field;
                 }
                 return;
             }
             _ => {}
         }
-        if picker.loading.is_some() {
+        if !picker.verified {
             self.geo_picker = Some(picker);
             return;
         }
         match key.code {
             KeyCode::Up => picker.focus = picker.focus.saturating_sub(1),
-            KeyCode::Down => picker.focus = (picker.focus + 1).min(picker.matches().len().saturating_sub(1)),
-            KeyCode::PageUp => { picker.action = None; picker.focus = picker.focus.saturating_sub(10); }
-            KeyCode::PageDown => { picker.action = None; picker.focus = (picker.focus + 10).min(picker.matches().len().saturating_sub(1)); }
-            KeyCode::Home => { picker.action = None; picker.focus = 0; }
-            KeyCode::End => { picker.action = None; picker.focus = picker.matches().len().saturating_sub(1); }
+            KeyCode::Down => {
+                picker.focus = (picker.focus + 1).min(picker.matches().len().saturating_sub(1))
+            }
+            KeyCode::PageUp => {
+                picker.action = None;
+                picker.focus = picker.focus.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                picker.action = None;
+                picker.focus = (picker.focus + 10).min(picker.matches().len().saturating_sub(1));
+            }
+            KeyCode::Home => {
+                picker.action = None;
+                picker.focus = 0;
+            }
+            KeyCode::End => {
+                picker.action = None;
+                picker.focus = picker.matches().len().saturating_sub(1);
+            }
             KeyCode::Char(' ') if key.modifiers.is_empty() && picker.action.is_none() => {
                 if let Some(code) = picker.matches().get(picker.focus).map(|s| (*s).to_owned()) {
-                    if !picker.marked.remove(&code) { picker.marked.insert(code); }
+                    if !picker.marked.remove(&code) {
+                        picker.marked.insert(code);
+                    }
                     picker.focus = picker.focus.min(picker.matches().len().saturating_sub(1));
-                    if picker.message.starts_with("Превышен размер поля") { picker.message.clear(); }
+                    if picker.message.starts_with("Превышен размер поля") {
+                        picker.message.clear();
+                    }
                 }
             }
-            KeyCode::Backspace => { picker.query.pop(); picker.focus = 0; picker.action = None; picker.marked_only = false; }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => { picker.query.clear(); picker.focus = 0; picker.action = None; picker.marked_only = false; }
-            KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => picker.query(&c.to_string()),
+            KeyCode::Backspace => {
+                picker.query.pop();
+                picker.focus = 0;
+                picker.action = None;
+                picker.marked_only = false;
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                picker.query.clear();
+                picker.focus = 0;
+                picker.action = None;
+                picker.marked_only = false;
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                picker.query(&c.to_string())
+            }
             _ => {}
         }
         self.geo_picker = Some(picker);
     }
     fn poll(&mut self) {
-        if let Some(picker) = &mut self.geo_picker { picker.poll(); }
+        if let Some(picker) = &mut self.geo_picker {
+            picker.poll();
+        }
         let Some(rx) = &self.download else {
             return;
         };
@@ -1367,10 +1805,12 @@ impl RoutingPanel {
             key: 'B',
             label: "Управление базами GeoData",
         });
-        items.push(ActionItem {
-            key: 'G',
-            label: "Домены диагностики клиентов",
-        });
+        if !self.standalone {
+            items.push(ActionItem {
+                key: 'G',
+                label: "Домены диагностики клиентов",
+            });
+        }
         if count > 1 {
             items.push(ActionItem {
                 key: '/',
@@ -1404,17 +1844,37 @@ impl RoutingPanel {
         let (_, values, focus) = self.fields.as_ref()?;
         let definitions = [
             (0, "Имя правила", "Короткое понятное название."),
-            (1, "Действие (←→)", "Стрелки влево и вправо выбирают действие из списка."),
-            (2, "Домены / GeoSite", "Введите домены через запятую или откройте выбор GeoSite."),
-            (5, "› Выбрать из GeoSite", "Enter — открыть поиск категорий GeoSite."),
-            (3, "IP / CIDR / GeoIP", "Введите IP/CIDR через запятую или откройте выбор GeoIP."),
-            (6, "› Выбрать из GeoIP", "Enter — открыть поиск. GeoIP Lite: региональные наборы IP, не геолокация."),
+            (
+                1,
+                "Действие (←→)",
+                "Стрелки влево и вправо выбирают действие из списка.",
+            ),
+            (
+                2,
+                "Домены / GeoSite",
+                "Введите домены через запятую или откройте выбор GeoSite.",
+            ),
+            (
+                5,
+                "› Выбрать из GeoSite",
+                "Enter — открыть поиск категорий GeoSite.",
+            ),
+            (
+                3,
+                "IP / CIDR / GeoIP",
+                "Введите IP/CIDR через запятую или откройте выбор GeoIP.",
+            ),
+            (
+                6,
+                "› Выбрать из GeoIP",
+                "Enter — открыть поиск. GeoIP Lite: региональные наборы IP, не геолокация.",
+            ),
         ];
         Some(Form {
             fields: definitions.iter().map(|&(id, label, hint)| Field {
                 id, label, hint,
                 value: match id {
-                    1 => Self::action_label(&values[id]).to_owned(),
+                    1 => self.display_action(&values[id]).to_owned(),
                     5 | 6 => "Открыть поиск (F6)".into(),
                     _ => values[id].clone(),
                 },
@@ -1433,7 +1893,11 @@ impl RoutingPanel {
         if let Some(form) = self.form() {
             form.render(frame, area, "Редактирование правила");
             if let Some(picker) = &self.geo_picker {
-                frame.render_widget(ratatui::widgets::Block::default().style(Style::default().add_modifier(Modifier::DIM)), area);
+                frame.render_widget(
+                    ratatui::widgets::Block::default()
+                        .style(Style::default().add_modifier(Modifier::DIM)),
+                    area,
+                );
                 picker.render(frame, area);
             }
             return;
@@ -1443,7 +1907,7 @@ impl RoutingPanel {
         if let Some([report, controls]) = self.layout(area) {
             if self.fields.is_none() && self.download.is_none() && !self.geodata_mode {
                 let info = format!(
-                    "GeoData: {} · {}\nПервое совпадение сверху; остальные — через сервер.",
+                    "GeoData: {} · {}\nПервое совпадение сверху; остальные — {}.",
                     self.settings
                         .datasets
                         .as_ref()
@@ -1452,6 +1916,11 @@ impl RoutingPanel {
                         "без изменений"
                     } else {
                         "черновик изменён"
+                    },
+                    if self.standalone {
+                        "напрямую при всех NoMatch"
+                    } else {
+                        "через сервер"
                     }
                 );
                 let header = Rect::new(report.x, report.y, report.width, 3.min(report.height));
@@ -1505,7 +1974,8 @@ impl RoutingPanel {
                             format!("{} {}", if chosen { "›" } else { " " }, i + 1),
                             rule.name.clone(),
                             conditions,
-                            Self::action_label(Self::action_name(rule.action)).to_owned(),
+                            self.display_action(Self::action_name(rule.action))
+                                .to_owned(),
                         ])
                         .style(
                             Style::default().fg(if chosen { ACCENT } else { TEXT }).bg(
@@ -1537,13 +2007,22 @@ impl RoutingPanel {
                     let footer = if !self.message.is_empty() {
                         self.message.clone()
                     } else if self.settings.rules.is_empty() {
-                        "Нет правил · по умолчанию: через сервер".into()
+                        if self.standalone {
+                            "Нет правил · по умолчанию: напрямую".into()
+                        } else {
+                            "Нет правил · по умолчанию: через сервер".into()
+                        }
                     } else {
                         format!(
-                            "{}–{} / {} · по умолчанию: через сервер · Tab действия",
+                            "{}–{} / {} · по умолчанию: {} · Tab действия",
                             start + 1,
                             (start + capacity).min(self.settings.rules.len()),
-                            self.settings.rules.len()
+                            self.settings.rules.len(),
+                            if self.standalone {
+                                "напрямую"
+                            } else {
+                                "через сервер"
+                            }
                         )
                     };
                     frame.render_widget(
@@ -1723,7 +2202,10 @@ impl RoutingPanel {
                     self.fields = None;
                 }
                 KeyCode::Up | KeyCode::BackTab | KeyCode::Down | KeyCode::Tab => {
-                    let index = Self::FORM_ORDER.iter().position(|id| id == focus).unwrap_or(0);
+                    let index = Self::FORM_ORDER
+                        .iter()
+                        .position(|id| id == focus)
+                        .unwrap_or(0);
                     let next = if matches!(key.code, KeyCode::Up | KeyCode::BackTab) {
                         index.saturating_sub(1)
                     } else {
@@ -1732,12 +2214,20 @@ impl RoutingPanel {
                     *focus = Self::FORM_ORDER[next];
                 }
                 KeyCode::Char('u')
-                    if *focus < 4 && *focus != 1 && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    if *focus < 4
+                        && *focus != 1
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
                     fields[*focus].clear()
                 }
                 KeyCode::Left | KeyCode::Right if *focus == 1 => {
-                    let options = crate::routing::Action::ALL.map(crate::routing::Action::name);
+                    let options = crate::routing::Action::ALL
+                        .into_iter()
+                        .filter(|action| {
+                            !self.standalone || *action != crate::routing::Action::Allowed
+                        })
+                        .map(crate::routing::Action::name)
+                        .collect::<Vec<_>>();
                     let index = options.iter().position(|a| *a == fields[1]).unwrap_or(0);
                     let next = if key.code == KeyCode::Right {
                         (index + 1) % options.len()
@@ -1750,7 +2240,8 @@ impl RoutingPanel {
                     fields[*focus].pop();
                 }
                 KeyCode::Char(c)
-                    if *focus < 4 && *focus != 1
+                    if *focus < 4
+                        && *focus != 1
                         && !key
                             .modifiers
                             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -1764,6 +2255,11 @@ impl RoutingPanel {
                         self.message = "Выберите действие стрелками влево или вправо.".into();
                         return true;
                     };
+                    if self.standalone && action == crate::routing::Action::Allowed {
+                        self.message =
+                            "Маршрут через сервер недоступен в самостоятельной роли.".into();
+                        return true;
+                    }
                     let split = |s: &str| {
                         s.split(|c: char| c == ',' || c.is_whitespace())
                             .filter(|s| !s.is_empty())
@@ -1854,7 +2350,7 @@ impl RoutingPanel {
                 self.geodata_mode = true;
                 self.action_focus = Some(0);
             }
-            KeyCode::Char('G') => {
+            KeyCode::Char('G') if !self.standalone => {
                 self.diagnostic_input = Some(self.settings.diagnostic_domains.join(", "));
                 self.message.clear();
             }
@@ -1895,6 +2391,9 @@ impl RoutingPanel {
                         Ok(()) => return false,
                         Err(e) => self.message = e.into(),
                     }
+                } else if self.standalone {
+                    self.save_requested = true;
+                    return false;
                 }
             }
             _ => {}
@@ -1925,7 +2424,7 @@ impl RoutingPanel {
             .enumerate()
             {
                 let value = if i == 1 {
-                    Self::action_label(value)
+                    self.display_action(value)
                 } else {
                     value.as_str()
                 };
@@ -1937,11 +2436,12 @@ impl RoutingPanel {
             body.push_str("\nДомены: example.org или geosite:google\nIP: 192.0.2.0/24 или geoip:private · через запятую\nПриложение: sha256: + 64 строчных hex-символа; в MVP нет атрибуции\nGeoIP Lite: in-ru, in-cn, in-ir — региональные наборы, не геолокация\n\n↑↓ / Tab: поле · ←→: действие · Ctrl+U: очистить\nEnter: принять правило · Esc: отменить");
         } else {
             body.push_str(&format!(
-                "GeoData: {} (GeoSite Standard + GeoIP Lite)\nПравила проверяются сверху вниз. Без совпадения — через сервер.\n",
+                "GeoData: {} (GeoSite Standard + GeoIP Lite)\nПравила проверяются сверху вниз. Без совпадения — {}.\n",
                 self.settings
                     .datasets
                     .as_ref()
-                    .map_or("не выбраны", |m| m.release.as_str())
+                    .map_or("не выбраны", |m| m.release.as_str()),
+                if self.standalone { "напрямую только при всех NoMatch" } else { "через сервер" }
             ));
             let start = self.selected.saturating_sub(3);
             for (i, rule) in self.settings.rules.iter().enumerate().skip(start).take(7) {
@@ -1950,7 +2450,7 @@ impl RoutingPanel {
                     if i == self.selected { "›" } else { " " },
                     i + 1,
                     rule.name,
-                    Self::action_label(Self::action_name(rule.action))
+                    self.display_action(Self::action_name(rule.action))
                 ));
             }
             if self.settings.rules.is_empty() {
@@ -3407,12 +3907,15 @@ impl Interaction {
         if let Some(panel) = self.reality_provision.as_mut() {
             if let Some(form) = panel.form() {
                 let target = guided_form_area(body, form.fields.len());
-                let hit = if panel.guide().is_some_and(|guide| guide.2 == "Выбор сайтов") {
+                let hit = if panel.guide().is_some_and(|guide| guide.2 == "Выбор сайтов")
+                {
                     form.hit_reference_choices(target, event.column, event.row)
                 } else {
                     form.hit(target, event.column, event.row)
                 };
-                if let Some(id) = hit { panel.select_field(id); }
+                if let Some(id) = hit {
+                    panel.select_field(id);
+                }
             }
             return;
         }
@@ -3525,9 +4028,15 @@ impl Interaction {
             let cards = home_layout(body);
             if inside(cards[0]) {
                 model.selected = Role::Server;
+                model.home_anti_dpi = false;
             }
             if inside(cards[1]) {
                 model.selected = Role::Client;
+                model.home_anti_dpi = false;
+            }
+            if inside(cards[2]) {
+                model.selected = Role::Client;
+                model.home_anti_dpi = true;
             }
             return;
         }
@@ -4677,9 +5186,15 @@ impl Interaction {
                                     // Both file formats use the same local picker and guarded
                                     // parser. Selecting a source does not read or trust it.
                                     self.workspace_focus = WorkspaceFocus::Fields;
-                                    self.update(model, KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+                                    self.update(
+                                        model,
+                                        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+                                    );
                                     if self.importing.is_some() {
-                                        self.update(model, KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
+                                        self.update(
+                                            model,
+                                            KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE),
+                                        );
                                     }
                                     return false;
                                 }
@@ -6214,7 +6729,7 @@ fn shell_layout(area: Rect) -> [Rect; 3] {
     [parts[0], parts[1], parts[2]]
 }
 
-fn home_layout(area: Rect) -> [Rect; 2] {
+fn home_layout(area: Rect) -> [Rect; 3] {
     let mut content = centered_column(area, 112);
     // Keep the roles side by side even in a narrow terminal so the
     // direction of the arrows never changes with window size.
@@ -6224,9 +6739,13 @@ fn home_layout(area: Rect) -> [Rect; 2] {
     }
     let parts = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+        ])
         .split(content);
-    [parts[0], parts[1]]
+    [parts[0], parts[1], parts[2]]
 }
 
 fn workspace_columns(area: Rect) -> Option<[Rect; 3]> {
@@ -6272,9 +6791,7 @@ fn record_rows(editor: &Editor, area: Rect) -> Vec<(usize, String)> {
         // even when a long hostname must wrap across several physical rows.
         let port_start = if editor.role() == Role::Client {
             label.rsplit_once(':').and_then(|(host, port)| {
-                (!port.is_empty()
-                    && port.bytes().all(|b| b.is_ascii_digit())
-                    && port.len() + 1 <= width)
+                (!port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && port.len() < width)
                     .then_some(host.len())
             })
         } else {
@@ -6930,23 +7447,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             applied.unwrap_or_else(|| "Работа с этими настройками не подтверждена".into())
         )
     };
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(
-                    format!(" {brand} "),
-                    Style::default()
-                        .fg(BG)
-                        .bg(ACCENT)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!("  {status}"), Style::default().fg(TEXT)),
-            ]),
-            Line::styled(state, Style::default().fg(MUTED)),
-        ])
-        .style(Style::default().bg(SURFACE)),
-        parts[0],
-    );
+    tui_widgets::shell_header(frame, parts[0], brand, status, &state);
     match model.screen {
         Screen::Home => {
             let cards = home_layout(parts[1]);
@@ -6954,8 +7455,9 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
                 frame.render_widget(Paragraph::new("Что вы хотите сделать?").style(Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
                     Rect::new(cards[0].x + 1, parts[1].y, cards[0].width.saturating_sub(2), 1));
             }
-            draw_role_card(frame, cards[0], Role::Server, model.selected == Role::Server);
-            draw_role_card(frame, cards[1], Role::Client, model.selected == Role::Client);
+            draw_role_card(frame, cards[0], Role::Server, !model.home_anti_dpi && model.selected == Role::Server);
+            draw_role_card(frame, cards[1], Role::Client, !model.home_anti_dpi && model.selected == Role::Client);
+            draw_home_card(frame, cards[2], "Anti-DPI", "Локальная диагностика без сервера.", model.home_anti_dpi);
         }
         Screen::Server | Screen::Client => {
             let role = if model.screen == Screen::Server { Role::Server } else { Role::Client };
@@ -7506,14 +8008,24 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             );
         }
     }
-    if let Some(picker) = interaction.and_then(|ui| ui.routing_panel.as_ref()).and_then(|panel| panel.geo_picker.as_ref()) {
+    if let Some(picker) = interaction
+        .and_then(|ui| ui.routing_panel.as_ref())
+        .and_then(|panel| panel.geo_picker.as_ref())
+    {
         // The entire workspace is modal while the picker is open. The
         // overlay is redrawn after dimming so only its own controls are active.
-        frame.render_widget(ratatui::widgets::Block::default().style(Style::default().add_modifier(Modifier::DIM)), parts[1]);
+        frame.render_widget(
+            ratatui::widgets::Block::default().style(Style::default().add_modifier(Modifier::DIM)),
+            parts[1],
+        );
         let content = workspace_columns(parts[1]).map_or(parts[1], |columns| columns[2]);
         picker.render(frame, content);
-        frame.render_widget(Paragraph::new(tui_widgets::key_line(picker.footer()))
-            .style(Style::default().bg(SURFACE)).wrap(Wrap { trim: true }), parts[2]);
+        frame.render_widget(
+            Paragraph::new(tui_widgets::key_line(picker.footer()))
+                .style(Style::default().bg(SURFACE))
+                .wrap(Wrap { trim: true }),
+            parts[2],
+        );
         return;
     }
     let footer = if interaction.is_some_and(Interaction::inline_import) {
@@ -8234,6 +8746,10 @@ fn draw_role_card(frame: &mut Frame<'_>, area: Rect, role: Role, selected: bool)
         Role::Server => ("Для сервера", "Настроить сервер и выдавать доступ."),
         Role::Client => ("Для клиента", "Подключиться по полученному ключу."),
     };
+    draw_home_card(frame, area, title, details, selected);
+}
+
+fn draw_home_card(frame: &mut Frame<'_>, area: Rect, title: &str, details: &str, selected: bool) {
     let area = Rect::new(
         area.x.saturating_add(1),
         area.y,
@@ -8355,9 +8871,7 @@ fn client_mode_lines(editor: &Editor, running: bool) -> Vec<Line<'static>> {
             } else {
                 "Нет отслеживаемого локального сеанса этой панели"
             },
-            Style::default()
-                .fg(MUTED)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
         ),
         Line::raw(format!("Активный профиль: {active}")),
         Line::raw(if editor.selected_record_is_active() {
@@ -8972,32 +9486,7 @@ fn draw_workspace(
     };
     let page = ui.map_or(0, |u| u.workspace_page);
     let nav_focused = ui.is_some_and(|u| u.workspace_focus == WorkspaceFocus::Navigation);
-    let categories = pages(role).iter().enumerate().map(|(i, label)| {
-        let current = i == page;
-        let marker = if current && nav_focused {
-            "›"
-        } else if current {
-            "•"
-        } else {
-            " "
-        };
-        let style = if current && nav_focused {
-            Style::default()
-                .fg(ACCENT)
-                .bg(FOCUS)
-                .add_modifier(Modifier::BOLD)
-        } else if current {
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(TEXT)
-        };
-        ListItem::new(format!("{marker} {label}")).style(style)
-    });
-    frame.render_widget(
-        List::new(categories.collect::<Vec<_>>())
-            .block(tui_widgets::section(" Разделы ", nav_focused)),
-        nav,
-    );
+    tui_widgets::section_navigation(frame, nav, pages(role), page, nav_focused);
     if let Some(editor) = editor {
         if page_has_records(role, page) {
             draw_workspace_records(
@@ -9478,6 +9967,11 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor, focused: bool
 
 /// Edit only when both role and a config path are explicitly supplied.
 /// Saving never changes a service. A separate, explicitly confirmed Linux\n/// IPC transaction is available only for saved server authorization deltas.
+pub fn run_anti_dpi(config_path: Option<&Path>) -> Result<(), TuiError> {
+    let default = crate::tui_menu::default_config("anti-dpi.toml");
+    standalone::run(config_path.unwrap_or(&default))
+}
+
 pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiError> {
     crate::diag!(
         Info,
@@ -9581,6 +10075,24 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
                     if interaction.update(&mut model, key) {
                         crate::diag!(Info, "tui", "closed_by_user");
                         return Ok(());
+                    }
+                    if std::mem::take(&mut model.launch_anti_dpi) {
+                        if interaction.editor.as_ref().is_some_and(Editor::dirty)
+                            || interaction.owned_running(Role::Server)
+                            || interaction.owned_running(Role::Client)
+                        {
+                            interaction.preview_text = Some(
+                                "Сначала завершите изменения и принадлежащие панели процессы."
+                                    .into(),
+                            );
+                            interaction.value_preview = true;
+                        } else {
+                            let path = crate::tui_menu::default_config("anti-dpi.toml");
+                            if let Err(error) = standalone::run_in(&mut terminal, &path) {
+                                interaction.preview_text = Some(error.message().into());
+                                interaction.value_preview = true;
+                            }
+                        }
                     }
                     if old_screen != model.screen {
                         if let Some(role) = Interaction::panel_role(&model) {
@@ -10113,7 +10625,10 @@ mod tests {
             PreviewScope::PassiveOnly,
         )));
         click_form_field(&mut ui, &mut model, area, 1);
-        assert_eq!(ui.domain.as_ref().unwrap().domain(), Some("samsung.com"));
+        assert_eq!(
+            ui.domain.as_ref().unwrap().domain(),
+            Some(crate::camouflage_discovery::POPULAR_HTTPS_DOMAINS[1])
+        );
         assert_eq!(ui.domain.as_ref().unwrap().selected_count(), 0);
         assert!(!ui.domain.as_ref().unwrap().is_running());
         ui.update(&mut model, press(KeyCode::Char('m')));
@@ -10416,8 +10931,9 @@ mod tests {
                 .all(|(_, row)| Span::raw(row.as_str()).width() <= usize::from(width - 4)));
         }
         let rows = record_rows(editor, Rect::new(0, 0, 28, 20));
-        assert!(rows.iter().any(|(index, row)| *index == 0
-            && row == "*№1 edge.example.org:443"));
+        assert!(rows
+            .iter()
+            .any(|(index, row)| *index == 0 && row == "*№1 edge.example.org:443"));
         // Both narrow and wide terminal layouts must map continuation rows
         // to the same profile. Re-select the first profile before each click
         // so this also checks that mouse selection actually changes focus.
@@ -10463,6 +10979,12 @@ mod tests {
         assert!(!app.update(press(KeyCode::Right)));
         assert_eq!(app.selected, Role::Client);
         assert!(!app.update(press(KeyCode::Right)));
+        assert!(app.home_anti_dpi);
+        assert!(!app.update(press(KeyCode::Enter)));
+        assert!(std::mem::take(&mut app.launch_anti_dpi));
+        assert_eq!(app.screen, Screen::Home);
+        assert!(!app.update(press(KeyCode::Left)));
+        assert!(!app.home_anti_dpi);
         assert_eq!(app.selected, Role::Client);
         assert!(!app.update(press(KeyCode::Left)));
         assert_eq!(app.selected, Role::Server);
@@ -10830,7 +11352,10 @@ mod tests {
         assert_eq!(recommendation_page(Role::Server, 'b'), (2, 'b'));
         assert_eq!(recommendation_page(Role::Server, 'G'), (2, 'G'));
         let imports = page_actions(Role::Client, 2, None);
-        assert_eq!(imports.iter().map(|a| a.key).collect::<Vec<_>>(), vec!['i', 'f', 'Q']);
+        assert_eq!(
+            imports.iter().map(|a| a.key).collect::<Vec<_>>(),
+            vec!['i', 'f', 'Q']
+        );
         assert_eq!(recommendation_page(Role::Client, 'i'), (2, 'i'));
         assert_eq!(recommendation_page(Role::Client, 'A'), (3, 'A'));
         assert_eq!(recommendation_page(Role::Server, 'S'), (5, 'S'));
@@ -11184,22 +11709,43 @@ mod tests {
         *focus = 2;
         values[2] = "example.org, geosite:google".into();
         panel.key(press(KeyCode::F(6)), None);
-        assert!(panel.geo_picker.as_ref().unwrap().message.contains("Нет выбранной"));
+        assert!(panel
+            .geo_picker
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("Нет выбранной"));
+        assert_eq!(
+            panel.geo_picker.as_ref().unwrap().row_status("google"),
+            ("Не проверено", MUTED)
+        );
+        assert!(panel.geo_picker.as_ref().unwrap().enter_action().is_none());
         panel.key(press(KeyCode::Esc), None);
-        let mut picker = GeoPicker::new(2);
-        picker.codes = vec!["category-ads".into(), "google".into(), "youtube".into()];
-        panel.geo_picker = Some(picker);
+        panel.key(press(KeyCode::F(6)), None);
+        let picker = panel.geo_picker.as_mut().unwrap();
+        picker.set_catalog(vec![
+            "category-ads".into(),
+            "google".into(),
+            "youtube".into(),
+        ]);
+        picker.message.clear();
+        assert!(picker.marked.contains("google"));
         panel.paste("goo");
-        panel.key(press(KeyCode::Char(' ')), None);
-        panel.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), None);
+        panel.key(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            None,
+        );
         panel.paste("you");
         panel.key(press(KeyCode::Char(' ')), None);
         panel.key(press(KeyCode::Enter), None);
-        assert_eq!(panel.fields.as_ref().unwrap().1[2], "example.org, geosite:google, geosite:youtube");
+        assert_eq!(
+            panel.fields.as_ref().unwrap().1[2],
+            "example.org, geosite:google, geosite:youtube"
+        );
         assert!(panel.settings.rules.is_empty());
         panel.fields.as_mut().unwrap().2 = 3;
         let mut picker = GeoPicker::new(3);
-        picker.codes = vec!["in-ru".into(), "private".into()];
+        picker.set_catalog(vec!["in-ru".into(), "private".into()]);
         panel.geo_picker = Some(picker);
         panel.key(press(KeyCode::Char(' ')), None);
         panel.key(press(KeyCode::Esc), None);
@@ -11211,7 +11757,8 @@ mod tests {
 
     #[test]
     fn geo_picker_named_actions_marked_view_and_compact_layout_preserve_draft() {
-        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("geo-actions").unwrap());
+        let dir =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("geo-actions").unwrap());
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("server.toml");
         let source = server_issuance_fixture();
@@ -11221,8 +11768,10 @@ mod tests {
         panel.edit(None);
         let area = Rect::new(0, 0, 88, 36);
         let form = panel.form().unwrap();
-        let point = (0..area.height).flat_map(|y| (0..area.width).map(move |x| (x, y)))
-            .find(|&(x,y)| form.hit(area,x,y) == Some(5)).unwrap();
+        let point = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .find(|&(x, y)| form.hit(area, x, y) == Some(5))
+            .unwrap();
         panel.select_at(area, point.0, point.1);
         assert!(panel.geo_picker.is_none());
         panel.paste("must-not-edit");
@@ -11231,11 +11780,14 @@ mod tests {
         assert_eq!(panel.geo_picker.as_ref().unwrap().field, 2);
         panel.key(press(KeyCode::Esc), None);
         let mut picker = GeoPicker::new(2);
-        picker.codes = vec!["google".into(), "youtube".into()];
+        picker.set_catalog(vec!["google".into(), "youtube".into()]);
         panel.geo_picker = Some(picker);
         panel.paste("goo");
         panel.key(press(KeyCode::Char(' ')), None);
-        panel.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), None);
+        panel.key(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            None,
+        );
         panel.paste("you");
         panel.key(press(KeyCode::Char(' ')), None);
         let picker = panel.geo_picker.as_ref().unwrap();
@@ -11244,13 +11796,20 @@ mod tests {
         assert_eq!(layout.info.bottom(), layout.controls.y);
         assert_eq!(picker.matches(), ["youtube"]);
         let items = picker.actions();
-        let action = Actions { items: &items, selected: 0 };
+        let action = Actions {
+            items: &items,
+            selected: 0,
+        };
         let point = (layout.controls.y..layout.controls.bottom())
-            .find(|&y| action.hit(layout.controls, layout.controls.x + 2, y) == Some(1)).unwrap();
+            .find(|&y| action.hit(layout.controls, layout.controls.x + 2, y) == Some(1))
+            .unwrap();
         panel.select_at(area, layout.controls.x + 2, point);
         assert!(!panel.geo_picker.as_ref().unwrap().marked_only);
         panel.key(press(KeyCode::Enter), None);
-        assert_eq!(panel.geo_picker.as_ref().unwrap().matches(), ["google", "youtube"]);
+        assert_eq!(
+            panel.geo_picker.as_ref().unwrap().matches(),
+            ["google", "youtube"]
+        );
         panel.key(press(KeyCode::Char(' ')), None);
         assert_eq!(panel.geo_picker.as_ref().unwrap().matches(), ["youtube"]);
         panel.key(press(KeyCode::Tab), None);
@@ -11261,15 +11820,117 @@ mod tests {
         assert_eq!(panel.fields.as_ref().unwrap().1[2], "geosite:youtube");
         assert!(panel.settings.rules.is_empty());
         let mut picker = GeoPicker::new(3);
-        picker.codes = vec!["in-ru".into()];
+        picker.set_catalog(vec!["in-ru".into()]);
         assert!(picker.info().contains("не геолокация"));
         for size in [(32, 12), (88, 36), (120, 40)] {
             let area = Rect::new(0, 0, size.0, size.1);
             let layout = picker.layout(area);
             assert!(layout.controls.bottom() <= layout.outer.bottom());
-            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(size.0,size.1)).unwrap();
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(size.0, size.1)).unwrap();
             terminal.draw(|frame| picker.render(frame, area)).unwrap();
         }
+        assert!(!editor.dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn geo_picker_reopens_syncs_and_removes_last_category_without_touching_literals() {
+        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("geo-reopen").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("server.toml");
+        let source = server_issuance_fixture();
+        std::fs::write(&path, &source).unwrap();
+        let editor = Editor::load(Role::Server, &path).unwrap();
+        let mut panel = RoutingPanel::new(&editor);
+        panel.edit(None);
+        let cases = [
+            (2, "domain:example.org, geosite:GOOGLE, full:other.example, geosite:google, geosite:old-code",
+                "google", "youtube", "domain:example.org, full:other.example, geosite:old-code, geosite:youtube",
+                "domain:example.org, full:other.example"),
+            (3, "192.0.2.0/24, geoip:IN-RU, 2001:db8::1, geoip:in-ru, geoip:old-code",
+                "in-ru", "private", "192.0.2.0/24, 2001:db8::1, geoip:old-code, geoip:private",
+                "192.0.2.0/24, 2001:db8::1"),
+        ];
+        for (field, initial, old, new, updated, literals) in cases {
+            let (_, values, focus) = panel.fields.as_mut().unwrap();
+            values[field] = initial.into();
+            *focus = field;
+            // A missing/unverified database must not allow edits, even
+            // when the input already includes categories.
+            panel.key(press(KeyCode::F(6)), None);
+            assert!(panel.geo_picker.as_ref().unwrap().marked.contains(old));
+            panel.key(press(KeyCode::Enter), None);
+            assert!(panel.geo_picker.is_some());
+            assert_eq!(panel.fields.as_ref().unwrap().1[field], initial);
+            panel.key(press(KeyCode::Esc), None);
+
+            let open = |panel: &mut RoutingPanel| {
+                panel.key(press(KeyCode::F(6)), None);
+                let picker = panel.geo_picker.as_mut().unwrap();
+                // Simulate the verified catalogue worker. The original
+                // selection must come from the real field-opening path.
+                picker.set_catalog(vec![old.into(), new.into()]);
+                picker.message.clear();
+            };
+            open(&mut panel);
+            assert_eq!(panel.geo_picker.as_ref().unwrap().marked.len(), 2);
+            assert!(panel
+                .geo_picker
+                .as_ref()
+                .unwrap()
+                .marked
+                .contains("old-code"));
+            assert!(panel
+                .geo_picker
+                .as_ref()
+                .unwrap()
+                .info()
+                .contains("нет в базе"));
+            assert_eq!(
+                panel.geo_picker.as_ref().unwrap().row_status("old-code"),
+                ("Нет в базе", WARNING)
+            );
+            assert_eq!(panel.geo_picker.as_ref().unwrap().changes(), (0, 0));
+            panel.paste(old);
+            panel.key(press(KeyCode::Char(' ')), None);
+            panel.key(
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+                None,
+            );
+            panel.paste(new);
+            panel.key(press(KeyCode::Char(' ')), None);
+            let picker = panel.geo_picker.as_ref().unwrap();
+            assert_eq!(picker.changes(), (1, 1));
+            assert_eq!(picker.actions()[picker.enter_action().unwrap()].key, 'a');
+            assert!(picker.footer().contains("Enter применить выбор"));
+            panel.key(press(KeyCode::Enter), None);
+            assert_eq!(panel.fields.as_ref().unwrap().1[field], updated);
+
+            open(&mut panel);
+            let picker = panel.geo_picker.as_ref().unwrap();
+            assert!(picker.marked.contains(new));
+            assert!(!picker.marked.contains(old));
+            panel.key(press(KeyCode::F(4)), None);
+            panel.key(press(KeyCode::Char(' ')), None);
+            panel.key(press(KeyCode::Char(' ')), None);
+            assert!(panel.geo_picker.as_ref().unwrap().marked.is_empty());
+            assert!(panel.geo_picker.as_ref().unwrap().can_apply());
+            assert!(panel.geo_picker.as_ref().unwrap().removes_all());
+            assert_eq!(panel.geo_picker.as_ref().unwrap().changes(), (0, 2));
+            panel.key(press(KeyCode::Esc), None);
+            assert_eq!(panel.fields.as_ref().unwrap().1[field], updated);
+
+            open(&mut panel);
+            panel.key(press(KeyCode::F(4)), None);
+            panel.key(press(KeyCode::Char(' ')), None);
+            panel.key(press(KeyCode::Char(' ')), None);
+            panel.key(press(KeyCode::Enter), None);
+            assert!(panel.geo_picker.is_none());
+            assert_eq!(panel.fields.as_ref().unwrap().1[field], literals);
+        }
+        assert!(panel.settings.rules.is_empty());
         assert!(!editor.dirty());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
         std::fs::remove_dir_all(dir).unwrap();
@@ -11441,7 +12102,9 @@ mod tests {
         std::fs::write(&path, include_str!("../../../examples/client.toml")).unwrap();
         let editor = Editor::load(Role::Client, &path).unwrap();
         let items = page_actions(Role::Client, 1, Some(&editor));
-        assert!(!page_actions(Role::Client, 5, Some(&editor)).iter().any(|a| a.key == 'S'));
+        assert!(!page_actions(Role::Client, 5, Some(&editor))
+            .iter()
+            .any(|a| a.key == 'S'));
         assert!(!items.iter().any(|a| matches!(a.key, 'A' | 'D')));
         assert!(!items.iter().any(|a| matches!(a.key, 'V' | 'i' | 'A')));
         assert!(page_actions(Role::Client, 3, Some(&editor))
@@ -11536,7 +12199,7 @@ mod tests {
             &mut model,
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
-                column: 90,
+                column: 60,
                 row: 5,
                 modifiers: KeyModifiers::NONE,
             },
@@ -11953,7 +12616,15 @@ mod tests {
         assert!(!interaction.update(&mut model, press(KeyCode::Enter)));
         assert!(interaction.workspace_advanced);
         assert_eq!(interaction.editor.as_ref().unwrap().field_count(), 4);
-        assert_eq!(interaction.editor.as_ref().unwrap().workspace_fields().len(), 4);
+        assert_eq!(
+            interaction
+                .editor
+                .as_ref()
+                .unwrap()
+                .workspace_fields()
+                .len(),
+            4
+        );
         assert!(!interaction.owned_running(Role::Client));
         assert!(!interaction.editor.as_ref().unwrap().dirty());
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
@@ -11990,7 +12661,10 @@ mod tests {
         interaction.select_workspace_page(Role::Client, 1);
         assert!(!interaction.workspace_advanced);
         assert_eq!(interaction.editor.as_ref().unwrap().field_count(), 1);
-        assert_eq!(interaction.editor.as_ref().unwrap().workspace_field_index(), 0);
+        assert_eq!(
+            interaction.editor.as_ref().unwrap().workspace_field_index(),
+            0
+        );
         fs::remove_file(path).unwrap();
     }
 
@@ -12017,7 +12691,11 @@ mod tests {
         editor.select_field(true);
         let mut interaction = Interaction::new(Some(editor));
         interaction.workspace_advanced = true;
-        interaction.editor.as_mut().unwrap().set_compact_server_fields(false);
+        interaction
+            .editor
+            .as_mut()
+            .unwrap()
+            .set_compact_server_fields(false);
         let model = Model::new(Some(Role::Client));
         for (width, height) in [(60, 18), (80, 24), (120, 40)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -13286,7 +13964,8 @@ mod tests {
 
     #[test]
     fn worker_receipts_are_distinct_from_runtime_activation_and_disconnect() {
-        let root = std::env::temp_dir().join(crate::tui_editor::generated_id("worker-receipts").unwrap());
+        let root =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("worker-receipts").unwrap());
         std::fs::create_dir(&root).unwrap();
         let server = root.join("server.toml");
         let client = root.join("client.toml");
@@ -13298,7 +13977,11 @@ mod tests {
         // reply. These transitions must not start a client or apply grants.
         for saved in [false, true] {
             for scenario in 0..5 {
-                let (role, path) = if scenario < 2 { (Role::Server, &server) } else { (Role::Client, &client) };
+                let (role, path) = if scenario < 2 {
+                    (Role::Server, &server)
+                } else {
+                    (Role::Client, &client)
+                };
                 let mut model = Model::new(Some(role));
                 let editor = Editor::load(role, path).unwrap();
                 let mut ui = Interaction::new(None);
@@ -13313,7 +13996,8 @@ mod tests {
                 ui.saving = Some(rx);
                 assert!(!ui.poll_save(&mut model).unwrap());
                 assert!(ui.editor.is_none());
-                tx.send((editor, saved)).unwrap_or_else(|_| panic!("worker receiver"));
+                tx.send((editor, saved))
+                    .unwrap_or_else(|_| panic!("worker receiver"));
                 assert!(!ui.poll_save(&mut model).unwrap());
                 assert!(ui.editor.is_some() && ui.saving.is_none());
                 match (scenario, saved) {
@@ -13329,7 +14013,9 @@ mod tests {
                         assert_eq!(ui.workspace_page, 3);
                         assert_eq!(ui.workspace_focus, WorkspaceFocus::Actions);
                     }
-                    (4, false) => assert!(matches!(ui.importing, Some(ImportFlow::ActivationFailed))),
+                    (4, false) => {
+                        assert!(matches!(ui.importing, Some(ImportFlow::ActivationFailed)))
+                    }
                     _ => unreachable!(),
                 }
                 assert!(!ui.owned_running(role));
@@ -13340,8 +14026,14 @@ mod tests {
         let mut model = Model::new(Some(Role::Server));
         for (result, expected) in [
             (Some(Ok((root.join("qr.svg"), true))), "QR SVG сохранён"),
-            (Some(Ok((root.join("key.invite"), false))), "Ничего не обрезано"),
-            (Some(Err("fixture write failure")), "повторная выдача требует ротации"),
+            (
+                Some(Ok((root.join("key.invite"), false))),
+                "Ничего не обрезано",
+            ),
+            (
+                Some(Err("fixture write failure")),
+                "повторная выдача требует ротации",
+            ),
             (None, "Результат записи не подтверждён"),
         ] {
             let mut ui = Interaction::new(Some(Editor::load(Role::Server, &server).unwrap()));
@@ -13349,10 +14041,14 @@ mod tests {
             ui.sharing = Some(rx);
             ui.issuance = Some(IssueFlow::Sharing);
             assert!(!ui.poll_save(&mut model).unwrap());
-            if let Some(result) = result { tx.send(result).unwrap(); }
+            if let Some(result) = result {
+                tx.send(result).unwrap();
+            }
             drop(tx);
             assert!(!ui.poll_save(&mut model).unwrap());
-            assert!(matches!(&ui.issuance, Some(IssueFlow::ShareDone(message)) if message.contains(expected)));
+            assert!(
+                matches!(&ui.issuance, Some(IssueFlow::ShareDone(message)) if message.contains(expected))
+            );
             assert!(ui.sharing.is_none());
             assert!(!ui.owned_running(Role::Server));
         }
@@ -13363,15 +14059,25 @@ mod tests {
             ui.issuance = Some(IssueFlow::Exporting);
             assert!(!ui.poll_save(&mut model).unwrap());
             let editor = Editor::load(Role::Server, &server).unwrap();
-            let result = if succeeded { Ok(root.join("key.invite")) } else { Err("fixture export failure") };
-            tx.send((editor, result)).unwrap_or_else(|_| panic!("worker receiver"));
+            let result = if succeeded {
+                Ok(root.join("key.invite"))
+            } else {
+                Err("fixture export failure")
+            };
+            tx.send((editor, result))
+                .unwrap_or_else(|_| panic!("worker receiver"));
             assert!(!ui.poll_save(&mut model).unwrap());
             assert!(ui.editor.is_some() && ui.exporting.is_none());
             if succeeded {
-                assert!(matches!(&ui.issuance, Some(IssueFlow::Exported(path)) if path == &root.join("key.invite")));
+                assert!(
+                    matches!(&ui.issuance, Some(IssueFlow::Exported(path)) if path == &root.join("key.invite"))
+                );
             } else {
                 assert!(matches!(ui.issuance, Some(IssueFlow::ExportFailed)));
-                assert_eq!(ui.editor.as_ref().unwrap().error.as_deref(), Some("fixture export failure"));
+                assert_eq!(
+                    ui.editor.as_ref().unwrap().error.as_deref(),
+                    Some("fixture export failure")
+                );
             }
         }
         let mut ui = Interaction::new(None);
@@ -13391,7 +14097,8 @@ mod tests {
 
     #[test]
     fn workspace_import_paste_is_bounded_hidden_and_contextual() {
-        let root = std::env::temp_dir().join(crate::tui_editor::generated_id("import-paste").unwrap());
+        let root =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("import-paste").unwrap());
         std::fs::create_dir(&root).unwrap();
         let path = root.join("client.toml");
         let original = include_str!("../../../examples/client.toml");
@@ -13404,7 +14111,9 @@ mod tests {
         ui.select_workspace_page(Role::Client, 2);
         ui.workspace_focus = WorkspaceFocus::Actions;
         ui.paste_workspace_import(&model, "sensitive-fixture\r\n");
-        assert!(matches!(&ui.importing, Some(ImportFlow::Input(source)) if source.as_str() == "sensitive-fixture"));
+        assert!(
+            matches!(&ui.importing, Some(ImportFlow::Input(source)) if source.as_str() == "sensitive-fixture")
+        );
         assert!(!rendered_interaction(120, 40, &model, &ui).contains("sensitive-fixture"));
         ui.paste_import_source("\tinvalid");
         assert!(matches!(&ui.importing, Some(ImportFlow::Input(source)) if source.is_empty()));
@@ -13416,7 +14125,9 @@ mod tests {
         ui.update(&mut model, press(KeyCode::F(6)));
         assert!(ui.import_browser.is_some());
         ui.paste_import_source("not-pasted-through-browser");
-        assert!(matches!(&ui.importing, Some(ImportFlow::Input(source)) if source.as_str() == "another-fixture"));
+        assert!(
+            matches!(&ui.importing, Some(ImportFlow::Input(source)) if source.as_str() == "another-fixture")
+        );
         ui.update(&mut model, press(KeyCode::Esc));
         ui.update(&mut model, press(KeyCode::Esc));
         assert!(ui.importing.is_none());

@@ -16,8 +16,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 tokio::task_local! { pub(crate) static PROFILE_DIAGNOSTIC: (); }
+#[cfg(any(windows, test))]
+tokio::task_local! { pub(crate) static STANDALONE_METER: std::sync::Arc<Counters>; }
+
 fn diagnostic() -> bool {
-    PROFILE_DIAGNOSTIC.try_with(|_| ()).is_ok()
+    let profile = PROFILE_DIAGNOSTIC.try_with(|_| ()).is_ok();
+    #[cfg(any(windows, test))]
+    {
+        profile || STANDALONE_METER.try_with(|_| ()).is_ok()
+    }
+    #[cfg(not(any(windows, test)))]
+    {
+        profile
+    }
 }
 static DIAGNOSTIC_COUNTERS: Counters = Counters::new();
 
@@ -29,14 +40,14 @@ pub(crate) struct Snapshot {
     pub download: u64,
 }
 
-struct Counters {
+pub(crate) struct Counters {
     active: AtomicU64,
     opened: AtomicU64,
     upload: AtomicU64,
     download: AtomicU64,
 }
 impl Counters {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             active: AtomicU64::new(0),
             opened: AtomicU64::new(0),
@@ -46,17 +57,23 @@ impl Counters {
     }
 
     fn enter(&self) -> Relay<'_> {
-        if diagnostic() {
+        if PROFILE_DIAGNOSTIC.try_with(|_| ()).is_ok() {
             DIAGNOSTIC_COUNTERS.opened.fetch_add(1, Ordering::Relaxed);
             DIAGNOSTIC_COUNTERS.active.fetch_add(1, Ordering::Relaxed);
-            return Relay(&DIAGNOSTIC_COUNTERS);
+            return Relay::Shared(&DIAGNOSTIC_COUNTERS);
+        }
+        #[cfg(any(windows, test))]
+        if let Ok(local) = STANDALONE_METER.try_with(Clone::clone) {
+            local.opened.fetch_add(1, Ordering::Relaxed);
+            local.active.fetch_add(1, Ordering::Relaxed);
+            return Relay::Owned(local);
         }
         self.opened.fetch_add(1, Ordering::Relaxed);
         self.active.fetch_add(1, Ordering::Relaxed);
-        Relay(self)
+        Relay::Shared(self)
     }
 
-    fn snapshot(&self) -> Snapshot {
+    pub(crate) fn snapshot(&self) -> Snapshot {
         Snapshot {
             active: self.active.load(Ordering::Relaxed),
             opened: self.opened.load(Ordering::Relaxed),
@@ -66,19 +83,79 @@ impl Counters {
     }
 }
 
-pub(crate) struct Relay<'a>(&'a Counters);
+pub(crate) enum Relay<'a> {
+    Shared(&'a Counters),
+    #[cfg(any(windows, test))]
+    Owned(std::sync::Arc<Counters>),
+}
 impl Relay<'_> {
+    fn counters(&self) -> &Counters {
+        match self {
+            Self::Shared(counters) => counters,
+            #[cfg(any(windows, test))]
+            Self::Owned(counters) => counters,
+        }
+    }
     pub(crate) fn upload(&self, bytes: usize) {
-        self.0.upload.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.counters()
+            .upload
+            .fetch_add(bytes as u64, Ordering::Relaxed);
     }
     pub(crate) fn download(&self, bytes: usize) {
-        self.0.download.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.counters()
+            .download
+            .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 }
 impl Drop for Relay<'_> {
     fn drop(&mut self) {
-        self.0.active.fetch_sub(1, Ordering::Relaxed);
+        self.counters().active.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn standalone_meter_is_per_session_and_diagnostics_do_not_enter_it() {
+    use std::sync::Arc;
+    let first = Arc::new(Counters::new());
+    let second = Arc::new(Counters::new());
+    STANDALONE_METER
+        .scope(first.clone(), async {
+            let relay = enter_direct();
+            relay.upload(4);
+            relay.download(8);
+            PROFILE_DIAGNOSTIC
+                .scope((), async {
+                    let diagnostic = enter_direct();
+                    diagnostic.upload(100);
+                })
+                .await;
+        })
+        .await;
+    STANDALONE_METER
+        .scope(second.clone(), async {
+            let relay = enter_udp(Role::Client, false, true);
+            relay.upload(2);
+        })
+        .await;
+    assert_eq!(
+        first.snapshot(),
+        Snapshot {
+            opened: 1,
+            active: 0,
+            upload: 4,
+            download: 8
+        }
+    );
+    assert_eq!(
+        second.snapshot(),
+        Snapshot {
+            opened: 1,
+            active: 0,
+            upload: 2,
+            download: 0
+        }
+    );
 }
 
 static SERVER_H2: Counters = Counters::new();
@@ -444,7 +521,10 @@ impl Monitor {
     pub(crate) fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         tui_widgets::canvas(frame, area);
         let idle = self.current.iter().all(|s| s.active == 0)
-            && self.history.iter().all(|sample| sample.iter().all(|&v| v == 0));
+            && self
+                .history
+                .iter()
+                .all(|sample| sample.iter().all(|&v| v == 0));
         if idle || area.width < 46 || area.height < 17 || (area.width < 86 && area.height < 27) {
             let area = if idle && area.width >= 86 {
                 Rect::new(area.x, area.y, area.width, area.height.min(13))
@@ -639,7 +719,10 @@ impl Monitor {
             );
         }
         if !self.history.is_empty()
-            && self.history.iter().all(|sample| sample.iter().all(|&v| v == 0))
+            && self
+                .history
+                .iter()
+                .all(|sample| sample.iter().all(|&v| v == 0))
         {
             result.push_str("\nВ измеренных интервалах нет трафика.");
         }
@@ -689,7 +772,7 @@ mod tests {
             .scope((), async {
                 assert!(diagnostic());
                 let relay = c.enter();
-                assert!(std::ptr::eq(relay.0, &DIAGNOSTIC_COUNTERS));
+                assert!(std::ptr::eq(relay.counters(), &DIAGNOSTIC_COUNTERS));
                 relay.upload(17);
                 relay.download(23);
                 assert_eq!(c.snapshot(), Snapshot::default());
@@ -722,7 +805,7 @@ mod tests {
         assert!(!diagnostic());
         assert_eq!(c.snapshot(), Snapshot::default());
         let relay = c.enter();
-        assert!(std::ptr::eq(relay.0, &c));
+        assert!(std::ptr::eq(relay.counters(), &c));
         drop(relay);
         assert_eq!(c.snapshot().opened, 1);
     }

@@ -1,6 +1,7 @@
 //! Theia command-line contract. Parsing never triggers networking, file I/O,
 //! or OS proxy modifications; the executable dispatches runtime commands.
 
+pub mod anti_dpi;
 mod bounded_input;
 pub mod camouflage_batch;
 pub mod camouflage_discovery;
@@ -119,6 +120,45 @@ pub enum Role {
 pub enum Command {
     Help(Option<&'static str>),
     Version,
+    AntiDpiValidate {
+        config: String,
+    },
+    AntiDpiTui {
+        config: Option<String>,
+    },
+    AntiDpiStatus {
+        config: String,
+    },
+    AntiDpiChange {
+        config: String,
+        instance: [u8; 32],
+        revision: u64,
+        policy: [u8; 32],
+        candidate: Option<[u8; 32]>,
+    },
+    AntiDpiApply {
+        config: String,
+        confirm: Option<[u8; 32]>,
+        enroll: bool,
+    },
+    AntiDpiConnect {
+        config: String,
+        confirm: Option<[u8; 32]>,
+    },
+    AntiDpiPreflight {
+        config: String,
+    },
+    AntiDpiCatalog {
+        overlay: Option<String>,
+    },
+    AntiDpiDiagnostic {
+        config: String,
+        overlay: Option<String>,
+        domains: Vec<String>,
+        confirm: Option<[u8; 32]>,
+        anonymous: bool,
+        owned: bool,
+    },
     Trust(descriptor_cli::Command),
     Reference(reference_cli::Command),
     Reality(reality_cli::Command),
@@ -357,13 +397,64 @@ fn expected_revision(raw: &str) -> Result<u64, CliError> {
     raw.parse::<u64>().map_err(|_| CliError::InvalidArguments)
 }
 
+fn parse_anti_dpi_diagnostic(
+    path: &str,
+    mut args: &[&str],
+    owned: bool,
+) -> Result<Command, CliError> {
+    let overlay = if let ["--overlay", path, rest @ ..] = args {
+        args = rest;
+        Some(config_path(path)?)
+    } else {
+        None
+    };
+    let ["--domains", selected, rest @ ..] = args else {
+        return Err(CliError::InvalidArguments);
+    };
+    if selected.len() > anti_dpi::catalog::MAX_JOB_DOMAINS * 254 {
+        return Err(CliError::InvalidArguments);
+    }
+    let domains = selected.split(',').map(str::to_owned).collect::<Vec<_>>();
+    if domains.is_empty()
+        || domains.len() > anti_dpi::catalog::MAX_JOB_DOMAINS
+        || domains.iter().any(|name| name.is_empty())
+    {
+        return Err(CliError::InvalidArguments);
+    }
+    let (confirm, anonymous) = match rest {
+        [] => (None, false),
+        ["--confirm", digest] => (
+            Some(parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?),
+            false,
+        ),
+        ["--confirm", digest, "--anonymous"] => (
+            Some(parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?),
+            true,
+        ),
+        _ => return Err(CliError::InvalidArguments),
+    };
+    if owned && overlay.is_some() {
+        return Err(CliError::InvalidArguments);
+    }
+    Ok(Command::AntiDpiDiagnostic {
+        config: config_path(path)?,
+        overlay,
+        domains,
+        confirm,
+        anonymous,
+        owned,
+    })
+}
+
 /// Parse arguments excluding argv[0]; reject unknown and duplicate flags.
 /// A recognized runtime command is NOT evidence that a runtime exists.
 pub fn parse(args: &[String]) -> Result<Command, CliError> {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     #[cfg(not(feature = "native-ingress-lab"))]
     if matches!(args.as_slice(), ["client", "linux" | "windivert", ..]) {
-        return Err(CliError::NotImplemented("native ingress laboratory (excluded from MVP build)"));
+        return Err(CliError::NotImplemented(
+            "native ingress laboratory (excluded from MVP build)",
+        ));
     }
     match args.as_slice() {
         [] | ["tui"] => Ok(Command::Tui { role: None }),
@@ -373,6 +464,69 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
         ["server", "--help" | "-h"] => Ok(Command::Help(Some("server"))),
         ["client", "--help" | "-h"] => Ok(Command::Help(Some("client"))),
         ["config", "--help" | "-h"] => Ok(Command::Help(Some("config"))),
+        ["anti-dpi", "--help" | "-h"] => Ok(Command::Help(Some("anti-dpi"))),
+        ["anti-dpi", "status", "--config", path] => Ok(Command::AntiDpiStatus {
+            config: config_path(path)?,
+        }),
+        ["anti-dpi", mode @ ("live-apply" | "disconnect"), "--config", path, "--instance", instance, "--revision", revision, "--policy", policy, rest @ ..] =>
+        {
+            if revision.is_empty()
+                || revision.starts_with('0')
+                || !revision.bytes().all(|b| b.is_ascii_digit())
+            {
+                return Err(CliError::InvalidArguments);
+            }
+            let candidate = match (*mode, rest) {
+                ("live-apply", ["--confirm", digest]) => {
+                    Some(parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?)
+                }
+                ("disconnect", []) => None,
+                _ => return Err(CliError::InvalidArguments),
+            };
+            Ok(Command::AntiDpiChange {
+                config: config_path(path)?,
+                instance: parse_restart_digest(instance).ok_or(CliError::InvalidArguments)?,
+                revision: revision.parse().map_err(|_| CliError::InvalidArguments)?,
+                policy: parse_restart_digest(policy).ok_or(CliError::InvalidArguments)?,
+                candidate,
+            })
+        }
+        ["anti-dpi", "tui"] => Ok(Command::AntiDpiTui { config: None }),
+        ["anti-dpi", "tui", "--config", path] => Ok(Command::AntiDpiTui {
+            config: Some(config_path(path)?),
+        }),
+        ["anti-dpi", mode @ ("apply" | "enroll" | "connect"), "--config", path, rest @ ..] => {
+            let config = config_path(path)?;
+            let confirm = match rest {
+                [] => None,
+                ["--confirm", digest] => {
+                    Some(parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?)
+                }
+                _ => return Err(CliError::InvalidArguments),
+            };
+            if *mode == "connect" {
+                Ok(Command::AntiDpiConnect { config, confirm })
+            } else {
+                Ok(Command::AntiDpiApply {
+                    config,
+                    confirm,
+                    enroll: *mode == "enroll",
+                })
+            }
+        }
+        ["anti-dpi", mode @ ("diagnose" | "diagnose-owned"), "--config", path, rest @ ..] => {
+            parse_anti_dpi_diagnostic(path, rest, *mode == "diagnose-owned")
+        }
+        ["anti-dpi", "catalog"] => Ok(Command::AntiDpiCatalog { overlay: None }),
+        ["anti-dpi", "catalog", "--overlay", path] => Ok(Command::AntiDpiCatalog {
+            overlay: Some(config_path(path)?),
+        }),
+        ["anti-dpi", "validate", "--config", path] => Ok(Command::AntiDpiValidate {
+            config: config_path(path)?,
+        }),
+        ["anti-dpi", "preflight", "--config", path] => Ok(Command::AntiDpiPreflight {
+            config: config_path(path)?,
+        }),
         ["trust", "--help" | "-h"] => Ok(Command::Help(Some("trust"))),
         ["trust", rest @ ..] => descriptor_cli::parse(rest).map(Command::Trust),
         ["reference", "--help" | "-h"] => Ok(Command::Help(Some("reference"))),
@@ -657,6 +811,16 @@ Usage:\n\
   theia client proxy --status             # Windows read-only proxy ownership status\n\
   theia client proxy --recover --confirm  # Windows crash recovery, CAS only\n\
   theia config validate --config <path>\n\
+  theia anti-dpi validate --config <path>   # standalone config, offline\n\
+  theia anti-dpi preflight --config <path>  # standalone policy/DAT, offline\n\
+  theia anti-dpi tui [--config PATH]\n\
+  theia anti-dpi status --config PATH\n\
+  theia anti-dpi live-apply --config PATH --instance HEX --revision N --policy HEX --confirm HEX\n\
+  theia anti-dpi disconnect --config PATH --instance HEX --revision N --policy HEX\n\
+  theia anti-dpi enroll --config PATH [--confirm HEX]\n\
+  theia anti-dpi apply --config PATH [--confirm HEX]\n\
+  theia anti-dpi connect --config PATH [--confirm HEX]  # Windows development Pass/Drop only\n\
+  theia anti-dpi diagnose --config PATH [--overlay PATH] --domains HOST[,HOST] [--confirm HEX] [--anonymous]\n\
   theia trust --help                  # offline candidate, no runtime Apply\n\
   theia reference --help              # consented reference health checks\n\
   theia reality --help                # guarded identity and enrollment\n\
@@ -679,6 +843,7 @@ pub fn help(topic: Option<&str>) -> Result<&'static str, CliError> {
         Some("client") => {
             Ok("Usage: theia client run --config <path> [--system-proxy --confirm]\ntheia client status\ntheia client lifecycle\ntheia client disconnect --expected-revision N --sha256 HEX --instance HEX --confirm\ntheia client reload --check --expected-revision N --sha256 HEX\ntheia client reload --apply --expected-revision N --sha256 HEX --confirm\ntheia client windivert --check --directory DIR --dll-sha256 HEX --sys-sha256 HEX [--install-lab --confirm]\ntheia client windivert --loopback-lab --directory DIR --dll-sha256 HEX --sys-sha256 HEX --confirm\ntheia client windivert --scope-drop-lab --directory DIR --dll-sha256 HEX --sys-sha256 HEX --interface-index N --seconds 1..30 --confirm-block (isolated local console only; drops all outbound IP on interface)\ntheia client windivert --redirect-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --targets IP:PORT[,IP:PORT] --seconds 5..120 --confirm-isolated\ntheia client windivert --tcp-relay-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --target IP:PORT --confirm\ntheia client windivert --udp-relay-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --target IP:PORT [--flows 1..8] --confirm\ntheia client windivert --interface-redirect-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --capture-interface N --carrier-interface N --seconds 5..120 --confirm-isolated-two-interface\ntheia client linux --host-redirect-lab --config PATH --port N --confirm-disposable-local-console\ntheia client linux --host-guard-rearm --confirm-disposable-host\ntheia client linux --host-guard-recover --confirm-disposable-local-console\ntheia client proxy --status\ntheia client proxy --recover --confirm\nWindows only: explicitly opt in to user WinINet HTTP(S) proxy after binding local HTTP/SOCKS5 listeners. Saved ingress_mode=system_proxy alone never starts a connection. Snapshot+durable journal, conditional restore on Ctrl+C/normal stop, explicit CAS recovery after crash. Never overwrites foreign proxy changes. CLI flags and TUI import alone never apply OS changes.")
         }
+        Some("anti-dpi") => Ok("Usage: theia anti-dpi validate --config <path> | theia anti-dpi preflight --config <path> | theia anti-dpi catalog [--overlay <path>] | theia anti-dpi diagnose --config PATH [--overlay PATH] --domains HOST[,HOST] [--confirm HEX] [--anonymous]\nCommands: tui [--config PATH]; status --config PATH; live-apply/disconnect require exact --instance HEX --revision N --policy HEX (live-apply also --confirm HEX); enroll/apply/connect --config PATH [--confirm HEX]. Enroll/Apply are offline; Connect requires an applied policy and explicit consent. Windows development Pass/Drop only; Modify is denied until acceptance. Validation, catalogue and unconfirmed diagnostic preview are offline. Use all to select the entire enabled catalogue within limits. Confirm the exact preview digest to run bounded Windows diagnostics without altering OS proxy settings. Use diagnose-owned instead of diagnose to use the current owner via IPC; uses the owner's fixed overlay and binds confirmation to its instance/revision. No VPS; unaccepted strategies remain disabled."),
         Some("trust") => Ok(descriptor_cli::HELP),
         Some("reference") => Ok(reference_cli::HELP),
         Some("reality") => Ok(reality_cli::HELP),

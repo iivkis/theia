@@ -218,47 +218,9 @@ impl Tunnel {
                         .relay_selected(Some(first), upload, download, flow)
                         .await;
                 }
-                // Destroy fallback before any attempted user send. Errors
-                // after this point can never replay the original datagram.
+                // Destroy fallback before any attempted user send.
                 drop(fallback);
-                verified.check_live()?;
-                let relay = async {
-                    if stun {
-                        relay_stun(
-                            &verified.socket,
-                            BindingStrategy::Fingerprint,
-                            first,
-                            upload,
-                            download,
-                            flow,
-                            Some(&verified),
-                        )
-                        .await
-                    } else {
-                        relay_local_batch(
-                            &verified.socket,
-                            Some(FIRST_RESPONSE),
-                            Some(first),
-                            batch,
-                            upload,
-                            download,
-                            flow,
-                            Some(&verified),
-                        )
-                        .await
-                    }
-                };
-                let result = tokio::select! {
-                    biased;
-                    result = verified.wait_revoked() => result.map_err(LocalRelayError::Application),
-                    result = relay => result,
-                };
-                if matches!(&result, Err(LocalRelayError::Peer(_))) && verified.check_live().is_ok()
-                {
-                    verified.failed();
-                    crate::traffic::udp_peer_failure();
-                }
-                result.map_err(LocalRelayError::into_client)
+                relay_verified_selected(verified, first, upload, download, flow, batch, stun).await
             }
             other => other.relay_selected(None, upload, download, flow).await,
         }
@@ -393,6 +355,85 @@ pub(crate) async fn relay_quic_lab(
     )
     .await;
     if matches!(&result, Err(LocalRelayError::Peer(_))) {
+        verified.failed();
+        crate::traffic::udp_peer_failure();
+    }
+    result.map_err(LocalRelayError::into_client)
+}
+
+/// Standalone path has no carrier or fallback object at all.
+#[cfg(windows)]
+pub(crate) async fn relay_standalone_verified(
+    verified: Box<crate::routing::dpi::VerifiedUdp>,
+    first: Vec<u8>,
+    upload: mpsc::Receiver<Vec<u8>>,
+    download: mpsc::Sender<Vec<u8>>,
+    flow: &crate::routing::flow::FlowLease,
+) -> Result<(), ClientError> {
+    use crate::routing::dpi::{
+        udp::{prepare_binding, BindingStrategy},
+        UdpStrategy,
+    };
+    flow.check_pending()?;
+    verified.check_live()?;
+    if !verified.admissible()? {
+        return Err(ClientError::Open(ErrorCode::PolicyDenied));
+    }
+    let batch = verified.quic_batch(&first);
+    let stun = matches!(
+        verified.strategy,
+        UdpStrategy::StunBinding(BindingStrategy::Fingerprint)
+    ) && prepare_binding(&first, BindingStrategy::Fingerprint)
+        .is_some_and(|bytes| bytes.as_ref() != first.as_slice());
+    if !stun && batch.is_none() {
+        return Err(ClientError::Open(ErrorCode::PolicyDenied));
+    }
+    relay_verified_selected(verified, first, upload, download, Some(flow), batch, stun).await
+}
+
+async fn relay_verified_selected(
+    verified: Box<crate::routing::dpi::VerifiedUdp>,
+    first: Vec<u8>,
+    upload: mpsc::Receiver<Vec<u8>>,
+    download: mpsc::Sender<Vec<u8>>,
+    flow: Option<&crate::routing::flow::FlowLease>,
+    batch: Option<Vec<Vec<u8>>>,
+    stun: bool,
+) -> Result<(), ClientError> {
+    use crate::routing::dpi::udp::BindingStrategy;
+    verified.check_live()?;
+    let relay = async {
+        if stun {
+            relay_stun(
+                &verified.socket,
+                BindingStrategy::Fingerprint,
+                first,
+                upload,
+                download,
+                flow,
+                Some(&verified),
+            )
+            .await
+        } else {
+            relay_local_batch(
+                &verified.socket,
+                Some(FIRST_RESPONSE),
+                Some(first),
+                batch,
+                upload,
+                download,
+                flow,
+                Some(&verified),
+            )
+            .await
+        }
+    };
+    let result = tokio::select! {
+        biased;
+        result = verified.wait_revoked() => result.map_err(LocalRelayError::Application),
+        result = relay => result,
+    };
+    if matches!(&result, Err(LocalRelayError::Peer(_))) && verified.check_live().is_ok() {
         verified.failed();
         crate::traffic::udp_peer_failure();
     }

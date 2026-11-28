@@ -57,6 +57,60 @@ impl ProbeScheduler {
     }
 }
 
+/// A role-local shared budget. Foreground operations queue on the common
+/// semaphore; diagnostics never enqueue ahead of a waiting foreground
+/// operation. In an owned session, the diagnostic runner also caps itself
+/// at two rows.
+pub(crate) struct PriorityBudget {
+    permits: Semaphore,
+    waiters: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(any(windows, test))]
+struct Waiting<'a>(&'a std::sync::atomic::AtomicUsize);
+#[cfg(any(windows, test))]
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+impl PriorityBudget {
+    #[cfg(any(windows, test))]
+    pub(crate) fn new() -> Self {
+        Self {
+            permits: Semaphore::new(4),
+            waiters: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    #[cfg(any(windows, test))]
+    pub(crate) async fn production(&self, count: u32) -> Result<SemaphorePermit<'_>, AcquireError> {
+        self.waiters
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let _waiting = Waiting(&self.waiters);
+        self.permits.acquire_many(count).await
+    }
+
+    pub(crate) async fn diagnostic(&self, deadline: Instant) -> Option<SemaphorePermit<'_>> {
+        loop {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            if self.waiters.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                if let Ok(permit) = self.permits.try_acquire() {
+                    if self.waiters.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                        return Some(permit);
+                    }
+                    drop(permit);
+                }
+            }
+            tokio::time::sleep_until((Instant::now() + Duration::from_millis(20)).min(deadline))
+                .await;
+        }
+    }
+}
+
 /// A probe must fit alongside the remaining setup reserve. Exhaustion is
 /// not a transport verdict; callers must not publish negative evidence.
 pub(crate) fn fits(deadline: Instant, attempt: Duration, reserve: Duration) -> bool {
@@ -94,6 +148,28 @@ mod tests {
         drop(permit);
         assert!(budget.try_acquire().is_ok());
     }
+    #[tokio::test(start_paused = true)]
+    async fn diagnostics_do_not_queue_ahead_of_production() {
+        let budget = PriorityBudget::new();
+        let held = budget.production(3).await.unwrap();
+        let waiting = budget.production(2);
+        tokio::pin!(waiting);
+        assert!(timeout(Duration::from_millis(1), &mut waiting)
+            .await
+            .is_err());
+        assert!(budget
+            .diagnostic(Instant::now() + Duration::from_millis(30))
+            .await
+            .is_none());
+        drop(held);
+        let production = waiting.await.unwrap();
+        assert!(budget
+            .diagnostic(Instant::now() + Duration::from_secs(1))
+            .await
+            .is_some());
+        drop(production);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn deadline_includes_setup_reserve() {
         let deadline = Instant::now() + Duration::from_secs(3);
