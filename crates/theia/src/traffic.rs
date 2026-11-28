@@ -20,14 +20,15 @@ tokio::task_local! { pub(crate) static PROFILE_DIAGNOSTIC: (); }
 tokio::task_local! { pub(crate) static STANDALONE_METER: std::sync::Arc<Counters>; }
 
 fn diagnostic() -> bool {
-    if PROFILE_DIAGNOSTIC.try_with(|_| ()).is_ok() {
-        return true;
-    }
+    let profile = PROFILE_DIAGNOSTIC.try_with(|_| ()).is_ok();
     #[cfg(any(windows, test))]
-    if STANDALONE_METER.try_with(|_| ()).is_ok() {
-        return true;
+    {
+        profile || STANDALONE_METER.try_with(|_| ()).is_ok()
     }
-    false
+    #[cfg(not(any(windows, test)))]
+    {
+        profile
+    }
 }
 static DIAGNOSTIC_COUNTERS: Counters = Counters::new();
 
