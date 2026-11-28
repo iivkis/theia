@@ -112,7 +112,12 @@ fn cell_color(cell: Option<&CellResult>) -> ratatui::style::Color {
 
 /// All edits stay in this local draft until a separate reviewed Save.
 /// Existing routing rules are never implicitly populated from the catalogue.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SetupStep { Mode, Domains, DomainInput, Dns, CustomDns, Direct, Modify }
+
 struct Draft {
+    step: SetupStep,
+    choice: usize,
     original: Document,
     expected: Option<Vec<u8>>,
     values: [String; 5],
@@ -129,13 +134,20 @@ impl Draft {
             local.proxy.http_listen.clone(), local.proxy.socks5_listen.clone(), String::new(),
         ];
         let flags = [local.consent.direct_egress, local.consent.direct_dpi, local.consent.direct_dpi_stun, false];
-        Self { original, expected, values, flags, selected: 0, error: String::new() }
+        Self { step: SetupStep::Mode, choice: 0, original, expected, values, flags, selected: 0, error: String::new() }
     }
 
     fn first_run(&self) -> bool { self.expected.is_none() }
-    fn count(&self) -> usize { if self.first_run() { 9 } else { 7 } }
+    fn count(&self) -> usize { 7 }
     fn input_index(&self) -> Option<usize> {
-        match self.selected { 0..=3 => Some(self.selected), 8 if self.first_run() && self.flags[3] => Some(4), _ => None }
+        if self.first_run() {
+            return match self.step {
+                SetupStep::DomainInput => Some(4),
+                SetupStep::CustomDns => Some(self.selected.min(1)),
+                _ => None,
+            };
+        }
+        match self.selected { 0..=3 => Some(self.selected), _ => None }
     }
     fn paste(&mut self, value: &str) {
         if let Some(i) = self.input_index() {
@@ -144,23 +156,86 @@ impl Draft {
             }
         }
     }
+    fn move_to(&mut self, step: SetupStep) {
+        self.step = step;
+        self.choice = 0;
+        self.selected = 0;
+        self.error.clear();
+    }
+
+    fn wizard_choices(&self) -> (&'static str, String, Vec<ActionItem>) {
+        let item = |key, label| ActionItem { key, label };
+        let domains = self.values[4].split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty()).count();
+        let (title, text, items) = match self.step {
+            SetupStep::Mode => ("Шаг 1 из 5 · Как настроить Anti-DPI?",
+                "Anti-DPI помогает проверять доступность сайтов и применять принятые способы изменения трафика.\nРаботает без VPS и ключей. Сейчас стратегии изменения трафика ожидают приёмки.\n\nВыберите способ настройки. Никаких сетевых запросов или изменений Windows пока не будет.".into(),
+                vec![item('1', "Рекомендуемая · выбрать нужные сайты"), item('2', "Ручная · настроить правила позднее")]),
+            SetupStep::Domains => ("Шаг 2 из 5 · Какие сайты вам нужны?",
+                format!("Укажите только сайты, для которых хотите использовать Anti-DPI.\nМожно отметить несколько сайтов из встроенного списка или ввести свои.\nОстальные сайты не получают правило Anti-DPI автоматически.\n\nВыбрано: {domains}. Пока это только черновик."),
+                vec![item('1', "Выбрать сайты из каталога"), item('2', "Ввести свои сайты"), item('3', "Далее · подтвердить выбранные сайты")]),
+            SetupStep::Dns => ("Шаг 3 из 5 · Кто будет определять адреса сайтов?",
+                "Защищённый DNS получает адреса сайтов по шифрованному соединению.\nВыберите поставщика самостоятельно: он сможет видеть ваши DNS-запросы и публичный IP.\nCloudflare — обычное разрешение имён; Quad9 фильтрует известные вредоносные домены.\nНи один вариант не гарантирует доступность сайтов. Пока соединение не проверялось.\nБез DNS доменные операции недоступны; системный DNS не используется как запасной.".into(),
+                vec![item('1', "Cloudflare · 1.1.1.1"), item('2', "Quad9 · 9.9.9.9"), item('3', "Другой DNS · ввести параметры"), item('4', "Настроить позднее · без DNS")]),
+            SetupStep::Direct => ("Шаг 4 из 5 · Разрешить выход в интернет?",
+                "Чтобы проверить сайты или подключаться к ним напрямую, требуется ваше разрешение.\nDNS-провайдер и сайты могут видеть ваш публичный IP. Anti-DPI не является VPN.\nЕсли не разрешить прямой выход, рабочий трафик не будет отправляться.\nЭто не запускает подключение. Разрешение можно изменить в настройках.".into(),
+                vec![item('1', "Пока не разрешать"), item('2', "Разрешить прямое подключение")]),
+            SetupStep::Modify => ("Шаг 5 из 5 · Разрешить Anti-DPI?",
+                "Разрешить изменение трафика только для сайтов, указанных в правилах.\nПока стратегии не приняты, это разрешение не включает работающий обход.\nПри невозможности применить Anti-DPI соединение блокируется, а не отправляется напрямую.\nSTUN остаётся выключенным; его отдельное разрешение доступно в настройках.".into(),
+                vec![item('1', "Пока не разрешать · Anti-DPI не активен"), item('2', "Разрешить принятые стратегии Anti-DPI")]),
+            SetupStep::DomainInput | SetupStep::CustomDns => ("", String::new(), Vec::new()),
+        };
+        (title, text, items)
+    }
+
+    fn wizard_form(&self) -> Form {
+        let fields = if self.step == SetupStep::DomainInput {
+            vec![Field { id: 0, label: "Адреса сайтов через запятую", value: self.values[4].clone(), hint: "Например: example.org, example.net. Только имена, без https:// и путей." }]
+        } else {
+            vec![
+                Field { id: 0, label: "Имя сервера DNS-over-HTTPS", value: self.values[0].clone(), hint: "Имя сервера из документации вашего поставщика, без https:// и пути." },
+                Field { id: 1, label: "Доверенные IP-адреса сервера", value: self.values[1].clone(), hint: "Публичные адреса из документации поставщика. Разделите запятыми." },
+            ]
+        };
+        Form { fields, selected: self.selected, lead: "Введите данные · Enter далее · Esc назад".into(), error: self.error.clone() }
+    }
+
+    fn render_wizard(&self, frame: &mut Frame<'_>, area: Rect) {
+        if matches!(self.step, SetupStep::DomainInput | SetupStep::CustomDns) {
+            self.wizard_form().render(frame, area, if self.step == SetupStep::DomainInput { "Шаг 2 из 5 · Свои сайты" } else { "Шаг 3 из 5 · Другой DNS" });
+            return;
+        }
+        let (title, mut text, items) = self.wizard_choices();
+        if !self.error.is_empty() { text.push_str("\n\n"); text.push_str(&self.error); }
+        let [content, controls] = tui_widgets::action_layout_rows(area, items.len(), 10).unwrap_or([area, Rect::new(area.x, area.bottom(), area.width, 0)]);
+        super::panel(frame, content, title, &text, true);
+        Actions { items: &items, selected: self.choice }.render_with_focus(frame, controls, true);
+    }
+
     fn form(&self) -> Form {
-        let mut fields = vec![
+        let fields = vec![
             Field { id: 0, label: "Имя защищённого DNS (DoH)", value: self.values[0].clone(), hint: "Введите выбранное вами имя HTTPS DNS. Без системного DNS и fallback." },
-            Field { id: 1, label: "Доверенные bootstrap IP", value: self.values[1].clone(), hint: "Публичные IP выбранного DNS-провайдера через запятую. Не угадываются автоматически." },
-            Field { id: 2, label: "HTTP / CONNECT listener", value: self.values[2].clone(), hint: "Только loopback. Изменение требует отключения активной сессии." },
-            Field { id: 3, label: "SOCKS5 listener", value: self.values[3].clone(), hint: "Только loopback. UDP ASSOCIATE не означает перехват всего UDP системы." },
+            Field { id: 1, label: "Доверенные IP-адреса DNS", value: self.values[1].clone(), hint: "Публичные IP выбранного DNS-провайдера через запятую. Не угадываются автоматически." },
+            Field { id: 2, label: "Локальный HTTP-прокси", value: self.values[2].clone(), hint: "Только loopback. Изменение требует отключения активной сессии." },
+            Field { id: 3, label: "Локальный SOCKS5-прокси", value: self.values[3].clone(), hint: "Только loopback. UDP ASSOCIATE не означает перехват всего UDP системы." },
             Field { id: 4, label: "Прямой выход в сеть (Пробел)", value: yes(self.flags[0]).into(), hint: "Ваш IP виден DNS-провайдеру и получателям. По умолчанию запрещено." },
             Field { id: 5, label: "Anti-DPI (Пробел)", value: yes(self.flags[1]).into(), hint: "Только принятые стратегии. При отказе нет перехода на прямой маршрут." },
             Field { id: 6, label: "STUN (отдельное разрешение)", value: yes(self.flags[2]).into(), hint: "Только совместимый credential-free Binding; приёмка обязательна." },
         ];
-        if self.first_run() {
-            fields.push(Field { id: 7, label: "Начальная политика (Пробел)", value: if self.flags[3] { "Anti-DPI для явно заданных доменов" } else { "Ручная (пока без правил)" }.into(), hint: "Каталог не становится политикой автоматически. Выберите способ явно." });
-            fields.push(Field { id: 8, label: "Домены для начального правила", value: if self.flags[3] { self.values[4].clone() } else { "Не используется в ручном режиме".into() }, hint: "Введите имена через запятую или F3 — взять явно отмеченные домены каталога. Только точные имена." });
-        }
         Form { fields, selected: self.selected,
             lead: "Черновик · ↑↓ поля · Пробел разрешения/режим · F5 проверить · Esc отменить".into(),
             error: self.error.clone() }
+    }
+
+    fn domain_values(&self) -> Result<BTreeSet<String>, String> {
+        let domains = self.values[4].split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty())
+            .map(|s| crate::routing::domain_name(s).map_err(|_| "Некорректное имя сайта. Введите только домен, без https:// и пути.".to_owned()))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if domains.is_empty() || domains.len() > MAX_JOB_DOMAINS {
+            return Err("Выберите от 1 до 64 сайтов.".into());
+        }
+        let overlay = Overlay { custom: domains.iter().cloned().collect(), ..Overlay::default() };
+        Catalog::build(&overlay).map_err(|e| e.to_string())?;
+        Ok(domains)
     }
 
     fn next_document(&self) -> Result<Document, String> {
@@ -177,15 +252,7 @@ impl Draft {
             Some(crate::anti_dpi::Resolver { hostname: hostname.to_owned(), bootstrap })
         };
         if self.first_run() && self.flags[3] {
-            let domains = self.values[4].split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty())
-                .map(|s| crate::routing::domain_name(s).map_err(|_| "Некорректное имя домена".to_owned()))
-                .collect::<Result<BTreeSet<_>, _>>()?;
-            if domains.is_empty() || domains.len() > MAX_JOB_DOMAINS {
-                return Err("Для рекомендуемой политики укажите от 1 до 64 доменов.".into());
-            }
-            // Validate via the same catalogue validator, including public-name restrictions.
-            let overlay = Overlay { custom: domains.iter().cloned().collect(), ..Overlay::default() };
-            Catalog::build(&overlay).map_err(|e| e.to_string())?;
+            let domains = self.domain_values()?;
             local.rules = vec![crate::routing::Rule { name: "Выбранные домены".into(),
                 action: crate::routing::Action::DirectDpi,
                 domains: domains.into_iter().map(|name| format!("full:{name}")).collect(), ips: Vec::new(), applications: Vec::new() }];
@@ -213,7 +280,15 @@ fn policy_text(doc: &Document) -> String {
             rule.domains.join(", "), rule.ips.join(", "));
     }
     let _ = writeln!(text, "По умолчанию: напрямую только если ни одно правило не совпало.\nНеопределённость или отказ Anti-DPI: блокировать, не переключать на прямой маршрут.");
-    if local.rules.is_empty() || !local.consent.direct_dpi { let _ = writeln!(text, "ВНИМАНИЕ: Anti-DPI не активен."); }
+    if local.rules.is_empty() || !local.consent.direct_dpi {
+        let _ = writeln!(text, "ВНИМАНИЕ: Anti-DPI не активен.");
+    } else if strategy_columns().into_iter().filter(|id| *id != "direct")
+        .all(|id| strategy_unavailable(id) == Some(Reason::AwaitingAcceptance)) {
+        let _ = writeln!(text, "ВНИМАНИЕ: ни одна стратегия Anti-DPI ещё не принята; соответствующие соединения будут блокироваться.");
+    }
+    if local.resolver.is_none() || !local.consent.direct_egress {
+        let _ = writeln!(text, "ВНИМАНИЕ: подключение недоступно до настройки DNS и разрешения выхода в интернет.");
+    }
     let _ = writeln!(text, "Прямое подключение раскрывает публичный IP. TUN/WinDivert недоступны.");
     text
 }
@@ -376,6 +451,7 @@ struct Panel {
     column: usize,
     report_context: Option<ReportContext>,
     applied_revision: Option<u64>,
+    newly_saved: bool,
     #[cfg(windows)]
     os_observation: Option<crate::windows_system_proxy::ObservedProxy>,
     #[cfg(windows)]
@@ -413,7 +489,7 @@ impl Panel {
             exit_after_stop: false,
             leave_requested: false,
             notice: "Сетевые запросы только после подтверждения.".into(), page: OVERVIEW, navigation: false, action: 0,
-            draft, catalogue_draft: None, confirm_selected: false, help: false, details: false, group: 0, column: 0, report_context: None, applied_revision: None,
+            draft, catalogue_draft: None, confirm_selected: false, help: false, details: false, group: 0, column: 0, report_context: None, applied_revision: None, newly_saved: false,
             #[cfg(windows)]
             os_observation: None,
             #[cfg(windows)]
@@ -596,18 +672,134 @@ impl Panel {
         }
     }
 
+    fn preview_draft(&mut self, mut draft: Draft) {
+        match draft.next_document() {
+            Ok(next) => {
+                self.review = Some(Review::Save(Box::new(draft), next));
+                self.review_scroll = 0;
+                self.confirm_selected = false;
+            }
+            Err(error) => {
+                draft.error = format!("Проверьте введённые данные: {error}");
+                self.draft = Some(draft);
+            }
+        }
+    }
+
+    fn wizard_key(&mut self, mut draft: Draft, code: KeyCode) {
+        use SetupStep::*;
+        if code == KeyCode::Esc {
+            let previous = match draft.step {
+                Mode => { self.notice = "Настройка отменена; файл не создан.".into(); return; }
+                Domains => Mode,
+                DomainInput => Domains,
+                Dns => if draft.flags[3] { Domains } else { Mode },
+                CustomDns => Dns,
+                Direct => Dns,
+                Modify => Direct,
+            };
+            draft.move_to(previous);
+            self.draft = Some(draft);
+            return;
+        }
+        if matches!(draft.step, DomainInput | CustomDns) {
+            match code {
+                KeyCode::Up | KeyCode::BackTab => draft.selected = 0,
+                KeyCode::Down | KeyCode::Tab if draft.step == CustomDns => draft.selected = 1,
+                KeyCode::Enter if draft.step == DomainInput => {
+                    match draft.domain_values() {
+                        Ok(_) => draft.move_to(Domains),
+                        Err(error) => draft.error = error,
+                    }
+                }
+                KeyCode::Enter if draft.step == CustomDns && draft.selected == 0 => draft.selected = 1,
+                KeyCode::Enter if draft.step == CustomDns => {
+                    if draft.values[0].trim().is_empty() || draft.values[1].trim().is_empty() {
+                        draft.error = "Нужны имя DNS-сервера и доверенные адреса.".into();
+                    } else {
+                        match draft.next_document() {
+                            Ok(_) => draft.move_to(Direct),
+                            Err(error) => draft.error = format!("Проверьте параметры DNS: {error}"),
+                        }
+                    }
+                }
+                KeyCode::Backspace => if let Some(i) = draft.input_index() { draft.values[i].pop(); draft.error.clear(); },
+                KeyCode::Delete => if let Some(i) = draft.input_index() { draft.values[i].clear(); draft.error.clear(); },
+                KeyCode::Char(ch) if !ch.is_control() => draft.paste(&ch.to_string()),
+                _ => {}
+            }
+            self.draft = Some(draft);
+            return;
+        }
+        let (_, _, items) = draft.wizard_choices();
+        // Only Enter commits a highlighted option. Movement never grants
+        // permission or changes a resolver.
+        let code = if code == KeyCode::Enter {
+            tui_widgets::action_key(&items, &mut draft.choice, code)
+        } else {
+            if matches!(code, KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab | KeyCode::Home | KeyCode::End) {
+                let _ = tui_widgets::action_key(&items, &mut draft.choice, code);
+            }
+            None
+        };
+        match (draft.step, code) {
+            (Mode, Some(KeyCode::Char('1'))) => { draft.flags[3] = true; draft.move_to(Domains); }
+            (Mode, Some(KeyCode::Char('2'))) => { draft.flags[3] = false; draft.move_to(Dns); }
+            (Domains, Some(KeyCode::Char('1'))) => {
+                self.selected = draft.values[4].split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty())
+                    .filter(|s| self.catalog.entries().iter().any(|e| e.hostname == *s && !e.excluded)).map(str::to_owned).collect();
+                self.filter.clear(); self.row = 0; self.offset = 0;
+                self.catalogue_draft = Some(draft);
+                self.open_page(DIAGNOSTICS);
+                self.notice = "Отметьте нужные сайты. Enter — принять выбор; Esc — назад. Проверки не запускаются.".into();
+                return;
+            }
+            (Domains, Some(KeyCode::Char('2'))) => draft.move_to(DomainInput),
+            (Domains, Some(KeyCode::Char('3'))) => {
+                match draft.domain_values() {
+                    Ok(_) => draft.move_to(Dns),
+                    Err(error) => draft.error = error,
+                }
+            }
+            (Dns, Some(KeyCode::Char('1' | '2'))) => {
+                // Bundled public DoH endpoints, from the providers' official
+                // documentation: developers.cloudflare.com/1.1.1.1/infrastructure/network-operators/
+                // and docs.quad9.net/services/. No implicit resolver or fallback.
+                let cloudflare = code == Some(KeyCode::Char('1'));
+                let (host, ips) = if cloudflare { ("cloudflare-dns.com", "1.1.1.1, 1.0.0.1") }
+                    else { ("dns.quad9.net", "9.9.9.9, 149.112.112.112") };
+                draft.values[0] = host.into();
+                draft.values[1] = ips.into();
+                draft.move_to(Direct);
+            }
+            (Dns, Some(KeyCode::Char('3'))) => { draft.values[0].clear(); draft.values[1].clear(); draft.move_to(CustomDns); }
+            (Dns, Some(KeyCode::Char('4'))) => { draft.values[0].clear(); draft.values[1].clear(); draft.move_to(Direct); }
+            (Direct, Some(KeyCode::Char('1'))) => {
+                draft.flags[0] = false; draft.flags[1] = false; draft.flags[2] = false;
+                self.preview_draft(draft);
+                return;
+            }
+            (Direct, Some(KeyCode::Char('2'))) => {
+                draft.flags[0] = true; draft.flags[1] = false; draft.flags[2] = false; draft.move_to(Modify);
+            }
+            (Modify, Some(KeyCode::Char('1' | '2'))) => {
+                draft.flags[1] = code == Some(KeyCode::Char('2'));
+                draft.flags[2] = false;
+                self.preview_draft(draft);
+                return;
+            }
+            _ => {}
+        }
+        self.draft = Some(draft);
+    }
+
     fn draft_key(&mut self, code: KeyCode) {
         let Some(mut draft) = self.draft.take() else { return };
+        if draft.first_run() { self.wizard_key(draft, code); return; }
         match code {
             KeyCode::Esc => { self.notice = "Черновик отменён; файл не изменён.".into(); return; }
             KeyCode::Up | KeyCode::BackTab => draft.selected = draft.selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Tab => draft.selected = (draft.selected + 1).min(draft.count() - 1),
-            KeyCode::F(3) if draft.first_run() && draft.flags[3] && draft.selected == 8 => {
-                self.catalogue_draft = Some(draft);
-                self.open_page(DIAGNOSTICS);
-                self.notice = "Выберите домены для начального правила; F3 вернуться к мастеру. Проверки не запускаются.".into();
-                return;
-            }
             KeyCode::F(5) => match draft.next_document() {
                 Ok(next) => {
                     self.review = Some(Review::Save(Box::new(draft), next));
@@ -617,7 +809,7 @@ impl Panel {
                 }
                 Err(error) => draft.error = error,
             },
-            KeyCode::Char(' ') | KeyCode::Enter if (4..=7).contains(&draft.selected) => {
+            KeyCode::Char(' ') | KeyCode::Enter if (4..=6).contains(&draft.selected) => {
                 let index = draft.selected - 4;
                 draft.flags[index] = !draft.flags[index];
                 draft.error.clear();
@@ -641,13 +833,30 @@ impl Panel {
         let item = |key, label| ActionItem { key, label };
         match self.page {
             OVERVIEW => {
-                if Document::read(&self.path).is_ok() { vec![item('p', "Открыть подключение"), item('t', "Настроить локальную политику"), item('d', "Открыть диагностику")] }
+                if let Ok(doc) = Document::read(&self.path) {
+                    let local = &doc.anti_dpi;
+                    if local.resolver.is_none() || !local.consent.direct_egress {
+                        vec![item('t', "Завершить настройку DNS и разрешений"), item('d', "Открыть каталог сайтов"), item('p', "Состояние подключения")]
+                    } else if self.newly_saved {
+                        vec![item('e', "Применить новую конфигурацию"), item('t', "Изменить настройки"), item('d', "Открыть диагностику")]
+                    } else if self.applied_revision != Some(local.revision) {
+                        vec![item('a', "Применить сохранённые правила"), item('e', "Первое применение (только новый файл)"), item('t', "Изменить настройки"), item('d', "Открыть диагностику")]
+                    } else if cfg!(windows) {
+                        vec![item('p', "Открыть подключение"), item('d', "Открыть диагностику"), item('t', "Изменить настройки")]
+                    } else { vec![item('d', "Открыть диагностику"), item('t', "Изменить настройки"), item('p', "Состояние подключения")] }
+                }
                 else if std::fs::symlink_metadata(&self.path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
                     vec![item('n', "Настроить Anti-DPI"), item('d', "Открыть каталог")]
                 } else { vec![item('t', "Проверить конфигурацию"), item('d', "Открыть каталог")] }
             }
             CONNECTION => {
-                let mut actions = vec![item('p', "Подключить / отключить (подтверждение)"), item('a', "Применить сохранённую политику"), item('e', "Первично зарегистрировать локальную политику"), item('t', "Настройки подключения")];
+                let mut actions = vec![item('t', "Настройки подключения"), item('a', "Применить сохранённые правила"), item('e', "Первое применение (новая конфигурация)")];
+                if cfg!(windows) {
+                    if self.owner_active() { actions.insert(0, item('p', "Отключить")); }
+                    else if Document::read(&self.path).is_ok_and(|doc| doc.anti_dpi.resolver.is_some() && doc.anti_dpi.consent.direct_egress) {
+                        actions.insert(0, item('p', "Подключить"));
+                    }
+                }
                 if cfg!(windows) { actions.push(item('v', "Проверить и восстановить системный прокси")); }
                 actions
             },
@@ -745,8 +954,9 @@ impl Panel {
                                 Ok(()) => {
                                     self.notice = "Файл сохранён. Политика ещё не применена; подключения не запускались.".into();
                                     self.applied_revision = None;
+                                    self.newly_saved = draft.first_run() || self.newly_saved;
                                     self.mark_stale();
-                                    self.open_page(SETTINGS);
+                                    self.open_page(OVERVIEW);
                                 }
                                 Err(error) => {
                                     let mut draft = *draft;
@@ -785,7 +995,7 @@ impl Panel {
                             let revision = candidate.document().anti_dpi.revision;
                             let digest = candidate.digest();
                             let result = if enroll { candidate.enroll(digest) } else { candidate.apply(digest) };
-                            if result.is_ok() { self.applied_revision = Some(revision); self.mark_stale(); }
+                            if result.is_ok() { self.applied_revision = Some(revision); self.newly_saved = false; self.mark_stale(); }
                             self.notice = result.map_or_else(|e| e.to_string(),
                                 |_| "Локальная политика применена; сеть и системный прокси не изменены.".into());
                         }
@@ -841,12 +1051,15 @@ impl Panel {
                     draft.values[4] = self.selected.iter().cloned().collect::<Vec<_>>().join(", ");
                     draft.error.clear();
                 }
+                draft.move_to(SetupStep::Domains);
+                self.filter.clear(); self.row = 0; self.offset = 0;
+                self.notice = "Сайты выбираются только для черновика; сеть не запускается.".into();
                 self.page = OVERVIEW;
                 self.draft = Some(draft);
                 return Ok(false);
             }
             if !matches!(code, KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown |
-                KeyCode::Char(' ') | KeyCode::Char('s') | KeyCode::Char('c') | KeyCode::Char('/') | KeyCode::Char('i')) {
+                KeyCode::Char(' ') | KeyCode::Char('s') | KeyCode::Char('c') | KeyCode::Char('/')) {
                 return Ok(false);
             }
         }
@@ -1037,10 +1250,11 @@ impl Panel {
             OVERVIEW => {
                 let _ = writeln!(text, "Anti-DPI не активен: стратегии ожидают независимой приёмки.\n{}", self.owner_text());
                 if let Some(local) = local {
-                    let _ = writeln!(text, "\nРежим: системный прокси\nПравил: {} · По умолчанию: напрямую при всех NoMatch\nЗащищённый DNS: {}\nПрямой выход: {}\n\nСледующий шаг\n{}",
+                    let _ = writeln!(text, "\nРежим: системный прокси\nПравил: {} · По умолчанию: напрямую, если ни одно правило не совпало\nЗащищённый DNS: {}\nПрямой выход: {}\n\nСледующий шаг\n{}",
                         local.rules.len(), if local.resolver.is_some() { "настроен (сеть не проверена)" } else { "не настроен" },
                         yes(local.consent.direct_egress), if local.resolver.is_none() || !local.consent.direct_egress {
-                            "Настройте DNS и явно выберите разрешения." } else { "Проверьте правила, примените политику и откройте подключение или диагностику." });
+                            if local.resolver.is_none() { "Выберите защищённый DNS и разрешения." } else { "Разрешите выход в интернет в настройках, если хотите подключаться." }
+                    } else { "Примените сохранённые правила, затем отдельно откройте подключение или диагностику." });
                 } else {
                     let _ = writeln!(text, "\nНастройте локальную конфигурацию. Без VPS, регистрации на сервере и импортируемых ключей.\nСоздание файла не запускает сеть или системный прокси.");
                 }
@@ -1093,6 +1307,27 @@ impl Panel {
             2 => vec![None, Some("quic_v2_initial_split")],
             _ => vec![None, Some("stun_fingerprint")],
         }
+    }
+
+    fn draw_setup_catalogue(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        use ratatui::widgets::Cell;
+        let body = Layout::vertical([Constraint::Length(4), Constraint::Min(2), Constraint::Length(2)]).split(area);
+        let header = format!("Шаг 2 из 5 · Выберите сайты\nОтмечено: {} из 64 · Поиск: {}\nИсторический список OONI. Выбор не запускает проверку и не сохраняет правила.", self.selected.len(), if self.filter.is_empty() { "нет" } else { &self.filter });
+        frame.render_widget(Paragraph::new(header).style(Style::default().fg(TEXT)).wrap(Wrap { trim: true }), body[0]);
+        let height = usize::from(body[1].height.saturating_sub(1)).max(1);
+        let len = self.visible().len();
+        self.row = self.row.min(len.saturating_sub(1));
+        if self.row < self.offset { self.offset = self.row; }
+        if self.row >= self.offset + height { self.offset = self.row + 1 - height; }
+        self.offset = self.offset.min(len.saturating_sub(1));
+        let rows = self.visible().iter().enumerate().skip(self.offset).take(height).map(|(i, entry)| {
+            let mark = if entry.excluded { "×" } else if self.selected.contains(&entry.hostname) { "✓" } else { "□" };
+            Row::new(vec![Cell::from(mark), Cell::from(entry.hostname.as_str()), Cell::from(if entry.excluded { "Исключён" } else { "Доступен для выбора" })])
+                .style(Style::default().fg(if entry.excluded { MUTED } else { TEXT }).bg(if i == self.row { FOCUS } else { SURFACE }))
+        }).collect::<Vec<_>>();
+        frame.render_widget(Table::new(rows, [Constraint::Length(3), Constraint::Min(16), Constraint::Length(23)])
+            .header(Row::new(["", "Сайт", "Выбор"]).style(Style::default().fg(ACCENT))), body[1]);
+        frame.render_widget(Paragraph::new("Пробел — отметить сайт. Enter — вернуться к мастеру с выбранными сайтами.").style(Style::default().fg(MUTED)).wrap(Wrap { trim: true }), body[2]);
     }
 
     fn draw_diagnostics(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -1217,7 +1452,7 @@ impl Panel {
                     if *enroll { "Первичная регистрация локальной ревизии (не регистрация на сервере)." } else { "Применить сохранённую ревизию." },
                     policy_text(candidate.document())), "Применить"),
                 Review::Save(draft, next) => ("Сохранение конфигурации", format!("{}\n{}\n\n{}", if draft.first_run() { "Создать новый файл без перезаписи." } else { "Сохранить новую ревизию (не Apply)." },
-                    "Подтверждение сохраняет конфигурацию и указанные разрешения. Подключение не запускается.", policy_text(next)), "Сохранить"),
+                    "Проверьте выбранные сайты, DNS и разрешения. Сохранение не применяет правила и не запускает подключение.", policy_text(next)), "Сохранить"),
                 Review::DiscardRouting => ("Отменить черновик?", "Несохранённые изменения маршрутизации будут потеряны. Рабочая политика не меняется.".into(), "Отменить изменения"),
                 Review::Export(_, path) => ("Обезличенный экспорт", format!("Сохранить агрегированный отчёт в:\n{}\n\nБез доменов, IP, секретов и идентификаторов. Существующий файл не перезаписывается.", path.display()), "Экспортировать"),
                 #[cfg(windows)]
@@ -1238,8 +1473,15 @@ impl Panel {
             tui_widgets::confirmation_bar(frame, parts[2], "↑↓ / PgUp PgDn просмотр · ←→ выбор · Enter · Esc отменить", false, label, self.confirm_selected);
             return;
         } else if let Some(draft) = &self.draft {
-            draft.form().render(frame, body, if draft.first_run() { "Первоначальная настройка Anti-DPI" } else { "Настройки локальной конфигурации" });
-            footer = "↑ ↓ поля · Пробел выбор · Del очистить · F3 домены · F5 проверить · Esc отменить".into();
+            if draft.first_run() {
+                draft.render_wizard(frame, body);
+                footer = if matches!(draft.step, SetupStep::DomainInput | SetupStep::CustomDns) {
+                    "↑ ↓ поля · Enter далее · Del очистить · Esc назад".into()
+                } else { "↑ ↓ выбор · Enter далее · Esc назад".into() };
+            } else {
+                draft.form().render(frame, body, "Настройки локальной конфигурации");
+                footer = "↑ ↓ поля · Пробел выбор · Del очистить · F5 проверить · Esc отменить".into();
+            }
         } else if let Some((panel, _, _)) = &self.routing {
             panel.render(frame, body, true);
             footer = "↑ ↓ выбор · Tab действия · Enter открыть · s сохранить · Esc назад · F6 GeoData".into();
@@ -1247,11 +1489,11 @@ impl Panel {
             super::panel(frame, body, "Подробности проверки", &self.detail_text(), true);
             footer = "Esc назад · F7 закрыть".into();
         } else if self.page == DIAGNOSTICS {
-            self.draw_diagnostics(frame, body);
+            if self.catalogue_draft.is_some() { self.draw_setup_catalogue(frame, body); } else { self.draw_diagnostics(frame, body); }
             footer = if let Some((custom, text)) = &self.editing {
                 format!("{}: {text} · Enter принять · Esc отменить", if *custom { "Свой домен" } else { "Поиск" })
             } else if self.catalogue_draft.is_some() {
-                "↑ ↓ строки · Пробел выбор · s все · c очистить · / поиск · i добавить · F3 принять домены · Esc назад".into()
+                "↑ ↓ сайты · Пробел отметить · s все · c очистить · / поиск · Enter принять · Esc назад".into()
             } else if self.worker.is_some() {
                 "Esc отменить · ↑ ↓ строки · ← → ячейки · [ ] протокол · F7 детали".into()
             } else {
@@ -1340,17 +1582,39 @@ mod tests {
         };
         let mut panel = Panel::new(path.clone()).unwrap();
         capture("anti-dpi-first-run", &mut panel);
-        if let Some(draft) = panel.draft.as_mut() {
-            draft.values[0] = "dns.example.com".into();
-            draft.values[1] = "1.1.1.1".into();
-            draft.flags[3] = true;
-            draft.values[4] = "example.org".into();
-        }
-        panel.key(KeyCode::F(5)).unwrap();
+        panel.key(KeyCode::Enter).unwrap();
+        capture("anti-dpi-setup-domains", &mut panel);
+        panel.key(KeyCode::Enter).unwrap();
+        panel.key(KeyCode::Char(' ')).unwrap();
+        capture("anti-dpi-setup-catalog", &mut panel);
+        panel.key(KeyCode::Enter).unwrap();
+        panel.key(KeyCode::Down).unwrap();
+        panel.key(KeyCode::Down).unwrap();
+        panel.key(KeyCode::Enter).unwrap();
+        capture("anti-dpi-setup-dns", &mut panel);
+        panel.key(KeyCode::Down).unwrap();
+        panel.key(KeyCode::Down).unwrap();
+        panel.key(KeyCode::Enter).unwrap();
+        capture("anti-dpi-setup-custom-dns", &mut panel);
+        panel.key(KeyCode::Esc).unwrap();
+        panel.key(KeyCode::Enter).unwrap();
+        capture("anti-dpi-setup-direct", &mut panel);
+        panel.key(KeyCode::Down).unwrap();
+        panel.key(KeyCode::Enter).unwrap();
+        capture("anti-dpi-setup-modify", &mut panel);
+        panel.key(KeyCode::Enter).unwrap();
         assert!(panel.review.is_some());
         capture("anti-dpi-first-run-preview", &mut panel);
+        assert!(!path.exists());
+        assert!(panel.worker.is_none());
         panel.key(KeyCode::Esc).unwrap();
-        panel.key(KeyCode::Esc).unwrap();
+        while panel.draft.is_some() { panel.key(KeyCode::Esc).unwrap(); }
+        panel.create_config();
+        panel.key(KeyCode::Down).unwrap();
+        panel.key(KeyCode::Enter).unwrap();
+        capture("anti-dpi-setup-manual", &mut panel);
+        while panel.draft.is_some() { panel.key(KeyCode::Esc).unwrap(); }
+        assert!(!path.exists());
         std::fs::write(&path, format!("{}\n[anti_dpi.resolver]\nhostname='dns.example.com'\nbootstrap=['1.1.1.1']\n",
             include_str!("../../../../examples/anti-dpi.toml"))).unwrap();
         capture("anti-dpi-overview", &mut panel);
@@ -1459,25 +1723,40 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let path = root.join("anti-dpi.toml");
         let mut panel = Panel::new(path.clone()).unwrap();
-        let draft = panel.draft.as_mut().unwrap();
-        assert_eq!(draft.flags, [false; 4]);
-        draft.values[0] = "dns.example.com".into();
-        draft.values[1] = "1.1.1.1".into();
-        draft.flags[3] = true;
-        draft.values[4] = "example.org".into();
-        panel.key(KeyCode::F(5)).unwrap();
+        assert_eq!(panel.draft.as_ref().unwrap().flags, [false; 4]);
+        panel.key(KeyCode::F(5)).unwrap(); // cannot skip choices
+        assert!(panel.review.is_none());
+        panel.key(KeyCode::Enter).unwrap(); // recommended
+        panel.key(KeyCode::Down).unwrap();
+        panel.key(KeyCode::Enter).unwrap(); // own domains
+        panel.draft.as_mut().unwrap().paste("example.org");
+        panel.key(KeyCode::Enter).unwrap();
+        panel.key(KeyCode::Down).unwrap();
+        panel.key(KeyCode::Down).unwrap();
+        panel.key(KeyCode::Enter).unwrap(); // continue with explicit domain
+        assert!(panel.draft.as_ref().unwrap().values[0].is_empty());
+        panel.key(KeyCode::Enter).unwrap(); // explicit Cloudflare choice
+        assert_eq!(panel.draft.as_ref().unwrap().values[0], "cloudflare-dns.com");
+        panel.key(KeyCode::Down).unwrap(); // highlighting permission does not grant it
+        assert!(!panel.draft.as_ref().unwrap().flags[0]);
+        panel.key(KeyCode::Up).unwrap();
+        panel.key(KeyCode::Enter).unwrap(); // deny, preview
         assert!(matches!(panel.review, Some(Review::Save(_, _))));
         assert!(!path.exists());
         panel.key(KeyCode::Enter).unwrap();
         assert!(panel.draft.is_some());
         assert!(!path.exists());
-        panel.key(KeyCode::F(5)).unwrap();
+        panel.key(KeyCode::Enter).unwrap();
         panel.key(KeyCode::Right).unwrap();
         panel.key(KeyCode::Enter).unwrap();
         let saved = Document::read(&path).unwrap();
         assert_eq!(saved.anti_dpi.rules.len(), 1);
         assert_eq!(saved.anti_dpi.rules[0].domains, ["full:example.org"]);
         assert!(!saved.anti_dpi.consent.direct_egress);
+        assert!(!saved.anti_dpi.consent.direct_dpi);
+        assert!(!saved.anti_dpi.consent.direct_dpi_stun);
+        assert_eq!(saved.anti_dpi.resolver.as_ref().unwrap().hostname, "cloudflare-dns.com");
+        assert!(panel.newly_saved);
         assert!(panel.applied_revision.is_none());
         assert!(!panel.owner_active());
         panel.open_page(DIAGNOSTICS);
