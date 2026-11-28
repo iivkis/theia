@@ -93,6 +93,7 @@ def main():
     required.update(["state-profile-diagnostics-choose","state-profile-diagnostics-custom","state-profile-diagnostics-validation-error","state-profile-diagnostics-fetching","state-profile-diagnostics-consent","state-profile-diagnostics-running","state-profile-diagnostics-completed","state-profile-diagnostics-partial","state-profile-diagnostics-details","state-profile-diagnostics-blocked","state-profile-diagnostics-failed"])
     required.update(["state-reality-step5-manual-choice", "state-reality-step5-manual-selected", "server-routing-geosite-picker", "server-routing-geoip-picker"])
     required.update(["server-routing-geodata-marked", "server-routing-geodata-empty", "server-routing-geodata-missing", "server-routing-geodata-added"])
+    required.update(["server-routing-geosite-reopened", "server-routing-geoip-reopened", "server-routing-geodata-clear"])
     assert not required & obsolete, "contradictory gallery contract"
     missing = required - actual
     assert not missing, f"missing required screens: {sorted(missing)}"

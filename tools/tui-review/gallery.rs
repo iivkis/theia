@@ -384,7 +384,7 @@ fn visual_review_gallery() {
                 panel.fields.as_mut().unwrap().2 = field;
                 let mut picker = GeoPicker::new(field);
                 picker.query = query.into();
-                picker.codes = codes.into_iter().map(str::to_owned).collect();
+                picker.set_catalog(codes.into_iter().map(str::to_owned).collect());
                 panel.geo_picker = Some(picker);
                 panel.key(press(KeyCode::Char(' ')), None);
                 review_capture(name, &model, &ui);
@@ -394,7 +394,7 @@ fn visual_review_gallery() {
                 let panel = ui.routing_panel.as_mut().unwrap();
                 panel.fields.as_mut().unwrap().2 = 2;
                 let mut picker = GeoPicker::new(2);
-                picker.codes = vec!["google".into(), "youtube".into(), "category-ads-all".into()];
+                picker.set_catalog(vec!["google".into(), "youtube".into(), "category-ads-all".into()]);
                 panel.geo_picker = Some(picker);
                 panel.paste("goo");
                 panel.key(press(KeyCode::Char(' ')), None);
@@ -408,8 +408,44 @@ fn visual_review_gallery() {
             review_capture("server-routing-geodata-added", &model, &ui);
             {
                 let panel = ui.routing_panel.as_mut().unwrap();
+                panel.settings.datasets = None;
+                panel.key(press(KeyCode::F(6)), None);
+                let picker = panel.geo_picker.as_mut().unwrap();
+                picker.set_catalog(vec!["google".into(), "youtube".into(), "category-ads-all".into()]);
+                picker.message.clear();
+                assert_eq!(picker.marked.len(), 2);
+            }
+            review_capture("server-routing-geosite-reopened", &model, &ui);
+            {
+                let panel = ui.routing_panel.as_mut().unwrap();
+                panel.key(press(KeyCode::F(4)), None);
+                panel.key(press(KeyCode::Char(' ')), None);
+                panel.key(press(KeyCode::Char(' ')), None);
+                assert!(panel.geo_picker.as_ref().unwrap().marked.is_empty());
+            }
+            review_capture("server-routing-geodata-clear", &model, &ui);
+            {
+                let panel = ui.routing_panel.as_mut().unwrap();
+                panel.key(press(KeyCode::Esc), None);
+                let (_, values, focus) = panel.fields.as_mut().unwrap();
+                values[3] = "192.0.2.0/24, geoip:in-ru, geoip:private".into();
+                *focus = 3;
+                panel.key(press(KeyCode::F(6)), None);
+                let picker = panel.geo_picker.as_mut().unwrap();
+                picker.set_catalog(vec!["in-cn".into(), "in-ru".into(), "private".into()]);
+                picker.message.clear();
+                assert_eq!(picker.marked.len(), 2);
+            }
+            review_capture("server-routing-geoip-reopened", &model, &ui);
+            {
+                let panel = ui.routing_panel.as_mut().unwrap();
+                panel.key(press(KeyCode::Esc), None);
+                panel.fields.as_mut().unwrap().2 = 2;
+            }
+            {
+                let panel = ui.routing_panel.as_mut().unwrap();
                 let mut picker = GeoPicker::new(2);
-                picker.codes = vec!["google".into(), "youtube".into()];
+                picker.set_catalog(vec!["google".into(), "youtube".into()]);
                 picker.query = "not-found".into();
                 panel.geo_picker = Some(picker);
             }
