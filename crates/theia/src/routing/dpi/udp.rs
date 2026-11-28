@@ -181,6 +181,16 @@ pub(super) async fn probe_stun_checked(
     strategy: BindingStrategy,
     live: impl Fn() -> bool,
 ) -> Result<Option<ProbeTiming>, crate::client::ClientError> {
+    probe_stun_observed(socket, strategy, live, |_| {}).await
+}
+
+/// Report a successful transformed send separately from its response.
+pub(super) async fn probe_stun_observed(
+    socket: &tokio::net::UdpSocket,
+    strategy: BindingStrategy,
+    live: impl Fn() -> bool,
+    sent: impl Fn(bool),
+) -> Result<Option<ProbeTiming>, crate::client::ClientError> {
     use crate::client::ClientError;
     use ring::rand::{SecureRandom, SystemRandom};
     let mut request = [0u8; 20];
@@ -191,6 +201,10 @@ pub(super) async fn probe_stun_checked(
         .map_err(|_| ClientError::Protocol)?;
     let expected = plain_binding(&request).ok_or(ClientError::Protocol)?;
     let packet = prepare_binding(&request, strategy).ok_or(ClientError::Protocol)?;
+    let modified = packet.as_ref() != request.as_slice();
+    if strategy == BindingStrategy::Fingerprint && !modified {
+        return Err(ClientError::Protocol);
+    }
     if !live() {
         return Err(super::stale_policy());
     }
@@ -202,6 +216,7 @@ pub(super) async fn probe_stun_checked(
             Ok(None)
         };
     }
+    sent(modified);
     let mut response = [0; 513];
     for _ in 0..8 {
         if !live() {

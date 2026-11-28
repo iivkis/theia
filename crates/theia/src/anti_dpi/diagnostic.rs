@@ -1,7 +1,7 @@
 //! Standalone diagnostic plan, single-job reservation and typed report.
 //! No server session, production evidence, listener or OS proxy mutation.
 use super::{
-    catalog::{Catalog, Overlay, VERSION},
+    catalog::{Catalog, EndpointMetadata, EndpointSupport, Overlay, MAX_JOB_CELLS, VERSION},
     dns::{self, DnsError},
     invalid, Decision, Document, PreparedPolicy,
 };
@@ -9,14 +9,16 @@ use crate::{
     config::{self, ConfigError},
     network_scope,
     routing::dpi::{
-        diagnostic::{self as tcp_probe, Failure, Observation},
+        diagnostic::{self as probe, Failure, Observation, UdpObservation},
         Strategy, UdpStrategy,
     },
 };
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fmt::Write,
     net::{IpAddr, SocketAddr},
+    sync::Arc,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
@@ -72,6 +74,7 @@ pub enum Reason {
     None,
     AwaitingAcceptance,
     MissingEndpointMetadata,
+    ConsentRequired,
     Budget,
     Cancelled,
     ContextChanged,
@@ -107,7 +110,7 @@ pub struct CellResult {
 #[derive(Clone, Copy)]
 enum Column {
     Tcp(Option<Strategy>),
-    Udp(UdpStrategy, Protocol),
+    Udp(Option<UdpStrategy>, Protocol),
 }
 
 impl Column {
@@ -122,27 +125,56 @@ impl Column {
         match self {
             Self::Tcp(None) => "direct",
             Self::Tcp(Some(strategy)) => strategy.id(),
-            Self::Udp(strategy, _) => strategy.id(),
+            Self::Udp(Some(strategy), _) => strategy.id(),
+            Self::Udp(None, Protocol::QuicV1) => "quic_v1_direct",
+            Self::Udp(None, Protocol::QuicV2) => "quic_v2_direct",
+            Self::Udp(None, Protocol::Stun) => "stun_direct",
+            Self::Udp(None, Protocol::TcpHttps) => unreachable!(),
         }
     }
 
     fn unavailable(self) -> Option<Reason> {
         match self {
-            Self::Tcp(None) => None,
-            Self::Tcp(Some(strategy)) => {
-                (!strategy.accepted_for_standalone()).then_some(Reason::AwaitingAcceptance)
-            }
-            Self::Udp(strategy, _) if !strategy.accepted_for_standalone() => {
+            Self::Tcp(Some(strategy)) if !strategy.available_for_standalone() => {
                 Some(Reason::AwaitingAcceptance)
             }
-            // A plain hostname does not advertise an authenticated QUIC or
-            // credential-free STUN endpoint. Never guess protocol/port.
-            Self::Udp(_, _) => Some(Reason::MissingEndpointMetadata),
+            Self::Udp(Some(strategy), _) if !strategy.available_for_standalone() => {
+                Some(Reason::AwaitingAcceptance)
+            }
+            _ => None,
         }
     }
 
-    fn cell(self, domain: &str) -> CellResult {
-        let reason = self.unavailable().unwrap_or(Reason::None);
+    fn supported(self, endpoint: &EndpointMetadata) -> bool {
+        match self.protocol() {
+            Protocol::TcpHttps => true,
+            Protocol::QuicV1 => endpoint.quic_v1 == EndpointSupport::QuicH3Candidate,
+            Protocol::QuicV2 => endpoint.quic_v2 == EndpointSupport::QuicH3Candidate,
+            Protocol::Stun => endpoint.stun == EndpointSupport::StunBindingCandidate,
+        }
+    }
+
+    fn planned(self, endpoint: &EndpointMetadata) -> bool {
+        // Keep unavailable Modify cells in the report. Allocate separate
+        // controls only for declared UDP endpoints, preserving the 512-cell
+        // bound even with a full 60-host catalogue.
+        !matches!(self, Self::Udp(None, _)) || self.supported(endpoint)
+    }
+
+    fn reason(self, endpoint: &EndpointMetadata, stun_allowed: bool) -> Option<Reason> {
+        self.unavailable().or_else(|| {
+            if !self.supported(endpoint) {
+                Some(Reason::MissingEndpointMetadata)
+            } else if self.protocol() == Protocol::Stun && !stun_allowed {
+                Some(Reason::ConsentRequired)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn cell(self, domain: &str, endpoint: &EndpointMetadata, stun_allowed: bool) -> CellResult {
+        let reason = self.reason(endpoint, stun_allowed).unwrap_or(Reason::None);
         CellResult {
             domain: domain.to_owned(),
             protocol: self.protocol(),
@@ -177,10 +209,13 @@ fn columns() -> Vec<Column> {
                 .map(|strategy| Column::Tcp(Some(strategy))),
         )
         .chain([
-            Column::Udp(UdpStrategy::Quic(Version::V1), Protocol::QuicV1),
-            Column::Udp(UdpStrategy::Quic(Version::V2), Protocol::QuicV2),
+            Column::Udp(None, Protocol::QuicV1),
+            Column::Udp(Some(UdpStrategy::Quic(Version::V1)), Protocol::QuicV1),
+            Column::Udp(None, Protocol::QuicV2),
+            Column::Udp(Some(UdpStrategy::Quic(Version::V2)), Protocol::QuicV2),
+            Column::Udp(None, Protocol::Stun),
             Column::Udp(
-                UdpStrategy::StunBinding(BindingStrategy::Fingerprint),
+                Some(UdpStrategy::StunBinding(BindingStrategy::Fingerprint)),
                 Protocol::Stun,
             ),
         ])
@@ -252,6 +287,7 @@ pub struct Plan {
     document: Document,
     policy: PreparedPolicy,
     hosts: Vec<String>,
+    endpoints: BTreeMap<String, EndpointMetadata>,
     digest: [u8; 32],
 }
 
@@ -288,13 +324,17 @@ impl Plan {
             hosts.to_vec()
         };
         let columns = columns();
-        let hosts = catalog
-            .select(&selected, columns.len())?
-            .into_iter()
-            .map(|entry| entry.hostname.clone())
-            .collect::<Vec<_>>();
+        let entries = catalog.select(&selected, 7)?;
+        let endpoints = entries.iter().map(|entry| (entry.hostname.clone(), entry.endpoint.clone())).collect::<BTreeMap<_, _>>();
+        let hosts = entries.iter().map(|entry| entry.hostname.clone()).collect::<Vec<_>>();
+        let planned: usize = endpoints.values().map(|endpoint| columns.iter().filter(|column| column.planned(endpoint)).count()).sum();
+        if planned > MAX_JOB_CELLS {
+            return Err(invalid("catalog.selection", "diagnostic matrix exceeds 512 cells; select fewer UDP endpoints"));
+        }
         let mut hash = Sha256::new();
-        field(&mut hash, b"theia/standalone/diagnostic/v1");
+        field(&mut hash, b"theia/standalone/diagnostic/v2");
+        field(&mut hash, &[u8::from(crate::routing::dpi::STANDALONE_EXPERIMENTAL)]);
+        field(&mut hash, b"quic-initial-decoalesce-or-crypto-split/v1");
         saved.hash(&mut hash);
         if let Some(overlay) = &overlay {
             field(&mut hash, b"overlay");
@@ -307,17 +347,15 @@ impl Plan {
         field(&mut hash, &policy.digest());
         field(
             &mut hash,
-            b"https:443 HEAD / HTTP/1.1; doh:443 GET /dns-query",
+            b"https:443 HEAD / HTTP/1.1; quic:443 HEAD / H3 exact v1/v2; stun:3478 Binding; doh:443 GET /dns-query",
         );
         for host in &hosts {
             field(&mut hash, host.as_bytes());
-        }
-        for column in columns {
-            field(&mut hash, column.id().as_bytes());
-            field(
-                &mut hash,
-                format!("{:?}:{:?}", column.protocol(), column.unavailable()).as_bytes(),
-            );
+            let endpoint = &endpoints[host];
+            for column in columns.iter().filter(|column| column.planned(endpoint)) {
+                field(&mut hash, column.id().as_bytes());
+                field(&mut hash, format!("{:?}:{:?}", column.protocol(), column.reason(endpoint, document.anti_dpi.consent.direct_dpi_stun)).as_bytes());
+            }
         }
         Ok(Self {
             saved,
@@ -325,6 +363,7 @@ impl Plan {
             document,
             policy,
             hosts,
+            endpoints,
             digest: hash.finalize().into(),
         })
     }
@@ -334,7 +373,31 @@ impl Plan {
     }
 
     pub fn planned_cells(&self) -> usize {
-        self.hosts.len() * columns().len()
+        self.endpoints.values().map(|endpoint| columns().iter().filter(|column| column.planned(endpoint)).count()).sum()
+    }
+
+    /// Maximum number of runnable target probes, excluding DNS preparation.
+    pub(crate) fn runnable_cells(&self) -> usize {
+        self.endpoints.values().map(|endpoint| columns().iter().filter(|column| {
+            column.planned(endpoint) && column.reason(endpoint, self.document.anti_dpi.consent.direct_dpi_stun).is_none()
+        }).count()).sum()
+    }
+
+    fn target_count(&self, column: Column) -> usize {
+        self.endpoints.values().filter(|endpoint| column.planned(endpoint)
+            && column.reason(endpoint, self.document.anti_dpi.consent.direct_dpi_stun).is_none()).count()
+    }
+
+    fn target_text(&self, host: &str) -> String {
+        let endpoint = &self.endpoints[host];
+        let mut text = format!("{host}: TCP 443 HEAD /");
+        for (protocol, label) in [(Protocol::QuicV1, "QUIC v1 UDP 443 HEAD /"), (Protocol::QuicV2, "QUIC v2 UDP 443 HEAD /"), (Protocol::Stun, "STUN UDP 3478 Binding")] {
+            if columns().iter().any(|column| column.protocol() == protocol && column.planned(endpoint)
+                && column.reason(endpoint, self.document.anti_dpi.consent.direct_dpi_stun).is_none()) {
+                let _ = write!(text, "; {label}");
+            }
+        }
+        text
     }
 
     fn files_current(&self) -> bool {
@@ -347,7 +410,7 @@ impl Plan {
             hex(Catalog::builtin_digest()), self.policy.revision(), self.hosts.len(),
         );
         for host in &self.hosts {
-            let _ = writeln!(result, "  {host}");
+            let _ = writeln!(result, "  {}", self.target_text(host));
         }
         if let Some(resolver) = &self.document.anti_dpi.resolver {
             let _ = writeln!(
@@ -356,22 +419,15 @@ impl Plan {
                 resolver.hostname, resolver.bootstrap[0]
             );
         }
-        let mut runnable = 0;
         for column in columns() {
-            if column.unavailable().is_none() {
-                runnable += 1;
-            }
-            let _ = writeln!(
-                result,
-                "{:?} {}: {:?}",
-                column.protocol(),
-                column.id(),
-                column.unavailable()
-            );
+            let _ = writeln!(result, "{:?} {}: {:?}; runnable targets={}", column.protocol(), column.id(), column.unavailable(), self.target_count(column));
+        }
+        if crate::routing::dpi::STANDALONE_EXPERIMENTAL {
+            let _ = writeln!(result, "Experimental standalone strategies; independent acceptance is not claimed.");
         }
         let _ = writeln!(result,
-            "At most {} DNS/HTTPS attempts; 4 concurrent, 6 s per cell, 600 s per job.\nLocal public IP and selected names are disclosed to the resolver/targets. No VPS, no redirect following or OS proxy changes.\nConfirm exact plan with SHA256={}",
-            self.hosts.len() * (dns::MAX_DNS_REQUESTS + runnable), hex(self.digest),
+            "At most {} DNS/endpoint attempts; 4 concurrent, 6 s per cell, 600 s per job.\nLocal public IP and selected names are disclosed to the resolver/targets. No VPS, no redirect following or OS proxy changes.\nConfirm exact plan with SHA256={}",
+            self.hosts.len() * dns::MAX_DNS_REQUESTS + self.runnable_cells(), hex(self.digest),
         );
         result
     }
@@ -380,16 +436,47 @@ impl Plan {
     /// keeps its stable technical representation separately.
     pub(crate) fn ui_preview(&self, owned: bool) -> String {
         let mut result = String::new();
-        let runnable = columns()
-            .iter()
-            .filter(|column| column.unavailable().is_none())
-            .count();
-        let _ = writeln!(result, "ПОДТВЕРЖДЕНИЕ ДИАГНОСТИКИ\nДо подтверждения сетевых запросов нет.\n\nЦелей: {} · Ячеек: {} · Ревизия: {}",
-            self.hosts.len(), self.planned_cells(), self.policy.revision());
+        let runnable = self.runnable_cells();
+        let skipped = self.planned_cells() - runnable;
+        let _ = writeln!(result, "Проверить {} сайт(ов)?\nЗапланировано сетевых проверок сайтов: {runnable}. Недоступных ячеек: {skipped}.", self.hosts.len());
+        if runnable == self.hosts.len() {
+            let _ = writeln!(result, "Сейчас доступна только прямая HTTPS-проверка. Anti-DPI не будет проверен.");
+        }
+        let _ = writeln!(result, "\n←/→ — выбрать «Запустить проверку», Enter — подтвердить. Esc — отменить.\nДо подтверждения запросов нет. DNS и сайты получат ваш публичный IP.\nПрокси Windows, правила и разрешения рабочего трафика не изменятся.");
+        if crate::routing::dpi::STANDALONE_EXPERIMENTAL {
+            let _ = writeln!(result, "Экспериментальные стратегии: независимая приёмка ещё не подтверждена.");
+        }
+        let _ = writeln!(result, "\nСпособы проверки:");
+        for column in columns() {
+            let name = match column.id() {
+                "direct" => "TCP HTTPS — напрямую (контроль)",
+                "tcp_header" => "TCP HTTPS — Header",
+                "tcp_middle" => "TCP HTTPS — Middle",
+                "tcp_balanced" => "TCP HTTPS — Balanced",
+                "quic_v1_direct" => "QUIC v1 — напрямую",
+                "quic_v2_direct" => "QUIC v2 — напрямую",
+                "stun_direct" => "STUN — напрямую",
+                "quic_v1_initial_split" => "QUIC v1 — Anti-DPI",
+                "quic_v2_initial_split" => "QUIC v2 — Anti-DPI",
+                "stun_fingerprint" => "STUN — Anti-DPI",
+                other => other,
+            };
+            let count = self.target_count(column);
+            let state = if count > 0 {
+                format!("целей: {count}")
+            } else if column.unavailable().is_some() {
+                "пока недоступно".into()
+            } else if column.protocol() == Protocol::Stun && !self.document.anti_dpi.consent.direct_dpi_stun {
+                "нужно отдельное разрешение STUN".into()
+            } else {
+                "нет данных о совместимом сервере".into()
+            };
+            let _ = writeln!(result, "  {name}: {state}");
+        }
         let _ = writeln!(
             result,
-            "Не более {} DNS/HTTPS операций, {} параллельно; 6 с на ячейку, 10 мин на задание.",
-            self.hosts.len() * (dns::MAX_DNS_REQUESTS + runnable),
+            "\nЛимиты: не более {} DNS/сетевых операций, {} параллельно; 6 с на ячейку, 10 мин на задание.",
+            self.hosts.len() * dns::MAX_DNS_REQUESTS + runnable,
             if owned { 2 } else { 4 }
         );
         if let Some(resolver) = &self.document.anti_dpi.resolver {
@@ -397,43 +484,15 @@ impl Plan {
                 result,
                 "DNS: HTTPS https://{}/dns-query · bootstrap {}",
                 resolver.hostname,
-                resolver
-                    .bootstrap
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                resolver.bootstrap.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
             );
         }
-        let _ = writeln!(result, "\nВНИМАНИЕ: DNS-провайдер и проверяемые ресурсы получат ваш публичный IP.\nПроверка не меняет прокси, правила и разрешения рабочего трафика.\nНе следует перенаправлениям. Доступность не доказывает обход DPI.\n\nСтратегии:");
-        for column in columns() {
-            let name = match column.id() {
-                "direct" => "TCP HTTPS — напрямую (контроль)",
-                "tcp_header" => "TCP HTTPS — Header",
-                "tcp_middle" => "TCP HTTPS — Middle",
-                "tcp_balanced" => "TCP HTTPS — Balanced",
-                "quic_v1_initial_split" => "QUIC v1",
-                "quic_v2_initial_split" => "QUIC v2",
-                "stun_fingerprint" => "STUN",
-                other => other,
-            };
-            let state = match column.unavailable() {
-                None => "запланировано",
-                Some(Reason::AwaitingAcceptance) => "не поддерживается (приёмка не завершена)",
-                Some(Reason::MissingEndpointMetadata) => "не проверено (нет данных endpoint)",
-                Some(_) => "не будет запущено",
-            };
-            let _ = writeln!(result, "  {name}: {state}");
-        }
-        let _ = writeln!(result, "\nТочные цели (HEAD /, HTTPS 443):");
+        let _ = writeln!(result, "Перенаправления не выполняются. Доступность не доказывает обход DPI.");
+        let _ = writeln!(result, "\nТочные цели и протоколы:");
         for host in &self.hosts {
-            let _ = writeln!(result, "  {host}");
+            let _ = writeln!(result, "  {}", self.target_text(host));
         }
-        let _ = writeln!(
-            result,
-            "\nКаталог: {VERSION}\nSHA256 плана: {}",
-            hex(self.digest)
-        );
+        let _ = writeln!(result, "\nТехнические сведения: ревизия {} · каталог {VERSION}\nSHA256 плана: {}", self.policy.revision(), hex(self.digest));
         result
     }
 
@@ -707,6 +766,44 @@ fn apply_observation(cell: &mut CellResult, observation: Observation, modify: bo
     }
 }
 
+fn apply_udp_observation(cell: &mut CellResult, observation: UdpObservation, modify: bool) {
+    // A STUN success is never an HTTP 200 or authenticated TLS peer.
+    if cell.protocol == Protocol::Stun {
+        cell.network = if observation.received { Stage::Passed } else { Stage::Failed };
+        cell.actual_modification = Some(observation.transformed);
+        match observation.result {
+            Ok(None) if observation.received && (!modify || observation.transformed) => {
+                cell.application = Stage::Passed;
+                cell.status = CellStatus::Available;
+            }
+            Ok(_) | Err(Failure::Unavailable) => {
+                cell.status = CellStatus::NotChecked;
+                cell.reason = Reason::NoTransformation;
+            }
+            Err(error) => {
+                cell.application = Stage::Failed;
+                (cell.status, cell.reason) = match error {
+                    Failure::Denied => (CellStatus::PolicyDenied, Reason::ProtectiveDenial),
+                    Failure::Timeout => (CellStatus::Unavailable, Reason::Timeout),
+                    Failure::Network => (CellStatus::Unavailable, Reason::Network),
+                    Failure::Tls => (CellStatus::SecurityError, Reason::Tls),
+                    Failure::Protocol => (CellStatus::Unavailable, Reason::Protocol),
+                    Failure::Unavailable => unreachable!(),
+                };
+            }
+        }
+    } else {
+        apply_observation(cell, Observation {
+            connected: observation.received,
+            verified_tls: observation.verified_tls,
+            transformed: observation.transformed,
+            result: observation.result.and_then(|code| {
+                if observation.verified_tls { code.ok_or(Failure::Protocol) } else { Err(Failure::Tls) }
+            }),
+        }, modify);
+    }
+}
+
 async fn optional_row(
     state: &State<'_>,
     host: Option<&String>,
@@ -719,15 +816,17 @@ async fn optional_row(
 }
 
 async fn row(state: &State<'_>, host: &str, roots: &rustls::RootCertStore) -> Vec<CellResult> {
-    let columns = columns();
+    let endpoint = &state.plan.endpoints[host];
+    let stun_allowed = state.active.document().anti_dpi.consent.direct_dpi_stun;
+    let columns = columns().into_iter().filter(|column| column.planned(endpoint)).collect::<Vec<_>>();
     let mut cells = columns
         .iter()
-        .map(|column| column.cell(host))
+        .map(|column| column.cell(host, endpoint, stun_allowed))
         .collect::<Vec<_>>();
     let started = Instant::now();
     if let Some(reason) = state.stop_reason() {
         for (column, cell) in columns.iter().zip(&mut cells) {
-            if column.unavailable().is_none() {
+            if column.reason(endpoint, stun_allowed).is_none() {
                 stopped(cell, reason);
             }
         }
@@ -746,7 +845,7 @@ async fn row(state: &State<'_>, host: &str, roots: &rustls::RootCertStore) -> Ve
             None => {
                 let reason = state.stop_reason().unwrap_or(Reason::Budget);
                 for (column, cell) in columns.iter().zip(&mut cells) {
-                    if column.unavailable().is_none() {
+                    if column.reason(endpoint, stun_allowed).is_none() {
                         stopped(cell, reason);
                     }
                 }
@@ -770,7 +869,7 @@ async fn row(state: &State<'_>, host: &str, roots: &rustls::RootCertStore) -> Ve
         Ok(pins) => pins,
         Err(error) => {
             for (column, cell) in columns.iter().zip(&mut cells) {
-                if column.unavailable().is_none() {
+                if column.reason(endpoint, stun_allowed).is_none() {
                     if let Some(reason) = state.stop_reason() {
                         stopped(cell, reason);
                     } else {
@@ -782,24 +881,13 @@ async fn row(state: &State<'_>, host: &str, roots: &rustls::RootCertStore) -> Ve
             return cells;
         }
     };
-    let peer = SocketAddr::new(pins.addresses()[0], 443);
-    let Some(scope) = network_scope::observe(peer) else {
-        for (column, cell) in columns.iter().zip(&mut cells) {
-            if column.unavailable().is_none() {
-                stopped(cell, Reason::ContextChanged);
-            }
-        }
-        return cells;
-    };
     let mut attempted = false;
     let mut protective = false;
+    let mut scopes = BTreeMap::new();
     for (column, cell) in columns.iter().zip(&mut cells) {
-        if column.unavailable().is_some() {
+        if column.reason(endpoint, stun_allowed).is_some() {
             continue;
         }
-        let Column::Tcp(strategy) = *column else {
-            continue;
-        };
         if let Some(reason) = state.stop_reason() {
             stopped(cell, reason);
             continue;
@@ -808,9 +896,16 @@ async fn row(state: &State<'_>, host: &str, roots: &rustls::RootCertStore) -> Ve
             stopped(cell, Reason::ProtectiveDenial);
             continue;
         }
+        let port = if column.protocol() == Protocol::Stun { 3478 } else { 443 };
+        let peer = SocketAddr::new(pins.addresses()[0], port);
+        let Some(scope) = network_scope::observe(peer) else {
+            stopped(cell, Reason::ContextChanged);
+            continue;
+        };
+        let original_scope = scopes.entry(peer).or_insert(scope);
         if !pins.current()
             || (pins.single_use() && attempted)
-            || network_scope::observe(peer) != Some(scope)
+            || *original_scope != scope
         {
             stopped(cell, Reason::ContextChanged);
             continue;
@@ -826,37 +921,93 @@ async fn row(state: &State<'_>, host: &str, roots: &rustls::RootCertStore) -> Ve
         cell.source = Some(scope.bind_address().ip());
         cell.policy_action = Some(pins.decision());
         let started = Instant::now();
+        let deadline = (started + budget).min(state.deadline);
         let permitted =
             || state.live() && pins.current() && network_scope::observe(peer) == Some(scope);
-        let observation = tcp_probe::https(
-            host,
-            peer,
-            scope,
-            strategy,
-            roots,
-            &permitted,
-            (started + budget).min(state.deadline),
-        )
-        .await;
+        let failed = match *column {
+            Column::Tcp(strategy) => {
+                let observation = probe::https(host, peer, scope, strategy, roots, &permitted, deadline).await;
+                apply_observation(cell, observation, strategy.is_some());
+                observation.result.is_err()
+            }
+            Column::Udp(strategy, Protocol::Stun) => {
+                let observation = probe::stun(peer, scope, strategy.is_some(), &permitted, deadline).await;
+                apply_udp_observation(cell, observation, strategy.is_some());
+                observation.result.is_err()
+            }
+            Column::Udp(strategy, protocol @ (Protocol::QuicV1 | Protocol::QuicV2)) => {
+                let version = if protocol == Protocol::QuicV1 {
+                    crate::quic_core::wire::Version::V1
+                } else {
+                    crate::quic_core::wire::Version::V2
+                };
+                let observation = match crate::net::tls::roots_tls13(roots.clone(), b"h3") {
+                    Ok(config) => probe::quic_https(host, peer, scope, version, strategy.is_some(), Arc::new(config), &permitted, deadline).await,
+                    Err(_) => UdpObservation { received: false, verified_tls: false, transformed: false, result: Err(Failure::Tls) },
+                };
+                apply_udp_observation(cell, observation, strategy.is_some());
+                observation.result.is_err()
+            }
+            Column::Udp(_, Protocol::TcpHttps) => unreachable!(),
+        };
         cell.duration_ms = (started.elapsed() + dns_elapsed).as_millis();
-        apply_observation(cell, observation, strategy.is_some());
         if let Some(reason) = state.stop_reason() {
-            if observation.result.is_err() {
+            if failed {
                 stopped(cell, reason);
             }
             cell.stale |= reason == Reason::ContextChanged;
         }
-        protective = matches!(
-            cell.status,
-            CellStatus::SecurityError | CellStatus::PolicyDenied
-        );
+        protective = matches!(cell.status, CellStatus::SecurityError | CellStatus::PolicyDenied);
     }
-    if (!pins.current() && !pins.single_use()) || network_scope::observe(peer) != Some(scope) {
+    if (!pins.current() && !pins.single_use())
+        || scopes.iter().any(|(peer, scope)| network_scope::observe(*peer) != Some(*scope))
+    {
         for cell in &mut cells {
             cell.stale = true;
         }
     }
     cells
+}
+
+/// Select the fastest successful, actually modified TCP observation only
+/// against a comparable failed direct control. Does not publish evidence.
+pub(crate) fn recommend_tcp<'a>(
+    direct: &CellResult,
+    candidates: impl IntoIterator<Item = &'a CellResult>,
+) -> Option<&'a CellResult> {
+    if direct.stale
+        || direct.protocol != Protocol::TcpHttps
+        || direct.strategy_id != "direct"
+        || direct.status != CellStatus::Unavailable
+        || !matches!(direct.reason, Reason::Timeout | Reason::Network | Reason::Protocol)
+        || direct.actual_modification != Some(false)
+        || direct.attempts != 1
+        || direct.endpoint.is_none()
+        || direct.source.is_none()
+        || !matches!(direct.policy_action, Some(Decision::Pass | Decision::Modify))
+    {
+        return None;
+    }
+    candidates
+        .into_iter()
+        .filter(|cell| {
+            cell.domain == direct.domain
+                && cell.protocol == direct.protocol
+                && Strategy::ALL.iter().any(|strategy| strategy.id() == cell.strategy_id)
+                && cell.status == CellStatus::Available
+                && cell.reason == Reason::None
+                && cell.actual_modification == Some(true)
+                && cell.network == Stage::Passed
+                && cell.tls == Stage::Passed
+                && cell.application == Stage::Passed
+                && cell.http_status.is_some_and(|code| (200..=299).contains(&code))
+                && cell.attempts == 1
+                && !cell.stale
+                && cell.endpoint == direct.endpoint
+                && cell.source == direct.source
+                && cell.policy_action == direct.policy_action
+        })
+        .min_by_key(|cell| (cell.duration_ms, cell.strategy_id))
 }
 
 #[derive(Debug)]
@@ -924,7 +1075,7 @@ mod tests {
             (451, CellStatus::HttpError),
             (503, CellStatus::HttpError),
         ] {
-            let mut cell = column.cell("example.com");
+            let mut cell = column.cell("example.com", &EndpointMetadata::default(), false);
             apply_observation(
                 &mut cell,
                 Observation {
@@ -954,22 +1105,63 @@ mod tests {
     #[test]
     fn unsupported_strategies_and_cancelled_rows_are_not_failures() {
         let columns = columns();
-        assert_eq!(columns.len(), 7);
-        let mut cell = columns[0].cell("example.com");
+        assert_eq!(columns.len(), 10);
+        let mut cell = columns[0].cell("example.com", &EndpointMetadata::default(), false);
         stopped(&mut cell, Reason::Cancelled);
         assert_eq!(cell.status, CellStatus::Cancelled);
         assert!(!cell.stale);
         stopped(&mut cell, Reason::ContextChanged);
         assert!(cell.stale);
         assert_eq!(
-            columns[1].cell("example.com").status,
-            CellStatus::Unsupported
+            columns[1].cell("example.com", &EndpointMetadata::default(), false).status,
+            if crate::routing::dpi::STANDALONE_EXPERIMENTAL { CellStatus::NotChecked } else { CellStatus::Unsupported }
         );
+        let missing = columns.iter().find(|column| column.id() == "quic_v1_initial_split").unwrap();
+        assert_eq!(missing.cell("example.com", &EndpointMetadata::default(), false).reason,
+            if crate::routing::dpi::STANDALONE_EXPERIMENTAL { Reason::MissingEndpointMetadata } else { Reason::AwaitingAcceptance });
+    }
+
+    #[test]
+    fn recommendations_require_comparable_verified_modified_success() {
+        let mut direct = Column::Tcp(None).cell("example.com", &EndpointMetadata::default(), false);
+        direct.status = CellStatus::Unavailable;
+        direct.reason = Reason::Timeout;
+        direct.actual_modification = Some(false);
+        direct.attempts = 1;
+        direct.endpoint = Some("1.1.1.1:443".parse().unwrap());
+        direct.source = Some("192.0.2.1".parse().unwrap());
+        direct.policy_action = Some(Decision::Pass);
+        let mut header = direct.clone();
+        header.strategy_id = "tcp_header";
+        header.reason = Reason::None;
+        header.status = CellStatus::Available;
+        header.actual_modification = Some(true);
+        header.network = Stage::Passed;
+        header.tls = Stage::Passed;
+        header.application = Stage::Passed;
+        header.http_status = Some(200);
+        header.duration_ms = 80;
+        let mut middle = header.clone();
+        middle.strategy_id = "tcp_middle";
+        middle.duration_ms = 40;
+        assert_eq!(recommend_tcp(&direct, [&header, &middle]), Some(&middle));
+        middle.stale = true;
+        assert_eq!(recommend_tcp(&direct, [&header, &middle]), Some(&header));
+        header.actual_modification = Some(false);
+        assert!(recommend_tcp(&direct, [&header, &middle]).is_none());
+        header.actual_modification = Some(true);
+        header.endpoint = Some("1.0.0.1:443".parse().unwrap());
+        assert!(recommend_tcp(&direct, [&header]).is_none());
+        header.endpoint = direct.endpoint;
+        direct.status = CellStatus::SecurityError;
+        assert!(recommend_tcp(&direct, [&header]).is_none());
+        direct.status = CellStatus::Available;
+        assert!(recommend_tcp(&direct, [&header]).is_none());
     }
 
     #[test]
     fn anonymous_summary_never_contains_endpoints_or_plan_digest() {
-        let mut cell = Column::Tcp(None).cell("private.example.com");
+        let mut cell = Column::Tcp(None).cell("private.example.com", &EndpointMetadata::default(), false);
         cell.endpoint = Some("1.1.1.1:443".parse().unwrap());
         cell.source = Some("10.2.3.4".parse().unwrap());
         let report = Report {

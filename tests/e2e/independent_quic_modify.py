@@ -59,9 +59,40 @@ def verify(version, original, initial, tail, hello):
     assert not any(frames.pull_bytes(len(payload) - frames.tell()))
 
 
+def verify_fresh(version, original, rewritten, hello):
+    before, before_offset = header(original)
+    after, after_offset = header(rewritten)
+    assert original != rewritten
+    assert len(original) == len(rewritten)
+    assert before.packet_type == after.packet_type == QuicPacketType.INITIAL
+    assert before.version == after.version == version
+    assert before.destination_cid == after.destination_cid
+    assert before.source_cid == after.source_cid
+    assert before_offset == after_offset
+
+    def decrypt(packet, offset):
+        crypto = CryptoPair()
+        crypto.setup_initial(cid=before.destination_cid, is_client=False, version=version)
+        return crypto.decrypt_packet(packet, offset, expected_packet_number=0)
+
+    old_aad, _, old_number = decrypt(original, before_offset)
+    aad, payload, number = decrypt(rewritten, after_offset)
+    assert aad == old_aad and number == old_number == 0
+    frames = Buffer(data=payload)
+    assert frames.pull_uint_var() == 6
+    assert frames.pull_uint_var() == 0
+    first = frames.pull_bytes(frames.pull_uint_var())
+    assert frames.pull_uint_var() == 6
+    assert frames.pull_uint_var() == len(first)
+    second = frames.pull_bytes(frames.pull_uint_var())
+    assert first and second and first + second == hello
+    assert not any(frames.pull_bytes(len(payload) - frames.tell()))
+
+
 if __name__ == "__main__":
     stream = sys.stdin.buffer
-    values = [field(stream) for _ in range(4)]
+    values = [field(stream) for _ in range(5)]
     assert not stream.read(1)
-    verify(int(sys.argv[1]), *values)
+    verify(int(sys.argv[1]), *values[:4])
+    verify_fresh(int(sys.argv[1]), values[1], values[4], values[3])
     print("Independent Initial authentication and exact datagram boundaries verified")

@@ -14,7 +14,8 @@ use std::{
 };
 
 const BUILTIN: &str = include_str!("catalog.tsv");
-pub const VERSION: &str = "ru-popular-services-2026-v2";
+const BUILTIN_ENDPOINTS: &str = include_str!("catalog-endpoints.tsv");
+pub const VERSION: &str = "ru-popular-services-2026-v3";
 pub const MAX_DOMAINS: usize = 256;
 pub const MAX_JOB_DOMAINS: usize = 64;
 pub const MAX_JOB_CELLS: usize = 512;
@@ -32,6 +33,8 @@ pub enum RestrictionScope {
 pub enum EndpointSupport {
     Unknown,
     HttpsHeadCandidate,
+    QuicH3Candidate,
+    StunBindingCandidate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +80,14 @@ pub struct Overlay {
     pub custom: Vec<String>,
     #[serde(default)]
     pub excluded: Vec<String>,
+    /// Explicit operator-supplied UDP endpoint capabilities. QUIC/H3 uses
+    /// UDP 443, credential-free STUN Binding uses UDP 3478.
+    #[serde(default)]
+    pub quic_v1: Vec<String>,
+    #[serde(default)]
+    pub quic_v2: Vec<String>,
+    #[serde(default)]
+    pub stun: Vec<String>,
 }
 
 impl Default for Overlay {
@@ -85,6 +96,9 @@ impl Default for Overlay {
             schema_version: 1,
             custom: Vec::new(),
             excluded: Vec::new(),
+            quic_v1: Vec::new(),
+            quic_v2: Vec::new(),
+            stun: Vec::new(),
         }
     }
 }
@@ -120,6 +134,9 @@ impl Overlay {
         }
         overlay.custom = normalized_set(&overlay.custom)?.into_iter().collect();
         overlay.excluded = normalized_set(&overlay.excluded)?.into_iter().collect();
+        overlay.quic_v1 = normalized_set(&overlay.quic_v1)?.into_iter().collect();
+        overlay.quic_v2 = normalized_set(&overlay.quic_v2)?.into_iter().collect();
+        overlay.stun = normalized_set(&overlay.stun)?.into_iter().collect();
         Catalog::build(&overlay)?;
         Ok(overlay)
     }
@@ -167,6 +184,9 @@ impl Catalog {
         }
         let custom = normalized_set(&overlay.custom)?;
         let excluded = normalized_set(&overlay.excluded)?;
+        let mut quic_v1 = normalized_set(&overlay.quic_v1)?;
+        let quic_v2 = normalized_set(&overlay.quic_v2)?;
+        let stun = normalized_set(&overlay.stun)?;
         let mut entries = BTreeMap::new();
         for line in BUILTIN
             .lines()
@@ -226,14 +246,42 @@ impl Catalog {
                 "combined catalogue exceeds limit",
             ));
         }
+        // Stored third-party observations of h3 on UDP/443, not current
+        // reachability or proof of a QUIC v2 capability. RFC 9369: an
+        // origin advertising h3 should support QUIC v1.
+        for line in BUILTIN_ENDPOINTS.lines().filter(|line| !line.starts_with('#') && !line.is_empty()) {
+            let mut fields = line.split('\t');
+            let (Some(host), Some("quic-v1"), Some(day), Some(source), None) =
+                (fields.next(), fields.next(), fields.next(), fields.next(), fields.next())
+            else { return Err(invalid("catalog.endpoint", "invalid embedded endpoint record")); };
+            if !entries.contains_key(host) || day.len() != 10 || !source.starts_with("https://") {
+                return Err(invalid("catalog.endpoint", "invalid embedded endpoint provenance"));
+            }
+            quic_v1.insert(host.to_owned());
+        }
+        if quic_v1.iter().chain(&quic_v2).chain(&stun).any(|host| !entries.contains_key(host)) {
+            return Err(invalid("catalog.endpoint", "UDP endpoint must refer to a catalogue hostname"));
+        }
         Ok(Self {
             entries: entries
                 .into_iter()
-                .map(|(hostname, provenance)| Entry {
-                    excluded: excluded.contains(&hostname),
-                    hostname,
-                    provenance,
-                    endpoint: EndpointMetadata::default(),
+                .map(|(hostname, provenance)| {
+                    let mut endpoint = EndpointMetadata::default();
+                    if quic_v1.contains(&hostname) {
+                        endpoint.quic_v1 = EndpointSupport::QuicH3Candidate;
+                    }
+                    if quic_v2.contains(&hostname) {
+                        endpoint.quic_v2 = EndpointSupport::QuicH3Candidate;
+                    }
+                    if stun.contains(&hostname) {
+                        endpoint.stun = EndpointSupport::StunBindingCandidate;
+                    }
+                    Entry {
+                        excluded: excluded.contains(&hostname),
+                        hostname,
+                        provenance,
+                        endpoint,
+                    }
                 })
                 .collect(),
             builtin_count,
@@ -249,7 +297,12 @@ impl Catalog {
 
     /// Hash of the immutable catalogue content, independent of user choices.
     pub fn builtin_digest() -> [u8; 32] {
-        Sha256::digest(BUILTIN.as_bytes()).into()
+        let mut hash = Sha256::new();
+        hash.update((BUILTIN.len() as u64).to_be_bytes());
+        hash.update(BUILTIN.as_bytes());
+        hash.update((BUILTIN_ENDPOINTS.len() as u64).to_be_bytes());
+        hash.update(BUILTIN_ENDPOINTS.as_bytes());
+        hash.finalize().into()
     }
 
     /// An offline, bounded selection. No socket or strategy admission is implied.
@@ -376,6 +429,19 @@ mod tests {
                 .contains(&e.hostname.as_str())));
         assert!(catalog.select(&["discord.com".into()], 1).is_err());
         assert!(catalog.select(&["custom.example.com".into()], 1).is_ok());
+    }
+
+    #[test]
+    fn udp_metadata_is_explicit_normalized_and_bound_to_catalogue() {
+        let overlay = Overlay::parse("schema_version=1\nquic_v1=['WWW.YOUTUBE.COM.']\nquic_v2=['www.youtube.com']\ncustom=['stun.example.com']\nstun=['stun.example.com']").unwrap();
+        let catalog = Catalog::build(&overlay).unwrap();
+        let youtube = catalog.entries().iter().find(|e| e.hostname == "www.youtube.com").unwrap();
+        assert_eq!(youtube.endpoint.quic_v1, EndpointSupport::QuicH3Candidate);
+        assert_eq!(youtube.endpoint.quic_v2, EndpointSupport::QuicH3Candidate);
+        assert_eq!(youtube.endpoint.stun, EndpointSupport::Unknown);
+        let stun = catalog.entries().iter().find(|e| e.hostname == "stun.example.com").unwrap();
+        assert_eq!(stun.endpoint.stun, EndpointSupport::StunBindingCandidate);
+        assert!(Overlay::parse("schema_version=1\nstun=['not-in-catalogue.example.com']").is_err());
     }
 
     #[test]

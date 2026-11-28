@@ -81,6 +81,21 @@ async fn head_status(input: &mut (impl AsyncRead + Unpin)) -> Result<u16, Failur
     Err(Failure::Protocol)
 }
 
+/// Transport closure/reset during TLS is not itself a certificate rejection.
+fn handshake_failure(error: &std::io::Error) -> Failure {
+    use std::io::ErrorKind;
+    if error.get_ref().and_then(|cause| cause.downcast_ref::<rustls::Error>()).is_some() {
+        return Failure::Tls;
+    }
+    match error.kind() {
+        ErrorKind::PermissionDenied => Failure::Denied,
+        ErrorKind::TimedOut => Failure::Timeout,
+        ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+        | ErrorKind::BrokenPipe | ErrorKind::NotConnected => Failure::Network,
+        _ => Failure::Tls,
+    }
+}
+
 /// One independently connected, fully authenticated HTTP HEAD. A requested
 /// transform must actually change the wire first flight; no plain fallback.
 /// The caller binds the exact pinned endpoint and strategy to its lease.
@@ -129,7 +144,7 @@ pub(crate) async fn https(
             let mut stream = tokio_rustls::TlsConnector::from(Arc::new(config))
                 .connect(server_name, local)
                 .await
-                .map_err(|_| Failure::Tls)?;
+                .map_err(|error| handshake_failure(&error))?;
             if stream
                 .get_ref()
                 .1
@@ -204,10 +219,255 @@ pub(crate) async fn https(
     }
 }
 
+/// Independent UDP result; a STUN Binding Success has no HTTP/TLS status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UdpObservation {
+    pub(crate) received: bool,
+    pub(crate) verified_tls: bool,
+    pub(crate) transformed: bool,
+    pub(crate) result: Result<Option<u16>, Failure>,
+}
+
+fn udp_io(error: std::io::Error) -> Failure {
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        Failure::Denied
+    } else {
+        Failure::Network
+    }
+}
+
+async fn udp_socket(
+    peer: SocketAddr,
+    scope: network_scope::Scope,
+) -> Result<(tokio::net::UdpSocket, crate::routing::carrier_socket::Lease), Failure> {
+    super::scoped_udp_checked(peer, scope)
+        .await
+        .map_err(|_| Failure::Denied)?
+        .ok_or(Failure::Network)
+}
+
+pub(crate) async fn stun(
+    peer: SocketAddr,
+    scope: network_scope::Scope,
+    modify: bool,
+    live: &(dyn Fn() -> bool + Sync),
+    deadline: Instant,
+) -> UdpObservation {
+    use super::udp::{probe_stun_observed, BindingStrategy};
+    use crate::client::ClientError;
+    let transformed = AtomicBool::new(false);
+    let scoped = || live() && network_scope::observe(peer) == Some(scope);
+    let operation = async {
+        if !scoped() {
+            return Err(Failure::Denied);
+        }
+        let (socket, _admission) = udp_socket(peer, scope).await?;
+        let strategy = if modify { BindingStrategy::Fingerprint } else { BindingStrategy::Plain };
+        let observed = probe_stun_observed(&socket, strategy, &scoped, |modified| {
+            transformed.store(modified, Ordering::Release);
+        }).await.map_err(|error| match error {
+            ClientError::Open(_) => Failure::Denied,
+            ClientError::Protocol => Failure::Protocol,
+            _ => Failure::Network,
+        })?;
+        if !scoped() {
+            return Err(Failure::Denied);
+        }
+        if observed.is_none() {
+            return Err(Failure::Network);
+        }
+        if modify && !transformed.load(Ordering::Acquire) {
+            return Err(Failure::Unavailable);
+        }
+        Ok(None)
+    };
+    let result = tokio::select! {
+        biased;
+        _ = revoked(&scoped) => Err(Failure::Denied),
+        _ = tokio::time::sleep_until(deadline) => Err(Failure::Timeout),
+        result = operation => if scoped() { result } else { Err(Failure::Denied) },
+    };
+    UdpObservation {
+        received: result.is_ok(),
+        verified_tls: false,
+        transformed: transformed.load(Ordering::Acquire),
+        result,
+    }
+}
+
+/// Fresh, exact-version H3 over an owned loopback pair and one scoped
+/// remote UDP socket. The same transform is used by the proxy relay.
+/// No original-flight replay, downgrade, tickets, 0-RTT or cache writes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn quic_https(
+    name: &str,
+    peer: SocketAddr,
+    scope: network_scope::Scope,
+    version: crate::quic_core::wire::Version,
+    modify: bool,
+    config: Arc<rustls::ClientConfig>,
+    live: &(dyn Fn() -> bool + Sync),
+    deadline: Instant,
+) -> UdpObservation {
+    use crate::quic_core::{dial, h3_adapter::NativeConnection, handshake_udp};
+    use tokio::net::UdpSocket;
+    let received = AtomicBool::new(false);
+    let verified = AtomicBool::new(false);
+    let transformed = AtomicBool::new(false);
+    let scoped = || live() && network_scope::observe(peer) == Some(scope);
+    let operation = async {
+        if !scoped() {
+            return Err(Failure::Denied);
+        }
+        let (remote, _admission) = udp_socket(peer, scope).await?;
+        let client = UdpSocket::bind("127.0.0.1:0").await.map_err(udp_io)?;
+        let relay = UdpSocket::bind("127.0.0.1:0").await.map_err(udp_io)?;
+        let relay_address = relay.local_addr().map_err(udp_io)?;
+        client.connect(relay_address).await.map_err(udp_io)?;
+        relay.connect(client.local_addr().map_err(udp_io)?).await.map_err(udp_io)?;
+        let app = async {
+            let mut config = (*config).clone();
+            verified_tls::configure_client(&mut config, b"h3");
+            verified_tls::require_full_handshake(&mut config);
+            let server_name = rustls::pki_types::ServerName::try_from(name.to_owned())
+                .map_err(|_| Failure::Tls)?;
+            let mut session = handshake_udp::connect_diagnostic_socket(
+                client, relay_address, Arc::new(config), server_name, version,
+            ).await.map_err(|error| match error {
+                handshake_udp::Error::Scope => Failure::Denied,
+                handshake_udp::Error::Timeout => Failure::Timeout,
+                handshake_udp::Error::Io(error) => udp_io(error),
+                _ => Failure::Tls,
+            })?;
+            dial::confirm(&mut session).await.map_err(|_| Failure::Tls)?;
+            if !scoped() {
+                return Err(Failure::Denied);
+            }
+            verified.store(true, Ordering::Release);
+            let (transport, _key) = NativeConnection::start(session).map_err(|_| Failure::Tls)?;
+            let _guard = transport.driver_guard();
+            let mut builder = h3::client::builder();
+            builder.max_field_section_size(u64::from(crate::transport_policy::MAX_HEADER_LIST_BYTES));
+            let (mut driver, mut sender) = builder.build::<_, _, bytes::Bytes>(transport)
+                .await.map_err(|_| Failure::Protocol)?;
+            let exchange = async {
+                let request = http::Request::builder()
+                    .method(http::Method::HEAD)
+                    .uri(format!("https://{name}/"))
+                    .body(())
+                    .map_err(|_| Failure::Protocol)?;
+                let mut stream = sender.send_request(request).await.map_err(|_| Failure::Protocol)?;
+                stream.finish().await.map_err(|_| Failure::Protocol)?;
+                for _ in 0..5 {
+                    let response = stream.recv_response().await.map_err(|_| Failure::Protocol)?;
+                    let code = response.status().as_u16();
+                    if (200..=599).contains(&code) {
+                        return Ok(Some(code));
+                    }
+                    if !(100..200).contains(&code) || code == 101 {
+                        return Err(Failure::Protocol);
+                    }
+                }
+                Err(Failure::Protocol)
+            };
+            tokio::select! {
+                biased;
+                result = exchange => result,
+                _ = std::future::poll_fn(|cx| driver.poll_close(cx)) => Err(Failure::Protocol),
+            }
+        };
+        let forward = async {
+            let mut first = true;
+            let mut outgoing = vec![0; crate::protocol::MAX_DATAGRAM + 1];
+            let mut incoming = vec![0; crate::protocol::MAX_DATAGRAM + 1];
+            loop {
+                tokio::select! {
+                    result = relay.recv(&mut outgoing) => {
+                        let n = result.map_err(udp_io)?;
+                        if n == 0 || n > crate::protocol::MAX_DATAGRAM {
+                            return Err(Failure::Protocol);
+                        }
+                        if !scoped() {
+                            return Err(Failure::Denied);
+                        }
+                        if first {
+                            first = false;
+                            let header = crate::reality_quic_wire::long(&outgoing[..n])
+                                .ok_or(Failure::Protocol)?;
+                            if header.version != version.wire()
+                                || header.kind != crate::reality_quic_wire::Kind::Initial {
+                                return Err(Failure::Protocol);
+                            }
+                            if modify {
+                                let parts = crate::routing::packet_modify::quic_initial_transform(
+                                    &outgoing[..n], name,
+                                ).ok_or(Failure::Unavailable)?;
+                                for part in &parts {
+                                    if !scoped() {
+                                        return Err(Failure::Denied);
+                                    }
+                                    crate::udp_relay::send_datagram(&remote, part).await.map_err(udp_io)?;
+                                }
+                                transformed.store(true, Ordering::Release);
+                                continue;
+                            }
+                        }
+                        crate::udp_relay::send_datagram(&remote, &outgoing[..n]).await.map_err(udp_io)?;
+                    }
+                    result = remote.recv(&mut incoming) => {
+                        let n = result.map_err(udp_io)?;
+                        if n == 0 || n > crate::protocol::MAX_DATAGRAM {
+                            return Err(Failure::Protocol);
+                        }
+                        if !scoped() {
+                            return Err(Failure::Denied);
+                        }
+                        received.store(true, Ordering::Release);
+                        crate::udp_relay::send_datagram(&relay, &incoming[..n]).await.map_err(udp_io)?;
+                    }
+                }
+            }
+        };
+        let result = tokio::select! {
+            biased;
+            result = app => result,
+            result = forward => result,
+        }?;
+        if modify && !transformed.load(Ordering::Acquire) {
+            return Err(Failure::Unavailable);
+        }
+        Ok(result)
+    };
+    let result = tokio::select! {
+        biased;
+        _ = revoked(&scoped) => Err(Failure::Denied),
+        _ = tokio::time::sleep_until(deadline) => Err(Failure::Timeout),
+        result = operation => if scoped() { result } else { Err(Failure::Denied) },
+    };
+    UdpObservation {
+        received: received.load(Ordering::Acquire),
+        verified_tls: verified.load(Ordering::Acquire),
+        transformed: transformed.load(Ordering::Acquire),
+        result,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn handshake_transport_closure_is_not_identity_rejection() {
+        use std::io::{Error, ErrorKind};
+        for kind in [ErrorKind::UnexpectedEof, ErrorKind::ConnectionReset, ErrorKind::BrokenPipe] {
+            assert_eq!(handshake_failure(&Error::from(kind)), Failure::Network);
+        }
+        assert_eq!(handshake_failure(&Error::from(ErrorKind::PermissionDenied)), Failure::Denied);
+        assert_eq!(handshake_failure(&Error::from(ErrorKind::InvalidData)), Failure::Tls);
+        let tls = Error::new(ErrorKind::UnexpectedEof, rustls::Error::NoCertificatesPresented);
+        assert_eq!(handshake_failure(&tls), Failure::Tls);
+    }
 
     #[tokio::test]
     async fn final_headers_are_required_and_codes_remain_distinct() {
@@ -225,6 +485,37 @@ mod tests {
         ] {
             let mut input = bytes;
             assert_eq!(head_status(&mut input).await, Err(Failure::Protocol));
+        }
+    }
+
+    #[tokio::test]
+    async fn stun_controls_measure_actual_binding_and_fingerprint() {
+        let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = target.local_addr().unwrap();
+        let scope = network_scope::observe(peer).unwrap();
+        for modify in [false, true] {
+            let server = async {
+                let mut buf = [0u8; 512];
+                let (n, source) = target.recv_from(&mut buf).await.unwrap();
+                assert_eq!(n, if modify { 28 } else { 20 });
+                assert_eq!(&buf[..2], &[0, 1]);
+                if modify {
+                    assert_eq!(&buf[20..24], &[0x80, 0x28, 0, 4]);
+                }
+                let mut response = buf[..20].to_vec();
+                response[0] = 1;
+                response[2..4].copy_from_slice(&12u16.to_be_bytes());
+                response.extend([0, 0x20, 0, 8, 0, 1, 0x21, 0x13, 1, 2, 3, 4]);
+                target.send_to(&response, source).await.unwrap();
+            };
+            let probe = stun(peer, scope, modify, &|| true, Instant::now() + Duration::from_secs(2));
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::join!(probe, server)
+            }).await.unwrap();
+            assert_eq!(result.result, Ok(None), "{result:?}");
+            assert!(result.received);
+            assert!(!result.verified_tls);
+            assert_eq!(result.transformed, modify);
         }
     }
 
