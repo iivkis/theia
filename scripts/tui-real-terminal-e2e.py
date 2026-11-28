@@ -355,7 +355,7 @@ def drive_client_proxy(binary, config, http_port, socks_port, echo_port):
     def apply(tty):
         review(tty, "e", "Запустить локальный прокси при необходимости")
         proxy_status(binary, "NoJournal")
-        confirm(tty, "Системный прокси включён")
+        confirm(tty, "Настройки прокси применены по последней проверке")
         proxy_status(binary, "PendingOwned")
 
     proxy_status(binary, "NoJournal")
@@ -373,7 +373,7 @@ def drive_client_proxy(binary, config, http_port, socks_port, echo_port):
                 assert sock.connect_ex(("127.0.0.1", port)) != 0, "listener started without consent"
         review(tty, "e", "Запустить локальный прокси при необходимости")
         proxy_status(binary, "NoJournal")
-        confirm(tty, "Системный прокси включён")
+        confirm(tty, "Настройки прокси применены по последней проверке")
         proxy_status(binary, "PendingOwned")
         test_tunnels(http_port, socks_port, echo_port)
         # Navigation must not tear down the owned runtime.
@@ -382,9 +382,9 @@ def drive_client_proxy(binary, config, http_port, socks_port, echo_port):
         proxy_status(binary, "PendingOwned")
         test_tunnels(http_port, socks_port, echo_port)
         tty.send("p")
-        tty.wait("Системный прокси включён")
+        tty.wait("Настройки прокси применены по последней проверке")
         review(tty, "x", "Отключиться?")
-        confirm(tty, "Локальный клиент остановлен")
+        confirm(tty, "Сеанс завершён. Результат восстановления")
         proxy_status(binary, "NoJournal")
         for port in (http_port, socks_port):
             with socket.socket() as sock:

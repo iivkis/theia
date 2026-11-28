@@ -74,6 +74,8 @@ pub(crate) enum Command {
     },
 }
 
+pub(crate) type DisconnectReceipt = (mpsc::Receiver<Result<(), String>>, tokio::sync::oneshot::Sender<()>);
+
 pub(crate) struct Control {
     phase: AtomicU8,
     pub(crate) stop: AtomicBool,
@@ -246,13 +248,7 @@ impl Control {
     pub(crate) fn disconnect_bound(
         &self,
         prior: Binding,
-    ) -> Result<
-        (
-            mpsc::Receiver<Result<(), String>>,
-            tokio::sync::oneshot::Sender<()>,
-        ),
-        ConfigError,
-    > {
+    ) -> Result<DisconnectReceipt, ConfigError> {
         if !self.matches(prior) {
             return Err(super::invalid(
                 "anti_dpi.owner",

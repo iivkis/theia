@@ -3483,12 +3483,14 @@ mod tests {
         let editor = Editor::load(Role::Server, &path).unwrap();
         let mut wizard = Wizard::new(&editor).unwrap();
         assert_eq!(wizard.fields[1], "443");
-        assert!(!wizard.body().contains("Выбор: auto / manual"));
+        assert!(!wizard.advanced && !wizard.visible_fields().contains(&6));
         wizard.sources = true;
         wizard.key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
-        assert!(wizard.body().contains("Выбор: auto / manual"));
+        assert!(wizard.advanced && !wizard.visible_fields().contains(&6));
+        assert!(wizard.body().contains("Свернуть"));
         wizard.key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
-        assert!(!wizard.body().contains("Выбор: auto / manual"));
+        assert!(!wizard.advanced && !wizard.visible_fields().contains(&6));
+        assert!(wizard.body().contains("Открыть"));
         wizard.sources = false;
         wizard.fields[1] = "127.0.0.1:9443".into();
         wizard.fields[2] = "127.0.0.1".into();
