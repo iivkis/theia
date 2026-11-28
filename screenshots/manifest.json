@@ -24,7 +24,7 @@
     {
       "scenario": "anti-dpi-diagnostic-consent",
       "file": "anti-dpi-diagnostic-consent.png",
-      "sha256": "b2f0be5d01135f0fd9aee400602ccfff503019fa56eb15b4447770a0394d651f",
+      "sha256": "c4c99173b5b53727368ce5f519355b1bde4e870276366cd6260ee915a8a03630",
       "state_fixture": false
     },
     {
@@ -42,7 +42,7 @@
     {
       "scenario": "anti-dpi-geodata",
       "file": "anti-dpi-geodata.png",
-      "sha256": "17c664b98470965322d5a9969b09ded7719cf72df66cf664141184ab9dd87736",
+      "sha256": "3c52d2065456c9b784b1dfa55f4ac2e936b712d14b9d684ca731a6c66ca36907",
       "state_fixture": false
     },
     {
@@ -108,7 +108,7 @@
     {
       "scenario": "client-action-new-profile",
       "file": "client-action-new-profile.png",
-      "sha256": "7ecb48a174d483ee4beb87a35c07a9c4f521c2acc4c4a10a5bd66140eb1a7113",
+      "sha256": "ef6de78f79b8bebac30df82a915a5a493ca84fae19114b7f57438bd59af3dc22",
       "state_fixture": false
     },
     {
@@ -630,7 +630,7 @@
     {
       "scenario": "server-reality-status-technical",
       "file": "server-reality-status-technical.png",
-      "sha256": "667053c3c84480e91e1a97e8047ca13e9bac3c0760c5ca06972f65c39084bfd1",
+      "sha256": "135251d738aad184fc387d7896ab4c518bb105be127562ef7d303a1cca6d0f72",
       "state_fixture": false
     },
     {
@@ -786,7 +786,7 @@
     {
       "scenario": "state-anti-dpi-export-confirm",
       "file": "state-anti-dpi-export-confirm.png",
-      "sha256": "316d16d43072e79bb0b380e08ed4c6910a58af2775ef8eedf474ab09d15556f5",
+      "sha256": "f9405eed8c1dde5c2cd56103ad1941c3970c7d93e196542b7bef7cb50c8cfd91",
       "state_fixture": true
     },
     {
@@ -1086,7 +1086,7 @@
     {
       "scenario": "state-reality-step6-save-inspection",
       "file": "state-reality-step6-save-inspection.png",
-      "sha256": "2e609f1fdd083027789155c376d1ffba56d4994fccb293660bfa7be57ddb529b",
+      "sha256": "84ca8025d54893be035aab933984291246f1f39668bb13a941fadcded80219cb",
       "state_fixture": true
     },
     {
