@@ -1745,6 +1745,9 @@ async fn real_local_proxy_modes_fixture() {
                 let proxy_client = load_client(&profile).await.unwrap();
                 let snapshot = proxy_client.routing_policy().await.unwrap();
                 assert_eq!(snapshot.manifest().revision, 2);
+                if transport == Transport::H2 {
+                    Box::pin(super::profile_diagnostics::transport_fixture(&proxy_client, &cert, Action::Direct, "H2")).await;
+                }
 
                 // The same production request handler, not a parser-only
                 // fixture, must route absolute-form over H2/H3 and Pass.
@@ -2098,6 +2101,33 @@ async fn real_local_proxy_modes_fixture() {
         })
         .await
         .unwrap();
+    h2.abort();
+    h3.abort();
+
+    // A separate authenticated policy makes localhost a Modify route. The
+    // diagnostic engine is disabled, so the real route must fall back over
+    // the selected carrier, not dial the origin directly.
+    let mut policy = policy;
+    let routing = policy.routing.as_mut().unwrap();
+    routing.revision = 3;
+    routing.rules[0].action = Action::DirectDpi;
+    let context = Arc::new(ServerContext::new(&inbound, std::slice::from_ref(&user), &policy));
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tcp_addr = tcp.local_addr().unwrap();
+    let h2 = tokio::spawn(crate::server::serve(tcp, tokio_rustls::TlsAcceptor::from(Arc::new(tls)), context.clone()));
+    let quic = crate::quic_transport::server_endpoint(
+        "127.0.0.1:0".parse().unwrap(),
+        vec![cert.cert.der().clone()],
+        rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
+    ).unwrap();
+    let quic_addr = quic.local_addr().unwrap();
+    let h3 = tokio::spawn(crate::h3_server::serve(quic, context));
+    for (transport, remote, label) in [(Transport::H2, tcp_addr, "H2"), (Transport::H3, quic_addr, "H3")] {
+        profile.transport = transport;
+        profile.server = remote.to_string();
+        let client = load_client(&profile).await.unwrap();
+        Box::pin(super::profile_diagnostics::transport_fixture(&client, &cert, Action::DirectDpi, label)).await;
+    }
     h2.abort();
     h3.abort();
 }

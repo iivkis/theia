@@ -238,8 +238,11 @@ impl LabSession {
         {
             return Err(Error::Scope);
         }
-        if socket.peer_addr().is_ok() {
-            return Err(Error::Scope);
+        // Preserve the exact pinned peer established during the handshake.
+        match (socket.native_pinned(), socket.peer_addr()) {
+            (true, Ok(connected)) if connected == peer => {},
+            (false, Err(error)) if error.kind() == io::ErrorKind::NotConnected => {},
+            _ => return Err(Error::Scope),
         }
         let mut send =
             SendFlow::new(server, MAX_STREAMS, FLOW_LIMIT, FLOW_LIMIT).map_err(Error::Send)?;

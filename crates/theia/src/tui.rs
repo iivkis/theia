@@ -960,7 +960,7 @@ impl RoutingPanel {
         });
     }
     fn actions(&self) -> Vec<ActionItem> {
-        if self.fields.is_some() || self.download.is_some() || self.search.is_some() {
+        if self.fields.is_some() || self.download.is_some() || self.search.is_some() || self.diagnostic_input.is_some() {
             return Vec::new();
         }
         if self.geodata_mode {
@@ -1240,7 +1240,7 @@ impl RoutingPanel {
             }
             return;
         }
-        if self.download.is_some() || self.search.is_some() {
+        if self.download.is_some() || self.search.is_some() || self.diagnostic_input.is_some() {
             return;
         }
         if let Some([report, controls]) = self.layout(area) {
@@ -10494,6 +10494,88 @@ mod tests {
         assert!(!panel.key(press(KeyCode::Char('s')), Some(&mut editor)));
         assert!(editor.dirty());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        std::fs::remove_file(path).unwrap();
+    }
+
+
+    #[test]
+    fn diagnostic_domain_editor_is_bounded_and_stages_only_on_explicit_save() {
+        let path = std::env::temp_dir().join(crate::tui_editor::generated_id("diagnostic-domains").unwrap());
+        let source = server_issuance_fixture();
+        std::fs::write(&path, &source).unwrap();
+        let mut editor = Editor::load(Role::Server, &path).unwrap();
+        let mut panel = RoutingPanel::new(&editor);
+        let original = panel.settings.diagnostic_domains.clone();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let clear = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert!(panel.actions().iter().any(|a| a.key == 'G'));
+        panel.key(key(KeyCode::Char('G')), Some(&mut editor));
+        assert!(panel.actions().is_empty());
+        assert_eq!(panel.diagnostic_input.as_deref(), Some(original.join(", ").as_str()));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 25)).unwrap();
+        terminal.draw(|frame| panel.render(frame, frame.area(), true)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen = (0..25).map(|y| (0..100).map(|x| buffer[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>().join("\n");
+        assert!(screen.contains("Домены диагностики клиентов"));
+        panel.key(clear, Some(&mut editor));
+        panel.paste("https://invalid");
+        panel.paste(&"a".repeat(4097));
+        panel.key(key(KeyCode::Char('ж')), Some(&mut editor));
+        assert_eq!(panel.diagnostic_input.as_deref(), Some(""));
+        panel.key(key(KeyCode::Enter), Some(&mut editor));
+        assert!(panel.message.contains("Некорректный"));
+        panel.paste("Discord.COM, x.com\n");
+        panel.key(key(KeyCode::Backspace), Some(&mut editor));
+        panel.key(key(KeyCode::Esc), Some(&mut editor));
+        assert_eq!(panel.settings.diagnostic_domains, original);
+        assert!(!editor.dirty());
+        panel.key(key(KeyCode::Char('G')), Some(&mut editor));
+        panel.key(clear, Some(&mut editor));
+        panel.paste("Discord.COM, x.co");
+        panel.key(key(KeyCode::Char('m')), Some(&mut editor));
+        panel.key(key(KeyCode::Enter), Some(&mut editor));
+        assert!(panel.diagnostic_input.is_none());
+        assert_eq!(panel.settings.diagnostic_domains, vec!["discord.com", "x.com"]);
+        assert!(panel.actions().iter().any(|a| a.key == 's'));
+        assert!(!editor.dirty());
+        assert!(!panel.key(key(KeyCode::Char('s')), Some(&mut editor)));
+        assert!(editor.dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn access_observation_is_bound_to_saved_inbound_user_and_fresh_reply() {
+        let path = std::env::temp_dir().join(crate::tui_editor::generated_id("access-observed").unwrap());
+        std::fs::write(&path, server_issuance_fixture()).unwrap();
+        let editor = Editor::load(Role::Server, &path).unwrap();
+        assert!(AccessObservation::start(&editor, "invalid user".into(), None, true).is_none());
+        let mut observation = AccessObservation::start(&editor, "test-user".into(), None, true).unwrap();
+        // Owned instance without an endpoint can never fall through to a
+        // different process's environment IPC.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while observation.receiver.is_some() && std::time::Instant::now() < deadline {
+            observation.poll();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(observation.receiver.is_none());
+        assert!(observation.label(&editor, "test-user").is_none());
+        for (state, expected) in [(0, "Нет подключения"), (1, "Нет права"), (2, "Отключён"), (3, "Разрешён")] {
+            let (tx, rx) = mpsc::channel();
+            observation.receiver = Some(rx);
+            observation.requested = std::time::Instant::now();
+            observation.poll();
+            assert_eq!(observation.label(&editor, "test-user").as_deref(), Some("Проверяется…"));
+            tx.send(Ok(crate::management::StatusReply::AccessObserved { revision: 7, state })).unwrap();
+            observation.poll();
+            assert_eq!(observation.label(&editor, "test-user").unwrap(), format!("{expected} · rev 7"));
+            assert!(observation.label(&editor, "other-user").is_none());
+        }
+        observation.requested = std::time::Instant::now() - Duration::from_secs(11);
+        assert!(observation.label(&editor, "test-user").is_none());
+        observation.requested = std::time::Instant::now();
+        observation.digest = [0; 32];
+        assert!(observation.label(&editor, "test-user").is_none());
         std::fs::remove_file(path).unwrap();
     }
 
