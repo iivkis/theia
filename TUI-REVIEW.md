@@ -1,7 +1,7 @@
 # TUI visual review
 
 This branch is a Linux-only visual evidence gallery, not a product development branch.
-The generator checks out the explicitly pinned dev commit (1d3b955a043e8eb6c9fa0cd61c130b34c6f5e9f1) and records real Ratatui draw buffers at one size: 120×40 columns/rows. PNGs use a fixed DejaVu Sans Mono font. No Windows job.
+The generator checks out the explicitly pinned dev commit (546cb845ef3387c57023a69bb008bf7900fd4adc) and records real Ratatui draw buffers at one size: 120×40 columns/rows. PNGs use a fixed DejaVu Sans Mono font. No Windows job.
 
 - Open [screenshots/README.md](screenshots/README.md) after a successful workflow.
 - Read screenshots/manifest.json first: it identifies the exact source SHA, scenario names and file digests.
@@ -39,3 +39,5 @@ The gallery also requires the multi-line domain editor, the bottom of the 40-can
 The gallery enumerates the actual eight server and eight client sections, checks unique visible action keys, and opens ordinary operations by selecting the section action and pressing Enter. Overview routes to management/connection without starting anything; F2 focuses the existing navigation rather than a second command catalog. The disabled-user fixture captures recovery separately. The separate REALITY import, invitations page and duplicate command-menu screenshots are no longer generated. The last successful gallery remains intact until replacement passes the required-screen and obsolete-screen checks.
 
 The client diagnostics workspace is a required independent screen. The idle server statistics screen reports unavailable metrics rather than claiming a live data source. The inline import and process-local traffic monitor are rendered within their sections. Required screenshots include masked existing-profile import, expanded settings, a user with no grants and the explicit delete confirmation; the revoke-save failure must not contain the underlying workspace. No screenshot implies successful external-runtime access.
+
+The diagnostic workspace includes synthetic offline states for source selection, input validation, fetching, consent, running, completed/partial results, details, policy blocking and failure. The gallery regression gate also verifies compact and advanced client profile navigation without writes, diagnostic consent and safe retry, and idle monitor rendering. Windows native lifecycle acceptance remains separate.
