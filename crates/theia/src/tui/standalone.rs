@@ -113,11 +113,12 @@ fn cell_color(cell: Option<&CellResult>) -> ratatui::style::Color {
 /// All edits stay in this local draft until a separate reviewed Save.
 /// Existing routing rules are never implicitly populated from the catalogue.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SetupStep { Mode, Domains, DomainInput, Dns, CustomDns, Direct, Modify }
+enum SetupStep { Mode, Domains, DomainInput, Dns, CustomDns, Direct, Modify, Settings, Advanced }
 
 struct Draft {
     step: SetupStep,
     choice: usize,
+    input_backup: Option<[String; 5]>,
     original: Document,
     expected: Option<Vec<u8>>,
     values: [String; 5],
@@ -134,13 +135,13 @@ impl Draft {
             local.proxy.http_listen.clone(), local.proxy.socks5_listen.clone(), String::new(),
         ];
         let flags = [local.consent.direct_egress, local.consent.direct_dpi, local.consent.direct_dpi_stun, false];
-        Self { step: SetupStep::Mode, choice: 0, original, expected, values, flags, selected: 0, error: String::new() }
+        Self { step: if expected.is_none() { SetupStep::Mode } else { SetupStep::Settings }, choice: 0, input_backup: None, original, expected, values, flags, selected: 0, error: String::new() }
     }
 
     fn first_run(&self) -> bool { self.expected.is_none() }
     fn count(&self) -> usize { 7 }
     fn input_index(&self) -> Option<usize> {
-        if self.first_run() {
+        if self.step != SetupStep::Advanced {
             return match self.step {
                 SetupStep::DomainInput => Some(4),
                 SetupStep::CustomDns => Some(self.selected.min(1)),
@@ -173,17 +174,29 @@ impl Draft {
             SetupStep::Domains => ("Шаг 2 из 5 · Какие сайты вам нужны?",
                 format!("Укажите только сайты, для которых хотите использовать Anti-DPI.\nМожно отметить несколько сайтов из встроенного списка или ввести свои.\nОстальные сайты не получают правило Anti-DPI автоматически.\n\nВыбрано: {domains}. Пока это только черновик."),
                 vec![item('1', "Выбрать сайты из каталога"), item('2', "Ввести свои сайты"), item('3', "Далее · подтвердить выбранные сайты")]),
-            SetupStep::Dns => ("Шаг 3 из 5 · Кто будет определять адреса сайтов?",
+            SetupStep::Settings => ("Настройки · Что изменить?",
+                format!("DNS: {}\nПрямой выход: {} · Anti-DPI: {} · STUN: {}\n\nВыберите только то, что хотите изменить. Правила сайтов и адреса локальных прокси сохраняются без изменений.", if self.values[0].is_empty() { "не настроен" } else { &self.values[0] }, yes(self.flags[0]), yes(self.flags[1]), yes(self.flags[2])),
+                vec![item('1', "Выбрать защищённый DNS"), item('2', "Изменить разрешения"), item('3', "Расширенные настройки · адреса прокси, STUN")]),
+            SetupStep::Dns => (if self.first_run() { "Шаг 3 из 5 · Кто будет определять адреса сайтов?" } else { "Настройки · Защищённый DNS" },
                 "Защищённый DNS получает адреса сайтов по шифрованному соединению.\nВыберите поставщика самостоятельно: он сможет видеть ваши DNS-запросы и публичный IP.\nCloudflare — обычное разрешение имён; Quad9 фильтрует известные вредоносные домены.\nНи один вариант не гарантирует доступность сайтов. Пока соединение не проверялось.\nБез DNS доменные операции недоступны; системный DNS не используется как запасной.".into(),
                 vec![item('1', "Cloudflare · 1.1.1.1"), item('2', "Quad9 · 9.9.9.9"), item('3', "Другой DNS · ввести параметры"), item('4', "Настроить позднее · без DNS")]),
-            SetupStep::Direct => ("Шаг 4 из 5 · Разрешить выход в интернет?",
+            SetupStep::Direct => (if self.first_run() { "Шаг 4 из 5 · Разрешить выход в интернет?" } else { "Разрешения 1 из 2 · Выход в интернет" },
                 "Чтобы проверить сайты или подключаться к ним напрямую, требуется ваше разрешение.\nDNS-провайдер и сайты могут видеть ваш публичный IP. Anti-DPI не является VPN.\nЕсли не разрешить прямой выход, рабочий трафик не будет отправляться.\nЭто не запускает подключение. Разрешение можно изменить в настройках.".into(),
                 vec![item('1', "Пока не разрешать"), item('2', "Разрешить прямое подключение")]),
-            SetupStep::Modify => ("Шаг 5 из 5 · Разрешить Anti-DPI?",
-                "Разрешить изменение трафика только для сайтов, указанных в правилах.\nПока стратегии не приняты, это разрешение не включает работающий обход.\nПри невозможности применить Anti-DPI соединение блокируется, а не отправляется напрямую.\nSTUN остаётся выключенным; его отдельное разрешение доступно в настройках.".into(),
+            SetupStep::Modify => (if self.first_run() { "Шаг 5 из 5 · Разрешить Anti-DPI?" } else { "Разрешения 2 из 2 · Anti-DPI" },
+                "Разрешить изменение трафика только для сайтов, указанных в правилах.\nПока стратегии не приняты, это разрешение не включает работающий обход.\nПри невозможности применить Anti-DPI соединение блокируется, а не отправляется напрямую.\nSTUN не включается этим шагом. Его отдельное разрешение доступно в расширенных настройках.".into(),
                 vec![item('1', "Пока не разрешать · Anti-DPI не активен"), item('2', "Разрешить принятые стратегии Anti-DPI")]),
-            SetupStep::DomainInput | SetupStep::CustomDns => ("", String::new(), Vec::new()),
+            SetupStep::DomainInput | SetupStep::CustomDns | SetupStep::Advanced => ("", String::new(), Vec::new()),
         };
+        let mut text = text;
+        if !self.first_run() {
+            match self.step {
+                SetupStep::Dns => text.push_str(&format!("\nТекущий DNS: {}", if self.values[0].is_empty() { "не настроен" } else { &self.values[0] })),
+                SetupStep::Direct => text.push_str(&format!("\nСейчас: {}", yes(self.flags[0]))),
+                SetupStep::Modify => text.push_str(&format!("\nСейчас: Anti-DPI — {}; STUN — {}. Запрет Anti-DPI отключит также STUN.", yes(self.flags[1]), yes(self.flags[2]))),
+                _ => {}
+            }
+        }
         (title, text, items)
     }
 
@@ -201,7 +214,7 @@ impl Draft {
 
     fn render_wizard(&self, frame: &mut Frame<'_>, area: Rect) {
         if matches!(self.step, SetupStep::DomainInput | SetupStep::CustomDns) {
-            self.wizard_form().render(frame, area, if self.step == SetupStep::DomainInput { "Шаг 2 из 5 · Свои сайты" } else { "Шаг 3 из 5 · Другой DNS" });
+            self.wizard_form().render(frame, area, if self.step == SetupStep::DomainInput { "Шаг 2 из 5 · Свои сайты" } else if self.first_run() { "Шаг 3 из 5 · Другой DNS" } else { "Настройки · Другой DNS" });
             return;
         }
         let (title, mut text, items) = self.wizard_choices();
@@ -444,6 +457,7 @@ struct Panel {
     action: usize,
     draft: Option<Draft>,
     catalogue_draft: Option<Draft>,
+    setup_catalogue_return: Option<(BTreeSet<String>, String, usize, usize)>,
     confirm_selected: bool,
     help: bool,
     details: bool,
@@ -489,7 +503,7 @@ impl Panel {
             exit_after_stop: false,
             leave_requested: false,
             notice: "Сетевые запросы только после подтверждения.".into(), page: OVERVIEW, navigation: false, action: 0,
-            draft, catalogue_draft: None, confirm_selected: false, help: false, details: false, group: 0, column: 0, report_context: None, applied_revision: None, newly_saved: false,
+            draft, catalogue_draft: None, setup_catalogue_return: None, confirm_selected: false, help: false, details: false, group: 0, column: 0, report_context: None, applied_revision: None, newly_saved: false,
             #[cfg(windows)]
             os_observation: None,
             #[cfg(windows)]
@@ -691,13 +705,16 @@ impl Panel {
         if code == KeyCode::Esc {
             let previous = match draft.step {
                 Mode => { self.notice = "Настройка отменена; файл не создан.".into(); return; }
+                Settings | Advanced => { self.notice = "Черновик отменён; файл не изменён.".into(); return; }
                 Domains => Mode,
                 DomainInput => Domains,
-                Dns => if draft.flags[3] { Domains } else { Mode },
+                Dns => if !draft.first_run() { Settings } else if draft.flags[3] { Domains } else { Mode },
                 CustomDns => Dns,
-                Direct => Dns,
+                Direct => if draft.first_run() { Dns } else { Settings },
                 Modify => Direct,
             };
+            if let Some(values) = draft.input_backup.take() { draft.values = values; }
+            if previous == Settings { draft = Draft::new(draft.original, draft.expected); }
             draft.move_to(previous);
             self.draft = Some(draft);
             return;
@@ -708,7 +725,7 @@ impl Panel {
                 KeyCode::Down | KeyCode::Tab if draft.step == CustomDns => draft.selected = 1,
                 KeyCode::Enter if draft.step == DomainInput => {
                     match draft.domain_values() {
-                        Ok(_) => draft.move_to(Domains),
+                        Ok(_) => { draft.input_backup = None; draft.move_to(Domains); },
                         Err(error) => draft.error = error,
                     }
                 }
@@ -718,7 +735,11 @@ impl Panel {
                         draft.error = "Нужны имя DNS-сервера и доверенные адреса.".into();
                     } else {
                         match draft.next_document() {
-                            Ok(_) => draft.move_to(Direct),
+                            Ok(_) => {
+                                draft.input_backup = None;
+                                if !draft.first_run() { self.preview_draft(draft); return; }
+                                draft.move_to(Direct);
+                            },
                             Err(error) => draft.error = format!("Проверьте параметры DNS: {error}"),
                         }
                     }
@@ -743,9 +764,13 @@ impl Panel {
             None
         };
         match (draft.step, code) {
+            (Settings, Some(KeyCode::Char('1'))) => draft.move_to(Dns),
+            (Settings, Some(KeyCode::Char('2'))) => draft.move_to(Direct),
+            (Settings, Some(KeyCode::Char('3'))) => draft.move_to(Advanced),
             (Mode, Some(KeyCode::Char('1'))) => { draft.flags[3] = true; draft.move_to(Domains); }
             (Mode, Some(KeyCode::Char('2'))) => { draft.flags[3] = false; draft.move_to(Dns); }
             (Domains, Some(KeyCode::Char('1'))) => {
+                self.setup_catalogue_return = Some((std::mem::take(&mut self.selected), std::mem::take(&mut self.filter), self.row, self.offset));
                 self.selected = draft.values[4].split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty())
                     .filter(|s| self.catalog.entries().iter().any(|e| e.hostname == *s && !e.excluded)).map(str::to_owned).collect();
                 self.filter.clear(); self.row = 0; self.offset = 0;
@@ -754,7 +779,7 @@ impl Panel {
                 self.notice = "Отметьте нужные сайты. Enter — принять выбор; Esc — назад. Проверки не запускаются.".into();
                 return;
             }
-            (Domains, Some(KeyCode::Char('2'))) => draft.move_to(DomainInput),
+            (Domains, Some(KeyCode::Char('2'))) => { draft.input_backup = Some(draft.values.clone()); draft.move_to(DomainInput); },
             (Domains, Some(KeyCode::Char('3'))) => {
                 match draft.domain_values() {
                     Ok(_) => draft.move_to(Dns),
@@ -770,21 +795,30 @@ impl Panel {
                     else { ("dns.quad9.net", "9.9.9.9, 149.112.112.112") };
                 draft.values[0] = host.into();
                 draft.values[1] = ips.into();
+                if !draft.first_run() { self.preview_draft(draft); return; }
                 draft.move_to(Direct);
             }
-            (Dns, Some(KeyCode::Char('3'))) => { draft.values[0].clear(); draft.values[1].clear(); draft.move_to(CustomDns); }
-            (Dns, Some(KeyCode::Char('4'))) => { draft.values[0].clear(); draft.values[1].clear(); draft.move_to(Direct); }
+            (Dns, Some(KeyCode::Char('3'))) => {
+                draft.input_backup = Some(draft.values.clone());
+                draft.move_to(CustomDns);
+            }
+            (Dns, Some(KeyCode::Char('4'))) => {
+                draft.values[0].clear(); draft.values[1].clear();
+                if !draft.first_run() { self.preview_draft(draft); return; }
+                draft.move_to(Direct);
+            }
             (Direct, Some(KeyCode::Char('1'))) => {
                 draft.flags[0] = false; draft.flags[1] = false; draft.flags[2] = false;
                 self.preview_draft(draft);
                 return;
             }
             (Direct, Some(KeyCode::Char('2'))) => {
-                draft.flags[0] = true; draft.flags[1] = false; draft.flags[2] = false; draft.move_to(Modify);
+                draft.flags[0] = true;
+                draft.move_to(Modify);
             }
             (Modify, Some(KeyCode::Char('1' | '2'))) => {
                 draft.flags[1] = code == Some(KeyCode::Char('2'));
-                draft.flags[2] = false;
+                if draft.first_run() || !draft.flags[1] { draft.flags[2] = false; }
                 self.preview_draft(draft);
                 return;
             }
@@ -795,9 +829,9 @@ impl Panel {
 
     fn draft_key(&mut self, code: KeyCode) {
         let Some(mut draft) = self.draft.take() else { return };
-        if draft.first_run() { self.wizard_key(draft, code); return; }
+        if draft.step != SetupStep::Advanced { self.wizard_key(draft, code); return; }
         match code {
-            KeyCode::Esc => { self.notice = "Черновик отменён; файл не изменён.".into(); return; }
+            KeyCode::Esc => { self.draft = Some(Draft::new(draft.original, draft.expected)); return; }
             KeyCode::Up | KeyCode::BackTab => draft.selected = draft.selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Tab => draft.selected = (draft.selected + 1).min(draft.count() - 1),
             KeyCode::F(5) => match draft.next_document() {
@@ -862,7 +896,7 @@ impl Panel {
             },
             ROUTING => vec![item('r', "Открыть редактор маршрутизации"), item('a', "Применить сохранённую политику")],
             STATISTICS => vec![item('p', "Открыть подключение"), item('d', "Открыть диагностику")],
-            SETTINGS => vec![item('t', "Изменить DNS, listeners и разрешения"), item('a', "Применить сохранённую политику"), item('e', "Первично зарегистрировать локальную политику")],
+            SETTINGS => vec![item('t', "Настроить DNS и разрешения"), item('a', "Применить сохранённую политику"), item('e', "Первично зарегистрировать локальную политику")],
             _ => Vec::new(),
         }
     }
@@ -1048,11 +1082,23 @@ impl Panel {
             if matches!(code, KeyCode::F(3) | KeyCode::Esc | KeyCode::Enter) {
                 let mut draft = self.catalogue_draft.take().unwrap();
                 if code != KeyCode::Esc {
-                    draft.values[4] = self.selected.iter().cloned().collect::<Vec<_>>().join(", ");
+                    // Keep explicit custom names outside the selectable catalogue.
+                    let mut hosts: BTreeSet<String> = draft.values[4].split(|c: char| c == ',' || c.is_whitespace())
+                        .filter(|s| !s.is_empty() && !self.catalog.entries().iter().any(|e| e.hostname == *s && !e.excluded))
+                        .map(str::to_owned).collect();
+                    hosts.extend(self.selected.iter().cloned());
+                    if hosts.len() > MAX_JOB_DOMAINS {
+                        self.notice = "Лимит: 64 сайта вместе с введёнными вручную. Снимите часть отметок.".into();
+                        self.catalogue_draft = Some(draft);
+                        return Ok(false);
+                    }
+                    draft.values[4] = hosts.into_iter().collect::<Vec<_>>().join(", ");
                     draft.error.clear();
                 }
                 draft.move_to(SetupStep::Domains);
-                self.filter.clear(); self.row = 0; self.offset = 0;
+                if let Some((selected, filter, row, offset)) = self.setup_catalogue_return.take() {
+                    self.selected = selected; self.filter = filter; self.row = row; self.offset = offset;
+                }
                 self.notice = "Сайты выбираются только для черновика; сеть не запускается.".into();
                 self.page = OVERVIEW;
                 self.draft = Some(draft);
@@ -1254,7 +1300,11 @@ impl Panel {
                         local.rules.len(), if local.resolver.is_some() { "настроен (сеть не проверена)" } else { "не настроен" },
                         yes(local.consent.direct_egress), if local.resolver.is_none() || !local.consent.direct_egress {
                             if local.resolver.is_none() { "Выберите защищённый DNS и разрешения." } else { "Разрешите выход в интернет в настройках, если хотите подключаться." }
-                    } else { "Примените сохранённые правила, затем отдельно откройте подключение или диагностику." });
+                    } else if self.newly_saved { "Примените новую конфигурацию. Это ещё не подключение." }
+                    else if self.applied_revision != Some(local.revision) { "Подтвердите применение сохранённых правил." }
+                    else if self.owner_active() { "Прокси принадлежит этой панели. Откройте подключение для состояния или отключения." }
+                    else if cfg!(windows) { "Откройте подключение или проверьте сайты в диагностике." }
+                    else { "Откройте диагностику. Системный прокси MVP доступен только на Windows." });
                 } else {
                     let _ = writeln!(text, "\nНастройте локальную конфигурацию. Без VPS, регистрации на сервере и импортируемых ключей.\nСоздание файла не запускает сеть или системный прокси.");
                 }
@@ -1473,14 +1523,14 @@ impl Panel {
             tui_widgets::confirmation_bar(frame, parts[2], "↑↓ / PgUp PgDn просмотр · ←→ выбор · Enter · Esc отменить", false, label, self.confirm_selected);
             return;
         } else if let Some(draft) = &self.draft {
-            if draft.first_run() {
+            if draft.step != SetupStep::Advanced {
                 draft.render_wizard(frame, body);
                 footer = if matches!(draft.step, SetupStep::DomainInput | SetupStep::CustomDns) {
                     "↑ ↓ поля · Enter далее · Del очистить · Esc назад".into()
                 } else { "↑ ↓ выбор · Enter далее · Esc назад".into() };
             } else {
                 draft.form().render(frame, body, "Настройки локальной конфигурации");
-                footer = "↑ ↓ поля · Пробел выбор · Del очистить · F5 проверить · Esc отменить".into();
+                footer = "↑ ↓ поля · Пробел выбор · Del очистить · F5 проверить · Esc назад".into();
             }
         } else if let Some((panel, _, _)) = &self.routing {
             panel.render(frame, body, true);
@@ -1625,7 +1675,19 @@ mod tests {
         panel.open_page(SETTINGS);
         capture("anti-dpi-settings", &mut panel);
         panel.open_settings();
+        capture("anti-dpi-settings-guided", &mut panel);
+        panel.key(KeyCode::Enter).unwrap();
+        capture("anti-dpi-settings-dns", &mut panel);
+        panel.key(KeyCode::Esc).unwrap();
+        panel.key(KeyCode::Down).unwrap();
+        panel.key(KeyCode::Enter).unwrap();
+        capture("anti-dpi-settings-permissions", &mut panel);
+        panel.key(KeyCode::Esc).unwrap();
+        panel.key(KeyCode::Down).unwrap();
+        panel.key(KeyCode::Down).unwrap();
+        panel.key(KeyCode::Enter).unwrap();
         capture("anti-dpi-settings-editor", &mut panel);
+        panel.key(KeyCode::Esc).unwrap();
         panel.key(KeyCode::Esc).unwrap();
         panel.open_page(ROUTING);
         assert!(panel.routing.is_some());
@@ -1715,6 +1777,57 @@ mod tests {
         terminal.draw(|frame| panel.draw(frame)).unwrap();
         panel.key(KeyCode::Char('c')).unwrap();
         assert!(panel.selected.is_empty());
+    }
+
+    #[test]
+    fn setup_catalogue_preserves_custom_sites_and_diagnostic_selection() {
+        let path = std::env::temp_dir().join(format!("theia-f20-selection-{}", std::process::id())).join("anti-dpi.toml");
+        let mut panel = Panel::new(path.clone()).unwrap();
+        let prior = panel.catalog.entries()[0].hostname.clone();
+        panel.selected.insert(prior.clone());
+        panel.filter = "prior".into();
+        panel.key(KeyCode::Enter).unwrap(); // recommended
+        panel.key(KeyCode::Down).unwrap();
+        panel.key(KeyCode::Enter).unwrap(); // custom sites
+        panel.draft.as_mut().unwrap().paste("example.org");
+        panel.key(KeyCode::Enter).unwrap();
+        panel.key(KeyCode::Enter).unwrap(); // catalogue
+        panel.key(KeyCode::Char(' ')).unwrap();
+        panel.key(KeyCode::Enter).unwrap();
+        let hosts = panel.draft.as_ref().unwrap().domain_values().unwrap();
+        assert!(hosts.contains("example.org"));
+        assert!(hosts.contains(&prior));
+        assert_eq!(panel.selected, BTreeSet::from([prior]));
+        assert_eq!(panel.filter, "prior");
+        assert!(!path.exists());
+        assert!(panel.worker.is_none());
+    }
+
+    #[test]
+    fn guided_settings_preview_changes_only_dns_and_preserves_cancellation() {
+        let root = std::env::temp_dir().join(format!("theia-f20-settings-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("anti-dpi.toml");
+        let original = include_str!("../../../../examples/anti-dpi.toml");
+        std::fs::write(&path, original).unwrap();
+        let mut panel = Panel::new(path.clone()).unwrap();
+        panel.open_settings();
+        assert!(panel.draft.as_ref().unwrap().step == SetupStep::Settings);
+        panel.key(KeyCode::Enter).unwrap(); // DNS
+        panel.key(KeyCode::Down).unwrap();
+        panel.key(KeyCode::Enter).unwrap(); // Quad9
+        if let Some(Review::Save(draft, next)) = &panel.review {
+            assert_eq!(next.anti_dpi.resolver.as_ref().unwrap().hostname, "dns.quad9.net");
+            assert_eq!(next.anti_dpi.rules, draft.original.anti_dpi.rules);
+            assert_eq!(next.anti_dpi.consent, draft.original.anti_dpi.consent);
+            assert_eq!(next.anti_dpi.proxy, draft.original.anti_dpi.proxy);
+        } else { panic!("expected reviewed Save"); }
+        panel.key(KeyCode::Esc).unwrap();
+        panel.key(KeyCode::Esc).unwrap();
+        panel.key(KeyCode::Esc).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(panel.worker.is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
