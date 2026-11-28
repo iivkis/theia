@@ -1,63 +1,63 @@
-# Source: OONI confirmed media domains dataset, 2024-09-01
-# Git blob: 5597113aeae99eb774503d2890d169864e95a14c
-# hostname, last_confirmed_day, confirmed_ASN_count (tab-separated)
-15minut.org	2024-08-29	30
-1plus1.ua	2024-08-31	32
-24tv.ua	2024-08-31	31
-activatica.org	2024-08-31	32
-atr.ua	2024-08-31	29
-avtonom.org	2024-08-31	32
-belsat.eu	2024-08-31	28
-blackseatv.com	2024-08-31	30
-boingboing.net	2024-08-31	31
-cherta.media	2024-08-31	28
-day.kyiv.ua	2024-08-31	28
-delo.ua	2024-08-31	16
-dev.ua	2024-08-31	15
-dossier.center	2024-08-31	26
-doxa.team	2024-08-31	17
-euroradio.fm	2024-08-31	27
-fergana.agency	2024-08-31	28
-focus.ua	2024-08-31	29
-gazeta.ua	2024-08-31	29
-glavcom.ua	2024-08-31	28
-glavred.info	2024-08-31	29
-graniru.org	2024-08-31	28
-gubernia.media	2024-08-31	28
-helpdesk.media	2024-08-31	30
-holod.media	2024-08-31	30
-hromadske.ua	2024-08-31	28
-is.fi	2024-08-31	15
-istories.media	2024-08-31	27
-itsmycity.ru	2024-08-31	30
-lb.ua	2024-08-31	28
-liveuamap.com	2024-08-31	27
-meduza.io	2024-08-31	28
-novayagazeta.eu	2024-08-31	27
-nv.ua	2024-08-30	23
-paperpaper.ru	2024-08-30	24
-redkollegia.org	2024-08-31	25
-republic.ru	2024-08-31	23
-semnasem.org	2024-08-31	25
-sobesednik.ru	2024-08-31	23
-thebell.io	2024-08-31	22
-theins.ru	2024-08-30	18
-tvrain.tv	2024-08-29	11
-twitter.com	2024-08-31	54
-uacrisis.org	2024-08-31	66
-verstka.media	2024-08-30	21
-www.bbc.com	2024-08-31	22
-www.bbcrussian.com	2024-08-31	18
-www.bellingcat.com	2024-08-31	20
-www.currenttime.tv	2024-08-31	19
-www.dw.com	2024-08-31	21
-www.facebook.com	2024-08-31	57
-www.proekt.media	2024-08-31	19
-www.rferl.org	2024-08-31	21
-www.rfi.fr	2024-08-31	103
-www.severreal.org	2024-08-31	23
-www.sibreal.org	2024-08-31	23
-www.svoboda.org	2024-08-28	19
-www.themoscowtimes.com	2024-08-30	18
-www.voanews.com	2024-08-31	73
-zona.media	2024-08-30	20
+# Popular restricted services in Russia; curated 2026-11-28.
+# hostname, service, evidence date, source URL, evidence scope (host/service).
+# Related hosts are diagnostic candidates; service-level evidence is not proof of host blocking or HTTPS/UDP capability.
+discord.com	Discord	2024-10-08	https://explorer.ooni.org/findings/2025-russia-blocked-discord	host
+discord.gg	Discord	2024-10-08	https://explorer.ooni.org/findings/2025-russia-blocked-discord	service
+discordapp.com	Discord	2024-10-08	https://explorer.ooni.org/findings/2025-russia-blocked-discord	service
+discordapp.net	Discord	2024-10-08	https://explorer.ooni.org/findings/2025-russia-blocked-discord	service
+cdn.discordapp.com	Discord	2024-10-08	https://explorer.ooni.org/findings/2025-russia-blocked-discord	service
+media.discordapp.net	Discord	2024-10-08	https://explorer.ooni.org/findings/2025-russia-blocked-discord	service
+gateway.discord.gg	Discord	2024-10-08	https://explorer.ooni.org/findings/2025-russia-blocked-discord	service
+discord.media	Discord	2024-10-08	https://explorer.ooni.org/findings/2025-russia-blocked-discord	service
+telegram.org	Telegram	2026-03-20	https://explorer.ooni.org/findings/2026-russia-blocked-telegram	service
+t.me	Telegram	2026-03-20	https://explorer.ooni.org/findings/2026-russia-blocked-telegram	service
+web.telegram.org	Telegram	2026-03-20	https://explorer.ooni.org/findings/2026-russia-blocked-telegram	service
+api.telegram.org	Telegram	2026-03-20	https://explorer.ooni.org/findings/2026-russia-blocked-telegram	service
+telegram.me	Telegram	2026-03-20	https://explorer.ooni.org/findings/2026-russia-blocked-telegram	service
+instagram.com	Instagram	2025-07-30	https://www.hrw.org/report/2025/07/30/disrupted-throttled-and-blocked/state-censorship-control-and-increasing-isolation	service
+www.instagram.com	Instagram	2025-07-30	https://www.hrw.org/report/2025/07/30/disrupted-throttled-and-blocked/state-censorship-control-and-increasing-isolation	service
+i.instagram.com	Instagram	2025-07-30	https://www.hrw.org/report/2025/07/30/disrupted-throttled-and-blocked/state-censorship-control-and-increasing-isolation	service
+graph.instagram.com	Instagram	2025-07-30	https://www.hrw.org/report/2025/07/30/disrupted-throttled-and-blocked/state-censorship-control-and-increasing-isolation	service
+cdninstagram.com	Instagram	2025-07-30	https://www.hrw.org/report/2025/07/30/disrupted-throttled-and-blocked/state-censorship-control-and-increasing-isolation	service
+scontent.cdninstagram.com	Instagram	2025-07-30	https://www.hrw.org/report/2025/07/30/disrupted-throttled-and-blocked/state-censorship-control-and-increasing-isolation	service
+youtube.com	YouTube	2025-07-30	https://www.hrw.org/report/2025/07/30/disrupted-throttled-and-blocked/state-censorship-control-and-increasing-isolation	service
+www.youtube.com	YouTube	2025-07-30	https://www.hrw.org/report/2025/07/30/disrupted-throttled-and-blocked/state-censorship-control-and-increasing-isolation	service
+m.youtube.com	YouTube	2025-07-30	https://www.hrw.org/report/2025/07/30/disrupted-throttled-and-blocked/state-censorship-control-and-increasing-isolation	service
+youtu.be	YouTube	2025-07-30	https://www.hrw.org/report/2025/07/30/disrupted-throttled-and-blocked/state-censorship-control-and-increasing-isolation	service
+youtubei.googleapis.com	YouTube	2025-07-30	https://www.hrw.org/report/2025/07/30/disrupted-throttled-and-blocked/state-censorship-control-and-increasing-isolation	service
+i.ytimg.com	YouTube	2025-07-30	https://www.hrw.org/report/2025/07/30/disrupted-throttled-and-blocked/state-censorship-control-and-increasing-isolation	service
+googlevideo.com	YouTube	2025-07-30	https://www.hrw.org/report/2025/07/30/disrupted-throttled-and-blocked/state-censorship-control-and-increasing-isolation	service
+whatsapp.com	WhatsApp	2026-10-28	https://whatsblocked.com/country/russia/	service
+www.whatsapp.com	WhatsApp	2026-10-28	https://whatsblocked.com/country/russia/	service
+web.whatsapp.com	WhatsApp	2026-10-28	https://whatsblocked.com/country/russia/	service
+api.whatsapp.com	WhatsApp	2026-10-28	https://whatsblocked.com/country/russia/	service
+whatsapp.net	WhatsApp	2026-10-28	https://whatsblocked.com/country/russia/	service
+wa.me	WhatsApp	2026-10-28	https://whatsblocked.com/country/russia/	service
+facebook.com	Facebook / Messenger	2025-07-30	https://www.hrw.org/report/2025/07/30/disrupted-throttled-and-blocked/state-censorship-control-and-increasing-isolation	service
+www.facebook.com	Facebook / Messenger	2025-07-30	https://www.hrw.org/report/2025/07/30/disrupted-throttled-and-blocked/state-censorship-control-and-increasing-isolation	service
+m.facebook.com	Facebook / Messenger	2025-07-30	https://www.hrw.org/report/2025/07/30/disrupted-throttled-and-blocked/state-censorship-control-and-increasing-isolation	service
+messenger.com	Facebook / Messenger	2025-07-30	https://www.hrw.org/report/2025/07/30/disrupted-throttled-and-blocked/state-censorship-control-and-increasing-isolation	service
+www.messenger.com	Facebook / Messenger	2025-07-30	https://www.hrw.org/report/2025/07/30/disrupted-throttled-and-blocked/state-censorship-control-and-increasing-isolation	service
+graph.facebook.com	Facebook / Messenger	2025-07-30	https://www.hrw.org/report/2025/07/30/disrupted-throttled-and-blocked/state-censorship-control-and-increasing-isolation	service
+x.com	X / Twitter	2026-11-27	https://vpnalert.com/tools/censorship-monitor/russia/	service
+twitter.com	X / Twitter	2026-11-27	https://vpnalert.com/tools/censorship-monitor/russia/	service
+api.x.com	X / Twitter	2026-11-27	https://vpnalert.com/tools/censorship-monitor/russia/	service
+pbs.twimg.com	X / Twitter	2026-11-27	https://vpnalert.com/tools/censorship-monitor/russia/	service
+t.co	X / Twitter	2026-11-27	https://vpnalert.com/tools/censorship-monitor/russia/	service
+signal.org	Signal	2026-10-28	https://whatsblocked.com/country/russia/	service
+www.signal.org	Signal	2026-10-28	https://whatsblocked.com/country/russia/	service
+updates.signal.org	Signal	2026-10-28	https://whatsblocked.com/country/russia/	service
+viber.com	Viber	2026-10-28	https://whatsblocked.com/country/russia/	service
+www.viber.com	Viber	2026-10-28	https://whatsblocked.com/country/russia/	service
+account.viber.com	Viber	2026-10-28	https://whatsblocked.com/country/russia/	service
+snapchat.com	Snapchat	2026-03-31	https://whatsblocked.com/country/russia/	service
+www.snapchat.com	Snapchat	2026-03-31	https://whatsblocked.com/country/russia/	service
+web.snapchat.com	Snapchat	2026-03-31	https://whatsblocked.com/country/russia/	service
+linkedin.com	LinkedIn	2026-11-27	https://vpnalert.com/tools/censorship-monitor/russia/	service
+www.linkedin.com	LinkedIn	2026-11-27	https://vpnalert.com/tools/censorship-monitor/russia/	service
+media.licdn.com	LinkedIn	2026-11-27	https://vpnalert.com/tools/censorship-monitor/russia/	service
+soundcloud.com	SoundCloud	2026-11-27	https://vpnalert.com/tools/censorship-monitor/russia/	service
+api.soundcloud.com	SoundCloud	2026-11-27	https://vpnalert.com/tools/censorship-monitor/russia/	service
+www.patreon.com	Patreon	2026-11-05	https://happ-ru.site/ne-rabotaet/	service
+speedtest.net	Speedtest	2025-07-30	https://www.reuters.com/sustainability/society-equity/russia-blocks-ooklas-online-speedtest-service-due-internet-security-threats-2025-07-30/	service
+www.speedtest.net	Speedtest	2025-07-30	https://www.reuters.com/sustainability/society-equity/russia-blocks-ooklas-online-speedtest-service-due-internet-security-threats-2025-07-30/	service

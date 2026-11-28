@@ -592,7 +592,7 @@ impl Panel {
     }
 
     fn visible(&self) -> Vec<&crate::anti_dpi::catalog::Entry> {
-        self.catalog.entries().iter().filter(|e| e.hostname.contains(&self.filter)
+        self.catalog.entries().iter().filter(|e| (e.hostname.contains(&self.filter) || e.provenance.as_ref().is_some_and(|p| p.service.to_ascii_lowercase().contains(&self.filter)))
             && (self.catalogue_draft.is_some() || !self.report_only || self.report_hosts.contains(&e.hostname))).collect()
     }
 
@@ -1571,7 +1571,7 @@ impl Panel {
         use ratatui::widgets::Cell;
         let body = Layout::vertical([Constraint::Length(4), Constraint::Min(2), Constraint::Length(2)]).split(area);
         let title = if self.catalogue_draft.as_ref().is_some_and(|d| d.adding_sites) { "Добавить сайты · Каталог" } else { "Шаг 2 из 5 · Выберите сайты" };
-        let header = format!("{title}\nОтмечено в каталоге: {} из 64 · Поиск: {}\nИсторический список OONI. Выбор не запускает проверку и не сохраняет правила.", self.selected.len(), if self.filter.is_empty() { "нет" } else { &self.filter });
+        let header = format!("{title}\nОтмечено в каталоге: {} из 64 · Поиск: {}\nПопулярные сервисы с ограничениями. Выбор не запускает сеть.", self.selected.len(), if self.filter.is_empty() { "нет" } else { &self.filter });
         frame.render_widget(Paragraph::new(header).style(Style::default().fg(TEXT)).wrap(Wrap { trim: true }), body[0]);
         let height = usize::from(body[1].height.saturating_sub(1)).max(1);
         let len = self.visible().len();
@@ -1581,7 +1581,7 @@ impl Panel {
         self.offset = self.offset.min(len.saturating_sub(1));
         let rows = self.visible().iter().enumerate().skip(self.offset).take(height).map(|(i, entry)| {
             let mark = if entry.excluded { "×" } else if self.selected.contains(&entry.hostname) { "✓" } else { "□" };
-            Row::new(vec![Cell::from(mark), Cell::from(entry.hostname.as_str()), Cell::from(if entry.excluded { "Исключён" } else if self.selected.contains(&entry.hostname) { "Выбран" } else { "" })])
+            Row::new(vec![Cell::from(mark), Cell::from(format!("{} · {}", entry.provenance.as_ref().map_or("Свой сайт", |p| p.service), entry.hostname)), Cell::from(if entry.excluded { "Исключён" } else if self.selected.contains(&entry.hostname) { "Выбран" } else { "" })])
                 .style(Style::default().fg(if entry.excluded { MUTED } else { TEXT }).bg(if i == self.row { FOCUS } else { SURFACE }))
         }).collect::<Vec<_>>();
         frame.render_widget(Table::new(rows, [Constraint::Length(3), Constraint::Min(16), Constraint::Length(23)])
@@ -1600,10 +1600,10 @@ impl Panel {
         let rows = self.visible().iter().enumerate().skip(self.offset).take(height).map(|(index, entry)| {
             let mark = if entry.excluded { "×" } else if self.selected.contains(&entry.hostname) { "✓" } else { "□" };
             let label = if entry.excluded { "Исключён" } else if self.selected.contains(&entry.hostname) { "Отмечен" } else { "" };
-            Row::new(vec![mark.to_owned(), entry.hostname.clone(), label.to_owned()]).style(Style::default().fg(if entry.excluded { MUTED } else { TEXT }).bg(if index == self.row { FOCUS } else { SURFACE }))
+            Row::new(vec![mark.to_owned(), format!("{} · {}", entry.provenance.as_ref().map_or("Свой сайт", |p| p.service), entry.hostname), label.to_owned()]).style(Style::default().fg(if entry.excluded { MUTED } else { TEXT }).bg(if index == self.row { FOCUS } else { SURFACE }))
         }).collect::<Vec<_>>();
         frame.render_widget(Table::new(rows, [Constraint::Length(3), Constraint::Min(12), Constraint::Length(12)]).header(Row::new(["", "Сайт", "Выбор"]).style(Style::default().fg(ACCENT))), regions[1]);
-        frame.render_widget(Paragraph::new("Исторический список OONI, не текущие блокировки. Выбор не меняет правила.").style(Style::default().fg(MUTED)).wrap(Wrap { trim: true }), regions[2]);
+        frame.render_widget(Paragraph::new("Ограничения сервисов не доказывают блокировку каждого адреса. Правила не меняются.").style(Style::default().fg(MUTED)).wrap(Wrap { trim: true }), regions[2]);
     }
 
     fn draw_diagnostics(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -1667,7 +1667,7 @@ impl Panel {
         frame.render_widget(Table::new(rows, widths).header(Row::new(headers).style(Style::default().fg(ACCENT))), body[1]);
         let selected = self.visible().get(self.row).map(|entry| {
             let source = entry.provenance.as_ref().map_or_else(|| "Свой домен; нет исторического доказательства".into(),
-                |p| format!("OONI · {} · сетей {}", p.last_confirmed_day, p.confirmed_networks));
+                |p| format!("{} · сведения от {}", p.service, p.evidence_day));
             format!("{} · {source}", entry.hostname)
         }).unwrap_or_else(|| "Нет совпадений".into());
         let legend = if self.group == 0 { "2xx — ответ получен · 3xx — перенаправление · 4xx/5xx — HTTP-ошибка\nн/п — не поддерживается · н/пр — неприменимо · — не проверено" }
@@ -1683,7 +1683,7 @@ impl Panel {
         let id = cols.get(self.column).copied().flatten();
         let name = id.map_or("Прямой контроль (UDP)", column_label);
         let provenance = entry.provenance.as_ref().map_or_else(|| "Свой домен; без доказательства ограничения".into(),
-            |p| format!("Источник: {}\nПоследнее подтверждение: {} · Сетей: {}\nМасштаб ограничения не установлен", p.source, p.last_confirmed_day, p.confirmed_networks));
+            |p| format!("Сервис: {}\nИсточник: {}\nДата сведения: {}\n{}", p.service, p.source, p.evidence_day, match p.restriction_scope { crate::anti_dpi::catalog::RestrictionScope::Host => "Измерения этого имени; не всех URL и протоколов.", crate::anti_dpi::catalog::RestrictionScope::Service => "Ограничения сервиса; блокировка этого имени не подтверждена отдельно." }));
         let mut text = format!("{} · {name}\n\n", entry.hostname);
         if let Some(c) = id.and_then(|id| self.results.get(&(entry.hostname.clone(), id))) {
             text.push_str(&format!("Что это значит: {}\n\nСтатус: {}\nАктуальность: {}\nПричина: {}\nПротокол: {:?}\nСеть: {} · TLS: {} · Приложение: {}\nHTTP: {} · Длительность: {} мс · Попыток: {}\nМодификация: {}\nEndpoint: {} · Source: {}\nРешение политики: {:?}",

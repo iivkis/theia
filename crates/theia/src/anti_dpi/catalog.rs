@@ -7,18 +7,17 @@ use sha2::{Digest, Sha256};
 use std::{collections::{BTreeMap, BTreeSet}, fmt::Write, path::Path};
 
 const BUILTIN: &str = include_str!("catalog.tsv");
-pub const VERSION: &str = "ru-ooni-2024-v1";
-pub const SOURCE: &str = "https://ooni.org/post/2024-russia-report/";
-pub const DATA_SOURCE: &str = "https://ooni.org/post/2024-russia-report/2024-09-01-russia-blocked-confirmed-media-domains.csv";
+pub const VERSION: &str = "ru-popular-services-2026-v2";
 pub const MAX_DOMAINS: usize = 256;
 pub const MAX_JOB_DOMAINS: usize = 64;
 pub const MAX_JOB_CELLS: usize = 512;
 
-/// The source measures blocked URLs grouped by hostname. It does not
-/// establish the scope of every domain-wide/IP/protocol restriction.
+/// Host evidence concerns a measured hostname, not every URL or protocol.
+/// Service evidence concerns a platform, not the individual related hostname.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestrictionScope {
-    Unknown,
+    Host,
+    Service,
 }
 
 /// Hostname alone is not evidence that a protocol endpoint is available.
@@ -50,8 +49,8 @@ impl Default for EndpointMetadata {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Provenance {
     pub source: &'static str,
-    pub last_confirmed_day: String,
-    pub confirmed_networks: u32,
+    pub service: &'static str,
+    pub evidence_day: &'static str,
     pub restriction_scope: RestrictionScope,
 }
 
@@ -154,17 +153,19 @@ impl Catalog {
         let mut entries = BTreeMap::new();
         for line in BUILTIN.lines().filter(|line| !line.starts_with('#') && !line.is_empty()) {
             let mut fields = line.split('\t');
-            let (Some(host), Some(day), Some(networks), None) =
-                (fields.next(), fields.next(), fields.next(), fields.next())
+            let (Some(host), Some(service), Some(day), Some(source), Some(scope), None) =
+                (fields.next(), fields.next(), fields.next(), fields.next(), fields.next(), fields.next())
             else {
                 return Err(invalid("catalog.builtin", "invalid embedded record"));
             };
-            let networks: u32 = networks.parse()
-                .map_err(|_| invalid("catalog.builtin", "invalid network count"))?;
-            if !canonical_host(host) || day.len() != 10 || networks == 0 ||
+            let restriction_scope = match scope {
+                "host" => RestrictionScope::Host,
+                "service" => RestrictionScope::Service,
+                _ => return Err(invalid("catalog.builtin", "unknown evidence scope")),
+            };
+            if !canonical_host(host) || service.is_empty() || day.len() != 10 || !source.starts_with("https://") ||
                 entries.insert(host.to_owned(), Some(Provenance {
-                    source: SOURCE, last_confirmed_day: day.to_owned(), confirmed_networks: networks,
-                    restriction_scope: RestrictionScope::Unknown,
+                    source, service, evidence_day: day, restriction_scope,
                 })).is_some() {
                 return Err(invalid("catalog.builtin", "invalid or duplicate embedded record"));
             }
@@ -219,7 +220,7 @@ impl Catalog {
         for entry in &self.entries {
             let _ = write!(out, "{}\t{}\t", entry.hostname, if entry.excluded { "excluded" } else { "enabled" });
             if let Some(p) = &entry.provenance {
-                let _ = writeln!(out, "{}\t{}\t{}\tscope={:?}\tendpoint={:?}", p.last_confirmed_day, p.confirmed_networks, p.source, p.restriction_scope, entry.endpoint);
+                let _ = writeln!(out, "{}\t{}\t{}\tscope={:?}\tendpoint={:?}", p.service, p.evidence_day, p.source, p.restriction_scope, entry.endpoint);
             } else {
                 let _ = writeln!(out, "user-supplied; no block evidence\tendpoint={:?}", entry.endpoint);
             }
@@ -234,18 +235,21 @@ mod tests {
 
     #[test]
     fn embedded_history_and_user_overlay_are_separate() {
-        let overlay = Overlay { custom: vec!["MEDUZA.IO.".into(), "custom.example.com".into()],
-            excluded: vec!["meduza.io".into()], ..Overlay::default() };
+        let overlay = Overlay { custom: vec!["DISCORD.COM.".into(), "custom.example.com".into()],
+            excluded: vec!["discord.com".into()], ..Overlay::default() };
         let catalog = Catalog::build(&overlay).unwrap();
         assert_eq!(catalog.builtin_count(), 60);
         assert_eq!(catalog.entries().len(), 61);
-        let entry = catalog.entries().iter().find(|e| e.hostname == "meduza.io").unwrap();
+        let entry = catalog.entries().iter().find(|e| e.hostname == "discord.com").unwrap();
         assert!(entry.excluded && entry.provenance.is_some());
-        assert_eq!(entry.provenance.as_ref().unwrap().restriction_scope, RestrictionScope::Unknown);
+        assert_eq!(entry.provenance.as_ref().unwrap().restriction_scope, RestrictionScope::Host);
         assert_eq!(entry.endpoint.quic_v1, EndpointSupport::Unknown);
         assert_eq!(entry.endpoint.stun, EndpointSupport::Unknown);
         assert_eq!(catalog.entries().iter().filter(|e| e.provenance.is_some()).count(), 60);
-        assert!(catalog.select(&["meduza.io".into()], 1).is_err());
+        assert_eq!(catalog.entries().iter().find(|e| e.hostname == "web.telegram.org").unwrap().provenance.as_ref().unwrap().restriction_scope, RestrictionScope::Service);
+        assert!(!catalog.entries().iter().any(|e| e.hostname == "meduza.io"));
+        assert!(!catalog.entries().iter().any(|e| crate::camouflage_discovery::POPULAR_HTTPS_DOMAINS.contains(&e.hostname.as_str())));
+        assert!(catalog.select(&["discord.com".into()], 1).is_err());
         assert!(catalog.select(&["custom.example.com".into()], 1).is_ok());
     }
 
@@ -255,8 +259,8 @@ mod tests {
         for host in ["https://example.com", "127.0.0.1", "foo.local", "foo.onion", "foo.invalid"] {
             assert!(Catalog::build(&Overlay { custom: vec![host.into()], ..Overlay::default() }).is_err());
         }
-        assert!(catalog.select(&["meduza.io".into()], 513).is_err());
-        assert!(catalog.select(&["meduza.io".into(), "MEDUZA.IO".into()], 1).is_err());
+        assert!(catalog.select(&["discord.com".into()], 513).is_err());
+        assert!(catalog.select(&["discord.com".into(), "DISCORD.COM".into()], 1).is_err());
         let hosts: Vec<_> = catalog.entries().iter().map(|e| e.hostname.clone()).collect();
         assert_eq!(catalog.select(&hosts, 8).unwrap().len(), 60);
         assert!(catalog.select(&hosts, 9).is_err());

@@ -35,7 +35,11 @@ fn catalogue_cli_is_offline_and_reports_historical_sources() {
     let output = String::from_utf8(result.stdout).unwrap();
     assert!(output.contains("built-in=60"));
     assert!(output.contains("No network checks performed"));
-    assert!(output.contains("meduza.io"));
+    assert!(output.contains("discord.com"));
+    assert!(output.contains("web.telegram.org"));
+    assert!(output.contains("www.instagram.com"));
+    assert!(!output.contains("meduza.io"));
+    assert!(output.contains("scope=Service"));
     assert!(output.contains("sha256="));
 }
 
@@ -45,12 +49,12 @@ fn diagnostic_preview_is_offline_and_confirmation_is_exact() {
     let example = include_str!("../../../examples/anti-dpi.toml");
     std::fs::write(&path, format!("{example}\n[anti_dpi.resolver]\nhostname='dns.example.com'\nbootstrap=['1.1.1.1']\n")).unwrap();
     let path = path.to_str().unwrap();
-    let args = ["anti-dpi", "diagnose", "--config", path, "--domains", "meduza.io"];
+    let args = ["anti-dpi", "diagnose", "--config", path, "--domains", "discord.com"];
     let result = Command::new(env!("CARGO_BIN_EXE_theia")).args(args).output().unwrap();
     assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
     let output = String::from_utf8(result.stdout).unwrap();
     assert!(output.contains("Diagnostic preview (no network requests)"));
-    assert!(output.contains("meduza.io"));
+    assert!(output.contains("discord.com"));
     assert!(output.contains("dns.example.com"));
     assert!(output.contains("AwaitingAcceptance"));
     assert!(output.contains("Confirm exact plan with SHA256="));
