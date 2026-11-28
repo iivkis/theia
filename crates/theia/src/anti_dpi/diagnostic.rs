@@ -117,7 +117,7 @@ impl Column {
             Self::Tcp(None) => None,
             Self::Tcp(Some(strategy)) => (!strategy.accepted_for_standalone())
                 .then_some(Reason::AwaitingAcceptance),
-            Self::Udp(strategy, _) if !strategy.accepted_for_proxy() => Some(Reason::AwaitingAcceptance),
+            Self::Udp(strategy, _) if !strategy.accepted_for_standalone() => Some(Reason::AwaitingAcceptance),
             // A plain hostname does not advertise an authenticated QUIC or
             // credential-free STUN endpoint. Never guess protocol/port.
             Self::Udp(_, _) => Some(Reason::MissingEndpointMetadata),

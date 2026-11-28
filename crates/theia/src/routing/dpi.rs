@@ -58,6 +58,7 @@ pub(crate) struct Engine {
     policy: Arc<PolicyState>,
     cache: strategy::Cache,
     scheduler: ProbeScheduler,
+    standalone: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -97,6 +98,13 @@ impl UdpStrategy {
     /// Product activation is a reviewed source-level gate, not a user
     /// configuration switch or a successful reachability probe. Populate
     /// only after independent, exact-revision F-15 acceptance.
+    pub(crate) fn accepted_for_standalone(self) -> bool {
+        // Independent F-20 evidence is mandatory, especially an actually
+        // transformed QUIC probe (ordinary reachability is insufficient).
+        const ACCEPTED: &[UdpStrategy] = &[];
+        !matches!(self, Self::StunBinding(udp::BindingStrategy::Plain)) && ACCEPTED.contains(&self)
+    }
+
     pub(crate) fn accepted_for_proxy(self) -> bool {
         const ACCEPTED: &[UdpStrategy] = &[];
         !matches!(self, Self::StunBinding(udp::BindingStrategy::Plain)) && ACCEPTED.contains(&self)
@@ -329,7 +337,13 @@ impl Engine {
             policy,
             cache: strategy::Cache::default(),
             scheduler: ProbeScheduler::new(4),
+            standalone: false,
         }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn new_standalone(policy: Arc<PolicyState>) -> Self {
+        Self { standalone: true, ..Self::new(policy) }
     }
     pub(crate) fn set_enabled(&self, enabled: bool) {
         self.policy.set_enabled(enabled);
@@ -532,6 +546,16 @@ impl Engine {
         self.open_udp_pinned(name, port, ips, &pin, strategy).await
     }
 
+    #[cfg(windows)]
+    pub(crate) async fn open_standalone_udp(
+        self: &Arc<Self>, name: &str, port: u16, ips: &[IpAddr], pin: &PolicyLease, strategy: UdpStrategy,
+    ) -> Result<Option<VerifiedUdp>, ClientError> {
+        if !self.standalone || !strategy.accepted_for_standalone() {
+            return Ok(None);
+        }
+        self.open_udp_pinned(name, port, ips, pin, strategy).await
+    }
+
     async fn open_udp_pinned(
         self: &Arc<Self>,
         name: &str,
@@ -541,6 +565,9 @@ impl Engine {
         strategy: UdpStrategy,
     ) -> Result<Option<VerifiedUdp>, ClientError> {
         pin.check_owner(&self.policy)?;
+        if self.standalone && !strategy.accepted_for_standalone() {
+            return Ok(None);
+        }
         let policy = pin.digest();
         let stun = match strategy {
             UdpStrategy::Quic(_) if port == 443 => false,
@@ -859,7 +886,9 @@ impl Engine {
     ) -> Result<Option<Tunnel>, ClientError> {
         pin.check_owner(&self.policy)?;
         let policy = pin.digest();
-        if !self.enabled() || !matches!(port, 443 | 8443) || ips.is_empty() {
+        if !self.enabled() || !matches!(port, 443 | 8443) || ips.is_empty()
+            || (self.standalone && !Strategy::ALL.into_iter().any(Strategy::accepted_for_standalone))
+        {
             return Ok(None);
         }
         if ips.len() > 64
@@ -910,7 +939,9 @@ impl Engine {
                         };
                         let mut verified = None;
                         let mut attempted = 0;
-                        let mut order = self.cache.ranked(&key);
+                        let mut order = self.cache.ranked(&key).into_iter()
+                            .filter(|strategy| !self.standalone || strategy.accepted_for_standalone())
+                            .collect::<Vec<_>>();
                         if let Some((
                             Verdict::Avoid {
                                 strategy: failed, ..
@@ -996,7 +1027,7 @@ impl Engine {
                             return Err(stale_policy());
                         }
                         let Some(strategy) = verified else {
-                            if attempted == Strategy::ALL.len() {
+                            if attempted == order.len() {
                                 let _ = self.cache.remember(&key, Verdict::Unavailable);
                             }
                             continue;

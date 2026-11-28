@@ -11,6 +11,12 @@ pub(crate) fn stale_policy() -> ClientError {
     ClientError::Open(crate::protocol::ErrorCode::PolicyDenied)
 }
 
+#[cfg(windows)]
+struct LocalAuthority {
+    digest: [u8; 32],
+    live: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
 #[derive(Default)]
 pub(crate) struct PolicyState {
     enabled: AtomicBool,
@@ -18,9 +24,24 @@ pub(crate) struct PolicyState {
     stun_enabled: AtomicBool,
     policy: std::sync::Mutex<Option<LocalPolicy>>,
     policy_epoch: AtomicU64,
+    #[cfg(windows)]
+    local: Option<LocalAuthority>,
 }
 
 impl PolicyState {
+    /// A standalone authority is not a server snapshot. Its immutable
+    /// guard owns the exact local publication, DNS pins and session scope.
+    #[cfg(windows)]
+    pub(crate) fn standalone(digest: [u8; 32], live: Arc<dyn Fn() -> bool + Send + Sync>, stun: bool) -> Arc<Self> {
+        Arc::new(Self {
+            enabled: AtomicBool::new(true),
+            stun_enabled: AtomicBool::new(stun),
+            policy_epoch: AtomicU64::new(1),
+            local: Some(LocalAuthority { digest, live }),
+            ..Self::default()
+        })
+    }
+
     pub(crate) fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::Relaxed);
     }
@@ -34,6 +55,8 @@ impl PolicyState {
     }
 
     pub(super) fn authorize_policy(&self, lease: Option<LocalPolicy>) {
+        #[cfg(windows)]
+        if self.local.is_some() { return; }
         if let Ok(mut policy) = self.policy.lock() {
             let next = if self.retired() { None } else { lease };
             let continuous = match (&*policy, &next) {
@@ -64,6 +87,15 @@ impl PolicyState {
     }
 
     fn current_epoch(&self, digest: [u8; 32]) -> Option<u64> {
+        #[cfg(windows)]
+        if let Some(local) = &self.local {
+            if self.retired() { return None; }
+            if !(local.live)() {
+                self.retired.store(true, Ordering::Release);
+                return None;
+            }
+            return (local.digest == digest).then_some(1);
+        }
         let mut policy = self.policy.lock().ok()?;
         if self.retired() {
             return None;
@@ -138,6 +170,22 @@ impl PolicyLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn standalone_revocation_is_irreversible_and_digest_bound() {
+        let alive = Arc::new(AtomicBool::new(true));
+        let check = alive.clone();
+        let authority = PolicyState::standalone([8; 32], Arc::new(move || check.load(Ordering::Acquire)), false);
+        assert!(authority.pin([7; 32]).is_err());
+        let lease = authority.pin([8; 32]).unwrap();
+        assert!(lease.check().is_ok());
+        assert!(!authority.stun_enabled());
+        alive.store(false, Ordering::Release);
+        assert!(lease.check().is_err());
+        alive.store(true, Ordering::Release);
+        assert!(authority.pin([8; 32]).is_err());
+    }
+
     #[test]
     fn revocation_and_republication_cannot_revive_a_lease() {
         let authority = Arc::new(PolicyState::default());

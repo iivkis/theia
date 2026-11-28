@@ -8,7 +8,7 @@ use crate::{
     net::guarded_io::{revoked, GuardedIo},
     network_scope,
     protocol::{Address, ErrorCode},
-    routing::{self, carrier_socket},
+    routing::{self, carrier_socket, dpi::{self, Engine, Strategy, UdpStrategy}, flow::{FlowTable, Protocol}, policy_lease::{PolicyState, PolicyLease}, PacketAction},
     udp_relay,
 };
 use std::{
@@ -32,6 +32,7 @@ struct Runtime {
     epoch: u64,
     roots: rustls::RootCertStore,
     resolver_slots: Semaphore,
+    flows: Arc<FlowTable>,
     control: Arc<Control>,
 }
 
@@ -77,17 +78,19 @@ impl Runtime {
         Ok(())
     }
 
-    async fn target(&self, active: &Arc<Active>, address: &Address, port: u16) -> Result<Target, ClientError> {
+    async fn target(&self, active: &Arc<Active>, address: &Address, port: u16, allow_modify: bool) -> Result<Target, ClientError> {
         if !self.live() || !active.live() || !active.document().anti_dpi.consent.direct_egress || port == 0 {
             return Err(denied());
         }
         let policy = active.policy();
+        let allow_modify = allow_modify && active.document().anti_dpi.consent.direct_dpi;
         let pins = match address {
             Address::Dns(name) => {
                 let name = routing::domain_name(name).map_err(|_| ClientError::Protocol)?;
                 // Reject conclusive Drop or unaccepted Modify before DNS.
                 match policy.classify_domain(&name) {
-                    Decision::Drop | Decision::Modify => return Err(denied()),
+                    Decision::Drop => return Err(denied()),
+                    Decision::Modify if !allow_modify => return Err(denied()),
                     _ => {}
                 }
                 let live = || self.live() && active.live();
@@ -108,7 +111,7 @@ impl Runtime {
                     dns::DnsError::Timeout => ClientError::Timeout,
                     _ => ClientError::Open(ErrorCode::DialFailed),
                 })?;
-                if result.decision() != Decision::Pass || !result.current() {
+                if !(result.decision() == Decision::Pass || (allow_modify && result.decision() == Decision::Modify)) || !result.current() {
                     return Err(denied());
                 }
                 Some(result)
@@ -127,7 +130,8 @@ impl Runtime {
         }
         let peer = SocketAddr::new(ip, port);
         let scope = network_scope::observe(peer).ok_or_else(denied)?;
-        let target = Target { peer, scope, pins, active: active.clone() };
+        let decision = pins.as_ref().map_or(Decision::Pass, dns::Pins::decision);
+        let target = Target { peer, scope, pins, decision, active: active.clone() };
         if !target.live(self) {
             return Err(denied());
         }
@@ -139,6 +143,7 @@ struct Target {
     peer: SocketAddr,
     scope: network_scope::Scope,
     pins: Option<dns::Pins>,
+    decision: Decision,
     active: Arc<Active>,
 }
 
@@ -149,12 +154,8 @@ impl Target {
     }
 }
 
-async fn tcp(
-    runtime: &Runtime, active: &Arc<Active>, socket: &mut TcpStream, is_http: bool,
-    address: &Address, port: u16,
-) -> Result<(TcpStream, Target), ClientError> {
-    let result = async {
-        let target = runtime.target(active, address, port).await?;
+async fn tcp(runtime: &Runtime, target: &Target) -> Result<TcpStream, ClientError> {
+    {
         let live = || target.live(runtime);
         let origin = tokio::select! {
             biased;
@@ -168,12 +169,56 @@ async fn tcp(
         if !target.live(runtime) || !origin.local_addr().is_ok_and(|a| target.scope.matches_local(a)) {
             return Err(denied());
         }
-        Ok((origin, target))
-    }.await;
-    if let Err(error) = &result {
-        ingress::failure(socket, is_http, error).await;
+        Ok(origin)
     }
-    result
+}
+
+fn modify_engine(runtime: &Arc<Runtime>, target: &Arc<Target>) -> Result<(Arc<Engine>, PolicyLease), ClientError> {
+    let digest = target.active.policy().digest();
+    let stun = target.active.document().anti_dpi.consent.direct_dpi_stun;
+    let runtime = runtime.clone();
+    let target = target.clone();
+    let authority = PolicyState::standalone(digest, Arc::new(move || {
+        target.live(&runtime) && target.active.document().anti_dpi.consent.direct_dpi
+    }), stun);
+    let pin = authority.pin(digest)?;
+    Ok((Arc::new(Engine::new_standalone(authority)), pin))
+}
+
+async fn modify_tcp(runtime: Arc<Runtime>, target: Arc<Target>, mut socket: TcpStream,
+    is_http: bool, address: Address, port: u16) -> Result<(), ClientError> {
+    let live = || target.live(&runtime);
+    let opened = async {
+        let Address::Dns(name) = &address else { return Err(denied()) };
+        let (engine, pin) = modify_engine(&runtime, &target)?;
+        let flow = runtime.flows.begin_pinned(pin.clone(), Protocol::Tcp, address.clone(), port, PacketAction::Modify)?;
+        let _permit = timeout(Duration::from_secs(6), runtime.resolver_slots.acquire_many(2))
+            .await.map_err(|_| ClientError::Timeout)?.map_err(|_| denied())?;
+        let tunnel = engine.open_checked_pinned(name, port, &[target.peer.ip()], &pin).await?.ok_or_else(denied)?;
+        flow.check_pending()?;
+        Ok::<_, ClientError>((tunnel, flow))
+    };
+    let (tunnel, flow) = match tokio::select! {
+        biased;
+        _ = revoked(&live) => Err(denied()),
+        result = opened => result,
+    } {
+        Ok(value) => value,
+        Err(error) => { ingress::failure(&mut socket, is_http, &error).await; return Err(error); }
+    };
+    tokio::select! {
+        biased;
+        _ = revoked(&live) => return Err(denied()),
+        result = ingress::success(&mut socket, is_http) => result?,
+    }
+    tokio::select! {
+        biased;
+        _ = revoked(&live) => Err(denied()),
+        result = tunnel.relay_guarded(socket, Some(&flow)) => match result? {
+            dpi::RelayOutcome::Finished => Ok(()),
+            dpi::RelayOutcome::Fallback { .. } => Err(denied()),
+        },
+    }
 }
 
 async fn handle(runtime: Arc<Runtime>, mut socket: TcpStream, is_http: bool) -> Result<(), ClientError> {
@@ -189,7 +234,19 @@ async fn handle(runtime: Arc<Runtime>, mut socket: TcpStream, is_http: bool) -> 
         Request::Tcp { address, port, plain } => (address, port, plain),
         Request::Udp { address, port } => return association(runtime.clone(), active.clone(), socket, address, port).await,
     };
-    let (origin, target) = tcp(&runtime, &active, &mut socket, is_http, &address, port).await?;
+    let allow_modify = plain.is_none() && matches!(port, 443 | 8443)
+        && Strategy::ALL.into_iter().any(Strategy::accepted_for_standalone);
+    let target = match runtime.target(&active, &address, port, allow_modify).await {
+        Ok(target) => target,
+        Err(error) => { ingress::failure(&mut socket, is_http, &error).await; return Err(error); }
+    };
+    if target.decision == Decision::Modify {
+        return modify_tcp(runtime.clone(), Arc::new(target), socket, is_http, address, port).await;
+    }
+    let origin = match tcp(&runtime, &target).await {
+        Ok(origin) => origin,
+        Err(error) => { ingress::failure(&mut socket, is_http, &error).await; return Err(error); }
+    };
     let live = || target.live(&runtime);
     if !live() {
         return Err(denied());
@@ -268,7 +325,20 @@ async fn udp_flow(
     runtime: Arc<Runtime>, active: Arc<Active>, socket: Arc<UdpSocket>, source: SocketAddr,
     address: Address, port: u16, mut queued: mpsc::Receiver<Vec<u8>>,
 ) -> Result<(), ClientError> {
-    let target = runtime.target(&active, &address, port).await?;
+    let current = || runtime.live() && active.live();
+    let first = tokio::select! {
+        biased;
+        _ = revoked(&current) => return Err(denied()),
+        first = queued.recv() => match first { Some(first) => first, None => return Ok(()) },
+    };
+    let mut observer = dpi::udp::Observer::default();
+    let strategy = super::egress::udp_strategy(&address, port, &observer.outgoing(&first), &first,
+        active.document().anti_dpi.consent.direct_dpi_stun).filter(|s| s.accepted_for_standalone());
+    let target = runtime.target(&active, &address, port, strategy.is_some()).await?;
+    if target.decision == Decision::Modify {
+        return modify_udp(runtime.clone(), Arc::new(target), socket, source, address, port,
+            strategy.ok_or_else(denied)?, first, queued).await;
+    }
     let live = || target.live(&runtime);
     let origin = tokio::select! {
         biased;
@@ -282,6 +352,9 @@ async fn udp_flow(
     let activity = udp_relay::Activity::new();
     let mut buffer = vec![0; 65536];
     let mut packet = Vec::new();
+    send_udp(&origin, &first, None, &live).await?;
+    runtime.control.uploaded.fetch_add(first.len() as u64, Ordering::Relaxed);
+    activity.touch();
     loop {
         tokio::select! {
             biased;
@@ -305,6 +378,48 @@ async fn udp_flow(
                 activity.touch();
             }
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn modify_udp(runtime: Arc<Runtime>, target: Arc<Target>, socket: Arc<UdpSocket>,
+    source: SocketAddr, address: Address, port: u16, strategy: UdpStrategy,
+    first: Vec<u8>, queued: mpsc::Receiver<Vec<u8>>) -> Result<(), ClientError> {
+    let Address::Dns(name) = &address else { return Err(denied()) };
+    let live = || target.live(&runtime);
+    let (engine, pin) = modify_engine(&runtime, &target)?;
+    let flow = runtime.flows.begin_pinned(pin.clone(), Protocol::Udp, address.clone(), port, PacketAction::Modify)?;
+    let verified = tokio::select! {
+        biased;
+        _ = revoked(&live) => return Err(denied()),
+        result = async {
+            let _permit = timeout(Duration::from_secs(6), runtime.resolver_slots.acquire())
+                .await.map_err(|_| ClientError::Timeout)?.map_err(|_| denied())?;
+            engine.open_standalone_udp(name, port, &[target.peer.ip()], &pin, strategy).await
+        } => result?.ok_or_else(denied)?,
+    };
+    let delivery = verified.fallback_policy();
+    let (tx, mut rx) = mpsc::channel(udp_relay::QUEUE);
+    let down = async {
+        let mut packet = Vec::new();
+        while let Some(data) = rx.recv().await {
+            if !live() { return Err(denied()); }
+            delivery.check()?;
+            flow.check_live(PacketAction::Modify)?;
+            if udp_relay::encode_socks_into(&mut packet, &address, port, &data) {
+                send_udp(&socket, &packet, Some(source), &|| live() && delivery.check().is_ok()
+                    && flow.check_live(PacketAction::Modify).is_ok()).await?;
+            }
+        }
+        Ok(())
+    };
+    tokio::select! {
+        biased;
+        _ = revoked(&live) => Err(denied()),
+        result = async {
+            tokio::try_join!(udp_relay::relay_standalone_verified(Box::new(verified), first, queued, tx, &flow), down)?;
+            Ok(())
+        } => result,
     }
 }
 
@@ -455,7 +570,7 @@ async fn run_inner(
     let roots = crate::net::tls::native_roots();
     if roots.is_empty() { return Err(ClientError::Tls); }
     let active = Arc::new(active);
-    let runtime = Arc::new(Runtime { active: RwLock::new(active.clone()), epoch, roots, resolver_slots: Semaphore::new(4), control: control.clone() });
+    let runtime = Arc::new(Runtime { active: RwLock::new(active.clone()), epoch, roots, resolver_slots: Semaphore::new(4), flows: FlowTable::shared(), control: control.clone() });
     let config = &active.document().anti_dpi.proxy;
     let http = super::bind_proxy_listener(&config.http_listen).await?;
     let socks = super::bind_proxy_listener(&config.socks5_listen).await?;

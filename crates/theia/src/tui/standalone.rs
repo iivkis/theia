@@ -6,7 +6,7 @@ use super::{io, event, Event, KeyCode, KeyEventKind, KeyModifiers, Terminal, Cro
 use crate::anti_dpi::{
     authority::Candidate,
     catalog::{Catalog, Overlay, MAX_JOB_DOMAINS},
-    diagnostic::{strategy_columns, CellResult, CellStatus, Plan, Report},
+    diagnostic::{strategy_columns, CellResult, CellStatus, Plan},
     Document,
 };
 use std::{
@@ -52,6 +52,9 @@ fn status(cell: Option<&CellResult>) -> &'static str {
 
 #[cfg(windows)]
 use crate::anti_dpi::session::{Control, DiagnosticUpdate as Update, Phase};
+
+#[cfg(not(windows))]
+use crate::anti_dpi::diagnostic::Report;
 
 #[cfg(not(windows))]
 enum Update {
@@ -557,7 +560,7 @@ impl Panel {
                     Phase::Starting => "подготовка", Phase::Connected => "подключено (readback)",
                     Phase::Stopping => "отключение", Phase::Stopped => "отключено", Phase::Failed => "ошибка",
                 };
-                text.push_str(&format!("\n\nПринадлежащая панели сессия: {phase}\nПрименённая ревизия: {} · Admission: {}\nЛокальные соединения: {} активных / {} принятых · ошибки: {}\nЗаписано к цели: {} байт · доставлено приложению: {} байт\nДиагностика не входит в эти счётчики.",
+                text.push_str(&format!("\n\nПринадлежащая панели сессия: {phase}\nПрименённая ревизия: {} · Admission: {}\nЛокальные соединения: {} активных / {} принятых · ошибки: {}\nPass: записано к цели {} байт · доставлено приложению {} байт\nДиагностика не входит в эти счётчики.",
                     status.revision, if status.admitting { "разрешён" } else { "закрыт" }, status.active, status.accepted, status.errors, status.uploaded, status.downloaded));
             } else {
                 text.push_str("\n\nСобственная сессия отсутствует; состояние внешнего процесса не подтверждено.");
