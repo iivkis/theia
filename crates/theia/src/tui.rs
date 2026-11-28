@@ -11066,6 +11066,9 @@ mod tests {
         std::fs::write(&path, original).unwrap();
         let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
         let mut model = Model::new(Some(Role::Client));
+        assert_eq!(ui.editor.as_ref().unwrap().field_count(), 1);
+        ui.workspace_advanced = true;
+        ui.editor.as_mut().unwrap().set_compact_server_fields(false);
         ui.editor.as_mut().unwrap().workspace_select_field(2);
         ui.update(&mut model, press(KeyCode::Enter));
         let before = ui.editor.as_ref().unwrap().field_value();
@@ -11133,6 +11136,8 @@ mod tests {
         let original = include_str!("../../../examples/client.toml");
         std::fs::write(&path, original).unwrap();
         ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
+        ui.workspace_advanced = true;
+        ui.editor.as_mut().unwrap().set_compact_server_fields(false);
         let details = workspace_columns(body).unwrap()[2];
         let details = page_layout(details, Role::Client, 1, ui.editor.as_ref())
             .map(|p| p[0])
@@ -11449,7 +11454,9 @@ mod tests {
         let mut editor = Editor::load(Role::Client, &path).unwrap();
         editor.select_record(true);
         editor.select_field(true);
-        let interaction = Interaction::new(Some(editor));
+        let mut interaction = Interaction::new(Some(editor));
+        interaction.workspace_advanced = true;
+        interaction.editor.as_mut().unwrap().set_compact_server_fields(false);
         let model = Model::new(Some(Role::Client));
         for (width, height) in [(60, 18), (80, 24), (120, 40)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
