@@ -179,3 +179,179 @@ fn profile_consent_is_local_and_ingress_selection_is_not_activation() {
         assert!(config::parse(&unsupported).is_err());
     }
 }
+
+
+// The binary's management dispatcher must never confuse missing IPC, rejected
+// CAS or an unrecognized receipt with a successful operation.
+fn isolated_management_command(args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_theia"));
+    command.args(args);
+    for name in [
+        "THEIA_CONTROL_DIR", "THEIA_CONTROL_PIPE",
+        "THEIA_CLIENT_CONTROL_DIR", "THEIA_CLIENT_CONTROL_PIPE",
+    ] {
+        command.env_remove(name);
+    }
+    command
+}
+
+#[test]
+fn management_commands_without_owner_never_report_success() {
+    let digest = "12".repeat(32);
+    let nonce = "34".repeat(32);
+    for args in [
+        vec!["server", "status"],
+        vec!["server", "reload", "--check"],
+        vec!["server", "restart", "--check"],
+        vec!["server", "quota", "--check"],
+        vec!["server", "auth", "rollback", "--check"],
+        vec!["server", "tls", "rollback", "--check"],
+        vec!["server", "restart", "rollback", "--check"],
+        vec!["server", "reload", "--expected-revision", "7"],
+        vec!["server", "reload", "--apply", "--expected-revision", "7", "--sha256", &digest, "--confirm"],
+        vec!["server", "quota", "--apply", "--expected-revision", "7", "--sha256", &digest, "--confirm"],
+        vec!["server", "restart", "--apply", "--expected-revision", "7", "--sha256", &digest, "--tls-sha256", &nonce, "--confirm"],
+        vec!["server", "auth", "rollback", "--apply", "--expected-revision", "7", "--confirm"],
+        vec!["server", "tls", "rollback", "--apply", "--expected-revision", "7", "--confirm"],
+        vec!["server", "restart", "rollback", "--apply", "--expected-revision", "7", "--confirm"],
+        vec!["client", "status"],
+        vec!["client", "lifecycle"],
+        vec!["client", "reload", "--check", "--expected-revision", "7", "--sha256", &digest],
+        vec!["client", "reload", "--apply", "--expected-revision", "7", "--sha256", &digest, "--confirm"],
+        vec!["client", "disconnect", "--expected-revision", "7", "--sha256", &digest, "--instance", &nonce, "--confirm"],
+    ] {
+        let out = isolated_management_command(&args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("management status unavailable"), "{args:?}: {stderr}");
+        assert!(!stderr.contains(&digest));
+        assert!(!stderr.contains(&nonce));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn native_cli_management_receipts_are_bound_and_never_overstate_lifecycle() {
+    use std::{
+        io::{BufRead, BufReader, Write},
+        os::unix::{fs::DirBuilderExt, net::UnixListener},
+        time::{Duration, Instant},
+    };
+    let dir = std::env::temp_dir().join(format!("theia-cli-receipts-{}", std::process::id()));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+    let _cleanup = Cleanup(dir.clone());
+    let path = dir.join("theia-server.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let digest = "12".repeat(32);
+    let nonce = "34".repeat(32);
+    let run = |args: &[&str], wire: &str, reply: &str, expected: Option<&str>| {
+        let mut child = isolated_management_command(args)
+            .env("THEIA_CONTROL_DIR", &dir)
+            .env("THEIA_CLIENT_CONTROL_DIR", &dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                    && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+                Err(error) => {
+                    let _ = child.kill();
+                    let out = child.wait_with_output().unwrap();
+                    panic!("no CLI request for {args:?}: {error}: {}", String::from_utf8_lossy(&out.stderr));
+                }
+            }
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut request = String::new();
+        BufReader::new(&stream).read_line(&mut request).unwrap();
+        assert_eq!(request, wire, "{args:?}");
+        stream.write_all(reply.as_bytes()).unwrap();
+        drop(stream);
+        let out = child.wait_with_output().unwrap();
+        if let Some(expected) = expected {
+            assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(stdout.contains(expected), "{args:?}: {stdout}");
+        } else {
+            assert_eq!(out.status.code(), Some(2), "{args:?}");
+            assert!(out.stdout.is_empty(), "{args:?}");
+            assert!(String::from_utf8_lossy(&out.stderr).contains("management status unavailable"));
+        }
+    };
+    for (reply, expected) in [
+        ("theia-status-v1 running inbounds=2\n", "reload not available"),
+        ("theia-status-v2 running inbounds=2 revision=7\n", "authorization revision=7"),
+    ] {
+        run(&["server", "status"], "status\n", reply, Some(expected));
+    }
+    run(&["server", "status"], "status\n", "theia-status-v2 running inbounds=2 revision=0\n", None);
+    run(&["server", "reload", "--check"], "check-reload\n", "theia-check-v1 compatible\n", Some("runtime UNCHANGED"));
+    run(&["server", "reload", "--check"], "check-reload\n", "theia-check-v1 rejected\n", None);
+    run(&["server", "quota", "--check"], "check-quota\n", "theia-quota-v1 ready\n", Some("nothing applied"));
+    for (reply, expected) in [
+        ("auth-only", "runtime UNCHANGED"),
+        ("same-port-tls", "same-port TLS rotation ready"),
+        ("maintenance", "controlled maintenance"),
+        ("ports-bindable", "NOT reserved or applied"),
+    ] {
+        run(&["server", "restart", "--check"], "check-restart\n",
+            &format!("theia-restart-v1 {reply}\n"), Some(expected));
+    }
+    for (kind, expected) in [
+        ("auth", "authorization rollback ready"),
+        ("tls", "same-port TLS identity rollback ready"),
+        ("restart", "structural rollback ready"),
+    ] {
+        let check = ["server", kind, "rollback", "--check"];
+        let wire = format!("{kind}-rollback-check\n");
+        run(&check, &wire, &format!("theia-{kind}-rollback-v1 ready revision=7 seconds=300\n"), Some(expected));
+        run(&check, &wire, &format!("theia-{kind}-rollback-v1 ready revision=7 seconds=301\n"), None);
+        let apply = ["server", kind, "rollback", "--apply", "--expected-revision", "7", "--confirm"];
+        let wire = format!("{kind}-rollback-apply rev=7\n");
+        run(&apply, &wire, &format!("theia-{kind}-rollback-v1 applied revision=8\n"), Some("revision=8"));
+        run(&apply, &wire, &format!("theia-{kind}-rollback-v1 applied revision=7\n"), None);
+    }
+    let reload = ["server", "reload", "--apply", "--expected-revision", "7", "--sha256", &digest, "--confirm"];
+    let wire = format!("apply-reload rev=7 sha256={digest}\n");
+    run(&reload, &wire, "theia-apply-v1 applied revision=8\n", Some("existing tunnels retained"));
+    run(&reload, &wire, "theia-apply-v1 applied revision=9\n", None);
+    run(&["server", "reload", "--expected-revision", "7"], "apply-reload rev=7\n", "theia-apply-v1 applied revision=8\n", Some("revision=8"));
+    let quota = ["server", "quota", "--apply", "--expected-revision", "7", "--sha256", &digest, "--confirm"];
+    let wire = format!("quota-apply rev=7 sha256={digest}\n");
+    run(&quota, &wire, "theia-quota-v1 applied revision=8\n", Some("cap contraction blocks new admission"));
+    run(&quota, &wire, "theia-quota-v1 rejected\n", None);
+    let restart = ["server", "restart", "--apply", "--expected-revision", "7", "--sha256", &digest, "--tls-sha256", &nonce, "--confirm"];
+    let wire = format!("restart-apply rev=7 sha256={digest} tls-sha256={nonce}\n");
+    run(&restart, &wire, "theia-restart-v1 applied revision=8\n", Some("no automatic rollback"));
+    run(&restart, &wire, "theia-restart-v1 applied revision=9\n", None);
+    let counters = ["0"; 38].join(",");
+    for (capture, expected) in [(0, "inactive"), (1, "preparing"), (2, "isolated_lab"), (3, "recovery_required")] {
+        run(&["client", "status"], "client-status\n", &format!("theia-client-v1 r=7 sha256={digest} d=0 t=2 x=1 f=0 rr=1 rs=1 rt={counters} fs=unknown cap={capture}\n"), Some(&format!("packet_interception={expected}")));
+    }
+    for (phase, listeners, applied, expected) in [
+        (0, 0, 0, "inactive"), (1, 0, 0, "preparing"), (2, 1, 1, "connected"),
+        (3, 0, 1, "stopping"), (4, 0, 2, "recovery_required"),
+    ] {
+        run(&["client", "lifecycle"], "client-lifecycle\n", &format!("theia-client-v1 lifecycle r=7 sha256={digest} instance={nonce} phase={phase} listeners={listeners} applied={applied}\n"), Some(&format!("lifecycle={expected}")));
+    }
+    run(&["client", "lifecycle"], "client-lifecycle\n", &format!("theia-client-v1 lifecycle r=7 sha256={digest} instance={nonce} phase=2 listeners=0 applied=1\n"), None);
+    let preview = ["client", "reload", "--check", "--expected-revision", "7", "--sha256", &digest];
+    run(&preview, &format!("client-preview rev=7 sha256={digest}\n"), "theia-client-v1 ready r=7\n", Some("nothing applied"));
+    let apply = ["client", "reload", "--apply", "--expected-revision", "7", "--sha256", &digest, "--confirm"];
+    let wire = format!("client-apply rev=7 sha256={digest}\n");
+    run(&apply, &wire, "theia-client-v1 applied r=8\n", Some("previous routing generation retired"));
+    run(&apply, &wire, "theia-client-v1 applied r=7\n", None);
+    let disconnect = ["client", "disconnect", "--expected-revision", "7", "--sha256", &digest, "--instance", &nonce, "--confirm"];
+    let wire = format!("client-disconnect rev=7 sha256={digest} instance={nonce}\n");
+    run(&disconnect, &wire, &format!("theia-client-v1 disconnect-accepted r=7 instance={nonce}\n"), Some("restoration not yet confirmed"));
+    run(&disconnect, &wire, &format!("theia-client-v1 disconnect-accepted r=7 instance={digest}\n"), None);
+}
