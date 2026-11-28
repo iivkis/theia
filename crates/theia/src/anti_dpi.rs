@@ -1,9 +1,10 @@
 //! F-20 standalone configuration, local routing and independent diagnostics.
 //! Configuration/preflight are offline. Live diagnostics require a reviewed
 //! exact plan, explicit confirmation and a reserved local proxy owner.
+pub mod authority;
 pub mod catalog;
 pub mod diagnostic;
-mod dns;
+pub(crate) mod dns;
 pub use dns::DnsError;
 
 use crate::{
@@ -91,7 +92,7 @@ fn canonical_host(value: &str) -> bool {
         .any(|suffix| value.ends_with(suffix))
 }
 
-fn canonical_ip(ip: IpAddr) -> IpAddr {
+pub(crate) fn canonical_ip(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
         _ => ip,

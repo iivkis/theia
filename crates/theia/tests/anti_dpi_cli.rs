@@ -63,3 +63,33 @@ fn diagnostic_preview_is_offline_and_confirmation_is_exact() {
     assert_eq!(invalid.status.code(), Some(2));
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn standalone_apply_is_explicit_and_connect_preview_is_offline() {
+    let dir = std::env::temp_dir().join(format!("theia-f20-apply-cli-{}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("anti-dpi.toml");
+    std::fs::write(&path, include_str!("../../../examples/anti-dpi.toml")).unwrap();
+    let run = |operation: &str, digest: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_theia"));
+        command.args(["anti-dpi", operation, "--config"]).arg(&path);
+        if let Some(digest) = digest { command.args(["--confirm", digest]); }
+        command.output().unwrap()
+    };
+    let preview = run("enroll", None);
+    assert!(preview.status.success());
+    let text = String::from_utf8(preview.stdout).unwrap();
+    let digest = text.split("Confirm policy SHA256=").last().unwrap().trim();
+    assert_eq!(digest.len(), 64);
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    assert!(!run("apply", Some(digest)).status.success());
+    assert!(!run("enroll", Some(&"00".repeat(32))).status.success());
+    assert!(run("enroll", Some(digest)).status.success());
+    assert!(run("apply", Some(digest)).status.success());
+    let connect = run("connect", None);
+    assert!(connect.status.success());
+    let text = String::from_utf8(connect.stdout).unwrap();
+    assert!(text.contains("Pass/Drop only"));
+    assert!(text.contains("Modify is denied"));
+    std::fs::remove_dir_all(dir).unwrap();
+}

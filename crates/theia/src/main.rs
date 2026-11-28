@@ -50,6 +50,38 @@ async fn run() {
         .map(|arg| arg.into_string().map_err(|_| CliError::NonUtf8Argument))
         .collect();
     let result: Result<String, CliError> = match args.and_then(|args| parse(&args)) {
+        Ok(Command::AntiDpiApply { config, confirm, enroll }) => {
+            use theia::anti_dpi::authority::Candidate;
+            Candidate::read(Path::new(&config)).and_then(|candidate| match confirm {
+                None => Ok(candidate.preview()),
+                Some(digest) => {
+                    if enroll { candidate.enroll(digest)?; } else { candidate.apply(digest)?; }
+                    Ok("standalone policy floor published; no network or OS proxy changes".to_owned())
+                }
+            }).map_err(CliError::Config)
+        }
+        Ok(Command::AntiDpiConnect { config, confirm }) => {
+            use theia::anti_dpi::authority::Candidate;
+            match Candidate::read(Path::new(&config)) {
+                Err(error) => Err(CliError::Config(error)),
+                Ok(candidate) => match confirm {
+                    None => Ok(candidate.connect_preview()),
+                    Some(digest) => {
+                        #[cfg(windows)]
+                        {
+                            local_proxy::run_standalone(candidate, digest).await
+                                .map(|_| "standalone stopped; conditional proxy restore completed".to_owned())
+                                .map_err(CliError::Client)
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            let _ = (candidate, digest);
+                            Err(CliError::NotImplemented("standalone Windows System Proxy"))
+                        }
+                    }
+                }
+            }
+        }
         Ok(Command::AntiDpiCatalog { overlay }) => {
             use theia::anti_dpi::catalog::{Catalog, Overlay};
             let overlay = match overlay {

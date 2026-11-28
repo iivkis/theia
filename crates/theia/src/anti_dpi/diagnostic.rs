@@ -294,7 +294,7 @@ impl Plan {
         }
         let _ = writeln!(result,
             "At most {} DNS/HTTPS attempts; 4 concurrent, 6 s per cell, 600 s per job.\nLocal public IP and selected names are disclosed to the resolver/targets. No VPS, no redirect following or OS proxy changes.\nConfirm exact plan with SHA256={}",
-            self.hosts.len() * (2 + runnable), hex(self.digest),
+            self.hosts.len() * (dns::MAX_DNS_REQUESTS + runnable), hex(self.digest),
         );
         result
     }
@@ -310,6 +310,11 @@ impl Plan {
         // This is the existing per-user System Proxy owner reservation.
         // No apply() call: diagnostics must not change any OS settings.
         let _owner = reserve()?;
+        let candidate = super::authority::Candidate::read(&self.saved.path)?;
+        if candidate.digest() != self.policy.digest() || !self.files_current() {
+            return Err(invalid("diagnostic", "applied policy changed; review again"));
+        }
+        let active = candidate.activate()?;
         let epoch = network_scope::generation()
             .ok_or_else(|| invalid("diagnostic", "network generation unavailable"))?;
         let roots = crate::net::tls::native_roots();
@@ -318,6 +323,7 @@ impl Plan {
         }
         let state = State {
             plan: &self,
+            active: &active,
             epoch,
             cancel,
             stale: AtomicBool::new(false),
@@ -361,6 +367,7 @@ fn reserve() -> Result<(), ConfigError> {
 
 struct State<'a> {
     plan: &'a Plan,
+    active: &'a super::authority::Active,
     epoch: u64,
     cancel: &'a AtomicBool,
     stale: AtomicBool,
@@ -372,7 +379,7 @@ impl State<'_> {
         if self.stale.load(Ordering::Acquire) {
             return false;
         }
-        if network_scope::generation() != Some(self.epoch) || !self.plan.files_current() {
+        if network_scope::generation() != Some(self.epoch) || !self.plan.files_current() || !self.active.live() {
             self.stale.store(true, Ordering::Release);
             return false;
         }
@@ -479,8 +486,8 @@ async fn row(state: &State<'_>, host: &str, roots: &rustls::RootCertStore) -> Ve
     let live = || state.live();
     let dns_deadline = (started + CELL_BUDGET).min(state.deadline);
     let result = dns::resolve(
-        state.plan.document.anti_dpi.resolver.as_ref(),
-        &state.plan.policy,
+        state.active.document().anti_dpi.resolver.as_ref(),
+        state.active.policy(),
         host,
         roots,
         &live,

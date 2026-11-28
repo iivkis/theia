@@ -18,6 +18,8 @@ use tokio::time::Instant;
 const MAX_MESSAGE: usize = 65535;
 const MAX_RECORDS: usize = 128;
 const MAX_CNAME: usize = 8;
+/// Two families, each with at most eight alias follow-ups.
+pub(crate) const MAX_DNS_REQUESTS: usize = 2 * (MAX_CNAME + 1);
 const MAX_ADDRESSES: usize = 64;
 const MAX_TTL: u32 = 60;
 
@@ -311,7 +313,7 @@ fn combine(
         return Err(DnsError::PolicyDenied);
     }
     for alias in a.aliases.iter().chain(&aaaa.aliases) {
-        if !matches!(policy.classify_resolved(alias, &addresses), Decision::Pass | Decision::Modify) {
+        if policy.classify_resolved(alias, &addresses) != decision {
             return Err(DnsError::PolicyDenied);
         }
     }
@@ -446,6 +448,78 @@ fn aged(mut answer: Answer, age: u32) -> Result<Answer, DnsError> {
     Ok(answer)
 }
 
+/// Continue an authenticated CNAME-only response on the same resolver and
+/// original deadline. All traversed aliases are checked before another query
+/// and again against the eventual exact egress pins.
+struct Chain {
+    target: String,
+    aliases: Vec<String>,
+    seen: BTreeSet<String>,
+    ttl: u32,
+}
+
+impl Chain {
+    fn new(target: &str) -> Self {
+        Self {
+            target: target.to_owned(),
+            aliases: Vec::new(),
+            seen: BTreeSet::from([target.to_owned()]),
+            ttl: MAX_TTL,
+        }
+    }
+
+    fn extend(&mut self, answer: Answer, policy: &PreparedPolicy)
+        -> Result<Option<Answer>, DnsError>
+    {
+        self.ttl = self.ttl.min(answer.ttl);
+        let had_alias = !answer.aliases.is_empty();
+        for alias in answer.aliases {
+            if self.aliases.len() >= MAX_CNAME || !self.seen.insert(alias.clone()) {
+                return Err(DnsError::Malformed);
+            }
+            if policy.classify_domain(&alias) == Decision::Drop {
+                return Err(DnsError::PolicyDenied);
+            }
+            self.target = alias.clone();
+            self.aliases.push(alias);
+        }
+        if answer.addresses.is_empty() && had_alias {
+            return Ok(None);
+        }
+        Ok(Some(Answer {
+            addresses: answer.addresses,
+            aliases: self.aliases.clone(),
+            ttl: self.ttl,
+        }))
+    }
+}
+
+async fn lookup_family(
+    resolver: &Resolver,
+    peer: SocketAddr,
+    policy: &PreparedPolicy,
+    target: &str,
+    kind: Kind,
+    config: Arc<rustls::ClientConfig>,
+    live: &(dyn Fn() -> bool + Sync),
+) -> Result<(Answer, Instant), DnsError> {
+    let started = Instant::now();
+    let mut chain = Chain::new(target);
+    for _ in 0..=MAX_CNAME {
+        if !live() {
+            return Err(DnsError::Cancelled);
+        }
+        let (raw, age) = exchange(resolver, peer, query(&chain.target, kind)?, config.clone(), live).await?;
+        let answer = aged(parse(&raw, &chain.target, kind)?, age)?;
+        if let Some(result) = chain.extend(answer, policy)? {
+            // Use earliest query start and minimum TTL, conservatively
+            // bounding every intermediate record rather than extending it.
+            return Ok((result, started));
+        }
+    }
+    Err(DnsError::Limit)
+}
+
 /// Both address families must complete under the same deadline. A failed
 /// AAAA lookup cannot silently become an A-only policy decision.
 pub(crate) async fn resolve(
@@ -474,16 +548,12 @@ pub(crate) async fn resolve(
     tls::configure_client(&mut config, b"h2");
     let config = Arc::new(config);
     let result = tokio::time::timeout_at(deadline, async {
-        let a_at = Instant::now();
-        let (a, age) = exchange(resolver, peer, query(target, Kind::A)?, config.clone(), live).await?;
-        let a = aged(parse(&a, target, Kind::A)?, age)?;
-        let aaaa_at = Instant::now();
-        let (aaaa, age) = exchange(resolver, peer, query(target, Kind::Aaaa)?, config, live).await?;
-        let aaaa = aged(parse(&aaaa, target, Kind::Aaaa)?, age)?;
+        let a = lookup_family(resolver, peer, policy, target, Kind::A, config.clone(), live).await?;
+        let aaaa = lookup_family(resolver, peer, policy, target, Kind::Aaaa, config, live).await?;
         if !live() {
             return Err(DnsError::Cancelled);
         }
-        combine(policy, target, (a, a_at), (aaaa, aaaa_at), deadline)
+        combine(policy, target, a, aaaa, deadline)
     }).await.map_err(|_| DnsError::Timeout)?;
     result
 }
@@ -551,6 +621,31 @@ mod tests {
         bytes[3] &= !15;
         bytes[3] |= 2;
         assert_eq!(parse(&bytes, "example.com", Kind::A), Err(DnsError::ResolverFailure));
+    }
+
+    #[test]
+    fn cross_response_alias_chain_is_bounded_and_cycle_safe() {
+        let doc = super::super::Document::parse(include_str!("../../../../examples/anti-dpi.toml")).unwrap();
+        let policy = doc.prepare().unwrap();
+        let mut chain = Chain::new("example.com");
+        let alias = |host: String| Answer { addresses: Vec::new(), aliases: vec![host], ttl: 30 };
+        assert!(chain.extend(alias("alias.example.com".into()), &policy).unwrap().is_none());
+        assert_eq!(chain.target, "alias.example.com");
+        assert_eq!(chain.extend(alias("example.com".into()), &policy), Err(DnsError::Malformed));
+
+        let mut chain = Chain::new("example.com");
+        for i in 0..8 {
+            assert!(chain.extend(alias(format!("a{i}.example.com")), &policy).unwrap().is_none());
+        }
+        assert_eq!(chain.extend(alias("overflow.example.com".into()), &policy), Err(DnsError::Malformed));
+
+        let mut chain = Chain::new("example.com");
+        chain.extend(alias("alias.example.com".into()), &policy).unwrap();
+        let answer = chain.extend(Answer {
+            addresses: vec!["1.1.1.1".parse().unwrap()], aliases: vec![], ttl: 60,
+        }, &policy).unwrap().unwrap();
+        assert_eq!(answer.ttl, 30);
+        assert_eq!(answer.aliases, vec!["alias.example.com"]);
     }
 
     #[test]
