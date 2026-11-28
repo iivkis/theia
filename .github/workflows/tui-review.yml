@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # Exact source snapshot for this review, not a moving branch.
-          ref: 4ea83632c8560dd19e9a8a580a80b2e20c892159
+          ref: 111989de199d9d57dec80f3a497f43fc4b18a5c6
           path: source
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -207,7 +207,7 @@ jobs:
           from pathlib import Path
           src = Path(os.environ["RUNNER_TEMP"]) / "tui-gallery"
           manifest = json.loads((src / "manifest.json").read_text())
-          assert manifest["source_sha"] == "4ea83632c8560dd19e9a8a580a80b2e20c892159"
+          assert manifest["source_sha"] == "111989de199d9d57dec80f3a497f43fc4b18a5c6"
           assert (manifest["platform"], manifest["columns"], manifest["rows"]) == ("linux",120,40)
           expected = {"manifest.json", "README.md"}
           for entry in manifest["screens"]:
@@ -235,6 +235,7 @@ jobs:
           required_navigation.update(["anti-dpi-first-run.png","anti-dpi-overview.png","anti-dpi-routing.png","anti-dpi-routing-editor.png","anti-dpi-geodata.png","anti-dpi-catalog.png","anti-dpi-diagnostic-consent.png","state-anti-dpi-diagnostic-report.png"])
           required_navigation.update(["anti-dpi-first-run-preview.png","anti-dpi-connection.png","anti-dpi-statistics.png","anti-dpi-settings.png","anti-dpi-settings-editor.png","state-anti-dpi-diagnostic-progress.png","state-anti-dpi-diagnostic-cancelled.png","state-anti-dpi-diagnostic-cell.png","state-anti-dpi-diagnostic-quic.png","state-anti-dpi-export-confirm.png"])
           required_navigation.update(["anti-dpi-setup-domains.png","anti-dpi-setup-catalog.png","anti-dpi-setup-dns.png","anti-dpi-setup-custom-dns.png","anti-dpi-setup-direct.png","anti-dpi-setup-modify.png","anti-dpi-setup-manual.png"])
+          required_navigation.update(["anti-dpi-settings-guided.png","anti-dpi-settings-dns.png","anti-dpi-settings-permissions.png"])
           assert required_navigation <= expected, f"missing navigation screenshots: {required_navigation - expected}"
           assert not obsolete_navigation & expected, "obsolete duplicate navigation screenshots"
           assert len(expected) >= 52
