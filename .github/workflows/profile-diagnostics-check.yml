@@ -14,18 +14,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: a0a6d286f4c8797b9e14c1df45d108eef83ebdbe
+          ref: e9b2410f36174eae277a6b6848a302c04ed08e71
           persist-credentials: false
       - name: Verify tested source
         shell: bash
-        run: test "$(git rev-parse HEAD)" = "a0a6d286f4c8797b9e14c1df45d108eef83ebdbe"
+        run: test "$(git rev-parse HEAD)" = "e9b2410f36174eae277a6b6848a302c04ed08e71"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: true
+          save-if: false
       - name: Authenticated diagnostic consent and UDP relay regression
         run: |
           cargo test -p theia --lib --locked real_local_proxy_modes_validate_credentials_and_relay_over_both_transports -- --nocapture
           cargo test -p theia --lib --locked profile_diagnostics
           cargo test -p theia --lib --locked diagnostic_domain_editor_is_bounded_and_stages_only_on_explicit_save
           cargo test -p theia --lib --locked access_observation_is_bound_to_saved_inbound_user_and_fresh_reply
+          cargo test -p theia --lib --locked tui_server_owns_startup_and_releases_listeners_on_confirmed_stop -- --nocapture
