@@ -12694,6 +12694,147 @@ mod tests {
     }
 
     #[test]
+    fn worker_receipts_are_distinct_from_runtime_activation_and_disconnect() {
+        let root = std::env::temp_dir().join(crate::tui_editor::generated_id("worker-receipts").unwrap());
+        std::fs::create_dir(&root).unwrap();
+        let server = root.join("server.toml");
+        let client = root.join("client.toml");
+        let server_source = server_issuance_fixture();
+        let client_source = include_str!("../../../examples/client.toml");
+        std::fs::write(&server, &server_source).unwrap();
+        std::fs::write(&client, client_source).unwrap();
+        // Inject only the worker's completion receipt, not a forged runtime
+        // reply. These transitions must not start a client or apply grants.
+        for saved in [false, true] {
+            for scenario in 0..5 {
+                let (role, path) = if scenario < 2 { (Role::Server, &server) } else { (Role::Client, &client) };
+                let mut model = Model::new(Some(role));
+                let editor = Editor::load(role, path).unwrap();
+                let mut ui = Interaction::new(None);
+                match scenario {
+                    0 => ui.issuance = Some(IssueFlow::Saving),
+                    1 => ui.revocation = Some(DisableFlow::Saving),
+                    2 => ui.importing = Some(ImportFlow::RefreshSaving),
+                    3 => ui.importing = Some(ImportFlow::Saving),
+                    _ => ui.importing = Some(ImportFlow::Activating),
+                }
+                let (tx, rx) = mpsc::channel();
+                ui.saving = Some(rx);
+                assert!(!ui.poll_save(&mut model).unwrap());
+                assert!(ui.editor.is_none());
+                tx.send((editor, saved)).unwrap_or_else(|_| panic!("worker receiver"));
+                assert!(!ui.poll_save(&mut model).unwrap());
+                assert!(ui.editor.is_some() && ui.saving.is_none());
+                match (scenario, saved) {
+                    (0, true) => assert!(matches!(ui.issuance, Some(IssueFlow::Offer))),
+                    (0, false) => assert!(matches!(ui.issuance, Some(IssueFlow::SaveFailed))),
+                    (1, true) => assert!(matches!(ui.revocation, Some(DisableFlow::Done))),
+                    (1, false) => assert!(matches!(ui.revocation, Some(DisableFlow::SaveFailed))),
+                    (2, true) => assert!(matches!(ui.importing, Some(ImportFlow::RefreshDone))),
+                    (3, true) => assert!(matches!(ui.importing, Some(ImportFlow::Done))),
+                    (2 | 3, false) => assert!(matches!(ui.importing, Some(ImportFlow::Failed))),
+                    (4, true) => {
+                        assert!(ui.importing.is_none());
+                        assert_eq!(ui.workspace_page, 3);
+                        assert_eq!(ui.workspace_focus, WorkspaceFocus::Actions);
+                    }
+                    (4, false) => assert!(matches!(ui.importing, Some(ImportFlow::ActivationFailed))),
+                    _ => unreachable!(),
+                }
+                assert!(!ui.owned_running(role));
+                assert_eq!(std::fs::read_to_string(&server).unwrap(), server_source);
+                assert_eq!(std::fs::read_to_string(&client).unwrap(), client_source);
+            }
+        }
+        let mut model = Model::new(Some(Role::Server));
+        for (result, expected) in [
+            (Some(Ok((root.join("qr.svg"), true))), "QR SVG сохранён"),
+            (Some(Ok((root.join("key.invite"), false))), "Ничего не обрезано"),
+            (Some(Err("fixture write failure")), "повторная выдача требует ротации"),
+            (None, "Результат записи не подтверждён"),
+        ] {
+            let mut ui = Interaction::new(Some(Editor::load(Role::Server, &server).unwrap()));
+            let (tx, rx) = mpsc::channel();
+            ui.sharing = Some(rx);
+            ui.issuance = Some(IssueFlow::Sharing);
+            assert!(!ui.poll_save(&mut model).unwrap());
+            if let Some(result) = result { tx.send(result).unwrap(); }
+            drop(tx);
+            assert!(!ui.poll_save(&mut model).unwrap());
+            assert!(matches!(&ui.issuance, Some(IssueFlow::ShareDone(message)) if message.contains(expected)));
+            assert!(ui.sharing.is_none());
+            assert!(!ui.owned_running(Role::Server));
+        }
+        for succeeded in [false, true] {
+            let mut ui = Interaction::new(None);
+            let (tx, rx) = mpsc::channel();
+            ui.exporting = Some(rx);
+            ui.issuance = Some(IssueFlow::Exporting);
+            assert!(!ui.poll_save(&mut model).unwrap());
+            let editor = Editor::load(Role::Server, &server).unwrap();
+            let result = if succeeded { Ok(root.join("key.invite")) } else { Err("fixture export failure") };
+            tx.send((editor, result)).unwrap_or_else(|_| panic!("worker receiver"));
+            assert!(!ui.poll_save(&mut model).unwrap());
+            assert!(ui.editor.is_some() && ui.exporting.is_none());
+            if succeeded {
+                assert!(matches!(&ui.issuance, Some(IssueFlow::Exported(path)) if path == &root.join("key.invite")));
+            } else {
+                assert!(matches!(ui.issuance, Some(IssueFlow::ExportFailed)));
+                assert_eq!(ui.editor.as_ref().unwrap().error.as_deref(), Some("fixture export failure"));
+            }
+        }
+        let mut ui = Interaction::new(None);
+        let (tx, rx) = mpsc::channel();
+        ui.exporting = Some(rx);
+        drop(tx);
+        assert!(matches!(ui.poll_save(&mut model), Err(TuiError::Io)));
+        ui.exporting = None;
+        let (tx, rx) = mpsc::channel();
+        ui.saving = Some(rx);
+        drop(tx);
+        assert!(matches!(ui.poll_save(&mut model), Err(TuiError::Io)));
+        assert_eq!(std::fs::read_to_string(&server).unwrap(), server_source);
+        assert_eq!(std::fs::read_to_string(&client).unwrap(), client_source);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn workspace_import_paste_is_bounded_hidden_and_contextual() {
+        let root = std::env::temp_dir().join(crate::tui_editor::generated_id("import-paste").unwrap());
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("client.toml");
+        let original = include_str!("../../../examples/client.toml");
+        std::fs::write(&path, original).unwrap();
+        let mut model = Model::new(Some(Role::Client));
+        let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
+        ui.select_workspace_page(Role::Client, 1);
+        ui.paste_workspace_import(&model, "not-a-key");
+        assert!(ui.importing.is_none());
+        ui.select_workspace_page(Role::Client, 2);
+        ui.workspace_focus = WorkspaceFocus::Actions;
+        ui.paste_workspace_import(&model, "sensitive-fixture\r\n");
+        assert!(matches!(&ui.importing, Some(ImportFlow::Input(source)) if source.as_str() == "sensitive-fixture"));
+        assert!(!rendered_interaction(120, 40, &model, &ui).contains("sensitive-fixture"));
+        ui.paste_import_source("\tinvalid");
+        assert!(matches!(&ui.importing, Some(ImportFlow::Input(source)) if source.is_empty()));
+        assert!(ui.editor.as_ref().unwrap().error.is_some());
+        ui.paste_import_source(&"x".repeat(crate::invite::MAX_URI + 1));
+        assert!(matches!(&ui.importing, Some(ImportFlow::Input(source)) if source.is_empty()));
+        ui.paste_import_source("another-fixture");
+        assert!(ui.editor.as_ref().unwrap().error.is_none());
+        ui.update(&mut model, press(KeyCode::F(6)));
+        assert!(ui.import_browser.is_some());
+        ui.paste_import_source("not-pasted-through-browser");
+        assert!(matches!(&ui.importing, Some(ImportFlow::Input(source)) if source.as_str() == "another-fixture"));
+        ui.update(&mut model, press(KeyCode::Esc));
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.importing.is_none());
+        assert!(!ui.owned_running(Role::Client));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn credential_and_revocation_panels_distinguish_saved_state_from_runtime() {
         fn render(mut render_panel: impl FnMut(&mut Frame<'_>, Rect)) -> String {
             let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
