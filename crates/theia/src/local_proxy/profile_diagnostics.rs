@@ -843,10 +843,8 @@ async fn application_head(
             line.push(b);
         }
         let code = status(&line)?;
-        if code >= 200 {
-            return Ok(code);
-        }
-        // Informational responses are not a completed application exchange.
+        // A status line alone is not a complete response. Require the bounded
+        // header terminator for final and informational responses alike.
         let mut tail = [0; 4];
         let mut complete = false;
         for _ in 0..8192 {
@@ -859,6 +857,9 @@ async fn application_head(
         }
         if !complete {
             return Err(ClientError::Protocol);
+        }
+        if code >= 200 {
+            return Ok(code);
         }
     }
     Err(ClientError::Protocol)
@@ -1626,6 +1627,38 @@ mod tests {
         assert_eq!(
             head_fixture(long, "diagnostic.example").await,
             Err(ClientError::Protocol)
+        );
+    }
+
+    #[tokio::test]
+    async fn head_rejects_truncated_and_overlong_final_headers() {
+        for incomplete in [
+            b"HTTP/1.1 200 OK\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nX-Test: incomplete\r\n".as_slice(),
+        ] {
+            assert_eq!(
+                head_fixture(incomplete.to_vec(), "diagnostic.example").await,
+                Err(ClientError::Io)
+            );
+        }
+        let mut oversized = b"HTTP/1.1 200 OK\r\nX-Test: ".to_vec();
+        oversized.extend(std::iter::repeat_n(b'a', 8192));
+        oversized.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(
+            head_fixture(oversized, "diagnostic.example").await,
+            Err(ClientError::Protocol)
+        );
+        let interim = b"HTTP/1.1 103 Early Hints\r\n\r\n".repeat(5);
+        assert_eq!(
+            head_fixture(interim, "diagnostic.example").await,
+            Err(ClientError::Protocol)
+        );
+        assert_eq!(
+            head_fixture(
+                b"HTTP/1.1 403 Forbidden\r\nX-Test: complete\r\n\r\n".to_vec(),
+                "diagnostic.example"
+            ).await,
+            Ok(403)
         );
     }
 
