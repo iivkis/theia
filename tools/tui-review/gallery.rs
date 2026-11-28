@@ -382,14 +382,47 @@ fn visual_review_gallery() {
             ] {
                 let panel = ui.routing_panel.as_mut().unwrap();
                 panel.fields.as_mut().unwrap().2 = field;
-                panel.geo_picker = Some(GeoPicker {
-                    field, query: query.into(), codes: codes.into_iter().map(str::to_owned).collect(),
-                    marked: Default::default(), focus: 0, loading: None, message: String::new(),
-                });
+                let mut picker = GeoPicker::new(field);
+                picker.query = query.into();
+                picker.codes = codes.into_iter().map(str::to_owned).collect();
+                panel.geo_picker = Some(picker);
                 panel.key(press(KeyCode::Char(' ')), None);
                 review_capture(name, &model, &ui);
                 ui.routing_panel.as_mut().unwrap().key(press(KeyCode::Esc), None);
             }
+            {
+                let panel = ui.routing_panel.as_mut().unwrap();
+                panel.fields.as_mut().unwrap().2 = 2;
+                let mut picker = GeoPicker::new(2);
+                picker.codes = vec!["google".into(), "youtube".into(), "category-ads-all".into()];
+                panel.geo_picker = Some(picker);
+                panel.paste("goo");
+                panel.key(press(KeyCode::Char(' ')), None);
+                panel.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), None);
+                panel.paste("you");
+                panel.key(press(KeyCode::Char(' ')), None);
+                panel.key(press(KeyCode::F(4)), None);
+            }
+            review_capture("server-routing-geodata-marked", &model, &ui);
+            ui.routing_panel.as_mut().unwrap().key(press(KeyCode::Enter), None);
+            review_capture("server-routing-geodata-added", &model, &ui);
+            {
+                let panel = ui.routing_panel.as_mut().unwrap();
+                let mut picker = GeoPicker::new(2);
+                picker.codes = vec!["google".into(), "youtube".into()];
+                picker.query = "not-found".into();
+                panel.geo_picker = Some(picker);
+            }
+            review_capture("server-routing-geodata-empty", &model, &ui);
+            {
+                let panel = ui.routing_panel.as_mut().unwrap();
+                panel.key(press(KeyCode::Esc), None);
+                panel.settings.datasets = None;
+                panel.fields.as_mut().unwrap().2 = 3;
+                panel.key(press(KeyCode::F(6)), None);
+            }
+            review_capture("server-routing-geodata-missing", &model, &ui);
+            ui.routing_panel.as_mut().unwrap().key(press(KeyCode::Esc), None);
         } else {
             let mut ui = Interaction::new(Some(Editor::load(role, path).unwrap()));
             ui.select_workspace_page(role, 6);

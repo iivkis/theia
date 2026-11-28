@@ -1,7 +1,7 @@
 # TUI visual review
 
 This branch is a Linux-only visual evidence gallery, not a product development branch.
-The generator checks out the explicitly pinned dev commit (a5e98893128e7bf246fd3a901bb3cbe125fcee19) and records real Ratatui draw buffers at one size: 120×40 columns/rows. PNGs use a fixed DejaVu Sans Mono font. No Windows job.
+The generator checks out the explicitly pinned dev commit (880714448065a9f32ea2553c16dcf581b504f676) and records real Ratatui draw buffers at one size: 120×40 columns/rows. PNGs use a fixed DejaVu Sans Mono font. No Windows job.
 
 - Open [screenshots/README.md](screenshots/README.md) after a successful workflow.
 - Read screenshots/manifest.json first: it identifies the exact source SHA, scenario names and file digests.
@@ -45,3 +45,5 @@ The diagnostic workspace includes synthetic offline states for source selection,
 Diagnostic states use distinct successful, policy-blocked, interrupted and failed fixtures. Publication rejects duplicate diagnostic PNGs. Compact action layout and mouse selection without execution are regression-tested; profile ports remain intact across wrapped rows.
 
 GeoSite/GeoIP picker screenshots use synthetic local category names, and the REALITY manual selection screenshots use synthetic H2 application-check durations. Navigation and role assignments never contact external sites; the real worker and persistence gates remain separate.
+
+GeoData visual states cover visible form actions, compact search, all marked categories across filters, added draft values, empty search and missing pinned datasets. Named actions and mouse focus are regression-tested; no real download is initiated.
