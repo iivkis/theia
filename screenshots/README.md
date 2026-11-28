@@ -1,6 +1,6 @@
 # Theia TUI visual review
 
-Source: 429e99a80e702dd7d7e29e4802197d35bf7a9fde
+Source: 897420d3845f7ab8f9dbfcbf72e0f3190da83a74
 
 Linux · 120×40 · actual production renderer cells. State fixtures and unavailable actions are not runtime success.
 
@@ -37,6 +37,18 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## anti-dpi-overview
 
 ![anti-dpi-overview](anti-dpi-overview.png)
+
+## anti-dpi-routing-delete-preview
+
+![anti-dpi-routing-delete-preview](anti-dpi-routing-delete-preview.png)
+
+## anti-dpi-routing-edit-list
+
+![anti-dpi-routing-edit-list](anti-dpi-routing-edit-list.png)
+
+## anti-dpi-routing-edit-sites
+
+![anti-dpi-routing-edit-sites](anti-dpi-routing-edit-sites.png)
 
 ## anti-dpi-routing-editor
 
