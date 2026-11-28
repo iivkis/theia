@@ -131,13 +131,20 @@ impl ProvisionPanel {
         panel.wizard.as_mut().unwrap().stage = WizardStage::SavingInitial(rx, input.health.parent().unwrap().to_owned());
         assert!(panel.poll().is_none());
         assert!(panel.body().contains("Запись не подтверждена"));
-        assert!(panel.confirmation_choice().is_none());
+        assert_eq!(panel.confirmation_choice(), Some(('o', "Открыть настройки заново")));
+        assert_eq!(panel.recovery_path(), Some(path.as_path()));
+        assert!(!panel.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)));
+        assert_eq!(panel.confirmation_choice(), Some(('o', "Открыть настройки заново")));
+        assert!(!path.exists() && !input.health.parent().unwrap().exists());
         screens.push(("state-reality-step6-save-uncertain", panel));
 
         let (mut panel, input) = setup();
         panel.wizard.as_mut().unwrap().stage = save_failed(input.health.parent().unwrap().to_owned(), None);
         panel.key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
-        assert!(panel.confirmation_choice().is_none());
+        assert_eq!(panel.confirmation_choice(), Some(('o', "Открыть настройки заново")));
+        assert_eq!(panel.recovery_path(), Some(path.as_path()));
+        assert!(panel.body().contains("Проверено только наличие, не целостность"));
+        assert!(!path.exists() && !input.health.parent().unwrap().exists());
         screens.push(("state-reality-step6-save-inspection", panel));
 
         let (mut panel, _) = setup();

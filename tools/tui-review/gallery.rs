@@ -48,6 +48,14 @@ fn visual_review_gallery() {
                 let screen = rendered_interaction(120, 40, &model, &ui);
                 assert!(screen.contains("Конфигурация к сохранению"));
             }
+            if matches!(name, "state-reality-step6-save-uncertain" | "state-reality-step6-save-inspection") {
+                let screen = rendered_interaction(120, 40, &model, &ui);
+                assert!(screen.contains("Открыть настройки заново"));
+                assert!(!screen.contains("Повторить настройку"));
+                ui.update(&mut model, press(KeyCode::Char('o')));
+                assert!(ui.reality_provision.is_none() && ui.config_dialog.is_some());
+                assert!(!path.exists());
+            }
             if name == "state-reality-step5-long-report" {
                 assert!(ui.viewport.max.get() > 0);
                 let last = ui.reality_provision.as_ref().unwrap().reference_review().unwrap().rows.last().unwrap().name.clone();
