@@ -4295,12 +4295,18 @@ mod hardening_tests {
         assert!(query(StatusCommand::ApplyReloadBound { expected_revision: 2, candidate_sha256: [0; 32] }).await.is_err());
         assert_eq!(query(StatusCommand::ApplyReloadBound { expected_revision: 2, candidate_sha256: digest }).await.unwrap(), StatusReply::Applied { revision: 3 });
         assert_eq!(query(access("alice", digest)).await.unwrap(), StatusReply::AccessObserved { revision: 3, state: 2 });
-        assert!(matches!(query(StatusCommand::CheckAuthRollback).await.unwrap(), StatusReply::AuthRollbackReady { revision: 3, .. }));
+        // Own-TLS-only deployments do not publish a REALITY auth rollback
+        // slot. Restoration is a new explicit, saved and CAS-bound reload.
+        assert!(query(StatusCommand::CheckAuthRollback).await.is_err());
         assert!(query(StatusCommand::ApplyAuthRollback { expected_revision: 2 }).await.is_err());
-        assert_eq!(query(StatusCommand::ApplyAuthRollback { expected_revision: 3 }).await.unwrap(), StatusReply::AuthRollbackApplied { revision: 4 });
-        assert_eq!(query(access("alice", digest)).await.unwrap(), StatusReply::AccessObserved { revision: 4, state: 3 });
         assert!(query(StatusCommand::ApplyAuthRollback { expected_revision: 3 }).await.is_err());
+        assert_eq!(query(access("alice", digest)).await.unwrap(), StatusReply::AccessObserved { revision: 3, state: 2 });
         candidate = enabled;
+        let digest = save(&candidate);
+        assert_eq!(query(StatusCommand::CheckReload).await.unwrap(), StatusReply::Compatible);
+        assert!(query(StatusCommand::ApplyReloadBound { expected_revision: 2, candidate_sha256: digest }).await.is_err());
+        assert_eq!(query(StatusCommand::ApplyReloadBound { expected_revision: 3, candidate_sha256: digest }).await.unwrap(), StatusReply::Applied { revision: 4 });
+        assert_eq!(query(access("alice", digest)).await.unwrap(), StatusReply::AccessObserved { revision: 4, state: 3 });
 
         let next_material = rcgen::generate_simple_self_signed(vec!["a.example.org".into()]).unwrap();
         let next_cert = directory.join("next-cert.pem");
