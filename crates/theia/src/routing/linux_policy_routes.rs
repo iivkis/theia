@@ -756,7 +756,7 @@ mod tests {
                 let objects = RefCell::new(Vec::<Object>::new());
                 let operations = Cell::new(0);
                 let read = || Ok(objects.borrow().clone());
-                let mutate = |kind, body: &[u8], create| {
+                let mutate = |kind: u16, body: &[u8], create: bool| {
                     assert!(create);
                     let n = operations.get();
                     operations.set(n + 1);
@@ -775,7 +775,7 @@ mod tests {
                 assert!(!intent.restored);
                 assert_eq!(result.is_ok(), fail_at == 4);
                 let deletes = Cell::new(0);
-                let recover = || recover_transaction(&path, scope.clone(), false, read, |kind, body, create| {
+                let recover = || recover_transaction(&path, scope.clone(), false, read, |kind: u16, body: &[u8], create: bool| {
                     assert!(!create);
                     let kind = if kind == DEL_RULE { NEW_RULE } else { assert_eq!(kind, DEL_ROUTE); NEW_ROUTE };
                     let mut objects = objects.borrow_mut();
