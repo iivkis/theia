@@ -42,14 +42,30 @@ class ToolchainTests(unittest.TestCase):
             rust.prepare((RELEASE, COMMIT), [])
             run.assert_called_once_with(["rustup", "default", "stable"], check=True)
 
-    def test_moving_stable_falls_back_to_exact_release(self):
-        with patch.object(rust, "ready", side_effect=[False, False, False, True]), \
+    def test_stale_stable_installs_only_exact_minimal_release(self):
+        with patch.object(rust, "ready", side_effect=[False, False, True]), \
                 patch.object(rust, "command", side_effect=[VERSION, "cargo 1.100.1"]), \
                 patch.object(rust.subprocess, "run") as run:
             rust.prepare((RELEASE, COMMIT), ["clippy"])
-            self.assertEqual(run.call_args_list[0].args[0][3], "stable")
-            self.assertEqual(run.call_args_list[1].args[0][3], RELEASE)
-            self.assertEqual(run.call_args_list[2].args[0], ["rustup", "default", RELEASE])
+            self.assertEqual(run.call_args_list[0].args[0],
+                             ["rustup", "toolchain", "install", RELEASE, "--profile",
+                              "minimal", "--no-self-update", "--component", "clippy"])
+            self.assertEqual(run.call_args_list[1].args[0], ["rustup", "default", RELEASE])
+            self.assertEqual(run.call_count, 2)
+
+    def test_existing_exact_release_avoids_install(self):
+        with patch.object(rust, "ready", side_effect=[False, True, True]), \
+                patch.object(rust, "command", side_effect=[VERSION, "cargo 1.100.1"]), \
+                patch.object(rust.subprocess, "run") as run:
+            rust.prepare((RELEASE, COMMIT), ["clippy"])
+            run.assert_called_once_with(["rustup", "default", RELEASE], check=True)
+
+    def test_exact_release_missing_required_components_is_rejected(self):
+        with patch.object(rust, "ready", side_effect=[False, False, False]), \
+                patch.object(rust.subprocess, "run") as run:
+            with self.assertRaises(ValueError):
+                rust.prepare((RELEASE, COMMIT), ["clippy"])
+            self.assertEqual(run.call_count, 1)
 
     def test_wrong_active_compiler_is_not_accepted(self):
         with patch.object(rust, "ready", return_value=True), \
