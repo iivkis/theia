@@ -80,18 +80,23 @@ jobs:
           if ($code -ne 0) { throw 'Release compilation failed' }
       - name: Verify excluded laboratory commands and retained MVP CLI
         run: |
-          $exe = Join-Path "target/$env:RELEASE_TARGET/release" $env:RELEASE_EXE
-          $help = & $exe client --help
-          if ($LASTEXITCODE -ne 0 -or ($help -join "`n") -notmatch '--system-proxy' -or ($help -join "`n") -match 'client (windivert|linux)') {
-            throw 'MVP client help does not match the feature boundary'
+          $exe = (Resolve-Path (Join-Path "target/$env:RELEASE_TARGET/release" $env:RELEASE_EXE)).Path
+          $out = Join-Path $env:RUNNER_TEMP 'theia-mvp-smoke-out.txt'
+          $err = Join-Path $env:RUNNER_TEMP 'theia-mvp-smoke-err.txt'
+          $helpProcess = Start-Process -FilePath $exe -ArgumentList @('client', '--help') -Wait -PassThru -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow
+          $help = Get-Content -LiteralPath $out -Raw
+          if ($helpProcess.ExitCode -ne 0 -or $help -notmatch '--system-proxy' -or $help -match 'client (windivert|linux)') {
+            throw "MVP client help does not match the feature boundary (exit=$($helpProcess.ExitCode)): $help"
           }
-          $PSNativeCommandUseErrorActionPreference = $false
           foreach ($lab in @('linux', 'windivert')) {
-            $result = & $exe client $lab --check 2>&1
-            if ($LASTEXITCODE -ne 3 -or ($result -join "`n") -notmatch 'excluded from MVP build') {
-              throw "Experimental command did not refuse safely: $lab"
+            $process = Start-Process -FilePath $exe -ArgumentList @('client', $lab, '--check') -Wait -PassThru -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow
+            $result = Get-Content -LiteralPath $err -Raw
+            if ($process.ExitCode -ne 3 -or $result -notmatch 'excluded from MVP build') {
+              throw "Experimental command did not refuse safely: $lab (exit=$($process.ExitCode)): $result"
             }
+            Write-Host "Verified safe refusal: $lab (exit=$($process.ExitCode))"
           }
+          exit 0
       - name: Upload compilation timing report
         if: always()
         uses: actions/upload-artifact@v7
