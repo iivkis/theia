@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # Exact source snapshot for this review, not a moving branch.
-          ref: 1757349f4bee1fc03eb4437ce61cd26d1591b4b4
+          ref: af60aeb9ecb6963bf42e732f5a1db585c219bbd5
           path: source
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -260,7 +260,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 1757349f4bee1fc03eb4437ce61cd26d1591b4b4
+          ref: af60aeb9ecb6963bf42e732f5a1db585c219bbd5
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
@@ -273,7 +273,7 @@ jobs:
       - name: Verify source and fixture dependencies
         shell: pwsh
         run: |
-          if ((git rev-parse HEAD).Trim() -ne '1757349f4bee1fc03eb4437ce61cd26d1591b4b4') { throw 'source mismatch' }
+          if ((git rev-parse HEAD).Trim() -ne 'af60aeb9ecb6963bf42e732f5a1db585c219bbd5') { throw 'source mismatch' }
           python -m pip install h2==4.2.0 aioquic==1.2.0
           if ($LASTEXITCODE -ne 0) { throw 'fixture dependencies failed' }
           "Tested SHA: $(git rev-parse HEAD)" >> $env:GITHUB_STEP_SUMMARY
@@ -347,7 +347,7 @@ jobs:
           from pathlib import Path
           src = Path(os.environ["RUNNER_TEMP"]) / "tui-gallery"
           manifest = json.loads((src / "manifest.json").read_text())
-          assert manifest["source_sha"] == "1757349f4bee1fc03eb4437ce61cd26d1591b4b4"
+          assert manifest["source_sha"] == "af60aeb9ecb6963bf42e732f5a1db585c219bbd5"
           assert (manifest["platform"], manifest["columns"], manifest["rows"]) == ("linux",120,40)
           expected = {"manifest.json", "README.md"}
           for entry in manifest["screens"]:
