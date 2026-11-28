@@ -74,7 +74,8 @@ impl Worker {
 
     fn view(&self) -> View {
         let observed = native::observed_proxy();
-        let known = observed.is_ok();
+        let known = observed.is_ok()
+            && !matches!(&observed, Ok(ObservedProxy::Journal(ProxyStatus::NoJournal)));
         let applied = self
             .session
             .as_ref()
@@ -93,7 +94,7 @@ impl Worker {
                 ))
             );
         let status = match observed {
-            Ok(ObservedProxy::Direct) => "Выключен: прямое подключение".into(),
+            Ok(ObservedProxy::Direct) => "В проверенной области WinINet нет прокси".into(),
             Ok(ObservedProxy::External) => "Настроен вне этой TUI".into(),
             Ok(ObservedProxy::Journal(ProxyStatus::PendingOwned)) if self.session.is_some() => {
                 "Управляется этой TUI (снимок совпадает)".into()
@@ -176,7 +177,7 @@ impl Worker {
                 .await
                 .map_err(|error| error.to_string())?;
                 self.session = Some(session);
-                Ok("Системный прокси включён. Удалённый туннель проверяется отдельно.".into())
+                Ok("Операция подключения завершена. Проверьте результат чтения настроек ниже.".into())
             }
             Pending::Recover(review) => {
                 let result = native::recover_reviewed(review).map_err(|error| error.to_string())?;
@@ -184,7 +185,7 @@ impl Worker {
             }
             Pending::Stop => {
                 self.stop().await?;
-                Ok("Локальный клиент остановлен; собственный lease завершён.".into())
+                Ok("Сеанс завершён. Результат восстановления настроек показан ниже.".into())
             }
         }
     }
@@ -452,25 +453,29 @@ impl Panel {
 
     pub(crate) fn body(&self) -> String {
         let status = if self.unavailable || self.phase == Phase::Busy {
-            "Операция не подтверждена / состояние обновляется"
+            "Нет актуального результата чтения настроек"
         } else {
             &self.view.status
         };
         let headline = if self.unavailable || self.phase == Phase::Busy {
-            "Состояние уточняется"
+            if self.unavailable {
+                "Состояние неизвестно: управление недоступно"
+            } else {
+                "Выполняется проверка или операция"
+            }
         } else if !self.view.known {
             "Состояние системного прокси неизвестно"
         } else if self.view.applied && self.view.running {
-            "Системный прокси включён"
+            "Настройки прокси применены по последней проверке"
         } else if self.view.owned || self.view.recovery {
             "Требуется проверка / восстановление"
         } else {
-            "Системный прокси Theia не включён"
+            "Нет подтверждённого системного прокси этой панели"
         };
         let controls = match self.phase {
             Phase::Busy => "Выполняется операция…",
             Phase::Confirm => "Выберите подтверждение или отмену (y / n, Esc).",
-            Phase::Idle if self.view.owned => "Выключение восстановит исходные параметры Windows.",
+            Phase::Idle if self.view.owned => "Отключение попытается восстановить исходные параметры, если они не изменены извне.",
             Phase::Idle if self.view.recovery => {
                 "Сначала проверьте восстановление исходных параметров."
             }
@@ -478,14 +483,14 @@ impl Panel {
             Phase::Idle => "Выберите «Подключиться». Esc — назад.",
         };
         format!(
-            "{headline}\n{}\n{controls}\n\nWindows: {status}\nЛокальный прокси: {}\nУдалённый туннель проверяется отдельно. Это не VPN.",
+            "{headline}\n{}\n{controls}\n\nWindows (последнее наблюдение): {status}\nЛокальный сеанс: {}\nПрохождение запросов приложений: не проверено этой панелью. Прокси не охватывает весь трафик устройства.",
             self.message,
             if self.unavailable || self.phase == Phase::Busy {
                 "неизвестно"
             } else if self.view.running {
-                "запущен"
+                "работал при последней проверке"
             } else {
-                "не запущен"
+                "работа не подтверждена"
             }
         )
     }
@@ -661,6 +666,8 @@ pub(crate) mod tests {
         action(&mut panel, 'e');
         assert!(!panel.view.running);
         assert!(!panel.view.owned);
+        assert!(panel.body().contains("Отказ/ошибка"));
+        assert!(!panel.body().contains("Настройки прокси применены"));
         assert_original();
         drop(second);
 
@@ -680,6 +687,8 @@ pub(crate) mod tests {
 
         action(&mut panel, 'e');
         assert!(panel.view.running && panel.view.applied && panel.view.owned);
+        assert!(panel.body().contains("Настройки прокси применены по последней проверке"));
+        assert!(panel.body().contains("Прохождение запросов приложений: не проверено"));
         assert_eq!(native::status().unwrap(), ProxyStatus::PendingOwned);
         assert!(TcpStream::connect_timeout(&http, Duration::from_secs(2)).is_ok());
         assert!(TcpStream::connect_timeout(&socks, Duration::from_secs(2)).is_ok());
@@ -695,6 +704,7 @@ pub(crate) mod tests {
         drop(other);
         action(&mut panel, 'x');
         assert!(!panel.view.running && !panel.view.owned);
+        assert!(!panel.body().contains("Настройки прокси применены"));
         assert_original();
         assert!(TcpStream::connect_timeout(&http, Duration::from_millis(100)).is_err());
         assert!(TcpStream::connect_timeout(&socks, Duration::from_millis(100)).is_err());
@@ -874,10 +884,13 @@ pub(crate) mod tests {
         crash();
         assert_eq!(native::status().unwrap(), ProxyStatus::PendingOwned);
         review(&mut panel, 'c');
+        assert!(panel.body().contains("Требуется проверка / восстановление"));
+        assert!(!panel.body().contains("Настройки прокси применены"));
         panel.key(key('n'));
         wait(&mut panel);
         assert_eq!(native::status().unwrap(), ProxyStatus::PendingOwned);
         action(&mut panel, 'c');
+        assert!(!panel.body().contains("Настройки прокси применены"));
         assert_original();
         drop(panel);
         drop(bearer);

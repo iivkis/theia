@@ -2022,7 +2022,7 @@ impl FirstSetup {
     }
 }
 
-fn default_config(filename: &str) -> std::path::PathBuf {
+pub(crate) fn default_config(filename: &str) -> std::path::PathBuf {
     #[cfg(target_os = "linux")]
     if filename == "server.toml" {
         let system = std::path::Path::new("/etc/theia");

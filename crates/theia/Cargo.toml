@@ -5,12 +5,14 @@ edition = "2021"
 publish = false
 
 [features]
-# F-13 laboratory backend remains compiled for independent tests.
-# The product config does not expose a selectable browser security mode.
-default = ["experimental-btls-h2"]
+# Default developer/coverage graph retains all existing regression code.
+# MVP distributables explicitly use --no-default-features.
+default = ["experimental-btls-h2", "native-ingress-lab"]
 experimental-btls-h2 = ["dep:btls", "dep:tokio-btls"]
+# Post-MVP isolated platform experiments, never needed for System Proxy.
+native-ingress-lab = []
 # Explicit laboratory build; requires system libbpf development/runtime files.
-linux-ebpf-lab = []
+linux-ebpf-lab = ["native-ingress-lab"]
 
 [dependencies]
 btls = { version = "=0.5.6", optional = true }

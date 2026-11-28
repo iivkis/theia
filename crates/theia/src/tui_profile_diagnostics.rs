@@ -6,9 +6,9 @@ use crate::{
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Rect},
     style::Style,
-    widgets::{Paragraph, Row, Table, Wrap},
+    widgets::{Paragraph, Row, Table},
     Frame,
 };
 use std::{path::PathBuf, sync::mpsc};
@@ -104,6 +104,7 @@ impl Panel {
         self.scroll = 0;
         self.action = 0;
         self.completed = false;
+        self.details = false;
     }
     pub(crate) fn poll(&mut self) {
         let Some(rx) = &self.receiver else {
@@ -171,18 +172,18 @@ impl Panel {
             self.input.push_str(input);
         }
     }
+    fn policy_blocked(&self, domain: &str) -> bool {
+        self.checks.iter().any(|check| {
+            check.domain.as_deref() == Some(domain)
+                && matches!(check.outcome, Outcome::Route(crate::routing::Action::Blocked))
+        })
+    }
+
     fn failed_domains(&self) -> Vec<String> {
         self.domains
             .iter()
             .filter(|domain| {
-                let blocked = self.checks.iter().any(|check| {
-                    check.domain.as_ref() == Some(*domain)
-                        && matches!(
-                            check.outcome,
-                            Outcome::Route(crate::routing::Action::Blocked)
-                        )
-                });
-                !blocked
+                !self.policy_blocked(domain)
                     && (!self.finished.contains(domain)
                         || self
                             .checks
@@ -205,8 +206,8 @@ impl Panel {
                 item('d', "Сводка / подробности"),
             ],
             Phase::Confirm => vec![
-                item('y', "Начать проверку указанных ресурсов"),
                 item('c', "Отменить"),
+                item('y', "Начать проверку указанных ресурсов"),
             ],
             Phase::Done => {
                 let mut actions = vec![
@@ -282,6 +283,8 @@ impl Panel {
             if self.phase == Phase::Custom {
                 self.phase = Phase::Choose;
                 self.action = 0;
+                self.scroll = 0;
+                self.error.clear();
                 return false;
             }
             return true;
@@ -301,6 +304,7 @@ impl Panel {
             KeyCode::Char('2') if self.phase == Phase::Choose => {
                 self.phase = Phase::Custom;
                 self.error.clear();
+                self.scroll = 0;
             }
             KeyCode::Backspace if self.phase == Phase::Custom => {
                 self.input.pop();
@@ -349,6 +353,13 @@ impl Panel {
             KeyCode::Char('n') if self.phase == Phase::Done => {
                 self.phase = Phase::Choose;
                 self.error.clear();
+                self.report.clear();
+                self.checks.clear();
+                self.finished.clear();
+                self.domains.clear();
+                self.input.clear();
+                self.details = false;
+                self.completed = false;
                 self.action = 0;
                 self.scroll = 0;
             }
@@ -370,11 +381,22 @@ impl Panel {
     fn lead(&self) -> String {
         match self.phase {
             Phase::Choose => "Выберите источник списка. Обращение к серверу не запускает проверку сайтов.".into(),
-            Phase::Custom => format!("Домены через пробел или запятую (до 16):\n{}\nEnter — проверить сервер · Ctrl+U — очистить", self.input),
+            Phase::Custom => format!("Домены через пробел или запятую (до 16):\n› {}", self.input),
             Phase::Fetching => "Проверяются H2/H3 и разрешения сервера…".into(),
             Phase::Confirm => format!("Разрешить HTTPS:443 и QUIC/HTTP3 на этих ресурсах? Локальные запросы возможны только по разрешённым правилам.\n{}", self.domains.join("\n")),
             Phase::Running => format!("Проверено {} из {} ресурсов…", self.finished.len(), self.domains.len()),
-            Phase::Done => if self.completed { "Проверки завершены; результаты могут содержать отказы.".into() } else { "Проверка прервана; доступен частичный отчёт.".into() },
+            Phase::Done => {
+                let blocked = self.domains.iter().filter(|d| self.policy_blocked(d)).count();
+                let failed = self.failed_domains().len();
+                let status = if self.completed {
+                    "Проверки завершены"
+                } else if self.checks.is_empty() {
+                    "Проверка не выполнена"
+                } else {
+                    "Проверка прервана"
+                };
+                format!("{status}. Обработано: {}/{} · Блокировано политикой: {blocked} · К повтору: {failed}", self.finished.len(), self.domains.len())
+            },
         }
     }
     fn cell(&self, domain: &str, check_kind: fn(&CheckKind) -> bool) -> String {
@@ -392,45 +414,110 @@ impl Panel {
                 },
             )
     }
-    pub(crate) fn render(&self, frame: &mut Frame<'_>, area: Rect) {
-        let actions = self.actions();
-        let controls = if !actions.is_empty() && area.height >= 8 {
-            (actions.len() as u16 + 2).min(area.height.saturating_sub(5))
+    pub(crate) fn footer(&self) -> &'static str {
+        match self.phase {
+            Phase::Choose => "↑ ↓ выбор · Enter открыть · Esc назад",
+            Phase::Custom => "Enter проверить сервер · Ctrl+U очистить · Esc назад · PgUp/PgDn прокрутка",
+            Phase::Confirm => "↑ ↓ выбор · Enter выполнить выбор · Esc отменить · PgUp/PgDn прокрутка",
+            Phase::Fetching | Phase::Running => "↑ ↓ выбор · Enter выполнить · Esc остановить · PgUp/PgDn прокрутка",
+            Phase::Done => "↑ ↓ выбор · Enter выполнить · Esc назад · PgUp/PgDn прокрутка",
+        }
+    }
+
+    fn text(&self, table: bool) -> String {
+        let mut lines = vec![format!("Профиль: {}", self.id), self.lead()];
+        if !self.error.is_empty() {
+            lines.push(self.error.clone());
+        }
+        lines.extend(self.checks.iter().filter(|check| check.domain.is_none()).map(|check| check.line(false)));
+        if !table {
+            lines.extend(self.report.iter().cloned());
+            if self.details || matches!(self.phase, Phase::Running | Phase::Done) {
+                lines.extend(self.checks.iter().filter(|check| check.domain.is_some()).map(|check| check.line(false)));
+            }
+        }
+        lines.join("\n")
+    }
+
+    // One geometry for drawing and hit-testing. Short states never reserve
+    // the entire terminal, and long reports keep their actions visible.
+    fn layout(&self, area: Rect) -> (Rect, Option<Rect>, Option<Rect>) {
+        let count = self.actions().len();
+        let controls = if count > 0 && area.height >= 8 {
+            (count as u16 + 2).min(area.height / 2)
         } else {
             0
         };
-        let parts =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(controls)]).split(area);
-        let general = self
-            .checks
-            .iter()
-            .filter(|check| check.domain.is_none())
-            .map(|check| check.line(false))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let body = format!("Профиль: {} · System Proxy\n{}\n{}\n{}\nPgUp/PgDn — прокрутка · Esc — назад/остановить", self.id, self.lead(), general, self.error);
-        let table_mode = !self.details
+        let available = area.height.saturating_sub(controls);
+        let table = !self.details
             && matches!(self.phase, Phase::Running | Phase::Done)
             && !self.domains.is_empty()
-            && parts[0].height >= 12
-            && parts[0].width >= 55;
-        if table_mode {
-            let regions = Layout::vertical([
-                Constraint::Length(8.min(parts[0].height.saturating_sub(4))),
-                Constraint::Min(1),
-            ])
-            .split(parts[0]);
-            frame.render_widget(
-                Paragraph::new(body)
-                    .block(tui_widgets::section("Сетевая диагностика профиля", true))
-                    .wrap(Wrap { trim: false }),
-                regions[0],
-            );
+            && available >= 12
+            && area.width >= 55;
+        let body = self.text(table);
+        let rows = crate::tui::visual_rows(&body, usize::from(area.width.saturating_sub(2))).0.len();
+        let preferred = (rows.saturating_add(2)).min(u16::MAX as usize) as u16;
+        let report_height = if table {
+            preferred.min(available.saturating_sub(4)).min(8)
+        } else {
+            preferred.min(available)
+        };
+        let report = Rect::new(area.x, area.y, area.width, report_height);
+        let table = table.then(|| Rect::new(
+            area.x,
+            report.bottom(),
+            area.width,
+            (self.domains.len() as u16 + 3).min(available.saturating_sub(report_height)),
+        ));
+        let bottom = table.map_or(report.bottom(), |rect| rect.bottom());
+        let actions = (controls > 0).then(|| Rect::new(area.x, bottom, area.width, controls));
+        (report, table, actions)
+    }
+
+    pub(crate) fn select_at(&mut self, area: Rect, x: u16, y: u16) {
+        if let (_, _, Some(controls)) = self.layout(area) {
+            let items = self.actions();
+            if let Some(index) = (Actions { items: &items, selected: self.action }).hit(controls, x, y) {
+                self.action = index;
+            }
+        }
+    }
+
+    pub(crate) fn render(&self, frame: &mut Frame<'_>, area: Rect) {
+        let (report, table, controls) = self.layout(area);
+        let body = self.text(table.is_some());
+        let rows = crate::tui::visual_rows(&body, usize::from(report.width.saturating_sub(2))).0;
+        let visible = usize::from(report.height.saturating_sub(2));
+        let offset = if table.is_some() {
+            0
+        } else {
+            usize::from(self.scroll).min(rows.len().saturating_sub(visible))
+        };
+        frame.render_widget(
+            Paragraph::new(rows.into_iter().skip(offset).take(visible).collect::<Vec<_>>())
+                .block(tui_widgets::section("Сетевая диагностика профиля", true)),
+            report,
+        );
+        if let Some(table) = table {
+            let visible = usize::from(table.height.saturating_sub(3));
+            let offset = usize::from(self.scroll).min(self.domains.len().saturating_sub(visible));
             let rows = self
                 .domains
                 .iter()
-                .skip(usize::from(self.scroll).min(self.domains.len().saturating_sub(1)))
+                .skip(offset)
                 .map(|domain| {
+                    if self.policy_blocked(domain) {
+                        return Row::new(vec![
+                            domain.clone(),
+                            "Блок".into(),
+                            "—".into(),
+                            "—".into(),
+                            "—".into(),
+                            "—".into(),
+                            "—".into(),
+                        ])
+                        .style(Style::default().fg(tui_widgets::WARNING));
+                    }
                     Row::new(vec![
                         domain.clone(),
                         self.cell(domain, |k| matches!(k, CheckKind::Https("штатный"))),
@@ -458,35 +545,12 @@ impl Panel {
                     Row::new(["Ресурс", "Авто", "H2", "H3", "UDP авт", "UDP/H2", "UDP/H3"])
                         .style(Style::default().fg(tui_widgets::MUTED)),
                 )
-                .block(tui_widgets::section("HTTP-коды · — не проверено", false)),
-                regions[1],
-            );
-        } else {
-            let lines = if self.details || matches!(self.phase, Phase::Running | Phase::Done) {
-                self.checks
-                    .iter()
-                    .filter(|c| c.domain.is_some())
-                    .map(|c| c.line(false))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            } else {
-                String::new()
-            };
-            let text = format!("{body}\n\n{}\n{lines}", self.report.join("\n"));
-            frame.render_widget(
-                Paragraph::new(text)
-                    .block(tui_widgets::section("Сетевая диагностика профиля", true))
-                    .wrap(Wrap { trim: false })
-                    .scroll((self.scroll, 0)),
-                parts[0],
+                .block(tui_widgets::section("HTTP-коды · Блок: запрещено политикой · — не проверено", false)),
+                table,
             );
         }
-        if controls > 0 {
-            Actions {
-                items: &actions,
-                selected: self.action,
-            }
-            .render(frame, parts[1]);
+        if let Some(controls) = controls {
+            Actions { items: &self.actions(), selected: self.action }.render(frame, controls);
         }
     }
 }
@@ -580,7 +644,8 @@ mod tests {
         assert!(panel.phase == Phase::Confirm);
         assert!(confirmation.try_recv().is_err());
         assert!(screen(&panel, 100, 25).contains("discord.com"));
-        panel.key(key(KeyCode::Enter));
+        assert_eq!(panel.actions()[0].key, 'c');
+        panel.key(key(KeyCode::Char('y')));
         assert_eq!(confirmation.try_recv(), Ok(()));
         assert!(panel.phase == Phase::Running);
         tx.send(Event::Check(Check {
@@ -632,6 +697,42 @@ mod tests {
     }
 
     #[test]
+    fn profile_diagnostic_actions_follow_content_and_mouse_only_selects() {
+        let mut panel = Panel::new(PathBuf::from("nonexistent"), [0; 32], "profile".into());
+        for width in [60, 90, 120] {
+            let area = Rect::new(0, 0, width, 36);
+            let (report, table, actions) = panel.layout(area);
+            let actions = actions.unwrap();
+            assert!(table.is_none());
+            assert_eq!(report.bottom(), actions.y);
+            assert!(actions.y <= 6);
+            let view = screen(&panel, width, 36);
+            assert!(!view.contains("PgUp/PgDn"));
+            assert!(view.contains("Ввести свои домены"));
+            panel.select_at(area, actions.x + 2, actions.y + 2);
+            assert_eq!(panel.action, 1);
+            assert!(panel.phase == Phase::Choose && panel.receiver.is_none());
+        }
+        panel.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(panel.phase == Phase::Custom);
+        assert!(panel.receiver.is_none());
+        panel.phase = Phase::Confirm;
+        panel.domains = (0..16).map(|i| format!("site{i}.test")).collect();
+        panel.action = 0;
+        let area = Rect::new(0, 0, 60, 18);
+        let (report, _, actions) = panel.layout(area);
+        let actions = actions.unwrap();
+        assert_eq!(report.bottom(), actions.y);
+        assert!(actions.bottom() <= area.bottom());
+        assert_eq!(panel.actions()[0].key, 'c');
+        panel.select_at(area, actions.x + 2, actions.y + 2);
+        assert_eq!(panel.action, 1);
+        assert!(panel.phase == Phase::Confirm && panel.receiver.is_none());
+        panel.scroll = u16::MAX;
+        assert!(screen(&panel, 60, 18).contains("site15.test"));
+    }
+
+    #[test]
     fn retry_and_export_respect_privacy_and_policy() {
         let mut panel = Panel::new(
             PathBuf::from("nonexistent"),
@@ -659,6 +760,12 @@ mod tests {
             outcome: Outcome::Route(crate::routing::Action::Blocked),
         });
         assert_eq!(panel.failed_domains(), vec!["failed.test"]);
+        assert!(panel.policy_blocked("blocked.test"));
+        assert!(!panel.policy_blocked("failed.test"));
+        panel.phase = Phase::Done;
+        let view = screen(&panel, 100, 25);
+        assert!(view.contains("Блок"));
+        assert!(view.contains("запрещено политикой"));
         assert!(!panel.checks[0].line(true).contains("failed.test"));
     }
 }

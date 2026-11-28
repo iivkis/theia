@@ -257,7 +257,7 @@ async fn modify_ips(
     Ok(ips)
 }
 
-fn udp_strategy(
+pub(super) fn udp_strategy(
     address: &Address,
     port: u16,
     candidate: &crate::routing::dpi::udp::Candidate,

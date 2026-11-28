@@ -185,6 +185,7 @@ pub struct WindowsServer {
     runtime: Option<Arc<crate::runtime_generation::State>>,
     restarts: Option<mpsc::Sender<crate::runtime_generation::RestartRequest>>,
     client: Option<Arc<crate::local_proxy::ClientRuntime>>,
+    standalone: Option<Arc<crate::anti_dpi::ipc::Endpoint>>,
 }
 
 impl WindowsServer {
@@ -192,7 +193,17 @@ impl WindowsServer {
         if inbounds == 0 || inbounds > 65535 {
             return Err(ManagementError::UnsafeEndpoint);
         }
-        let name = pipe_name(id)?;
+        Self::bind_name(pipe_name(id)?, inbounds)
+    }
+
+    pub(crate) fn bind_standalone(path: std::path::PathBuf, control: Arc<crate::anti_dpi::session::Control>) -> Result<Self, ManagementError> {
+        let name = standalone_name()?;
+        let mut server = Self::bind_name(name, 1)?;
+        server.standalone = Some(Arc::new(crate::anti_dpi::ipc::Endpoint::new(path, control)));
+        Ok(server)
+    }
+
+    fn bind_name(name: String, inbounds: usize) -> Result<Self, ManagementError> {
         let current = create_instance(&name, true)?;
         Ok(Self {
             name,
@@ -203,6 +214,7 @@ impl WindowsServer {
             runtime: None,
             restarts: None,
             client: None,
+            standalone: None,
         })
     }
 
@@ -267,9 +279,12 @@ impl WindowsServer {
             let runtime = self.runtime.clone();
             let restarts = self.restarts.clone();
             let client = self.client.clone();
+            let standalone = self.standalone.clone();
             tasks.spawn(async move {
                 let _permit = permit;
-                if let Some(client) = client {
+                if let Some(endpoint) = standalone {
+                    let _ = endpoint.handle(stream).await;
+                } else if let Some(client) = client {
                     let _ = timeout(
                         management::CLIENT_TIMEOUT,
                         management::handle_client(stream, client),
@@ -288,6 +303,42 @@ impl WindowsServer {
             while tasks.try_join_next().is_some() {}
         }
     }
+}
+
+fn standalone_name() -> Result<String, ManagementError> {
+    Ok(format!(r"\\.\pipe\theia-anti-dpi-v1-{}", current_user_sid()?))
+}
+
+/// Reuse the same SID-derived local-only pipe and busy timeout, but keep
+/// standalone wire commands completely separate from SmartTheia.
+pub(crate) async fn query_standalone(request: &str) -> Result<String, ManagementError> {
+    let name = standalone_name()?;
+    timeout(management::CLIENT_TIMEOUT, async {
+        loop {
+            match ClientOptions::new().open(&name) {
+                Ok(stream) => return crate::anti_dpi::ipc::exchange(stream, request).await,
+                Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
+                    sleep(Duration::from_millis(15)).await;
+                }
+                Err(_) => return Err(ManagementError::SocketUnavailable),
+            }
+        }
+    }).await.map_err(|_| ManagementError::TimedOut)?
+}
+
+pub(crate) async fn query_standalone_report(request: &str) -> Result<String, ManagementError> {
+    let name = standalone_name()?;
+    let stream = timeout(management::CLIENT_TIMEOUT, async {
+        loop {
+            match ClientOptions::new().open(&name) {
+                Ok(stream) => return Ok(stream),
+                Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => sleep(Duration::from_millis(15)).await,
+                Err(_) => return Err(ManagementError::SocketUnavailable),
+            }
+        }
+    }).await.map_err(|_| ManagementError::TimedOut)??;
+    timeout(Duration::from_secs(610), crate::anti_dpi::ipc::exchange_report(stream, request))
+        .await.map_err(|_| ManagementError::TimedOut)?
 }
 
 pub async fn query_pipe(id: &str, command: StatusCommand) -> Result<StatusReply, ManagementError> {

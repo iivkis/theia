@@ -2,37 +2,37 @@
 //! No DNS, transport, file I/O or implicit bypass occurs in this module.
 pub(crate) mod carrier_socket;
 pub(crate) mod client_state;
-#[cfg(target_os = "linux")]
+#[cfg(all(any(feature = "native-ingress-lab", test), target_os = "linux"))]
 pub mod dns_attribution;
 pub(crate) mod dpi;
 pub(crate) mod exchange;
 pub(crate) mod flow;
 pub mod geodata;
-#[cfg(target_os = "linux")]
+#[cfg(all(any(feature = "native-ingress-lab", test), target_os = "linux"))]
 pub mod linux_attribution;
 #[cfg(all(target_os = "linux", feature = "linux-ebpf-lab"))]
 pub mod linux_bpf_loader;
-#[cfg(target_os = "linux")]
+#[cfg(all(any(feature = "native-ingress-lab", test), target_os = "linux"))]
 pub mod linux_carrier;
-#[cfg(target_os = "linux")]
+#[cfg(all(any(feature = "native-ingress-lab", test), target_os = "linux"))]
 pub mod linux_events;
-#[cfg(target_os = "linux")]
+#[cfg(all(any(feature = "native-ingress-lab", test), target_os = "linux"))]
 pub mod linux_ingress;
-#[cfg(target_os = "linux")]
+#[cfg(all(any(feature = "native-ingress-lab", test), target_os = "linux"))]
 pub mod linux_rules;
-#[cfg(any(
-    target_os = "linux",
-    all(target_os = "windows", target_arch = "x86_64")
+#[cfg(all(
+    any(feature = "native-ingress-lab", test),
+    any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64"))
 ))]
 pub(crate) mod native_dns;
-#[cfg(target_os = "linux")]
+#[cfg(all(any(feature = "native-ingress-lab", test), target_os = "linux"))]
 pub mod nfqueue;
 pub mod packet;
 pub mod packet_modify;
 pub(crate) mod policy_lease;
 mod settings;
 pub mod snapshot;
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(all(feature = "native-ingress-lab", target_os = "windows"), test))]
 pub mod windivert;
 pub use settings::Settings;
 
@@ -449,6 +449,34 @@ fn entry_code(bytes: &[u8]) -> Result<String, RoutingError> {
     code.ok_or(RoutingError::InvalidDat)
 }
 
+/// Enumerate only selector-compatible category names from an already pinned DAT.
+pub(crate) fn category_catalog(data: &[u8]) -> Result<Vec<String>, RoutingError> {
+    if data.len() > MAX_DAT {
+        return Err(RoutingError::Limit);
+    }
+    let mut names = std::collections::BTreeSet::new();
+    let mut wire = Wire(data);
+    while let Some((field, value)) = wire.next()? {
+        if field != 1 {
+            continue;
+        }
+        let Field::Bytes(bytes) = value else {
+            return Err(RoutingError::InvalidDat);
+        };
+        let code = entry_code(bytes)?;
+        if category(&code).is_err() {
+            continue;
+        }
+        if !names.insert(code.to_ascii_lowercase()) {
+            return Err(RoutingError::InvalidDat);
+        }
+        if names.len() > MAX_SELECTORS {
+            return Err(RoutingError::Limit);
+        }
+    }
+    Ok(names.into_iter().collect())
+}
+
 fn dat_domain(bytes: &[u8], regex_count: &mut usize) -> Result<DomainPattern, RoutingError> {
     let mut wire = Wire(bytes);
     let mut kind = None;
@@ -640,6 +668,12 @@ impl Policy {
     /// Syntactic validation; category existence is checked against pinned DAT at prepare time.
     pub fn validate_rules(rules: &[Rule]) -> Result<(), RoutingError> {
         compile_selectors(rules).map(|_| ())
+    }
+
+    /// Check whether syntactically valid rules require a verified DAT pair.
+    pub(crate) fn requires_geodata(rules: &[Rule]) -> Result<bool, RoutingError> {
+        let (_, sites, ips) = compile_selectors(rules)?;
+        Ok(!sites.is_empty() || !ips.is_empty())
     }
 
     pub fn compile(rules: &[Rule], geosite: &[u8], geoip: &[u8]) -> Result<Self, RoutingError> {
@@ -1075,6 +1109,19 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn category_catalog_lists_supported_names_without_expanding_records() {
+        let mut data = site("GOOGLE@CN", 2, "other.example");
+        data.extend(site("GOOGLE", 2, "google.com"));
+        data.extend(site("CATEGORY-ADS", 2, "ads.example"));
+        assert_eq!(category_catalog(&data).unwrap(), ["category-ads", "google"]);
+        data.extend(site("google", 2, "duplicate.example"));
+        assert!(category_catalog(&data).is_err());
+        let mut ips = ip_data("IN-RU", &[192, 0, 2, 0], 24, false);
+        ips.extend(ip_data("PRIVATE", &[10, 0, 0, 0], 8, false));
+        assert_eq!(category_catalog(&ips).unwrap(), ["in-ru", "private"]);
     }
 
     #[test]

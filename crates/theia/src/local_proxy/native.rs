@@ -1828,6 +1828,69 @@ impl NativeIngress {
         assert!(!self.native_modify_enabled().unwrap());
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) async fn native_dns_denial_fixture(&self, source: SocketAddr) {
+        use crate::routing::{packet::{FlowKey, PacketMeta, Transport}, PacketAction};
+        use std::sync::atomic::Ordering;
+        let denied = ClientError::Open(ErrorCode::PolicyDenied);
+        let key = |port, transport| FlowKey {
+            source,
+            destination: SocketAddr::new("198.51.100.1".parse().unwrap(), port),
+            transport,
+            interface: 7,
+        };
+        let mut query = vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        query.extend_from_slice(b"\x09localhost\x00\x00\x01\x00\x01");
+        let tcp = key(53, Transport::Tcp);
+        let udp = key(53, Transport::Udp);
+        assert!(matches!(self.protected_dns_answer(key(54, Transport::Tcp), &query, true, None).await, Err(e) if e == denied));
+        assert!(matches!(self.protected_dns_answer(tcp, &[0; 11], true, None).await, Err(ClientError::Protocol)));
+        assert!(matches!(self.protected_dns_answer(udp, &query, false, None).await, Err(e) if e == denied));
+        self.unified.store(true, Ordering::Release);
+        for (flow, flags) in [(tcp, Some(2)), (udp, None)] {
+            let packet = PacketMeta { flow, payload_len: query.len(), tcp_flags: flags };
+            assert_eq!(self.raw_decision(packet, Some(101), true).await, PacketAction::Redirect);
+        }
+        let digest = self.client.routing_policy().await.unwrap().digest();
+        assert!(self.check_native_modify(tcp, digest).is_ok());
+        // TCP termination has no UDP capture proof. An absent registrar
+        // still prohibits DNS egress, even for an authenticated policy.
+        assert!(matches!(self.protected_dns_answer(tcp, &query, true, None).await, Err(e) if e == denied));
+        let raw_key = FlowKey { interface: 0, ..udp };
+        {
+            let mut raw = self.raw.lock().unwrap();
+            let entry = raw.get_mut(&raw_key).unwrap();
+            assert!(entry.dns_capture.record(&query));
+        }
+        assert!(matches!(self.protected_dns_answer(udp, &query, false, None).await, Err(e) if e == denied));
+        // A consumed capture may not be replayed. Failure retires the tuple.
+        assert!(matches!(self.protected_dns_answer(udp, &query, false, None).await, Err(e) if e == denied));
+        assert!(self.check_native_modify(udp, digest).is_err());
+        assert!(self.raw.lock().unwrap().get(&raw_key).unwrap().denied);
+
+        for (wire, expected) in [
+            (Vec::new(), Ok(())),
+            (vec![0, 11], Err(ClientError::Protocol)),
+            (vec![0, 12, 1, 2], Err(ClientError::Io)),
+            ([u16::try_from(query.len()).unwrap().to_be_bytes().as_slice(), query.as_slice()].concat(), Err(denied)),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut app = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let (local, _) = listener.accept().await.unwrap();
+            app.write_all(&wire).await.unwrap();
+            app.shutdown().await.unwrap();
+            assert_eq!(self.relay_native_dns_tcp(tcp, local).await, expected);
+        }
+        assert!(self.dns_probe_hints.lock().unwrap().get(tcp.source.ip(), tcp.destination.ip(), digest).is_none());
+        let answer = ProtectedDnsAnswer {
+            key: tcp, wire: Vec::new(), digest, hint: Some(("localhost".into(), vec!["127.0.0.1".parse().unwrap()])),
+        };
+        assert_eq!(self.record_dns_delivery(udp, answer), Err(denied));
+        self.deny_raw_packet(Some(PacketMeta { flow: tcp, payload_len: 0, tcp_flags: Some(2) }));
+        assert!(self.check_native_modify(tcp, digest).is_err());
+        self.unified.store(false, Ordering::Release);
+    }
+
     #[cfg(target_os = "linux")]
     async fn raw_decision(
         &self,

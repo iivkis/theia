@@ -2021,6 +2021,7 @@ async fn real_local_proxy_modes_fixture() {
                             );
                         }
                         ingress.unified_redirect_regression_fixture(meta("198.51.100.1:8443", PacketTransport::Tcp, Some(2))).await;
+                        ingress.native_dns_denial_fixture(source).await;
                         assert!(ingress
                             .prepare_stun_lab(
                                 key("192.0.2.1:3478", PacketTransport::Tcp),
