@@ -1543,10 +1543,10 @@ impl Editor {
         }
     }
 
-    /// Simple presentation only: never collapse different listener addresses.
-    /// The common port edit changes both typed socket addresses atomically.
+    /// Compact workspace fields: hide client transport details, and never
+    /// collapse distinct server listeners. The common port edit is atomic.
     pub(crate) fn set_compact_server_fields(&mut self, compact: bool) {
-        if self.role == Role::Server && !self.editing {
+        if !self.editing {
             self.compact_server_fields = compact;
             self.selected_field = self
                 .selected_field
@@ -1578,6 +1578,7 @@ impl Editor {
                 }
             }
             Role::Server => 3,
+            Role::Client if self.compact_server_fields => 1,
             Role::Client => 4,
         }
     }
@@ -1690,7 +1691,8 @@ impl Editor {
         let labels: &[&str] = match self.role {
             Role::Server if self.compact_server_fields => &["Адрес сервера", "Порт подключения"],
             Role::Server => &["TLS DNS", "H2 TCP", "H3 UDP"],
-            Role::Client => &["Endpoint", "TLS SNI", "Transport", "XHTTP"],
+            Role::Client if self.compact_server_fields => &["Адрес сервера"],
+            Role::Client => &["Адрес сервера", "Имя сервера (TLS)", "Транспорт", "Режим XHTTP"],
         };
         let values: Vec<String> = match &self.draft {
             Config::Server(doc) => doc
