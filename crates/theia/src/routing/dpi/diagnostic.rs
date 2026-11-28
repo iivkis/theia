@@ -81,6 +81,21 @@ async fn head_status(input: &mut (impl AsyncRead + Unpin)) -> Result<u16, Failur
     Err(Failure::Protocol)
 }
 
+/// Transport closure/reset during TLS is not itself a certificate rejection.
+fn handshake_failure(error: &std::io::Error) -> Failure {
+    use std::io::ErrorKind;
+    if error.get_ref().and_then(|cause| cause.downcast_ref::<rustls::Error>()).is_some() {
+        return Failure::Tls;
+    }
+    match error.kind() {
+        ErrorKind::PermissionDenied => Failure::Denied,
+        ErrorKind::TimedOut => Failure::Timeout,
+        ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+        | ErrorKind::BrokenPipe | ErrorKind::NotConnected => Failure::Network,
+        _ => Failure::Tls,
+    }
+}
+
 /// One independently connected, fully authenticated HTTP HEAD. A requested
 /// transform must actually change the wire first flight; no plain fallback.
 /// The caller binds the exact pinned endpoint and strategy to its lease.
@@ -129,7 +144,7 @@ pub(crate) async fn https(
             let mut stream = tokio_rustls::TlsConnector::from(Arc::new(config))
                 .connect(server_name, local)
                 .await
-                .map_err(|_| Failure::Tls)?;
+                .map_err(|error| handshake_failure(&error))?;
             if stream
                 .get_ref()
                 .1
@@ -208,6 +223,18 @@ pub(crate) async fn https(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn handshake_transport_closure_is_not_identity_rejection() {
+        use std::io::{Error, ErrorKind};
+        for kind in [ErrorKind::UnexpectedEof, ErrorKind::ConnectionReset, ErrorKind::BrokenPipe] {
+            assert_eq!(handshake_failure(&Error::from(kind)), Failure::Network);
+        }
+        assert_eq!(handshake_failure(&Error::from(ErrorKind::PermissionDenied)), Failure::Denied);
+        assert_eq!(handshake_failure(&Error::from(ErrorKind::InvalidData)), Failure::Tls);
+        let tls = Error::new(ErrorKind::UnexpectedEof, rustls::Error::NoCertificatesPresented);
+        assert_eq!(handshake_failure(&tls), Failure::Tls);
+    }
 
     #[tokio::test]
     async fn final_headers_are_required_and_codes_remain_distinct() {

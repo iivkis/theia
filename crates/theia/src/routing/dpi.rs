@@ -2101,7 +2101,7 @@ mod tests {
         std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert.cert.der().clone()).unwrap();
-        let config = tls::tls_config(roots).unwrap();
+        let config = tls::tls_config(roots.clone()).unwrap();
         let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../scripts/anti-dpi-tls-peer.py");
         let python = std::env::var_os("THEIA_DPI_PYTHON").unwrap_or_else(|| {
@@ -2227,6 +2227,32 @@ mod tests {
             assert!(flow.committed(super::super::PacketAction::Modify));
         }
 
+        // Independently observe the exact F-20 HTTPS diagnostic transport,
+        // not only the production relay or a TLS handshake reachability probe.
+        let scope = network_scope::observe(address).unwrap();
+        let probe = |strategy| {
+            diagnostic::https(
+                "localhost",
+                address,
+                scope,
+                strategy,
+                &roots,
+                &|| true,
+                tokio::time::Instant::now() + Duration::from_secs(6),
+            )
+        };
+        let baseline = probe(None).await;
+        assert_eq!(baseline.result, Ok(200), "{baseline:?}");
+        assert!(baseline.verified_tls && !baseline.transformed);
+        let blocked = probe(None).await;
+        assert!(matches!(blocked.result, Err(diagnostic::Failure::Network | diagnostic::Failure::Timeout)), "{blocked:?}");
+        assert!(!blocked.verified_tls && !blocked.transformed);
+        for strategy in Strategy::ALL {
+            let result = probe(Some(strategy)).await;
+            assert_eq!(result.result, Ok(200), "{result:?}");
+            assert!(result.connected && result.verified_tls && result.transformed);
+        }
+
         for expected in [
             "PASS baseline records=1 handshake=1 exchange=1",
             "PASS blocked records=1 handshake=0 exchange=0",
@@ -2236,6 +2262,11 @@ mod tests {
             "PASS middle records=2 handshake=1 exchange=1",
             "PASS balanced-probe records=4 handshake=1 exchange=0",
             "PASS balanced records=4 handshake=1 exchange=1",
+            "PASS https-baseline records=1 handshake=1 exchange=1",
+            "PASS https-blocked records=1 handshake=0 exchange=0",
+            "PASS https-header records=2 handshake=1 exchange=1",
+            "PASS https-middle records=2 handshake=1 exchange=1",
+            "PASS https-balanced records=4 handshake=1 exchange=1",
         ] {
             let actual = incoming.recv_timeout(Duration::from_secs(10)).unwrap();
             assert_eq!(actual, expected);
