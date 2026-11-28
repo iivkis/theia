@@ -1,7 +1,7 @@
 # TUI visual review
 
 This branch is a Linux-only visual evidence gallery, not a product development branch.
-The generator checks out the explicitly pinned dev commit (24868f20de975beeb626122e1d2478d1b7c0fbed) and records real Ratatui draw buffers at one size: 120×40 columns/rows. PNGs use a fixed DejaVu Sans Mono font. No Windows job.
+The generator checks out the explicitly pinned dev commit (84036d6a9888b261cdbc500514068113c8d17546) and records real Ratatui draw buffers at one size: 120×40 columns/rows. PNGs use a fixed DejaVu Sans Mono font. Only the Linux screenshot-producing fixtures, PNG rendering, manifest validation and publication run here. General unit/integration, native Windows, independent protocol fixtures and coverage run in the post-merge main CI, not this gallery workflow. A successful gallery is not a general CI result.
 
 - Open [screenshots/README.md](screenshots/README.md) after a successful workflow.
 - Read screenshots/manifest.json first: it identifies the exact source SHA, scenario names and file digests.
@@ -40,7 +40,7 @@ The gallery enumerates the actual eight server and eight client sections, checks
 
 The client diagnostics workspace is a required independent screen. The idle server statistics screen reports unavailable metrics rather than claiming a live data source. The inline import and process-local traffic monitor are rendered within their sections. Required screenshots include masked existing-profile import, expanded settings, a user with no grants and the explicit delete confirmation; the revoke-save failure must not contain the underlying workspace. No screenshot implies successful external-runtime access.
 
-The diagnostic workspace includes synthetic offline states for source selection, input validation, fetching, consent, running, completed/partial results, details, policy blocking and failure. The gallery regression gate also verifies compact and advanced client profile navigation without writes, diagnostic consent and safe retry, and idle monitor rendering. Windows native lifecycle acceptance remains separate.
+The diagnostic workspace includes synthetic offline states for source selection, input validation, fetching, consent, running, completed/partial results, details, policy blocking and failure. The screenshot fixtures depict compact and advanced profile navigation, diagnostic consent, retry and idle monitoring; general regression tests for these behaviors run in main CI. Windows native lifecycle acceptance remains separate.
 
 Diagnostic states use distinct successful, policy-blocked, interrupted and failed fixtures. Publication rejects duplicate diagnostic PNGs. Compact action layout and mouse selection without execution are regression-tested; profile ports remain intact across wrapped rows.
 

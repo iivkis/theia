@@ -146,81 +146,11 @@ jobs:
           test -x "$test_bin"
           inventory="$RUNNER_TEMP/tui-review-tests.txt"
           "$test_bin" --list --format terse > "$inventory"
-          # Report every independent regression in one CI run; never publish on failure.
+          # Only screenshot-producing fixtures run here. General regression,
+          # native Windows, protocol and coverage tests belong to merged-dev main CI.
           failed=0
           test_started=$SECONDS
           for test in \
-            first_key_import_creates_active_profile_and_opens_connection_panel \
-            common_import_dispatches_reality_key_to_masked_review_and_cancels_without_writes \
-            client_import_modal_masks_pasted_link_and_requires_explicit_confirmation \
-            preview_binds_independent_identity_and_admission_without_exposing_secret \
-            client_connection_modes_are_visible_and_do_not_start_or_write_on_selection \
-            client_proxy_shortcut_refuses_dirty_or_unconfigured_editor \
-            managed_key_import_has_no_extra_input_fields \
-            compact_reality_with_three_maximum_dns_references_fits_access_key_limit \
-            access_status_is_bounded_read_only_and_strictly_parsed \
-            workspace_navigation_mouse_and_keyboard_never_commit_or_start \
-            workspace_has_single_owner_for_every_visible_operation \
-            workspace_import_and_monitor_are_inline_and_read_only \
-            workspace_selected_user_and_advanced_actions_are_contextual \
-            revocation_failure_replaces_entire_workspace \
-            configured_sections_shortcut_uses_navigation_not_second_menu \
-            server_overview_opens_recommended_workflow_without_starting \
-            review_client_import_opens_directly_from_page_without_writing \
-            workspace_actions_follow_record_mode_and_eligibility \
-            server_workspace_action_selection_and_diagnostics_require_separate_consent \
-            own_tls_status_only_offers_common_runtime_controls \
-            runtime_stop_confirmation_and_disconnected_worker_are_observable \
-            client_start_with_missing_saved_profile_reports_failure_without_runtime \
-            model_navigation_help_and_safe_exit \
-            form_keyboard_selects_record_and_field_without_implicit_activation \
-            workspace_navigation_and_actions_do_not_write_on_focus \
-            opens_existing_actions_without_requiring_shortcuts \
-            action_selection_matches_rendered_rows_and_enter_dispatches_only_one_key \
-            confirmation_choices_default_to_cancel_and_never_execute_on_focus \
-            direct_profile_selection_wraps_long_addresses_without_activating \
-            technical_status_is_opt_in_and_never_starts_a_worker \
-            review_layout_keeps_actions_near_content_at_120_columns \
-            dirty_draft_guards_quit_and_navigation_while_editing_is_isolated \
-            compact_report_actions_follow_the_visible_text \
-            diagnostics_menu_navigation_never_grants_network_consent \
-            server_issuance_modal_hides_secret_until_durable_save_and_explicit_reveal \
-            conflict_after_issuance_refuses_reveal_and_requires_retry_or_discard \
-            rotation_modal_confirms_global_change_and_hides_new_secret_until_saved \
-            invitation_offer_clears_workspace_and_keeps_reveal_explicit \
-            novice_setup_and_source_choices_do_not_start_network_or_write \
-            source_choice_rows_are_not_text_inputs_and_examples_are_visible \
-            expanded_tls_and_result_views_never_approve_and_progress_is_bounded \
-            save_recovery_does_not_retry_uncertain_or_changed_paths \
-            reference_review_keeps_rejected_rows_and_long_values_visible \
-            first_server_wizard_publishes_only_after_review_and_never_overwrites \
-            multiline_domain_draft_preserves_cancel_and_bounds \
-            reality_success_handoff_opens_key_draft_without_issuing_or_starting \
-            inline_routing_actions_never_execute_on_focus \
-            common_server_port_edits_both_listeners_only_after_validation \
-            routing_workspace_reports_verified_ipc_and_stages_only_draft \
-            geodata_automatic_activation_preserves_pending_edit_and_rejects_rollback \
-            client_status_requires_canonical_fields_and_exact_revision_cas \
-            real_local_proxy_modes_validate_credentials_and_relay_over_both_transports \
-            pinned_sources_and_checksums \
-            compact_cache_never_reuses_old_full_edition \
-            unrelated_upstream_category_keys_do_not_break_selected_rules \
-            conditional_snapshot_is_exact_and_rejects_ambiguous_headers \
-            conditional_refresh_reuses_only_the_exact_verified_snapshot \
-            cache_rejects_rollback_and_equivocation \
-            direct_dial_and_relay \
-            transport_choice_changes_only_draft_after_enter_and_cancel_restores_value \
-            welcome_and_parameter_mouse_hits_change_focus_without_writes \
-            form_renders_multiple_selected_fields_without_secret_references \
-            confirmation_and_partial_report_have_distinct_workspace_states \
-            retry_and_export_respect_privacy_and_policy \
-            idle_monitor_distinguishes_unsampled_and_measured_zero \
-            profile_diagnostic_actions_follow_content_and_mouse_only_selects \
-            category_catalog_lists_supported_names_without_expanding_records \
-            geo_picker_filters_marks_and_appends_only_to_draft \
-            manual_reference_selection_requires_explicit_distinct_primary_and_reserve \
-            geo_picker_named_actions_marked_view_and_compact_layout_preserve_draft \
-            geo_picker_reopens_syncs_and_removes_last_category_without_touching_literals \
             f20_panel_gallery_capture \
             visual_review_gallery
           do
@@ -248,78 +178,6 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
-
-  native-f20:
-    name: F-20 locked native checks / ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, windows-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: 84036d6a9888b261cdbc500514068113c8d17546
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: f20-validation-v1-${{ matrix.os }}
-          cache-workspace-crates: false
-      - name: Verify source and fixture dependencies
-        shell: pwsh
-        run: |
-          if ((git rev-parse HEAD).Trim() -ne '84036d6a9888b261cdbc500514068113c8d17546') { throw 'source mismatch' }
-          python -m pip install h2==4.2.0 aioquic==1.2.0
-          if ($LASTEXITCODE -ne 0) { throw 'fixture dependencies failed' }
-          "Tested SHA: $(git rev-parse HEAD)" >> $env:GITHUB_STEP_SUMMARY
-          "Hosted runner native compile and protocol fixtures only; not Windows 10/11 desktop E2E or independent F-20 activation." >> $env:GITHUB_STEP_SUMMARY
-      - name: Locked native compile
-        shell: pwsh
-        run: |
-          cargo check --workspace --all-targets --locked
-          if ($LASTEXITCODE -ne 0) { throw 'compile failed' }
-      - name: F-20 CLI, authority, scheduler, IPC and renderer fixtures
-        shell: pwsh
-        run: |
-          cargo test --locked -p theia --test anti_dpi_cli
-          if ($LASTEXITCODE -ne 0) { throw 'CLI tests failed' }
-          cargo test --locked -p theia --lib anti_dpi::
-          if ($LASTEXITCODE -ne 0) { throw 'standalone tests failed' }
-          cargo test --locked -p theia --lib f20_panel_gallery_capture
-          if ($LASTEXITCODE -ne 0) { throw 'gallery fixture failed' }
-          cargo test --locked -p theia --lib wizard_never_saves_without_review_and_preview_is_localized
-          if ($LASTEXITCODE -ne 0) { throw 'wizard and viewport fixture failed' }
-          cargo test --locked -p theia --lib diagnostics_do_not_queue_ahead_of_production
-          if ($LASTEXITCODE -ne 0) { throw 'scheduler fixture failed' }
-          cargo test --locked -p theia --lib standalone_meter_is_per_session_and_diagnostics_do_not_enter_it
-          if ($LASTEXITCODE -ne 0) { throw 'meter fixture failed' }
-      - name: Independent peer fixtures (shared engine, not F-20 acceptance)
-        shell: pwsh
-        run: |
-          $tests = @(
-            @{ name='routing::dpi::tests::independent_openssl_record_filter_and_application_exchange'; ignored=$false },
-            @{ name='routing::dpi::tests::real_tls_peer_accepts_native_record_strategies_and_rejects_wrong_name'; ignored=$false },
-            @{ name='routing::dpi::diagnostic::tests::direct_and_transformed_flights_reach_a_verified_fixture'; ignored=$false },
-            @{ name='udp_relay::tests::independent_stun_product_relay_binding_exchange'; ignored=$false },
-            @{ name='routing::packet_modify::tests::independent_aioquic_initial_modify_v1_v2'; ignored=$true },
-            @{ name='udp_relay::tests::independent_quic_product_relay_v1_v2'; ignored=$true }
-          )
-          $failed = 0
-          foreach ($test in $tests) {
-            $arguments = @('test','--locked','-p','theia','--lib','--',$test.name,'--exact','--nocapture')
-            if ($test.ignored) { $arguments += '--ignored' }
-            $output = & cargo @arguments 2>&1 | Out-String
-            $code = $LASTEXITCODE
-            Write-Host $output
-            if ($code -ne 0 -or $output -notmatch 'test result: ok\. 1 passed; 0 failed') { $failed++ }
-            else { "$($test.name): passed (shared fixture)" >> $env:GITHUB_STEP_SUMMARY }
-          }
-          if ($failed -gt 0) { throw "$failed independent shared fixtures failed" }
 
   publish:
     needs: capture
