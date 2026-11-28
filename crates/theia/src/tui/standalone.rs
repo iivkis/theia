@@ -642,7 +642,7 @@ mod tests {
     /// Exercise the actual third-panel renderer. Gallery publication is
     /// optional; the ordinary test does not require the review environment.
     #[test]
-    fn standalone_visual_review_gallery() {
+    fn f20_panel_gallery_capture() {
         use crate::anti_dpi::diagnostic::{Protocol, Reason, Stage};
         use std::io::Write;
         let root = std::env::temp_dir().join(format!("theia-f20-review-{}", std::process::id()));
