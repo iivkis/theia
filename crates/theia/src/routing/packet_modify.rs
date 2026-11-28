@@ -1194,7 +1194,8 @@ mod tests {
                 .unwrap();
             {
                 let mut stdin = peer.stdin.take().unwrap();
-                for data in [&input, &outputs[0], &outputs[1], &hello] {
+                let rewritten = quic_initial_crypto_split(&initial, "example.org").unwrap();
+                for data in [&input, &outputs[0], &outputs[1], &hello, &rewritten] {
                     stdin.write_all(&(data.len() as u32).to_be_bytes()).unwrap();
                     stdin.write_all(data).unwrap();
                 }

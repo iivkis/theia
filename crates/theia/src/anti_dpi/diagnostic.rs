@@ -332,7 +332,9 @@ impl Plan {
             return Err(invalid("catalog.selection", "diagnostic matrix exceeds 512 cells; select fewer UDP endpoints"));
         }
         let mut hash = Sha256::new();
-        field(&mut hash, b"theia/standalone/diagnostic/v1");
+        field(&mut hash, b"theia/standalone/diagnostic/v2");
+        field(&mut hash, &[u8::from(crate::routing::dpi::STANDALONE_EXPERIMENTAL)]);
+        field(&mut hash, b"quic-initial-decoalesce-or-crypto-split/v1");
         saved.hash(&mut hash);
         if let Some(overlay) = &overlay {
             field(&mut hash, b"overlay");

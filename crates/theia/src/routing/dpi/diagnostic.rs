@@ -489,6 +489,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stun_controls_measure_actual_binding_and_fingerprint() {
+        let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = target.local_addr().unwrap();
+        let scope = network_scope::observe(peer).unwrap();
+        for modify in [false, true] {
+            let server = async {
+                let mut buf = [0u8; 512];
+                let (n, source) = target.recv_from(&mut buf).await.unwrap();
+                assert_eq!(n, if modify { 28 } else { 20 });
+                assert_eq!(&buf[..2], &[0, 1]);
+                if modify {
+                    assert_eq!(&buf[20..24], &[0x80, 0x28, 0, 4]);
+                }
+                let mut response = buf[..20].to_vec();
+                response[0] = 1;
+                response[2..4].copy_from_slice(&12u16.to_be_bytes());
+                response.extend([0, 0x20, 0, 8, 0, 1, 0x21, 0x13, 1, 2, 3, 4]);
+                target.send_to(&response, source).await.unwrap();
+            };
+            let probe = stun(peer, scope, modify, &|| true, Instant::now() + Duration::from_secs(2));
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::join!(probe, server)
+            }).await.unwrap();
+            assert_eq!(result.result, Ok(None), "{result:?}");
+            assert!(result.received);
+            assert!(!result.verified_tls);
+            assert_eq!(result.transformed, modify);
+        }
+    }
+
+    #[tokio::test]
     async fn direct_and_transformed_flights_reach_a_verified_fixture() {
         let cert = rcgen::generate_simple_self_signed(vec!["example.com".into()]).unwrap();
         let mut roots = rustls::RootCertStore::empty();
