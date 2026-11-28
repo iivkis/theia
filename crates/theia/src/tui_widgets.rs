@@ -4,7 +4,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Row, Table, Wrap},
     Frame,
 };
 
@@ -268,6 +268,54 @@ impl Form {
         self.fields.get(index).map(|f| f.id)
     }
 
+    fn reference_window(&self, area: Rect) -> (Rect, usize, usize) {
+        let top = area.height.min(3);
+        let bottom = area.height.saturating_sub(top).min(5);
+        let table = Rect::new(area.x, area.y + top, area.width, area.height.saturating_sub(top + bottom));
+        let capacity = usize::from(table.height.saturating_sub(1));
+        let start = self.selected.saturating_sub(capacity.saturating_sub(1)).min(self.fields.len().saturating_sub(capacity));
+        (table, start, capacity)
+    }
+
+    pub(crate) fn hit_reference_choices(&self, area: Rect, x: u16, y: u16) -> Option<usize> {
+        let (table, start, capacity) = self.reference_window(area);
+        if x < table.x || x >= table.right() || y <= table.y || y >= table.bottom() { return None; }
+        let offset = usize::from(y - table.y - 1);
+        if offset >= capacity { return None; }
+        self.fields.get(start + offset).map(|field| field.id)
+    }
+
+    pub(crate) fn render_reference_choices(&self, frame: &mut Frame<'_>, area: Rect) {
+        canvas(frame, area);
+        let (table, start, capacity) = self.reference_window(area);
+        frame.render_widget(Paragraph::new(self.lead.as_str()).wrap(Wrap { trim: true }).style(Style::default().fg(TEXT)),
+            Rect::new(area.x, area.y, area.width, table.y - area.y));
+        let wide = area.width >= 78;
+        let widths = if wide {
+            vec![Constraint::Min(15), Constraint::Length(25), Constraint::Length(3), Constraint::Length(3), Constraint::Length(8), Constraint::Length(4), Constraint::Length(12)]
+        } else {
+            vec![Constraint::Min(10), Constraint::Length(8), Constraint::Length(4), Constraint::Length(11)]
+        };
+        let header = if wide { vec!["Сайт", "Адрес", "H2", "H3", "H2, мс", "Балл", "Назначение"] }
+            else { vec!["Сайт", "H2, мс", "Балл", "Назначение"] };
+        let rows = self.fields.iter().skip(start).take(capacity).map(|field| {
+            let columns: Vec<_> = field.value.split('\t').collect();
+            let cell = |i| columns.get(i).copied().unwrap_or("").to_owned();
+            let cells = if wide { vec![cell(0), cell(1), cell(2), cell(3), cell(4), cell(5), field.label.to_owned()] }
+                else { vec![cell(0), cell(4), cell(5), field.label.to_owned()] };
+            Row::new(cells).style(Style::default().fg(if field.label == "Отказ" { ERROR } else if field.label == "Подходит" { TEXT } else { ACCENT })
+                .bg(if field.id == self.selected { FOCUS } else { BG }))
+        });
+        frame.render_widget(Table::new(rows, widths).header(Row::new(header).style(Style::default().fg(MUTED))), table);
+        let info = self.fields.iter().find(|field| field.id == self.selected).map_or(String::new(), |field| {
+            let columns: Vec<_> = field.value.split('\t').collect();
+            format!("{} · {} · H2 {} · H3 {} · {}", columns.first().copied().unwrap_or(""), columns.get(1).copied().unwrap_or(""), columns.get(2).copied().unwrap_or("?"), columns.get(3).copied().unwrap_or("?"), field.label)
+        });
+        let detail = format!("{}–{} / {}\n{}\n{}", if capacity == 0 { 0 } else { start + 1 }, (start + capacity).min(self.fields.len()), self.fields.len(), info, self.error);
+        frame.render_widget(Paragraph::new(detail).wrap(Wrap { trim: true }).style(Style::default().fg(if self.error.is_empty() { MUTED } else { WARNING })),
+            Rect::new(area.x, table.bottom(), area.width, area.bottom().saturating_sub(table.bottom())));
+    }
+
     pub(crate) fn render(&self, frame: &mut Frame<'_>, area: Rect, title: &str) {
         self.render_as(frame, area, title, false);
     }
@@ -524,6 +572,7 @@ pub(crate) struct ReferenceRow {
     pub score: u8,
     pub h2: bool,
     pub h3: bool,
+    pub latency_ms: Option<u64>,
     pub selected: Option<usize>,
 }
 
@@ -568,7 +617,7 @@ impl ReferenceReview {
                 }),
             );
         }
-        append_wrapped(&mut lines, "100: H2 и H3 подтверждены · 80: только H2 подтверждён · 0: H2 не подтверждён. ? — не подтверждено. Оценка не измеряет скорость.", width, Style::default().fg(MUTED));
+        append_wrapped(&mut lines, "100: H2 и H3 подтверждены · 80: только H2 подтверждён · 0: H2 не подтверждён. ? — не подтверждено. HTTPS H2, мс — среднее двух успешных проверок, не ICMP-пинг.", width, Style::default().fg(MUTED));
         if selected > 0 {
             lines.push(Line::raw(""));
             lines.push(Line::styled(
@@ -650,8 +699,8 @@ impl ReferenceReview {
         if wide {
             lines.push(Line::styled(
                 format!(
-                    "{:<30} {:<25} {:<18} {}",
-                    "Сайт", "Адрес", "TLS / H2 / H3", "Результат"
+                    "{:<26} {:<25} {:<14} {:<9} {}",
+                    "Сайт", "Адрес", "TLS / H2 / H3", "H2, мс", "Результат"
                 ),
                 Style::default().fg(MUTED),
             ));
@@ -677,18 +726,19 @@ impl ReferenceReview {
                 if row.h2 { "✓" } else { "?" },
                 if row.h3 { "✓" } else { "?" }
             );
+            let latency = row.latency_ms.map_or("—".into(), |ms| ms.to_string());
             // Long names and IPv6 addresses must remain visible, not elided.
             if wide
-                && Span::raw(row.name.as_str()).width() <= 28
+                && Span::raw(row.name.as_str()).width() <= 24
                 && row.address.len() <= 23
-                && 76 + Span::raw(format!("{status} · {}", row.score)).width() <= usize::from(width)
+                && 78 + Span::raw(format!("{status} · {}", row.score)).width() <= usize::from(width)
             {
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!("{:<30} {:<25} ", row.name, row.address),
+                        format!("{:<26} {:<25} ", row.name, row.address),
                         Style::default().fg(TEXT),
                     ),
-                    Span::styled(format!("{transports:<18} "), Style::default().fg(MUTED)),
+                    Span::styled(format!("{transports:<14} {latency:<9} "), Style::default().fg(MUTED)),
                     Span::styled(
                         format!("{status} · {}", row.score),
                         Style::default().fg(color).add_modifier(Modifier::BOLD),
@@ -709,7 +759,7 @@ impl ReferenceReview {
                 );
                 append_wrapped(
                     lines,
-                    &format!("  {transports} · {status} · {}", row.score),
+                    &format!("  {transports} · H2: {latency} мс · {status} · {}", row.score),
                     width,
                     Style::default().fg(color),
                 );
@@ -1080,6 +1130,7 @@ mod tests {
                     score: 100,
                     h2: true,
                     h3: true,
+                    latency_ms: None,
                     selected: Some(0),
                 },
                 ReferenceRow {
@@ -1088,6 +1139,7 @@ mod tests {
                     score: 80,
                     h2: true,
                     h3: false,
+                    latency_ms: None,
                     selected: Some(1),
                 },
                 ReferenceRow {
@@ -1096,6 +1148,7 @@ mod tests {
                     score: 0,
                     h2: false,
                     h3: false,
+                    latency_ms: None,
                     selected: None,
                 },
             ],

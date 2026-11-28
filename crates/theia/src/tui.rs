@@ -3241,13 +3241,13 @@ impl Interaction {
         }
         if let Some(panel) = self.reality_provision.as_mut() {
             if let Some(form) = panel.form() {
-                if let Some(id) = form.hit(
-                    guided_form_area(body, form.fields.len()),
-                    event.column,
-                    event.row,
-                ) {
-                    panel.select_field(id);
-                }
+                let target = guided_form_area(body, form.fields.len());
+                let hit = if panel.guide().is_some_and(|guide| guide.2 == "Выбор сайтов") {
+                    form.hit_reference_choices(target, event.column, event.row)
+                } else {
+                    form.hit(target, event.column, event.row)
+                };
+                if let Some(id) = hit { panel.select_field(id); }
             }
             return;
         }
@@ -6555,7 +6555,9 @@ fn draw_guided(
         } else {
             "Параметры"
         };
-        if matches!(
+        if heading == "Выбор сайтов" {
+            form.render_reference_choices(frame, parts[1]);
+        } else if matches!(
             heading,
             "Выбор пользователей"
                 | "Выбор пользователя"

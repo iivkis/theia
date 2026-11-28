@@ -494,6 +494,7 @@ impl WizardInput {
                         score: 0,
                         h2: false,
                         h3: false,
+                        latency_ms: None,
                         selected: None,
                     });
                 }
@@ -716,6 +717,7 @@ fn rank_checked(
             score: item.score(),
             h2: item.eligible(),
             h3: item.h3(),
+            latency_ms: None,
             selected: None,
         })
         .collect();
@@ -815,51 +817,90 @@ fn merge_rechecked(screen: &mut RankedReview, fresh: RankedReview) {
     screen.text.push_str(&fresh.text);
 }
 
-async fn screen_and_recheck(
-    input: &WizardInput,
-    resolved: ResolvedSearch,
-    progress: &AtomicUsize,
-    recheck_done: &AtomicUsize,
-    recheck_total: &AtomicUsize,
-) -> Result<(Option<reference_health::State>, RankedReview), Error> {
+fn screening_report(
+    targets: Vec<reference_health::Target>,
+    observations: Vec<reference_health::SearchObservation>,
+    mut unresolved: Vec<crate::tui_widgets::ReferenceRow>,
+) -> Result<RankedReview, Error> {
+    if targets.len() != observations.len() { return Err(Error::Health); }
+    let mut rows: Vec<_> = targets.into_iter().zip(observations).map(|(target, item)| {
+        crate::tui_widgets::ReferenceRow {
+            name: target.server_name,
+            address: target.address.to_string(),
+            score: item.evidence.score(),
+            h2: item.evidence.eligible(),
+            h3: item.evidence.h3(),
+            latency_ms: item.h2_ms,
+            selected: None,
+        }
+    }).collect();
+    rows.append(&mut unresolved);
+    rows.sort_by_key(|row| (std::cmp::Reverse(row.score), row.latency_ms.unwrap_or(u64::MAX)));
+    Ok(RankedReview { text: "Первичная проверка завершена. Ничего не выбрано и не сохранено.".into(), rows })
+}
+
+async fn screen_candidates(resolved: ResolvedSearch, progress: &AtomicUsize) -> Result<RankedReview, Error> {
     let plan = resolved.plan.ok_or(Error::Health)?;
     let approved = plan.digest().map_err(|_| Error::Health)?;
-    let evidence = reference_health::check_search(&plan, approved, progress)
-        .await
-        .map_err(|_| Error::Health)?;
-    let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
-    let (screen_state, mut report) = rank_checked(
-        input,
-        plan.into_targets(),
-        evidence,
-        now,
-        resolved.unresolved,
-    )?;
-    let Some(screen_state) = screen_state else {
-        return Ok((None, report));
-    };
-    // Screening may take minutes. Its earliest observations must not be
-    // stamped with the end time of the full search for provisioning.
-    let selected = screen_state.plan().references.clone();
-    let final_plan = input.search_plan(selected.clone())?;
-    let approved = final_plan.digest().map_err(|_| Error::Health)?;
-    let started = reference_health::unix_now().map_err(|_| Error::Clock)?;
-    recheck_total.store(selected.len(), Ordering::Relaxed);
-    let evidence = tokio::time::timeout(
-        std::time::Duration::from_secs(55),
-        reference_health::check_search(&final_plan, approved, recheck_done),
-    )
-    .await
-    .map_err(|_| Error::Health)?
-    .map_err(|_| Error::Health)?;
-    let (state, fresh) = rank_checked(input, selected, evidence, started, Vec::new())?;
-    merge_rechecked(&mut report, fresh);
-    let now = reference_health::unix_now().map_err(|_| Error::Clock)?;
-    if let Some(state) = &state {
-        state.provisioning_ready(now).map_err(|_| Error::Health)?;
-    }
-    Ok((state, report))
+    let observations = reference_health::check_search(&plan, approved, progress).await.map_err(|_| Error::Health)?;
+    screening_report(plan.into_targets(), observations, resolved.unresolved)
 }
+
+struct ReferenceSelection {
+    input: WizardInput,
+    report: RankedReview,
+    focus: usize,
+    error: String,
+}
+impl ReferenceSelection {
+    fn new(input: WizardInput, mut report: RankedReview) -> Self {
+        for row in &mut report.rows { row.selected = None; }
+        Self { input, report, focus: 0, error: String::new() }
+    }
+    fn target(row: &crate::tui_widgets::ReferenceRow) -> Option<reference_health::Target> {
+        if !row.h2 { return None; }
+        Some(reference_health::Target { server_name: row.name.clone(), address: row.address.parse().ok()? })
+    }
+    fn targets(&self) -> Result<Vec<reference_health::Target>, &'static str> {
+        let mut selected: Vec<_> = self.report.rows.iter().filter_map(|row| row.selected.map(|slot| (slot, row))).collect();
+        selected.sort_by_key(|(slot, _)| *slot);
+        if selected.first().map(|(slot, _)| *slot) != Some(0) {
+            return Err("Назначьте основной сайт клавишей 1.");
+        }
+        let targets = selected.iter().map(|(_, row)| Self::target(row).ok_or("Выбранный сайт не прошёл H2-проверку.")).collect::<Result<Vec<_>, _>>()?;
+        self.input.plan(targets.clone()).map_err(|_| "Основной и резервные должны иметь разные имена и адреса.")?;
+        if targets.len() == 1 && self.report.rows.iter().filter_map(Self::target).any(|candidate| {
+            self.input.plan(vec![targets[0].clone(), candidate]).is_ok()
+        }) {
+            return Err("Назначьте хотя бы один независимый резерв клавишей 2 или 3.");
+        }
+        Ok(targets)
+    }
+    fn assign(&mut self, slot: usize) {
+        let Some(row) = self.report.rows.get(self.focus) else { return; };
+        let Some(target) = Self::target(row) else {
+            self.error = "Нельзя выбрать сайт без подтверждённого H2.".into(); return;
+        };
+        if row.selected == Some(slot) {
+            self.report.rows[self.focus].selected = None;
+            self.error.clear();
+            return;
+        }
+        let mut targets = vec![target];
+        targets.extend(self.report.rows.iter().enumerate().filter(|(index, row)| *index != self.focus && row.selected.is_some() && row.selected != Some(slot)).filter_map(|(_, row)| Self::target(row)));
+        if self.input.plan(targets).is_err() {
+            self.error = "Нельзя назначить одинаковые имена или IP основному и резерву.".into();
+            return;
+        }
+        for row in &mut self.report.rows {
+            if row.selected == Some(slot) { row.selected = None; }
+        }
+        self.report.rows[self.focus].selected = Some(slot);
+        self.error.clear();
+    }
+}
+
+type ScreenResult = Result<(WizardInput, RankedReview), Error>;
 
 type CheckResult = Result<(WizardInput, Option<reference_health::State>, RankedReview), Error>;
 
@@ -871,6 +912,8 @@ enum WizardStage {
         tokio::sync::oneshot::Sender<()>,
     ),
     ProbeConfirm(Box<(WizardInput, ResolvedSearch)>),
+    Screening(Receiver<ScreenResult>, tokio::sync::oneshot::Sender<()>),
+    SelectReferences(Box<ReferenceSelection>),
     Checking(Receiver<CheckResult>, tokio::sync::oneshot::Sender<()>),
     CreateConfirm(Box<(WizardInput, reference_health::State, RankedReview)>),
     NoEligible(RankedReview),
@@ -1371,9 +1414,6 @@ impl Wizard {
         if self.ranges_enabled {
             fields.push(7);
         }
-        if self.advanced {
-            fields.push(6);
-        }
         fields.push(11);
         fields.push(13);
         fields
@@ -1684,24 +1724,85 @@ impl Wizard {
                 self.progress = Arc::new(AtomicUsize::new(0));
                 self.recheck_done = Arc::new(AtomicUsize::new(0));
                 self.recheck_total = Arc::new(AtomicUsize::new(0));
-                let recheck_done = Arc::clone(&self.recheck_done);
-                let recheck_total = Arc::clone(&self.recheck_total);
                 let progress = Arc::clone(&self.progress);
                 let (tx, rx) = mpsc::channel();
                 let (cancel, cancelled) = tokio::sync::oneshot::channel();
                 let _worker = std::thread::spawn(move || {
                     let result = input.check_source().and_then(|()| {
                         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| Error::Storage)?;
-                        let (state, report) = rt.block_on(async { tokio::select! {
+                        let report = rt.block_on(async { tokio::select! {
                             biased;
                             _ = cancelled => Err(Error::Health),
-                            value = screen_and_recheck(&input, resolved, &progress, &recheck_done, &recheck_total) => value,
+                            value = screen_candidates(resolved, &progress) => value,
                         } })?;
-                        Ok((input, state, report))
+                        Ok((input, report))
                     });
                     let _ = tx.send(result);
                 });
-                WizardStage::Checking(rx, cancel)
+                WizardStage::Screening(rx, cancel)
+            }
+            WizardStage::SelectReferences(mut selection) => {
+                match key.code {
+                    KeyCode::Esc => return false,
+                    KeyCode::Up | KeyCode::BackTab => selection.focus = selection.focus.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Tab => selection.focus = (selection.focus + 1).min(selection.report.rows.len().saturating_sub(1)),
+                    KeyCode::PageUp => selection.focus = selection.focus.saturating_sub(10),
+                    KeyCode::PageDown => selection.focus = (selection.focus + 10).min(selection.report.rows.len().saturating_sub(1)),
+                    KeyCode::Home => selection.focus = 0,
+                    KeyCode::End => selection.focus = selection.report.rows.len().saturating_sub(1),
+                    KeyCode::Char('1' | '2' | '3') if key.modifiers.is_empty() => {
+                        if let KeyCode::Char(ch) = key.code { selection.assign(ch as usize - '1' as usize); }
+                    }
+                    KeyCode::Delete | KeyCode::Backspace => {
+                        if let Some(row) = selection.report.rows.get_mut(selection.focus) { row.selected = None; }
+                        selection.error.clear();
+                    }
+                    KeyCode::Enter => match selection.targets() {
+                        Ok(targets) => {
+                            let ReferenceSelection { input, mut report, .. } = *selection;
+                            let (tx, rx) = mpsc::channel();
+                            let (cancel, cancelled) = tokio::sync::oneshot::channel();
+                            self.recheck_done = Arc::new(AtomicUsize::new(0));
+                            self.recheck_total = Arc::new(AtomicUsize::new(targets.len()));
+                            let progress = Arc::clone(&self.recheck_done);
+                            let _worker = std::thread::spawn(move || {
+                                let result = input.check_source().and_then(|()| {
+                                    let plan = input.search_plan(targets.clone())?;
+                                    let approved = plan.digest().map_err(|_| Error::Health)?;
+                                    let started = reference_health::unix_now().map_err(|_| Error::Clock)?;
+                                    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| Error::Storage)?;
+                                    let observations = rt.block_on(async { tokio::select! {
+                                        biased;
+                                        _ = cancelled => Err(Error::Health),
+                                        result = tokio::time::timeout(std::time::Duration::from_secs(55), reference_health::check_search(&plan, approved, &progress)) => {
+                                            result.map_err(|_| Error::Health)?.map_err(|_| Error::Health)
+                                        },
+                                    } })?;
+                                    let mut ordered = input.clone();
+                                    ordered.automatic = false;
+                                    let evidence = observations.iter().map(|o| o.evidence).collect();
+                                    let (state, mut fresh) = rank_checked(&ordered, targets.clone(), evidence, started, Vec::new())?;
+                                    for (target, observed) in targets.iter().zip(observations) {
+                                        if let Some(row) = fresh.rows.iter_mut().find(|r| r.name == target.server_name && r.address == target.address.to_string()) {
+                                            row.latency_ms = observed.h2_ms;
+                                        }
+                                    }
+                                    merge_rechecked(&mut report, fresh);
+                                    if let Some(state) = &state {
+                                        state.provisioning_ready(reference_health::unix_now().map_err(|_| Error::Clock)?).map_err(|_| Error::Health)?;
+                                    }
+                                    Ok((input, state, report))
+                                });
+                                let _ = tx.send(result);
+                            });
+                            self.stage = WizardStage::Checking(rx, cancel);
+                            return false;
+                        }
+                        Err(message) => selection.error = message.into(),
+                    },
+                    _ => {}
+                }
+                WizardStage::SelectReferences(selection)
             }
             WizardStage::CreateConfirm(value) if key.code == KeyCode::F(2) => {
                 self.result_details = !self.result_details;
@@ -1839,7 +1940,7 @@ impl Wizard {
                 WizardStage::Input
             }
             WizardStage::NoEligible(_) if key.code == KeyCode::Enter => WizardStage::Input,
-            WizardStage::Checking(_, cancel) if key.code == KeyCode::Esc => {
+            WizardStage::Screening(_, cancel) | WizardStage::Checking(_, cancel) if key.code == KeyCode::Esc => {
                 let _ = cancel.send(());
                 WizardStage::Input
             }
@@ -1927,9 +2028,25 @@ impl Wizard {
                 }),
                 Err(TryRecvError::Empty) => return None, Err(TryRecvError::Disconnected) => Err(Error::Health),
             },
+            WizardStage::Screening(rx, _) => match rx.try_recv() {
+                Ok(value) => value.map(|(input, report)| {
+                    self.result_details = false;
+                    if report.rows.iter().any(|row| row.h2) {
+                        WizardStage::SelectReferences(Box::new(ReferenceSelection::new(input, report)))
+                    } else {
+                        WizardStage::NoEligible(report)
+                    }
+                }),
+                Err(TryRecvError::Empty) => return None, Err(TryRecvError::Disconnected) => Err(Error::Health),
+            },
             WizardStage::Checking(rx, _) => match rx.try_recv() {
                 Ok(value) => value.map(|(input, state, report)| { self.result_details = false; match state {
                     Some(state) => WizardStage::CreateConfirm(Box::new((input, state, report))),
+                    None if report.rows.iter().any(|row| row.h2) => {
+                        let mut selection = ReferenceSelection::new(input, report);
+                        selection.error = "Один из выбранных сайтов не прошёл повторную проверку. Выберите заново.".into();
+                        WizardStage::SelectReferences(Box::new(selection))
+                    }
                     None => WizardStage::NoEligible(report),
                 } }),
                 Err(TryRecvError::Empty) => return None, Err(TryRecvError::Disconnected) => Err(Error::Health),
@@ -2017,7 +2134,7 @@ impl Wizard {
             WizardStage::Resolving(_, _) => progress_text("Фаза 1/3: поиск сетевых адресов", self.progress.load(Ordering::Relaxed), self.total),
             WizardStage::ProbeConfirm(value) => {
                 let targets = value.1.plan.as_ref().map(|p| p.targets()).unwrap_or_default();
-                let mut text = format!("Theia проверит защищённые соединения с выбранными сайтами.\n\nАдресов для проверки: {} · не удалось найти адрес: {}\nТолько перечисленные IP и имена, порт 443, TLS 1.3, HTTP/2 и HTTP/3.\nСверка DNS сервера и сайтов; по две проверки HTTPS HEAD без перенаправлений, ключей и тела запроса.\nНастройки не записываются. Лучшие сайты будут перепроверены.", targets.len(), value.1.unresolved.len());
+                let mut text = format!("Theia проверит защищённые соединения с выбранными сайтами.\n\nАдресов для проверки: {} · не удалось найти адрес: {}\nТолько перечисленные IP и имена, порт 443, TLS 1.3, HTTP/2 и HTTP/3.\nСверка DNS сервера и сайтов; по две проверки HTTPS HEAD без перенаправлений, ключей и тела запроса.\nНастройки не записываются. После проверки выберите основной и резервные сайты вручную.", targets.len(), value.1.unresolved.len());
                 if self.tls_details {
                     text.push_str("\n\nТочные цели проверки\n");
                     for target in targets {
@@ -2028,13 +2145,15 @@ impl Wizard {
                 }
                 text
             }
+            WizardStage::Screening(_, _) => progress_text("Фаза 2/3: проверка защищённых соединений", self.progress.load(Ordering::Relaxed), self.total),
+            WizardStage::SelectReferences(selection) => format!("Выберите основной и резервные сайты самостоятельно.\n{}\n{}", selection.report.text, selection.error),
             WizardStage::Checking(_, _) => {
                 let done = self.progress.load(Ordering::Relaxed);
                 let total = self.recheck_total.load(Ordering::Relaxed);
                 if total > 0 {
                     format!("✓ Адреса найдены · ✓ Первичная проверка завершена\n{}", progress_text("Фаза 3/3: повторная проверка выбранных сайтов", self.recheck_done.load(Ordering::Relaxed), total))
                 } else if done >= self.total {
-                    "Подбираем лучшие сайты для повторной проверки.\nНастройки не изменяются.".into()
+                    "Подготовка повторной проверки выбранных сайтов.\nНастройки не изменяются.".into()
                 } else {
                     format!("✓ Адреса найдены\n{}", progress_text("Фаза 2/3: проверка защищённых соединений", done, self.total))
                 }
@@ -2315,6 +2434,24 @@ impl ProvisionPanel {
         if let Some(panel) = &wizard.registration {
             return panel.form();
         }
+        if let WizardStage::SelectReferences(selection) = &wizard.stage {
+            return Some(Form {
+                fields: selection.report.rows.iter().enumerate().map(|(id, row)| Field {
+                    id,
+                    label: match row.selected {
+                        Some(0) => "Основной", Some(1) => "Резерв 1", Some(2) => "Резерв 2",
+                        _ if row.h2 => "Подходит", _ => "Отказ",
+                    },
+                    value: format!("{}\t{}\t{}\t{}\t{}\t{}", row.name, row.address,
+                        if row.h2 { "✓" } else { "?" }, if row.h3 { "✓" } else { "?" },
+                        row.latency_ms.map_or("—".into(), |ms| ms.to_string()), row.score),
+                    hint: "1 — основной, 2/3 — резерв, Delete — снять назначение.",
+                }).collect(),
+                selected: selection.focus,
+                lead: format!("Выберите основной и резерв вручную. HTTPS H2, мс — среднее двух успешных проверок, не ICMP-пинг. Выбрано: {}.", selection.report.rows.iter().filter(|row| row.selected.is_some()).count()),
+                error: selection.error.clone(),
+            });
+        }
         if !matches!(wizard.stage, WizardStage::Input) {
             return None;
         }
@@ -2359,7 +2496,7 @@ impl ProvisionPanel {
             ("Свои сайты", "Пример: example.org · F4 открыть многострочный редактор. Можно вставить список имён через запятую; допустимо имя=IP."),
             (if first { "Имя первого пользователя" } else { "› Пользователи с доступом" },
              if first { "Пример: user · Придумайте имя. После создания выдайте личный ключ через «Восстановить доступ»." } else { "Пробел или F6 — открыть список. Если никто не выбран, Enter откроет его. Доступ не выдаётся автоматически." }),
-            ("› Порядок выбора", "Пробел — изменить. Автоматический подбор рекомендуется."),
+            ("Порядок выбора", "Основной и резервные сайты выбираются после проверки."),
             ("Разрешённые IP-диапазоны", "Пример: 203.0.113.8/29 · Укажите реальную назначенную публичную подсеть с разрешением. Формат CIDR или имя@CIDR."),
             (if wizard.catalogue_enabled() { "[x] Готовый каталог сайтов" } else { "[ ] Готовый каталог сайтов" }, "Пробел или ←/→ — включить или выключить. Сеть только после подтверждения."),
             (if wizard.custom_enabled { "[x] Добавить свои сайты" } else { "[ ] Добавить свои сайты" }, "Пробел или ←/→ — включить или выключить дополнительный источник."),
@@ -2393,6 +2530,10 @@ impl ProvisionPanel {
         if let Some(wizard) = self.wizard.as_mut() {
             if let Some(panel) = wizard.registration.as_mut() {
                 panel.select_field(id);
+                return;
+            }
+            if let WizardStage::SelectReferences(selection) = &mut wizard.stage {
+                if id < selection.report.rows.len() { selection.focus = id; }
                 return;
             }
             if let Some(draft) = wizard.domain_draft.as_mut() {
@@ -2519,7 +2660,8 @@ impl ProvisionPanel {
                 "Проверка сайтов",
                 "Y проверить перечисленные адреса · N / Esc назад",
             ),
-            WizardStage::Checking(_, _) => (4, 6, "Проверка сайтов", "Esc отменить"),
+            WizardStage::Screening(_, _) | WizardStage::Checking(_, _) => (4, 6, "Проверка сайтов", "Esc отменить"),
+            WizardStage::SelectReferences(_) => (5, 6, "Выбор сайтов", "↑↓ строка · 1 основной · 2/3 резерв · Delete снять · Enter перепроверить · Esc назад"),
             WizardStage::NoEligible(_) | WizardStage::CreateConfirm(_) if wizard.result_details => (5, 6, "Полный отчёт", "PgUp/PgDn прокрутка · F2 / Enter / Esc свернуть"),
             WizardStage::NoEligible(_) => (5, 6, "Нет подходящих сайтов", "F2 отчёт · Enter / Esc изменить источники"),
             WizardStage::CreateConfirm(value) => (
@@ -2791,6 +2933,45 @@ mod tests {
     }
 
     #[test]
+    fn manual_reference_selection_requires_explicit_distinct_primary_and_reserve() {
+        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("manual-reference").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("server.toml");
+        let mut wizard = Wizard::first(path.clone()).unwrap();
+        wizard.fields[2] = "edge.example.org".into();
+        wizard.fields[3] = "93.184.216.1".into();
+        wizard.fields[5] = "owner".into();
+        let input = WizardInput::parse(path.clone(), None, &wizard.effective_fields()).unwrap();
+        let targets: Vec<_> = (2..=4).map(|n| reference_health::Target {
+            server_name: format!("host{n}.example.org"),
+            address: format!("93.184.216.{n}:443").parse().unwrap(),
+        }).collect();
+        let observations = vec![
+            reference_health::SearchObservation { evidence: Evidence { h2_status: Some(200), h3_status: None }, h2_ms: Some(23) },
+            reference_health::SearchObservation { evidence: Evidence { h2_status: Some(200), h3_status: Some(200) }, h2_ms: Some(45) },
+            reference_health::SearchObservation::default(),
+        ];
+        let report = screening_report(targets.clone(), observations, Vec::new()).unwrap();
+        assert!(report.rows.iter().all(|row| row.selected.is_none()));
+        assert_eq!(report.rows[0].name, targets[1].server_name);
+        let mut selection = ReferenceSelection::new(input, report);
+        assert!(selection.targets().is_err());
+        selection.focus = 1;
+        selection.assign(0);
+        assert!(selection.targets().is_err());
+        selection.focus = 2;
+        selection.assign(1);
+        assert!(selection.targets().is_err());
+        selection.focus = 0;
+        selection.assign(1);
+        assert_eq!(selection.targets().unwrap(), vec![targets[0].clone(), targets[1].clone()]);
+        selection.assign(1);
+        assert!(selection.targets().is_err());
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn recheck_never_promotes_an_unobserved_backup() {
         let row = |name: &str, score, selected| crate::tui_widgets::ReferenceRow {
             name: name.into(),
@@ -2798,6 +2979,7 @@ mod tests {
             score,
             h2: score > 0,
             h3: score == 100,
+            latency_ms: None,
             selected,
         };
         let mut screening = RankedReview {
