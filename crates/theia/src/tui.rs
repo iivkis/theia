@@ -6793,7 +6793,7 @@ fn record_rows(editor: &Editor, area: Rect) -> Vec<(usize, String)> {
             label.rsplit_once(':').and_then(|(host, port)| {
                 (!port.is_empty()
                     && port.bytes().all(|b| b.is_ascii_digit())
-                    && port.len() + 1 <= width)
+                    && port.len() < width)
                     .then_some(host.len())
             })
         } else {

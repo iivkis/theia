@@ -8,6 +8,7 @@ use super::{
 use crate::{
     anti_dpi::{
         authority::{Active, Candidate},
+        diagnostic::RunContext,
         dns,
         session::{Command, Control, DiagnosticUpdate, Job, Phase},
         Decision,
@@ -775,12 +776,14 @@ async fn diagnostic(runtime: Arc<Runtime>, job: Job) {
         .plan
         .run_owned(
             job.confirmation,
-            &active,
-            runtime.epoch,
-            &runtime.roots,
-            &job.cancel,
-            &ready,
-            &runtime.resolver_slots,
+            RunContext {
+                active: &active,
+                epoch: runtime.epoch,
+                roots: &runtime.roots,
+                cancel: &job.cancel,
+                ready: &ready,
+                permits: Some(&runtime.resolver_slots),
+            },
             |cells| {
                 let _ = job.updates.send(DiagnosticUpdate::Cells(cells.to_vec()));
             },

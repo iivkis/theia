@@ -27,6 +27,16 @@ const CELL_BUDGET: Duration = Duration::from_secs(6);
 const JOB_BUDGET: Duration = Duration::from_secs(600);
 const CONCURRENCY: usize = 4;
 
+/// Borrowed, exact runtime context; owned jobs must provide the shared budget.
+pub(crate) struct RunContext<'a> {
+    pub active: &'a super::authority::Active,
+    pub epoch: u64,
+    pub roots: &'a rustls::RootCertStore,
+    pub cancel: &'a AtomicBool,
+    pub ready: &'a (dyn Fn() -> bool + Sync),
+    pub permits: Option<&'a crate::net::probe::PriorityBudget>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
     TcpHttps,
@@ -469,12 +479,14 @@ impl Plan {
             return Err(invalid("diagnostic", "native trust roots unavailable"));
         }
         self.run_context(
-            &active,
-            epoch,
-            &roots,
-            cancel,
-            &|| true,
-            None,
+            RunContext {
+                active: &active,
+                epoch,
+                roots: &roots,
+                cancel,
+                ready: &|| true,
+                permits: None,
+            },
             &mut progress,
         )
         .await
@@ -486,48 +498,31 @@ impl Plan {
     pub(crate) async fn run_owned(
         self,
         confirmation: [u8; 32],
-        active: &super::authority::Active,
-        epoch: u64,
-        roots: &rustls::RootCertStore,
-        cancel: &AtomicBool,
-        ready: &(dyn Fn() -> bool + Sync),
-        permits: &crate::net::probe::PriorityBudget,
+        context: RunContext<'_>,
         mut progress: impl FnMut(&[CellResult]),
     ) -> Result<Report, ConfigError> {
         if self.digest != confirmation
             || !self.files_current()
-            || !active.matches_path(&self.saved.path)
-            || active.policy().digest() != self.policy.digest()
-            || !active.live()
-            || !ready()
+            || !context.active.matches_path(&self.saved.path)
+            || context.active.policy().digest() != self.policy.digest()
+            || !context.active.live()
+            || !(context.ready)()
+            || context.permits.is_none()
         {
             return Err(invalid(
                 "diagnostic.owner",
                 "owned policy or connection changed; review again",
             ));
         }
-        self.run_context(
-            active,
-            epoch,
-            roots,
-            cancel,
-            ready,
-            Some(permits),
-            &mut progress,
-        )
-        .await
+        self.run_context(context, &mut progress).await
     }
 
     async fn run_context(
         self,
-        active: &super::authority::Active,
-        epoch: u64,
-        roots: &rustls::RootCertStore,
-        cancel: &AtomicBool,
-        ready: &(dyn Fn() -> bool + Sync),
-        permits: Option<&crate::net::probe::PriorityBudget>,
+        context: RunContext<'_>,
         progress: &mut (impl FnMut(&[CellResult]) + ?Sized),
     ) -> Result<Report, ConfigError> {
+        let RunContext { active, epoch, roots, cancel, ready, permits } = context;
         let state = State {
             plan: &self,
             active,
