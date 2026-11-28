@@ -1,6 +1,6 @@
 # Theia TUI visual review
 
-Source: 1d3b955a043e8eb6c9fa0cd61c130b34c6f5e9f1
+Source: 546cb845ef3387c57023a69bb008bf7900fd4adc
 
 Linux · 120×40 · actual production renderer cells. State fixtures and unavailable actions are not runtime success.
 
@@ -489,6 +489,50 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## state-issuance-rotate-reveal-confirm
 
 ![state-issuance-rotate-reveal-confirm](state-issuance-rotate-reveal-confirm.png)
+
+## state-profile-diagnostics-blocked
+
+![state-profile-diagnostics-blocked](state-profile-diagnostics-blocked.png)
+
+## state-profile-diagnostics-choose
+
+![state-profile-diagnostics-choose](state-profile-diagnostics-choose.png)
+
+## state-profile-diagnostics-completed
+
+![state-profile-diagnostics-completed](state-profile-diagnostics-completed.png)
+
+## state-profile-diagnostics-consent
+
+![state-profile-diagnostics-consent](state-profile-diagnostics-consent.png)
+
+## state-profile-diagnostics-custom
+
+![state-profile-diagnostics-custom](state-profile-diagnostics-custom.png)
+
+## state-profile-diagnostics-details
+
+![state-profile-diagnostics-details](state-profile-diagnostics-details.png)
+
+## state-profile-diagnostics-failed
+
+![state-profile-diagnostics-failed](state-profile-diagnostics-failed.png)
+
+## state-profile-diagnostics-fetching
+
+![state-profile-diagnostics-fetching](state-profile-diagnostics-fetching.png)
+
+## state-profile-diagnostics-partial
+
+![state-profile-diagnostics-partial](state-profile-diagnostics-partial.png)
+
+## state-profile-diagnostics-running
+
+![state-profile-diagnostics-running](state-profile-diagnostics-running.png)
+
+## state-profile-diagnostics-validation-error
+
+![state-profile-diagnostics-validation-error](state-profile-diagnostics-validation-error.png)
 
 ## state-reality-step1-grant-picker
 
