@@ -2230,6 +2230,7 @@ mod tests {
         // Independently observe the exact F-20 HTTPS diagnostic transport,
         // not only the production relay or a TLS handshake reachability probe.
         let scope = network_scope::observe(address).unwrap();
+        let live = || true;
         let probe = |strategy| {
             diagnostic::https(
                 "localhost",
@@ -2237,7 +2238,7 @@ mod tests {
                 scope,
                 strategy,
                 &roots,
-                &|| true,
+                &live,
                 tokio::time::Instant::now() + Duration::from_secs(6),
             )
         };
