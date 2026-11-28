@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # Exact source snapshot for this review, not a moving branch.
-          ref: 429e99a80e702dd7d7e29e4802197d35bf7a9fde
+          ref: 897420d3845f7ab8f9dbfcbf72e0f3190da83a74
           path: source
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -207,7 +207,7 @@ jobs:
           from pathlib import Path
           src = Path(os.environ["RUNNER_TEMP"]) / "tui-gallery"
           manifest = json.loads((src / "manifest.json").read_text())
-          assert manifest["source_sha"] == "429e99a80e702dd7d7e29e4802197d35bf7a9fde"
+          assert manifest["source_sha"] == "897420d3845f7ab8f9dbfcbf72e0f3190da83a74"
           assert (manifest["platform"], manifest["columns"], manifest["rows"]) == ("linux",120,40)
           expected = {"manifest.json", "README.md"}
           for entry in manifest["screens"]:
@@ -237,6 +237,7 @@ jobs:
           required_navigation.update(["anti-dpi-setup-domains.png","anti-dpi-setup-catalog.png","anti-dpi-setup-dns.png","anti-dpi-setup-custom-dns.png","anti-dpi-setup-direct.png","anti-dpi-setup-modify.png","anti-dpi-setup-manual.png"])
           required_navigation.update(["anti-dpi-settings-guided.png","anti-dpi-settings-dns.png","anti-dpi-settings-permissions.png"])
           required_navigation.update(["anti-dpi-routing-sites.png","anti-dpi-routing-sites-preview.png","anti-dpi-diagnostic-actions.png","state-anti-dpi-report-actions.png"])
+          required_navigation.update(["anti-dpi-routing-edit-list.png","anti-dpi-routing-edit-sites.png","anti-dpi-routing-delete-preview.png"])
           assert required_navigation <= expected, f"missing navigation screenshots: {required_navigation - expected}"
           assert not obsolete_navigation & expected, "obsolete duplicate navigation screenshots"
           assert len(expected) >= 52
