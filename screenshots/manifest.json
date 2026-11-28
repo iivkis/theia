@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "source_sha": "d8e17afefc96ce4d13facc5fc3e7bc8705f8c0d3",
+  "source_sha": "7cec238cc6661a94a88ea6b89d9cdbfc532776bb",
   "platform": "linux",
   "columns": 120,
   "rows": 40,
@@ -36,7 +36,7 @@
     {
       "scenario": "client-action-new-profile",
       "file": "client-action-new-profile.png",
-      "sha256": "157826f7b2c9bf528c533f88df1e03031172fb4944b189b548b912da491df177",
+      "sha256": "aa809b2af932e7b10f845fbb863fd9b58e1d8197ddbe9e51b1e8efa1ccb9e953",
       "state_fixture": false
     },
     {
@@ -558,7 +558,7 @@
     {
       "scenario": "server-reality-status-technical",
       "file": "server-reality-status-technical.png",
-      "sha256": "2a30d3a898d64b6b5f466c3c652e2c182f2bdfd6d48e10f86a3d861d51e7c2f2",
+      "sha256": "56e5fb558f5506023e916a20259837db5674907de28f25b58fa7a273b80c8f09",
       "state_fixture": false
     },
     {
@@ -576,13 +576,25 @@
     {
       "scenario": "server-routing-edit",
       "file": "server-routing-edit.png",
-      "sha256": "e9f70b8e2572e77603116ff4331804aaee2f857bfd9970e3509106cd3071cf9f",
+      "sha256": "0a323a3679b8019e73ab1a2c5633bb70bd4da1f338ceee0d0e663f046e92677a",
       "state_fixture": false
     },
     {
       "scenario": "server-routing-geodata",
       "file": "server-routing-geodata.png",
       "sha256": "c3fc5d9c719871dcdb47222255c77bfca3004ef7c6d225aa8855e3924a7f4f3c",
+      "state_fixture": false
+    },
+    {
+      "scenario": "server-routing-geoip-picker",
+      "file": "server-routing-geoip-picker.png",
+      "sha256": "d14ab720991d28588f5ce92825a4b44269936e8b7be45486804d6113c61f35d7",
+      "state_fixture": false
+    },
+    {
+      "scenario": "server-routing-geosite-picker",
+      "file": "server-routing-geosite-picker.png",
+      "sha256": "b9332de67ac8b8240ae9b90abd999c8f535d62d127caf5aa069a68271e170404",
       "state_fixture": false
     },
     {
@@ -828,13 +840,13 @@
     {
       "scenario": "state-reality-step4-tls-consent",
       "file": "state-reality-step4-tls-consent.png",
-      "sha256": "d259837a708a0e4a3a2337b5fef244f554a70f49233d99af6d3fd5f4108a8dcd",
+      "sha256": "17a72a4f655791d2830eeb5347f083d7776b7c7e35e411427bf315325c1c4563",
       "state_fixture": true
     },
     {
       "scenario": "state-reality-step4-tls-expanded",
       "file": "state-reality-step4-tls-expanded.png",
-      "sha256": "bdd396aaf46e09eacac0f76e4a894751ee9b39ccb034ba01201efa532f379918",
+      "sha256": "705498cd5030069003a75275b5f617f033a052048c9e15fab621746ea4aa69b7",
       "state_fixture": true
     },
     {
@@ -852,37 +864,49 @@
     {
       "scenario": "state-reality-step5-long-report-scrolled",
       "file": "state-reality-step5-long-report-scrolled.png",
-      "sha256": "8e7a9ba2d4f40619ba2b7d910f1fc5a9eb534b2b3bf6b282eb400a3365bda959",
+      "sha256": "c3ba4b88a1f6e4e4ee8b4885ac1e916e11a6c31d450a3ba25a81d8a3233840ec",
       "state_fixture": true
     },
     {
       "scenario": "state-reality-step5-long-report",
       "file": "state-reality-step5-long-report.png",
-      "sha256": "ef4f4b4f10506425228aec8aaa39bbaf93a353e1a6c59e780f62488a4b0a0448",
+      "sha256": "b62854dfea93d752ebcf86601069a4117e595bc219eab72011728d82c490deca",
+      "state_fixture": true
+    },
+    {
+      "scenario": "state-reality-step5-manual-choice",
+      "file": "state-reality-step5-manual-choice.png",
+      "sha256": "bace20669fce05967b1e00b63eec1b536e757d43447a39c120431c3f2354e8c7",
+      "state_fixture": true
+    },
+    {
+      "scenario": "state-reality-step5-manual-selected",
+      "file": "state-reality-step5-manual-selected.png",
+      "sha256": "bacaf716b9f56b766b993af6afb47d17aa643276e182fa626f81b3c767669d24",
       "state_fixture": true
     },
     {
       "scenario": "state-reality-step5-no-eligible-expanded",
       "file": "state-reality-step5-no-eligible-expanded.png",
-      "sha256": "6a6811ae65380008a4d51c0de35bcddc37c5a00ec95542dae59cf8b9e095d337",
+      "sha256": "a3d10c6aca3b85138589e1dd47c30ab63e71583fc1f8b28510fa64204b457d19",
       "state_fixture": true
     },
     {
       "scenario": "state-reality-step5-no-eligible",
       "file": "state-reality-step5-no-eligible.png",
-      "sha256": "ed7b0285d869c2c08553597064e794d6152639bcaa9da6af31dea106a51f0efc",
+      "sha256": "46661efaa2bd9a3776febc87dcebe8713ee06212a5b35b59600b5325a13fe6ef",
       "state_fixture": true
     },
     {
       "scenario": "state-reality-step5-ranked-expanded",
       "file": "state-reality-step5-ranked-expanded.png",
-      "sha256": "f2237110057f48d10d56c7d780b4afb46b1f1433b0247823bbce22b06676eaac",
+      "sha256": "95838a2d4c333f28bb68281fdfd0bd63bc999f05ae1621cb3f197327c9188cde",
       "state_fixture": true
     },
     {
       "scenario": "state-reality-step5-ranked-review",
       "file": "state-reality-step5-ranked-review.png",
-      "sha256": "fcb796b68c749f904a3b8ce6ae9a25fe9310f89549ca03b4f1a18090f71b9b8f",
+      "sha256": "cd490f5ad7533d9791f7187e36be3f1907179aac34d3f54ed10e977150ff4b06",
       "state_fixture": true
     },
     {
@@ -900,7 +924,7 @@
     {
       "scenario": "state-reality-step6-save-inspection",
       "file": "state-reality-step6-save-inspection.png",
-      "sha256": "50f5a1f36c7cb6aac2a479619aaf6b345dcd60891ca87d936ee44374b17134a1",
+      "sha256": "21ec5df2d2043069e15c6b003242fa178d4e75f5df75149e6f33c7eb55684f58",
       "state_fixture": true
     },
     {
