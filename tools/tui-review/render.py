@@ -102,6 +102,7 @@ def main():
     required.update(["server-page-routing","client-page-routing","client-page-diagnostics","server-routing-rules","server-routing-edit","server-routing-geodata","server-page-users-observed","client-routing-fresh","client-routing-expired","client-routing-unconfirmed"])
     required.update(["state-profile-diagnostics-choose","state-profile-diagnostics-custom","state-profile-diagnostics-validation-error","state-profile-diagnostics-fetching","state-profile-diagnostics-consent","state-profile-diagnostics-running","state-profile-diagnostics-completed","state-profile-diagnostics-partial","state-profile-diagnostics-details","state-profile-diagnostics-blocked","state-profile-diagnostics-failed"])
     required.update(["state-reality-step5-manual-choice", "state-reality-step5-manual-selected", "server-routing-geosite-picker", "server-routing-geoip-picker"])
+    required.update(["anti-dpi-first-run","anti-dpi-overview","anti-dpi-routing","anti-dpi-routing-editor","anti-dpi-geodata","anti-dpi-catalog","anti-dpi-diagnostic-consent","state-anti-dpi-diagnostic-report"])
     required.update(["server-routing-geodata-marked", "server-routing-geodata-empty", "server-routing-geodata-missing", "server-routing-geodata-added"])
     required.update(["server-routing-geosite-reopened", "server-routing-geoip-reopened", "server-routing-geodata-clear"])
     required.update(["server-routing-geodata-removed", "server-routing-geodata-obsolete"])
