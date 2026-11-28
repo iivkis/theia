@@ -1297,8 +1297,12 @@ async fn establish_inner(
     if server && handshake.retry.is_some() {
         handshake.budget.validate();
     }
-    if socket.peer_addr().is_ok() {
-        return Err(Error::Scope);
+    // Only the explicit pinned-socket path may use a connected UDP
+    // socket. Unpinned transports must retain source-address validation.
+    match (socket.native_pinned(), socket.peer_addr()) {
+        (true, Ok(connected)) if connected == peer => {},
+        (false, Err(error)) if error.kind() == io::ErrorKind::NotConnected => {},
+        _ => return Err(Error::Scope),
     }
     let outcome = tokio::time::timeout(DEADLINE, async {
         let mut buffer = [0; super::mtu::MAX_UDP_PAYLOAD + 1];
