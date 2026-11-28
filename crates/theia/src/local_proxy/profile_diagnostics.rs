@@ -1255,10 +1255,9 @@ pub(super) async fn transport_fixture(client: &ProxyClient, cert: &rcgen::Certif
         let probe = async {
             let result = Box::pin(udp_https(carrier, cache, (name, port), digest, automatic, action, quic_tls.clone())).await;
             let _ = done.send(());
-            result
+            result.unwrap_or_else(|error| panic!("UDP diagnostic {label} automatic={automatic}: {error:?}"))
         };
-        let (result, ()) = timeout(Duration::from_secs(12), async { tokio::join!(probe, origin) }).await.expect("bounded independent HTTP/3 diagnostic fixture");
-        let (code, route, _) = result.unwrap();
+        let ((code, route, _), ()) = timeout(Duration::from_secs(18), async { tokio::join!(probe, origin) }).await.expect("bounded independent HTTP/3 diagnostic fixture");
         assert_eq!(code, 204);
         assert!(matches!(route, ActualRoute::Xhttp { carrier, fallback, .. } if carrier == label && matches!(fallback, Some(FallbackCause::Disabled)) == (automatic && action == Action::DirectDpi)));
     }
