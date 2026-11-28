@@ -2964,7 +2964,7 @@ mod tests {
         assert!(selection.targets().is_err());
         selection.focus = 0;
         selection.assign(1);
-        assert_eq!(selection.targets().unwrap(), vec![targets[0].clone(), targets[1].clone()]);
+        assert!(selection.targets().unwrap() == vec![targets[0].clone(), targets[1].clone()]);
         selection.assign(1);
         assert!(selection.targets().is_err());
         assert!(!path.exists());
