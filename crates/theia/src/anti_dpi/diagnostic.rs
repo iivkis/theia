@@ -522,7 +522,14 @@ impl Plan {
         context: RunContext<'_>,
         progress: &mut (impl FnMut(&[CellResult]) + ?Sized),
     ) -> Result<Report, ConfigError> {
-        let RunContext { active, epoch, roots, cancel, ready, permits } = context;
+        let RunContext {
+            active,
+            epoch,
+            roots,
+            cancel,
+            ready,
+            permits,
+        } = context;
         let state = State {
             plan: &self,
             active,

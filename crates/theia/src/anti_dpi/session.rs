@@ -74,7 +74,10 @@ pub(crate) enum Command {
     },
 }
 
-pub(crate) type DisconnectReceipt = (mpsc::Receiver<Result<(), String>>, tokio::sync::oneshot::Sender<()>);
+pub(crate) type DisconnectReceipt = (
+    mpsc::Receiver<Result<(), String>>,
+    tokio::sync::oneshot::Sender<()>,
+);
 
 pub(crate) struct Control {
     phase: AtomicU8,

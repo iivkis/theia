@@ -3,8 +3,8 @@
 use super::{
     event, io, tui_widgets, workspace_columns, ActionItem, Actions, Constraint, CrosstermBackend,
     Event, Field, Form, Frame, IsTerminal, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, Layout,
-    Modifier, Paragraph, Rect, RoutingPanel, Row, Style, Table, Terminal, TerminalGuard,
-    TuiError, Wrap, ACCENT, ERROR, FOCUS, MUTED, SURFACE, TEXT, WARNING,
+    Modifier, Paragraph, Rect, RoutingPanel, Row, Style, Table, Terminal, TerminalGuard, TuiError,
+    Wrap, ACCENT, ERROR, FOCUS, MUTED, SURFACE, TEXT, WARNING,
 };
 use crate::anti_dpi::{
     authority::Candidate,

@@ -6791,9 +6791,7 @@ fn record_rows(editor: &Editor, area: Rect) -> Vec<(usize, String)> {
         // even when a long hostname must wrap across several physical rows.
         let port_start = if editor.role() == Role::Client {
             label.rsplit_once(':').and_then(|(host, port)| {
-                (!port.is_empty()
-                    && port.bytes().all(|b| b.is_ascii_digit())
-                    && port.len() < width)
+                (!port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && port.len() < width)
                     .then_some(host.len())
             })
         } else {
@@ -10627,7 +10625,10 @@ mod tests {
             PreviewScope::PassiveOnly,
         )));
         click_form_field(&mut ui, &mut model, area, 1);
-        assert_eq!(ui.domain.as_ref().unwrap().domain(), Some(crate::camouflage_discovery::POPULAR_HTTPS_DOMAINS[1]));
+        assert_eq!(
+            ui.domain.as_ref().unwrap().domain(),
+            Some(crate::camouflage_discovery::POPULAR_HTTPS_DOMAINS[1])
+        );
         assert_eq!(ui.domain.as_ref().unwrap().selected_count(), 0);
         assert!(!ui.domain.as_ref().unwrap().is_running());
         ui.update(&mut model, press(KeyCode::Char('m')));
