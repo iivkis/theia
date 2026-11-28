@@ -1,6 +1,6 @@
 # Theia TUI visual review
 
-Source: 111989de199d9d57dec80f3a497f43fc4b18a5c6
+Source: 429e99a80e702dd7d7e29e4802197d35bf7a9fde
 
 Linux · 120×40 · actual production renderer cells. State fixtures and unavailable actions are not runtime success.
 
@@ -13,6 +13,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## anti-dpi-connection
 
 ![anti-dpi-connection](anti-dpi-connection.png)
+
+## anti-dpi-diagnostic-actions
+
+![anti-dpi-diagnostic-actions](anti-dpi-diagnostic-actions.png)
 
 ## anti-dpi-diagnostic-consent
 
@@ -37,6 +41,14 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## anti-dpi-routing-editor
 
 ![anti-dpi-routing-editor](anti-dpi-routing-editor.png)
+
+## anti-dpi-routing-sites-preview
+
+![anti-dpi-routing-sites-preview](anti-dpi-routing-sites-preview.png)
+
+## anti-dpi-routing-sites
+
+![anti-dpi-routing-sites](anti-dpi-routing-sites.png)
 
 ## anti-dpi-routing
 
@@ -565,6 +577,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## state-anti-dpi-export-confirm
 
 ![state-anti-dpi-export-confirm](state-anti-dpi-export-confirm.png)
+
+## state-anti-dpi-report-actions
+
+![state-anti-dpi-report-actions](state-anti-dpi-report-actions.png)
 
 ## state-disable-confirm
 

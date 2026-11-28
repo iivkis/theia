@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "source_sha": "111989de199d9d57dec80f3a497f43fc4b18a5c6",
+  "source_sha": "429e99a80e702dd7d7e29e4802197d35bf7a9fde",
   "platform": "linux",
   "columns": 120,
   "rows": 40,
@@ -12,133 +12,151 @@
     {
       "scenario": "anti-dpi-catalog",
       "file": "anti-dpi-catalog.png",
-      "sha256": "2b83afd5e91f534688e1e3df34db2efbf9231568c6077dd54a78de9200080aef",
+      "sha256": "b15c3c02d92a8e69851a7bc4526cbdf73b4857fe48670248de1d08e9431956d1",
       "state_fixture": false
     },
     {
       "scenario": "anti-dpi-connection",
       "file": "anti-dpi-connection.png",
-      "sha256": "6d3990bb275aa1470164bf358b4ecdf1ce4035bcf47aa46bfc6a7a97c085a37d",
+      "sha256": "f6bd907b069f6c8d0d57c23c73f5ead46c687958c668baa7769f9d3e4bbe9fd6",
+      "state_fixture": false
+    },
+    {
+      "scenario": "anti-dpi-diagnostic-actions",
+      "file": "anti-dpi-diagnostic-actions.png",
+      "sha256": "e224d6aeb9f0d88a1a0d92bb529fa85d8edb4394abf2c43f25fb4996e69c3b07",
       "state_fixture": false
     },
     {
       "scenario": "anti-dpi-diagnostic-consent",
       "file": "anti-dpi-diagnostic-consent.png",
-      "sha256": "6258dbf7dd08aa2429e42948e5c0c8eb6062fe099b58902e594d23e99a522025",
+      "sha256": "14c4eed3a281f3aea1bc177d63757836353f35037f38a3f49f99b4ba844ecd03",
       "state_fixture": false
     },
     {
       "scenario": "anti-dpi-first-run-preview",
       "file": "anti-dpi-first-run-preview.png",
-      "sha256": "895344cdc4fa2d155c10d836b82b497cbfe0df831af0acee948c9ca305b6ca8c",
+      "sha256": "d79ab2663f7b8db730e529269ce49da60efc4be303117ce6ffb6d79175639ba5",
       "state_fixture": false
     },
     {
       "scenario": "anti-dpi-first-run",
       "file": "anti-dpi-first-run.png",
-      "sha256": "1d3551b4c6db17dfa4973403753cdc53a253676eaed69b8652d6a0594ef88fa6",
+      "sha256": "11ea6285fc0e101a342dc7aa3f5fe7c0836ee945a567db4d4a8b8d09b28901ae",
       "state_fixture": false
     },
     {
       "scenario": "anti-dpi-geodata",
       "file": "anti-dpi-geodata.png",
-      "sha256": "1a94a0dfd0f97f5e054a8ac87ef103f9d0f341f419dfea6c133410e1437a10b3",
+      "sha256": "7a91ed36bc6cb522745b830989c940ee0c560c3b716fbff45af254351d050e40",
       "state_fixture": false
     },
     {
       "scenario": "anti-dpi-overview",
       "file": "anti-dpi-overview.png",
-      "sha256": "f5f5246fe762676ff6446ee275330f19e31a1d6704bc9036253f87d43f4f2c47",
+      "sha256": "44f3f7e07526497af084f152b12c6d1ed17d74ed429d01ea914b4357bd7650f4",
       "state_fixture": false
     },
     {
       "scenario": "anti-dpi-routing-editor",
       "file": "anti-dpi-routing-editor.png",
-      "sha256": "18b206570b51c5fb3318cec83f6ef68aeff64cf62ea55c8761783c92cb664cb8",
+      "sha256": "1382d35af6bd8c9bfb27482ee4845260492dab2db9d0e8fbbe1c347e2c00e919",
+      "state_fixture": false
+    },
+    {
+      "scenario": "anti-dpi-routing-sites-preview",
+      "file": "anti-dpi-routing-sites-preview.png",
+      "sha256": "154fd3127aec7eefa86f0195bfd0047d96d0a530215f79654293e898c5ee766e",
+      "state_fixture": false
+    },
+    {
+      "scenario": "anti-dpi-routing-sites",
+      "file": "anti-dpi-routing-sites.png",
+      "sha256": "747bdacad70fb50ba8b2612cce62280543af78004e4664b0dcc95e546c6518bd",
       "state_fixture": false
     },
     {
       "scenario": "anti-dpi-routing",
       "file": "anti-dpi-routing.png",
-      "sha256": "b67e3d60ab089a74f91c9e40d2b02f7a0c7bf2f1b0a3e7faca52dbb1d07bd11d",
+      "sha256": "2548961dca0350cf1d64c7ac3dd66316464492691dcb2d332a110bd211b6df89",
       "state_fixture": false
     },
     {
       "scenario": "anti-dpi-settings-dns",
       "file": "anti-dpi-settings-dns.png",
-      "sha256": "87329c7ad8a07f87e357058e1675ee9af0079a057bbc015d6836d9239c6e134d",
+      "sha256": "33a7b41c9e29ceb4717c231d3b7a558fe7d2369070c56272c75db2b29a344413",
       "state_fixture": false
     },
     {
       "scenario": "anti-dpi-settings-editor",
       "file": "anti-dpi-settings-editor.png",
-      "sha256": "01f3e0deea0bad908dc3c9e600948676e86c17a5d78019db65eb9a651427713a",
+      "sha256": "139011cb5a5cb2bbdaff4a7da664cf60d9e484e88cd59ee7c54e1542b385ef18",
       "state_fixture": false
     },
     {
       "scenario": "anti-dpi-settings-guided",
       "file": "anti-dpi-settings-guided.png",
-      "sha256": "e12f3f625c9fa83bc5f6dd9ad36cfa7978a976aa2437f8d2c34a23e60e1046bd",
+      "sha256": "6c327de8342a4db4c4572d62d715904f979cb46479a678ffa6e281b2efc377a8",
       "state_fixture": false
     },
     {
       "scenario": "anti-dpi-settings-permissions",
       "file": "anti-dpi-settings-permissions.png",
-      "sha256": "f44b28af9c1b8da29bd6b0d2e54a043fbb358044de4bdf4a27ca32c58062d333",
+      "sha256": "1b579a2d70b25dd6b79106f45abe442897fa48c65cfe81349d64b356fa154ce7",
       "state_fixture": false
     },
     {
       "scenario": "anti-dpi-settings",
       "file": "anti-dpi-settings.png",
-      "sha256": "c7a0e158a274b8a413aec5a9dc86c10af3d2d65d39df64f650b9a61b1b3fbb95",
+      "sha256": "8881d40a6a2d0309a2f9dc31e4b5a11315b6efc4b44d0c72a97ee8a9096c2a51",
       "state_fixture": false
     },
     {
       "scenario": "anti-dpi-setup-catalog",
       "file": "anti-dpi-setup-catalog.png",
-      "sha256": "723dd69060fb3659b55d72507ac7ee555697ed2c674ac4ee75d19bbfa8c00d0c",
+      "sha256": "452e666252f40a98cf631744e94220e052b07990378a94438c7a43939771ab99",
       "state_fixture": false
     },
     {
       "scenario": "anti-dpi-setup-custom-dns",
       "file": "anti-dpi-setup-custom-dns.png",
-      "sha256": "d6824ce7cfc3fdb1095792236d3064194a697f3cd2ffbadebda00c6c20bb3ccd",
+      "sha256": "6bdff021ca269b25f6a00045e8dc3583bfa4eb635754982d366075a5d230b21a",
       "state_fixture": false
     },
     {
       "scenario": "anti-dpi-setup-direct",
       "file": "anti-dpi-setup-direct.png",
-      "sha256": "d8c0b0ff2c26cf2f0fc94b03b1d7330773802264de2c390878e8b3fef5db94b1",
+      "sha256": "9b697a4808a9c17b44200426feba46010fcbff6621ae3c4b744416e23595d154",
       "state_fixture": false
     },
     {
       "scenario": "anti-dpi-setup-dns",
       "file": "anti-dpi-setup-dns.png",
-      "sha256": "a58ffe037565abe373fb03a98e8f6feba824588846885fabb46c3da82abef2f2",
+      "sha256": "6c7fbe6e41b17056d6889293803a7725ab276d4ea1566250e4524511c6c924ad",
       "state_fixture": false
     },
     {
       "scenario": "anti-dpi-setup-domains",
       "file": "anti-dpi-setup-domains.png",
-      "sha256": "62af18894c8e5099480968c11ea8ea55142cec1fb7e9570f4b21605d7d8763f9",
+      "sha256": "9eab84beabdd2d20292a42a81c1cdd083e92ba9bbfc057bbc606f175ad4ec496",
       "state_fixture": false
     },
     {
       "scenario": "anti-dpi-setup-manual",
       "file": "anti-dpi-setup-manual.png",
-      "sha256": "72949381f381839dc5d28793db66f987a50768357dda802196d6c08e6c75817a",
+      "sha256": "51e60791c490df906cdd0b58a9c12e848eae9289796456c2e4188025eba2b0ac",
       "state_fixture": false
     },
     {
       "scenario": "anti-dpi-setup-modify",
       "file": "anti-dpi-setup-modify.png",
-      "sha256": "4412fef3aefa0683c9730df43999cd1529ef706ead74beca476e29807cd5977b",
+      "sha256": "dec800dec6fdd5ae6da881f1a2309e1dfd58af812f176a3171d1aeb946a26653",
       "state_fixture": false
     },
     {
       "scenario": "anti-dpi-statistics",
       "file": "anti-dpi-statistics.png",
-      "sha256": "5105938d699b1c1a3e0cd1ac79c09b52a16098a92818e6ca576674f074a6b153",
+      "sha256": "b11ad54e40a0af03d8b225f2b861d039b89d19ff2f25b245b23a67aaa39c5f9a",
       "state_fixture": false
     },
     {
@@ -168,7 +186,7 @@
     {
       "scenario": "client-action-new-profile",
       "file": "client-action-new-profile.png",
-      "sha256": "a3b3ea40bed3a08c532906bf8414f9868a1664ed8627f5f3c41fbf882f9503a2",
+      "sha256": "90b9365036c33b5f4264e3b988d25c7f927a15e1519f6d702774244cf869c9fb",
       "state_fixture": false
     },
     {
@@ -690,7 +708,7 @@
     {
       "scenario": "server-reality-status-technical",
       "file": "server-reality-status-technical.png",
-      "sha256": "a614b9f0068c631ce1988bbb0009e605b6b066200e7bca72cde7affa29a2ea7c",
+      "sha256": "5e3469a685399685c9ceba4c9b50a60a6e88d011a6ac2e5adf0f271cac213d59",
       "state_fixture": false
     },
     {
@@ -816,37 +834,43 @@
     {
       "scenario": "state-anti-dpi-diagnostic-cancelled",
       "file": "state-anti-dpi-diagnostic-cancelled.png",
-      "sha256": "34b2a74a1a64db8442a88991c6529a879219781c0d7127dfea2ef360135b7fa3",
+      "sha256": "740eb912dac8113e911aa7ffb2151fd026b838d2ef4a9b9c5c4a5101c27d28ee",
       "state_fixture": true
     },
     {
       "scenario": "state-anti-dpi-diagnostic-cell",
       "file": "state-anti-dpi-diagnostic-cell.png",
-      "sha256": "344aeb0aa2aba868dab8c08dd3e1fa9f0be63e311dee9c42a348ab70ed051188",
+      "sha256": "c10d3951d99315f30c3f62cc6171d08fb66f9501dedcafb18bd6d7c902feab11",
       "state_fixture": true
     },
     {
       "scenario": "state-anti-dpi-diagnostic-progress",
       "file": "state-anti-dpi-diagnostic-progress.png",
-      "sha256": "fe128facdc52e350fe169f7b2df93d14e5aeeb68a13c62b4f35e917a4131ac29",
+      "sha256": "b4bf611906217659b44b6042162a7323d9e6518ed6da9ca718bf1e2240da85da",
       "state_fixture": true
     },
     {
       "scenario": "state-anti-dpi-diagnostic-quic",
       "file": "state-anti-dpi-diagnostic-quic.png",
-      "sha256": "af47a1547df8ea5a1bfcdaa4cf2f82282a7c089e040a4cd952582adc89c9628f",
+      "sha256": "834bf9b7b89b592c4af4cba2350dc98bc2e0b1504b4d3f9b0a37fd50f9aa42db",
       "state_fixture": true
     },
     {
       "scenario": "state-anti-dpi-diagnostic-report",
       "file": "state-anti-dpi-diagnostic-report.png",
-      "sha256": "fc13c5b8d828aa28a1ccb89e4c330c0a7d6f9ad17bd292301d6751da9d693458",
+      "sha256": "299328492ef7415bd309f6205644b63b4cb3b7c0da59c74c2bc47cd11b6ea8a7",
       "state_fixture": true
     },
     {
       "scenario": "state-anti-dpi-export-confirm",
       "file": "state-anti-dpi-export-confirm.png",
-      "sha256": "580221adae883189f216d3527c7650d3beefb3edd606ac1db221bba0ba76c819",
+      "sha256": "ec2cfec0d8eeeccea6421597b7eccacb21d8952faf4e80a6bbcd1827cd92e21d",
+      "state_fixture": true
+    },
+    {
+      "scenario": "state-anti-dpi-report-actions",
+      "file": "state-anti-dpi-report-actions.png",
+      "sha256": "0b1e31600fa26c1027eb61e3295d6d41295842bd5a7c04cac85d9a79a143c71e",
       "state_fixture": true
     },
     {
@@ -1146,7 +1170,7 @@
     {
       "scenario": "state-reality-step6-save-inspection",
       "file": "state-reality-step6-save-inspection.png",
-      "sha256": "5853c3d02e1ac171cbbfd560ef6f29bd90ab1d64b522558449f0162e1df3e9c4",
+      "sha256": "a83f0a7947436fff9c3ccb00927109571031607fbc7fa1aa23648522b5a78605",
       "state_fixture": true
     },
     {
