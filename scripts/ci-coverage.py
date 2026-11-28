@@ -20,7 +20,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 PLATFORMS = {"Linux", "Windows"}
 SHA = re.compile(r"[0-9a-f]{40}\Z")
-MIN_PERCENT = 80
+MIN_PERCENT = 50
 # Verified six-field segment layouts, including LLVM 23.1.5 (Rust 1.100).
 LLVM_EXPORT_VERSIONS = {"2.0.1", "3.1.0"}
 

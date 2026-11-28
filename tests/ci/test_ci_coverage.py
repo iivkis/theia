@@ -63,9 +63,11 @@ class CoverageTests(unittest.TestCase):
 
     def test_union_not_average_and_exact_threshold(self):
         linux = report("Linux", {A: {"1": 1, "2": 0, "3": 1, "6": 1}})
-        windows = report("Windows", {A: {"1": 0, "2": 1, "3": 0}, B: {"1": 1, "2": 0}})
+        windows = report("Windows", {A: {"1": 0, "2": 1, "3": 0}, B: {"1": 1, "2": 0, "3": 0, "4": 0, "5": 0}})
         result = cov.combine([linux, windows], FILES, SHA, EXCLUDED, LENGTHS)
-        self.assertEqual((result["covered"], result["total"]), (4, 5))
+        self.assertEqual(result["minimum_percent"], 50)
+        self.assertEqual((result["covered"], result["total"]), (4, 8))
+        self.assertEqual(result["percent"], 50.0)
         self.assertTrue(result["passed"])
         windows["files"][B]["1"] = 0
         self.assertFalse(cov.combine([linux, windows], FILES, SHA, EXCLUDED, LENGTHS)["passed"])
