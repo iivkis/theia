@@ -443,7 +443,14 @@ impl Monitor {
     /// the same chart scale; the history is bounded to 60 sampled intervals.
     pub(crate) fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         tui_widgets::canvas(frame, area);
-        if area.width < 46 || area.height < 17 || (area.width < 86 && area.height < 27) {
+        let idle = self.current.iter().all(|s| s.active == 0)
+            && self.history.iter().all(|sample| sample.iter().all(|&v| v == 0));
+        if idle || area.width < 46 || area.height < 17 || (area.width < 86 && area.height < 27) {
+            let area = if idle && area.width >= 86 {
+                Rect::new(area.x, area.y, area.width, area.height.min(13))
+            } else {
+                area
+            };
             frame.render_widget(
                 Paragraph::new(self.body())
                     .wrap(Wrap { trim: false })
@@ -628,8 +635,13 @@ impl Monitor {
         }
         if self.history.is_empty() {
             result.push_str(
-                "\nСбор первого интервала скорости; нулевой отсчёт не означает отсутствие трафика.",
+                "\nСбор первого измерения скорости; отсутствие отсчёта не означает отсутствие трафика.",
             );
+        }
+        if !self.history.is_empty()
+            && self.history.iter().all(|sample| sample.iter().all(|&v| v == 0))
+        {
+            result.push_str("\nВ измеренных интервалах нет трафика.");
         }
         result.push_str("\nОбновление 1 с • Esc: назад");
         result
