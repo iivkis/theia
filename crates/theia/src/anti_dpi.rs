@@ -5,6 +5,8 @@ pub mod authority;
 pub mod catalog;
 pub mod diagnostic;
 pub(crate) mod dns;
+#[cfg(windows)]
+pub(crate) mod session;
 pub use dns::DnsError;
 
 use crate::{

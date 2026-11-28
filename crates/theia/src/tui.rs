@@ -1168,6 +1168,8 @@ impl GeoPicker {
 }
 
 struct RoutingPanel {
+    standalone: bool,
+    save_requested: bool,
     settings: crate::routing::Settings,
     original: crate::routing::Settings,
     search: Option<String>,
@@ -1205,7 +1207,27 @@ impl RoutingPanel {
                     .unwrap_or(Path::new("."))
                     .join("geodata")
             });
+        Self::from_settings(settings, directory, false)
+    }
+
+    fn for_standalone(document: &crate::anti_dpi::Document, path: &Path) -> Self {
+        let local = &document.anti_dpi;
+        let settings = crate::routing::Settings {
+            revision: local.revision,
+            geodata_directory: local.geodata.as_ref().map(|g| g.directory.clone()),
+            diagnostic_domains: crate::routing::snapshot::default_diagnostic_domains(),
+            rules: local.rules.clone(),
+            datasets: local.geodata.as_ref().map(|g| g.manifest.clone()),
+        };
+        let directory = settings.geodata_directory.as_ref().map(PathBuf::from)
+            .unwrap_or_else(|| path.parent().unwrap_or(Path::new(".")).join("geodata"));
+        Self::from_settings(settings, directory, true)
+    }
+
+    fn from_settings(settings: crate::routing::Settings, directory: PathBuf, standalone: bool) -> Self {
         Self {
+            standalone,
+            save_requested: false,
             original: settings.clone(),
             settings,
             search: None,
@@ -1232,6 +1254,17 @@ impl RoutingPanel {
             None => value,
         }
     }
+    fn display_action(&self, value: &str) -> &str {
+        if self.standalone && crate::routing::Action::from_name(value) == Some(crate::routing::Action::DirectDpi) {
+            "Anti-DPI (без резервного маршрута)"
+        } else {
+            // All canonical action names have static Russian labels.
+            match crate::routing::Action::from_name(value) {
+                Some(action) => Self::action_label(action.name()),
+                None => "Неизвестное действие",
+            }
+        }
+    }
     fn edit(&mut self, index: Option<usize>) {
         let values = index
             .and_then(|i| self.settings.rules.get(i))
@@ -1247,7 +1280,7 @@ impl RoutingPanel {
             .unwrap_or_else(|| {
                 [
                     String::new(),
-                    crate::routing::Action::Allowed.name().into(),
+                    (if self.standalone { crate::routing::Action::Direct } else { crate::routing::Action::Allowed }).name().into(),
                     String::new(),
                     String::new(),
                     String::new(),
@@ -1521,10 +1554,9 @@ impl RoutingPanel {
             key: 'B',
             label: "Управление базами GeoData",
         });
-        items.push(ActionItem {
-            key: 'G',
-            label: "Домены диагностики клиентов",
-        });
+        if !self.standalone {
+            items.push(ActionItem { key: 'G', label: "Домены диагностики клиентов" });
+        }
         if count > 1 {
             items.push(ActionItem {
                 key: '/',
@@ -1568,7 +1600,7 @@ impl RoutingPanel {
             fields: definitions.iter().map(|&(id, label, hint)| Field {
                 id, label, hint,
                 value: match id {
-                    1 => Self::action_label(&values[id]).to_owned(),
+                    1 => self.display_action(&values[id]).to_owned(),
                     5 | 6 => "Открыть поиск (F6)".into(),
                     _ => values[id].clone(),
                 },
@@ -1597,7 +1629,7 @@ impl RoutingPanel {
         if let Some([report, controls]) = self.layout(area) {
             if self.fields.is_none() && self.download.is_none() && !self.geodata_mode {
                 let info = format!(
-                    "GeoData: {} · {}\nПервое совпадение сверху; остальные — через сервер.",
+                    "GeoData: {} · {}\nПервое совпадение сверху; остальные — {}.",
                     self.settings
                         .datasets
                         .as_ref()
@@ -1606,7 +1638,8 @@ impl RoutingPanel {
                         "без изменений"
                     } else {
                         "черновик изменён"
-                    }
+                    },
+                    if self.standalone { "напрямую при всех NoMatch" } else { "через сервер" }
                 );
                 let header = Rect::new(report.x, report.y, report.width, 3.min(report.height));
                 panel(
@@ -1659,7 +1692,7 @@ impl RoutingPanel {
                             format!("{} {}", if chosen { "›" } else { " " }, i + 1),
                             rule.name.clone(),
                             conditions,
-                            Self::action_label(Self::action_name(rule.action)).to_owned(),
+                            self.display_action(Self::action_name(rule.action)).to_owned(),
                         ])
                         .style(
                             Style::default().fg(if chosen { ACCENT } else { TEXT }).bg(
@@ -1691,13 +1724,14 @@ impl RoutingPanel {
                     let footer = if !self.message.is_empty() {
                         self.message.clone()
                     } else if self.settings.rules.is_empty() {
-                        "Нет правил · по умолчанию: через сервер".into()
+                        if self.standalone { "Нет правил · по умолчанию: напрямую".into() } else { "Нет правил · по умолчанию: через сервер".into() }
                     } else {
                         format!(
-                            "{}–{} / {} · по умолчанию: через сервер · Tab действия",
+                            "{}–{} / {} · по умолчанию: {} · Tab действия",
                             start + 1,
                             (start + capacity).min(self.settings.rules.len()),
-                            self.settings.rules.len()
+                            self.settings.rules.len(),
+                            if self.standalone { "напрямую" } else { "через сервер" }
                         )
                     };
                     frame.render_widget(
@@ -1891,7 +1925,9 @@ impl RoutingPanel {
                     fields[*focus].clear()
                 }
                 KeyCode::Left | KeyCode::Right if *focus == 1 => {
-                    let options = crate::routing::Action::ALL.map(crate::routing::Action::name);
+                    let options = crate::routing::Action::ALL.into_iter()
+                        .filter(|action| !self.standalone || *action != crate::routing::Action::Allowed)
+                        .map(crate::routing::Action::name).collect::<Vec<_>>();
                     let index = options.iter().position(|a| *a == fields[1]).unwrap_or(0);
                     let next = if key.code == KeyCode::Right {
                         (index + 1) % options.len()
@@ -1918,6 +1954,10 @@ impl RoutingPanel {
                         self.message = "Выберите действие стрелками влево или вправо.".into();
                         return true;
                     };
+                    if self.standalone && action == crate::routing::Action::Allowed {
+                        self.message = "Маршрут через сервер недоступен в самостоятельной роли.".into();
+                        return true;
+                    }
                     let split = |s: &str| {
                         s.split(|c: char| c == ',' || c.is_whitespace())
                             .filter(|s| !s.is_empty())
@@ -2008,7 +2048,7 @@ impl RoutingPanel {
                 self.geodata_mode = true;
                 self.action_focus = Some(0);
             }
-            KeyCode::Char('G') => {
+            KeyCode::Char('G') if !self.standalone => {
                 self.diagnostic_input = Some(self.settings.diagnostic_domains.join(", "));
                 self.message.clear();
             }
@@ -2049,6 +2089,9 @@ impl RoutingPanel {
                         Ok(()) => return false,
                         Err(e) => self.message = e.into(),
                     }
+                } else if self.standalone {
+                    self.save_requested = true;
+                    return false;
                 }
             }
             _ => {}
@@ -2079,7 +2122,7 @@ impl RoutingPanel {
             .enumerate()
             {
                 let value = if i == 1 {
-                    Self::action_label(value)
+                    self.display_action(value)
                 } else {
                     value.as_str()
                 };
@@ -2091,11 +2134,12 @@ impl RoutingPanel {
             body.push_str("\nДомены: example.org или geosite:google\nIP: 192.0.2.0/24 или geoip:private · через запятую\nПриложение: sha256: + 64 строчных hex-символа; в MVP нет атрибуции\nGeoIP Lite: in-ru, in-cn, in-ir — региональные наборы, не геолокация\n\n↑↓ / Tab: поле · ←→: действие · Ctrl+U: очистить\nEnter: принять правило · Esc: отменить");
         } else {
             body.push_str(&format!(
-                "GeoData: {} (GeoSite Standard + GeoIP Lite)\nПравила проверяются сверху вниз. Без совпадения — через сервер.\n",
+                "GeoData: {} (GeoSite Standard + GeoIP Lite)\nПравила проверяются сверху вниз. Без совпадения — {}.\n",
                 self.settings
                     .datasets
                     .as_ref()
-                    .map_or("не выбраны", |m| m.release.as_str())
+                    .map_or("не выбраны", |m| m.release.as_str()),
+                if self.standalone { "напрямую только при всех NoMatch" } else { "через сервер" }
             ));
             let start = self.selected.saturating_sub(3);
             for (i, rule) in self.settings.rules.iter().enumerate().skip(start).take(7) {
@@ -2104,7 +2148,7 @@ impl RoutingPanel {
                     if i == self.selected { "›" } else { " " },
                     i + 1,
                     rule.name,
-                    Self::action_label(Self::action_name(rule.action))
+                    self.display_action(Self::action_name(rule.action))
                 ));
             }
             if self.settings.rules.is_empty() {

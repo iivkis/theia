@@ -341,23 +341,59 @@ impl Plan {
         if roots.is_empty() {
             return Err(invalid("diagnostic", "native trust roots unavailable"));
         }
+        self.run_context(&active, epoch, &roots, cancel, &|| true, None, &mut progress).await
+    }
+
+    /// The caller is the actual runtime that holds the Windows proxy owner.
+    /// No second reservation, no OS mutation, and no externally asserted owner.
+    #[cfg(windows)]
+    pub(crate) async fn run_owned(
+        self,
+        confirmation: [u8; 32],
+        active: &super::authority::Active,
+        epoch: u64,
+        roots: &rustls::RootCertStore,
+        cancel: &AtomicBool,
+        ready: &(dyn Fn() -> bool + Sync),
+        permits: &tokio::sync::Semaphore,
+        mut progress: impl FnMut(&[CellResult]),
+    ) -> Result<Report, ConfigError> {
+        if self.digest != confirmation || !self.files_current()
+            || !active.matches_path(&self.saved.path)
+            || active.policy().digest() != self.policy.digest()
+            || !active.live() || !ready() {
+            return Err(invalid("diagnostic.owner", "owned policy or connection changed; review again"));
+        }
+        self.run_context(active, epoch, roots, cancel, ready, Some(permits), &mut progress).await
+    }
+
+    async fn run_context(
+        self,
+        active: &super::authority::Active,
+        epoch: u64,
+        roots: &rustls::RootCertStore,
+        cancel: &AtomicBool,
+        ready: &(dyn Fn() -> bool + Sync),
+        permits: Option<&tokio::sync::Semaphore>,
+        progress: &mut (impl FnMut(&[CellResult]) + ?Sized),
+    ) -> Result<Report, ConfigError> {
         let state = State {
-            plan: &self,
-            active: &active,
-            epoch,
-            cancel,
+            plan: &self, active, epoch, cancel, ready, permits,
             stale: AtomicBool::new(false),
             deadline: Instant::now() + JOB_BUDGET,
         };
         let mut cells = Vec::new();
-        for group in self.hosts.chunks(CONCURRENCY) {
+        // Keep at least two of the four shared permits available for production.
+        // Pre-connect diagnostics still use four independent rows.
+        let concurrency = if permits.is_some() { 2 } else { CONCURRENCY };
+        for group in self.hosts.chunks(concurrency) {
             // Fixed-size batches of borrowed futures: no detached tasks.
             // Dropping the job drops every active socket before owner release.
             let (a, b, c, d) = tokio::join!(
-                optional_row(&state, group.first(), &roots),
-                optional_row(&state, group.get(1), &roots),
-                optional_row(&state, group.get(2), &roots),
-                optional_row(&state, group.get(3), &roots),
+                optional_row(&state, group.first(), roots),
+                optional_row(&state, group.get(1), roots),
+                optional_row(&state, group.get(2), roots),
+                optional_row(&state, group.get(3), roots),
             );
             for row in [a, b, c, d] {
                 if !row.is_empty() {
@@ -392,6 +428,8 @@ struct State<'a> {
     active: &'a super::authority::Active,
     epoch: u64,
     cancel: &'a AtomicBool,
+    ready: &'a (dyn Fn() -> bool + Sync),
+    permits: Option<&'a tokio::sync::Semaphore>,
     stale: AtomicBool,
     deadline: Instant,
 }
@@ -401,7 +439,7 @@ impl State<'_> {
         if self.stale.load(Ordering::Acquire) {
             return false;
         }
-        if network_scope::generation() != Some(self.epoch) || !self.plan.files_current() || !self.active.live() {
+        if !(self.ready)() || network_scope::generation() != Some(self.epoch) || !self.plan.files_current() || !self.active.live() {
             self.stale.store(true, Ordering::Release);
             return false;
         }
@@ -507,6 +545,24 @@ async fn row(state: &State<'_>, host: &str, roots: &rustls::RootCertStore) -> Ve
     }
     let live = || state.live();
     let dns_deadline = (started + CELL_BUDGET).min(state.deadline);
+    let _permit = if let Some(permits) = state.permits {
+        let acquired = tokio::select! {
+            biased;
+            _ = crate::net::guarded_io::revoked(&live) => None,
+            result = tokio::time::timeout_at(dns_deadline, permits.acquire()) =>
+                result.ok().and_then(Result::ok),
+        };
+        match acquired {
+            Some(permit) => Some(permit),
+            None => {
+                let reason = state.stop_reason().unwrap_or(Reason::Budget);
+                for (column, cell) in columns.iter().zip(&mut cells) {
+                    if column.unavailable().is_none() { stopped(cell, reason); }
+                }
+                return cells;
+            }
+        }
+    } else { None };
     let result = dns::resolve(
         state.active.document().anti_dpi.resolver.as_ref(),
         state.active.policy(),

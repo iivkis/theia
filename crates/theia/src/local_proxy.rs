@@ -21,6 +21,16 @@ mod standalone;
 pub async fn run_standalone(candidate: crate::anti_dpi::authority::Candidate, expected: [u8; 32]) -> Result<(), ClientError> {
     Box::pin(standalone::run(candidate, expected)).await
 }
+#[cfg(windows)]
+pub(crate) async fn run_standalone_controlled(
+    candidate: crate::anti_dpi::authority::Candidate,
+    expected: [u8; 32],
+    control: Arc<crate::anti_dpi::session::Control>,
+    commands: tokio::sync::mpsc::Receiver<crate::anti_dpi::session::Command>,
+) -> Result<(), ClientError> {
+    Box::pin(standalone::run_controlled(candidate, expected, control, commands)).await
+}
+
 #[cfg(all(any(feature = "native-ingress-lab", test), target_os = "linux"))]
 pub use native::LabStunPermit;
 #[cfg(all(any(feature = "native-ingress-lab", test), any(target_os = "linux", target_os = "windows")))]

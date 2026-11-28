@@ -1,7 +1,7 @@
 //! Independent, functional standalone diagnostic workspace. Uses the same
 //! terminal, catalogue, exact plan consent and backend as the CLI.
 use super::{io, event, Event, KeyCode, KeyEventKind, KeyModifiers, Terminal, CrosstermBackend,
-    Frame, Layout, Constraint, Paragraph, Row, Table, Wrap, Style, Line,
+    Frame, Layout, Constraint, Paragraph, Row, Table, Wrap, Style, Line, KeyEvent, RoutingPanel,
     TEXT, MUTED, ACCENT, SURFACE, FOCUS, WARNING, tui_widgets, TuiError, TerminalGuard, IsTerminal};
 use crate::anti_dpi::{
     authority::Candidate,
@@ -50,6 +50,10 @@ fn status(cell: Option<&CellResult>) -> &'static str {
     }
 }
 
+#[cfg(windows)]
+use crate::anti_dpi::session::{Control, DiagnosticUpdate as Update, Phase};
+
+#[cfg(not(windows))]
 enum Update {
     Cells(Vec<CellResult>),
     Done(Result<Report, String>),
@@ -80,6 +84,15 @@ impl Worker {
         Ok(Self { cancel, updates, thread: Some(thread), total })
     }
 
+    #[cfg(windows)]
+    fn start_owned(plan: Plan, control: &Control) -> Result<Self, String> {
+        let total = plan.planned_cells();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (send, updates) = mpsc::channel();
+        control.diagnose(plan, cancel.clone(), send).map_err(|e| e.to_string())?;
+        Ok(Self { cancel, updates, thread: None, total })
+    }
+
     fn cancel(&self) { self.cancel.store(true, Ordering::Release); }
 }
 
@@ -93,6 +106,41 @@ impl Drop for Worker {
 enum Review {
     Diagnostic(Plan),
     Policy(Candidate, bool),
+    #[cfg(windows)]
+    Connect(Candidate),
+    #[cfg(windows)]
+    Disconnect(bool),
+}
+
+#[cfg(windows)]
+struct OwnedSession {
+    control: Arc<Control>,
+    thread: Option<thread::JoinHandle<Result<(), String>>>,
+}
+
+#[cfg(windows)]
+impl OwnedSession {
+    fn start(candidate: Candidate) -> Result<Self, String> {
+        let digest = candidate.digest();
+        let (control, commands) = Control::channel();
+        let owner = control.clone();
+        let thread = thread::Builder::new().name("theia-f20-owner".into()).spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2)
+                .thread_stack_size(8 * 1024 * 1024).enable_all().build()
+                .map_err(|_| "Не удалось создать runtime".to_owned())?;
+            runtime.block_on(crate::local_proxy::run_standalone_controlled(candidate, digest, owner, commands))
+                .map_err(|error| error.to_string())
+        }).map_err(|_| "Не удалось запустить локальный runtime".to_owned())?;
+        Ok(Self { control, thread: Some(thread) })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for OwnedSession {
+    fn drop(&mut self) {
+        self.control.disconnect();
+        if let Some(thread) = self.thread.take() { let _ = thread.join(); }
+    }
 }
 
 struct Panel {
@@ -110,6 +158,14 @@ struct Panel {
     review: Option<Review>,
     review_scroll: u16,
     worker: Option<Worker>,
+    routing: Option<(RoutingPanel, Document, Vec<u8>)>,
+    #[cfg(windows)]
+    session: Option<OwnedSession>,
+    #[cfg(windows)]
+    apply_reply: Option<mpsc::Receiver<Result<(), String>>>,
+    #[cfg(windows)]
+    exit_after_stop: bool,
+    leave_requested: bool,
     notice: String,
     overview: bool,
 }
@@ -132,7 +188,14 @@ impl Panel {
         let catalog = Catalog::build(&overlay).map_err(|_| TuiError::Configuration("invalid diagnostic catalogue"))?;
         Ok(Self { path, overlay_path, overlay, overlay_bytes, catalog, selected: BTreeSet::new(),
             results: BTreeMap::new(), row: 0, offset: 0, filter: String::new(), editing: None,
-            review: None, review_scroll: 0, worker: None,
+            review: None, review_scroll: 0, worker: None, routing: None,
+            #[cfg(windows)]
+            session: None,
+            #[cfg(windows)]
+            apply_reply: None,
+            #[cfg(windows)]
+            exit_after_stop: false,
+            leave_requested: false,
             notice: "Запросы выполняются только после подтверждения плана.".into(), overview: true })
     }
 
@@ -161,6 +224,31 @@ impl Panel {
     }
 
     fn poll(&mut self) {
+        if let Some((panel, _, _)) = &mut self.routing { panel.poll(); }
+        #[cfg(windows)]
+        {
+            if let Some(reply) = &self.apply_reply {
+                match reply.try_recv() {
+                    Ok(result) => {
+                        self.apply_reply = None;
+                        self.notice = result.map_or_else(|e| e, |_| "Политика применена без перезапуска; прежние потоки отозваны.".into());
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.apply_reply = None;
+                        self.notice = "Apply: ответ владельца не получен; проверьте состояние.".into();
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+            }
+            if self.session.as_ref().and_then(|s| s.thread.as_ref()).is_some_and(|t| t.is_finished()) {
+                if let Some(mut session) = self.session.take() {
+                    let result = session.thread.take().unwrap().join().unwrap_or_else(|_| Err("Runtime завершился аварийно".into()));
+                    self.leave_requested = self.exit_after_stop && result.is_ok();
+                    self.exit_after_stop = false;
+                    self.notice = result.map_or_else(|error| format!("Остановка: {error}; проверьте восстановление прокси."), |_| "Отключено; условное восстановление завершено.".into());
+                }
+            }
+        }
         let mut done = None;
         if let Some(worker) = &self.worker {
             loop {
@@ -188,6 +276,53 @@ impl Panel {
                     self.notice = "Задание завершено. Доступность не доказывает обход DPI.".into();
                 }
                 Err(error) => self.notice = error,
+            }
+        }
+    }
+
+    fn open_routing(&mut self) {
+        let result = (|| {
+            let bytes = crate::config::editor_bytes(&self.path).map_err(|e| e.to_string())?;
+            let document = Document::parse(std::str::from_utf8(&bytes).map_err(|_| "Некорректный UTF-8".to_owned())?)
+                .map_err(|e| e.to_string())?;
+            let panel = RoutingPanel::for_standalone(&document, &self.path);
+            Ok::<_, String>((panel, document, bytes))
+        })();
+        match result {
+            Ok(panel) => self.routing = Some(panel),
+            Err(error) => self.notice = error,
+        }
+    }
+
+    fn routing_key(&mut self, key: KeyEvent) {
+        let Some((mut panel, document, bytes)) = self.routing.take() else { return };
+        if panel.key(key, None) {
+            self.routing = Some((panel, document, bytes));
+            return;
+        }
+        if !panel.save_requested { return; }
+        panel.save_requested = false;
+        let mut next = document.clone();
+        let result = (|| {
+            next.anti_dpi.revision = document.anti_dpi.revision.checked_add(1)
+                .ok_or("Исчерпан номер ревизии".to_owned())?;
+            next.anti_dpi.rules = panel.settings.rules.clone();
+            next.anti_dpi.geodata = match (&panel.settings.geodata_directory, &panel.settings.datasets) {
+                (Some(directory), Some(manifest)) => Some(crate::anti_dpi::GeoData { directory: directory.clone(), manifest: manifest.clone() }),
+                (None, None) => None,
+                _ => return Err("Неполная пара GeoData".into()),
+            };
+            next.prepare().map_err(|e| e.to_string())?;
+            next.save(&self.path, Some(&bytes)).map_err(|e| format!("{e:?}"))
+        })();
+        match result {
+            Ok(()) => {
+                self.notice = "Сохранён новый черновик. Для публикации выберите Apply.".into();
+                self.results.clear();
+            }
+            Err(error) => {
+                panel.message = error;
+                self.routing = Some((panel, document, bytes));
             }
         }
     }
@@ -221,6 +356,12 @@ impl Panel {
     }
 
     fn key(&mut self, code: KeyCode) -> Result<bool, TuiError> {
+        if self.routing.is_some() {
+            self.routing_key(KeyEvent::new(code, KeyModifiers::NONE));
+            return Ok(false);
+        }
+        #[cfg(windows)]
+        if self.apply_reply.is_some() { return Ok(false); }
         if let Some((custom, mut text)) = self.editing.take() {
             match code {
                 KeyCode::Esc => {}
@@ -253,6 +394,18 @@ impl Panel {
                 KeyCode::Char('y') => if let Some(review) = self.review.take() {
                     match review {
                         Review::Policy(candidate, enroll) => {
+                            #[cfg(windows)]
+                            if let Some(session) = &self.session {
+                                if enroll {
+                                    self.notice = "Регистрация недоступна при активном владельце.".into();
+                                } else {
+                                    match session.control.apply(candidate) {
+                                        Ok(reply) => { self.apply_reply = Some(reply); self.notice = "Apply выполняется владельцем…".into(); }
+                                        Err(error) => self.notice = error.to_string(),
+                                    }
+                                }
+                                return Ok(false);
+                            }
                             let digest = candidate.digest();
                             let result = if enroll { candidate.enroll(digest) } else { candidate.apply(digest) };
                             self.notice = result.map_or_else(|e| e.to_string(),
@@ -260,8 +413,29 @@ impl Panel {
                         }
                         Review::Diagnostic(plan) => {
                             self.results.clear();
+                            #[cfg(windows)]
+                            if let Some(session) = &self.session {
+                                match Worker::start_owned(plan, &session.control) {
+                                    Ok(worker) => { self.worker = Some(worker); self.notice = "Диагностика в собственной сессии; Esc отменяет.".into(); }
+                                    Err(error) => self.notice = error,
+                                }
+                                return Ok(false);
+                            }
                             self.worker = Some(Worker::start(plan)?);
                             self.notice = "Диагностика выполняется. Esc отменяет задание.".into();
+                        }
+                        #[cfg(windows)]
+                        Review::Connect(candidate) => match OwnedSession::start(candidate) {
+                            Ok(session) => { self.session = Some(session); self.notice = "Подготовка listeners и WinINet…".into(); }
+                            Err(error) => self.notice = error,
+                        },
+                        #[cfg(windows)]
+                        Review::Disconnect(exit) => {
+                            if let Some(session) = &self.session {
+                                self.exit_after_stop = exit;
+                                session.control.disconnect();
+                                self.notice = "Отключение и условное восстановление настроек…".into();
+                            }
                         }
                     }
                 },
@@ -277,11 +451,33 @@ impl Panel {
             return Ok(false);
         }
         match code {
-            KeyCode::Esc | KeyCode::Char('q') => return Ok(true),
+            KeyCode::Esc | KeyCode::Char('q') => {
+                #[cfg(windows)]
+                if self.session.is_some() {
+                    self.review = Some(Review::Disconnect(true));
+                    self.review_scroll = 0;
+                    return Ok(false);
+                }
+                return Ok(true);
+            },
             KeyCode::Tab | KeyCode::BackTab => self.overview = !self.overview,
             KeyCode::Char('n') if self.overview => self.create_config(),
             KeyCode::Char('e') if self.overview => self.begin_review(Some(true)),
             KeyCode::Char('a') if self.overview => self.begin_review(Some(false)),
+            KeyCode::Char('r') if self.overview => self.open_routing(),
+            KeyCode::Char('p') if self.overview => {
+                #[cfg(windows)]
+                {
+                    self.review_scroll = 0;
+                    if self.session.is_some() { self.review = Some(Review::Disconnect(false)); }
+                    else { match Candidate::read(&self.path) {
+                        Ok(candidate) => self.review = Some(Review::Connect(candidate)),
+                        Err(error) => self.notice = error.to_string(),
+                    } }
+                }
+                #[cfg(not(windows))]
+                { self.notice = "System Proxy MVP доступен только на Windows.".into(); }
+            },
             KeyCode::Char('/') if !self.overview => self.editing = Some((false, self.filter.clone())),
             KeyCode::Char('i') if !self.overview => self.editing = Some((true, String::new())),
             KeyCode::Up if !self.overview => self.row = self.row.saturating_sub(1),
@@ -321,6 +517,10 @@ impl Panel {
     fn draw(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
         tui_widgets::canvas(frame, area);
+        if let Some((panel, _, _)) = &self.routing {
+            panel.render(frame, area, true);
+            return;
+        }
         let parts = Layout::vertical([Constraint::Length(3), Constraint::Min(1), Constraint::Length(3)]).split(area);
         let head = if self.overview { "THEIA ANTI-DPI · Обзор / конфигурация" }
             else { "THEIA ANTI-DPI · Диагностика" };
@@ -331,6 +531,10 @@ impl Panel {
                 Review::Diagnostic(plan) => plan.preview(),
                 Review::Policy(candidate, enroll) => format!("{}\nОперация: {}", candidate.preview(),
                     if *enroll { "первичная регистрация" } else { "Apply" }),
+                #[cfg(windows)]
+                Review::Connect(candidate) => candidate.connect_preview(),
+                #[cfg(windows)]
+                Review::Disconnect(exit) => format!("Отключить принадлежащую панели сессию?\nБудет закрыт приём трафика и выполнено условное восстановление Windows proxy.\n{}", if *exit { "Затем выйти из панели." } else { "Панель останется открытой." }),
             };
             frame.render_widget(Paragraph::new(text).style(Style::default().fg(TEXT)).wrap(Wrap { trim: false })
                 .scroll((self.review_scroll, 0)), parts[1]);
@@ -339,13 +543,27 @@ impl Panel {
             return;
         }
         if self.overview {
-            let text = match Document::read(&self.path) {
-                Ok(doc) => format!("Сохранённая ревизия: {}\nПравил: {}\nDirect consent: {}\nDoH: {}\n\n{}\n\nSystem Proxy: состояние внешнего процесса здесь не подтверждено.\nConnect (режим разработки Pass/Drop) доступен через CLI. Modify пока запрещён.",
+            let mut text = match Document::read(&self.path) {
+                Ok(doc) => format!("Сохранённая ревизия: {}\nПравил: {}\nDirect consent: {}\nDoH: {}\n\n{}\n\nРежим: системный прокси (MVP). Modify пока запрещён.",
                     doc.anti_dpi.revision, doc.anti_dpi.rules.len(), doc.anti_dpi.consent.direct_egress,
                     if doc.anti_dpi.resolver.is_some() { "настроен" } else { "не настроен" },
                     doc.anti_dpi.rules.iter().map(|rule| format!("{} · {:?}", rule.name, rule.action)).collect::<Vec<_>>().join("\n")),
                 Err(_) => "Конфигурация отсутствует или недействительна. n — создать новый файл без перезаписи; существующий ошибочный файл исправьте отдельно.".into(),
             };
+            #[cfg(windows)]
+            if let Some(session) = &self.session {
+                let status = session.control.status();
+                let phase = match status.phase {
+                    Phase::Starting => "подготовка", Phase::Connected => "подключено (readback)",
+                    Phase::Stopping => "отключение", Phase::Stopped => "отключено", Phase::Failed => "ошибка",
+                };
+                text.push_str(&format!("\n\nПринадлежащая панели сессия: {phase}\nПрименённая ревизия: {} · Admission: {}\nЛокальные соединения: {} активных / {} принятых · ошибки: {}\nЗаписано к цели: {} байт · доставлено приложению: {} байт\nДиагностика не входит в эти счётчики.",
+                    status.revision, if status.admitting { "разрешён" } else { "закрыт" }, status.active, status.accepted, status.errors, status.uploaded, status.downloaded));
+            } else {
+                text.push_str("\n\nСобственная сессия отсутствует; состояние внешнего процесса не подтверждено.");
+            }
+            #[cfg(not(windows))]
+            text.push_str("\n\nSystem Proxy MVP недоступен на этой платформе.");
             frame.render_widget(Paragraph::new(text).style(Style::default().fg(TEXT)).wrap(Wrap { trim: true }), parts[1]);
         } else {
             let body = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(parts[1]);
@@ -372,7 +590,7 @@ impl Panel {
         } else if self.worker.is_some() {
             "Esc отменить задание".into()
         } else if self.overview {
-            "Tab диагностика · n создать · e регистрация · a Apply · Esc назад".into()
+            "Tab диагностика · r маршрутизация · p подключить/отключить · n создать · e регистрация · a Apply · Esc назад".into()
         } else {
             "↑↓ выбор · пробел отметить · s все · c очистить · / поиск · i добавить · x исключить/вернуть · Enter проверка · Tab обзор".into()
         };
@@ -384,15 +602,21 @@ pub(super) fn run_in(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, path
     let mut panel = Panel::new(path.to_path_buf())?;
     loop {
         panel.poll();
+        if panel.leave_requested { return Ok(()); }
         terminal.draw(|frame| panel.draw(frame))?;
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     let code = if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') { KeyCode::Esc } else { key.code };
-                    if panel.key(code)? { return Ok(()); }
+                    if panel.routing.is_some() {
+                        panel.routing_key(if code == KeyCode::Esc { KeyEvent::new(code, KeyModifiers::NONE) } else { key });
+                    } else if panel.key(code)? { return Ok(()); }
                 }
-                Event::Paste(value) => if let Some((_, text)) = &mut panel.editing {
-                    if !value.chars().any(char::is_control) && text.len() + value.len() <= 253 { text.push_str(&value); }
+                Event::Paste(value) => {
+                    if let Some((routing, _, _)) = &mut panel.routing { routing.paste(&value); }
+                    else if let Some((_, text)) = &mut panel.editing {
+                        if !value.chars().any(char::is_control) && text.len() + value.len() <= 253 { text.push_str(&value); }
+                    }
                 },
                 _ => {}
             }

@@ -90,6 +90,9 @@ impl Candidate {
 
     pub fn document(&self) -> &Document { &self.document }
 
+    #[cfg(windows)]
+    pub(crate) fn path(&self) -> &Path { &self.path }
+
     pub fn digest(&self) -> [u8; 32] { self.policy.digest() }
 
     pub fn preview(&self) -> String {
@@ -136,14 +139,22 @@ impl Candidate {
     /// Explicit first enrollment. A missing floor is not silently recreated
     /// by Apply or Connect. Resetting trust requires a separate reviewed flow.
     pub fn enroll(&self, expected: [u8; 32]) -> Result<(), ConfigError> {
-        self.publish(expected, true)
+        self.publish(expected, true, None)
     }
 
     pub fn apply(&self, expected: [u8; 32]) -> Result<(), ConfigError> {
-        self.publish(expected, false)
+        self.publish(expected, false, None)
     }
 
-    fn publish(&self, expected: [u8; 32], enroll: bool) -> Result<(), ConfigError> {
+    #[cfg(windows)]
+    pub(crate) fn apply_over(&self, expected: [u8; 32], active: &Active) -> Result<(), ConfigError> {
+        if self.path != active.candidate.path {
+            return Err(invalid("anti_dpi.floor", "wrong active configuration"));
+        }
+        self.publish(expected, false, Some(&active.floor_bytes))
+    }
+
+    fn publish(&self, expected: [u8; 32], enroll: bool, active_floor: Option<&[u8]>) -> Result<(), ConfigError> {
         if self.digest() != expected {
             return Err(invalid("anti_dpi", "confirmation does not match policy"));
         }
@@ -151,6 +162,9 @@ impl Candidate {
         self.assert_saved()?;
         let path = floor_path(&self.path)?;
         let previous = load_floor(&path)?;
+        if active_floor.is_some_and(|expected| previous.as_deref() != Some(expected)) {
+            return Err(invalid("anti_dpi.floor", "active revision floor changed; review or recover"));
+        }
         let next = checkpoint(&self.policy);
         match &previous {
             Some(raw) => {
@@ -202,6 +216,9 @@ pub(crate) struct Active {
 impl Active {
     pub(crate) fn document(&self) -> &Document { &self.candidate.document }
     pub(crate) fn policy(&self) -> &PreparedPolicy { &self.candidate.policy }
+
+    #[cfg(windows)]
+    pub(crate) fn matches_path(&self, path: &Path) -> bool { self.candidate.path == path }
 
     pub(crate) fn revoke(&self) {
         self.revoked.store(true, Ordering::Release);

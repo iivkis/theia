@@ -6,11 +6,18 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 pub(crate) struct GuardedIo<'a, T> {
     inner: T,
     live: &'a (dyn Fn() -> bool + Sync),
+    written: Option<&'a std::sync::atomic::AtomicU64>,
 }
 
 impl<'a, T> GuardedIo<'a, T> {
     pub(crate) fn new(inner: T, live: &'a (dyn Fn() -> bool + Sync)) -> Self {
-        Self { inner, live }
+        Self { inner, live, written: None }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn counted(mut self, counter: &'a std::sync::atomic::AtomicU64) -> Self {
+        self.written = Some(counter);
+        self
     }
 
     fn check(&self) -> io::Result<()> {
@@ -46,7 +53,13 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for GuardedIo<'_, T> {
         if let Err(error) = this.check() {
             return Poll::Ready(Err(error));
         }
-        Pin::new(&mut this.inner).poll_write(cx, buf)
+        let result = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &result {
+            if let Some(counter) = this.written {
+                counter.fetch_add(*n as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        result
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
