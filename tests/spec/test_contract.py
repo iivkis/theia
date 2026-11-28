@@ -288,11 +288,14 @@ class SpecContractTests(unittest.TestCase):
         tests = read("crates/theia/tests/server_h2.rs")
         binary = read("crates/theia/src/main.rs")
         for term in ("pub async fn serve(", "pub async fn run_file(",
-                     "fn allowed_destination(", "URL_SAFE_NO_PAD", "Sha256::digest",
+                     "pub use crate::net::address::allowed_destination;", "URL_SAFE_NO_PAD", "Sha256::digest",
                      "ct_eq(", "lookup_host(", "carrier_socket::connect_plain_tcp",
                      "Frame::OpenOk", "TlsAcceptor", "Carrier::H2.h2_server()",
                      "Carrier::H2.accepts_tls("):
             self.assertIn(term, implementation)
+        address_policy = read("crates/theia/src/net/address.rs")
+        self.assertIn("pub fn allowed_destination(", address_policy)
+        self.assertIn("allowed_destination(candidate.ip(), allow_private)", implementation)
         factory = read("crates/theia/src/routing/carrier_socket.rs")
         self.assertIn("socket.connect(peer).await?", factory)
         self.assertIn("admit_tcp_dial(&socket, peer)?", factory)
