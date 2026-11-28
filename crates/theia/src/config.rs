@@ -21,7 +21,7 @@ pub struct ConfigError {
 }
 
 impl ConfigError {
-    fn new(field: impl Into<String>, reason: &'static str) -> Self {
+    pub(crate) fn new(field: impl Into<String>, reason: &'static str) -> Self {
         Self {
             field: field.into(),
             reason,
@@ -390,7 +390,7 @@ fn overlaps(a: SocketAddr, b: SocketAddr) -> bool {
         }
     }
 }
-fn validate_shared(schema: u32, m: &Management, ui: &Ui) -> Check {
+pub(crate) fn validate_shared(schema: u32, m: &Management, ui: &Ui) -> Check {
     ensure(schema == 1, "schema_version", "only version 1 is supported")?;
     ensure(m.ipc == "auto", "management.ipc", "only auto is supported")?;
     ensure(
@@ -703,28 +703,31 @@ impl ClientDocument {
             "client.active_profile",
             "unknown profile",
         )?;
-        let proxy = &self.client.proxy;
-        let http = listen(&proxy.http_listen, "client.proxy.http_listen")?;
-        let socks = listen(&proxy.socks5_listen, "client.proxy.socks5_listen")?;
-        for (address, field) in [
-            (http, "client.proxy.http_listen"),
-            (socks, "client.proxy.socks5_listen"),
-        ] {
-            ensure(
-                matches!(
-                    address.ip(),
-                    IpAddr::V4(Ipv4Addr::LOCALHOST) | IpAddr::V6(Ipv6Addr::LOCALHOST)
-                ),
-                field,
-                "listener must bind to 127.0.0.1 or [::1]",
-            )?;
-        }
-        ensure(
-            http != socks,
-            "client.proxy",
-            "HTTP and SOCKS5 listener addresses must differ",
-        )
+        validate_proxy(&self.client.proxy, "client.proxy")
     }
+}
+
+/// Both client roles must enforce identical listener constraints.
+pub(crate) fn validate_proxy(proxy: &LocalProxy, field: &str) -> Check {
+    let http_field = format!("{field}.http_listen");
+    let socks_field = format!("{field}.socks5_listen");
+    let http = listen(&proxy.http_listen, &http_field)?;
+    let socks = listen(&proxy.socks5_listen, &socks_field)?;
+    for (address, field) in [(http, http_field), (socks, socks_field)] {
+        ensure(
+            matches!(
+                address.ip(),
+                IpAddr::V4(Ipv4Addr::LOCALHOST) | IpAddr::V6(Ipv6Addr::LOCALHOST)
+            ),
+            field,
+            "listener must bind to 127.0.0.1 or [::1]",
+        )?;
+    }
+    ensure(
+        http != socks,
+        field,
+        "HTTP and SOCKS5 listener addresses must differ",
+    )
 }
 
 /// Distinguish refusal before replacement from uncertain durability after

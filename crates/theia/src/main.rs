@@ -50,6 +50,13 @@ async fn run() {
         .map(|arg| arg.into_string().map_err(|_| CliError::NonUtf8Argument))
         .collect();
     let result: Result<String, CliError> = match args.and_then(|args| parse(&args)) {
+        Ok(Command::AntiDpiValidate { config }) => theia::anti_dpi::Document::read(Path::new(&config))
+            .map(|_| "standalone configuration structurally valid; no network or OS settings changed".to_owned())
+            .map_err(CliError::Config),
+        Ok(Command::AntiDpiPreflight { config }) => theia::anti_dpi::Document::read(Path::new(&config))
+            .and_then(|document| document.prepare().map(|_| ()))
+            .map(|_| "standalone policy compiled against pinned GeoData; runtime readiness not checked".to_owned())
+            .map_err(CliError::Config),
         Ok(Command::Tui { role }) => tui::run(role, None)
             .map(|_| "tui closed".to_owned())
             .map_err(|error| CliError::Tui(error.message())),

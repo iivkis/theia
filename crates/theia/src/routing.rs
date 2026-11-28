@@ -670,6 +670,12 @@ impl Policy {
         compile_selectors(rules).map(|_| ())
     }
 
+    /// Check whether syntactically valid rules require a verified DAT pair.
+    pub(crate) fn requires_geodata(rules: &[Rule]) -> Result<bool, RoutingError> {
+        let (_, sites, ips) = compile_selectors(rules)?;
+        Ok(!sites.is_empty() || !ips.is_empty())
+    }
+
     pub fn compile(rules: &[Rule], geosite: &[u8], geoip: &[u8]) -> Result<Self, RoutingError> {
         if rules.len() > MAX_RULES || geosite.len() > MAX_DAT || geoip.len() > MAX_DAT {
             return Err(RoutingError::Limit);
