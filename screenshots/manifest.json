@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "source_sha": "1757349f4bee1fc03eb4437ce61cd26d1591b4b4",
+  "source_sha": "af60aeb9ecb6963bf42e732f5a1db585c219bbd5",
   "platform": "linux",
   "columns": 120,
   "rows": 40,
@@ -12,31 +12,31 @@
     {
       "scenario": "anti-dpi-catalog",
       "file": "anti-dpi-catalog.png",
-      "sha256": "3f0dd6381440ca5f57494a5a142016ee83f409540bd3892f1200d2acc43b7f80",
+      "sha256": "4b65cd728bad1433e102be457b29ab880f6bc2dab263000e70a36994177f654e",
       "state_fixture": false
     },
     {
       "scenario": "anti-dpi-diagnostic-consent",
       "file": "anti-dpi-diagnostic-consent.png",
-      "sha256": "7d44c31343cc0a68bd42b560eaa39a69cd2c0929daa7fb05ee21ae1fd2784fa8",
+      "sha256": "ef1a1bcf06e957d88a508e7f3a55873cf3a0e64c671c8fe3bb0337fba5d7bd15",
       "state_fixture": false
     },
     {
       "scenario": "anti-dpi-first-run",
       "file": "anti-dpi-first-run.png",
-      "sha256": "efca0fa73c18c6b0326d54cfc07d098622231f0201a0bcc3541796f9ec5199e0",
+      "sha256": "f3d5a14946c0e1b0c82f2a1bcca345e9a9bccaf4fd0660dad454bb3ba7a09551",
       "state_fixture": false
     },
     {
       "scenario": "anti-dpi-geodata",
       "file": "anti-dpi-geodata.png",
-      "sha256": "7cbe7240078a29b571d5bfa29d60f9fea8118e9ffc9e3809b5d4872a59121148",
+      "sha256": "82f2d51736a263665a021c817866fab38d88607ee49537fe5e12f946378986c8",
       "state_fixture": false
     },
     {
       "scenario": "anti-dpi-overview",
       "file": "anti-dpi-overview.png",
-      "sha256": "3f28658a68ce8fd875766a2bd2b994681aabbf336cf3b0ec09d42e39426771fa",
+      "sha256": "dde335aa35c09a4dccd99902cd1b830beb80b1c5c238003c80bfce14211763ef",
       "state_fixture": false
     },
     {
@@ -78,7 +78,7 @@
     {
       "scenario": "client-action-new-profile",
       "file": "client-action-new-profile.png",
-      "sha256": "3ba383bff887f73759264aa79981b5f973eea850e4a7ada9dbe3ac7280dcd407",
+      "sha256": "025ce70392fe2ce0e8129d5082fafefddf328e5ae01c0200983806652edc3ae5",
       "state_fixture": false
     },
     {
@@ -600,7 +600,7 @@
     {
       "scenario": "server-reality-status-technical",
       "file": "server-reality-status-technical.png",
-      "sha256": "1c5a619c0b5a5f047ff0ea2395cc17adcfee7def1bd318a4e10a654d87aefe64",
+      "sha256": "daef0a738308666cff3f398146c866c56ff53ede0581346e1252700efaf129ba",
       "state_fixture": false
     },
     {
@@ -726,7 +726,7 @@
     {
       "scenario": "state-anti-dpi-diagnostic-report",
       "file": "state-anti-dpi-diagnostic-report.png",
-      "sha256": "b28ff78598e39d93c368bb46c1e1cc4f46521cf43d78c2cc0882315be07082ea",
+      "sha256": "81d00ce223a9bb9c0100e22f1ccbbc0e6c55bb192c1305082eecf457700ba707",
       "state_fixture": true
     },
     {
@@ -1026,7 +1026,7 @@
     {
       "scenario": "state-reality-step6-save-inspection",
       "file": "state-reality-step6-save-inspection.png",
-      "sha256": "00d0f25b797000e38f627dbdd044577b02e0e71873ac952c786f762e4ee810ec",
+      "sha256": "33e60dcebbd0715adb3f15def78e706da8952ffe8a2eccd3951117ddac097c56",
       "state_fixture": true
     },
     {
