@@ -195,6 +195,7 @@ struct Draft {
     choice: usize,
     input_backup: Option<[String; 5]>,
     adding_sites: bool,
+    diagnostic_proposal: bool,
     edit_rule: Option<usize>,
     delete_rule: bool,
     original: Document,
@@ -238,6 +239,7 @@ impl Draft {
             choice: 0,
             input_backup: None,
             adding_sites: false,
+            diagnostic_proposal: false,
             edit_rule: None,
             delete_rule: false,
             original,
@@ -724,11 +726,7 @@ impl ReportContext {
             stale: false,
         })
     }
-    fn refresh(&mut self, path: &Path, overlay_path: &Path) {
-        if self.stale || self.checked.elapsed() < Duration::from_secs(1) {
-            return;
-        }
-        self.checked = Instant::now();
+    fn current(&self, path: &Path, overlay_path: &Path) -> bool {
         let overlay_current = match &self.overlay {
             Some(bytes) => {
                 crate::config::editor_bytes(overlay_path).is_ok_and(|value| &value == bytes)
@@ -736,9 +734,17 @@ impl ReportContext {
             None => std::fs::symlink_metadata(overlay_path)
                 .is_err_and(|e| e.kind() == io::ErrorKind::NotFound),
         };
-        self.stale = !overlay_current
-            || crate::network_scope::generation() != self.epoch
-            || !crate::config::editor_bytes(path).is_ok_and(|value| value == self.config);
+        !self.stale
+            && overlay_current
+            && crate::network_scope::generation() == self.epoch
+            && crate::config::editor_bytes(path).is_ok_and(|value| value == self.config)
+    }
+    fn refresh(&mut self, path: &Path, overlay_path: &Path) {
+        if self.stale || self.checked.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.checked = Instant::now();
+        self.stale = !self.current(path, overlay_path);
     }
 }
 
@@ -1749,7 +1755,7 @@ impl Panel {
         if self.group != 0
             || self.worker.is_some()
             || !self.report_only
-            || !self.report_context.as_ref().is_some_and(|context| !context.stale)
+            || !self.report_context.as_ref().is_some_and(|context| !context.stale && context.epoch.is_some())
         {
             return None;
         }
@@ -1775,17 +1781,7 @@ impl Panel {
         let Some(context) = &self.report_context else {
             return;
         };
-        let overlay_current = match &context.overlay {
-            Some(bytes) => crate::config::editor_bytes(&self.overlay_path)
-                .is_ok_and(|value| &value == bytes),
-            None => std::fs::symlink_metadata(&self.overlay_path)
-                .is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
-        };
-        if !overlay_current
-            || context.epoch.is_none()
-            || crate::network_scope::generation() != context.epoch
-            || !crate::config::editor_bytes(&self.path).is_ok_and(|bytes| bytes == context.config)
-        {
+        if context.epoch.is_none() || !context.current(&self.path, &self.overlay_path) {
             self.mark_stale();
             self.notice = "Условия изменились. Повторите диагностику.".into();
             return;
@@ -1809,6 +1805,7 @@ impl Panel {
             return;
         }
         draft.adding_sites = true;
+        draft.diagnostic_proposal = true;
         draft.values[4] = cell.domain;
         draft.move_to(SetupStep::Domains);
         // Never reorder an earlier rule. Refuse a suggestion that would be
@@ -1987,6 +1984,17 @@ impl Panel {
                     if let Some(review) = self.review.take() {
                         match review {
                             Review::Save(draft, next) => {
+                                if draft.diagnostic_proposal
+                                    && !self.report_context.as_ref().is_some_and(|context| {
+                                        context.epoch.is_some()
+                                            && context.current(&self.path, &self.overlay_path)
+                                            && draft.expected.as_ref() == Some(&context.config)
+                                    })
+                                {
+                                    self.mark_stale();
+                                    self.notice = "Условия изменились. Правило не сохранено; повторите диагностику.".into();
+                                    return Ok(false);
+                                }
                                 match next.save(&self.path, draft.expected.as_deref()) {
                                     Ok(()) => {
                                         self.notice = "Файл сохранён. Политика ещё не применена; подключения не запускались.".into();
@@ -3562,6 +3570,16 @@ mod tests {
             .collect();
         panel.begin_review(None);
         assert!(panel.review.is_some());
+        if let Some(Review::Diagnostic(plan)) = &panel.review {
+            let preview = plan.ui_preview(false);
+            let runnable = plan.runnable_cells();
+            assert!(preview.contains(&format!("Запланировано сетевых проверок сайтов: {runnable}.")));
+            assert!(preview.contains(&format!("Недоступных ячеек: {}.", plan.planned_cells() - runnable)));
+            assert_eq!(preview.contains("Anti-DPI не будет проверен"), runnable == 6);
+            assert!(preview.contains("Esc — отменить"));
+            assert!(preview.contains("SHA256 плана"));
+            assert!(!preview.contains("приёмка не завершена"));
+        }
         capture("anti-dpi-diagnostic-consent", &mut panel);
         panel.review = None;
         for (index, entry) in panel.catalog.entries().iter().take(6).enumerate() {

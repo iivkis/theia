@@ -413,10 +413,6 @@ impl Plan {
             };
             let _ = writeln!(result, "  {name}: {state}");
         }
-        let _ = writeln!(result, "\nТочные цели (HEAD /, HTTPS 443):");
-        for host in &self.hosts {
-            let _ = writeln!(result, "  {host}");
-        }
         let _ = writeln!(
             result,
             "\nЛимиты: не более {} DNS/HTTPS операций, {} параллельно; 6 с на ячейку, 10 мин на задание.",
@@ -431,7 +427,12 @@ impl Plan {
                 resolver.bootstrap.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
             );
         }
-        let _ = writeln!(result, "Перенаправления не выполняются. Доступность не доказывает обход DPI.\n\nТехнические сведения: ревизия {} · каталог {VERSION}\nSHA256 плана: {}", self.policy.revision(), hex(self.digest));
+        let _ = writeln!(result, "Перенаправления не выполняются. Доступность не доказывает обход DPI.");
+        let _ = writeln!(result, "\nТочные цели (HEAD /, HTTPS 443):");
+        for host in &self.hosts {
+            let _ = writeln!(result, "  {host}");
+        }
+        let _ = writeln!(result, "\nТехнические сведения: ревизия {} · каталог {VERSION}\nSHA256 плана: {}", self.policy.revision(), hex(self.digest));
         result
     }
 
