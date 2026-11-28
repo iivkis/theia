@@ -96,6 +96,8 @@ def main():
     assert not missing, f"missing required screens: {sorted(missing)}"
     hashes = {e["scenario"]: e["sha256"] for e in entries}
     assert hashes["server-page-management"] != hashes["server-page-connections"], "management screenshot duplicates connections"
+    diagnostic_names = sorted(name for name in actual if name.startswith("state-profile-diagnostics-"))
+    assert len({hashes[name] for name in diagnostic_names}) == len(diagnostic_names), "duplicate profile diagnostic states"
     assert len(entries) >= 50, f"unexpectedly incomplete gallery: {len(entries)}"
     manifest = {"schema_version":1,"source_sha":args.source_sha,"platform":"linux","columns":120,"rows":40,
                 "pixel_width":1200,"pixel_height":840,"renderer":"Ratatui TestBackend + DejaVu Sans Mono",

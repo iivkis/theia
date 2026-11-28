@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # Exact source snapshot for this review, not a moving branch.
-          ref: 546cb845ef3387c57023a69bb008bf7900fd4adc
+          ref: d8e17afefc96ce4d13facc5fc3e7bc8705f8c0d3
           path: source
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -215,6 +215,7 @@ jobs:
             confirmation_and_partial_report_have_distinct_workspace_states \
             retry_and_export_respect_privacy_and_policy \
             idle_monitor_distinguishes_unsampled_and_measured_zero \
+            profile_diagnostic_actions_follow_content_and_mouse_only_selects \
             visual_review_gallery
           do
             echo "::group::$test"
@@ -270,7 +271,7 @@ jobs:
           from pathlib import Path
           src = Path(os.environ["RUNNER_TEMP"]) / "tui-gallery"
           manifest = json.loads((src / "manifest.json").read_text())
-          assert manifest["source_sha"] == "546cb845ef3387c57023a69bb008bf7900fd4adc"
+          assert manifest["source_sha"] == "d8e17afefc96ce4d13facc5fc3e7bc8705f8c0d3"
           assert (manifest["platform"], manifest["columns"], manifest["rows"]) == ("linux",120,40)
           expected = {"manifest.json", "README.md"}
           for entry in manifest["screens"]:

@@ -19,27 +19,44 @@ impl Panel {
         ] {
             let mut p = Self::new(path.clone(), [0; 32], "review-profile".into());
             p.phase = phase;
+            let blocked = name.ends_with("blocked");
+            let partial = name.ends_with("partial");
+            let failed = name.ends_with("failed");
             if phase == Phase::Custom {
-                p.input = "example.test, blocked.test".into();
+                p.input = "example.test, second.test".into();
                 if name.ends_with("validation-error") {
                     p.input.clear();
                     p.error = "Введите хотя бы один допустимый домен.".into();
                 }
             }
-            if matches!(phase, Phase::Confirm | Phase::Running | Phase::Done) {
-                p.domains = vec!["example.test".into(), "failed.test".into(), "blocked.test".into()];
-                p.checks.push(Check { domain: None, kind: CheckKind::Carrier("H2"), outcome: Outcome::Verified(8) });
+            if matches!(phase, Phase::Confirm | Phase::Running | Phase::Done) && !failed {
+                p.domains = vec!["example.test".into(), "second.test".into(), "third.test".into()];
+                for carrier in ["H2", "H3"] {
+                    p.checks.push(Check { domain: None, kind: CheckKind::Carrier(carrier), outcome: Outcome::Verified(8) });
+                }
             }
-            if matches!(phase, Phase::Running | Phase::Done) {
-                p.checks.push(Check { domain: Some("example.test".into()), kind: CheckKind::Https("штатный"), outcome: Outcome::Http(200, ActualRoute::Direct, 10) });
-                p.finished.push("example.test".into());
-                p.checks.push(Check { domain: Some("blocked.test".into()), kind: CheckKind::Policy, outcome: Outcome::Route(crate::routing::Action::Blocked) });
-                p.finished.push("blocked.test".into());
+            if matches!(phase, Phase::Running | Phase::Done) && !failed {
+                let domains = p.domains.clone();
+                for (index, domain) in domains.iter().enumerate() {
+                    if (phase == Phase::Running && index > 0) || (partial && index == 2) {
+                        continue;
+                    }
+                    if blocked && index == 2 {
+                        p.checks.push(Check { domain: Some(domain.clone()), kind: CheckKind::Policy, outcome: Outcome::Route(crate::routing::Action::Blocked) });
+                    } else if partial && index == 1 {
+                        p.checks.push(Check { domain: Some(domain.clone()), kind: CheckKind::Https("H2"), outcome: Outcome::Failure(ClientError::Timeout) });
+                        continue;
+                    } else {
+                        for mode in ["штатный", "H2", "H3"] {
+                            p.checks.push(Check { domain: Some(domain.clone()), kind: CheckKind::Https(mode), outcome: Outcome::Http(200, ActualRoute::Direct, 10) });
+                            p.checks.push(Check { domain: Some(domain.clone()), kind: CheckKind::Udp(mode), outcome: Outcome::Udp(200, ActualRoute::Direct, 12) });
+                        }
+                    }
+                    p.finished.push(domain.clone());
+                }
                 if phase == Phase::Done {
-                    p.checks.push(Check { domain: Some("failed.test".into()), kind: CheckKind::Https("H2"), outcome: Outcome::Failure(ClientError::Timeout) });
-                    p.finished.push("failed.test".into());
-                    p.completed = !name.ends_with("partial") && !name.ends_with("failed");
-                    if !p.completed {
+                    p.completed = !partial;
+                    if partial {
                         p.error = "Проверка прервана. Частичные результаты сохранены.".into();
                     }
                 }
@@ -47,10 +64,7 @@ impl Panel {
             if name.ends_with("details") {
                 p.details = true;
             }
-            if name.ends_with("failed") {
-                p.checks.clear();
-                p.domains.clear();
-                p.finished.clear();
+            if failed {
                 p.error = "Не удалось получить подтверждённый список доменов.".into();
             }
             states.push((name, p));

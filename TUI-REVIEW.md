@@ -1,7 +1,7 @@
 # TUI visual review
 
 This branch is a Linux-only visual evidence gallery, not a product development branch.
-The generator checks out the explicitly pinned dev commit (546cb845ef3387c57023a69bb008bf7900fd4adc) and records real Ratatui draw buffers at one size: 120×40 columns/rows. PNGs use a fixed DejaVu Sans Mono font. No Windows job.
+The generator checks out the explicitly pinned dev commit (d8e17afefc96ce4d13facc5fc3e7bc8705f8c0d3) and records real Ratatui draw buffers at one size: 120×40 columns/rows. PNGs use a fixed DejaVu Sans Mono font. No Windows job.
 
 - Open [screenshots/README.md](screenshots/README.md) after a successful workflow.
 - Read screenshots/manifest.json first: it identifies the exact source SHA, scenario names and file digests.
@@ -41,3 +41,5 @@ The gallery enumerates the actual eight server and eight client sections, checks
 The client diagnostics workspace is a required independent screen. The idle server statistics screen reports unavailable metrics rather than claiming a live data source. The inline import and process-local traffic monitor are rendered within their sections. Required screenshots include masked existing-profile import, expanded settings, a user with no grants and the explicit delete confirmation; the revoke-save failure must not contain the underlying workspace. No screenshot implies successful external-runtime access.
 
 The diagnostic workspace includes synthetic offline states for source selection, input validation, fetching, consent, running, completed/partial results, details, policy blocking and failure. The gallery regression gate also verifies compact and advanced client profile navigation without writes, diagnostic consent and safe retry, and idle monitor rendering. Windows native lifecycle acceptance remains separate.
+
+Diagnostic states use distinct successful, policy-blocked, interrupted and failed fixtures. Publication rejects duplicate diagnostic PNGs. Compact action layout and mouse selection without execution are regression-tested; profile ports remain intact across wrapped rows.
