@@ -203,7 +203,7 @@ impl VerifiedUdp {
         if crate::reality_quic_wire::long(first)?.version != version.wire() {
             return None;
         }
-        super::packet_modify::quic_initial_datagrams(first, &self.key.name)
+        super::packet_modify::quic_initial_transform(first, &self.key.name)
     }
 
     /// Once the real flow is selected, cache expiry is not a reason to
