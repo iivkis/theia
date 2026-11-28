@@ -735,7 +735,7 @@ mod tests {
             .scope((), async {
                 assert!(diagnostic());
                 let relay = c.enter();
-                assert!(std::ptr::eq(relay.0, &DIAGNOSTIC_COUNTERS));
+                assert!(std::ptr::eq(relay.counters(), &DIAGNOSTIC_COUNTERS));
                 relay.upload(17);
                 relay.download(23);
                 assert_eq!(c.snapshot(), Snapshot::default());
@@ -768,7 +768,7 @@ mod tests {
         assert!(!diagnostic());
         assert_eq!(c.snapshot(), Snapshot::default());
         let relay = c.enter();
-        assert!(std::ptr::eq(relay.0, &c));
+        assert!(std::ptr::eq(relay.counters(), &c));
         drop(relay);
         assert_eq!(c.snapshot().opened, 1);
     }

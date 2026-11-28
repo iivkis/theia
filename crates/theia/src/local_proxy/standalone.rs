@@ -400,7 +400,7 @@ async fn modify_udp(runtime: Arc<Runtime>, target: Arc<Target>, socket: Arc<UdpS
         } => result?.ok_or_else(denied)?,
     };
     let delivery = verified.fallback_policy();
-    let (tx, mut rx) = mpsc::channel(udp_relay::QUEUE);
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(udp_relay::QUEUE);
     let down = async {
         let mut packet = Vec::new();
         while let Some(data) = rx.recv().await {
@@ -593,12 +593,13 @@ async fn run_inner(
     let (restored, outcome, cleanup) = {
         let serving = serve(runtime.clone(), &http, &socks);
         tokio::pin!(serving);
+        let not_stopped = || !control.stop.load(Ordering::Acquire);
         let (outcome, ended) = loop {
             tokio::select! {
                 biased;
                 signal = tokio::signal::ctrl_c() =>
                     break (signal.map_err(|_| ClientError::Io), false),
-                _ = revoked(&|| !control.stop.load(Ordering::Acquire)) => break (Ok(()), false),
+                _ = revoked(&not_stopped) => break (Ok(()), false),
                 result = &mut serving => break (if control.stop.load(Ordering::Acquire) { Ok(()) } else { result }, true),
                 _ = jobs.join_next(), if !jobs.is_empty() => {},
                 _ = &mut ipc_serving => break (Err(ClientError::SystemProxy), false),
