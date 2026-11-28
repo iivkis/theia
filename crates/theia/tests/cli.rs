@@ -225,8 +225,8 @@ fn management_commands_without_owner_never_report_success() {
         assert!(out.stdout.is_empty(), "{args:?}");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("management status unavailable"), "{args:?}: {stderr}");
-        assert!(!stderr.contains(&digest));
-        assert!(!stderr.contains(&nonce));
+        assert!(!stderr.contains(digest.as_str()));
+        assert!(!stderr.contains(nonce.as_str()));
     }
 }
 
