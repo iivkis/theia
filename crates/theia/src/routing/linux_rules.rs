@@ -309,65 +309,13 @@ impl Netlink {
     }
     fn generation(&self) -> io::Result<u32> {
         let b = self.request(GET_GEN, &[])?;
-        let (kind, seq, body) = checked_header(&b)?;
-        if kind == 2 {
-            return Err(ack_error(body)?.unwrap_or_else(invalid));
-        }
-        if kind != NEW_GEN || seq != 1 || body.len() < 4 || body[1] != 0 {
-            return Err(invalid());
-        }
-        let mut rest = &body[4..];
-        let mut generation = None;
-        while let Some((kind, value)) = next_attr(&mut rest)? {
-            if kind == 1 {
-                if generation.is_some() || value.len() != 4 {
-                    return Err(invalid());
-                }
-                generation = Some(u32::from_be_bytes(value.try_into().map_err(|_| invalid())?));
-            }
-        }
-        generation.filter(|n| *n != 0).ok_or_else(invalid)
+        decode_generation(&b)
     }
     fn table(&self, journal: &Journal) -> io::Result<bool> {
         let mut attrs = Vec::new();
         name_attr(&mut attrs, 1, &journal.name());
         let b = self.request(GET_TABLE, &attrs)?;
-        let (kind, seq, body) = checked_header(&b)?;
-        if seq != 1 {
-            return Err(invalid());
-        }
-        if kind == 2 {
-            let error = ack_error(body)?.ok_or_else(invalid)?;
-            return if error.raw_os_error() == Some(libc::ENOENT) {
-                Ok(false)
-            } else {
-                Err(error)
-            };
-        }
-        if kind != NEW_TABLE || body.len() < 4 || body[0] != FAMILY_INET || body[1] != 0 {
-            return Err(invalid());
-        }
-        let mut rest = &body[4..];
-        let (mut name, mut nonce, mut use_count) = (None, None, None);
-        while let Some((kind, value)) = next_attr(&mut rest)? {
-            match kind {
-                1 if name.is_none() => name = Some(value),
-                6 if nonce.is_none() => nonce = Some(value),
-                3 if use_count.is_none() && value.len() == 4 => {
-                    use_count = Some(u32::from_be_bytes(value.try_into().map_err(|_| invalid())?))
-                }
-                1 | 3 | 6 => return Err(invalid()),
-                _ => {}
-            }
-        }
-        let expected = journal.name() + "\0";
-        if name != Some(expected.as_bytes())
-            || nonce != Some(journal.nonce.as_slice())
-            || use_count != Some(if journal.redirect.is_some() { 5 } else { 1 })
-        {
-            return Err(refused());
-        }
-        Ok(true)
+        decode_table(&b, journal)
     }
     fn batch(&self, generation: u32, operations: &[Vec<u8>]) -> io::Result<()> {
         if generation == 0 || operations.is_empty() || operations.len() > MAX_RULE_OPERATIONS {
@@ -386,38 +334,102 @@ impl Netlink {
         let mut buffer = vec![0u8; 65536];
         for _ in 0..MAX_RULE_OPERATIONS {
             let n = receive(self.0.as_raw_fd(), &mut buffer)?;
-            let mut rest = &buffer[..n];
-            while !rest.is_empty() {
-                let header = rest.get(..16).ok_or_else(invalid)?;
-                let len =
-                    u32::from_ne_bytes(header[..4].try_into().map_err(|_| invalid())?) as usize;
-                if len < 16 || align4(len) > rest.len() {
-                    return Err(invalid());
-                }
-                let (kind, seq, body) = checked_header(&rest[..align4(len)])?;
-                if kind != 2 {
-                    return Err(invalid());
-                }
-                if let Some(error) = ack_error(body)? {
-                    return Err(error);
-                }
-                if seq < 2 || seq > operations.len() as u32 + 1 {
-                    return Err(invalid());
-                }
-                let slot = &mut seen[(seq - 2) as usize];
-                if *slot {
-                    return Err(invalid());
-                }
-                *slot = true;
-                received += 1;
-                rest = &rest[align4(len)..];
-            }
+            decode_batch_ack(&buffer[..n], &mut seen, &mut received)?;
             if received == operations.len() {
                 return Ok(());
             }
         }
         Err(invalid())
     }
+}
+// The same production decoder is used for actual kernel reads and for
+// deterministic malformed-message regression fixtures without NET_ADMIN.
+fn decode_generation(bytes: &[u8]) -> io::Result<u32> {
+    let (kind, seq, body) = checked_header(bytes)?;
+    if kind == 2 {
+        return Err(ack_error(body)?.unwrap_or_else(invalid));
+    }
+    if kind != NEW_GEN || seq != 1 || body.len() < 4 || body[1] != 0 {
+        return Err(invalid());
+    }
+    let mut rest = &body[4..];
+    let mut generation = None;
+    while let Some((kind, value)) = next_attr(&mut rest)? {
+        if kind == 1 {
+            if generation.is_some() || value.len() != 4 {
+                return Err(invalid());
+            }
+            generation = Some(u32::from_be_bytes(value.try_into().map_err(|_| invalid())?));
+        }
+    }
+    generation.filter(|n| *n != 0).ok_or_else(invalid)
+}
+fn decode_table(bytes: &[u8], journal: &Journal) -> io::Result<bool> {
+    let (kind, seq, body) = checked_header(bytes)?;
+    if seq != 1 {
+        return Err(invalid());
+    }
+    if kind == 2 {
+        let error = ack_error(body)?.ok_or_else(invalid)?;
+        return if error.raw_os_error() == Some(libc::ENOENT) {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    if kind != NEW_TABLE || body.len() < 4 || body[0] != FAMILY_INET || body[1] != 0 {
+        return Err(invalid());
+    }
+    let mut rest = &body[4..];
+    let (mut name, mut nonce, mut use_count) = (None, None, None);
+    while let Some((kind, value)) = next_attr(&mut rest)? {
+        match kind {
+            1 if name.is_none() => name = Some(value),
+            6 if nonce.is_none() => nonce = Some(value),
+            3 if use_count.is_none() && value.len() == 4 => {
+                use_count = Some(u32::from_be_bytes(value.try_into().map_err(|_| invalid())?))
+            }
+            1 | 3 | 6 => return Err(invalid()),
+            _ => {}
+        }
+    }
+    let expected = journal.name() + "\0";
+    if name != Some(expected.as_bytes())
+        || nonce != Some(journal.nonce.as_slice())
+        || use_count != Some(if journal.redirect.is_some() { 5 } else { 1 })
+    {
+        return Err(refused());
+    }
+    Ok(true)
+}
+fn decode_batch_ack(bytes: &[u8], seen: &mut [bool], received: &mut usize) -> io::Result<()> {
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let header = rest.get(..16).ok_or_else(invalid)?;
+        let len =
+            u32::from_ne_bytes(header[..4].try_into().map_err(|_| invalid())?) as usize;
+        if len < 16 || align4(len) > rest.len() {
+            return Err(invalid());
+        }
+        let (kind, seq, body) = checked_header(&rest[..align4(len)])?;
+        if kind != 2 {
+            return Err(invalid());
+        }
+        if let Some(error) = ack_error(body)? {
+            return Err(error);
+        }
+        if seq < 2 || seq > seen.len() as u32 + 1 {
+            return Err(invalid());
+        }
+        let slot = &mut seen[(seq - 2) as usize];
+        if *slot {
+            return Err(invalid());
+        }
+        *slot = true;
+        *received += 1;
+        rest = &rest[align4(len)..];
+    }
+    Ok(())
 }
 fn ack_error(body: &[u8]) -> io::Result<Option<io::Error>> {
     if body.len() < 20 {
@@ -1953,6 +1965,87 @@ mod tests {
         assert!(Scope::current(&File::open(&path).unwrap()).is_err());
         assert!(Scope::current(&File::open("/proc/thread-self/ns/net").unwrap()).is_err());
         assert!(Scope::current(&File::open("/proc/thread-self/ns/mnt").unwrap()).is_err());
+    }
+
+
+    #[test]
+    fn nft_generation_table_and_batch_receipts_are_strict_and_bound_to_owner() {
+        fn frame(kind: u16, sequence: u32, body: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&((16 + body.len()) as u32).to_ne_bytes());
+            out.extend_from_slice(&kind.to_ne_bytes());
+            out.extend_from_slice(&0u16.to_ne_bytes());
+            out.extend_from_slice(&sequence.to_ne_bytes());
+            out.extend_from_slice(&0u32.to_ne_bytes());
+            out.extend_from_slice(body);
+            out.resize(align4(out.len()), 0);
+            out
+        }
+        let mut attributes = Vec::new();
+        attr(&mut attributes, 1, &13u32.to_be_bytes());
+        let valid = nft_message(NEW_GEN, 0, 1, &attributes);
+        assert_eq!(decode_generation(&valid).unwrap(), 13);
+        assert!(decode_generation(&nft_message(NEW_GEN, 0, 2, &attributes)).is_err());
+        assert!(decode_generation(&nft_message(NEW_TABLE, 0, 1, &attributes)).is_err());
+        assert!(decode_generation(&nft_message(NEW_GEN, 0, 1, &[])).is_err());
+        let mut bad = valid.clone();
+        bad[17] = 1;
+        assert!(decode_generation(&bad).is_err());
+        attr(&mut attributes, 1, &14u32.to_be_bytes());
+        assert!(decode_generation(&nft_message(NEW_GEN, 0, 1, &attributes)).is_err());
+        for value in [vec![0; 4], vec![1; 3], vec![1; 5]] {
+            let mut attrs = Vec::new();
+            attr(&mut attrs, 1, &value);
+            assert!(decode_generation(&nft_message(NEW_GEN, 0, 1, &attrs)).is_err());
+        }
+        let mut ack = [0; 20];
+        ack[..4].copy_from_slice(&(-libc::EPERM).to_ne_bytes());
+        assert_eq!(decode_generation(&frame(2, 1, &ack)).unwrap_err().raw_os_error(), Some(libc::EPERM));
+
+        let mut owner = journal();
+        for redirect in [false, true] {
+            owner.redirect = redirect.then_some(RedirectScope { port: 1080, loopback: 1, policy_queue: None });
+            let expected_count = if redirect { 5u32 } else { 1 };
+            let make = |name: &str, nonce: &[u8], use_count: u32| {
+                let mut attrs = Vec::new();
+                name_attr(&mut attrs, 1, name);
+                attr(&mut attrs, 6, nonce);
+                attr(&mut attrs, 3, &use_count.to_be_bytes());
+                nft_message(NEW_TABLE, 0, 1, &attrs)
+            };
+            assert!(decode_table(&make(&owner.name(), &owner.nonce, expected_count), &owner).unwrap());
+            assert!(decode_table(&make("foreign", &owner.nonce, expected_count), &owner).is_err());
+            assert!(decode_table(&make(&owner.name(), &[9; 16], expected_count), &owner).is_err());
+            assert!(decode_table(&make(&owner.name(), &owner.nonce, expected_count+1), &owner).is_err());
+            let mut duplicate = Vec::new();
+            name_attr(&mut duplicate, 1, &owner.name());
+            name_attr(&mut duplicate, 1, &owner.name());
+            assert!(decode_table(&nft_message(NEW_TABLE, 0, 1, &duplicate), &owner).is_err());
+        }
+        ack[..4].copy_from_slice(&(-libc::ENOENT).to_ne_bytes());
+        assert!(!decode_table(&frame(2, 1, &ack), &owner).unwrap());
+        ack[..4].copy_from_slice(&(-libc::EPERM).to_ne_bytes());
+        assert_eq!(decode_table(&frame(2, 1, &ack), &owner).unwrap_err().raw_os_error(), Some(libc::EPERM));
+
+        let a = frame(2, 2, &[0; 20]);
+        let b = frame(2, 3, &[0; 20]);
+        let mut seen = [false; 2];
+        let mut received = 0;
+        decode_batch_ack(&b, &mut seen, &mut received).unwrap();
+        assert_eq!(seen, [false, true]);
+        assert_eq!(received, 1);
+        decode_batch_ack(&a, &mut seen, &mut received).unwrap();
+        assert_eq!(seen, [true, true]);
+        assert_eq!(received, 2);
+        assert!(decode_batch_ack(&a, &mut seen, &mut received).is_err());
+        for bad in [
+            a[..15].to_vec(), a[..a.len()-1].to_vec(),
+            frame(3, 2, &[0; 20]), frame(2, 1, &[0; 20]),
+            frame(2, 4, &[0; 20]), frame(2, 2, &[0; 19]),
+            frame(2, 2, &ack), [a.as_slice(), a.as_slice()].concat(),
+        ] {
+            assert!(decode_batch_ack(&bad, &mut [false; 2], &mut 0).is_err());
+        }
     }
 
     #[test]
