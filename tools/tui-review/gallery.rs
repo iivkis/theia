@@ -426,8 +426,14 @@ fn visual_review_gallery() {
             review_capture("server-routing-geodata-clear", &model, &ui);
             {
                 let panel = ui.routing_panel.as_mut().unwrap();
-                panel.key(press(KeyCode::Esc), None);
+                panel.key(press(KeyCode::Enter), None);
+                assert_eq!(panel.fields.as_ref().unwrap().1[2], "domain:example.test");
+            }
+            review_capture("server-routing-geodata-removed", &model, &ui);
+            {
+                let panel = ui.routing_panel.as_mut().unwrap();
                 let (_, values, focus) = panel.fields.as_mut().unwrap();
+                values[2] = "domain:example.test, geosite:google, geosite:youtube".into();
                 values[3] = "192.0.2.0/24, geoip:in-ru, geoip:private".into();
                 *focus = 3;
                 panel.key(press(KeyCode::F(6)), None);
@@ -444,12 +450,27 @@ fn visual_review_gallery() {
             }
             {
                 let panel = ui.routing_panel.as_mut().unwrap();
-                let mut picker = GeoPicker::new(2);
+                panel.key(press(KeyCode::F(6)), None);
+                let picker = panel.geo_picker.as_mut().unwrap();
                 picker.set_catalog(vec!["google".into(), "youtube".into()]);
-                picker.query = "not-found".into();
-                panel.geo_picker = Some(picker);
+                picker.message.clear();
+                picker.query("not-found");
+                assert!(picker.matches().is_empty());
+                assert_eq!(picker.marked.len(), 2);
+                assert_eq!(picker.changes(), (0, 0));
             }
             review_capture("server-routing-geodata-empty", &model, &ui);
+            {
+                let panel = ui.routing_panel.as_mut().unwrap();
+                panel.key(press(KeyCode::Esc), None);
+                panel.key(press(KeyCode::F(6)), None);
+                let picker = panel.geo_picker.as_mut().unwrap();
+                picker.set_catalog(vec!["google".into(), "category-ads-all".into()]);
+                picker.message.clear();
+                assert_eq!(picker.row_status("youtube"), ("Нет в базе", WARNING));
+                assert!(picker.marked.contains("youtube"));
+            }
+            review_capture("server-routing-geodata-obsolete", &model, &ui);
             {
                 let panel = ui.routing_panel.as_mut().unwrap();
                 panel.key(press(KeyCode::Esc), None);

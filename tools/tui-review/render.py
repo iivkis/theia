@@ -5,7 +5,7 @@ import hashlib
 import json
 import re
 from pathlib import Path
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageColor
 
 PALETTE = ["#161b22", "#e05a5a", "#69b96e", "#d6b85d", "#609bdf", "#b980d9", "#62c0c4", "#c9d1d9",
            "#69717c", "#ff8585", "#8fdb91", "#ffe08c", "#8cbaff", "#d6a6ff", "#91ebec", "#ffffff"]
@@ -31,7 +31,15 @@ def color(value, default):
         return (8 + 10 * (index - 232),) * 3
     raise ValueError(f"unsupported terminal color: {value}")
 
+def dim_foreground(fg, bg):
+    """Approximate ANSI faint intensity without dimming the cell background."""
+    fg = ImageColor.getrgb(fg) if isinstance(fg, str) else fg
+    bg = ImageColor.getrgb(bg) if isinstance(bg, str) else bg
+    return tuple(round(b + (f - b) * 0.48) for f, b in zip(fg, bg))
+
 def main():
+    assert dim_foreground("#ffffff", "#000000") == (122, 122, 122)
+    assert dim_foreground((20, 40, 60), (20, 40, 60)) == (20, 40, 60)
     ap = argparse.ArgumentParser()
     ap.add_argument("cells", type=Path)
     ap.add_argument("output", type=Path)
@@ -60,6 +68,8 @@ def main():
             fg, bg = color(fg, "#c9d1d9"), color(bg, "#161b22")
             if "REVERSED" in mods:
                 fg, bg = bg, fg
+            if "DIM" in mods:
+                fg = dim_foreground(fg, bg)
             x, y = i % w * cw, i // w * ch
             draw.rectangle((x, y, x+cw-1, y+ch-1), fill=bg)
             glyphs.append((x,y,fg,mods,bytes.fromhex(symbol).decode("utf-8")))
@@ -94,6 +104,7 @@ def main():
     required.update(["state-reality-step5-manual-choice", "state-reality-step5-manual-selected", "server-routing-geosite-picker", "server-routing-geoip-picker"])
     required.update(["server-routing-geodata-marked", "server-routing-geodata-empty", "server-routing-geodata-missing", "server-routing-geodata-added"])
     required.update(["server-routing-geosite-reopened", "server-routing-geoip-reopened", "server-routing-geodata-clear"])
+    required.update(["server-routing-geodata-removed", "server-routing-geodata-obsolete"])
     assert not required & obsolete, "contradictory gallery contract"
     missing = required - actual
     assert not missing, f"missing required screens: {sorted(missing)}"
