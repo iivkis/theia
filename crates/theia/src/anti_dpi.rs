@@ -7,6 +7,8 @@ pub mod diagnostic;
 pub(crate) mod dns;
 #[cfg(windows)]
 pub(crate) mod session;
+#[cfg(windows)]
+pub mod ipc;
 pub use dns::DnsError;
 
 use crate::{

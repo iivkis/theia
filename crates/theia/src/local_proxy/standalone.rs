@@ -54,7 +54,7 @@ impl Runtime {
 
     fn publication_status(&self) {
         if let Ok(active) = self.snapshot() {
-            self.control.publication(active.policy().revision(),
+            self.control.publication(active.policy().revision(), active.policy().digest(),
                 self.live() && active.live() && active.document().anti_dpi.consent.direct_egress);
         }
     }
@@ -408,7 +408,7 @@ async fn serve(runtime: Arc<Runtime>, http: &TcpListener, socks: &TcpListener) -
 /// both retained through CAS restore, and bounded flow cleanup precedes
 /// release of the shared owner. No fake SmartTheia profile or carrier.
 pub(crate) async fn run(candidate: Candidate, expected: [u8; 32]) -> Result<(), ClientError> {
-    let (control, commands) = Control::channel();
+    let (control, commands) = Control::channel().map_err(|_| ClientError::Configuration)?;
     run_controlled(candidate, expected, control, commands).await
 }
 
@@ -446,6 +446,7 @@ async fn run_inner(
     }
     let reservation = crate::windows_system_proxy::ReservedProxy::acquire()
         .map_err(|_| ClientError::SystemProxy)?;
+    let control_path = candidate.path().to_path_buf();
     let active = candidate.activate().map_err(|_| ClientError::Configuration)?;
     if !active.document().anti_dpi.consent.direct_egress || active.document().anti_dpi.resolver.is_none() {
         return Err(ClientError::Configuration);
@@ -460,6 +461,8 @@ async fn run_inner(
     let socks = super::bind_proxy_listener(&config.socks5_listen).await?;
     if !active.live() || control.stop.load(Ordering::Acquire) { return Err(denied()); }
     let bind = http.local_addr().map_err(|_| ClientError::Io)?;
+    let ipc = crate::windows_control::WindowsServer::bind_standalone(control_path, control.clone())
+        .map_err(|_| ClientError::Configuration)?;
     let mut owner = reservation.apply(bind, None).map_err(|_| ClientError::SystemProxy)?;
     if owner.verify().is_err() {
         return Err(ClientError::SystemProxy);
@@ -467,6 +470,8 @@ async fn run_inner(
     control.set_phase(Phase::Connected);
     runtime.publication_status();
     let mut jobs = JoinSet::new();
+    let ipc_serving = ipc.serve();
+    tokio::pin!(ipc_serving);
     let (restored, outcome, cleanup) = {
         let serving = serve(runtime.clone(), &http, &socks);
         tokio::pin!(serving);
@@ -478,6 +483,7 @@ async fn run_inner(
                 _ = revoked(&|| !control.stop.load(Ordering::Acquire)) => break (Ok(()), false),
                 result = &mut serving => break (if control.stop.load(Ordering::Acquire) { Ok(()) } else { result }, true),
                 _ = jobs.join_next(), if !jobs.is_empty() => {},
+                _ = &mut ipc_serving => break (Err(ClientError::SystemProxy), false),
                 Some(command) = commands.recv() => match command {
                     Command::Diagnose(job) => {
                         if jobs.is_empty() && runtime.live() && owner.verify().is_ok() {
@@ -486,11 +492,22 @@ async fn run_inner(
                             let _ = job.updates.send(DiagnosticUpdate::Done(Err("Diagnostic already active or proxy owner unavailable".into())));
                         }
                     }
-                    Command::Apply { candidate, expected, reply } => {
-                        let result = if owner.verify().is_ok() && runtime.live() {
+                    Command::Apply { prior, candidate, expected, reply } => {
+                        let result = if owner.verify().is_ok() && runtime.live() && control.matches(prior) {
                             runtime.apply(candidate, expected)
                         } else { Err("Proxy ownership lost".into()) };
                         let _ = reply.send(result);
+                    }
+                    Command::Disconnect { prior, reply, ack } => {
+                        if owner.verify().is_ok() && control.matches(prior) {
+                            control.disconnect();
+                            let _ = reply.send(Ok(()));
+                            // Admission is closed immediately. Wait briefly for the
+                            // protected IPC response, never for a remote peer.
+                            let _ = timeout(Duration::from_secs(1), ack).await;
+                            break (Ok(()), false);
+                        }
+                        let _ = reply.send(Err("Proxy ownership or instance changed".into()));
                     }
                 },
                 _ = tokio::time::sleep(Duration::from_millis(250)) => {
@@ -507,7 +524,7 @@ async fn run_inner(
         while let Ok(command) = commands.try_recv() {
             match command {
                 Command::Diagnose(job) => { let _ = job.updates.send(DiagnosticUpdate::Done(Err("Proxy session stopped".into()))); }
-                Command::Apply { reply, .. } => { let _ = reply.send(Err("Proxy session stopped".into())); }
+                Command::Apply { reply, .. } | Command::Disconnect { reply, .. } => { let _ = reply.send(Err("Proxy session stopped".into())); }
             }
         }
         let restored = owner.restore_held().map_err(|_| ClientError::SystemProxy);

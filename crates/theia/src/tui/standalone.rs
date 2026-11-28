@@ -122,7 +122,7 @@ struct OwnedSession {
 impl OwnedSession {
     fn start(candidate: Candidate) -> Result<Self, String> {
         let digest = candidate.digest();
-        let (control, commands) = Control::channel();
+        let (control, commands) = Control::channel().map_err(|error| error.to_string())?;
         let owner = control.clone();
         let thread = thread::Builder::new().name("theia-f20-owner".into()).spawn(move || {
             let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2)

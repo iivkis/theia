@@ -50,6 +50,18 @@ async fn run() {
         .map(|arg| arg.into_string().map_err(|_| CliError::NonUtf8Argument))
         .collect();
     let result: Result<String, CliError> = match args.and_then(|args| parse(&args)) {
+        Ok(Command::AntiDpiStatus { config }) => {
+            #[cfg(windows)]
+            { theia::anti_dpi::ipc::status(Path::new(&config)).await.map_err(CliError::Management) }
+            #[cfg(not(windows))]
+            { let _ = config; Err(CliError::NotImplemented("standalone Windows IPC")) }
+        }
+        Ok(Command::AntiDpiChange { config, instance, revision, policy, candidate }) => {
+            #[cfg(windows)]
+            { theia::anti_dpi::ipc::change(Path::new(&config), instance, revision, policy, candidate).await.map_err(CliError::Management) }
+            #[cfg(not(windows))]
+            { let _ = (config, instance, revision, policy, candidate); Err(CliError::NotImplemented("standalone Windows IPC")) }
+        }
         Ok(Command::AntiDpiTui { config }) => tui::run_anti_dpi(config.as_deref().map(Path::new))
             .map(|_| "standalone tui closed".to_owned())
             .map_err(|error| CliError::Tui(error.message())),

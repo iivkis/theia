@@ -1,17 +1,32 @@
-//! In-process owner control for the standalone Windows System Proxy.
-//! Never accepts an external claim of ownership. IPC is a separate boundary.
+//! Bounded owner commands shared by the standalone TUI and protected IPC.
+//! Mutation is bound to the exact process instance and active policy revision.
 use super::{authority::Candidate, diagnostic::{CellResult, Plan, Report}};
 use crate::config::ConfigError;
-use std::sync::{Arc, atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering}, mpsc};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering}, mpsc, Mutex};
 use tokio::sync::mpsc as async_mpsc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Phase { Starting, Connected, Stopping, Stopped, Failed }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Binding {
+    pub instance: [u8; 32],
+    pub revision: u64,
+    pub digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Publication {
+    revision: u64,
+    digest: [u8; 32],
+    admitting: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Status {
     pub phase: Phase,
     pub revision: u64,
+    pub binding: Binding,
     pub admitting: bool,
     pub accepted: u64,
     pub active: u64,
@@ -34,15 +49,16 @@ pub(crate) struct Job {
 
 pub(crate) enum Command {
     Diagnose(Job),
-    Apply { candidate: Candidate, expected: [u8; 32], reply: mpsc::Sender<Result<(), String>> },
+    Apply { prior: Binding, candidate: Candidate, expected: [u8; 32], reply: mpsc::Sender<Result<(), String>> },
+    Disconnect { prior: Binding, reply: mpsc::Sender<Result<(), String>>, ack: tokio::sync::oneshot::Receiver<()> },
 }
 
 pub(crate) struct Control {
     phase: AtomicU8,
     pub(crate) stop: AtomicBool,
     commands: async_mpsc::Sender<Command>,
-    revision: AtomicU64,
-    admitting: AtomicBool,
+    instance: [u8; 32],
+    publication: Mutex<Publication>,
     accepted: AtomicU64,
     active: AtomicU64,
     errors: AtomicU64,
@@ -51,14 +67,18 @@ pub(crate) struct Control {
 }
 
 impl Control {
-    pub(crate) fn channel() -> (Arc<Self>, async_mpsc::Receiver<Command>) {
+    pub(crate) fn channel() -> Result<(Arc<Self>, async_mpsc::Receiver<Command>), ConfigError> {
+        use ring::rand::SecureRandom as _;
+        let mut instance = [0; 32];
+        ring::rand::SystemRandom::new().fill(&mut instance)
+            .map_err(|_| super::invalid("anti_dpi.owner", "cannot create instance nonce"))?;
         let (commands, receiver) = async_mpsc::channel(1);
-        (Arc::new(Self {
+        Ok((Arc::new(Self {
             phase: AtomicU8::new(0), stop: AtomicBool::new(false), commands,
-            revision: AtomicU64::new(0), admitting: AtomicBool::new(false),
+            instance, publication: Mutex::new(Publication::default()),
             accepted: AtomicU64::new(0), active: AtomicU64::new(0),
             errors: AtomicU64::new(0), uploaded: AtomicU64::new(0), downloaded: AtomicU64::new(0),
-        }), receiver)
+        }), receiver))
     }
 
     pub(crate) fn set_phase(&self, phase: Phase) {
@@ -84,9 +104,11 @@ impl Control {
     }
 
     pub(crate) fn status(&self) -> Status {
+        let publication = self.publication.lock().map(|state| *state).unwrap_or_default();
         Status {
-            phase: self.phase(), revision: self.revision.load(Ordering::Acquire),
-            admitting: self.ready() && self.admitting.load(Ordering::Acquire),
+            phase: self.phase(), revision: publication.revision,
+            binding: Binding { instance: self.instance, revision: publication.revision, digest: publication.digest },
+            admitting: self.ready() && publication.admitting,
             accepted: self.accepted.load(Ordering::Relaxed),
             active: self.active.load(Ordering::Relaxed), errors: self.errors.load(Ordering::Relaxed),
             uploaded: self.uploaded.load(Ordering::Relaxed), downloaded: self.downloaded.load(Ordering::Relaxed),
@@ -104,21 +126,40 @@ impl Control {
             .map_err(|_| super::invalid("diagnostic.owner", "owner command queue busy or closed"))
     }
 
-    pub(crate) fn publication(&self, revision: u64, admitting: bool) {
-        self.admitting.store(false, Ordering::Release);
-        self.revision.store(revision, Ordering::Release);
-        self.admitting.store(admitting, Ordering::Release);
+    pub(crate) fn publication(&self, revision: u64, digest: [u8; 32], admitting: bool) {
+        if let Ok(mut state) = self.publication.lock() {
+            *state = Publication { revision, digest, admitting };
+        }
+    }
+
+    pub(crate) fn matches(&self, binding: Binding) -> bool {
+        self.ready() && binding.revision != 0 && self.status().binding == binding
     }
 
     pub(crate) fn apply(&self, candidate: Candidate) -> Result<mpsc::Receiver<Result<(), String>>, ConfigError> {
-        if !self.ready() {
-            return Err(super::invalid("anti_dpi.owner", "owned proxy is not connected"));
+        self.apply_bound(self.status().binding, candidate)
+    }
+
+    pub(crate) fn apply_bound(&self, prior: Binding, candidate: Candidate) -> Result<mpsc::Receiver<Result<(), String>>, ConfigError> {
+        if !self.matches(prior) {
+            return Err(super::invalid("anti_dpi.owner", "stale instance or policy binding"));
         }
         let expected = candidate.digest();
         let (reply, receiver) = mpsc::channel();
-        self.commands.try_send(Command::Apply { candidate, expected, reply })
+        self.commands.try_send(Command::Apply { prior, candidate, expected, reply })
             .map_err(|_| super::invalid("anti_dpi.owner", "owner command queue busy or closed"))?;
         Ok(receiver)
+    }
+
+    pub(crate) fn disconnect_bound(&self, prior: Binding) -> Result<(mpsc::Receiver<Result<(), String>>, tokio::sync::oneshot::Sender<()>), ConfigError> {
+        if !self.matches(prior) {
+            return Err(super::invalid("anti_dpi.owner", "stale instance or policy binding"));
+        }
+        let (reply, receiver) = mpsc::channel();
+        let (ack_send, ack) = tokio::sync::oneshot::channel();
+        self.commands.try_send(Command::Disconnect { prior, reply, ack })
+            .map_err(|_| super::invalid("anti_dpi.owner", "owner command queue busy or closed"))?;
+        Ok((receiver, ack_send))
     }
 
     pub(crate) fn enter(&self) -> Connection<'_> {
@@ -141,11 +182,17 @@ mod tests {
     use super::*;
     #[test]
     fn owner_state_and_counters_are_local() {
-        let (first, _) = Control::channel();
-        let (second, _) = Control::channel();
+        let (first, _) = Control::channel().unwrap();
+        let (second, _) = Control::channel().unwrap();
         assert!(!first.ready());
         first.set_phase(Phase::Connected);
         assert!(first.ready());
+        first.publication(1, [1; 32], true);
+        let stale = first.status().binding;
+        assert!(first.matches(stale));
+        assert!(!second.matches(stale));
+        first.publication(2, [2; 32], true);
+        assert!(!first.matches(stale));
         let connection = first.enter();
         connection.failure();
         assert_eq!(first.status().active, 1);
