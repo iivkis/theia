@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "source_sha": "64ffe53f5b6d36afdcf9c6fea32a7c870ab99c9a",
+  "source_sha": "24868f20de975beeb626122e1d2478d1b7c0fbed",
   "platform": "linux",
   "columns": 120,
   "rows": 40,
@@ -36,7 +36,7 @@
     {
       "scenario": "client-action-new-profile",
       "file": "client-action-new-profile.png",
-      "sha256": "923505a9a9bc6c20ec88ec4beb1818a569408140f2a548369db7b6b99727cd7b",
+      "sha256": "47e0b91ef803b501c2bf82e44c1da429ae18c7309436ebc51d3ec76144074253",
       "state_fixture": false
     },
     {
@@ -558,7 +558,7 @@
     {
       "scenario": "server-reality-status-technical",
       "file": "server-reality-status-technical.png",
-      "sha256": "20aa5210e51b239fadf813c253be103ff87f14e7596f0fe494dcf9544084b420",
+      "sha256": "78faf9d5f0dbaa1e1af8b3aa596ed72c69cb1cdff3345c89ce365b178637011a",
       "state_fixture": false
     },
     {
@@ -588,25 +588,37 @@
     {
       "scenario": "server-routing-geodata-clear",
       "file": "server-routing-geodata-clear.png",
-      "sha256": "2935b3d515855f3e442f684381782e3a6169480a2133f4904c32db5a84a51920",
+      "sha256": "effe61b091efa969a766618c00afa6ca8588dda0de1951f3a8c9c02702918cad",
       "state_fixture": false
     },
     {
       "scenario": "server-routing-geodata-empty",
       "file": "server-routing-geodata-empty.png",
-      "sha256": "8e0b1f05baa7bf4947b7ef1615c0b96163c4b08bb666a0b0a10ac48de2a87b1f",
+      "sha256": "c8346ea31d09a69639b5df426a4477514b53cbc470619e346b5ff3a1b2be6eae",
       "state_fixture": false
     },
     {
       "scenario": "server-routing-geodata-marked",
       "file": "server-routing-geodata-marked.png",
-      "sha256": "cacf7d4b948deed9bd323f19c36d50ba82c2dd4e49356d0e1feb5ddc20fcb4bf",
+      "sha256": "abf4861e48a9b203f2a39a0789758bc3e9208c8aa5de173cd7a658e2aed1bec0",
       "state_fixture": false
     },
     {
       "scenario": "server-routing-geodata-missing",
       "file": "server-routing-geodata-missing.png",
-      "sha256": "0320bac63ed44df2e9b9a61b85921bcba9b4489b32e0bcdd2d925f522ca12e44",
+      "sha256": "d57903c917820ad810c02940194a94c43fcd7bbbf5ed15fab92a938a7027d291",
+      "state_fixture": false
+    },
+    {
+      "scenario": "server-routing-geodata-obsolete",
+      "file": "server-routing-geodata-obsolete.png",
+      "sha256": "037e736844cb606c5bd741b3d19587cbb869d126b498be3cb4e9a0982f4b872f",
+      "state_fixture": false
+    },
+    {
+      "scenario": "server-routing-geodata-removed",
+      "file": "server-routing-geodata-removed.png",
+      "sha256": "79fa446ed79f2798cb97d7fd38f7d62693e5c89cd15b2233dfa4339277f021f4",
       "state_fixture": false
     },
     {
@@ -618,25 +630,25 @@
     {
       "scenario": "server-routing-geoip-picker",
       "file": "server-routing-geoip-picker.png",
-      "sha256": "abfd19b9dcab520d5d9aac1de906aafc27698c2a8368e82141ed517b03137837",
+      "sha256": "3519956a8272205dec0c37808962692afa6bb904632d33913de0a3ff9edf5940",
       "state_fixture": false
     },
     {
       "scenario": "server-routing-geoip-reopened",
       "file": "server-routing-geoip-reopened.png",
-      "sha256": "3a477f9102dfa2fb9c3922b6d2cf67e9412e2c2e1b3f963878d9db9d40822b4c",
+      "sha256": "1747a36b27fd258301d478428e6924e6320def26d0b534f85a601769e8034521",
       "state_fixture": false
     },
     {
       "scenario": "server-routing-geosite-picker",
       "file": "server-routing-geosite-picker.png",
-      "sha256": "ddb0995cb9d71eac02285dad9029d0c0b4fc35a996b1d3c03ce233dbd8c739a1",
+      "sha256": "30eccf4c0b8deb0fff06b5aa70892adffd63df511e34fd6c5ab893fc8cc0b08b",
       "state_fixture": false
     },
     {
       "scenario": "server-routing-geosite-reopened",
       "file": "server-routing-geosite-reopened.png",
-      "sha256": "f38ac4c5125bd68ed23f899f57188a7acdc0fdcb01f4c91dc062da5d422255a3",
+      "sha256": "4df032eb46a1126d9d398a8dc42c4e0621c46452785b259b13ccfd294ec4134b",
       "state_fixture": false
     },
     {
@@ -966,7 +978,7 @@
     {
       "scenario": "state-reality-step6-save-inspection",
       "file": "state-reality-step6-save-inspection.png",
-      "sha256": "7341e373eb7c3e7de9f91bf54fd7d80170018bbf6d7f01169ae0060cb74a84f9",
+      "sha256": "2677de48f3240233eed1e1fab4aadbe9296a2205745370612a502ccd5f32f1f4",
       "state_fixture": true
     },
     {
