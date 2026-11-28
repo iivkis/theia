@@ -9352,6 +9352,14 @@ mod tests {
                     if page == 1 {
                         let content = layout.map_or(details, |p| p[0]);
                         let table = editor_layout(content).unwrap()[1];
+                        let editor = ui.editor.as_ref().unwrap();
+                        let field = if role == Role::Client {
+                            assert_eq!(editor.field_count(), 1);
+                            assert_eq!(editor.workspace_fields().len(), 1);
+                            0
+                        } else {
+                            1
+                        };
                         let y = (table.y..table.bottom())
                             .find(|&y| {
                                 editor_field_hit(
@@ -9359,11 +9367,12 @@ mod tests {
                                     ui.editor.as_ref().unwrap(),
                                     table.x + 2,
                                     y,
-                                ) == Some(1)
+                                ) == Some(field)
                             })
-                            .unwrap();
+                            .expect("visible compact field");
                         ui.mouse(&mut model, click_at(table.x + 2, y), area);
-                        assert_eq!(ui.editor.as_ref().unwrap().workspace_field_index(), 1);
+                        assert_eq!(ui.editor.as_ref().unwrap().workspace_field_index(), field);
+                        assert_eq!(ui.workspace_focus, WorkspaceFocus::Fields);
                         assert!(!ui.editor.as_ref().unwrap().editing);
                     } else if page_has_users(role, page) {
                         let content = layout.unwrap()[0];
@@ -11389,7 +11398,8 @@ mod tests {
         second.id = "backup".into();
         second.server = "backup.example.org:443".into();
         doc.client.profiles.push(second);
-        fs::write(&path, Config::Client(doc).to_toml().unwrap()).unwrap();
+        let original = Config::Client(doc).to_toml().unwrap();
+        fs::write(&path, &original).unwrap();
 
         let mut interaction = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
         let mut model = Model::new(Some(Role::Client));
@@ -11407,6 +11417,32 @@ mod tests {
             .as_ref()
             .unwrap()
             .selected_record_is_active());
+        assert_eq!(interaction.editor.as_ref().unwrap().field_count(), 1);
+        assert_eq!(
+            interaction.editor.as_ref().unwrap().field_name(),
+            "client.profiles[1].server"
+        );
+        // Down leaves the only basic field for the action list. Opening
+        // advanced fields is an explicit, presentation-only action.
+        assert!(!interaction.update(&mut model, press(KeyCode::Down)));
+        assert_eq!(interaction.workspace_focus, WorkspaceFocus::Actions);
+        let items = page_actions(Role::Client, 1, interaction.editor.as_ref());
+        let advanced = items.iter().position(|a| a.key == 'z').unwrap();
+        for _ in 0..advanced {
+            assert!(!interaction.update(&mut model, press(KeyCode::Down)));
+        }
+        assert_eq!(interaction.workspace_action, advanced);
+        assert!(!interaction.update(&mut model, press(KeyCode::Enter)));
+        assert!(interaction.workspace_advanced);
+        assert_eq!(interaction.editor.as_ref().unwrap().field_count(), 4);
+        assert_eq!(interaction.editor.as_ref().unwrap().workspace_fields().len(), 4);
+        assert!(!interaction.owned_running(Role::Client));
+        assert!(!interaction.editor.as_ref().unwrap().dirty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!interaction.update(&mut model, press(KeyCode::Left)));
+        assert_eq!(interaction.workspace_focus, WorkspaceFocus::Records);
+        assert!(!interaction.update(&mut model, press(KeyCode::Right)));
+        assert_eq!(interaction.workspace_focus, WorkspaceFocus::Fields);
         assert!(!interaction.update(&mut model, press(KeyCode::Down)));
         assert_eq!(
             interaction.editor.as_ref().unwrap().field_name(),
@@ -11430,6 +11466,13 @@ mod tests {
         );
         assert_eq!(model.screen, Screen::Client);
         assert!(!interaction.editor.as_ref().unwrap().dirty());
+        assert!(!interaction.owned_running(Role::Client));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        // Reopening the section restores the compact view and clamps focus.
+        interaction.select_workspace_page(Role::Client, 1);
+        assert!(!interaction.workspace_advanced);
+        assert_eq!(interaction.editor.as_ref().unwrap().field_count(), 1);
+        assert_eq!(interaction.editor.as_ref().unwrap().workspace_field_index(), 0);
         fs::remove_file(path).unwrap();
     }
 
