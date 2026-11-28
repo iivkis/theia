@@ -163,6 +163,11 @@ fn columns() -> Vec<Column> {
         .collect()
 }
 
+/// Canonical diagnostic columns are shared by all presentations.
+pub fn strategy_columns() -> Vec<&'static str> {
+    columns().into_iter().map(Column::id).collect()
+}
+
 #[derive(Debug)]
 struct Saved {
     path: PathBuf,
@@ -269,6 +274,10 @@ impl Plan {
         self.digest
     }
 
+    pub fn planned_cells(&self) -> usize {
+        self.hosts.len() * columns().len()
+    }
+
     fn files_current(&self) -> bool {
         self.saved.current() && self.overlay.as_ref().is_none_or(Saved::current)
     }
@@ -304,6 +313,17 @@ impl Plan {
     pub async fn run(self, confirmation: [u8; 32], cancel: &AtomicBool)
         -> Result<Report, ConfigError>
     {
+        self.run_with_progress(confirmation, cancel, |_| {}).await
+    }
+
+    /// The callback sees only finished cells (including typed unsupported
+    /// and cancelled outcomes); no production evidence or shared cache.
+    pub async fn run_with_progress(
+        self,
+        confirmation: [u8; 32],
+        cancel: &AtomicBool,
+        mut progress: impl FnMut(&[CellResult]),
+    ) -> Result<Report, ConfigError> {
         if self.digest != confirmation || !self.files_current() {
             return Err(invalid("diagnostic", "confirmation or saved document changed; review again"));
         }
@@ -339,10 +359,12 @@ impl Plan {
                 optional_row(&state, group.get(2), &roots),
                 optional_row(&state, group.get(3), &roots),
             );
-            cells.extend(a);
-            cells.extend(b);
-            cells.extend(c);
-            cells.extend(d);
+            for row in [a, b, c, d] {
+                if !row.is_empty() {
+                    progress(&row);
+                    cells.extend(row);
+                }
+            }
         }
         if !state.context_current() {
             for cell in &mut cells {

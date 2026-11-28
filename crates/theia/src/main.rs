@@ -50,6 +50,9 @@ async fn run() {
         .map(|arg| arg.into_string().map_err(|_| CliError::NonUtf8Argument))
         .collect();
     let result: Result<String, CliError> = match args.and_then(|args| parse(&args)) {
+        Ok(Command::AntiDpiTui { config }) => tui::run_anti_dpi(config.as_deref().map(Path::new))
+            .map(|_| "standalone tui closed".to_owned())
+            .map_err(|error| CliError::Tui(error.message())),
         Ok(Command::AntiDpiApply { config, confirm, enroll }) => {
             use theia::anti_dpi::authority::Candidate;
             Candidate::read(Path::new(&config)).and_then(|candidate| match confirm {

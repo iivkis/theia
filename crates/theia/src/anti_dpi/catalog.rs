@@ -14,17 +14,52 @@ pub const MAX_DOMAINS: usize = 256;
 pub const MAX_JOB_DOMAINS: usize = 64;
 pub const MAX_JOB_CELLS: usize = 512;
 
+/// The source measures blocked URLs grouped by hostname. It does not
+/// establish the scope of every domain-wide/IP/protocol restriction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestrictionScope {
+    Unknown,
+}
+
+/// Hostname alone is not evidence that a protocol endpoint is available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointSupport {
+    Unknown,
+    HttpsHeadCandidate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointMetadata {
+    pub tcp_https: EndpointSupport,
+    pub quic_v1: EndpointSupport,
+    pub quic_v2: EndpointSupport,
+    pub stun: EndpointSupport,
+}
+
+impl Default for EndpointMetadata {
+    fn default() -> Self {
+        Self {
+            tcp_https: EndpointSupport::HttpsHeadCandidate,
+            quic_v1: EndpointSupport::Unknown,
+            quic_v2: EndpointSupport::Unknown,
+            stun: EndpointSupport::Unknown,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Provenance {
     pub source: &'static str,
     pub last_confirmed_day: String,
     pub confirmed_networks: u32,
+    pub restriction_scope: RestrictionScope,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub hostname: String,
     pub provenance: Option<Provenance>,
+    pub endpoint: EndpointMetadata,
     pub excluded: bool,
 }
 
@@ -129,6 +164,7 @@ impl Catalog {
             if !canonical_host(host) || day.len() != 10 || networks == 0 ||
                 entries.insert(host.to_owned(), Some(Provenance {
                     source: SOURCE, last_confirmed_day: day.to_owned(), confirmed_networks: networks,
+                    restriction_scope: RestrictionScope::Unknown,
                 })).is_some() {
                 return Err(invalid("catalog.builtin", "invalid or duplicate embedded record"));
             }
@@ -146,6 +182,7 @@ impl Catalog {
         Ok(Self {
             entries: entries.into_iter().map(|(hostname, provenance)| Entry {
                 excluded: excluded.contains(&hostname), hostname, provenance,
+                endpoint: EndpointMetadata::default(),
             }).collect(),
             builtin_count,
         })
@@ -182,9 +219,9 @@ impl Catalog {
         for entry in &self.entries {
             let _ = write!(out, "{}\t{}\t", entry.hostname, if entry.excluded { "excluded" } else { "enabled" });
             if let Some(p) = &entry.provenance {
-                let _ = writeln!(out, "{}\t{}\t{}", p.last_confirmed_day, p.confirmed_networks, p.source);
+                let _ = writeln!(out, "{}\t{}\t{}\tscope={:?}\tendpoint={:?}", p.last_confirmed_day, p.confirmed_networks, p.source, p.restriction_scope, entry.endpoint);
             } else {
-                out.push_str("user-supplied; no block evidence\n");
+                let _ = writeln!(out, "user-supplied; no block evidence\tendpoint={:?}", entry.endpoint);
             }
         }
         out
@@ -204,6 +241,9 @@ mod tests {
         assert_eq!(catalog.entries().len(), 61);
         let entry = catalog.entries().iter().find(|e| e.hostname == "meduza.io").unwrap();
         assert!(entry.excluded && entry.provenance.is_some());
+        assert_eq!(entry.provenance.as_ref().unwrap().restriction_scope, RestrictionScope::Unknown);
+        assert_eq!(entry.endpoint.quic_v1, EndpointSupport::Unknown);
+        assert_eq!(entry.endpoint.stun, EndpointSupport::Unknown);
         assert_eq!(catalog.entries().iter().filter(|e| e.provenance.is_some()).count(), 60);
         assert!(catalog.select(&["meduza.io".into()], 1).is_err());
         assert!(catalog.select(&["custom.example.com".into()], 1).is_ok());

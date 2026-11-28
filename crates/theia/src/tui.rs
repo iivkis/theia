@@ -2,6 +2,8 @@
 //!
 //! M4.1c edits safe fields; M4.4b adds one-time server issuance and reveal.
 //! Explicit runtime and Windows proxy actions are isolated in confirmed panels.
+mod standalone;
+
 use crate::{
     client_import,
     invite::Invitation,
@@ -124,6 +126,8 @@ enum Screen {
 #[derive(Debug, Clone, Copy)]
 struct Model {
     selected: Role,
+    home_anti_dpi: bool,
+    launch_anti_dpi: bool,
     screen: Screen,
     return_from_help: Screen,
 }
@@ -138,6 +142,8 @@ impl Model {
         };
         Self {
             selected,
+            home_anti_dpi: false,
+            launch_anti_dpi: false,
             screen,
             return_from_help: screen,
         }
@@ -170,30 +176,45 @@ impl Model {
             }
             KeyCode::Char('1') if self.screen != Screen::Help => {
                 self.selected = Role::Server;
+                self.home_anti_dpi = false;
                 self.screen = Screen::Server;
                 false
             }
             KeyCode::Char('2') if self.screen != Screen::Help => {
                 self.selected = Role::Client;
+                self.home_anti_dpi = false;
                 self.screen = Screen::Client;
                 false
             }
+            KeyCode::Char('3') if self.screen == Screen::Home => {
+                self.home_anti_dpi = true;
+                self.launch_anti_dpi = true;
+                false
+            }
             KeyCode::Left if self.screen == Screen::Home => {
-                self.selected = Role::Server;
+                if self.home_anti_dpi {
+                    self.home_anti_dpi = false;
+                    self.selected = Role::Client;
+                } else {
+                    self.selected = Role::Server;
+                }
                 false
             }
             KeyCode::Right if self.screen == Screen::Home => {
-                self.selected = Role::Client;
+                if self.selected == Role::Client {
+                    self.home_anti_dpi = true;
+                } else {
+                    self.selected = Role::Client;
+                }
                 false
             }
             // Tab remains an optional accessibility shortcut, not the primary
             // navigation. Vertical arrows do not move horizontal role cards.
             KeyCode::Tab | KeyCode::BackTab if self.screen == Screen::Home => {
-                self.selected = if self.selected == Role::Server {
-                    Role::Client
-                } else {
-                    Role::Server
-                };
+                let current = if self.home_anti_dpi { 2 } else if self.selected == Role::Client { 1 } else { 0 };
+                let next = if key.code == KeyCode::BackTab { (current + 2) % 3 } else { (current + 1) % 3 };
+                self.home_anti_dpi = next == 2;
+                self.selected = if next == 0 { Role::Server } else { Role::Client };
                 false
             }
             KeyCode::Tab | KeyCode::BackTab if self.screen != Screen::Help => {
@@ -210,6 +231,10 @@ impl Model {
                 false
             }
             KeyCode::Enter if self.screen == Screen::Home => {
+                if self.home_anti_dpi {
+                    self.launch_anti_dpi = true;
+                    return false;
+                }
                 self.screen = match self.selected {
                     Role::Server => Screen::Server,
                     Role::Client => Screen::Client,
@@ -3654,9 +3679,15 @@ impl Interaction {
             let cards = home_layout(body);
             if inside(cards[0]) {
                 model.selected = Role::Server;
+                model.home_anti_dpi = false;
             }
             if inside(cards[1]) {
                 model.selected = Role::Client;
+                model.home_anti_dpi = false;
+            }
+            if inside(cards[2]) {
+                model.selected = Role::Client;
+                model.home_anti_dpi = true;
             }
             return;
         }
@@ -6343,7 +6374,7 @@ fn shell_layout(area: Rect) -> [Rect; 3] {
     [parts[0], parts[1], parts[2]]
 }
 
-fn home_layout(area: Rect) -> [Rect; 2] {
+fn home_layout(area: Rect) -> [Rect; 3] {
     let mut content = centered_column(area, 112);
     // Keep the roles side by side even in a narrow terminal so the
     // direction of the arrows never changes with window size.
@@ -6353,9 +6384,9 @@ fn home_layout(area: Rect) -> [Rect; 2] {
     }
     let parts = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([Constraint::Percentage(33), Constraint::Percentage(33), Constraint::Percentage(34)])
         .split(content);
-    [parts[0], parts[1]]
+    [parts[0], parts[1], parts[2]]
 }
 
 fn workspace_columns(area: Rect) -> Option<[Rect; 3]> {
@@ -7083,8 +7114,9 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
                 frame.render_widget(Paragraph::new("Что вы хотите сделать?").style(Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
                     Rect::new(cards[0].x + 1, parts[1].y, cards[0].width.saturating_sub(2), 1));
             }
-            draw_role_card(frame, cards[0], Role::Server, model.selected == Role::Server);
-            draw_role_card(frame, cards[1], Role::Client, model.selected == Role::Client);
+            draw_role_card(frame, cards[0], Role::Server, !model.home_anti_dpi && model.selected == Role::Server);
+            draw_role_card(frame, cards[1], Role::Client, !model.home_anti_dpi && model.selected == Role::Client);
+            draw_home_card(frame, cards[2], "Anti-DPI", "Локальная диагностика без сервера.", model.home_anti_dpi);
         }
         Screen::Server | Screen::Client => {
             let role = if model.screen == Screen::Server { Role::Server } else { Role::Client };
@@ -8363,6 +8395,10 @@ fn draw_role_card(frame: &mut Frame<'_>, area: Rect, role: Role, selected: bool)
         Role::Server => ("Для сервера", "Настроить сервер и выдавать доступ."),
         Role::Client => ("Для клиента", "Подключиться по полученному ключу."),
     };
+    draw_home_card(frame, area, title, details, selected);
+}
+
+fn draw_home_card(frame: &mut Frame<'_>, area: Rect, title: &str, details: &str, selected: bool) {
     let area = Rect::new(
         area.x.saturating_add(1),
         area.y,
@@ -9607,6 +9643,11 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor, focused: bool
 
 /// Edit only when both role and a config path are explicitly supplied.
 /// Saving never changes a service. A separate, explicitly confirmed Linux\n/// IPC transaction is available only for saved server authorization deltas.
+pub fn run_anti_dpi(config_path: Option<&Path>) -> Result<(), TuiError> {
+    let default = crate::tui_menu::default_config("anti-dpi.toml");
+    standalone::run(config_path.unwrap_or(&default))
+}
+
 pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiError> {
     crate::diag!(
         Info,
@@ -9710,6 +9751,21 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
                     if interaction.update(&mut model, key) {
                         crate::diag!(Info, "tui", "closed_by_user");
                         return Ok(());
+                    }
+                    if std::mem::take(&mut model.launch_anti_dpi) {
+                        if interaction.editor.as_ref().is_some_and(Editor::dirty)
+                            || interaction.owned_running(Role::Server)
+                            || interaction.owned_running(Role::Client)
+                        {
+                            interaction.preview_text = Some("Сначала завершите изменения и принадлежащие панели процессы.".into());
+                            interaction.value_preview = true;
+                        } else {
+                            let path = crate::tui_menu::default_config("anti-dpi.toml");
+                            if let Err(error) = standalone::run_in(&mut terminal, &path) {
+                                interaction.preview_text = Some(error.message().into());
+                                interaction.value_preview = true;
+                            }
+                        }
                     }
                     if old_screen != model.screen {
                         if let Some(role) = Interaction::panel_role(&model) {
@@ -10592,6 +10648,12 @@ mod tests {
         assert!(!app.update(press(KeyCode::Right)));
         assert_eq!(app.selected, Role::Client);
         assert!(!app.update(press(KeyCode::Right)));
+        assert!(app.home_anti_dpi);
+        assert!(!app.update(press(KeyCode::Enter)));
+        assert!(std::mem::take(&mut app.launch_anti_dpi));
+        assert_eq!(app.screen, Screen::Home);
+        assert!(!app.update(press(KeyCode::Left)));
+        assert!(!app.home_anti_dpi);
         assert_eq!(app.selected, Role::Client);
         assert!(!app.update(press(KeyCode::Left)));
         assert_eq!(app.selected, Role::Server);
@@ -11753,7 +11815,7 @@ mod tests {
             &mut model,
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
-                column: 90,
+                column: 60,
                 row: 5,
                 modifiers: KeyModifiers::NONE,
             },
