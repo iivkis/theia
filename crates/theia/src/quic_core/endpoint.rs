@@ -240,8 +240,8 @@ impl LabSession {
         }
         // Preserve the exact pinned peer established during the handshake.
         match (socket.native_pinned(), socket.peer_addr()) {
-            (true, Ok(connected)) if connected == peer => {},
-            (false, Err(error)) if error.kind() == io::ErrorKind::NotConnected => {},
+            (true, Ok(connected)) if connected == peer => {}
+            (false, Err(error)) if error.kind() == io::ErrorKind::NotConnected => {}
             _ => return Err(Error::Scope),
         }
         let mut send =
