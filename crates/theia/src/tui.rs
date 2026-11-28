@@ -10727,6 +10727,51 @@ mod tests {
     }
 
     #[test]
+    fn routing_table_and_form_pointer_preserve_draft_without_io() {
+        let dir =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("routing-pointer").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("server.toml");
+        let source = server_issuance_fixture();
+        std::fs::write(&path, &source).unwrap();
+        let editor = Editor::load(Role::Server, &path).unwrap();
+        let mut panel = RoutingPanel::new(&editor);
+        let area = Rect::new(0, 0, 120, 40);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| panel.render(frame, area, true)).unwrap();
+        for name in ["alpha", "beta", "gamma"] {
+            panel.edit(None);
+            let (_, values, _) = panel.fields.as_mut().unwrap();
+            values[0] = name.into();
+            values[2] = "domain:example.org, full:localhost".into();
+            values[3] = "192.0.2.0/24".into();
+            let form = panel.form().unwrap();
+            let target = (0..area.height)
+                .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+                .find(|&(x, y)| form.hit(area, x, y) == Some(3))
+                .unwrap();
+            panel.select_at(area, target.0, target.1);
+            assert_eq!(panel.fields.as_ref().unwrap().2, 3);
+            terminal.draw(|frame| panel.render(frame, area, true)).unwrap();
+            panel.key(press(KeyCode::Enter), None);
+            assert!(panel.fields.is_none());
+        }
+        let [report, _] = panel.layout(area).unwrap();
+        panel.select_at(area, report.x + 1, report.y + 4);
+        assert_eq!(panel.selected, 0);
+        panel.select_at(area, report.x + 1, report.y + 5);
+        assert_eq!(panel.selected, 1);
+        assert!(panel.action_focus.is_none());
+        terminal.draw(|frame| panel.render(frame, area, true)).unwrap();
+        terminal.draw(|frame| panel.render(frame, area, false)).unwrap();
+        let names = panel.settings.rules.iter().map(|r| r.name.as_str()).collect::<Vec<_>>();
+        assert_eq!(names, ["alpha", "beta", "gamma"]);
+        assert!(!editor.dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn routing_observation_never_treats_stale_or_mismatched_runtime_as_active() {
         let digest = [7; 32];
         let mut observation = RoutingObservation::new(digest);
