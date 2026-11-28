@@ -376,6 +376,20 @@ fn visual_review_gallery() {
             ui.routing_panel.as_mut().unwrap().geodata_mode = false;
             ui.routing_panel.as_mut().unwrap().edit(Some(0));
             review_capture("server-routing-edit", &model, &ui);
+            for (field, name, codes, query) in [
+                (2, "server-routing-geosite-picker", vec!["category-ads-all", "google", "google-deepmind", "youtube"], "goo"),
+                (3, "server-routing-geoip-picker", vec!["in-cn", "in-ir", "in-ru", "private"], "in-"),
+            ] {
+                let panel = ui.routing_panel.as_mut().unwrap();
+                panel.fields.as_mut().unwrap().2 = field;
+                panel.geo_picker = Some(GeoPicker {
+                    field, query: query.into(), codes: codes.into_iter().map(str::to_owned).collect(),
+                    marked: Default::default(), focus: 0, loading: None, message: String::new(),
+                });
+                panel.key(press(KeyCode::Char(' ')), None);
+                review_capture(name, &model, &ui);
+                ui.routing_panel.as_mut().unwrap().key(press(KeyCode::Esc), None);
+            }
         } else {
             let mut ui = Interaction::new(Some(Editor::load(role, path).unwrap()));
             ui.select_workspace_page(role, 6);

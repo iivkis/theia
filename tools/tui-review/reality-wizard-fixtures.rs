@@ -70,8 +70,30 @@ impl ProvisionPanel {
             reference_health::Evidence { h2_status: None, h3_status: None },
             reference_health::Evidence { h2_status: None, h3_status: None },
         ];
+        for (name, marked) in [
+            ("state-reality-step5-manual-choice", false),
+            ("state-reality-step5-manual-selected", true),
+        ] {
+            let (mut panel, input) = setup();
+            let observations = good.iter().enumerate().map(|(i, evidence)| reference_health::SearchObservation {
+                evidence: *evidence,
+                h2_ms: evidence.eligible().then_some(18 + i as u64 * 11),
+            }).collect();
+            let report = screening_report(targets.clone(), observations, Vec::new()).unwrap();
+            let wizard = panel.wizard.as_mut().unwrap();
+            wizard.stage = WizardStage::SelectReferences(Box::new(ReferenceSelection::new(input, report)));
+            if marked {
+                panel.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+                panel.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+                panel.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+                panel.key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+            }
+            assert!(panel.confirmation_choice().is_none());
+            screens.push((name, panel));
+        }
         let (mut panel, input) = setup();
-        let (state, review) = rank_checked(&input, targets.clone(), good.clone(), now, Vec::new()).unwrap();
+        let (state, mut review) = rank_checked(&input, targets.clone(), good.clone(), now, Vec::new()).unwrap();
+        for (i, row) in review.rows.iter_mut().enumerate() { if row.h2 { row.latency_ms = Some(22 + i as u64 * 9); } }
         assert_eq!(review.rows.iter().filter(|r| r.selected.is_some()).count(), 3);
         assert_eq!(review.rows.iter().filter(|r| r.h2).count(), 4);
         panel.wizard.as_mut().unwrap().stage = WizardStage::CreateConfirm(Box::new((input, state.unwrap(), review)));

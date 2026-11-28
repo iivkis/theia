@@ -1,7 +1,7 @@
 # TUI visual review
 
 This branch is a Linux-only visual evidence gallery, not a product development branch.
-The generator checks out the explicitly pinned dev commit (d8e17afefc96ce4d13facc5fc3e7bc8705f8c0d3) and records real Ratatui draw buffers at one size: 120×40 columns/rows. PNGs use a fixed DejaVu Sans Mono font. No Windows job.
+The generator checks out the explicitly pinned dev commit (a5e98893128e7bf246fd3a901bb3cbe125fcee19) and records real Ratatui draw buffers at one size: 120×40 columns/rows. PNGs use a fixed DejaVu Sans Mono font. No Windows job.
 
 - Open [screenshots/README.md](screenshots/README.md) after a successful workflow.
 - Read screenshots/manifest.json first: it identifies the exact source SHA, scenario names and file digests.
@@ -43,3 +43,5 @@ The client diagnostics workspace is a required independent screen. The idle serv
 The diagnostic workspace includes synthetic offline states for source selection, input validation, fetching, consent, running, completed/partial results, details, policy blocking and failure. The gallery regression gate also verifies compact and advanced client profile navigation without writes, diagnostic consent and safe retry, and idle monitor rendering. Windows native lifecycle acceptance remains separate.
 
 Diagnostic states use distinct successful, policy-blocked, interrupted and failed fixtures. Publication rejects duplicate diagnostic PNGs. Compact action layout and mouse selection without execution are regression-tested; profile ports remain intact across wrapped rows.
+
+GeoSite/GeoIP picker screenshots use synthetic local category names, and the REALITY manual selection screenshots use synthetic H2 application-check durations. Navigation and role assignments never contact external sites; the real worker and persistence gates remain separate.
