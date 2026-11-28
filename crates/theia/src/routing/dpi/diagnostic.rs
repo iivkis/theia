@@ -84,14 +84,21 @@ async fn head_status(input: &mut (impl AsyncRead + Unpin)) -> Result<u16, Failur
 /// Transport closure/reset during TLS is not itself a certificate rejection.
 fn handshake_failure(error: &std::io::Error) -> Failure {
     use std::io::ErrorKind;
-    if error.get_ref().and_then(|cause| cause.downcast_ref::<rustls::Error>()).is_some() {
+    if error
+        .get_ref()
+        .and_then(|cause| cause.downcast_ref::<rustls::Error>())
+        .is_some()
+    {
         return Failure::Tls;
     }
     match error.kind() {
         ErrorKind::PermissionDenied => Failure::Denied,
         ErrorKind::TimedOut => Failure::Timeout,
-        ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
-        | ErrorKind::BrokenPipe | ErrorKind::NotConnected => Failure::Network,
+        ErrorKind::UnexpectedEof
+        | ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::BrokenPipe
+        | ErrorKind::NotConnected => Failure::Network,
         _ => Failure::Tls,
     }
 }
@@ -262,10 +269,16 @@ pub(crate) async fn stun(
             return Err(Failure::Denied);
         }
         let (socket, _admission) = udp_socket(peer, scope).await?;
-        let strategy = if modify { BindingStrategy::Fingerprint } else { BindingStrategy::Plain };
+        let strategy = if modify {
+            BindingStrategy::Fingerprint
+        } else {
+            BindingStrategy::Plain
+        };
         let observed = probe_stun_observed(&socket, strategy, &scoped, |modified| {
             transformed.store(modified, Ordering::Release);
-        }).await.map_err(|error| match error {
+        })
+        .await
+        .map_err(|error| match error {
             ClientError::Open(_) => Failure::Denied,
             ClientError::Protocol => Failure::Protocol,
             _ => Failure::Network,
@@ -324,7 +337,10 @@ pub(crate) async fn quic_https(
         let relay = UdpSocket::bind("127.0.0.1:0").await.map_err(udp_io)?;
         let relay_address = relay.local_addr().map_err(udp_io)?;
         client.connect(relay_address).await.map_err(udp_io)?;
-        relay.connect(client.local_addr().map_err(udp_io)?).await.map_err(udp_io)?;
+        relay
+            .connect(client.local_addr().map_err(udp_io)?)
+            .await
+            .map_err(udp_io)?;
         let app = async {
             let mut config = (*config).clone();
             verified_tls::configure_client(&mut config, b"h3");
@@ -332,14 +348,22 @@ pub(crate) async fn quic_https(
             let server_name = rustls::pki_types::ServerName::try_from(name.to_owned())
                 .map_err(|_| Failure::Tls)?;
             let mut session = handshake_udp::connect_diagnostic_socket(
-                client, relay_address, Arc::new(config), server_name, version,
-            ).await.map_err(|error| match error {
+                client,
+                relay_address,
+                Arc::new(config),
+                server_name,
+                version,
+            )
+            .await
+            .map_err(|error| match error {
                 handshake_udp::Error::Scope => Failure::Denied,
                 handshake_udp::Error::Timeout => Failure::Timeout,
                 handshake_udp::Error::Io(error) => udp_io(error),
                 _ => Failure::Tls,
             })?;
-            dial::confirm(&mut session).await.map_err(|_| Failure::Tls)?;
+            dial::confirm(&mut session)
+                .await
+                .map_err(|_| Failure::Tls)?;
             if !scoped() {
                 return Err(Failure::Denied);
             }
@@ -347,19 +371,28 @@ pub(crate) async fn quic_https(
             let (transport, _key) = NativeConnection::start(session).map_err(|_| Failure::Tls)?;
             let _guard = transport.driver_guard();
             let mut builder = h3::client::builder();
-            builder.max_field_section_size(u64::from(crate::transport_policy::MAX_HEADER_LIST_BYTES));
-            let (mut driver, mut sender) = builder.build::<_, _, bytes::Bytes>(transport)
-                .await.map_err(|_| Failure::Protocol)?;
+            builder
+                .max_field_section_size(u64::from(crate::transport_policy::MAX_HEADER_LIST_BYTES));
+            let (mut driver, mut sender) = builder
+                .build::<_, _, bytes::Bytes>(transport)
+                .await
+                .map_err(|_| Failure::Protocol)?;
             let exchange = async {
                 let request = http::Request::builder()
                     .method(http::Method::HEAD)
                     .uri(format!("https://{name}/"))
                     .body(())
                     .map_err(|_| Failure::Protocol)?;
-                let mut stream = sender.send_request(request).await.map_err(|_| Failure::Protocol)?;
+                let mut stream = sender
+                    .send_request(request)
+                    .await
+                    .map_err(|_| Failure::Protocol)?;
                 stream.finish().await.map_err(|_| Failure::Protocol)?;
                 for _ in 0..5 {
-                    let response = stream.recv_response().await.map_err(|_| Failure::Protocol)?;
+                    let response = stream
+                        .recv_response()
+                        .await
+                        .map_err(|_| Failure::Protocol)?;
                     let code = response.status().as_u16();
                     if (200..=599).contains(&code) {
                         return Ok(Some(code));
@@ -460,12 +493,25 @@ mod tests {
     #[test]
     fn handshake_transport_closure_is_not_identity_rejection() {
         use std::io::{Error, ErrorKind};
-        for kind in [ErrorKind::UnexpectedEof, ErrorKind::ConnectionReset, ErrorKind::BrokenPipe] {
+        for kind in [
+            ErrorKind::UnexpectedEof,
+            ErrorKind::ConnectionReset,
+            ErrorKind::BrokenPipe,
+        ] {
             assert_eq!(handshake_failure(&Error::from(kind)), Failure::Network);
         }
-        assert_eq!(handshake_failure(&Error::from(ErrorKind::PermissionDenied)), Failure::Denied);
-        assert_eq!(handshake_failure(&Error::from(ErrorKind::InvalidData)), Failure::Tls);
-        let tls = Error::new(ErrorKind::UnexpectedEof, rustls::Error::NoCertificatesPresented);
+        assert_eq!(
+            handshake_failure(&Error::from(ErrorKind::PermissionDenied)),
+            Failure::Denied
+        );
+        assert_eq!(
+            handshake_failure(&Error::from(ErrorKind::InvalidData)),
+            Failure::Tls
+        );
+        let tls = Error::new(
+            ErrorKind::UnexpectedEof,
+            rustls::Error::NoCertificatesPresented,
+        );
         assert_eq!(handshake_failure(&tls), Failure::Tls);
     }
 
@@ -508,10 +554,18 @@ mod tests {
                 response.extend([0, 0x20, 0, 8, 0, 1, 0x21, 0x13, 1, 2, 3, 4]);
                 target.send_to(&response, source).await.unwrap();
             };
-            let probe = stun(peer, scope, modify, &|| true, Instant::now() + Duration::from_secs(2));
+            let probe = stun(
+                peer,
+                scope,
+                modify,
+                &|| true,
+                Instant::now() + Duration::from_secs(2),
+            );
             let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async {
                 tokio::join!(probe, server)
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
             assert_eq!(result.result, Ok(None), "{result:?}");
             assert!(result.received);
             assert!(!result.verified_tls);

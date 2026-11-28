@@ -691,15 +691,21 @@ impl Engine {
                                         config,
                                         &live,
                                         (tokio::time::Instant::now() + budget).min(deadline),
-                                    ).await;
+                                    )
+                                    .await;
                                     match observed.result {
-                                        Ok(Some(200..=299)) if observed.transformed && observed.verified_tls => {
+                                        Ok(Some(200..=299))
+                                            if observed.transformed && observed.verified_tls =>
+                                        {
                                             Some(udp::ProbeTiming { rtt: None })
                                         }
-                                        Err(diagnostic::Failure::Denied) => return Err(stale_policy()),
-                                        Err(diagnostic::Failure::Tls | diagnostic::Failure::Protocol) => {
-                                            return Err(ClientError::Tls)
+                                        Err(diagnostic::Failure::Denied) => {
+                                            return Err(stale_policy())
                                         }
+                                        Err(
+                                            diagnostic::Failure::Tls
+                                            | diagnostic::Failure::Protocol,
+                                        ) => return Err(ClientError::Tls),
                                         _ => None,
                                     }
                                 } else {
@@ -2279,7 +2285,13 @@ mod tests {
         assert_eq!(baseline.result, Ok(200), "{baseline:?}");
         assert!(baseline.verified_tls && !baseline.transformed);
         let blocked = probe(None).await;
-        assert!(matches!(blocked.result, Err(diagnostic::Failure::Network | diagnostic::Failure::Timeout)), "{blocked:?}");
+        assert!(
+            matches!(
+                blocked.result,
+                Err(diagnostic::Failure::Network | diagnostic::Failure::Timeout)
+            ),
+            "{blocked:?}"
+        );
         assert!(!blocked.verified_tls && !blocked.transformed);
         for strategy in Strategy::ALL {
             let result = probe(Some(strategy)).await;

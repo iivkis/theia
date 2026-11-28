@@ -249,18 +249,41 @@ impl Catalog {
         // Stored third-party observations of h3 on UDP/443, not current
         // reachability or proof of a QUIC v2 capability. RFC 9369: an
         // origin advertising h3 should support QUIC v1.
-        for line in BUILTIN_ENDPOINTS.lines().filter(|line| !line.starts_with('#') && !line.is_empty()) {
+        for line in BUILTIN_ENDPOINTS
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+        {
             let mut fields = line.split('\t');
-            let (Some(host), Some("quic-v1"), Some(day), Some(source), None) =
-                (fields.next(), fields.next(), fields.next(), fields.next(), fields.next())
-            else { return Err(invalid("catalog.endpoint", "invalid embedded endpoint record")); };
+            let (Some(host), Some("quic-v1"), Some(day), Some(source), None) = (
+                fields.next(),
+                fields.next(),
+                fields.next(),
+                fields.next(),
+                fields.next(),
+            ) else {
+                return Err(invalid(
+                    "catalog.endpoint",
+                    "invalid embedded endpoint record",
+                ));
+            };
             if !entries.contains_key(host) || day.len() != 10 || !source.starts_with("https://") {
-                return Err(invalid("catalog.endpoint", "invalid embedded endpoint provenance"));
+                return Err(invalid(
+                    "catalog.endpoint",
+                    "invalid embedded endpoint provenance",
+                ));
             }
             quic_v1.insert(host.to_owned());
         }
-        if quic_v1.iter().chain(&quic_v2).chain(&stun).any(|host| !entries.contains_key(host)) {
-            return Err(invalid("catalog.endpoint", "UDP endpoint must refer to a catalogue hostname"));
+        if quic_v1
+            .iter()
+            .chain(&quic_v2)
+            .chain(&stun)
+            .any(|host| !entries.contains_key(host))
+        {
+            return Err(invalid(
+                "catalog.endpoint",
+                "UDP endpoint must refer to a catalogue hostname",
+            ));
         }
         Ok(Self {
             entries: entries
@@ -435,11 +458,19 @@ mod tests {
     fn udp_metadata_is_explicit_normalized_and_bound_to_catalogue() {
         let overlay = Overlay::parse("schema_version=1\nquic_v1=['WWW.YOUTUBE.COM.']\nquic_v2=['www.youtube.com']\ncustom=['stun.example.com']\nstun=['stun.example.com']").unwrap();
         let catalog = Catalog::build(&overlay).unwrap();
-        let youtube = catalog.entries().iter().find(|e| e.hostname == "www.youtube.com").unwrap();
+        let youtube = catalog
+            .entries()
+            .iter()
+            .find(|e| e.hostname == "www.youtube.com")
+            .unwrap();
         assert_eq!(youtube.endpoint.quic_v1, EndpointSupport::QuicH3Candidate);
         assert_eq!(youtube.endpoint.quic_v2, EndpointSupport::QuicH3Candidate);
         assert_eq!(youtube.endpoint.stun, EndpointSupport::Unknown);
-        let stun = catalog.entries().iter().find(|e| e.hostname == "stun.example.com").unwrap();
+        let stun = catalog
+            .entries()
+            .iter()
+            .find(|e| e.hostname == "stun.example.com")
+            .unwrap();
         assert_eq!(stun.endpoint.stun, EndpointSupport::StunBindingCandidate);
         assert!(Overlay::parse("schema_version=1\nstun=['not-in-catalogue.example.com']").is_err());
     }

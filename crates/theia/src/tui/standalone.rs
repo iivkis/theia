@@ -10,8 +10,8 @@ use crate::anti_dpi::{
     authority::Candidate,
     catalog::{Catalog, Overlay, MAX_JOB_DOMAINS, VERSION},
     diagnostic::{
-        recommend_tcp, strategy_columns, strategy_unavailable, CellResult, CellStatus, Plan, Reason,
-        Report, Stage,
+        recommend_tcp, strategy_columns, strategy_unavailable, CellResult, CellStatus, Plan,
+        Reason, Report, Stage,
     },
     Document,
 };
@@ -698,7 +698,10 @@ fn policy_text(doc: &Document) -> String {
         let _ = writeln!(text, "ВНИМАНИЕ: ни одна стратегия Anti-DPI ещё не принята; соответствующие соединения будут блокироваться.");
     }
     if crate::routing::dpi::STANDALONE_EXPERIMENTAL {
-        let _ = writeln!(text, "Экспериментальные способы Anti-DPI. Независимая приёмка не подтверждена.");
+        let _ = writeln!(
+            text,
+            "Экспериментальные способы Anti-DPI. Независимая приёмка не подтверждена."
+        );
     }
     if local.resolver.is_none() || !local.consent.direct_egress {
         let _ = writeln!(
@@ -1759,7 +1762,10 @@ impl Panel {
         if self.group != 0
             || self.worker.is_some()
             || !self.report_only
-            || !self.report_context.as_ref().is_some_and(|context| !context.stale && context.epoch.is_some())
+            || !self
+                .report_context
+                .as_ref()
+                .is_some_and(|context| !context.stale && context.epoch.is_some())
         {
             return None;
         }
@@ -1814,22 +1820,32 @@ impl Panel {
         draft.move_to(SetupStep::Domains);
         // Never reorder an earlier rule. Refuse a suggestion that would be
         // shadowed even at the exact observed endpoint.
-        let effective = draft.next_document().ok().and_then(|next| next.prepare().ok())
+        let effective = draft
+            .next_document()
+            .ok()
+            .and_then(|next| next.prepare().ok())
             .zip(cell.endpoint)
             .is_some_and(|(policy, endpoint)| {
                 policy.classify_resolved(&draft.values[4], &[endpoint.ip()])
                     == crate::anti_dpi::Decision::Modify
             });
         if !effective {
-            self.notice = "Более раннее правило имеет приоритет. Проверьте маршрутизацию вручную.".into();
+            self.notice =
+                "Более раннее правило имеет приоритет. Проверьте маршрутизацию вручную.".into();
             return;
         }
         self.preview_draft(draft);
     }
 
     fn toggle_udp_endpoint(&mut self, key: char) {
-        let Some(host) = self.visible().get(self.row).filter(|entry| !entry.excluded)
-            .map(|entry| entry.hostname.clone()) else { return; };
+        let Some(host) = self
+            .visible()
+            .get(self.row)
+            .filter(|entry| !entry.excluded)
+            .map(|entry| entry.hostname.clone())
+        else {
+            return;
+        };
         let mut next = self.overlay.clone();
         let list = match key {
             'h' => &mut next.quic_v1,
@@ -2461,7 +2477,11 @@ impl Panel {
                     self.begin_review(None);
                 }
             }
-            KeyCode::Char(key @ ('h' | 'H' | 'S')) if self.page == DIAGNOSTICS && !self.report_only && self.catalogue_draft.is_none() => {
+            KeyCode::Char(key @ ('h' | 'H' | 'S'))
+                if self.page == DIAGNOSTICS
+                    && !self.report_only
+                    && self.catalogue_draft.is_none() =>
+            {
                 self.toggle_udp_endpoint(key);
             }
             KeyCode::Char('R') if self.page == DIAGNOSTICS && !self.report_only => {
@@ -2553,7 +2573,9 @@ impl Panel {
             use crate::windows_system_proxy::{ObservedProxy, ProxyStatus};
             match self.os_observation {
                 Some(ObservedProxy::Direct) => "Собственная сессия отсутствует",
-                Some(ObservedProxy::External) => "Windows: сторонние настройки прокси · Theia не подключена",
+                Some(ObservedProxy::External) => {
+                    "Windows: сторонние настройки прокси · Theia не подключена"
+                }
                 Some(ObservedProxy::Journal(ProxyStatus::PendingOwned)) => {
                     "Журнал прокси · владелец не подтверждён"
                 }
@@ -2634,7 +2656,11 @@ impl Panel {
                 let _ = writeln!(
                     text,
                     "{}\n{}",
-                    if crate::routing::dpi::STANDALONE_EXPERIMENTAL { "Anti-DPI: экспериментальные стратегии TCP/QUIC/STUN доступны." } else { "Anti-DPI: используются только принятые стратегии." },
+                    if crate::routing::dpi::STANDALONE_EXPERIMENTAL {
+                        "Anti-DPI: экспериментальные стратегии TCP/QUIC/STUN доступны."
+                    } else {
+                        "Anti-DPI: используются только принятые стратегии."
+                    },
                     self.owner_text()
                 );
                 if let Some(local) = local {
@@ -3112,7 +3138,11 @@ impl Panel {
             format!("Подошёл способ {} ({} мс). u — подготовить правило; выбор способа в работе автоматический.", column_label(cell.strategy_id), cell.duration_ms)
         } else if self.worker.is_some() {
             "Дождитесь завершения проверки.".into()
-        } else if strategy_columns().iter().filter(|id| **id != "direct" && !id.ends_with("_direct")).all(|id| strategy_unavailable(id).is_some()) {
+        } else if strategy_columns()
+            .iter()
+            .filter(|id| **id != "direct" && !id.ends_with("_direct"))
+            .all(|id| strategy_unavailable(id).is_some())
+        {
             "Anti-DPI пока недоступен: проверка только прямого подключения.".into()
         } else {
             "Нет подтверждённого улучшения относительно прямого подключения.".into()
@@ -3161,9 +3191,15 @@ impl Panel {
                 c.duration_ms, c.attempts, c.actual_modification.map_or("Не подтверждена", |m| if m { "Да" } else { "Нет" }),
                 c.endpoint.map_or_else(|| "—".into(), |e| e.to_string()), c.source.map_or_else(|| "—".into(), |ip| ip.to_string()), c.policy_action));
         } else {
-            text.push_str(if id.is_none() { "Нет данных о совместимом UDP-сервере для выбранного протокола." }
-                else if id.is_some_and(|id| strategy_unavailable(id) == Some(Reason::AwaitingAcceptance)) { "Этот способ пока недоступен в данной версии. Проверка не выполнялась." }
-                else { "Нет результата. Для UDP проверьте сведения о поддержке протокола в каталоге." });
+            text.push_str(if id.is_none() {
+                "Нет данных о совместимом UDP-сервере для выбранного протокола."
+            } else if id
+                .is_some_and(|id| strategy_unavailable(id) == Some(Reason::AwaitingAcceptance))
+            {
+                "Этот способ пока недоступен в данной версии. Проверка не выполнялась."
+            } else {
+                "Нет результата. Для UDP проверьте сведения о поддержке протокола в каталоге."
+            });
         }
         text.push_str(&format!(
             "\n\nИстория каталога (не результат текущей проверки):\n{provenance}"
@@ -3603,9 +3639,17 @@ mod tests {
         if let Some(Review::Diagnostic(plan)) = &panel.review {
             let preview = plan.ui_preview(false);
             let runnable = plan.runnable_cells();
-            assert!(preview.contains(&format!("Запланировано сетевых проверок сайтов: {runnable}.")));
-            assert!(preview.contains(&format!("Недоступных ячеек: {}.", plan.planned_cells() - runnable)));
-            assert_eq!(preview.contains("Anti-DPI не будет проверен"), runnable == 6);
+            assert!(preview.contains(&format!(
+                "Запланировано сетевых проверок сайтов: {runnable}."
+            )));
+            assert!(preview.contains(&format!(
+                "Недоступных ячеек: {}.",
+                plan.planned_cells() - runnable
+            )));
+            assert_eq!(
+                preview.contains("Anti-DPI не будет проверен"),
+                runnable == 6
+            );
             assert!(preview.contains("Esc — отменить"));
             assert!(preview.contains("SHA256 плана"));
             assert!(!preview.contains("приёмка не завершена"));
@@ -3663,11 +3707,19 @@ mod tests {
                         domain: host.clone(),
                         protocol,
                         strategy_id,
-                        status: if protocol == Protocol::TcpHttps { CellStatus::Cancelled } else { CellStatus::NotChecked },
+                        status: if protocol == Protocol::TcpHttps {
+                            CellStatus::Cancelled
+                        } else {
+                            CellStatus::NotChecked
+                        },
                         network: Stage::NotRun,
                         tls: Stage::NotRun,
                         application: Stage::NotRun,
-                        reason: if protocol == Protocol::TcpHttps { Reason::Cancelled } else { Reason::MissingEndpointMetadata },
+                        reason: if protocol == Protocol::TcpHttps {
+                            Reason::Cancelled
+                        } else {
+                            Reason::MissingEndpointMetadata
+                        },
                         actual_modification: None,
                         http_status: None,
                         duration_ms: 0,

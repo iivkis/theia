@@ -541,7 +541,10 @@ pub(crate) fn quic_initial_crypto_split(data: &[u8], expected_name: &str) -> Opt
     }
     let keys = suite.keys(long.dcid, Side::Client, version).local;
     let mut out = opened.header;
-    let tag = keys.packet.encrypt_in_place(opened.number, &out, &mut payload).ok()?;
+    let tag = keys
+        .packet
+        .encrypt_in_place(opened.number, &out, &mut payload)
+        .ok()?;
     out.extend(payload);
     out.extend_from_slice(tag.as_ref());
     let sample_start = pn_offset.checked_add(4)?;
@@ -551,11 +554,13 @@ pub(crate) fn quic_initial_crypto_split(data: &[u8], expected_name: &str) -> Opt
     }
     let (prefix, suffix) = out.split_at_mut(sample_start);
     let (first, rest) = prefix.split_first_mut()?;
-    keys.header.encrypt_in_place(
-        &suffix[..sample_end - sample_start],
-        first,
-        &mut rest[pn_offset - 1..],
-    ).ok()?;
+    keys.header
+        .encrypt_in_place(
+            &suffix[..sample_end - sample_start],
+            first,
+            &mut rest[pn_offset - 1..],
+        )
+        .ok()?;
     if out.len() != data.len() || out == data {
         return None;
     }
@@ -571,9 +576,8 @@ pub(crate) fn quic_initial_crypto_split(data: &[u8], expected_name: &str) -> Opt
 /// A shared proxy/diagnostic transformation. Prefer byte-exact datagram
 /// de-coalescing; fresh standalone Initials use the CRYPTO-frame alternative.
 pub(crate) fn quic_initial_transform(data: &[u8], name: &str) -> Option<Vec<Vec<u8>>> {
-    quic_initial_datagrams(data, name).or_else(|| {
-        quic_initial_crypto_split(data, name).map(|packet| vec![packet])
-    })
+    quic_initial_datagrams(data, name)
+        .or_else(|| quic_initial_crypto_split(data, name).map(|packet| vec![packet]))
 }
 
 /// An untrusted probe hint, never a domain identity. The lab accepts
@@ -1098,15 +1102,23 @@ mod tests {
             assert_eq!(input.len(), output.len());
             let a = wire::long(&input).unwrap();
             let b = wire::long(&output).unwrap();
-            assert_eq!((a.version, a.dcid, a.scid, a.token), (b.version, b.dcid, b.scid, b.token));
+            assert_eq!(
+                (a.version, a.dcid, a.scid, a.token),
+                (b.version, b.dcid, b.scid, b.token)
+            );
             let mut observed = Flight::new(&b).unwrap();
-            assert!(matches!(observed.inspect(&output), Inspection::Hello(bytes) if bytes == hello));
+            assert!(
+                matches!(observed.inspect(&output), Inspection::Hello(bytes) if bytes == hello)
+            );
             assert!(quic_initial_crypto_split(&output, "example.org").is_none());
             assert!(quic_initial_crypto_split(&input, "wrong.example").is_none());
             let mut damaged = input.clone();
             damaged[100] ^= 1;
             assert!(quic_initial_crypto_split(&damaged, "example.org").is_none());
-            assert_eq!(quic_initial_transform(&input, "example.org"), Some(vec![output]));
+            assert_eq!(
+                quic_initial_transform(&input, "example.org"),
+                Some(vec![output])
+            );
         }
     }
 
