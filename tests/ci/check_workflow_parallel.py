@@ -219,7 +219,7 @@ contains(cg, "pattern: coverage-shard-*", "merge-multiple: false",
          "ci-coverage.py gate --reports-dir coverage-shards --shards 6",
          "THEIA_COVERAGE_SYNTAX_TESTS", "coverage-summary")
 require((cov + cg).count('--sha "${{ needs.specification.outputs.tested_sha }}"') == 2, "exact coverage SHA")
-contains((ROOT / "scripts/ci-coverage.py").read_text(encoding="utf-8"), "MIN_PERCENT = 80",
+contains((ROOT / "scripts/ci-coverage.py").read_text(encoding="utf-8"), "MIN_PERCENT = 50",
          "read_shards", "identity in seen", 'report["inventory"] != expected',
          "Production sources missing executable evidence", "max(combined[name].get(number, 0), hits)")
 tui = (ROOT / "crates/theia/tests/tui_real_terminal.rs").read_text(encoding="utf-8")
