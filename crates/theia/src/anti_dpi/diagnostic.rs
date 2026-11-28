@@ -337,6 +337,12 @@ impl Plan {
         self.hosts.len() * columns().len()
     }
 
+    /// Maximum number of runnable target probes, excluding DNS preparation.
+    pub(crate) fn runnable_cells(&self) -> usize {
+        self.hosts.len()
+            * columns().iter().filter(|column| column.unavailable().is_none()).count()
+    }
+
     fn files_current(&self) -> bool {
         self.saved.current() && self.overlay.as_ref().is_none_or(Saved::current)
     }
@@ -380,32 +386,14 @@ impl Plan {
     /// keeps its stable technical representation separately.
     pub(crate) fn ui_preview(&self, owned: bool) -> String {
         let mut result = String::new();
-        let runnable = columns()
-            .iter()
-            .filter(|column| column.unavailable().is_none())
-            .count();
-        let _ = writeln!(result, "ПОДТВЕРЖДЕНИЕ ДИАГНОСТИКИ\nДо подтверждения сетевых запросов нет.\n\nЦелей: {} · Ячеек: {} · Ревизия: {}",
-            self.hosts.len(), self.planned_cells(), self.policy.revision());
-        let _ = writeln!(
-            result,
-            "Не более {} DNS/HTTPS операций, {} параллельно; 6 с на ячейку, 10 мин на задание.",
-            self.hosts.len() * (dns::MAX_DNS_REQUESTS + runnable),
-            if owned { 2 } else { 4 }
-        );
-        if let Some(resolver) = &self.document.anti_dpi.resolver {
-            let _ = writeln!(
-                result,
-                "DNS: HTTPS https://{}/dns-query · bootstrap {}",
-                resolver.hostname,
-                resolver
-                    .bootstrap
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+        let runnable = self.runnable_cells();
+        let skipped = self.planned_cells() - runnable;
+        let _ = writeln!(result, "Проверить {} сайт(ов)?\nЗапланировано сетевых проверок сайтов: {runnable}. Недоступных ячеек: {skipped}.", self.hosts.len());
+        if runnable == self.hosts.len() {
+            let _ = writeln!(result, "Сейчас доступна только прямая HTTPS-проверка. Anti-DPI не будет проверен.");
         }
-        let _ = writeln!(result, "\nВНИМАНИЕ: DNS-провайдер и проверяемые ресурсы получат ваш публичный IP.\nПроверка не меняет прокси, правила и разрешения рабочего трафика.\nНе следует перенаправлениям. Доступность не доказывает обход DPI.\n\nСтратегии:");
+        let _ = writeln!(result, "\n←/→ — выбрать «Запустить проверку», Enter — подтвердить. Esc — отменить.\nДо подтверждения запросов нет. DNS и сайты получат ваш публичный IP.\nПрокси Windows, правила и разрешения рабочего трафика не изменятся.");
+        let _ = writeln!(result, "\nСпособы проверки:");
         for column in columns() {
             let name = match column.id() {
                 "direct" => "TCP HTTPS — напрямую (контроль)",
@@ -418,9 +406,9 @@ impl Plan {
                 other => other,
             };
             let state = match column.unavailable() {
-                None => "запланировано",
-                Some(Reason::AwaitingAcceptance) => "не поддерживается (приёмка не завершена)",
-                Some(Reason::MissingEndpointMetadata) => "не проверено (нет данных endpoint)",
+                None => "будет проверено",
+                Some(Reason::AwaitingAcceptance) => "пока недоступно",
+                Some(Reason::MissingEndpointMetadata) => "нет данных о совместимом сервере",
                 Some(_) => "не будет запущено",
             };
             let _ = writeln!(result, "  {name}: {state}");
@@ -431,9 +419,19 @@ impl Plan {
         }
         let _ = writeln!(
             result,
-            "\nКаталог: {VERSION}\nSHA256 плана: {}",
-            hex(self.digest)
+            "\nЛимиты: не более {} DNS/HTTPS операций, {} параллельно; 6 с на ячейку, 10 мин на задание.",
+            self.hosts.len() * dns::MAX_DNS_REQUESTS + runnable,
+            if owned { 2 } else { 4 }
         );
+        if let Some(resolver) = &self.document.anti_dpi.resolver {
+            let _ = writeln!(
+                result,
+                "DNS: HTTPS https://{}/dns-query · bootstrap {}",
+                resolver.hostname,
+                resolver.bootstrap.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+            );
+        }
+        let _ = writeln!(result, "Перенаправления не выполняются. Доступность не доказывает обход DPI.\n\nТехнические сведения: ревизия {} · каталог {VERSION}\nSHA256 плана: {}", self.policy.revision(), hex(self.digest));
         result
     }
 
@@ -859,6 +857,47 @@ async fn row(state: &State<'_>, host: &str, roots: &rustls::RootCertStore) -> Ve
     cells
 }
 
+/// Select the fastest successful, actually modified TCP observation only
+/// against a comparable failed direct control. Does not publish evidence.
+pub(crate) fn recommend_tcp<'a>(
+    direct: &CellResult,
+    candidates: impl IntoIterator<Item = &'a CellResult>,
+) -> Option<&'a CellResult> {
+    if direct.stale
+        || direct.protocol != Protocol::TcpHttps
+        || direct.strategy_id != "direct"
+        || direct.status != CellStatus::Unavailable
+        || !matches!(direct.reason, Reason::Timeout | Reason::Network | Reason::Protocol)
+        || direct.actual_modification != Some(false)
+        || direct.attempts != 1
+        || direct.endpoint.is_none()
+        || direct.source.is_none()
+        || !matches!(direct.policy_action, Some(Decision::Pass | Decision::Modify))
+    {
+        return None;
+    }
+    candidates
+        .into_iter()
+        .filter(|cell| {
+            cell.domain == direct.domain
+                && cell.protocol == direct.protocol
+                && Strategy::ALL.iter().any(|strategy| strategy.id() == cell.strategy_id)
+                && cell.status == CellStatus::Available
+                && cell.reason == Reason::None
+                && cell.actual_modification == Some(true)
+                && cell.network == Stage::Passed
+                && cell.tls == Stage::Passed
+                && cell.application == Stage::Passed
+                && cell.http_status.is_some_and(|code| (200..=299).contains(&code))
+                && cell.attempts == 1
+                && !cell.stale
+                && cell.endpoint == direct.endpoint
+                && cell.source == direct.source
+                && cell.policy_action == direct.policy_action
+        })
+        .min_by_key(|cell| (cell.duration_ms, cell.strategy_id))
+}
+
 #[derive(Debug)]
 pub struct Report {
     pub catalog_version: &'static str,
@@ -965,6 +1004,44 @@ mod tests {
             columns[1].cell("example.com").status,
             CellStatus::Unsupported
         );
+    }
+
+    #[test]
+    fn recommendations_require_comparable_verified_modified_success() {
+        let mut direct = Column::Tcp(None).cell("example.com");
+        direct.status = CellStatus::Unavailable;
+        direct.reason = Reason::Timeout;
+        direct.actual_modification = Some(false);
+        direct.attempts = 1;
+        direct.endpoint = Some("1.1.1.1:443".parse().unwrap());
+        direct.source = Some("192.0.2.1".parse().unwrap());
+        direct.policy_action = Some(Decision::Pass);
+        let mut header = direct.clone();
+        header.strategy_id = "tcp_header";
+        header.reason = Reason::None;
+        header.status = CellStatus::Available;
+        header.actual_modification = Some(true);
+        header.network = Stage::Passed;
+        header.tls = Stage::Passed;
+        header.application = Stage::Passed;
+        header.http_status = Some(200);
+        header.duration_ms = 80;
+        let mut middle = header.clone();
+        middle.strategy_id = "tcp_middle";
+        middle.duration_ms = 40;
+        assert_eq!(recommend_tcp(&direct, [&header, &middle]), Some(&middle));
+        middle.stale = true;
+        assert_eq!(recommend_tcp(&direct, [&header, &middle]), Some(&header));
+        header.actual_modification = Some(false);
+        assert!(recommend_tcp(&direct, [&header, &middle]).is_none());
+        header.actual_modification = Some(true);
+        header.endpoint = Some("1.0.0.1:443".parse().unwrap());
+        assert!(recommend_tcp(&direct, [&header]).is_none());
+        header.endpoint = direct.endpoint;
+        direct.status = CellStatus::SecurityError;
+        assert!(recommend_tcp(&direct, [&header]).is_none());
+        direct.status = CellStatus::Available;
+        assert!(recommend_tcp(&direct, [&header]).is_none());
     }
 
     #[test]

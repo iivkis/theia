@@ -10,7 +10,8 @@ use crate::anti_dpi::{
     authority::Candidate,
     catalog::{Catalog, Overlay, MAX_JOB_DOMAINS, VERSION},
     diagnostic::{
-        strategy_columns, strategy_unavailable, CellResult, CellStatus, Plan, Reason, Report, Stage,
+        recommend_tcp, strategy_columns, strategy_unavailable, CellResult, CellStatus, Plan, Reason,
+        Report, Stage,
     },
     Document,
 };
@@ -91,7 +92,7 @@ fn stage(value: Stage) -> &'static str {
 fn reason(value: Reason) -> &'static str {
     match value {
         Reason::None => "Нет ошибки",
-        Reason::AwaitingAcceptance => "Стратегия не прошла независимую приёмку",
+        Reason::AwaitingAcceptance => "Способ пока не доступен в этой версии",
         Reason::MissingEndpointMetadata => "Нет подтверждённых данных о совместимом endpoint",
         Reason::Budget => "Исчерпан бюджет задания",
         Reason::Cancelled => "Отменено пользователем",
@@ -312,7 +313,7 @@ impl Draft {
             .count();
         let (title, text, mut items) = match self.step {
             SetupStep::Mode => ("Шаг 1 из 5 · Как настроить Anti-DPI?",
-                "Anti-DPI помогает проверять доступность сайтов и применять принятые способы изменения трафика.\nРаботает без VPS и ключей. Сейчас стратегии изменения трафика ожидают приёмки.\n\nВыберите способ настройки. Никаких сетевых запросов или изменений Windows пока не будет.".into(),
+                "Anti-DPI помогает проверять доступность сайтов и применять принятые способы изменения трафика.\nРаботает без VPS и ключей. Недоступные способы не используются.\n\nВыберите способ настройки. Никаких сетевых запросов или изменений Windows пока не будет.".into(),
                 vec![item('1', "Рекомендуемая · выбрать нужные сайты"), item('2', "Ручная · настроить правила позднее")]),
             SetupStep::Domains => (if self.edit_rule.is_some() { "Изменить список сайтов" } else if self.adding_sites { "Добавить сайты для Anti-DPI" } else { "Шаг 2 из 5 · Какие сайты вам нужны?" },
                 format!("Укажите сайты, для которых хотите использовать Anti-DPI. Остальные не получат это правило.\n\nВыбрано: {domains}\n{}\n\nПока это только черновик. Для продолжения нужен хотя бы один сайт.", if self.values[4].is_empty() { "Пока ничего не выбрано" } else { &self.values[4] }),
@@ -327,7 +328,7 @@ impl Draft {
                 "Чтобы проверить сайты или подключаться к ним напрямую, требуется ваше разрешение.\nDNS-провайдер и сайты могут видеть ваш публичный IP. Anti-DPI не является VPN.\nЕсли не разрешить прямой выход, рабочий трафик не будет отправляться.\nЭто не запускает подключение. Разрешение можно изменить в настройках.".into(),
                 vec![item('1', "Пока не разрешать"), item('2', "Разрешить прямое подключение")]),
             SetupStep::Modify => (if self.first_run() { if self.flags[3] { "Шаг 5 из 5 · Разрешить Anti-DPI?" } else { "Шаг 4 из 4 · Разрешить Anti-DPI?" } } else { "Разрешения 2 из 2 · Anti-DPI" },
-                "Разрешить изменение трафика только для сайтов, указанных в правилах.\nПока стратегии не приняты, это разрешение не включает работающий обход.\nПри невозможности применить Anti-DPI соединение блокируется, а не отправляется напрямую.\nSTUN не включается этим шагом. Его отдельное разрешение доступно в расширенных настройках.".into(),
+                "Разрешить изменение трафика только для сайтов, указанных в правилах.\nРазрешение включает только доступные в этой версии способы.\nПри невозможности применить Anti-DPI соединение блокируется, а не отправляется напрямую.\nSTUN не включается этим шагом. Его отдельное разрешение доступно в расширенных настройках.".into(),
                 vec![item('1', "Пока не разрешать · Anti-DPI не активен"), item('2', "Разрешить принятые стратегии Anti-DPI")]),
             SetupStep::DomainInput | SetupStep::CustomDns | SetupStep::Advanced | SetupStep::RulePick => ("", String::new(), Vec::new()),
         };
@@ -1744,6 +1745,87 @@ impl Panel {
         }
     }
 
+    fn selected_recommendation(&self) -> Option<&CellResult> {
+        if self.group != 0
+            || self.worker.is_some()
+            || !self.report_only
+            || !self.report_context.as_ref().is_some_and(|context| !context.stale)
+        {
+            return None;
+        }
+        let visible = self.visible();
+        let host = &visible.get(self.row)?.hostname;
+        let direct = self.results.get(&(host.clone(), "direct"))?;
+        recommend_tcp(
+            direct,
+            self.results.values().filter(|cell| {
+                cell.domain == *host && strategy_unavailable(cell.strategy_id).is_none()
+            }),
+        )
+    }
+
+    fn recommend_route(&mut self) {
+        // Suggestions are not strategy pins, consent or production evidence.
+        // Recheck the report against current files and the network before
+        // constructing a guarded, separately reviewed routing draft.
+        let Some(cell) = self.selected_recommendation().cloned() else {
+            self.notice = "Нет сопоставимого успешного результата Anti-DPI.".into();
+            return;
+        };
+        let Some(context) = &self.report_context else {
+            return;
+        };
+        let overlay_current = match &context.overlay {
+            Some(bytes) => crate::config::editor_bytes(&self.overlay_path)
+                .is_ok_and(|value| &value == bytes),
+            None => std::fs::symlink_metadata(&self.overlay_path)
+                .is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
+        };
+        if !overlay_current
+            || context.epoch.is_none()
+            || crate::network_scope::generation() != context.epoch
+            || !crate::config::editor_bytes(&self.path).is_ok_and(|bytes| bytes == context.config)
+        {
+            self.mark_stale();
+            self.notice = "Условия изменились. Повторите диагностику.".into();
+            return;
+        }
+        if cell.policy_action == Some(crate::anti_dpi::Decision::Modify) {
+            self.notice = "Для сайта уже действует правило Anti-DPI; рабочий движок сам выбирает принятый способ.".into();
+            return;
+        }
+        let expected = context.config.clone();
+        self.open_settings();
+        let Some(mut draft) = self.draft.take() else {
+            return;
+        };
+        if draft.expected.as_ref() != Some(&expected) {
+            self.mark_stale();
+            self.notice = "Файл изменился. Повторите диагностику.".into();
+            return;
+        }
+        if !draft.flags[0] || !draft.flags[1] {
+            self.notice = "Сначала отдельно разрешите Anti-DPI и прямой выход в настройках.".into();
+            return;
+        }
+        draft.adding_sites = true;
+        draft.values[4] = cell.domain;
+        draft.move_to(SetupStep::Domains);
+        // Never reorder an earlier rule. Refuse a suggestion that would be
+        // shadowed even at the exact observed endpoint.
+        let effective = draft.next_document().ok().and_then(|next| next.prepare().ok())
+            .zip(cell.endpoint)
+            .is_some_and(|(policy, endpoint)| {
+                policy.classify_resolved(&draft.values[4], &[endpoint.ip()])
+                    == crate::anti_dpi::Decision::Modify
+            });
+        if !effective {
+            self.notice = "Более раннее правило имеет приоритет. Проверьте маршрутизацию вручную.".into();
+            return;
+        }
+        self.preview_draft(draft);
+    }
+
     fn diagnostic_actions(&self) -> Vec<ActionItem> {
         let item = |key, label| ActionItem { key, label };
         if self.report_only {
@@ -1753,6 +1835,9 @@ impl Panel {
                 item('[', "Предыдущий протокол"),
                 item(']', "Следующий протокол"),
             ];
+            if self.selected_recommendation().is_some() {
+                items.push(item('u', "Подготовить правило Anti-DPI для сайта"));
+            }
             if !self.results.is_empty() {
                 items.extend([
                     item('b', "Повторить неуспешные проверки"),
@@ -2311,6 +2396,7 @@ impl Panel {
             }
             KeyCode::F(7) | KeyCode::Char('j') if self.page == DIAGNOSTICS => self.details = true,
             KeyCode::Char('z') if self.page == DIAGNOSTICS => self.begin_export(),
+            KeyCode::Char('u') if self.page == DIAGNOSTICS => self.recommend_route(),
             KeyCode::Char('b') if self.page == DIAGNOSTICS => {
                 let failed = self
                     .results
@@ -2431,7 +2517,7 @@ impl Panel {
             use crate::windows_system_proxy::{ObservedProxy, ProxyStatus};
             match self.os_observation {
                 Some(ObservedProxy::Direct) => "Собственная сессия отсутствует",
-                Some(ObservedProxy::External) => "Внешний прокси / PAC / автоопределение",
+                Some(ObservedProxy::External) => "Windows: сторонние настройки прокси · Theia не подключена",
                 Some(ObservedProxy::Journal(ProxyStatus::PendingOwned)) => {
                     "Журнал прокси · владелец не подтверждён"
                 }
@@ -2856,7 +2942,7 @@ impl Panel {
             self.visible().len()
         );
         let header_h = if area.width < 90 { 7 } else { 5 };
-        let details_h = if area.height >= 20 { 5 } else { 2 };
+        let details_h = if area.height >= 20 { 7 } else { 3 };
         let table_h = (self
             .visible()
             .len()
@@ -2982,8 +3068,19 @@ impl Panel {
         } else {
             "Прямой* — контроль UDP не реализован. Сравнение с TCP недопустимо.\nн/п — не поддерживается · — не проверено"
         };
+        let recommendation = if self.group != 0 {
+            "Для сравнения нужен отдельный контроль того же UDP-протокола.".into()
+        } else if let Some(cell) = self.selected_recommendation() {
+            format!("Подошёл способ {} ({} мс). u — подготовить правило; выбор способа в работе автоматический.", column_label(cell.strategy_id), cell.duration_ms)
+        } else if self.worker.is_some() {
+            "Дождитесь завершения проверки.".into()
+        } else if strategy_columns().iter().filter(|id| **id != "direct").all(|id| strategy_unavailable(id).is_some()) {
+            "Anti-DPI пока недоступен: проверка только прямого подключения.".into()
+        } else {
+            "Нет подтверждённого улучшения относительно прямого подключения.".into()
+        };
         let summary = format!(
-            "{selected}\n{legend}\nДоступность не доказывает обход DPI. [ ] — сменить протокол."
+            "{selected}\n{recommendation}\n{legend}\nДоступность не доказывает обход DPI. [ ] — сменить протокол."
         );
         frame.render_widget(
             Paragraph::new(summary)
@@ -3027,7 +3124,7 @@ impl Panel {
                 c.endpoint.map_or_else(|| "—".into(), |e| e.to_string()), c.source.map_or_else(|| "—".into(), |ip| ip.to_string()), c.policy_action));
         } else {
             text.push_str(if id.is_none() { "Отдельный Direct-контроль UDP ещё не реализован. Сравнение недоступно." }
-                else if id.is_some_and(|id| strategy_unavailable(id) == Some(Reason::AwaitingAcceptance)) { "Стратегия не поддерживается: независимая приёмка не завершена. Проверка не выполнялась." }
+                else if id.is_some_and(|id| strategy_unavailable(id) == Some(Reason::AwaitingAcceptance)) { "Этот способ пока недоступен в данной версии. Проверка не выполнялась." }
                 else { "Нет результата для этой стратегии. Не проверено." });
         }
         text.push_str(&format!(
@@ -3087,12 +3184,14 @@ impl Panel {
             footer = "Esc закрыть · F1 справка".into();
         } else if let Some(review) = &self.review {
             let (title, text, label) = match review {
-                Review::Diagnostic(plan) => ("Диагностика", plan.ui_preview(self.owner_active()), "Запустить проверку"),
+                Review::Diagnostic(plan) => ("Подтверждение диагностики", plan.ui_preview(self.owner_active()), "Запустить проверку"),
                 Review::Policy(candidate, enroll) => ("Применение локальной политики", format!("{}\n\n{}\nСеть и настройки ОС не меняются этой операцией.\nСтарые разрешения потоков отзываются при публикации.",
                     if *enroll { "Первичная регистрация локальной ревизии (не регистрация на сервере)." } else { "Применить сохранённую ревизию." },
                     policy_text(candidate.document())), "Применить"),
                 Review::Save(draft, next) => {
-                    let change = if let Some(index) = draft.edit_rule {
+                    let change = if draft.adding_sites && draft.edit_rule.is_none() {
+                        "Новое правило будет последним. Существующие правила сохраняются и имеют приоритет. Способ Anti-DPI выбирается автоматически; диагностика не выдаёт рабочее разрешение.\n\n".into()
+                    } else if let Some(index) = draft.edit_rule {
                         let old = &draft.original.anti_dpi.rules[index];
                         let before = old.domains.iter().map(|d| d.strip_prefix("full:").unwrap_or(d)).collect::<Vec<_>>().join(", ");
                         let after = if draft.delete_rule { "Правило будет удалено".into() } else { next.anti_dpi.rules[index].domains.iter().map(|d| d.strip_prefix("full:").unwrap_or(d)).collect::<Vec<_>>().join(", ") };
