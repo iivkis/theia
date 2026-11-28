@@ -186,53 +186,61 @@ impl Rtnl {
         let mut objects = Vec::new();
         for _ in 0..128 {
             let n = receive(net.0.as_raw_fd(), &mut bytes)?;
-            let mut rest = &bytes[..n];
-            while !rest.is_empty() {
-                let header = rest.get(..16).ok_or_else(invalid)?;
-                let len =
-                    u32::from_ne_bytes(header[..4].try_into().map_err(|_| invalid())?) as usize;
-                if len < 16
-                    || align4(len) > rest.len()
-                    || u16::from_ne_bytes([header[6], header[7]]) & 0x10 != 0
-                {
-                    return Err(invalid()); // interrupted dump
-                }
-                let (typ, seq, body) = checked_header(&rest[..align4(len)])?;
-                if seq != 1 {
-                    return Err(invalid());
-                }
-                if typ == 3 {
-                    if rest.len() != align4(len)
-                        || (!body.is_empty() && (body.len() < 4 || body[..4] != [0; 4]))
-                    {
-                        return Err(invalid());
-                    }
-                    return Ok(objects);
-                }
-                if typ
-                    != (if kind == GET_ROUTE {
-                        NEW_ROUTE
-                    } else {
-                        NEW_RULE
-                    })
-                    || body.len() < 12
-                    || body[0] != family
-                    || objects.len() >= 4096
-                {
-                    return Err(invalid());
-                }
-                let object = Object {
-                    kind: typ,
-                    body: body.to_vec(),
-                };
-                if relevant(&object)? {
-                    objects.push(object);
-                }
-                rest = &rest[align4(len)..];
+            if decode_dump(&bytes[..n], kind, family, &mut objects)? {
+                return Ok(objects);
             }
         }
         Err(invalid())
     }
+}
+// Parse a complete received datagram; preserve the kernel's multipart
+// completion and interruption rules independently of the socket transport.
+fn decode_dump(bytes: &[u8], kind: u16, family: u8, objects: &mut Vec<Object>) -> io::Result<bool> {
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let header = rest.get(..16).ok_or_else(invalid)?;
+        let len =
+            u32::from_ne_bytes(header[..4].try_into().map_err(|_| invalid())?) as usize;
+        if len < 16
+            || align4(len) > rest.len()
+            || u16::from_ne_bytes([header[6], header[7]]) & 0x10 != 0
+        {
+            return Err(invalid()); // interrupted dump
+        }
+        let (typ, seq, body) = checked_header(&rest[..align4(len)])?;
+        if seq != 1 {
+            return Err(invalid());
+        }
+        if typ == 3 {
+            if rest.len() != align4(len)
+                || (!body.is_empty() && (body.len() < 4 || body[..4] != [0; 4]))
+            {
+                return Err(invalid());
+            }
+            return Ok(true);
+        }
+        if typ
+            != (if kind == GET_ROUTE {
+                NEW_ROUTE
+            } else {
+                NEW_RULE
+            })
+            || body.len() < 12
+            || body[0] != family
+            || objects.len() >= 4096
+        {
+            return Err(invalid());
+        }
+        let object = Object {
+            kind: typ,
+            body: body.to_vec(),
+        };
+        if relevant(&object)? {
+            objects.push(object);
+        }
+        rest = &rest[align4(len)..];
+    }
+    Ok(false)
 }
 fn attrs(body: &[u8]) -> io::Result<std::collections::BTreeMap<u16, &[u8]>> {
     let mut rest = body.get(12..).ok_or_else(invalid)?;
@@ -632,4 +640,71 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn multipart_route_dump_rejects_interrupted_truncated_foreign_sequence_and_invalid_completion() {
+        fn frame(kind: u16, flags: u16, seq: u32, body: &[u8]) -> Vec<u8> {
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&((16 + body.len()) as u32).to_ne_bytes());
+            frame.extend_from_slice(&kind.to_ne_bytes());
+            frame.extend_from_slice(&flags.to_ne_bytes());
+            frame.extend_from_slice(&seq.to_ne_bytes());
+            frame.extend_from_slice(&0u32.to_ne_bytes());
+            frame.extend_from_slice(body);
+            frame.resize(align4(frame.len()), 0);
+            frame
+        }
+        for family in FAMILIES {
+            for (get, new) in [(GET_ROUTE, NEW_ROUTE), (GET_RULE, NEW_RULE)] {
+                let object = expected(new, family, 1);
+                let mut foreign = vec![0; 12];
+                foreign[0] = family;
+                let first = frame(new, 2, 1, &foreign);
+                let second = frame(new, 2, 1, &object.body);
+                let done = frame(3, 2, 1, &[0; 4]);
+                let mut seen = Vec::new();
+                assert!(!decode_dump(&first, get, family, &mut seen).unwrap());
+                assert!(seen.is_empty());
+                assert!(!decode_dump(&second, get, family, &mut seen).unwrap());
+                assert_eq!(seen, vec![object.clone()]);
+                assert!(decode_dump(&done, get, family, &mut seen).unwrap());
+                let combined = [first.as_slice(), second.as_slice(), done.as_slice()].concat();
+                let mut seen = Vec::new();
+                assert!(decode_dump(&combined, get, family, &mut seen).unwrap());
+                assert_eq!(seen, vec![object.clone()]);
+                for malformed in [
+                    second[..15].to_vec(),
+                    second[..second.len()-1].to_vec(),
+                    frame(new, 0x10, 1, &object.body),
+                    frame(new, 2, 2, &object.body),
+                    frame(255, 2, 1, &object.body),
+                    frame(new, 2, 1, &[family; 11]),
+                    frame(new, 2, 1, &[0; 12]),
+                    frame(3, 2, 1, &[1, 0, 0, 0]),
+                    frame(3, 2, 1, &[0]),
+                    [done.as_slice(), second.as_slice()].concat(),
+                ] {
+                    assert!(decode_dump(&malformed, get, family, &mut Vec::new()).is_err());
+                }
+                let mut capacity = vec![object.clone(); 4096];
+                assert!(decode_dump(&second, get, family, &mut capacity).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn kernel_route_inventory_is_read_only_and_bounded() {
+        // RTM_GETROUTE/GETRULE only: no route installation, no elevation.
+        for family in FAMILIES {
+            for (get, new) in [(GET_ROUTE, NEW_ROUTE), (GET_RULE, NEW_RULE)] {
+                let records = Rtnl::dump(get, family).unwrap();
+                assert!(records.len() <= 4096);
+                for record in records {
+                    assert_eq!(record.kind, new);
+                    assert_eq!(record.body[0], family);
+                    assert!(relevant(&record).unwrap());
+                }
+            }
+        }
+    }
+
 }
