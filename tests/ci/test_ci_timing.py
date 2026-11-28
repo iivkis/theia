@@ -120,6 +120,23 @@ class TimingTests(unittest.TestCase):
         with self.assertRaises(timing.EvidenceError):
             timing.summarize(run, jobs)
 
+    def test_current_50_percent_matrix_is_complete_and_not_mixed_with_legacy(self):
+        run, jobs = snapshot(merged=True)
+        template = deepcopy(jobs["jobs"][0])
+        jobs["jobs"] = [{**deepcopy(template), "name": name}
+                        for name in sorted(timing.CURRENT_MVP_JOBS)]
+        jobs["total_count"] = len(jobs["jobs"])
+        result = timing.summarize(run, jobs)
+        self.assertEqual(len(result["jobs"]), 23)
+        self.assertIn("Production line coverage >= 50%", result["jobs"])
+        self.assertNotIn("Production line coverage >= 80%", result["jobs"])
+        broken = deepcopy(jobs)
+        broken["jobs"] = [job for job in broken["jobs"]
+                          if job["name"] != "Production line coverage >= 50%"]
+        broken["total_count"] -= 1
+        with self.assertRaises(timing.EvidenceError):
+            timing.summarize(run, broken)
+
     def test_real_sanitized_api_snapshots_match_observed_durations(self):
         path = SOURCE.parents[1] / "tests" / "ci" / "fixtures" / "timing-snapshots.json"
         snapshots = json.loads(path.read_text(encoding="utf-8"))
