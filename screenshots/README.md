@@ -1,6 +1,6 @@
 # Theia TUI visual review
 
-Source: af60aeb9ecb6963bf42e732f5a1db585c219bbd5
+Source: 84036d6a9888b261cdbc500514068113c8d17546
 
 Linux · 120×40 · actual production renderer cells. State fixtures and unavailable actions are not runtime success.
 
@@ -10,9 +10,17 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![anti-dpi-catalog](anti-dpi-catalog.png)
 
+## anti-dpi-connection
+
+![anti-dpi-connection](anti-dpi-connection.png)
+
 ## anti-dpi-diagnostic-consent
 
 ![anti-dpi-diagnostic-consent](anti-dpi-diagnostic-consent.png)
+
+## anti-dpi-first-run-preview
+
+![anti-dpi-first-run-preview](anti-dpi-first-run-preview.png)
 
 ## anti-dpi-first-run
 
@@ -33,6 +41,18 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## anti-dpi-routing
 
 ![anti-dpi-routing](anti-dpi-routing.png)
+
+## anti-dpi-settings-editor
+
+![anti-dpi-settings-editor](anti-dpi-settings-editor.png)
+
+## anti-dpi-settings
+
+![anti-dpi-settings](anti-dpi-settings.png)
+
+## anti-dpi-statistics
+
+![anti-dpi-statistics](anti-dpi-statistics.png)
 
 ## client-action-active-profile
 
@@ -482,9 +502,29 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 
 ![server-welcome](server-welcome.png)
 
+## state-anti-dpi-diagnostic-cancelled
+
+![state-anti-dpi-diagnostic-cancelled](state-anti-dpi-diagnostic-cancelled.png)
+
+## state-anti-dpi-diagnostic-cell
+
+![state-anti-dpi-diagnostic-cell](state-anti-dpi-diagnostic-cell.png)
+
+## state-anti-dpi-diagnostic-progress
+
+![state-anti-dpi-diagnostic-progress](state-anti-dpi-diagnostic-progress.png)
+
+## state-anti-dpi-diagnostic-quic
+
+![state-anti-dpi-diagnostic-quic](state-anti-dpi-diagnostic-quic.png)
+
 ## state-anti-dpi-diagnostic-report
 
 ![state-anti-dpi-diagnostic-report](state-anti-dpi-diagnostic-report.png)
+
+## state-anti-dpi-export-confirm
+
+![state-anti-dpi-export-confirm](state-anti-dpi-export-confirm.png)
 
 ## state-disable-confirm
 
