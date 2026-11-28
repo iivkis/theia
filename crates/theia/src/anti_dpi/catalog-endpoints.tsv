@@ -1,0 +1,5 @@
+# hostname	capability	observation/retrieval date	source
+www.youtube.com	quic-v1	2026-11-28	https://h3check.de/en/check/www.youtube.com/
+youtube.com	quic-v1	2026-11-28	https://http3check.net/?host=youtube.com
+www.facebook.com	quic-v1	2026-11-05	https://h3check.de/en/check/www.facebook.com/
+api.x.com	quic-v1	2026-11-28	https://h3check.de/en/check/api.x.com/

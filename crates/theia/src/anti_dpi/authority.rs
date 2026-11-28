@@ -181,7 +181,7 @@ impl Candidate {
         use std::fmt::Write as _;
         let _ = writeln!(
             text,
-            "\nWindows System Proxy development mode: Pass/Drop only; Modify is denied."
+            "\nWindows System Proxy development mode: Pass/Modify/Drop; experimental Modify, independent acceptance not claimed."
         );
         let _ = writeln!(
             text,

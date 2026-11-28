@@ -14,7 +14,8 @@ use std::{
 };
 
 const BUILTIN: &str = include_str!("catalog.tsv");
-pub const VERSION: &str = "ru-popular-services-2026-v2";
+const BUILTIN_ENDPOINTS: &str = include_str!("catalog-endpoints.tsv");
+pub const VERSION: &str = "ru-popular-services-2026-v3";
 pub const MAX_DOMAINS: usize = 256;
 pub const MAX_JOB_DOMAINS: usize = 64;
 pub const MAX_JOB_CELLS: usize = 512;
@@ -183,7 +184,7 @@ impl Catalog {
         }
         let custom = normalized_set(&overlay.custom)?;
         let excluded = normalized_set(&overlay.excluded)?;
-        let quic_v1 = normalized_set(&overlay.quic_v1)?;
+        let mut quic_v1 = normalized_set(&overlay.quic_v1)?;
         let quic_v2 = normalized_set(&overlay.quic_v2)?;
         let stun = normalized_set(&overlay.stun)?;
         let mut entries = BTreeMap::new();
@@ -245,6 +246,19 @@ impl Catalog {
                 "combined catalogue exceeds limit",
             ));
         }
+        // Stored third-party observations of h3 on UDP/443, not current
+        // reachability or proof of a QUIC v2 capability. RFC 9369: an
+        // origin advertising h3 should support QUIC v1.
+        for line in BUILTIN_ENDPOINTS.lines().filter(|line| !line.starts_with('#') && !line.is_empty()) {
+            let mut fields = line.split('\t');
+            let (Some(host), Some("quic-v1"), Some(day), Some(source), None) =
+                (fields.next(), fields.next(), fields.next(), fields.next(), fields.next())
+            else { return Err(invalid("catalog.endpoint", "invalid embedded endpoint record")); };
+            if !entries.contains_key(host) || day.len() != 10 || !source.starts_with("https://") {
+                return Err(invalid("catalog.endpoint", "invalid embedded endpoint provenance"));
+            }
+            quic_v1.insert(host.to_owned());
+        }
         if quic_v1.iter().chain(&quic_v2).chain(&stun).any(|host| !entries.contains_key(host)) {
             return Err(invalid("catalog.endpoint", "UDP endpoint must refer to a catalogue hostname"));
         }
@@ -283,7 +297,12 @@ impl Catalog {
 
     /// Hash of the immutable catalogue content, independent of user choices.
     pub fn builtin_digest() -> [u8; 32] {
-        Sha256::digest(BUILTIN.as_bytes()).into()
+        let mut hash = Sha256::new();
+        hash.update((BUILTIN.len() as u64).to_be_bytes());
+        hash.update(BUILTIN.as_bytes());
+        hash.update((BUILTIN_ENDPOINTS.len() as u64).to_be_bytes());
+        hash.update(BUILTIN_ENDPOINTS.as_bytes());
+        hash.finalize().into()
     }
 
     /// An offline, bounded selection. No socket or strategy admission is implied.
