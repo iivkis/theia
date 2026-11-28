@@ -13,14 +13,29 @@ const NEGATIVE_TTL: Duration = Duration::from_secs(20);
 const HISTORY_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Strategy {
+pub(crate) enum Strategy {
     Header,
     Middle,
     Balanced,
 }
 
 impl Strategy {
-    pub(super) const ALL: [Self; 3] = [Self::Header, Self::Middle, Self::Balanced];
+    pub(crate) const ALL: [Self; 3] = [Self::Header, Self::Middle, Self::Balanced];
+
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            Self::Header => "tcp_header",
+            Self::Middle => "tcp_middle",
+            Self::Balanced => "tcp_balanced",
+        }
+    }
+
+    /// Separate role acceptance, not inherited from the SmartTheia path.
+    /// Enable only after independent exact-revision F-20 evidence.
+    pub(crate) fn accepted_for_standalone(self) -> bool {
+        const ACCEPTED: &[Strategy] = &[];
+        ACCEPTED.contains(&self)
+    }
     fn index(self) -> usize {
         self as usize
     }

@@ -60,6 +60,31 @@ async fn run() {
                 .map(|catalog| catalog.render())
                 .map_err(CliError::Config)
         }
+        Ok(Command::AntiDpiDiagnostic { config, overlay, domains, confirm, anonymous }) => {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use theia::anti_dpi::diagnostic::Plan;
+            match Plan::prepare(Path::new(&config), overlay.as_deref().map(Path::new), &domains) {
+                Ok(plan) => match confirm {
+                    None => Ok(plan.preview()),
+                    Some(confirmation) => {
+                        let cancel = AtomicBool::new(false);
+                        let run = plan.run(confirmation, &cancel);
+                        tokio::pin!(run);
+                        let report = tokio::select! {
+                            result = &mut run => result,
+                            _ = tokio::signal::ctrl_c() => {
+                                cancel.store(true, Ordering::Release);
+                                run.await
+                            }
+                        };
+                        report.map(|report| {
+                            if anonymous { report.anonymous_summary() } else { report.render() }
+                        }).map_err(CliError::Config)
+                    }
+                },
+                Err(error) => Err(CliError::Config(error)),
+            }
+        }
         Ok(Command::AntiDpiValidate { config }) => theia::anti_dpi::Document::read(Path::new(&config))
             .map(|_| "standalone configuration structurally valid; no network or OS settings changed".to_owned())
             .map_err(CliError::Config),

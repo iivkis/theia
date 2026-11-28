@@ -38,3 +38,28 @@ fn catalogue_cli_is_offline_and_reports_historical_sources() {
     assert!(output.contains("meduza.io"));
     assert!(output.contains("sha256="));
 }
+
+#[test]
+fn diagnostic_preview_is_offline_and_confirmation_is_exact() {
+    let path = std::env::temp_dir().join(format!("theia-f20-preview-{}.toml", std::process::id()));
+    let example = include_str!("../../../examples/anti-dpi.toml");
+    std::fs::write(&path, format!("{example}\n[anti_dpi.resolver]\nhostname='dns.example.com'\nbootstrap=['1.1.1.1']\n")).unwrap();
+    let path = path.to_str().unwrap();
+    let args = ["anti-dpi", "diagnose", "--config", path, "--domains", "meduza.io"];
+    let result = Command::new(env!("CARGO_BIN_EXE_theia")).args(args).output().unwrap();
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    let output = String::from_utf8(result.stdout).unwrap();
+    assert!(output.contains("Diagnostic preview (no network requests)"));
+    assert!(output.contains("meduza.io"));
+    assert!(output.contains("dns.example.com"));
+    assert!(output.contains("AwaitingAcceptance"));
+    assert!(output.contains("Confirm exact plan with SHA256="));
+    let result = Command::new(env!("CARGO_BIN_EXE_theia")).args(args)
+        .args(["--confirm", &"00".repeat(32)]).output().unwrap();
+    assert_eq!(result.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("review again"));
+    let invalid = Command::new(env!("CARGO_BIN_EXE_theia")).args(args)
+        .arg("--anonymous").output().unwrap();
+    assert_eq!(invalid.status.code(), Some(2));
+    std::fs::remove_file(path).unwrap();
+}

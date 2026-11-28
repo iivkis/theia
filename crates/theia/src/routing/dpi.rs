@@ -1,5 +1,6 @@
 //! Native proxy-based Anti-DPI coordinator. All processing is on owned
 //! TCP streams; no raw packets, drivers or platform-specific DPI modules.
+pub(crate) mod diagnostic;
 mod quic;
 mod strategy;
 mod tcp;
@@ -39,7 +40,8 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use strategy::{Key, Lease, Strategy, Verdict};
+pub(crate) use strategy::Strategy;
+use strategy::{Key, Lease, Verdict};
 use tokio::{io::AsyncWriteExt, net::TcpStream, time::timeout};
 
 const ATTEMPT: Duration = Duration::from_secs(2);
@@ -82,6 +84,16 @@ pub(crate) enum UdpStrategy {
 }
 
 impl UdpStrategy {
+    pub(crate) fn id(self) -> &'static str {
+        use crate::quic_core::wire::Version;
+        match self {
+            Self::Quic(Version::V1) => "quic_v1_initial_split",
+            Self::Quic(Version::V2) => "quic_v2_initial_split",
+            Self::StunBinding(udp::BindingStrategy::Fingerprint) => "stun_fingerprint",
+            Self::StunBinding(udp::BindingStrategy::Plain) => "stun_plain",
+        }
+    }
+
     /// Product activation is a reviewed source-level gate, not a user
     /// configuration switch or a successful reachability probe. Populate
     /// only after independent, exact-revision F-15 acceptance.
