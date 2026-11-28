@@ -122,6 +122,7 @@ pub enum Command {
     Version,
     AntiDpiValidate { config: String },
     AntiDpiPreflight { config: String },
+    AntiDpiCatalog { overlay: Option<String> },
     Trust(descriptor_cli::Command),
     Reference(reference_cli::Command),
     Reality(reality_cli::Command),
@@ -377,6 +378,8 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
         ["client", "--help" | "-h"] => Ok(Command::Help(Some("client"))),
         ["config", "--help" | "-h"] => Ok(Command::Help(Some("config"))),
         ["anti-dpi", "--help" | "-h"] => Ok(Command::Help(Some("anti-dpi"))),
+        ["anti-dpi", "catalog"] => Ok(Command::AntiDpiCatalog { overlay: None }),
+        ["anti-dpi", "catalog", "--overlay", path] => Ok(Command::AntiDpiCatalog { overlay: Some(config_path(path)?) }),
         ["anti-dpi", "validate", "--config", path] => Ok(Command::AntiDpiValidate {
             config: config_path(path)?,
         }),
@@ -691,7 +694,7 @@ pub fn help(topic: Option<&str>) -> Result<&'static str, CliError> {
         Some("client") => {
             Ok("Usage: theia client run --config <path> [--system-proxy --confirm]\ntheia client status\ntheia client lifecycle\ntheia client disconnect --expected-revision N --sha256 HEX --instance HEX --confirm\ntheia client reload --check --expected-revision N --sha256 HEX\ntheia client reload --apply --expected-revision N --sha256 HEX --confirm\ntheia client windivert --check --directory DIR --dll-sha256 HEX --sys-sha256 HEX [--install-lab --confirm]\ntheia client windivert --loopback-lab --directory DIR --dll-sha256 HEX --sys-sha256 HEX --confirm\ntheia client windivert --scope-drop-lab --directory DIR --dll-sha256 HEX --sys-sha256 HEX --interface-index N --seconds 1..30 --confirm-block (isolated local console only; drops all outbound IP on interface)\ntheia client windivert --redirect-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --targets IP:PORT[,IP:PORT] --seconds 5..120 --confirm-isolated\ntheia client windivert --tcp-relay-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --target IP:PORT --confirm\ntheia client windivert --udp-relay-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --target IP:PORT [--flows 1..8] --confirm\ntheia client windivert --interface-redirect-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --capture-interface N --carrier-interface N --seconds 5..120 --confirm-isolated-two-interface\ntheia client linux --host-redirect-lab --config PATH --port N --confirm-disposable-local-console\ntheia client linux --host-guard-rearm --confirm-disposable-host\ntheia client linux --host-guard-recover --confirm-disposable-local-console\ntheia client proxy --status\ntheia client proxy --recover --confirm\nWindows only: explicitly opt in to user WinINet HTTP(S) proxy after binding local HTTP/SOCKS5 listeners. Saved ingress_mode=system_proxy alone never starts a connection. Snapshot+durable journal, conditional restore on Ctrl+C/normal stop, explicit CAS recovery after crash. Never overwrites foreign proxy changes. CLI flags and TUI import alone never apply OS changes.")
         }
-        Some("anti-dpi") => Ok("Usage: theia anti-dpi validate --config <path> | theia anti-dpi preflight --config <path>\nOffline standalone configuration and pinned routing validation only. No listener, DNS request, strategy activation or OS proxy changes."),
+        Some("anti-dpi") => Ok("Usage: theia anti-dpi validate --config <path> | theia anti-dpi preflight --config <path> | theia anti-dpi catalog [--overlay <path>]\nOffline standalone configuration and pinned routing validation only. No listener, DNS request, strategy activation or OS proxy changes."),
         Some("trust") => Ok(descriptor_cli::HELP),
         Some("reference") => Ok(reference_cli::HELP),
         Some("reality") => Ok(reality_cli::HELP),

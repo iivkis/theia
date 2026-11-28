@@ -26,3 +26,15 @@ fn standalone_validation_and_preflight_are_offline_and_role_specific() {
     assert_eq!(invoke("anti-dpi", "preflight").status.code(), Some(2));
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn catalogue_cli_is_offline_and_reports_historical_sources() {
+    let result = Command::new(env!("CARGO_BIN_EXE_theia"))
+        .args(["anti-dpi", "catalog"]).output().unwrap();
+    assert!(result.status.success());
+    let output = String::from_utf8(result.stdout).unwrap();
+    assert!(output.contains("built-in=60"));
+    assert!(output.contains("No network checks performed"));
+    assert!(output.contains("meduza.io"));
+    assert!(output.contains("sha256="));
+}

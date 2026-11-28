@@ -1,6 +1,8 @@
 //! F-20 offline standalone configuration and routing foundation.
 //! No server credentials, transport session, DNS request or OS proxy mutation.
 //! Runtime admission must additionally bind a fresh policy/consent lease.
+pub mod catalog;
+
 use crate::{
     config::{self, ConfigError, IngressMode, LocalProxy, Management, Ui},
     net::address::allowed_destination,

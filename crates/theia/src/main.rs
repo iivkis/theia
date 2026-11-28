@@ -50,6 +50,16 @@ async fn run() {
         .map(|arg| arg.into_string().map_err(|_| CliError::NonUtf8Argument))
         .collect();
     let result: Result<String, CliError> = match args.and_then(|args| parse(&args)) {
+        Ok(Command::AntiDpiCatalog { overlay }) => {
+            use theia::anti_dpi::catalog::{Catalog, Overlay};
+            let overlay = match overlay {
+                Some(path) => Overlay::read(Path::new(&path)),
+                None => Ok(Overlay::default()),
+            };
+            overlay.and_then(|overlay| Catalog::build(&overlay))
+                .map(|catalog| catalog.render())
+                .map_err(CliError::Config)
+        }
         Ok(Command::AntiDpiValidate { config }) => theia::anti_dpi::Document::read(Path::new(&config))
             .map(|_| "standalone configuration structurally valid; no network or OS settings changed".to_owned())
             .map_err(CliError::Config),
