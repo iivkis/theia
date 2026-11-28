@@ -1372,7 +1372,10 @@ impl Panel {
                 if self.session.is_none() {
                     match crate::windows_system_proxy::review_recovery() {
                         Ok(review) => { self.review = Some(Review::Recover(review)); self.review_scroll = 0; self.confirm_selected = false; }
-                        Err(error) => self.notice = format!("Восстановление недоступно: {error:?}. Чужой процесс не останавливаем."),
+                        Err(error) => {
+                            self.notice = format!("Восстановление недоступно: {error:?}.");
+                            self.notice.push_str(" Чужой процесс не останавливаем.");
+                        }
                     }
                 } else { self.notice = "Сначала штатно отключите собственную сессию.".into(); }
             },
