@@ -79,7 +79,7 @@ async fn run() {
             }
         }
         Ok(Command::ClientLinuxHostLab{config,port})=>{
-            #[cfg(target_os="linux")]
+            #[cfg(all(feature = "native-ingress-lab", target_os = "linux"))]
             {
                 tokio::task::spawn_blocking(move || {
                     let host=std::fs::File::open("/proc/1/ns/net").map_err(|_|theia::client::ClientError::Configuration)?;
@@ -91,11 +91,11 @@ async fn run() {
                     .and_then(|result|result.map_err(CliError::Client))
                     .map(|_|"Linux disposable host lab stopped; owned rules and routes restored".to_owned())
             }
-            #[cfg(not(target_os="linux"))]
+            #[cfg(not(all(feature = "native-ingress-lab", target_os = "linux")))]
             {let _=(config,port);Err(CliError::NotImplemented("Linux disposable host lab"))}
         }
         Ok(command @ (Command::ClientLinuxHostRearm|Command::ClientLinuxHostRecover))=>{
-            #[cfg(target_os="linux")]
+            #[cfg(all(feature = "native-ingress-lab", target_os = "linux"))]
             {
                 tokio::task::spawn_blocking(move || {
                     let host=std::fs::File::open("/proc/1/ns/net")?;
@@ -107,11 +107,11 @@ async fn run() {
                     .and_then(|result|result.map_err(|_|CliError::Client(theia::client::ClientError::Io)))
                     .map(|_|"Linux host guard transaction complete; no physical enforcement or production readiness asserted".to_owned())
             }
-            #[cfg(not(target_os="linux"))]
+            #[cfg(not(all(feature = "native-ingress-lab", target_os = "linux")))]
             {let _=command;Err(CliError::NotImplemented("Linux host guard"))}
         }
         Ok(Command::ClientLinuxRedirectLab{config,journal,port})=>{
-            #[cfg(target_os="linux")]
+            #[cfg(all(feature = "native-ingress-lab", target_os = "linux"))]
             {
                 // Inherit the explicitly selected network namespace
                 // from the caller (e.g. ip netns exec). Compare against
@@ -126,11 +126,11 @@ async fn run() {
                     .and_then(|result|result.map_err(CliError::Client))
                     .map(|_|"Linux isolated redirect stopped; owned nftables table and policy routes restored".to_owned())
             }
-            #[cfg(not(target_os="linux"))]
+            #[cfg(not(all(feature = "native-ingress-lab", target_os = "linux")))]
             {let _=(config,journal,port);Err(CliError::NotImplemented("Linux isolated redirect"))}
         }
         Ok(Command::ClientLinuxRecoverLab{journal})=>{
-            #[cfg(target_os="linux")]
+            #[cfg(all(feature = "native-ingress-lab", target_os = "linux"))]
             {
                 tokio::task::spawn_blocking(move || {
                     let host=std::fs::File::open("/proc/1/ns/net")?;
@@ -139,98 +139,103 @@ async fn run() {
                     .and_then(|result|result.map_err(|_|CliError::Client(theia::client::ClientError::Io)))
                     .map(|_|"Linux isolated guard recovered; owned policy route objects restored".to_owned())
             }
-            #[cfg(not(target_os="linux"))]
+            #[cfg(not(all(feature = "native-ingress-lab", target_os = "linux")))]
             {let _=journal;Err(CliError::NotImplemented("Linux isolated guard recovery"))}
         }
         Ok(Command::WinDivertGuardHolder) => {
-            // The parent duplicates exactly one already-open lab handle
-            // into this bounded fixture. No driver or network access here.
-            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
-            Ok("WinDivert handle holder exited".to_owned())
+            #[cfg(feature = "native-ingress-lab")]
+            {
+                // The parent duplicates exactly one already-open lab handle
+                // into this bounded fixture. No driver or network access here.
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                Ok("WinDivert handle holder exited".to_owned())
+            }
+            #[cfg(not(feature = "native-ingress-lab"))]
+            { Err(CliError::NotImplemented("native ingress laboratory")) }
         }
         Ok(Command::ClientWinDivertScopeDropLab { directory,dll_sha256,sys_sha256,interface,seconds }) => {
-            #[cfg(all(windows,target_arch="x86_64"))]
+            #[cfg(all(feature = "native-ingress-lab", windows, target_arch = "x86_64"))]
             {
                 theia::routing::windivert::scope_drop_acceptance(directory.into(),dll_sha256,sys_sha256,interface,seconds).await
                     .map(|s|format!("WinDivert scope drop lab finished; observed={} tcp4={} tcp6={} udp4={} udp6={} unsupported_or_malformed={} distinct_tuples={}; all captured packets discarded; no persistent protection or application identity asserted",s.observed(),s.tcp_v4,s.tcp_v6,s.udp_v4,s.udp_v6,s.unsupported_or_malformed,s.distinct_tuples))
                     .map_err(|_|CliError::Client(theia::client::ClientError::Io))
             }
-            #[cfg(not(all(windows,target_arch="x86_64")))]
+            #[cfg(not(all(feature = "native-ingress-lab", windows, target_arch = "x86_64")))]
             {
                 let _=(directory,dll_sha256,sys_sha256,interface,seconds);
                 Err(CliError::NotImplemented("WinDivert x64 Windows backend"))
             }
         }
         Ok(Command::ClientWinDivertInterfaceRedirectLab{config,directory,dll_sha256,sys_sha256,capture,carrier,seconds})=>{
-            #[cfg(all(windows,target_arch="x86_64"))]
+            #[cfg(all(feature = "native-ingress-lab", windows, target_arch = "x86_64"))]
             {
                 local_proxy::NativeIngress::run_windows_interface_redirect_lab(Path::new(&config),directory.into(),dll_sha256,sys_sha256,capture,carrier,seconds).await
                     .map(|_|"WinDivert isolated interface redirect ended; outside interface never protected; no production readiness asserted".to_owned())
                     .map_err(CliError::Client)
             }
-            #[cfg(not(all(windows,target_arch="x86_64")))]
+            #[cfg(not(all(feature = "native-ingress-lab", windows, target_arch = "x86_64")))]
             {let _=(config,directory,dll_sha256,sys_sha256,capture,carrier,seconds);Err(CliError::NotImplemented("WinDivert x64 interface redirect"))}
         }
         Ok(Command::ClientWinDivertRedirectLab { config,directory,dll_sha256,sys_sha256,targets,seconds }) => {
-            #[cfg(all(windows,target_arch="x86_64"))]
+            #[cfg(all(feature = "native-ingress-lab", windows, target_arch = "x86_64"))]
             {
                 local_proxy::NativeIngress::run_windows_redirect_lab(Path::new(&config),directory.into(),dll_sha256,sys_sha256,targets,seconds).await
                     .map(|_|"WinDivert scoped TCP/UDP redirect laboratory ended; capture inactive; no production readiness or successful application exchange asserted".to_owned())
                     .map_err(CliError::Client)
             }
-            #[cfg(not(all(windows,target_arch="x86_64")))]
+            #[cfg(not(all(feature = "native-ingress-lab", windows, target_arch = "x86_64")))]
             {
                 let _=(config,directory,dll_sha256,sys_sha256,targets,seconds);
                 Err(CliError::NotImplemented("WinDivert x64 Windows backend"))
             }
         }
         Ok(Command::ClientWinDivertTcpRelayLab { config,directory,dll_sha256,sys_sha256,target }) => {
-            #[cfg(all(windows,target_arch="x86_64"))]
+            #[cfg(all(feature = "native-ingress-lab", windows, target_arch = "x86_64"))]
             {
                 local_proxy::NativeIngress::run_windows_tcp_relay_lab(Path::new(&config),directory.into(),dll_sha256,sys_sha256,target).await
                     .map(|_|"WinDivert authorized TCP echo through the configured authenticated carrier verified; capture inactive".to_owned())
                     .map_err(CliError::Client)
             }
-            #[cfg(not(all(windows,target_arch="x86_64")))]
+            #[cfg(not(all(feature = "native-ingress-lab", windows, target_arch = "x86_64")))]
             {
                 let _=(config,directory,dll_sha256,sys_sha256,target);
                 Err(CliError::NotImplemented("WinDivert x64 Windows backend"))
             }
         }
         Ok(Command::ClientWinDivertUdpRelayLab { config,directory,dll_sha256,sys_sha256,target,flows }) => {
-            #[cfg(all(windows,target_arch="x86_64"))]
+            #[cfg(all(feature = "native-ingress-lab", windows, target_arch = "x86_64"))]
             {
                 local_proxy::NativeIngress::run_windows_udp_relay_lab(Path::new(&config),directory.into(),dll_sha256,sys_sha256,target,flows).await
                     .map(|_|"WinDivert authorized UDP echo through the configured authenticated carrier verified; capture inactive".to_owned())
                     .map_err(CliError::Client)
             }
-            #[cfg(not(all(windows,target_arch="x86_64")))]
+            #[cfg(not(all(feature = "native-ingress-lab", windows, target_arch = "x86_64")))]
             {
                 let _=(config,directory,dll_sha256,sys_sha256,target,flows);
                 Err(CliError::NotImplemented("WinDivert x64 Windows backend"))
             }
         }
         Ok(Command::ClientWinDivertLoopback { directory, dll_sha256, sys_sha256 }) => {
-            #[cfg(all(windows, target_arch = "x86_64"))]
+            #[cfg(all(feature = "native-ingress-lab", windows, target_arch = "x86_64"))]
             {
                 theia::routing::windivert::loopback_acceptance(directory.into(),dll_sha256,sys_sha256).await
                     .map(|_| "WinDivert isolated IPv4/IPv6 TCP redirect, UDP receive/send/reverse socket lifecycle and scoped crash guard verified; capture inactive".to_owned())
                     .map_err(|_| CliError::Client(theia::client::ClientError::Io))
             }
-            #[cfg(not(all(windows, target_arch = "x86_64")))]
+            #[cfg(not(all(feature = "native-ingress-lab", windows, target_arch = "x86_64")))]
             {
                 let _ = (directory,dll_sha256,sys_sha256);
                 Err(CliError::NotImplemented("WinDivert x64 Windows backend"))
             }
         }
         Ok(Command::ClientWinDivertCheck { directory, dll_sha256, sys_sha256, install_lab }) => {
-            #[cfg(all(windows, target_arch = "x86_64"))]
+            #[cfg(all(feature = "native-ingress-lab", windows, target_arch = "x86_64"))]
             {
                 theia::routing::windivert::probe(Path::new(&directory), dll_sha256, sys_sha256, install_lab)
                     .map(|_| "WinDivert 2.2 API available; capture inactive; loaded driver hash not attested".to_owned())
                     .map_err(|_| CliError::Client(theia::client::ClientError::Io))
             }
-            #[cfg(not(all(windows, target_arch = "x86_64")))]
+            #[cfg(not(all(feature = "native-ingress-lab", windows, target_arch = "x86_64")))]
             {
                 let _ = (directory, dll_sha256, sys_sha256, install_lab);
                 Err(CliError::NotImplemented("WinDivert x64 Windows backend"))

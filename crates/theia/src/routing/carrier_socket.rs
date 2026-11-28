@@ -53,17 +53,25 @@ pub(crate) fn active() -> bool {
 /// Native Windows carriers must reserve an exclusive local endpoint
 /// before bind. A later tuple registration cannot repair shared binding.
 pub(crate) fn prepare_tcp(socket: &TcpSocket) -> io::Result<()> {
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[cfg(all(any(feature = "native-ingress-lab", test), target_os = "windows", target_arch = "x86_64"))]
     if active() {
         return super::windivert::prepare_carrier_tcp(socket);
+    }
+    #[cfg(not(any(feature = "native-ingress-lab", test)))]
+    if active() {
+        return Err(io::ErrorKind::PermissionDenied.into());
     }
     let _ = socket;
     Ok(())
 }
 pub(crate) async fn bind_udp(address: SocketAddr) -> io::Result<UdpSocket> {
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[cfg(all(any(feature = "native-ingress-lab", test), target_os = "windows", target_arch = "x86_64"))]
     if active() {
         return super::windivert::bind_carrier_udp(address);
+    }
+    #[cfg(not(any(feature = "native-ingress-lab", test)))]
+    if active() {
+        return Err(io::ErrorKind::PermissionDenied.into());
     }
     UdpSocket::bind(address).await
 }
