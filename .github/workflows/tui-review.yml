@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # Exact source snapshot for this review, not a moving branch.
-          ref: af60aeb9ecb6963bf42e732f5a1db585c219bbd5
+          ref: 84036d6a9888b261cdbc500514068113c8d17546
           path: source
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -260,7 +260,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: af60aeb9ecb6963bf42e732f5a1db585c219bbd5
+          ref: 84036d6a9888b261cdbc500514068113c8d17546
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
@@ -273,7 +273,7 @@ jobs:
       - name: Verify source and fixture dependencies
         shell: pwsh
         run: |
-          if ((git rev-parse HEAD).Trim() -ne 'af60aeb9ecb6963bf42e732f5a1db585c219bbd5') { throw 'source mismatch' }
+          if ((git rev-parse HEAD).Trim() -ne '84036d6a9888b261cdbc500514068113c8d17546') { throw 'source mismatch' }
           python -m pip install h2==4.2.0 aioquic==1.2.0
           if ($LASTEXITCODE -ne 0) { throw 'fixture dependencies failed' }
           "Tested SHA: $(git rev-parse HEAD)" >> $env:GITHUB_STEP_SUMMARY
@@ -292,6 +292,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'standalone tests failed' }
           cargo test --locked -p theia --lib f20_panel_gallery_capture
           if ($LASTEXITCODE -ne 0) { throw 'gallery fixture failed' }
+          cargo test --locked -p theia --lib wizard_never_saves_without_review_and_preview_is_localized
+          if ($LASTEXITCODE -ne 0) { throw 'wizard and viewport fixture failed' }
           cargo test --locked -p theia --lib diagnostics_do_not_queue_ahead_of_production
           if ($LASTEXITCODE -ne 0) { throw 'scheduler fixture failed' }
           cargo test --locked -p theia --lib standalone_meter_is_per_session_and_diagnostics_do_not_enter_it
@@ -347,7 +349,7 @@ jobs:
           from pathlib import Path
           src = Path(os.environ["RUNNER_TEMP"]) / "tui-gallery"
           manifest = json.loads((src / "manifest.json").read_text())
-          assert manifest["source_sha"] == "af60aeb9ecb6963bf42e732f5a1db585c219bbd5"
+          assert manifest["source_sha"] == "84036d6a9888b261cdbc500514068113c8d17546"
           assert (manifest["platform"], manifest["columns"], manifest["rows"]) == ("linux",120,40)
           expected = {"manifest.json", "README.md"}
           for entry in manifest["screens"]:
@@ -373,6 +375,7 @@ jobs:
           required_navigation.update(["server-page-routing.png","client-page-routing.png","client-page-diagnostics.png","server-routing-rules.png","server-routing-edit.png","server-routing-geodata.png","server-page-users-observed.png","client-routing-fresh.png","client-routing-expired.png","client-routing-unconfirmed.png"])
           required_navigation.update(["state-profile-diagnostics-choose.png","state-profile-diagnostics-custom.png","state-profile-diagnostics-validation-error.png","state-profile-diagnostics-fetching.png","state-profile-diagnostics-consent.png","state-profile-diagnostics-running.png","state-profile-diagnostics-completed.png","state-profile-diagnostics-partial.png","state-profile-diagnostics-details.png","state-profile-diagnostics-blocked.png","state-profile-diagnostics-failed.png"])
           required_navigation.update(["anti-dpi-first-run.png","anti-dpi-overview.png","anti-dpi-routing.png","anti-dpi-routing-editor.png","anti-dpi-geodata.png","anti-dpi-catalog.png","anti-dpi-diagnostic-consent.png","state-anti-dpi-diagnostic-report.png"])
+          required_navigation.update(["anti-dpi-first-run-preview.png","anti-dpi-connection.png","anti-dpi-statistics.png","anti-dpi-settings.png","anti-dpi-settings-editor.png","state-anti-dpi-diagnostic-progress.png","state-anti-dpi-diagnostic-cancelled.png","state-anti-dpi-diagnostic-cell.png","state-anti-dpi-diagnostic-quic.png","state-anti-dpi-export-confirm.png"])
           assert required_navigation <= expected, f"missing navigation screenshots: {required_navigation - expected}"
           assert not obsolete_navigation & expected, "obsolete duplicate navigation screenshots"
           assert len(expected) >= 52
