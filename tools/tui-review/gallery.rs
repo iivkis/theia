@@ -30,6 +30,18 @@ fn visual_review_gallery() {
     let client = root.join("client.toml");
     std::fs::write(&server, server_issuance_fixture()).unwrap();
     std::fs::write(&client, include_str!("../../../examples/client.toml")).unwrap();
+    // Synthetic diagnostics fixtures exercise the actual renderer without traffic.
+    {
+        let model = Model::new(Some(Role::Client));
+        for (name, panel) in crate::tui_profile_diagnostics::Panel::review_stages(client.clone()) {
+            let mut ui = Interaction::new(Some(Editor::load(Role::Client, &client).unwrap()));
+            ui.select_workspace_page(Role::Client, 7);
+            ui.workspace_focus = WorkspaceFocus::Actions;
+            ui.profile_diagnostics = Some(panel);
+            review_capture(name, &model, &ui);
+            assert!(!ui.owned_running(Role::Client));
+        }
+    }
     // Capture otherwise nondeterministic asynchronous wizard stages using
     // the real renderer and offline test-only state fixtures.
     {
