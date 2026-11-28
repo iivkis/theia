@@ -36,6 +36,10 @@ impl Strategy {
         const ACCEPTED: &[Strategy] = &[];
         ACCEPTED.contains(&self)
     }
+    pub(crate) fn available_for_standalone(self) -> bool {
+        self.accepted_for_standalone() || super::STANDALONE_EXPERIMENTAL
+    }
+
     fn index(self) -> usize {
         self as usize
     }

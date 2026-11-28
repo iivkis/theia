@@ -466,6 +466,116 @@ pub fn quic_initial_datagrams(data: &[u8], expected_name: &str) -> Option<Vec<Ve
     (result.len() > 1).then_some(result)
 }
 
+/// Alternative for a fresh, single client Initial: split the original
+/// CRYPTO frame into two offset-preserving frames inside the same packet.
+/// Only public Initial keys are used; no TLS transcript, packet number,
+/// CID, version, token, length or application bytes are changed. The
+/// original ciphertext must never also be sent to the destination.
+/// Other Initial layouts, Retry and coalesced packets fail closed here.
+pub(crate) fn quic_initial_crypto_split(data: &[u8], expected_name: &str) -> Option<Vec<u8>> {
+    use crate::{
+        quic_core::{initial::crypto_frame, packet::Reader, wire::varint},
+        reality_quic_wire::{self as wire, Flight, Inspection, Kind},
+    };
+    use rustls::{crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256, quic, Side};
+    if !(wire::MIN_INITIAL..=wire::MAX_DATAGRAM).contains(&data.len()) {
+        return None;
+    }
+    let long = wire::long(data)?;
+    if long.kind != Kind::Initial
+        || long.end != data.len()
+        || !long.token.is_empty()
+        || !(8..=20).contains(&long.dcid.len())
+    {
+        return None;
+    }
+    let name = super::domain_name(expected_name).ok()?;
+    let mut flight = Flight::new(&long)?;
+    let Inspection::Hello(hello) = flight.inspect(data) else {
+        return None;
+    };
+    if !super::dpi::packet_quic_hello(&hello, &name) {
+        return None;
+    }
+    let suite = TLS13_AES_128_GCM_SHA256.tls13()?.quic_suite()?;
+    let version = match long.version {
+        wire::V1 => quic::Version::V1,
+        wire::V2 => quic::Version::V2,
+        _ => return None,
+    };
+    let pn_offset = long.packet_number_offset();
+    let mut reader = Reader::new(suite.keys(long.dcid, Side::Client, version).local);
+    let opened = reader.open(data, pn_offset).ok()?;
+    // Only one complete CRYPTO frame plus padding. In particular do not
+    // rewrite ACKs, connection-close, Retry or unknown frame semantics.
+    let mut at = 0;
+    let mut crypto = None;
+    while at < opened.payload.len() {
+        match varint(&opened.payload, &mut at)? {
+            0 => {}
+            6 if crypto.is_none() => {
+                if varint(&opened.payload, &mut at)? != 0 {
+                    return None;
+                }
+                let length = usize::try_from(varint(&opened.payload, &mut at)?).ok()?;
+                let end = at.checked_add(length)?;
+                crypto = Some(opened.payload.get(at..end)?);
+                at = end;
+            }
+            _ => return None,
+        }
+    }
+    let crypto = crypto?;
+    if crypto != hello.as_slice() || crypto.len() < 2 {
+        return None;
+    }
+    let middle = crypto.len() / 2;
+    let mut payload = crypto_frame(0, &crypto[..middle]).ok()?;
+    payload.extend(crypto_frame(middle as u64, &crypto[middle..]).ok()?);
+    if payload.len() > opened.payload.len() {
+        return None;
+    }
+    payload.resize(opened.payload.len(), 0);
+    if payload == opened.payload {
+        return None;
+    }
+    let keys = suite.keys(long.dcid, Side::Client, version).local;
+    let mut out = opened.header;
+    let tag = keys.packet.encrypt_in_place(opened.number, &out, &mut payload).ok()?;
+    out.extend(payload);
+    out.extend_from_slice(tag.as_ref());
+    let sample_start = pn_offset.checked_add(4)?;
+    let sample_end = sample_start.checked_add(keys.header.sample_len())?;
+    if sample_end > out.len() {
+        return None;
+    }
+    let (prefix, suffix) = out.split_at_mut(sample_start);
+    let (first, rest) = prefix.split_first_mut()?;
+    keys.header.encrypt_in_place(
+        &suffix[..sample_end - sample_start],
+        first,
+        &mut rest[pn_offset - 1..],
+    ).ok()?;
+    if out.len() != data.len() || out == data {
+        return None;
+    }
+    // Round-trip the rewritten wire image before giving it to a socket.
+    let new_header = wire::long(&out)?;
+    let mut verify = Flight::new(&new_header)?;
+    if !matches!(verify.inspect(&out), Inspection::Hello(bytes) if bytes == hello) {
+        return None;
+    }
+    Some(out)
+}
+
+/// A shared proxy/diagnostic transformation. Prefer byte-exact datagram
+/// de-coalescing; fresh standalone Initials use the CRYPTO-frame alternative.
+pub(crate) fn quic_initial_transform(data: &[u8], name: &str) -> Option<Vec<Vec<u8>>> {
+    quic_initial_datagrams(data, name).or_else(|| {
+        quic_initial_crypto_split(data, name).map(|packet| vec![packet])
+    })
+}
+
 /// An untrusted probe hint, never a domain identity. The lab accepts
 /// complete v1/v2 H3 Initials only if an actual transformation is possible.
 /// The caller must independently verify the exact version, not downgrade.
@@ -978,6 +1088,29 @@ mod tests {
     }
 
     #[test]
+    fn fresh_quic_initial_crypto_split_preserves_packet_and_transcript() {
+        use crate::reality_quic_wire::{self as wire, Flight, Inspection};
+        for version in [wire::V1, wire::V2] {
+            let hello = super::super::dpi::packet_test_quic_hello("example.org");
+            let input = wire::test_initial(version, &hello);
+            let output = quic_initial_crypto_split(&input, "example.org").unwrap();
+            assert_ne!(input, output);
+            assert_eq!(input.len(), output.len());
+            let a = wire::long(&input).unwrap();
+            let b = wire::long(&output).unwrap();
+            assert_eq!((a.version, a.dcid, a.scid, a.token), (b.version, b.dcid, b.scid, b.token));
+            let mut observed = Flight::new(&b).unwrap();
+            assert!(matches!(observed.inspect(&output), Inspection::Hello(bytes) if bytes == hello));
+            assert!(quic_initial_crypto_split(&output, "example.org").is_none());
+            assert!(quic_initial_crypto_split(&input, "wrong.example").is_none());
+            let mut damaged = input.clone();
+            damaged[100] ^= 1;
+            assert!(quic_initial_crypto_split(&damaged, "example.org").is_none());
+            assert_eq!(quic_initial_transform(&input, "example.org"), Some(vec![output]));
+        }
+    }
+
+    #[test]
     fn quic_candidate_never_splits_unauthenticated_or_short_initial() {
         use crate::reality_quic_wire as wire;
         for version in [wire::V1, wire::V2] {
@@ -1061,7 +1194,8 @@ mod tests {
                 .unwrap();
             {
                 let mut stdin = peer.stdin.take().unwrap();
-                for data in [&input, &outputs[0], &outputs[1], &hello] {
+                let rewritten = quic_initial_crypto_split(&initial, "example.org").unwrap();
+                for data in [&input, &outputs[0], &outputs[1], &hello, &rewritten] {
                     stdin.write_all(&(data.len() as u32).to_be_bytes()).unwrap();
                     stdin.write_all(data).unwrap();
                 }

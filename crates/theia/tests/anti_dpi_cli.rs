@@ -76,7 +76,8 @@ fn diagnostic_preview_is_offline_and_confirmation_is_exact() {
     assert!(output.contains("Diagnostic preview (no network requests)"));
     assert!(output.contains("discord.com"));
     assert!(output.contains("dns.example.com"));
-    assert!(output.contains("AwaitingAcceptance"));
+    assert!(output.contains("tcp_header: None; runnable targets=1"));
+    assert!(output.contains("Experimental standalone strategies"));
     assert!(output.contains("Confirm exact plan with SHA256="));
     let result = Command::new(env!("CARGO_BIN_EXE_theia"))
         .args(args)
@@ -121,7 +122,7 @@ fn standalone_apply_is_explicit_and_connect_preview_is_offline() {
     let connect = run("connect", None);
     assert!(connect.status.success());
     let text = String::from_utf8(connect.stdout).unwrap();
-    assert!(text.contains("Pass/Drop only"));
-    assert!(text.contains("Modify is denied"));
+    assert!(text.contains("Pass/Modify/Drop"));
+    assert!(text.contains("experimental Modify"));
     std::fs::remove_dir_all(dir).unwrap();
 }

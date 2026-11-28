@@ -475,12 +475,20 @@ async fn relay_local_batch(
             .ok_or(LocalRelayError::Application(ClientError::Protocol))?;
         let parts = match first_batch {
             Some(parts) => {
-                if parts.len() < 2
+                let valid = if let Some(verified) = verified {
+                    // Re-derive the exact shared transform; a single
+                    // reprotected public Initial is allowed only if it is
+                    // the validated CRYPTO-frame alternative, never Plain.
+                    verified.quic_batch(&data).as_ref() == Some(&parts)
+                } else {
+                    parts.len() >= 2 && parts.concat() == data
+                };
+                if !valid
+                    || parts.is_empty()
                     || parts.len() > 3
                     || parts
                         .iter()
                         .any(|p| p.is_empty() || p.len() > protocol::MAX_DATAGRAM)
-                    || parts.concat() != data
                 {
                     return Err(LocalRelayError::Application(ClientError::Protocol));
                 }

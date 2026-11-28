@@ -347,7 +347,7 @@ async fn handle(
         && matches!(port, 443 | 8443)
         && Strategy::ALL
             .into_iter()
-            .any(Strategy::accepted_for_standalone);
+            .any(Strategy::available_for_standalone);
     let target = match runtime.target(&active, &address, port, allow_modify).await {
         Ok(target) => target,
         Err(error) => {
@@ -470,14 +470,14 @@ async fn udp_flow(
         first = queued.recv() => match first { Some(first) => first, None => return Ok(()) },
     };
     let mut observer = dpi::udp::Observer::default();
-    let strategy = super::egress::udp_strategy(
+    let strategy = super::egress::udp_strategy_standalone(
         &address,
         port,
         &observer.outgoing(&first),
         &first,
         active.document().anti_dpi.consent.direct_dpi_stun,
     )
-    .filter(|s| s.accepted_for_standalone());
+    .filter(|s| s.available_for_standalone());
     let target = runtime
         .target(&active, &address, port, strategy.is_some())
         .await?;

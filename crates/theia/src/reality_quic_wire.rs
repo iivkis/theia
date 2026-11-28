@@ -32,6 +32,13 @@ pub(crate) struct Long<'a> {
     pub end: usize,
 }
 
+impl Long<'_> {
+    /// Offset of the protected packet number within this long-header packet.
+    pub(crate) fn packet_number_offset(&self) -> usize {
+        self.pn
+    }
+}
+
 fn take<'a>(bytes: &'a [u8], pos: &mut usize, n: usize) -> Option<&'a [u8]> {
     let end = pos.checked_add(n)?;
     let value = bytes.get(*pos..end)?;

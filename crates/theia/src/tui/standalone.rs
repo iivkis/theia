@@ -10,7 +10,8 @@ use crate::anti_dpi::{
     authority::Candidate,
     catalog::{Catalog, Overlay, MAX_JOB_DOMAINS, VERSION},
     diagnostic::{
-        strategy_columns, strategy_unavailable, CellResult, CellStatus, Plan, Reason, Report, Stage,
+        recommend_tcp, strategy_columns, strategy_unavailable, CellResult, CellStatus, Plan, Reason,
+        Report, Stage,
     },
     Document,
 };
@@ -27,7 +28,7 @@ use std::{
 
 fn column_label(id: &str) -> &str {
     match id {
-        "direct" => "Прямой",
+        "direct" | "quic_v1_direct" | "quic_v2_direct" | "stun_direct" => "Прямой",
         "tcp_header" => "Header",
         "tcp_middle" => "Middle",
         "tcp_balanced" => "Balanced",
@@ -91,8 +92,9 @@ fn stage(value: Stage) -> &'static str {
 fn reason(value: Reason) -> &'static str {
     match value {
         Reason::None => "Нет ошибки",
-        Reason::AwaitingAcceptance => "Стратегия не прошла независимую приёмку",
-        Reason::MissingEndpointMetadata => "Нет подтверждённых данных о совместимом endpoint",
+        Reason::AwaitingAcceptance => "Способ пока не доступен в этой версии",
+        Reason::MissingEndpointMetadata => "Нет сведений о поддержке протокола этим сервером",
+        Reason::ConsentRequired => "Нужно отдельное разрешение STUN в настройках",
         Reason::Budget => "Исчерпан бюджет задания",
         Reason::Cancelled => "Отменено пользователем",
         Reason::ContextChanged => "Изменился контекст политики или сети",
@@ -126,7 +128,7 @@ fn cell_explanation(cell: &CellResult) -> &'static str {
     }
     match cell.status {
         CellStatus::Available => {
-            if cell.strategy_id == "direct" {
+            if cell.strategy_id == "direct" || cell.strategy_id.ends_with("_direct") {
                 "Цель ответила напрямую. Для этой проверки Anti-DPI не требовался."
             } else {
                 "Цель ответила при проверке стратегии. Это не гарантия обхода DPI."
@@ -194,6 +196,7 @@ struct Draft {
     choice: usize,
     input_backup: Option<[String; 5]>,
     adding_sites: bool,
+    diagnostic_proposal: bool,
     edit_rule: Option<usize>,
     delete_rule: bool,
     original: Document,
@@ -237,6 +240,7 @@ impl Draft {
             choice: 0,
             input_backup: None,
             adding_sites: false,
+            diagnostic_proposal: false,
             edit_rule: None,
             delete_rule: false,
             original,
@@ -312,7 +316,7 @@ impl Draft {
             .count();
         let (title, text, mut items) = match self.step {
             SetupStep::Mode => ("Шаг 1 из 5 · Как настроить Anti-DPI?",
-                "Anti-DPI помогает проверять доступность сайтов и применять принятые способы изменения трафика.\nРаботает без VPS и ключей. Сейчас стратегии изменения трафика ожидают приёмки.\n\nВыберите способ настройки. Никаких сетевых запросов или изменений Windows пока не будет.".into(),
+                "Anti-DPI помогает проверять доступность сайтов и применять доступные способы изменения трафика.\nРаботает без VPS и ключей. Недоступные способы не используются.\n\nВыберите способ настройки. Никаких сетевых запросов или изменений Windows пока не будет.".into(),
                 vec![item('1', "Рекомендуемая · выбрать нужные сайты"), item('2', "Ручная · настроить правила позднее")]),
             SetupStep::Domains => (if self.edit_rule.is_some() { "Изменить список сайтов" } else if self.adding_sites { "Добавить сайты для Anti-DPI" } else { "Шаг 2 из 5 · Какие сайты вам нужны?" },
                 format!("Укажите сайты, для которых хотите использовать Anti-DPI. Остальные не получат это правило.\n\nВыбрано: {domains}\n{}\n\nПока это только черновик. Для продолжения нужен хотя бы один сайт.", if self.values[4].is_empty() { "Пока ничего не выбрано" } else { &self.values[4] }),
@@ -327,8 +331,8 @@ impl Draft {
                 "Чтобы проверить сайты или подключаться к ним напрямую, требуется ваше разрешение.\nDNS-провайдер и сайты могут видеть ваш публичный IP. Anti-DPI не является VPN.\nЕсли не разрешить прямой выход, рабочий трафик не будет отправляться.\nЭто не запускает подключение. Разрешение можно изменить в настройках.".into(),
                 vec![item('1', "Пока не разрешать"), item('2', "Разрешить прямое подключение")]),
             SetupStep::Modify => (if self.first_run() { if self.flags[3] { "Шаг 5 из 5 · Разрешить Anti-DPI?" } else { "Шаг 4 из 4 · Разрешить Anti-DPI?" } } else { "Разрешения 2 из 2 · Anti-DPI" },
-                "Разрешить изменение трафика только для сайтов, указанных в правилах.\nПока стратегии не приняты, это разрешение не включает работающий обход.\nПри невозможности применить Anti-DPI соединение блокируется, а не отправляется напрямую.\nSTUN не включается этим шагом. Его отдельное разрешение доступно в расширенных настройках.".into(),
-                vec![item('1', "Пока не разрешать · Anti-DPI не активен"), item('2', "Разрешить принятые стратегии Anti-DPI")]),
+                "Разрешить изменение трафика только для сайтов, указанных в правилах.\nЭкспериментальная сборка: способы доступны, независимая приёмка не подтверждена.\nПри невозможности применить Anti-DPI соединение блокируется, а не отправляется напрямую.\nSTUN не включается этим шагом. Его отдельное разрешение доступно в расширенных настройках.".into(),
+                vec![item('1', "Пока не разрешать · Anti-DPI не активен"), item('2', "Разрешить Anti-DPI (экспериментальные способы)")]),
             SetupStep::DomainInput | SetupStep::CustomDns | SetupStep::Advanced | SetupStep::RulePick => ("", String::new(), Vec::new()),
         };
         let mut text = text;
@@ -489,7 +493,7 @@ impl Draft {
             Field { id: 3, label: "Локальный SOCKS5-прокси", value: self.values[3].clone(), hint: "Только loopback. UDP ASSOCIATE не означает перехват всего UDP системы." },
             Field { id: 4, label: "Прямой выход в сеть (Пробел)", value: yes(self.flags[0]).into(), hint: "Ваш IP виден DNS-провайдеру и получателям. По умолчанию запрещено." },
             Field { id: 5, label: "Anti-DPI (Пробел)", value: yes(self.flags[1]).into(), hint: "Только принятые стратегии. При отказе нет перехода на прямой маршрут." },
-            Field { id: 6, label: "STUN (отдельное разрешение)", value: yes(self.flags[2]).into(), hint: "Только совместимый credential-free Binding; приёмка обязательна." },
+            Field { id: 6, label: "STUN (отдельное разрешение)", value: yes(self.flags[2]).into(), hint: "Только совместимый credential-free Binding; отдельное согласие." },
         ];
         Form {
             fields,
@@ -688,10 +692,13 @@ fn policy_text(doc: &Document) -> String {
         let _ = writeln!(text, "ВНИМАНИЕ: Anti-DPI не активен.");
     } else if strategy_columns()
         .into_iter()
-        .filter(|id| *id != "direct")
+        .filter(|id| *id != "direct" && !id.ends_with("_direct"))
         .all(|id| strategy_unavailable(id) == Some(Reason::AwaitingAcceptance))
     {
         let _ = writeln!(text, "ВНИМАНИЕ: ни одна стратегия Anti-DPI ещё не принята; соответствующие соединения будут блокироваться.");
+    }
+    if crate::routing::dpi::STANDALONE_EXPERIMENTAL {
+        let _ = writeln!(text, "Экспериментальные способы Anti-DPI. Независимая приёмка не подтверждена.");
     }
     if local.resolver.is_none() || !local.consent.direct_egress {
         let _ = writeln!(
@@ -723,11 +730,7 @@ impl ReportContext {
             stale: false,
         })
     }
-    fn refresh(&mut self, path: &Path, overlay_path: &Path) {
-        if self.stale || self.checked.elapsed() < Duration::from_secs(1) {
-            return;
-        }
-        self.checked = Instant::now();
+    fn current(&self, path: &Path, overlay_path: &Path) -> bool {
         let overlay_current = match &self.overlay {
             Some(bytes) => {
                 crate::config::editor_bytes(overlay_path).is_ok_and(|value| &value == bytes)
@@ -735,9 +738,17 @@ impl ReportContext {
             None => std::fs::symlink_metadata(overlay_path)
                 .is_err_and(|e| e.kind() == io::ErrorKind::NotFound),
         };
-        self.stale = !overlay_current
-            || crate::network_scope::generation() != self.epoch
-            || !crate::config::editor_bytes(path).is_ok_and(|value| value == self.config);
+        !self.stale
+            && overlay_current
+            && crate::network_scope::generation() == self.epoch
+            && crate::config::editor_bytes(path).is_ok_and(|value| value == self.config)
+    }
+    fn refresh(&mut self, path: &Path, overlay_path: &Path) {
+        if self.stale || self.checked.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.checked = Instant::now();
+        self.stale = !self.current(path, overlay_path);
     }
 }
 
@@ -1744,6 +1755,96 @@ impl Panel {
         }
     }
 
+    fn selected_recommendation(&self) -> Option<&CellResult> {
+        if self.group != 0
+            || self.worker.is_some()
+            || !self.report_only
+            || !self.report_context.as_ref().is_some_and(|context| !context.stale && context.epoch.is_some())
+        {
+            return None;
+        }
+        let visible = self.visible();
+        let host = &visible.get(self.row)?.hostname;
+        let direct = self.results.get(&(host.clone(), "direct"))?;
+        recommend_tcp(
+            direct,
+            self.results.values().filter(|cell| {
+                cell.domain == *host && strategy_unavailable(cell.strategy_id).is_none()
+            }),
+        )
+    }
+
+    fn recommend_route(&mut self) {
+        // Suggestions are not strategy pins, consent or production evidence.
+        // Recheck the report against current files and the network before
+        // constructing a guarded, separately reviewed routing draft.
+        let Some(cell) = self.selected_recommendation().cloned() else {
+            self.notice = "Нет сопоставимого успешного результата Anti-DPI.".into();
+            return;
+        };
+        let Some(context) = &self.report_context else {
+            return;
+        };
+        if context.epoch.is_none() || !context.current(&self.path, &self.overlay_path) {
+            self.mark_stale();
+            self.notice = "Условия изменились. Повторите диагностику.".into();
+            return;
+        }
+        if cell.policy_action == Some(crate::anti_dpi::Decision::Modify) {
+            self.notice = "Для сайта уже действует правило Anti-DPI; рабочий движок сам выбирает доступный способ.".into();
+            return;
+        }
+        let expected = context.config.clone();
+        self.open_settings();
+        let Some(mut draft) = self.draft.take() else {
+            return;
+        };
+        if draft.expected.as_ref() != Some(&expected) {
+            self.mark_stale();
+            self.notice = "Файл изменился. Повторите диагностику.".into();
+            return;
+        }
+        if !draft.flags[0] || !draft.flags[1] {
+            self.notice = "Сначала отдельно разрешите Anti-DPI и прямой выход в настройках.".into();
+            return;
+        }
+        draft.adding_sites = true;
+        draft.diagnostic_proposal = true;
+        draft.values[4] = cell.domain;
+        draft.move_to(SetupStep::Domains);
+        // Never reorder an earlier rule. Refuse a suggestion that would be
+        // shadowed even at the exact observed endpoint.
+        let effective = draft.next_document().ok().and_then(|next| next.prepare().ok())
+            .zip(cell.endpoint)
+            .is_some_and(|(policy, endpoint)| {
+                policy.classify_resolved(&draft.values[4], &[endpoint.ip()])
+                    == crate::anti_dpi::Decision::Modify
+            });
+        if !effective {
+            self.notice = "Более раннее правило имеет приоритет. Проверьте маршрутизацию вручную.".into();
+            return;
+        }
+        self.preview_draft(draft);
+    }
+
+    fn toggle_udp_endpoint(&mut self, key: char) {
+        let Some(host) = self.visible().get(self.row).filter(|entry| !entry.excluded)
+            .map(|entry| entry.hostname.clone()) else { return; };
+        let mut next = self.overlay.clone();
+        let list = match key {
+            'h' => &mut next.quic_v1,
+            'H' => &mut next.quic_v2,
+            'S' => &mut next.stun,
+            _ => return,
+        };
+        if list.contains(&host) {
+            list.retain(|entry| entry != &host);
+        } else {
+            list.push(host);
+        }
+        self.set_overlay(next);
+    }
+
     fn diagnostic_actions(&self) -> Vec<ActionItem> {
         let item = |key, label| ActionItem { key, label };
         if self.report_only {
@@ -1753,6 +1854,9 @@ impl Panel {
                 item('[', "Предыдущий протокол"),
                 item(']', "Следующий протокол"),
             ];
+            if self.selected_recommendation().is_some() {
+                items.push(item('u', "Подготовить правило Anti-DPI для сайта"));
+            }
             if !self.results.is_empty() {
                 items.extend([
                     item('b', "Повторить неуспешные проверки"),
@@ -1770,6 +1874,9 @@ impl Panel {
                 item('c', "Очистить выбор"),
                 item('x', "Исключить / вернуть сайт"),
                 item('R', "Вернуть исключённые сайты"),
+                item('h', "Указать / снять свой QUIC v1 (UDP 443)"),
+                item('H', "Указать / снять свой QUIC v2 (UDP 443)"),
+                item('S', "Указать / снять STUN для сервера (UDP 3478)"),
             ];
             if !self.report_hosts.is_empty() {
                 items.push(item('v', "Открыть последний отчёт"));
@@ -1902,6 +2009,17 @@ impl Panel {
                     if let Some(review) = self.review.take() {
                         match review {
                             Review::Save(draft, next) => {
+                                if draft.diagnostic_proposal
+                                    && !self.report_context.as_ref().is_some_and(|context| {
+                                        context.epoch.is_some()
+                                            && context.current(&self.path, &self.overlay_path)
+                                            && draft.expected.as_ref() == Some(&context.config)
+                                    })
+                                {
+                                    self.mark_stale();
+                                    self.notice = "Условия изменились. Правило не сохранено; повторите диагностику.".into();
+                                    return Ok(false);
+                                }
                                 match next.save(&self.path, draft.expected.as_deref()) {
                                     Ok(()) => {
                                         self.notice = "Файл сохранён. Политика ещё не применена; подключения не запускались.".into();
@@ -2311,6 +2429,7 @@ impl Panel {
             }
             KeyCode::F(7) | KeyCode::Char('j') if self.page == DIAGNOSTICS => self.details = true,
             KeyCode::Char('z') if self.page == DIAGNOSTICS => self.begin_export(),
+            KeyCode::Char('u') if self.page == DIAGNOSTICS => self.recommend_route(),
             KeyCode::Char('b') if self.page == DIAGNOSTICS => {
                 let failed = self
                     .results
@@ -2341,6 +2460,9 @@ impl Panel {
                 } else {
                     self.begin_review(None);
                 }
+            }
+            KeyCode::Char(key @ ('h' | 'H' | 'S')) if self.page == DIAGNOSTICS && !self.report_only && self.catalogue_draft.is_none() => {
+                self.toggle_udp_endpoint(key);
             }
             KeyCode::Char('R') if self.page == DIAGNOSTICS && !self.report_only => {
                 self.set_overlay(Overlay {
@@ -2431,7 +2553,7 @@ impl Panel {
             use crate::windows_system_proxy::{ObservedProxy, ProxyStatus};
             match self.os_observation {
                 Some(ObservedProxy::Direct) => "Собственная сессия отсутствует",
-                Some(ObservedProxy::External) => "Внешний прокси / PAC / автоопределение",
+                Some(ObservedProxy::External) => "Windows: сторонние настройки прокси · Theia не подключена",
                 Some(ObservedProxy::Journal(ProxyStatus::PendingOwned)) => {
                     "Журнал прокси · владелец не подтверждён"
                 }
@@ -2495,11 +2617,12 @@ impl Panel {
     fn readiness_text(&self, document: &Document) -> String {
         let local = &document.anti_dpi;
         let applied = self.applied_revision == Some(local.revision);
-        format!("Готовность к подключению\n[OK] Настройки прочитаны\n[{}] DNS: {}\n[{}] Выход в интернет: {}\n[{}] Применение правил: {}\n[{}] Системный прокси: {}\nAnti-DPI: стратегии ожидают независимой приёмки.",
+        format!("Готовность к подключению\n[OK] Настройки прочитаны\n[{}] DNS: {}\n[{}] Выход в интернет: {}\n[{}] Применение правил: {}\n[{}] Системный прокси: {}\nAnti-DPI: {}.",
             if local.resolver.is_some() { "OK" } else { "!" }, local.resolver.as_ref().map_or("выберите поставщика", |r| r.hostname.as_str()),
             if local.consent.direct_egress { "OK" } else { "!" }, yes(local.consent.direct_egress),
             if applied { "OK" } else { "!" }, if applied { "подтверждено этой панелью" } else { "нужно подтвердить" },
-            if cfg!(windows) { "?" } else { "—" }, self.owner_text())
+            if cfg!(windows) { "?" } else { "—" }, self.owner_text(),
+            if crate::routing::dpi::STANDALONE_EXPERIMENTAL { "экспериментальные стратегии доступны после согласия" } else { "только принятые стратегии" })
     }
 
     fn draw_page(&self, frame: &mut Frame<'_>, area: Rect, document: Option<&Document>) {
@@ -2510,7 +2633,8 @@ impl Panel {
             OVERVIEW => {
                 let _ = writeln!(
                     text,
-                    "Anti-DPI не активен: стратегии ожидают независимой приёмки.\n{}",
+                    "{}\n{}",
+                    if crate::routing::dpi::STANDALONE_EXPERIMENTAL { "Anti-DPI: экспериментальные стратегии TCP/QUIC/STUN доступны." } else { "Anti-DPI: используются только принятые стратегии." },
                     self.owner_text()
                 );
                 if let Some(local) = local {
@@ -2618,9 +2742,9 @@ impl Panel {
         let ids = strategy_columns();
         match self.group {
             0 => ids.into_iter().take(4).map(Some).collect(),
-            1 => vec![None, Some("quic_v1_initial_split")],
-            2 => vec![None, Some("quic_v2_initial_split")],
-            _ => vec![None, Some("stun_fingerprint")],
+            1 => vec![Some("quic_v1_direct"), Some("quic_v1_initial_split")],
+            2 => vec![Some("quic_v2_direct"), Some("quic_v2_initial_split")],
+            _ => vec![Some("stun_direct"), Some("stun_fingerprint")],
         }
     }
 
@@ -2856,7 +2980,7 @@ impl Panel {
             self.visible().len()
         );
         let header_h = if area.width < 90 { 7 } else { 5 };
-        let details_h = if area.height >= 20 { 5 } else { 2 };
+        let details_h = if area.height >= 20 { 7 } else { 3 };
         let table_h = (self
             .visible()
             .len()
@@ -2980,10 +3104,21 @@ impl Panel {
         let legend = if self.group == 0 {
             "2xx — ответ получен · 3xx — перенаправление · 4xx/5xx — HTTP-ошибка\nн/п — не поддерживается · н/пр — неприменимо · — не проверено"
         } else {
-            "Прямой* — контроль UDP не реализован. Сравнение с TCP недопустимо.\nн/п — не поддерживается · — не проверено"
+            "Прямой — контроль выбранного UDP-протокола. Сравнение с TCP недопустимо.\nн/п — не поддерживается · — не проверено"
+        };
+        let recommendation = if self.group != 0 {
+            "Сравнивайте прямой контроль и Anti-DPI одного протокола.".into()
+        } else if let Some(cell) = self.selected_recommendation() {
+            format!("Подошёл способ {} ({} мс). u — подготовить правило; выбор способа в работе автоматический.", column_label(cell.strategy_id), cell.duration_ms)
+        } else if self.worker.is_some() {
+            "Дождитесь завершения проверки.".into()
+        } else if strategy_columns().iter().filter(|id| **id != "direct" && !id.ends_with("_direct")).all(|id| strategy_unavailable(id).is_some()) {
+            "Anti-DPI пока недоступен: проверка только прямого подключения.".into()
+        } else {
+            "Нет подтверждённого улучшения относительно прямого подключения.".into()
         };
         let summary = format!(
-            "{selected}\n{legend}\nДоступность не доказывает обход DPI. [ ] — сменить протокол."
+            "{selected}\n{recommendation}\n{legend}\nДоступность не доказывает обход DPI. [ ] — сменить протокол."
         );
         frame.render_widget(
             Paragraph::new(summary)
@@ -3026,9 +3161,9 @@ impl Panel {
                 c.duration_ms, c.attempts, c.actual_modification.map_or("Не подтверждена", |m| if m { "Да" } else { "Нет" }),
                 c.endpoint.map_or_else(|| "—".into(), |e| e.to_string()), c.source.map_or_else(|| "—".into(), |ip| ip.to_string()), c.policy_action));
         } else {
-            text.push_str(if id.is_none() { "Отдельный Direct-контроль UDP ещё не реализован. Сравнение недоступно." }
-                else if id.is_some_and(|id| strategy_unavailable(id) == Some(Reason::AwaitingAcceptance)) { "Стратегия не поддерживается: независимая приёмка не завершена. Проверка не выполнялась." }
-                else { "Нет результата для этой стратегии. Не проверено." });
+            text.push_str(if id.is_none() { "Нет данных о совместимом UDP-сервере для выбранного протокола." }
+                else if id.is_some_and(|id| strategy_unavailable(id) == Some(Reason::AwaitingAcceptance)) { "Этот способ пока недоступен в данной версии. Проверка не выполнялась." }
+                else { "Нет результата. Для UDP проверьте сведения о поддержке протокола в каталоге." });
         }
         text.push_str(&format!(
             "\n\nИстория каталога (не результат текущей проверки):\n{provenance}"
@@ -3087,12 +3222,14 @@ impl Panel {
             footer = "Esc закрыть · F1 справка".into();
         } else if let Some(review) = &self.review {
             let (title, text, label) = match review {
-                Review::Diagnostic(plan) => ("Диагностика", plan.ui_preview(self.owner_active()), "Запустить проверку"),
+                Review::Diagnostic(plan) => ("Подтверждение диагностики", plan.ui_preview(self.owner_active()), "Запустить проверку"),
                 Review::Policy(candidate, enroll) => ("Применение локальной политики", format!("{}\n\n{}\nСеть и настройки ОС не меняются этой операцией.\nСтарые разрешения потоков отзываются при публикации.",
                     if *enroll { "Первичная регистрация локальной ревизии (не регистрация на сервере)." } else { "Применить сохранённую ревизию." },
                     policy_text(candidate.document())), "Применить"),
                 Review::Save(draft, next) => {
-                    let change = if let Some(index) = draft.edit_rule {
+                    let change = if draft.adding_sites && draft.edit_rule.is_none() {
+                        "Новое правило будет последним. Существующие правила сохраняются и имеют приоритет. Способ Anti-DPI выбирается автоматически; диагностика не выдаёт рабочее разрешение.\n\n".into()
+                    } else if let Some(index) = draft.edit_rule {
                         let old = &draft.original.anti_dpi.rules[index];
                         let before = old.domains.iter().map(|d| d.strip_prefix("full:").unwrap_or(d)).collect::<Vec<_>>().join(", ");
                         let after = if draft.delete_rule { "Правило будет удалено".into() } else { next.anti_dpi.rules[index].domains.iter().map(|d| d.strip_prefix("full:").unwrap_or(d)).collect::<Vec<_>>().join(", ") };
@@ -3463,6 +3600,16 @@ mod tests {
             .collect();
         panel.begin_review(None);
         assert!(panel.review.is_some());
+        if let Some(Review::Diagnostic(plan)) = &panel.review {
+            let preview = plan.ui_preview(false);
+            let runnable = plan.runnable_cells();
+            assert!(preview.contains(&format!("Запланировано сетевых проверок сайтов: {runnable}.")));
+            assert!(preview.contains(&format!("Недоступных ячеек: {}.", plan.planned_cells() - runnable)));
+            assert_eq!(preview.contains("Anti-DPI не будет проверен"), runnable == 6);
+            assert!(preview.contains("Esc — отменить"));
+            assert!(preview.contains("SHA256 плана"));
+            assert!(!preview.contains("приёмка не завершена"));
+        }
         capture("anti-dpi-diagnostic-consent", &mut panel);
         panel.review = None;
         for (index, entry) in panel.catalog.entries().iter().take(6).enumerate() {
@@ -3505,9 +3652,9 @@ mod tests {
             panel.results.insert((host.clone(), "direct"), direct);
             for strategy_id in strategy_columns().into_iter().filter(|id| *id != "direct") {
                 let protocol = match strategy_id {
-                    "quic_v1_initial_split" => Protocol::QuicV1,
-                    "quic_v2_initial_split" => Protocol::QuicV2,
-                    "stun_fingerprint" => Protocol::Stun,
+                    "quic_v1_direct" | "quic_v1_initial_split" => Protocol::QuicV1,
+                    "quic_v2_direct" | "quic_v2_initial_split" => Protocol::QuicV2,
+                    "stun_direct" | "stun_fingerprint" => Protocol::Stun,
                     _ => Protocol::TcpHttps,
                 };
                 panel.results.insert(
@@ -3516,11 +3663,11 @@ mod tests {
                         domain: host.clone(),
                         protocol,
                         strategy_id,
-                        status: CellStatus::Unsupported,
+                        status: if protocol == Protocol::TcpHttps { CellStatus::Cancelled } else { CellStatus::NotChecked },
                         network: Stage::NotRun,
                         tls: Stage::NotRun,
                         application: Stage::NotRun,
-                        reason: Reason::AwaitingAcceptance,
+                        reason: if protocol == Protocol::TcpHttps { Reason::Cancelled } else { Reason::MissingEndpointMetadata },
                         actual_modification: None,
                         http_status: None,
                         duration_ms: 0,
