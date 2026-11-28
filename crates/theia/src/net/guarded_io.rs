@@ -1,6 +1,10 @@
 //! Guard a socket at every I/O poll. The owner still supplies the deadline,
 //! cancellation wakeup, scope and policy. Dropping the future drops its socket.
-use std::{io, pin::Pin, task::{Context, Poll}};
+use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll},
+};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub(crate) struct GuardedIo<'a, T> {
@@ -11,7 +15,11 @@ pub(crate) struct GuardedIo<'a, T> {
 
 impl<'a, T> GuardedIo<'a, T> {
     pub(crate) fn new(inner: T, live: &'a (dyn Fn() -> bool + Sync)) -> Self {
-        Self { inner, live, written: None }
+        Self {
+            inner,
+            live,
+            written: None,
+        }
     }
 
     #[cfg(windows)]
@@ -30,9 +38,11 @@ impl<'a, T> GuardedIo<'a, T> {
 }
 
 impl<T: AsyncRead + Unpin> AsyncRead for GuardedIo<'_, T> {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>)
-        -> Poll<io::Result<()>>
-    {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         if let Err(error) = this.check() {
             return Poll::Ready(Err(error));
@@ -46,9 +56,11 @@ impl<T: AsyncRead + Unpin> AsyncRead for GuardedIo<'_, T> {
 }
 
 impl<T: AsyncWrite + Unpin> AsyncWrite for GuardedIo<'_, T> {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8])
-        -> Poll<io::Result<usize>>
-    {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         if let Err(error) = this.check() {
             return Poll::Ready(Err(error));

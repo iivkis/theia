@@ -74,7 +74,10 @@ pub(crate) struct StandaloneEvidence {
 #[cfg(windows)]
 impl StandaloneEvidence {
     pub(crate) fn new() -> Self {
-        Self { cache: Arc::new(strategy::Cache::default()), scheduler: Arc::new(ProbeScheduler::new(4)) }
+        Self {
+            cache: Arc::new(strategy::Cache::default()),
+            scheduler: Arc::new(ProbeScheduler::new(4)),
+        }
     }
 }
 
@@ -360,7 +363,12 @@ impl Engine {
 
     #[cfg(windows)]
     pub(crate) fn new_standalone(policy: Arc<PolicyState>, evidence: &StandaloneEvidence) -> Self {
-        Self { policy, standalone: true, cache: evidence.cache.clone(), scheduler: evidence.scheduler.clone() }
+        Self {
+            policy,
+            standalone: true,
+            cache: evidence.cache.clone(),
+            scheduler: evidence.scheduler.clone(),
+        }
     }
     pub(crate) fn set_enabled(&self, enabled: bool) {
         self.policy.set_enabled(enabled);
@@ -565,7 +573,12 @@ impl Engine {
 
     #[cfg(windows)]
     pub(crate) async fn open_standalone_udp(
-        self: &Arc<Self>, name: &str, port: u16, ips: &[IpAddr], pin: &PolicyLease, strategy: UdpStrategy,
+        self: &Arc<Self>,
+        name: &str,
+        port: u16,
+        ips: &[IpAddr],
+        pin: &PolicyLease,
+        strategy: UdpStrategy,
     ) -> Result<Option<VerifiedUdp>, ClientError> {
         if !self.standalone || !strategy.accepted_for_standalone() {
             return Ok(None);
@@ -903,8 +916,13 @@ impl Engine {
     ) -> Result<Option<Tunnel>, ClientError> {
         pin.check_owner(&self.policy)?;
         let policy = pin.digest();
-        if !self.enabled() || !matches!(port, 443 | 8443) || ips.is_empty()
-            || (self.standalone && !Strategy::ALL.into_iter().any(Strategy::accepted_for_standalone))
+        if !self.enabled()
+            || !matches!(port, 443 | 8443)
+            || ips.is_empty()
+            || (self.standalone
+                && !Strategy::ALL
+                    .into_iter()
+                    .any(Strategy::accepted_for_standalone))
         {
             return Ok(None);
         }
@@ -956,8 +974,13 @@ impl Engine {
                         };
                         let mut verified = None;
                         let mut attempted = 0;
-                        let mut order = self.cache.ranked(&key).into_iter()
-                            .filter(|strategy| !self.standalone || strategy.accepted_for_standalone())
+                        let mut order = self
+                            .cache
+                            .ranked(&key)
+                            .into_iter()
+                            .filter(|strategy| {
+                                !self.standalone || strategy.accepted_for_standalone()
+                            })
                             .collect::<Vec<_>>();
                         if let Some((
                             Verdict::Avoid {

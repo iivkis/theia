@@ -406,8 +406,7 @@ fn decode_batch_ack(bytes: &[u8], seen: &mut [bool], received: &mut usize) -> io
     let mut rest = bytes;
     while !rest.is_empty() {
         let header = rest.get(..16).ok_or_else(invalid)?;
-        let len =
-            u32::from_ne_bytes(header[..4].try_into().map_err(|_| invalid())?) as usize;
+        let len = u32::from_ne_bytes(header[..4].try_into().map_err(|_| invalid())?) as usize;
         if len < 16 || align4(len) > rest.len() {
             return Err(invalid());
         }
@@ -1967,7 +1966,6 @@ mod tests {
         assert!(Scope::current(&File::open("/proc/thread-self/ns/mnt").unwrap()).is_err());
     }
 
-
     #[test]
     fn nft_generation_table_and_batch_receipts_are_strict_and_bound_to_owner() {
         fn frame(kind: u16, sequence: u32, body: &[u8]) -> Vec<u8> {
@@ -2000,11 +1998,20 @@ mod tests {
         }
         let mut ack = [0; 20];
         ack[..4].copy_from_slice(&(-libc::EPERM).to_ne_bytes());
-        assert_eq!(decode_generation(&frame(2, 1, &ack)).unwrap_err().raw_os_error(), Some(libc::EPERM));
+        assert_eq!(
+            decode_generation(&frame(2, 1, &ack))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPERM)
+        );
 
         let mut owner = journal();
         for redirect in [false, true] {
-            owner.redirect = redirect.then_some(RedirectScope { port: 1080, loopback: 1, policy_queue: None });
+            owner.redirect = redirect.then_some(RedirectScope {
+                port: 1080,
+                loopback: 1,
+                policy_queue: None,
+            });
             let expected_count = if redirect { 5u32 } else { 1 };
             let make = |name: &str, nonce: &[u8], use_count: u32| {
                 let mut attrs = Vec::new();
@@ -2013,10 +2020,16 @@ mod tests {
                 attr(&mut attrs, 3, &use_count.to_be_bytes());
                 nft_message(NEW_TABLE, 0, 1, &attrs)
             };
-            assert!(decode_table(&make(&owner.name(), &owner.nonce, expected_count), &owner).unwrap());
+            assert!(
+                decode_table(&make(&owner.name(), &owner.nonce, expected_count), &owner).unwrap()
+            );
             assert!(decode_table(&make("foreign", &owner.nonce, expected_count), &owner).is_err());
             assert!(decode_table(&make(&owner.name(), &[9; 16], expected_count), &owner).is_err());
-            assert!(decode_table(&make(&owner.name(), &owner.nonce, expected_count+1), &owner).is_err());
+            assert!(decode_table(
+                &make(&owner.name(), &owner.nonce, expected_count + 1),
+                &owner
+            )
+            .is_err());
             let mut duplicate = Vec::new();
             name_attr(&mut duplicate, 1, &owner.name());
             name_attr(&mut duplicate, 1, &owner.name());
@@ -2025,7 +2038,12 @@ mod tests {
         ack[..4].copy_from_slice(&(-libc::ENOENT).to_ne_bytes());
         assert!(!decode_table(&frame(2, 1, &ack), &owner).unwrap());
         ack[..4].copy_from_slice(&(-libc::EPERM).to_ne_bytes());
-        assert_eq!(decode_table(&frame(2, 1, &ack), &owner).unwrap_err().raw_os_error(), Some(libc::EPERM));
+        assert_eq!(
+            decode_table(&frame(2, 1, &ack), &owner)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPERM)
+        );
 
         let a = frame(2, 2, &[0; 20]);
         let b = frame(2, 3, &[0; 20]);
@@ -2039,10 +2057,14 @@ mod tests {
         assert_eq!(received, 2);
         assert!(decode_batch_ack(&a, &mut seen, &mut received).is_err());
         for bad in [
-            a[..15].to_vec(), a[..a.len()-1].to_vec(),
-            frame(3, 2, &[0; 20]), frame(2, 1, &[0; 20]),
-            frame(2, 4, &[0; 20]), frame(2, 2, &[0; 19]),
-            frame(2, 2, &ack), [a.as_slice(), a.as_slice()].concat(),
+            a[..15].to_vec(),
+            a[..a.len() - 1].to_vec(),
+            frame(3, 2, &[0; 20]),
+            frame(2, 1, &[0; 20]),
+            frame(2, 4, &[0; 20]),
+            frame(2, 2, &[0; 19]),
+            frame(2, 2, &ack),
+            [a.as_slice(), a.as_slice()].concat(),
         ] {
             assert!(decode_batch_ack(&bad, &mut [false; 2], &mut 0).is_err());
         }

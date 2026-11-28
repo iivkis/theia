@@ -199,8 +199,7 @@ fn decode_dump(bytes: &[u8], kind: u16, family: u8, objects: &mut Vec<Object>) -
     let mut rest = bytes;
     while !rest.is_empty() {
         let header = rest.get(..16).ok_or_else(invalid)?;
-        let len =
-            u32::from_ne_bytes(header[..4].try_into().map_err(|_| invalid())?) as usize;
+        let len = u32::from_ne_bytes(header[..4].try_into().map_err(|_| invalid())?) as usize;
         if len < 16
             || align4(len) > rest.len()
             || u16::from_ne_bytes([header[6], header[7]]) & 0x10 != 0
@@ -363,7 +362,14 @@ impl PolicyRoutes {
         let owner = lock()?;
         let path = path_for(guard);
         check_parent(&path)?;
-        let intent = install_transaction(&path, scope, host_mode, snapshot, Rtnl::mutate, loopback_index)?;
+        let intent = install_transaction(
+            &path,
+            scope,
+            host_mode,
+            snapshot,
+            Rtnl::mutate,
+            loopback_index,
+        )?;
         let result = Self {
             intent,
             path,
@@ -665,7 +671,8 @@ mod tests {
         }
     }
     #[test]
-    fn multipart_route_dump_rejects_interrupted_truncated_foreign_sequence_and_invalid_completion() {
+    fn multipart_route_dump_rejects_interrupted_truncated_foreign_sequence_and_invalid_completion()
+    {
         fn frame(kind: u16, flags: u16, seq: u32, body: &[u8]) -> Vec<u8> {
             let mut frame = Vec::new();
             frame.extend_from_slice(&((16 + body.len()) as u32).to_ne_bytes());
@@ -697,7 +704,7 @@ mod tests {
                 assert_eq!(seen, vec![object.clone()]);
                 for malformed in [
                     second[..15].to_vec(),
-                    second[..second.len()-1].to_vec(),
+                    second[..second.len() - 1].to_vec(),
                     frame(new, 0x10, 1, &object.body),
                     frame(new, 2, 2, &object.body),
                     frame(255, 2, 1, &object.body),
@@ -733,7 +740,10 @@ mod tests {
 
     #[test]
     fn transaction_requires_exact_readback_and_recovers_only_confirmed_objects() {
-        use std::{cell::{Cell, RefCell}, os::unix::fs::DirBuilderExt};
+        use std::{
+            cell::{Cell, RefCell},
+            os::unix::fs::DirBuilderExt,
+        };
         let mut random = [0; 16];
         ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut random).unwrap();
         let name: String = random.iter().map(|n| format!("{n:02x}")).collect();
@@ -741,12 +751,16 @@ mod tests {
         std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
         struct Cleanup(PathBuf);
         impl Drop for Cleanup {
-            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
         }
         let _cleanup = Cleanup(dir.clone());
         let scope = Scope {
             boot: "00000000-0000-0000-0000-000000000001".into(),
-            dev: 1, ino: 2, machine: Some("a".repeat(32)),
+            dev: 1,
+            ino: 2,
+            machine: Some("a".repeat(32)),
         };
         // At every possible mutation boundary simulate an interrupted
         // acknowledgement, including an object created but not confirmed.
@@ -762,28 +776,51 @@ mod tests {
                     operations.set(n + 1);
                     if n == fail_at {
                         if uncertain {
-                            objects.borrow_mut().push(Object { kind, body: body.to_vec() });
+                            objects.borrow_mut().push(Object {
+                                kind,
+                                body: body.to_vec(),
+                            });
                         }
                         return Err(refused());
                     }
-                    objects.borrow_mut().push(Object { kind, body: body.to_vec() });
+                    objects.borrow_mut().push(Object {
+                        kind,
+                        body: body.to_vec(),
+                    });
                     Ok(())
                 };
-                let result = install_transaction(&path, scope.clone(), false, read, mutate, || Ok(1));
+                let result =
+                    install_transaction(&path, scope.clone(), false, read, mutate, || Ok(1));
                 let (intent, _) = read_intent(&path, &scope).unwrap().unwrap();
                 assert_eq!(intent.confirmed.len(), fail_at);
                 assert!(!intent.restored);
                 assert_eq!(result.is_ok(), fail_at == 4);
                 let deletes = Cell::new(0);
-                let recover = || recover_transaction(&path, scope.clone(), false, read, |kind: u16, body: &[u8], create: bool| {
-                    assert!(!create);
-                    let kind = if kind == DEL_RULE { NEW_RULE } else { assert_eq!(kind, DEL_ROUTE); NEW_ROUTE };
-                    let mut objects = objects.borrow_mut();
-                    let position = objects.iter().position(|o| o.kind == kind && o.body == body).unwrap();
-                    objects.remove(position);
-                    deletes.set(deletes.get() + 1);
-                    Ok(())
-                });
+                let recover = || {
+                    recover_transaction(
+                        &path,
+                        scope.clone(),
+                        false,
+                        read,
+                        |kind: u16, body: &[u8], create: bool| {
+                            assert!(!create);
+                            let kind = if kind == DEL_RULE {
+                                NEW_RULE
+                            } else {
+                                assert_eq!(kind, DEL_ROUTE);
+                                NEW_ROUTE
+                            };
+                            let mut objects = objects.borrow_mut();
+                            let position = objects
+                                .iter()
+                                .position(|o| o.kind == kind && o.body == body)
+                                .unwrap();
+                            objects.remove(position);
+                            deletes.set(deletes.get() + 1);
+                            Ok(())
+                        },
+                    )
+                };
                 if uncertain && fail_at < 4 {
                     assert!(recover().is_err());
                     assert_eq!(deletes.get(), 0);
@@ -801,21 +838,51 @@ mod tests {
         // A successful ACK alone is not enough: missing exact readback
         // must never become a confirmed object in the durable journal.
         let path = dir.join("missing-readback");
-        let result = install_transaction(&path, scope.clone(), false, || Ok(vec![]), |_, _, _| Ok(()), || Ok(1));
+        let result = install_transaction(
+            &path,
+            scope.clone(),
+            false,
+            || Ok(vec![]),
+            |_, _, _| Ok(()),
+            || Ok(1),
+        );
         assert!(result.is_err());
-        assert!(read_intent(&path, &scope).unwrap().unwrap().0.confirmed.is_empty());
+        assert!(read_intent(&path, &scope)
+            .unwrap()
+            .unwrap()
+            .0
+            .confirmed
+            .is_empty());
         // Recovery across a reboot must not delete any route on the new boot.
         let path = dir.join("reboot");
-        let old = Intent { version: 1, scope: scope.clone(), loopback: 1,
-            confirmed: vec![expected(NEW_ROUTE, FAMILIES[0], 1)], restored: false };
+        let old = Intent {
+            version: 1,
+            scope: scope.clone(),
+            loopback: 1,
+            confirmed: vec![expected(NEW_ROUTE, FAMILIES[0], 1)],
+            restored: false,
+        };
         let raw = write_intent(&path, &old, None).unwrap();
         let mut reboot = scope.clone();
         reboot.boot = "00000000-0000-0000-0000-000000000002".into();
-        assert!(recover_transaction(&path, reboot.clone(), true, || Ok(old.confirmed.clone()), |_,_,_| panic!("foreign object deletion")).is_err());
+        assert!(recover_transaction(
+            &path,
+            reboot.clone(),
+            true,
+            || Ok(old.confirmed.clone()),
+            |_, _, _| panic!("foreign object deletion")
+        )
+        .is_err());
         assert_eq!(journal_bytes(&path).unwrap().unwrap(), raw);
-        recover_transaction(&path, reboot.clone(), true, || Ok(vec![]), |_,_,_| panic!("old boot deletion")).unwrap();
+        recover_transaction(
+            &path,
+            reboot.clone(),
+            true,
+            || Ok(vec![]),
+            |_, _, _| panic!("old boot deletion"),
+        )
+        .unwrap();
         let new = read_intent(&path, &reboot).unwrap().unwrap().0;
         assert!(new.restored && new.confirmed.is_empty());
     }
-
 }

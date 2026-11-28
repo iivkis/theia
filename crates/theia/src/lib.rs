@@ -120,14 +120,37 @@ pub enum Role {
 pub enum Command {
     Help(Option<&'static str>),
     Version,
-    AntiDpiValidate { config: String },
-    AntiDpiTui { config: Option<String> },
-    AntiDpiStatus { config: String },
-    AntiDpiChange { config: String, instance: [u8; 32], revision: u64, policy: [u8; 32], candidate: Option<[u8; 32]> },
-    AntiDpiApply { config: String, confirm: Option<[u8; 32]>, enroll: bool },
-    AntiDpiConnect { config: String, confirm: Option<[u8; 32]> },
-    AntiDpiPreflight { config: String },
-    AntiDpiCatalog { overlay: Option<String> },
+    AntiDpiValidate {
+        config: String,
+    },
+    AntiDpiTui {
+        config: Option<String>,
+    },
+    AntiDpiStatus {
+        config: String,
+    },
+    AntiDpiChange {
+        config: String,
+        instance: [u8; 32],
+        revision: u64,
+        policy: [u8; 32],
+        candidate: Option<[u8; 32]>,
+    },
+    AntiDpiApply {
+        config: String,
+        confirm: Option<[u8; 32]>,
+        enroll: bool,
+    },
+    AntiDpiConnect {
+        config: String,
+        confirm: Option<[u8; 32]>,
+    },
+    AntiDpiPreflight {
+        config: String,
+    },
+    AntiDpiCatalog {
+        overlay: Option<String>,
+    },
     AntiDpiDiagnostic {
         config: String,
         overlay: Option<String>,
@@ -374,7 +397,11 @@ fn expected_revision(raw: &str) -> Result<u64, CliError> {
     raw.parse::<u64>().map_err(|_| CliError::InvalidArguments)
 }
 
-fn parse_anti_dpi_diagnostic(path: &str, mut args: &[&str], owned: bool) -> Result<Command, CliError> {
+fn parse_anti_dpi_diagnostic(
+    path: &str,
+    mut args: &[&str],
+    owned: bool,
+) -> Result<Command, CliError> {
     let overlay = if let ["--overlay", path, rest @ ..] = args {
         args = rest;
         Some(config_path(path)?)
@@ -388,7 +415,8 @@ fn parse_anti_dpi_diagnostic(path: &str, mut args: &[&str], owned: bool) -> Resu
         return Err(CliError::InvalidArguments);
     }
     let domains = selected.split(',').map(str::to_owned).collect::<Vec<_>>();
-    if domains.is_empty() || domains.len() > anti_dpi::catalog::MAX_JOB_DOMAINS
+    if domains.is_empty()
+        || domains.len() > anti_dpi::catalog::MAX_JOB_DOMAINS
         || domains.iter().any(|name| name.is_empty())
     {
         return Err(CliError::InvalidArguments);
@@ -396,15 +424,26 @@ fn parse_anti_dpi_diagnostic(path: &str, mut args: &[&str], owned: bool) -> Resu
     let (confirm, anonymous) = match rest {
         [] => (None, false),
         ["--confirm", digest] => (
-            Some(parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?), false,
+            Some(parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?),
+            false,
         ),
         ["--confirm", digest, "--anonymous"] => (
-            Some(parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?), true,
+            Some(parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?),
+            true,
         ),
         _ => return Err(CliError::InvalidArguments),
     };
-    if owned && overlay.is_some() { return Err(CliError::InvalidArguments); }
-    Ok(Command::AntiDpiDiagnostic { config: config_path(path)?, overlay, domains, confirm, anonymous, owned })
+    if owned && overlay.is_some() {
+        return Err(CliError::InvalidArguments);
+    }
+    Ok(Command::AntiDpiDiagnostic {
+        config: config_path(path)?,
+        overlay,
+        domains,
+        confirm,
+        anonymous,
+        owned,
+    })
 }
 
 /// Parse arguments excluding argv[0]; reject unknown and duplicate flags.
@@ -413,7 +452,9 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     #[cfg(not(feature = "native-ingress-lab"))]
     if matches!(args.as_slice(), ["client", "linux" | "windivert", ..]) {
-        return Err(CliError::NotImplemented("native ingress laboratory (excluded from MVP build)"));
+        return Err(CliError::NotImplemented(
+            "native ingress laboratory (excluded from MVP build)",
+        ));
     }
     match args.as_slice() {
         [] | ["tui"] => Ok(Command::Tui { role: None }),
@@ -424,14 +465,21 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
         ["client", "--help" | "-h"] => Ok(Command::Help(Some("client"))),
         ["config", "--help" | "-h"] => Ok(Command::Help(Some("config"))),
         ["anti-dpi", "--help" | "-h"] => Ok(Command::Help(Some("anti-dpi"))),
-        ["anti-dpi", "status", "--config", path] => Ok(Command::AntiDpiStatus { config: config_path(path)? }),
-        ["anti-dpi", mode @ ("live-apply" | "disconnect"), "--config", path,
-            "--instance", instance, "--revision", revision, "--policy", policy, rest @ ..] => {
-            if revision.is_empty() || revision.starts_with('0') || !revision.bytes().all(|b| b.is_ascii_digit()) {
+        ["anti-dpi", "status", "--config", path] => Ok(Command::AntiDpiStatus {
+            config: config_path(path)?,
+        }),
+        ["anti-dpi", mode @ ("live-apply" | "disconnect"), "--config", path, "--instance", instance, "--revision", revision, "--policy", policy, rest @ ..] =>
+        {
+            if revision.is_empty()
+                || revision.starts_with('0')
+                || !revision.bytes().all(|b| b.is_ascii_digit())
+            {
                 return Err(CliError::InvalidArguments);
             }
             let candidate = match (*mode, rest) {
-                ("live-apply", ["--confirm", digest]) => Some(parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?),
+                ("live-apply", ["--confirm", digest]) => {
+                    Some(parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?)
+                }
                 ("disconnect", []) => None,
                 _ => return Err(CliError::InvalidArguments),
             };
@@ -442,26 +490,37 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
                 policy: parse_restart_digest(policy).ok_or(CliError::InvalidArguments)?,
                 candidate,
             })
-        },
+        }
         ["anti-dpi", "tui"] => Ok(Command::AntiDpiTui { config: None }),
-        ["anti-dpi", "tui", "--config", path] => Ok(Command::AntiDpiTui { config: Some(config_path(path)?) }),
+        ["anti-dpi", "tui", "--config", path] => Ok(Command::AntiDpiTui {
+            config: Some(config_path(path)?),
+        }),
         ["anti-dpi", mode @ ("apply" | "enroll" | "connect"), "--config", path, rest @ ..] => {
             let config = config_path(path)?;
             let confirm = match rest {
                 [] => None,
-                ["--confirm", digest] => Some(parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?),
+                ["--confirm", digest] => {
+                    Some(parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?)
+                }
                 _ => return Err(CliError::InvalidArguments),
             };
             if *mode == "connect" {
                 Ok(Command::AntiDpiConnect { config, confirm })
             } else {
-                Ok(Command::AntiDpiApply { config, confirm, enroll: *mode == "enroll" })
+                Ok(Command::AntiDpiApply {
+                    config,
+                    confirm,
+                    enroll: *mode == "enroll",
+                })
             }
-        },
-        ["anti-dpi", mode @ ("diagnose" | "diagnose-owned"), "--config", path, rest @ ..] =>
-            parse_anti_dpi_diagnostic(path, rest, *mode == "diagnose-owned"),
+        }
+        ["anti-dpi", mode @ ("diagnose" | "diagnose-owned"), "--config", path, rest @ ..] => {
+            parse_anti_dpi_diagnostic(path, rest, *mode == "diagnose-owned")
+        }
         ["anti-dpi", "catalog"] => Ok(Command::AntiDpiCatalog { overlay: None }),
-        ["anti-dpi", "catalog", "--overlay", path] => Ok(Command::AntiDpiCatalog { overlay: Some(config_path(path)?) }),
+        ["anti-dpi", "catalog", "--overlay", path] => Ok(Command::AntiDpiCatalog {
+            overlay: Some(config_path(path)?),
+        }),
         ["anti-dpi", "validate", "--config", path] => Ok(Command::AntiDpiValidate {
             config: config_path(path)?,
         }),

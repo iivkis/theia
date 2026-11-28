@@ -370,16 +370,21 @@ pub(crate) async fn relay_standalone_verified(
     download: mpsc::Sender<Vec<u8>>,
     flow: &crate::routing::flow::FlowLease,
 ) -> Result<(), ClientError> {
-    use crate::routing::dpi::{udp::{prepare_binding, BindingStrategy}, UdpStrategy};
+    use crate::routing::dpi::{
+        udp::{prepare_binding, BindingStrategy},
+        UdpStrategy,
+    };
     flow.check_pending()?;
     verified.check_live()?;
     if !verified.admissible()? {
         return Err(ClientError::Open(ErrorCode::PolicyDenied));
     }
     let batch = verified.quic_batch(&first);
-    let stun = matches!(verified.strategy, UdpStrategy::StunBinding(BindingStrategy::Fingerprint))
-        && prepare_binding(&first, BindingStrategy::Fingerprint)
-            .is_some_and(|bytes| bytes.as_ref() != first.as_slice());
+    let stun = matches!(
+        verified.strategy,
+        UdpStrategy::StunBinding(BindingStrategy::Fingerprint)
+    ) && prepare_binding(&first, BindingStrategy::Fingerprint)
+        .is_some_and(|bytes| bytes.as_ref() != first.as_slice());
     if !stun && batch.is_none() {
         return Err(ClientError::Open(ErrorCode::PolicyDenied));
     }
@@ -428,8 +433,7 @@ async fn relay_verified_selected(
         result = verified.wait_revoked() => result.map_err(LocalRelayError::Application),
         result = relay => result,
     };
-    if matches!(&result, Err(LocalRelayError::Peer(_))) && verified.check_live().is_ok()
-    {
+    if matches!(&result, Err(LocalRelayError::Peer(_))) && verified.check_live().is_ok() {
         verified.failed();
         crate::traffic::udp_peer_failure();
     }

@@ -75,7 +75,10 @@ impl Worker {
     fn view(&self) -> View {
         let observed = native::observed_proxy();
         let known = observed.is_ok()
-            && !matches!(&observed, Ok(ObservedProxy::Journal(ProxyStatus::NoJournal)));
+            && !matches!(
+                &observed,
+                Ok(ObservedProxy::Journal(ProxyStatus::NoJournal))
+            );
         let applied = self
             .session
             .as_ref()
@@ -177,7 +180,10 @@ impl Worker {
                 .await
                 .map_err(|error| error.to_string())?;
                 self.session = Some(session);
-                Ok("Операция подключения завершена. Проверьте результат чтения настроек ниже.".into())
+                Ok(
+                    "Операция подключения завершена. Проверьте результат чтения настроек ниже."
+                        .into(),
+                )
             }
             Pending::Recover(review) => {
                 let result = native::recover_reviewed(review).map_err(|error| error.to_string())?;
@@ -475,7 +481,9 @@ impl Panel {
         let controls = match self.phase {
             Phase::Busy => "Выполняется операция…",
             Phase::Confirm => "Выберите подтверждение или отмену (y / n, Esc).",
-            Phase::Idle if self.view.owned => "Отключение попытается восстановить исходные параметры, если они не изменены извне.",
+            Phase::Idle if self.view.owned => {
+                "Отключение попытается восстановить исходные параметры, если они не изменены извне."
+            }
             Phase::Idle if self.view.recovery => {
                 "Сначала проверьте восстановление исходных параметров."
             }
@@ -687,8 +695,12 @@ pub(crate) mod tests {
 
         action(&mut panel, 'e');
         assert!(panel.view.running && panel.view.applied && panel.view.owned);
-        assert!(panel.body().contains("Настройки прокси применены по последней проверке"));
-        assert!(panel.body().contains("Прохождение запросов приложений: не проверено"));
+        assert!(panel
+            .body()
+            .contains("Настройки прокси применены по последней проверке"));
+        assert!(panel
+            .body()
+            .contains("Прохождение запросов приложений: не проверено"));
         assert_eq!(native::status().unwrap(), ProxyStatus::PendingOwned);
         assert!(TcpStream::connect_timeout(&http, Duration::from_secs(2)).is_ok());
         assert!(TcpStream::connect_timeout(&socks, Duration::from_secs(2)).is_ok());

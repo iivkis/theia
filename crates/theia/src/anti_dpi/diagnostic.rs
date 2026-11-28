@@ -1,6 +1,10 @@
 //! Standalone diagnostic plan, single-job reservation and typed report.
 //! No server session, production evidence, listener or OS proxy mutation.
-use super::{catalog::{Catalog, Overlay, VERSION}, dns::{self, DnsError}, invalid, Decision, Document, PreparedPolicy};
+use super::{
+    catalog::{Catalog, Overlay, VERSION},
+    dns::{self, DnsError},
+    invalid, Decision, Document, PreparedPolicy,
+};
 use crate::{
     config::{self, ConfigError},
     network_scope,
@@ -115,9 +119,12 @@ impl Column {
     fn unavailable(self) -> Option<Reason> {
         match self {
             Self::Tcp(None) => None,
-            Self::Tcp(Some(strategy)) => (!strategy.accepted_for_standalone())
-                .then_some(Reason::AwaitingAcceptance),
-            Self::Udp(strategy, _) if !strategy.accepted_for_standalone() => Some(Reason::AwaitingAcceptance),
+            Self::Tcp(Some(strategy)) => {
+                (!strategy.accepted_for_standalone()).then_some(Reason::AwaitingAcceptance)
+            }
+            Self::Udp(strategy, _) if !strategy.accepted_for_standalone() => {
+                Some(Reason::AwaitingAcceptance)
+            }
             // A plain hostname does not advertise an authenticated QUIC or
             // credential-free STUN endpoint. Never guess protocol/port.
             Self::Udp(_, _) => Some(Reason::MissingEndpointMetadata),
@@ -154,11 +161,18 @@ impl Column {
 fn columns() -> Vec<Column> {
     use crate::{quic_core::wire::Version, routing::dpi::udp::BindingStrategy};
     std::iter::once(Column::Tcp(None))
-        .chain(Strategy::ALL.into_iter().map(|strategy| Column::Tcp(Some(strategy))))
+        .chain(
+            Strategy::ALL
+                .into_iter()
+                .map(|strategy| Column::Tcp(Some(strategy))),
+        )
         .chain([
             Column::Udp(UdpStrategy::Quic(Version::V1), Protocol::QuicV1),
             Column::Udp(UdpStrategy::Quic(Version::V2), Protocol::QuicV2),
-            Column::Udp(UdpStrategy::StunBinding(BindingStrategy::Fingerprint), Protocol::Stun),
+            Column::Udp(
+                UdpStrategy::StunBinding(BindingStrategy::Fingerprint),
+                Protocol::Stun,
+            ),
         ])
         .collect()
 }
@@ -169,7 +183,10 @@ pub fn strategy_columns() -> Vec<&'static str> {
 }
 
 pub(crate) fn strategy_unavailable(id: &str) -> Option<Reason> {
-    columns().into_iter().find(|column| column.id() == id).and_then(Column::unavailable)
+    columns()
+        .into_iter()
+        .find(|column| column.id() == id)
+        .and_then(Column::unavailable)
 }
 
 #[derive(Debug)]
@@ -229,28 +246,43 @@ pub struct Plan {
 }
 
 impl Plan {
-    pub fn prepare(config_path: &Path, overlay_path: Option<&Path>, hosts: &[String])
-        -> Result<Self, ConfigError>
-    {
+    pub fn prepare(
+        config_path: &Path,
+        overlay_path: Option<&Path>,
+        hosts: &[String],
+    ) -> Result<Self, ConfigError> {
         let saved = Saved::read(&super::authority::canonical_config_path(config_path)?)?;
         let document = Document::parse(saved.text()?)?;
         let policy = document.prepare()?;
         if document.anti_dpi.resolver.is_none() {
-            return Err(invalid("diagnostic.resolver", "explicit DoH resolver required"));
+            return Err(invalid(
+                "diagnostic.resolver",
+                "explicit DoH resolver required",
+            ));
         }
         let overlay = overlay_path.map(Saved::read).transpose()?;
-        let choices = overlay.as_ref().map(|saved| Overlay::parse(saved.text()?))
-            .transpose()?.unwrap_or_default();
+        let choices = overlay
+            .as_ref()
+            .map(|saved| Overlay::parse(saved.text()?))
+            .transpose()?
+            .unwrap_or_default();
         let catalog = Catalog::build(&choices)?;
         let selected = if hosts.len() == 1 && hosts[0] == "all" {
-            catalog.entries().iter().filter(|entry| !entry.excluded)
-                .map(|entry| entry.hostname.clone()).collect::<Vec<_>>()
+            catalog
+                .entries()
+                .iter()
+                .filter(|entry| !entry.excluded)
+                .map(|entry| entry.hostname.clone())
+                .collect::<Vec<_>>()
         } else {
             hosts.to_vec()
         };
         let columns = columns();
-        let hosts = catalog.select(&selected, columns.len())?.into_iter()
-            .map(|entry| entry.hostname.clone()).collect::<Vec<_>>();
+        let hosts = catalog
+            .select(&selected, columns.len())?
+            .into_iter()
+            .map(|entry| entry.hostname.clone())
+            .collect::<Vec<_>>();
         let mut hash = Sha256::new();
         field(&mut hash, b"theia/standalone/diagnostic/v1");
         saved.hash(&mut hash);
@@ -263,15 +295,28 @@ impl Plan {
         field(&mut hash, VERSION.as_bytes());
         field(&mut hash, &Catalog::builtin_digest());
         field(&mut hash, &policy.digest());
-        field(&mut hash, b"https:443 HEAD / HTTP/1.1; doh:443 GET /dns-query");
+        field(
+            &mut hash,
+            b"https:443 HEAD / HTTP/1.1; doh:443 GET /dns-query",
+        );
         for host in &hosts {
             field(&mut hash, host.as_bytes());
         }
         for column in columns {
             field(&mut hash, column.id().as_bytes());
-            field(&mut hash, format!("{:?}:{:?}", column.protocol(), column.unavailable()).as_bytes());
+            field(
+                &mut hash,
+                format!("{:?}:{:?}", column.protocol(), column.unavailable()).as_bytes(),
+            );
         }
-        Ok(Self { saved, overlay, document, policy, hosts, digest: hash.finalize().into() })
+        Ok(Self {
+            saved,
+            overlay,
+            document,
+            policy,
+            hosts,
+            digest: hash.finalize().into(),
+        })
     }
 
     pub fn digest(&self) -> [u8; 32] {
@@ -295,15 +340,24 @@ impl Plan {
             let _ = writeln!(result, "  {host}");
         }
         if let Some(resolver) = &self.document.anti_dpi.resolver {
-            let _ = writeln!(result, "Resolver: https://{}/dns-query, bootstrap {}",
-                resolver.hostname, resolver.bootstrap[0]);
+            let _ = writeln!(
+                result,
+                "Resolver: https://{}/dns-query, bootstrap {}",
+                resolver.hostname, resolver.bootstrap[0]
+            );
         }
         let mut runnable = 0;
         for column in columns() {
             if column.unavailable().is_none() {
                 runnable += 1;
             }
-            let _ = writeln!(result, "{:?} {}: {:?}", column.protocol(), column.id(), column.unavailable());
+            let _ = writeln!(
+                result,
+                "{:?} {}: {:?}",
+                column.protocol(),
+                column.id(),
+                column.unavailable()
+            );
         }
         let _ = writeln!(result,
             "At most {} DNS/HTTPS attempts; 4 concurrent, 6 s per cell, 600 s per job.\nLocal public IP and selected names are disclosed to the resolver/targets. No VPS, no redirect following or OS proxy changes.\nConfirm exact plan with SHA256={}",
@@ -316,14 +370,30 @@ impl Plan {
     /// keeps its stable technical representation separately.
     pub(crate) fn ui_preview(&self, owned: bool) -> String {
         let mut result = String::new();
-        let runnable = columns().iter().filter(|column| column.unavailable().is_none()).count();
+        let runnable = columns()
+            .iter()
+            .filter(|column| column.unavailable().is_none())
+            .count();
         let _ = writeln!(result, "ПОДТВЕРЖДЕНИЕ ДИАГНОСТИКИ\nДо подтверждения сетевых запросов нет.\n\nЦелей: {} · Ячеек: {} · Ревизия: {}",
             self.hosts.len(), self.planned_cells(), self.policy.revision());
-        let _ = writeln!(result, "Не более {} DNS/HTTPS операций, {} параллельно; 6 с на ячейку, 10 мин на задание.",
-            self.hosts.len() * (dns::MAX_DNS_REQUESTS + runnable), if owned { 2 } else { 4 });
+        let _ = writeln!(
+            result,
+            "Не более {} DNS/HTTPS операций, {} параллельно; 6 с на ячейку, 10 мин на задание.",
+            self.hosts.len() * (dns::MAX_DNS_REQUESTS + runnable),
+            if owned { 2 } else { 4 }
+        );
         if let Some(resolver) = &self.document.anti_dpi.resolver {
-            let _ = writeln!(result, "DNS: HTTPS https://{}/dns-query · bootstrap {}", resolver.hostname,
-                resolver.bootstrap.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "));
+            let _ = writeln!(
+                result,
+                "DNS: HTTPS https://{}/dns-query · bootstrap {}",
+                resolver.hostname,
+                resolver
+                    .bootstrap
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
         let _ = writeln!(result, "\nВНИМАНИЕ: DNS-провайдер и проверяемые ресурсы получат ваш публичный IP.\nПроверка не меняет прокси, правила и разрешения рабочего трафика.\nНе следует перенаправлениям. Доступность не доказывает обход DPI.\n\nСтратегии:");
         for column in columns() {
@@ -346,16 +416,24 @@ impl Plan {
             let _ = writeln!(result, "  {name}: {state}");
         }
         let _ = writeln!(result, "\nТочные цели (HEAD /, HTTPS 443):");
-        for host in &self.hosts { let _ = writeln!(result, "  {host}"); }
-        let _ = writeln!(result, "\nКаталог: {VERSION}\nSHA256 плана: {}", hex(self.digest));
+        for host in &self.hosts {
+            let _ = writeln!(result, "  {host}");
+        }
+        let _ = writeln!(
+            result,
+            "\nКаталог: {VERSION}\nSHA256 плана: {}",
+            hex(self.digest)
+        );
         result
     }
 
     /// Requires explicit confirmation of this exact plan. No persistent
     /// consent or production strategy evidence is created.
-    pub async fn run(self, confirmation: [u8; 32], cancel: &AtomicBool)
-        -> Result<Report, ConfigError>
-    {
+    pub async fn run(
+        self,
+        confirmation: [u8; 32],
+        cancel: &AtomicBool,
+    ) -> Result<Report, ConfigError> {
         self.run_with_progress(confirmation, cancel, |_| {}).await
     }
 
@@ -368,14 +446,20 @@ impl Plan {
         mut progress: impl FnMut(&[CellResult]),
     ) -> Result<Report, ConfigError> {
         if self.digest != confirmation || !self.files_current() {
-            return Err(invalid("diagnostic", "confirmation or saved document changed; review again"));
+            return Err(invalid(
+                "diagnostic",
+                "confirmation or saved document changed; review again",
+            ));
         }
         // This is the existing per-user System Proxy owner reservation.
         // No apply() call: diagnostics must not change any OS settings.
         let _owner = reserve()?;
         let candidate = super::authority::Candidate::read(&self.saved.path)?;
         if candidate.digest() != self.policy.digest() || !self.files_current() {
-            return Err(invalid("diagnostic", "applied policy changed; review again"));
+            return Err(invalid(
+                "diagnostic",
+                "applied policy changed; review again",
+            ));
         }
         let active = candidate.activate()?;
         let epoch = network_scope::generation()
@@ -384,7 +468,16 @@ impl Plan {
         if roots.is_empty() {
             return Err(invalid("diagnostic", "native trust roots unavailable"));
         }
-        self.run_context(&active, epoch, &roots, cancel, &|| true, None, &mut progress).await
+        self.run_context(
+            &active,
+            epoch,
+            &roots,
+            cancel,
+            &|| true,
+            None,
+            &mut progress,
+        )
+        .await
     }
 
     /// The caller is the actual runtime that holds the Windows proxy owner.
@@ -401,13 +494,28 @@ impl Plan {
         permits: &crate::net::probe::PriorityBudget,
         mut progress: impl FnMut(&[CellResult]),
     ) -> Result<Report, ConfigError> {
-        if self.digest != confirmation || !self.files_current()
+        if self.digest != confirmation
+            || !self.files_current()
             || !active.matches_path(&self.saved.path)
             || active.policy().digest() != self.policy.digest()
-            || !active.live() || !ready() {
-            return Err(invalid("diagnostic.owner", "owned policy or connection changed; review again"));
+            || !active.live()
+            || !ready()
+        {
+            return Err(invalid(
+                "diagnostic.owner",
+                "owned policy or connection changed; review again",
+            ));
         }
-        self.run_context(active, epoch, roots, cancel, ready, Some(permits), &mut progress).await
+        self.run_context(
+            active,
+            epoch,
+            roots,
+            cancel,
+            ready,
+            Some(permits),
+            &mut progress,
+        )
+        .await
     }
 
     async fn run_context(
@@ -421,7 +529,12 @@ impl Plan {
         progress: &mut (impl FnMut(&[CellResult]) + ?Sized),
     ) -> Result<Report, ConfigError> {
         let state = State {
-            plan: &self, active, epoch, cancel, ready, permits,
+            plan: &self,
+            active,
+            epoch,
+            cancel,
+            ready,
+            permits,
             stale: AtomicBool::new(false),
             deadline: Instant::now() + JOB_BUDGET,
         };
@@ -450,20 +563,31 @@ impl Plan {
                 cell.stale = true;
             }
         }
-        Ok(Report { catalog_version: VERSION, catalog_digest: Catalog::builtin_digest(),
-            plan_digest: self.digest, cells })
+        Ok(Report {
+            catalog_version: VERSION,
+            catalog_digest: Catalog::builtin_digest(),
+            plan_digest: self.digest,
+            cells,
+        })
     }
 }
 
 #[cfg(windows)]
 fn reserve() -> Result<crate::windows_system_proxy::ReservedProxy, ConfigError> {
-    crate::windows_system_proxy::ReservedProxy::acquire()
-        .map_err(|_| invalid("diagnostic.owner", "proxy owner conflict or recovery required"))
+    crate::windows_system_proxy::ReservedProxy::acquire().map_err(|_| {
+        invalid(
+            "diagnostic.owner",
+            "proxy owner conflict or recovery required",
+        )
+    })
 }
 
 #[cfg(not(windows))]
 fn reserve() -> Result<(), ConfigError> {
-    Err(invalid("diagnostic", "live standalone System Proxy diagnostics require Windows"))
+    Err(invalid(
+        "diagnostic",
+        "live standalone System Proxy diagnostics require Windows",
+    ))
 }
 
 struct State<'a> {
@@ -482,7 +606,11 @@ impl State<'_> {
         if self.stale.load(Ordering::Acquire) {
             return false;
         }
-        if !(self.ready)() || network_scope::generation() != Some(self.epoch) || !self.plan.files_current() || !self.active.live() {
+        if !(self.ready)()
+            || network_scope::generation() != Some(self.epoch)
+            || !self.plan.files_current()
+            || !self.active.live()
+        {
             self.stale.store(true, Ordering::Release);
             return false;
         }
@@ -490,7 +618,8 @@ impl State<'_> {
     }
 
     fn live(&self) -> bool {
-        !self.cancel.load(Ordering::Acquire) && self.context_current()
+        !self.cancel.load(Ordering::Acquire)
+            && self.context_current()
             && Instant::now() < self.deadline
     }
 
@@ -528,7 +657,11 @@ fn dns_failed(cell: &mut CellResult, error: DnsError) {
 }
 
 fn apply_observation(cell: &mut CellResult, observation: Observation, modify: bool) {
-    cell.network = if observation.connected { Stage::Passed } else { Stage::Failed };
+    cell.network = if observation.connected {
+        Stage::Passed
+    } else {
+        Stage::Failed
+    };
     cell.tls = if observation.verified_tls {
         Stage::Passed
     } else if observation.connected {
@@ -552,7 +685,11 @@ fn apply_observation(cell: &mut CellResult, observation: Observation, modify: bo
             cell.reason = Reason::NoTransformation;
         }
         Err(error) => {
-            cell.application = if observation.verified_tls { Stage::Failed } else { Stage::NotRun };
+            cell.application = if observation.verified_tls {
+                Stage::Failed
+            } else {
+                Stage::NotRun
+            };
             (cell.status, cell.reason) = match error {
                 Failure::Timeout => (CellStatus::Unavailable, Reason::Timeout),
                 Failure::Denied => (CellStatus::PolicyDenied, Reason::ProtectiveDenial),
@@ -565,9 +702,11 @@ fn apply_observation(cell: &mut CellResult, observation: Observation, modify: bo
     }
 }
 
-async fn optional_row(state: &State<'_>, host: Option<&String>, roots: &rustls::RootCertStore)
-    -> Vec<CellResult>
-{
+async fn optional_row(
+    state: &State<'_>,
+    host: Option<&String>,
+    roots: &rustls::RootCertStore,
+) -> Vec<CellResult> {
     match host {
         Some(host) => row(state, host, roots).await,
         None => Vec::new(),
@@ -576,7 +715,10 @@ async fn optional_row(state: &State<'_>, host: Option<&String>, roots: &rustls::
 
 async fn row(state: &State<'_>, host: &str, roots: &rustls::RootCertStore) -> Vec<CellResult> {
     let columns = columns();
-    let mut cells = columns.iter().map(|column| column.cell(host)).collect::<Vec<_>>();
+    let mut cells = columns
+        .iter()
+        .map(|column| column.cell(host))
+        .collect::<Vec<_>>();
     let started = Instant::now();
     if let Some(reason) = state.stop_reason() {
         for (column, cell) in columns.iter().zip(&mut cells) {
@@ -599,12 +741,16 @@ async fn row(state: &State<'_>, host: &str, roots: &rustls::RootCertStore) -> Ve
             None => {
                 let reason = state.stop_reason().unwrap_or(Reason::Budget);
                 for (column, cell) in columns.iter().zip(&mut cells) {
-                    if column.unavailable().is_none() { stopped(cell, reason); }
+                    if column.unavailable().is_none() {
+                        stopped(cell, reason);
+                    }
                 }
                 return cells;
             }
         }
-    } else { None };
+    } else {
+        None
+    };
     let result = dns::resolve(
         state.active.document().anti_dpi.resolver.as_ref(),
         state.active.policy(),
@@ -612,7 +758,8 @@ async fn row(state: &State<'_>, host: &str, roots: &rustls::RootCertStore) -> Ve
         roots,
         &live,
         dns_deadline,
-    ).await;
+    )
+    .await;
     let dns_elapsed = started.elapsed();
     let pins = match result {
         Ok(pins) => pins,
@@ -645,7 +792,9 @@ async fn row(state: &State<'_>, host: &str, roots: &rustls::RootCertStore) -> Ve
         if column.unavailable().is_some() {
             continue;
         }
-        let Column::Tcp(strategy) = *column else { continue };
+        let Column::Tcp(strategy) = *column else {
+            continue;
+        };
         if let Some(reason) = state.stop_reason() {
             stopped(cell, reason);
             continue;
@@ -654,7 +803,8 @@ async fn row(state: &State<'_>, host: &str, roots: &rustls::RootCertStore) -> Ve
             stopped(cell, Reason::ProtectiveDenial);
             continue;
         }
-        if !pins.current() || (pins.single_use() && attempted)
+        if !pins.current()
+            || (pins.single_use() && attempted)
             || network_scope::observe(peer) != Some(scope)
         {
             stopped(cell, Reason::ContextChanged);
@@ -671,11 +821,18 @@ async fn row(state: &State<'_>, host: &str, roots: &rustls::RootCertStore) -> Ve
         cell.source = Some(scope.bind_address().ip());
         cell.policy_action = Some(pins.decision());
         let started = Instant::now();
-        let permitted = || state.live() && pins.current() && network_scope::observe(peer) == Some(scope);
+        let permitted =
+            || state.live() && pins.current() && network_scope::observe(peer) == Some(scope);
         let observation = tcp_probe::https(
-            host, peer, scope, strategy, roots, &permitted,
+            host,
+            peer,
+            scope,
+            strategy,
+            roots,
+            &permitted,
             (started + budget).min(state.deadline),
-        ).await;
+        )
+        .await;
         cell.duration_ms = (started.elapsed() + dns_elapsed).as_millis();
         apply_observation(cell, observation, strategy.is_some());
         if let Some(reason) = state.stop_reason() {
@@ -684,7 +841,10 @@ async fn row(state: &State<'_>, host: &str, roots: &rustls::RootCertStore) -> Ve
             }
             cell.stale |= reason == Reason::ContextChanged;
         }
-        protective = matches!(cell.status, CellStatus::SecurityError | CellStatus::PolicyDenied);
+        protective = matches!(
+            cell.status,
+            CellStatus::SecurityError | CellStatus::PolicyDenied
+        );
     }
     if (!pins.current() && !pins.single_use()) || network_scope::observe(peer) != Some(scope) {
         for cell in &mut cells {
@@ -724,13 +884,19 @@ impl Report {
     pub fn anonymous_summary(&self) -> String {
         let mut counts = std::collections::BTreeMap::new();
         for cell in &self.cells {
-            let key = format!("{:?}\t{}\t{:?}\t{:?}\tstale={}",
-                cell.protocol, cell.strategy_id, cell.status, cell.reason, cell.stale);
+            let key = format!(
+                "{:?}\t{}\t{:?}\t{:?}\tstale={}",
+                cell.protocol, cell.strategy_id, cell.status, cell.reason, cell.stale
+            );
             let entry = counts.entry(key).or_insert((0usize, 0u128));
             entry.0 += 1;
             entry.1 += cell.duration_ms;
         }
-        let mut result = format!("{} SHA256={}\n", self.catalog_version, hex(self.catalog_digest));
+        let mut result = format!(
+            "{} SHA256={}\n",
+            self.catalog_version,
+            hex(self.catalog_digest)
+        );
         for (key, (count, duration)) in counts {
             let _ = writeln!(result, "{key}\tcount={count}\ttotal_ms={duration}");
         }
@@ -746,19 +912,36 @@ mod tests {
     fn response_status_and_noop_modification_are_not_false_successes() {
         let column = Column::Tcp(None);
         for (code, status) in [
-            (200, CellStatus::Available), (302, CellStatus::Redirect),
-            (403, CellStatus::HttpError), (429, CellStatus::HttpError),
-            (451, CellStatus::HttpError), (503, CellStatus::HttpError),
+            (200, CellStatus::Available),
+            (302, CellStatus::Redirect),
+            (403, CellStatus::HttpError),
+            (429, CellStatus::HttpError),
+            (451, CellStatus::HttpError),
+            (503, CellStatus::HttpError),
         ] {
             let mut cell = column.cell("example.com");
-            apply_observation(&mut cell, Observation {
-                connected: true, verified_tls: true, transformed: false, result: Ok(code),
-            }, false);
+            apply_observation(
+                &mut cell,
+                Observation {
+                    connected: true,
+                    verified_tls: true,
+                    transformed: false,
+                    result: Ok(code),
+                },
+                false,
+            );
             assert_eq!(cell.status, status);
             assert_eq!(cell.http_status, Some(code));
-            apply_observation(&mut cell, Observation {
-                connected: true, verified_tls: true, transformed: false, result: Ok(code),
-            }, true);
+            apply_observation(
+                &mut cell,
+                Observation {
+                    connected: true,
+                    verified_tls: true,
+                    transformed: false,
+                    result: Ok(code),
+                },
+                true,
+            );
             assert_eq!(cell.status, CellStatus::NotChecked);
         }
     }
@@ -773,7 +956,10 @@ mod tests {
         assert!(!cell.stale);
         stopped(&mut cell, Reason::ContextChanged);
         assert!(cell.stale);
-        assert_eq!(columns[1].cell("example.com").status, CellStatus::Unsupported);
+        assert_eq!(
+            columns[1].cell("example.com").status,
+            CellStatus::Unsupported
+        );
     }
 
     #[test]
@@ -781,8 +967,12 @@ mod tests {
         let mut cell = Column::Tcp(None).cell("private.example.com");
         cell.endpoint = Some("1.1.1.1:443".parse().unwrap());
         cell.source = Some("10.2.3.4".parse().unwrap());
-        let report = Report { catalog_version: VERSION, catalog_digest: [1; 32],
-            plan_digest: [2; 32], cells: vec![cell] };
+        let report = Report {
+            catalog_version: VERSION,
+            catalog_digest: [1; 32],
+            plan_digest: [2; 32],
+            cells: vec![cell],
+        };
         let text = report.anonymous_summary();
         assert!(!text.contains("private.example.com"));
         assert!(!text.contains("1.1.1.1"));

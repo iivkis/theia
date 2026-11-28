@@ -22,7 +22,10 @@ pub mod linux_ingress;
 pub mod linux_rules;
 #[cfg(all(
     any(feature = "native-ingress-lab", test),
-    any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64"))
+    any(
+        target_os = "linux",
+        all(target_os = "windows", target_arch = "x86_64")
+    )
 ))]
 pub(crate) mod native_dns;
 #[cfg(all(any(feature = "native-ingress-lab", test), target_os = "linux"))]

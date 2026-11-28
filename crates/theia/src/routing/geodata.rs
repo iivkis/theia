@@ -102,7 +102,11 @@ impl Pair {
         Ok(Policy::compile(rules, &self.geosite, &self.geoip)?)
     }
     pub(crate) fn category_names(&self, site: bool) -> Result<Vec<String>, Error> {
-        Ok(super::category_catalog(if site { &self.geosite } else { &self.geoip })?)
+        Ok(super::category_catalog(if site {
+            &self.geosite
+        } else {
+            &self.geoip
+        })?)
     }
 }
 

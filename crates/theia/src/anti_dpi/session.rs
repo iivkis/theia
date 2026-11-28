@@ -1,12 +1,24 @@
 //! Bounded owner commands shared by the standalone TUI and protected IPC.
 //! Mutation is bound to the exact process instance and active policy revision.
-use super::{authority::Candidate, diagnostic::{CellResult, Plan, Report}};
+use super::{
+    authority::Candidate,
+    diagnostic::{CellResult, Plan, Report},
+};
 use crate::config::ConfigError;
-use std::sync::{Arc, atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering}, mpsc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
+    mpsc, Arc, Mutex,
+};
 use tokio::sync::mpsc as async_mpsc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Phase { Starting, Connected, Stopping, Stopped, Failed }
+pub(crate) enum Phase {
+    Starting,
+    Connected,
+    Stopping,
+    Stopped,
+    Failed,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Binding {
@@ -49,8 +61,17 @@ pub(crate) struct Job {
 
 pub(crate) enum Command {
     Diagnose(Job),
-    Apply { prior: Binding, candidate: Candidate, expected: [u8; 32], reply: mpsc::Sender<Result<(), String>> },
-    Disconnect { prior: Binding, reply: mpsc::Sender<Result<(), String>>, ack: tokio::sync::oneshot::Receiver<()> },
+    Apply {
+        prior: Binding,
+        candidate: Candidate,
+        expected: [u8; 32],
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    Disconnect {
+        prior: Binding,
+        reply: mpsc::Sender<Result<(), String>>,
+        ack: tokio::sync::oneshot::Receiver<()>,
+    },
 }
 
 pub(crate) struct Control {
@@ -71,29 +92,48 @@ impl Control {
     pub(crate) fn channel() -> Result<(Arc<Self>, async_mpsc::Receiver<Command>), ConfigError> {
         use ring::rand::SecureRandom as _;
         let mut instance = [0; 32];
-        ring::rand::SystemRandom::new().fill(&mut instance)
+        ring::rand::SystemRandom::new()
+            .fill(&mut instance)
             .map_err(|_| super::invalid("anti_dpi.owner", "cannot create instance nonce"))?;
         let (commands, receiver) = async_mpsc::channel(1);
-        Ok((Arc::new(Self {
-            phase: AtomicU8::new(0), stop: AtomicBool::new(false), commands,
-            instance, publication: Mutex::new(Publication::default()),
-            accepted: AtomicU64::new(0), active: AtomicU64::new(0),
-            errors: AtomicU64::new(0), uploaded: AtomicU64::new(0), downloaded: AtomicU64::new(0),
-            modify_meter: Arc::new(crate::traffic::Counters::new()),
-        }), receiver))
+        Ok((
+            Arc::new(Self {
+                phase: AtomicU8::new(0),
+                stop: AtomicBool::new(false),
+                commands,
+                instance,
+                publication: Mutex::new(Publication::default()),
+                accepted: AtomicU64::new(0),
+                active: AtomicU64::new(0),
+                errors: AtomicU64::new(0),
+                uploaded: AtomicU64::new(0),
+                downloaded: AtomicU64::new(0),
+                modify_meter: Arc::new(crate::traffic::Counters::new()),
+            }),
+            receiver,
+        ))
     }
 
     pub(crate) fn set_phase(&self, phase: Phase) {
-        self.phase.store(match phase {
-            Phase::Starting => 0, Phase::Connected => 1, Phase::Stopping => 2,
-            Phase::Stopped => 3, Phase::Failed => 4,
-        }, Ordering::Release);
+        self.phase.store(
+            match phase {
+                Phase::Starting => 0,
+                Phase::Connected => 1,
+                Phase::Stopping => 2,
+                Phase::Stopped => 3,
+                Phase::Failed => 4,
+            },
+            Ordering::Release,
+        );
     }
 
     pub(crate) fn phase(&self) -> Phase {
         match self.phase.load(Ordering::Acquire) {
-            0 => Phase::Starting, 1 => Phase::Connected, 2 => Phase::Stopping,
-            3 => Phase::Stopped, _ => Phase::Failed,
+            0 => Phase::Starting,
+            1 => Phase::Connected,
+            2 => Phase::Stopping,
+            3 => Phase::Stopped,
+            _ => Phase::Failed,
         }
     }
 
@@ -106,33 +146,65 @@ impl Control {
     }
 
     pub(crate) fn status(&self) -> Status {
-        let publication = self.publication.lock().map(|state| *state).unwrap_or_default();
+        let publication = self
+            .publication
+            .lock()
+            .map(|state| *state)
+            .unwrap_or_default();
         let modify = self.modify_meter.snapshot();
         Status {
-            phase: self.phase(), revision: publication.revision,
-            binding: Binding { instance: self.instance, revision: publication.revision, digest: publication.digest },
+            phase: self.phase(),
+            revision: publication.revision,
+            binding: Binding {
+                instance: self.instance,
+                revision: publication.revision,
+                digest: publication.digest,
+            },
             admitting: self.ready() && publication.admitting,
             accepted: self.accepted.load(Ordering::Relaxed),
-            active: self.active.load(Ordering::Relaxed), errors: self.errors.load(Ordering::Relaxed),
-            uploaded: self.uploaded.load(Ordering::Relaxed).saturating_add(modify.upload),
-            downloaded: self.downloaded.load(Ordering::Relaxed).saturating_add(modify.download),
+            active: self.active.load(Ordering::Relaxed),
+            errors: self.errors.load(Ordering::Relaxed),
+            uploaded: self
+                .uploaded
+                .load(Ordering::Relaxed)
+                .saturating_add(modify.upload),
+            downloaded: self
+                .downloaded
+                .load(Ordering::Relaxed)
+                .saturating_add(modify.download),
         }
     }
 
-    pub(crate) fn diagnose(&self, plan: Plan, cancel: Arc<AtomicBool>,
-        updates: mpsc::Sender<DiagnosticUpdate>) -> Result<(), ConfigError>
-    {
+    pub(crate) fn diagnose(
+        &self,
+        plan: Plan,
+        cancel: Arc<AtomicBool>,
+        updates: mpsc::Sender<DiagnosticUpdate>,
+    ) -> Result<(), ConfigError> {
         if !self.ready() {
-            return Err(super::invalid("diagnostic.owner", "owned proxy is not connected"));
+            return Err(super::invalid(
+                "diagnostic.owner",
+                "owned proxy is not connected",
+            ));
         }
         let confirmation = plan.digest();
-        self.commands.try_send(Command::Diagnose(Job { plan, confirmation, cancel, updates }))
+        self.commands
+            .try_send(Command::Diagnose(Job {
+                plan,
+                confirmation,
+                cancel,
+                updates,
+            }))
             .map_err(|_| super::invalid("diagnostic.owner", "owner command queue busy or closed"))
     }
 
     pub(crate) fn publication(&self, revision: u64, digest: [u8; 32], admitting: bool) {
         if let Ok(mut state) = self.publication.lock() {
-            *state = Publication { revision, digest, admitting };
+            *state = Publication {
+                revision,
+                digest,
+                admitting,
+            };
         }
     }
 
@@ -140,28 +212,57 @@ impl Control {
         self.ready() && binding.revision != 0 && self.status().binding == binding
     }
 
-    pub(crate) fn apply(&self, candidate: Candidate) -> Result<mpsc::Receiver<Result<(), String>>, ConfigError> {
+    pub(crate) fn apply(
+        &self,
+        candidate: Candidate,
+    ) -> Result<mpsc::Receiver<Result<(), String>>, ConfigError> {
         self.apply_bound(self.status().binding, candidate)
     }
 
-    pub(crate) fn apply_bound(&self, prior: Binding, candidate: Candidate) -> Result<mpsc::Receiver<Result<(), String>>, ConfigError> {
+    pub(crate) fn apply_bound(
+        &self,
+        prior: Binding,
+        candidate: Candidate,
+    ) -> Result<mpsc::Receiver<Result<(), String>>, ConfigError> {
         if !self.matches(prior) {
-            return Err(super::invalid("anti_dpi.owner", "stale instance or policy binding"));
+            return Err(super::invalid(
+                "anti_dpi.owner",
+                "stale instance or policy binding",
+            ));
         }
         let expected = candidate.digest();
         let (reply, receiver) = mpsc::channel();
-        self.commands.try_send(Command::Apply { prior, candidate, expected, reply })
+        self.commands
+            .try_send(Command::Apply {
+                prior,
+                candidate,
+                expected,
+                reply,
+            })
             .map_err(|_| super::invalid("anti_dpi.owner", "owner command queue busy or closed"))?;
         Ok(receiver)
     }
 
-    pub(crate) fn disconnect_bound(&self, prior: Binding) -> Result<(mpsc::Receiver<Result<(), String>>, tokio::sync::oneshot::Sender<()>), ConfigError> {
+    pub(crate) fn disconnect_bound(
+        &self,
+        prior: Binding,
+    ) -> Result<
+        (
+            mpsc::Receiver<Result<(), String>>,
+            tokio::sync::oneshot::Sender<()>,
+        ),
+        ConfigError,
+    > {
         if !self.matches(prior) {
-            return Err(super::invalid("anti_dpi.owner", "stale instance or policy binding"));
+            return Err(super::invalid(
+                "anti_dpi.owner",
+                "stale instance or policy binding",
+            ));
         }
         let (reply, receiver) = mpsc::channel();
         let (ack_send, ack) = tokio::sync::oneshot::channel();
-        self.commands.try_send(Command::Disconnect { prior, reply, ack })
+        self.commands
+            .try_send(Command::Disconnect { prior, reply, ack })
             .map_err(|_| super::invalid("anti_dpi.owner", "owner command queue busy or closed"))?;
         Ok((receiver, ack_send))
     }
@@ -175,10 +276,14 @@ impl Control {
 
 pub(crate) struct Connection<'a>(&'a Control);
 impl Connection<'_> {
-    pub(crate) fn failure(&self) { self.0.errors.fetch_add(1, Ordering::Relaxed); }
+    pub(crate) fn failure(&self) {
+        self.0.errors.fetch_add(1, Ordering::Relaxed);
+    }
 }
 impl Drop for Connection<'_> {
-    fn drop(&mut self) { self.0.active.fetch_sub(1, Ordering::Relaxed); }
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]

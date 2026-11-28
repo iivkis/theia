@@ -2,7 +2,11 @@
 //! DNS is authenticated by TLS hostname/CA, not a claim of DNSSEC validation.
 use super::{canonical_host, canonical_ip, Decision, PreparedPolicy, Resolver};
 use crate::{
-    net::{address::allowed_destination, guarded_io::{revoked, GuardedIo}, tls},
+    net::{
+        address::allowed_destination,
+        guarded_io::{revoked, GuardedIo},
+        tls,
+    },
     network_scope,
     routing::carrier_socket,
 };
@@ -126,14 +130,19 @@ fn name(message: &[u8], pos: &mut usize) -> Result<String, DnsError> {
         let label = take(message, &mut cursor, usize::from(length))?;
         expanded += label.len() + 1;
         if expanded > 255
-            || !label.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+            || !label
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
             || label.first() == Some(&b'-')
             || label.last() == Some(&b'-')
         {
             return Err(DnsError::Malformed);
         }
-        labels.push(std::str::from_utf8(label)
-            .map_err(|_| DnsError::Malformed)?.to_ascii_lowercase());
+        labels.push(
+            std::str::from_utf8(label)
+                .map_err(|_| DnsError::Malformed)?
+                .to_ascii_lowercase(),
+        );
     }
 }
 
@@ -197,7 +206,8 @@ fn parse(message: &[u8], expected: &str, kind: Kind) -> Result<Answer, DnsError>
             5 => {
                 let mut at = begin;
                 let target = name(message, &mut at)?;
-                if at != pos || !canonical_host(&target)
+                if at != pos
+                    || !canonical_host(&target)
                     || aliases.insert(owner, (target, ttl)).is_some()
                 {
                     return Err(DnsError::Malformed);
@@ -208,7 +218,9 @@ fn parse(message: &[u8], expected: &str, kind: Kind) -> Result<Answer, DnsError>
                     return Err(DnsError::Malformed);
                 }
                 let ip = match rr {
-                    1 if data.len() == 4 => IpAddr::V4(Ipv4Addr::new(data[0], data[1], data[2], data[3])),
+                    1 if data.len() == 4 => {
+                        IpAddr::V4(Ipv4Addr::new(data[0], data[1], data[2], data[3]))
+                    }
                     28 if data.len() == 16 => {
                         let octets: [u8; 16] = data.try_into().map_err(|_| DnsError::Malformed)?;
                         IpAddr::V6(Ipv6Addr::from(octets))
@@ -243,9 +255,7 @@ fn parse(message: &[u8], expected: &str, kind: Kind) -> Result<Answer, DnsError>
     let mut seen = BTreeSet::new();
     let mut ttl = MAX_TTL;
     while let Some((next, lifetime)) = aliases.remove(&current) {
-        if addresses.contains_key(&current) || !seen.insert(current)
-            || chain.len() >= MAX_CNAME
-        {
+        if addresses.contains_key(&current) || !seen.insert(current) || chain.len() >= MAX_CNAME {
             return Err(DnsError::Malformed);
         }
         ttl = ttl.min(lifetime);
@@ -266,7 +276,11 @@ fn parse(message: &[u8], expected: &str, kind: Kind) -> Result<Answer, DnsError>
         ttl = ttl.min(lifetime);
         ips.insert(ip);
     }
-    Ok(Answer { addresses: ips.into_iter().collect(), aliases: chain, ttl })
+    Ok(Answer {
+        addresses: ips.into_iter().collect(),
+        aliases: chain,
+        ttl,
+    })
 }
 
 /// An immutable resolution for the current operation only, never a global
@@ -280,9 +294,15 @@ pub(crate) struct Pins {
 }
 
 impl Pins {
-    pub(crate) fn addresses(&self) -> &[IpAddr] { &self.addresses }
-    pub(crate) fn decision(&self) -> Decision { self.decision }
-    pub(crate) fn single_use(&self) -> bool { self.single_use }
+    pub(crate) fn addresses(&self) -> &[IpAddr] {
+        &self.addresses
+    }
+    pub(crate) fn decision(&self) -> Decision {
+        self.decision
+    }
+    pub(crate) fn single_use(&self) -> bool {
+        self.single_use
+    }
     pub(crate) fn current(&self) -> bool {
         Instant::now() < self.expires
     }
@@ -327,12 +347,22 @@ fn combine(
             at + Duration::from_secs(u64::from(ttl))
         }
     };
-    let expires = expiry(a.ttl, a_at).min(expiry(aaaa.ttl, aaaa_at))
-        .min(if single_use { deadline } else { Instant::now() + Duration::from_secs(60) });
+    let expires = expiry(a.ttl, a_at)
+        .min(expiry(aaaa.ttl, aaaa_at))
+        .min(if single_use {
+            deadline
+        } else {
+            Instant::now() + Duration::from_secs(60)
+        });
     if Instant::now() >= expires {
         return Err(DnsError::Expired);
     }
-    Ok(Pins { addresses, expires, single_use, decision })
+    Ok(Pins {
+        addresses,
+        expires,
+        single_use,
+        decision,
+    })
 }
 
 async fn exchange(
@@ -351,46 +381,68 @@ async fn exchange(
         if !scoped() {
             return Err(DnsError::PolicyDenied);
         }
-        let socket = carrier_socket::connect_plain_tcp(peer).await.map_err(|_| DnsError::Transport)?;
-        if !socket.local_addr().is_ok_and(|local| scope.matches_local(local)) || !scoped() {
+        let socket = carrier_socket::connect_plain_tcp(peer)
+            .await
+            .map_err(|_| DnsError::Transport)?;
+        if !socket
+            .local_addr()
+            .is_ok_and(|local| scope.matches_local(local))
+            || !scoped()
+        {
             return Err(DnsError::PolicyDenied);
         }
         let server = rustls::pki_types::ServerName::try_from(resolver.hostname.clone())
             .map_err(|_| DnsError::Tls)?;
         let guarded = GuardedIo::new(socket, &scoped);
         let stream = tokio_rustls::TlsConnector::from(config)
-            .connect(server, guarded).await.map_err(|_| DnsError::Tls)?;
+            .connect(server, guarded)
+            .await
+            .map_err(|_| DnsError::Tls)?;
         if stream.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
             return Err(DnsError::Tls);
         }
         let (sender, connection) = h2::client::Builder::new()
             .max_header_list_size(8 * 1024)
-            .handshake::<_, bytes::Bytes>(stream).await.map_err(|_| DnsError::Transport)?;
+            .handshake::<_, bytes::Bytes>(stream)
+            .await
+            .map_err(|_| DnsError::Transport)?;
         // Drive the HTTP/2 connection in the same future: no detached task,
         // retries, redirects, cookies or mutable system resolver dependency.
         let response = async {
             let mut sender = sender.ready().await.map_err(|_| DnsError::Transport)?;
-            let uri = format!("https://{}/dns-query?dns={}", resolver.hostname,
-                URL_SAFE_NO_PAD.encode(request_bytes));
+            let uri = format!(
+                "https://{}/dns-query?dns={}",
+                resolver.hostname,
+                URL_SAFE_NO_PAD.encode(request_bytes)
+            );
             let request = http::Request::get(uri)
                 .header(http::header::ACCEPT, "application/dns-message")
                 .header(http::header::ACCEPT_ENCODING, "identity")
                 .header(http::header::CACHE_CONTROL, "no-cache, no-store")
-                .body(()).map_err(|_| DnsError::Malformed)?;
+                .body(())
+                .map_err(|_| DnsError::Malformed)?;
             if !scoped() {
                 return Err(DnsError::Cancelled);
             }
-            let (response, _) = sender.send_request(request, true)
+            let (response, _) = sender
+                .send_request(request, true)
                 .map_err(|_| DnsError::Transport)?;
             let response = response.await.map_err(|_| DnsError::Transport)?;
             let headers = response.headers();
             if response.status() != http::StatusCode::OK
                 || headers.get_all(http::header::CONTENT_TYPE).iter().count() != 1
-                || !headers.get(http::header::CONTENT_TYPE)
-                    .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"application/dns-message"))
+                || !headers.get(http::header::CONTENT_TYPE).is_some_and(|v| {
+                    v.as_bytes()
+                        .eq_ignore_ascii_case(b"application/dns-message")
+                })
                 || headers.get_all(http::header::CONTENT_LENGTH).iter().count() > 1
-                || headers.get_all(http::header::CONTENT_ENCODING).iter().count() > 1
-                || headers.get(http::header::CONTENT_ENCODING)
+                || headers
+                    .get_all(http::header::CONTENT_ENCODING)
+                    .iter()
+                    .count()
+                    > 1
+                || headers
+                    .get(http::header::CONTENT_ENCODING)
                     .is_some_and(|v| v.as_bytes() != b"identity")
             {
                 return Err(DnsError::Http);
@@ -398,12 +450,25 @@ async fn exchange(
             if headers.get_all(http::header::AGE).iter().count() > 1 {
                 return Err(DnsError::Http);
             }
-            let age = headers.get(http::header::AGE)
-                .map(|v| v.to_str().ok().and_then(|s| s.parse::<u32>().ok())
-                    .ok_or(DnsError::Http)).transpose()?.unwrap_or(0);
-            let length = headers.get(http::header::CONTENT_LENGTH)
-                .map(|v| v.to_str().ok().and_then(|s| s.parse::<usize>().ok())
-                    .ok_or(DnsError::Http)).transpose()?;
+            let age = headers
+                .get(http::header::AGE)
+                .map(|v| {
+                    v.to_str()
+                        .ok()
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .ok_or(DnsError::Http)
+                })
+                .transpose()?
+                .unwrap_or(0);
+            let length = headers
+                .get(http::header::CONTENT_LENGTH)
+                .map(|v| {
+                    v.to_str()
+                        .ok()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .ok_or(DnsError::Http)
+                })
+                .transpose()?;
             if length.is_some_and(|n| n > MAX_MESSAGE) {
                 return Err(DnsError::Limit);
             }
@@ -418,10 +483,17 @@ async fn exchange(
                     return Err(DnsError::Limit);
                 }
                 bytes.extend_from_slice(&chunk);
-                body.flow_control().release_capacity(chunk.len()).map_err(|_| DnsError::Transport)?;
+                body.flow_control()
+                    .release_capacity(chunk.len())
+                    .map_err(|_| DnsError::Transport)?;
             }
-            if length.is_some_and(|n| n != bytes.len()) || body.trailers().await
-                .map_err(|_| DnsError::Transport)?.is_some() {
+            if length.is_some_and(|n| n != bytes.len())
+                || body
+                    .trailers()
+                    .await
+                    .map_err(|_| DnsError::Transport)?
+                    .is_some()
+            {
                 return Err(DnsError::Http);
             }
             Ok((bytes, age))
@@ -470,9 +542,11 @@ impl Chain {
         }
     }
 
-    fn extend(&mut self, answer: Answer, policy: &PreparedPolicy)
-        -> Result<Option<Answer>, DnsError>
-    {
+    fn extend(
+        &mut self,
+        answer: Answer,
+        policy: &PreparedPolicy,
+    ) -> Result<Option<Answer>, DnsError> {
         self.ttl = self.ttl.min(answer.ttl);
         let had_alias = !answer.aliases.is_empty();
         for alias in answer.aliases {
@@ -511,7 +585,14 @@ async fn lookup_family(
         if !live() {
             return Err(DnsError::Cancelled);
         }
-        let (raw, age) = exchange(resolver, peer, query(&chain.target, kind)?, config.clone(), live).await?;
+        let (raw, age) = exchange(
+            resolver,
+            peer,
+            query(&chain.target, kind)?,
+            config.clone(),
+            live,
+        )
+        .await?;
         let answer = aged(parse(&raw, &chain.target, kind)?, age)?;
         if let Some(result) = chain.extend(answer, policy)? {
             // Use earliest query start and minimum TTL, conservatively
@@ -540,8 +621,10 @@ pub(crate) async fn resolve(
     }
     let resolver = resolver.ok_or(DnsError::NotConfigured)?;
     resolver.validate().map_err(|_| DnsError::PolicyDenied)?;
-    if !matches!(policy.classify_resolved(&resolver.hostname, &resolver.bootstrap),
-        Decision::Pass | Decision::Modify) {
+    if !matches!(
+        policy.classify_resolved(&resolver.hostname, &resolver.bootstrap),
+        Decision::Pass | Decision::Modify
+    ) {
         return Err(DnsError::PolicyDenied);
     }
     // Explicit deterministic bootstrap, no implicit fallback or second dial.
@@ -550,13 +633,24 @@ pub(crate) async fn resolve(
     tls::configure_client(&mut config, b"h2");
     let config = Arc::new(config);
     let result = tokio::time::timeout_at(deadline, async {
-        let a = lookup_family(resolver, peer, policy, target, Kind::A, config.clone(), live).await?;
+        let a = lookup_family(
+            resolver,
+            peer,
+            policy,
+            target,
+            Kind::A,
+            config.clone(),
+            live,
+        )
+        .await?;
         let aaaa = lookup_family(resolver, peer, policy, target, Kind::Aaaa, config, live).await?;
         if !live() {
             return Err(DnsError::Cancelled);
         }
         combine(policy, target, a, aaaa, deadline)
-    }).await.map_err(|_| DnsError::Timeout)?;
+    })
+    .await
+    .map_err(|_| DnsError::Timeout)?;
     result
 }
 
@@ -587,16 +681,28 @@ mod tests {
         let result = parse(&bytes, "example.com", Kind::A).unwrap();
         assert_eq!(result.ttl, 60);
         assert_eq!(result.addresses, vec!["1.1.1.1".parse::<IpAddr>().unwrap()]);
-        assert_eq!(parse(&bytes, "other.com", Kind::A), Err(DnsError::Malformed));
-        assert_eq!(parse(&bytes, "example.com", Kind::Aaaa), Err(DnsError::Malformed));
+        assert_eq!(
+            parse(&bytes, "other.com", Kind::A),
+            Err(DnsError::Malformed)
+        );
+        assert_eq!(
+            parse(&bytes, "example.com", Kind::Aaaa),
+            Err(DnsError::Malformed)
+        );
         for n in 0..bytes.len() {
             assert!(parse(&bytes[..n], "example.com", Kind::A).is_err());
         }
         let mut truncated = bytes.clone();
         truncated[2] |= 2;
-        assert_eq!(parse(&truncated, "example.com", Kind::A), Err(DnsError::Malformed));
+        assert_eq!(
+            parse(&truncated, "example.com", Kind::A),
+            Err(DnsError::Malformed)
+        );
         bytes.push(0);
-        assert_eq!(parse(&bytes, "example.com", Kind::A), Err(DnsError::Malformed));
+        assert_eq!(
+            parse(&bytes, "example.com", Kind::A),
+            Err(DnsError::Malformed)
+        );
     }
 
     #[test]
@@ -611,41 +717,80 @@ mod tests {
         let mut denied = response("example.com", Kind::A, 2);
         rr(&mut denied, &[0xc0, 12], 1, 60, &[8, 8, 8, 8]);
         rr(&mut denied, &[0xc0, 12], 1, 60, &[127, 0, 0, 1]);
-        assert_eq!(parse(&denied, "example.com", Kind::A), Err(DnsError::PolicyDenied));
+        assert_eq!(
+            parse(&denied, "example.com", Kind::A),
+            Err(DnsError::PolicyDenied)
+        );
     }
 
     #[test]
     fn nxdomain_and_empty_answer_are_distinct() {
         let mut bytes = response("example.com", Kind::A, 0);
-        assert!(parse(&bytes, "example.com", Kind::A).unwrap().addresses.is_empty());
+        assert!(parse(&bytes, "example.com", Kind::A)
+            .unwrap()
+            .addresses
+            .is_empty());
         bytes[3] |= 3;
-        assert_eq!(parse(&bytes, "example.com", Kind::A), Err(DnsError::NxDomain));
+        assert_eq!(
+            parse(&bytes, "example.com", Kind::A),
+            Err(DnsError::NxDomain)
+        );
         bytes[3] &= !15;
         bytes[3] |= 2;
-        assert_eq!(parse(&bytes, "example.com", Kind::A), Err(DnsError::ResolverFailure));
+        assert_eq!(
+            parse(&bytes, "example.com", Kind::A),
+            Err(DnsError::ResolverFailure)
+        );
     }
 
     #[test]
     fn cross_response_alias_chain_is_bounded_and_cycle_safe() {
-        let doc = super::super::Document::parse(include_str!("../../../../examples/anti-dpi.toml")).unwrap();
+        let doc = super::super::Document::parse(include_str!("../../../../examples/anti-dpi.toml"))
+            .unwrap();
         let policy = doc.prepare().unwrap();
         let mut chain = Chain::new("example.com");
-        let alias = |host: String| Answer { addresses: Vec::new(), aliases: vec![host], ttl: 30 };
-        assert!(chain.extend(alias("alias.example.com".into()), &policy).unwrap().is_none());
+        let alias = |host: String| Answer {
+            addresses: Vec::new(),
+            aliases: vec![host],
+            ttl: 30,
+        };
+        assert!(chain
+            .extend(alias("alias.example.com".into()), &policy)
+            .unwrap()
+            .is_none());
         assert_eq!(chain.target, "alias.example.com");
-        assert_eq!(chain.extend(alias("example.com".into()), &policy), Err(DnsError::Malformed));
+        assert_eq!(
+            chain.extend(alias("example.com".into()), &policy),
+            Err(DnsError::Malformed)
+        );
 
         let mut chain = Chain::new("example.com");
         for i in 0..8 {
-            assert!(chain.extend(alias(format!("a{i}.example.com")), &policy).unwrap().is_none());
+            assert!(chain
+                .extend(alias(format!("a{i}.example.com")), &policy)
+                .unwrap()
+                .is_none());
         }
-        assert_eq!(chain.extend(alias("overflow.example.com".into()), &policy), Err(DnsError::Malformed));
+        assert_eq!(
+            chain.extend(alias("overflow.example.com".into()), &policy),
+            Err(DnsError::Malformed)
+        );
 
         let mut chain = Chain::new("example.com");
-        chain.extend(alias("alias.example.com".into()), &policy).unwrap();
-        let answer = chain.extend(Answer {
-            addresses: vec!["1.1.1.1".parse().unwrap()], aliases: vec![], ttl: 60,
-        }, &policy).unwrap().unwrap();
+        chain
+            .extend(alias("alias.example.com".into()), &policy)
+            .unwrap();
+        let answer = chain
+            .extend(
+                Answer {
+                    addresses: vec!["1.1.1.1".parse().unwrap()],
+                    aliases: vec![],
+                    ttl: 60,
+                },
+                &policy,
+            )
+            .unwrap()
+            .unwrap();
         assert_eq!(answer.ttl, 30);
         assert_eq!(answer.aliases, vec!["alias.example.com"]);
     }
@@ -654,13 +799,34 @@ mod tests {
     fn cname_cycle_and_unrelated_answer_fail_closed() {
         let mut bytes = response("example.com", Kind::A, 1);
         rr(&mut bytes, &[0xc0, 12], 5, 10, &[0xc0, 12]);
-        assert_eq!(parse(&bytes, "example.com", Kind::A), Err(DnsError::Malformed));
+        assert_eq!(
+            parse(&bytes, "example.com", Kind::A),
+            Err(DnsError::Malformed)
+        );
         let mut bytes = response("example.com", Kind::A, 2);
-        rr(&mut bytes, &[0xc0, 12], 5, 10, b"\x05alias\x07example\x03com\x00");
-        rr(&mut bytes, b"\x05alias\x07example\x03com\x00", 5, 10, &[0xc0, 12]);
-        assert_eq!(parse(&bytes, "example.com", Kind::A), Err(DnsError::Malformed));
+        rr(
+            &mut bytes,
+            &[0xc0, 12],
+            5,
+            10,
+            b"\x05alias\x07example\x03com\x00",
+        );
+        rr(
+            &mut bytes,
+            b"\x05alias\x07example\x03com\x00",
+            5,
+            10,
+            &[0xc0, 12],
+        );
+        assert_eq!(
+            parse(&bytes, "example.com", Kind::A),
+            Err(DnsError::Malformed)
+        );
         let mut bytes = response("example.com", Kind::A, 1);
         rr(&mut bytes, b"\x05other\x03com\x00", 1, 10, &[1, 1, 1, 1]);
-        assert_eq!(parse(&bytes, "example.com", Kind::A), Err(DnsError::Malformed));
+        assert_eq!(
+            parse(&bytes, "example.com", Kind::A),
+            Err(DnsError::Malformed)
+        );
     }
 }

@@ -175,7 +175,10 @@ impl Panel {
     fn policy_blocked(&self, domain: &str) -> bool {
         self.checks.iter().any(|check| {
             check.domain.as_deref() == Some(domain)
-                && matches!(check.outcome, Outcome::Route(crate::routing::Action::Blocked))
+                && matches!(
+                    check.outcome,
+                    Outcome::Route(crate::routing::Action::Blocked)
+                )
         })
     }
 
@@ -417,9 +420,15 @@ impl Panel {
     pub(crate) fn footer(&self) -> &'static str {
         match self.phase {
             Phase::Choose => "↑ ↓ выбор · Enter открыть · Esc назад",
-            Phase::Custom => "Enter проверить сервер · Ctrl+U очистить · Esc назад · PgUp/PgDn прокрутка",
-            Phase::Confirm => "↑ ↓ выбор · Enter выполнить выбор · Esc отменить · PgUp/PgDn прокрутка",
-            Phase::Fetching | Phase::Running => "↑ ↓ выбор · Enter выполнить · Esc остановить · PgUp/PgDn прокрутка",
+            Phase::Custom => {
+                "Enter проверить сервер · Ctrl+U очистить · Esc назад · PgUp/PgDn прокрутка"
+            }
+            Phase::Confirm => {
+                "↑ ↓ выбор · Enter выполнить выбор · Esc отменить · PgUp/PgDn прокрутка"
+            }
+            Phase::Fetching | Phase::Running => {
+                "↑ ↓ выбор · Enter выполнить · Esc остановить · PgUp/PgDn прокрутка"
+            }
             Phase::Done => "↑ ↓ выбор · Enter выполнить · Esc назад · PgUp/PgDn прокрутка",
         }
     }
@@ -429,11 +438,21 @@ impl Panel {
         if !self.error.is_empty() {
             lines.push(self.error.clone());
         }
-        lines.extend(self.checks.iter().filter(|check| check.domain.is_none()).map(|check| check.line(false)));
+        lines.extend(
+            self.checks
+                .iter()
+                .filter(|check| check.domain.is_none())
+                .map(|check| check.line(false)),
+        );
         if !table {
             lines.extend(self.report.iter().cloned());
             if self.details || matches!(self.phase, Phase::Running | Phase::Done) {
-                lines.extend(self.checks.iter().filter(|check| check.domain.is_some()).map(|check| check.line(false)));
+                lines.extend(
+                    self.checks
+                        .iter()
+                        .filter(|check| check.domain.is_some())
+                        .map(|check| check.line(false)),
+                );
             }
         }
         lines.join("\n")
@@ -455,7 +474,9 @@ impl Panel {
             && available >= 12
             && area.width >= 55;
         let body = self.text(table);
-        let rows = crate::tui::visual_rows(&body, usize::from(area.width.saturating_sub(2))).0.len();
+        let rows = crate::tui::visual_rows(&body, usize::from(area.width.saturating_sub(2)))
+            .0
+            .len();
         let preferred = (rows.saturating_add(2)).min(u16::MAX as usize) as u16;
         let report_height = if table {
             preferred.min(available.saturating_sub(4)).min(8)
@@ -463,12 +484,14 @@ impl Panel {
             preferred.min(available)
         };
         let report = Rect::new(area.x, area.y, area.width, report_height);
-        let table = table.then(|| Rect::new(
-            area.x,
-            report.bottom(),
-            area.width,
-            (self.domains.len() as u16 + 3).min(available.saturating_sub(report_height)),
-        ));
+        let table = table.then(|| {
+            Rect::new(
+                area.x,
+                report.bottom(),
+                area.width,
+                (self.domains.len() as u16 + 3).min(available.saturating_sub(report_height)),
+            )
+        });
         let bottom = table.map_or(report.bottom(), |rect| rect.bottom());
         let actions = (controls > 0).then(|| Rect::new(area.x, bottom, area.width, controls));
         (report, table, actions)
@@ -477,7 +500,12 @@ impl Panel {
     pub(crate) fn select_at(&mut self, area: Rect, x: u16, y: u16) {
         if let (_, _, Some(controls)) = self.layout(area) {
             let items = self.actions();
-            if let Some(index) = (Actions { items: &items, selected: self.action }).hit(controls, x, y) {
+            if let Some(index) = (Actions {
+                items: &items,
+                selected: self.action,
+            })
+            .hit(controls, x, y)
+            {
                 self.action = index;
             }
         }
@@ -494,40 +522,41 @@ impl Panel {
             usize::from(self.scroll).min(rows.len().saturating_sub(visible))
         };
         frame.render_widget(
-            Paragraph::new(rows.into_iter().skip(offset).take(visible).collect::<Vec<_>>())
-                .block(tui_widgets::section("Сетевая диагностика профиля", true)),
+            Paragraph::new(
+                rows.into_iter()
+                    .skip(offset)
+                    .take(visible)
+                    .collect::<Vec<_>>(),
+            )
+            .block(tui_widgets::section("Сетевая диагностика профиля", true)),
             report,
         );
         if let Some(table) = table {
             let visible = usize::from(table.height.saturating_sub(3));
             let offset = usize::from(self.scroll).min(self.domains.len().saturating_sub(visible));
-            let rows = self
-                .domains
-                .iter()
-                .skip(offset)
-                .map(|domain| {
-                    if self.policy_blocked(domain) {
-                        return Row::new(vec![
-                            domain.clone(),
-                            "Блок".into(),
-                            "—".into(),
-                            "—".into(),
-                            "—".into(),
-                            "—".into(),
-                            "—".into(),
-                        ])
-                        .style(Style::default().fg(tui_widgets::WARNING));
-                    }
-                    Row::new(vec![
+            let rows = self.domains.iter().skip(offset).map(|domain| {
+                if self.policy_blocked(domain) {
+                    return Row::new(vec![
                         domain.clone(),
-                        self.cell(domain, |k| matches!(k, CheckKind::Https("штатный"))),
-                        self.cell(domain, |k| matches!(k, CheckKind::Https("H2"))),
-                        self.cell(domain, |k| matches!(k, CheckKind::Https("H3"))),
-                        self.cell(domain, |k| matches!(k, CheckKind::Udp("штатный"))),
-                        self.cell(domain, |k| matches!(k, CheckKind::Udp("H2"))),
-                        self.cell(domain, |k| matches!(k, CheckKind::Udp("H3"))),
+                        "Блок".into(),
+                        "—".into(),
+                        "—".into(),
+                        "—".into(),
+                        "—".into(),
+                        "—".into(),
                     ])
-                });
+                    .style(Style::default().fg(tui_widgets::WARNING));
+                }
+                Row::new(vec![
+                    domain.clone(),
+                    self.cell(domain, |k| matches!(k, CheckKind::Https("штатный"))),
+                    self.cell(domain, |k| matches!(k, CheckKind::Https("H2"))),
+                    self.cell(domain, |k| matches!(k, CheckKind::Https("H3"))),
+                    self.cell(domain, |k| matches!(k, CheckKind::Udp("штатный"))),
+                    self.cell(domain, |k| matches!(k, CheckKind::Udp("H2"))),
+                    self.cell(domain, |k| matches!(k, CheckKind::Udp("H3"))),
+                ])
+            });
             frame.render_widget(
                 Table::new(
                     rows,
@@ -545,12 +574,19 @@ impl Panel {
                     Row::new(["Ресурс", "Авто", "H2", "H3", "UDP авт", "UDP/H2", "UDP/H3"])
                         .style(Style::default().fg(tui_widgets::MUTED)),
                 )
-                .block(tui_widgets::section("HTTP-коды · Блок: запрещено политикой · — не проверено", false)),
+                .block(tui_widgets::section(
+                    "HTTP-коды · Блок: запрещено политикой · — не проверено",
+                    false,
+                )),
                 table,
             );
         }
         if let Some(controls) = controls {
-            Actions { items: &self.actions(), selected: self.action }.render(frame, controls);
+            Actions {
+                items: &self.actions(),
+                selected: self.action,
+            }
+            .render(frame, controls);
         }
     }
 }

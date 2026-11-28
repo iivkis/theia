@@ -32,7 +32,11 @@ impl PolicyState {
     /// A standalone authority is not a server snapshot. Its immutable
     /// guard owns the exact local publication, DNS pins and session scope.
     #[cfg(windows)]
-    pub(crate) fn standalone(digest: [u8; 32], live: Arc<dyn Fn() -> bool + Send + Sync>, stun: bool) -> Arc<Self> {
+    pub(crate) fn standalone(
+        digest: [u8; 32],
+        live: Arc<dyn Fn() -> bool + Send + Sync>,
+        stun: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             enabled: AtomicBool::new(true),
             stun_enabled: AtomicBool::new(stun),
@@ -56,7 +60,9 @@ impl PolicyState {
 
     pub(super) fn authorize_policy(&self, lease: Option<LocalPolicy>) {
         #[cfg(windows)]
-        if self.local.is_some() { return; }
+        if self.local.is_some() {
+            return;
+        }
         if let Ok(mut policy) = self.policy.lock() {
             let next = if self.retired() { None } else { lease };
             let continuous = match (&*policy, &next) {
@@ -89,7 +95,9 @@ impl PolicyState {
     fn current_epoch(&self, digest: [u8; 32]) -> Option<u64> {
         #[cfg(windows)]
         if let Some(local) = &self.local {
-            if self.retired() { return None; }
+            if self.retired() {
+                return None;
+            }
             if !(local.live)() {
                 self.retired.store(true, Ordering::Release);
                 return None;
@@ -175,7 +183,11 @@ mod tests {
     fn standalone_revocation_is_irreversible_and_digest_bound() {
         let alive = Arc::new(AtomicBool::new(true));
         let check = alive.clone();
-        let authority = PolicyState::standalone([8; 32], Arc::new(move || check.load(Ordering::Acquire)), false);
+        let authority = PolicyState::standalone(
+            [8; 32],
+            Arc::new(move || check.load(Ordering::Acquire)),
+            false,
+        );
         assert!(authority.pin([7; 32]).is_err());
         let lease = authority.pin([8; 32]).unwrap();
         assert!(lease.check().is_ok());

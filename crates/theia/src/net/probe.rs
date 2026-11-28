@@ -78,19 +78,25 @@ impl Drop for Waiting<'_> {
 impl PriorityBudget {
     #[cfg(any(windows, test))]
     pub(crate) fn new() -> Self {
-        Self { permits: Semaphore::new(4), waiters: std::sync::atomic::AtomicUsize::new(0) }
+        Self {
+            permits: Semaphore::new(4),
+            waiters: std::sync::atomic::AtomicUsize::new(0),
+        }
     }
 
     #[cfg(any(windows, test))]
     pub(crate) async fn production(&self, count: u32) -> Result<SemaphorePermit<'_>, AcquireError> {
-        self.waiters.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.waiters
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let _waiting = Waiting(&self.waiters);
         self.permits.acquire_many(count).await
     }
 
     pub(crate) async fn diagnostic(&self, deadline: Instant) -> Option<SemaphorePermit<'_>> {
         loop {
-            if Instant::now() >= deadline { return None; }
+            if Instant::now() >= deadline {
+                return None;
+            }
             if self.waiters.load(std::sync::atomic::Ordering::Acquire) == 0 {
                 if let Ok(permit) = self.permits.try_acquire() {
                     if self.waiters.load(std::sync::atomic::Ordering::Acquire) == 0 {
@@ -99,7 +105,8 @@ impl PriorityBudget {
                     drop(permit);
                 }
             }
-            tokio::time::sleep_until((Instant::now() + Duration::from_millis(20)).min(deadline)).await;
+            tokio::time::sleep_until((Instant::now() + Duration::from_millis(20)).min(deadline))
+                .await;
         }
     }
 }
@@ -147,11 +154,19 @@ mod tests {
         let held = budget.production(3).await.unwrap();
         let waiting = budget.production(2);
         tokio::pin!(waiting);
-        assert!(timeout(Duration::from_millis(1), &mut waiting).await.is_err());
-        assert!(budget.diagnostic(Instant::now() + Duration::from_millis(30)).await.is_none());
+        assert!(timeout(Duration::from_millis(1), &mut waiting)
+            .await
+            .is_err());
+        assert!(budget
+            .diagnostic(Instant::now() + Duration::from_millis(30))
+            .await
+            .is_none());
         drop(held);
         let production = waiting.await.unwrap();
-        assert!(budget.diagnostic(Instant::now() + Duration::from_secs(1)).await.is_some());
+        assert!(budget
+            .diagnostic(Instant::now() + Duration::from_secs(1))
+            .await
+            .is_some());
         drop(production);
     }
 

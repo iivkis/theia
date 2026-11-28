@@ -9,16 +9,22 @@ pub(crate) mod profile_diagnostics;
 mod runtime;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) use runtime::ClientRuntime;
-#[cfg(all(any(feature = "native-ingress-lab", test), any(target_os = "linux", target_os = "windows")))]
+#[cfg(all(
+    any(feature = "native-ingress-lab", test),
+    any(target_os = "linux", target_os = "windows")
+))]
 mod native;
 #[cfg(windows)]
-mod system_proxy;
-#[cfg(windows)]
 mod standalone;
+#[cfg(windows)]
+mod system_proxy;
 
 /// Explicit development standalone Pass/Drop session. Not a complete Anti-DPI release.
 #[cfg(windows)]
-pub async fn run_standalone(candidate: crate::anti_dpi::authority::Candidate, expected: [u8; 32]) -> Result<(), ClientError> {
+pub async fn run_standalone(
+    candidate: crate::anti_dpi::authority::Candidate,
+    expected: [u8; 32],
+) -> Result<(), ClientError> {
     Box::pin(standalone::run(candidate, expected)).await
 }
 #[cfg(windows)]
@@ -29,12 +35,22 @@ pub(crate) async fn run_standalone_controlled(
     commands: tokio::sync::mpsc::Receiver<crate::anti_dpi::session::Command>,
     review: crate::windows_system_proxy::ApplyReview,
 ) -> Result<(), ClientError> {
-    Box::pin(standalone::run_controlled(candidate, expected, control, commands, Some(review))).await
+    Box::pin(standalone::run_controlled(
+        candidate,
+        expected,
+        control,
+        commands,
+        Some(review),
+    ))
+    .await
 }
 
 #[cfg(all(any(feature = "native-ingress-lab", test), target_os = "linux"))]
 pub use native::LabStunPermit;
-#[cfg(all(any(feature = "native-ingress-lab", test), any(target_os = "linux", target_os = "windows")))]
+#[cfg(all(
+    any(feature = "native-ingress-lab", test),
+    any(target_os = "linux", target_os = "windows")
+))]
 pub use native::NativeIngress;
 #[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
 use native::NativeOwner;

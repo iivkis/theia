@@ -377,24 +377,46 @@ async fn socks_request(socket: &mut TcpStream) -> Result<SocksRequest, ClientErr
 /// Role-neutral negotiation, with exactly the same framing and loopback
 /// boundary for SmartTheia and the standalone client. No egress is opened.
 pub(super) enum Request {
-    Tcp { address: Address, port: u16, plain: Option<Vec<u8>> },
-    Udp { address: Address, port: u16 },
+    Tcp {
+        address: Address,
+        port: u16,
+        plain: Option<Vec<u8>>,
+    },
+    Udp {
+        address: Address,
+        port: u16,
+    },
 }
 
-pub(super) async fn negotiate(socket: &mut TcpStream, is_http: bool)
-    -> Result<Request, ClientError>
-{
-    if !socket.peer_addr().map_err(|_| ClientError::Io)?.ip().is_loopback()
-        || !socket.local_addr().map_err(|_| ClientError::Io)?.ip().is_loopback()
+pub(super) async fn negotiate(
+    socket: &mut TcpStream,
+    is_http: bool,
+) -> Result<Request, ClientError> {
+    if !socket
+        .peer_addr()
+        .map_err(|_| ClientError::Io)?
+        .ip()
+        .is_loopback()
+        || !socket
+            .local_addr()
+            .map_err(|_| ClientError::Io)?
+            .ip()
+            .is_loopback()
     {
         return Err(ClientError::Open(ErrorCode::PolicyDenied));
     }
     if is_http {
         match timeout(NEGOTIATE_TIMEOUT, http_target(socket)).await {
-            Ok(Ok(HttpRequest::Connect(address, port))) =>
-                Ok(Request::Tcp { address, port, plain: None }),
-            Ok(Ok(HttpRequest::Plain(address, port, request))) =>
-                Ok(Request::Tcp { address, port, plain: Some(request) }),
+            Ok(Ok(HttpRequest::Connect(address, port))) => Ok(Request::Tcp {
+                address,
+                port,
+                plain: None,
+            }),
+            Ok(Ok(HttpRequest::Plain(address, port, request))) => Ok(Request::Tcp {
+                address,
+                port,
+                plain: Some(request),
+            }),
             Ok(Err(reply)) => {
                 let _ = timeout(REPLY_TIMEOUT, socket.write_all(reply)).await;
                 Err(ClientError::Protocol)
@@ -402,11 +424,15 @@ pub(super) async fn negotiate(socket: &mut TcpStream, is_http: bool)
             Err(_) => Err(ClientError::Timeout),
         }
     } else {
-        match timeout(NEGOTIATE_TIMEOUT, socks_request(socket)).await
+        match timeout(NEGOTIATE_TIMEOUT, socks_request(socket))
+            .await
             .map_err(|_| ClientError::Timeout)??
         {
-            SocksRequest::Connect(address, port) =>
-                Ok(Request::Tcp { address, port, plain: None }),
+            SocksRequest::Connect(address, port) => Ok(Request::Tcp {
+                address,
+                port,
+                plain: None,
+            }),
             SocksRequest::Associate(address, port) => Ok(Request::Udp { address, port }),
         }
     }
@@ -414,10 +440,13 @@ pub(super) async fn negotiate(socket: &mut TcpStream, is_http: bool)
 
 pub(super) async fn success(socket: &mut TcpStream, is_http: bool) -> Result<(), ClientError> {
     if is_http {
-        timeout(REPLY_TIMEOUT, socket.write_all(HTTP_OK)).await
-            .map_err(|_| ClientError::Timeout)?.map_err(|_| ClientError::Io)
+        timeout(REPLY_TIMEOUT, socket.write_all(HTTP_OK))
+            .await
+            .map_err(|_| ClientError::Timeout)?
+            .map_err(|_| ClientError::Io)
     } else {
-        timeout(REPLY_TIMEOUT, socks_reply(socket, 0)).await
+        timeout(REPLY_TIMEOUT, socks_reply(socket, 0))
+            .await
             .map_err(|_| ClientError::Timeout)?
     }
 }
@@ -426,7 +455,8 @@ pub(super) async fn failure(socket: &mut TcpStream, is_http: bool, error: &Clien
     if is_http {
         let reply = match error {
             ClientError::Open(ErrorCode::PolicyDenied) | ClientError::Unauthorized => HTTP_DENIED,
-            ClientError::Timeout | ClientError::QuicUnreachable
+            ClientError::Timeout
+            | ClientError::QuicUnreachable
             | ClientError::QuicEndpointNetworkRefused
             | ClientError::Open(ErrorCode::DialTimeout) => HTTP_TIMEOUT,
             _ => HTTP_FAILED,
@@ -458,9 +488,14 @@ pub(super) async fn handle(
         "session" = Value::Count(session_id)
     );
     let (address, port, plain) = match negotiate(&mut socket, is_http).await {
-        Ok(Request::Tcp { address, port, plain }) => (address, port, plain),
-        Ok(Request::Udp { address, port }) =>
-            return Box::pin(udp_association(socket, client, address, port)).await,
+        Ok(Request::Tcp {
+            address,
+            port,
+            plain,
+        }) => (address, port, plain),
+        Ok(Request::Udp { address, port }) => {
+            return Box::pin(udp_association(socket, client, address, port)).await
+        }
         Err(error) => {
             crate::diag!(
                 Warn,

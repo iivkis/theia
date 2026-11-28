@@ -2,7 +2,10 @@
 //! transformer and socket factory, but never publish production evidence.
 use super::{strategy::Strategy, tcp, tls};
 use crate::{
-    net::{guarded_io::{revoked, GuardedIo}, tls as verified_tls},
+    net::{
+        guarded_io::{revoked, GuardedIo},
+        tls as verified_tls,
+    },
     network_scope,
 };
 use std::{
@@ -68,7 +71,8 @@ async fn head_status(input: &mut (impl AsyncRead + Unpin)) -> Result<u16, Failur
         for line in lines {
             let (key, value) = line.split_once(':').ok_or(Failure::Protocol)?;
             http::header::HeaderName::from_bytes(key.as_bytes()).map_err(|_| Failure::Protocol)?;
-            http::header::HeaderValue::from_bytes(value.as_bytes()).map_err(|_| Failure::Protocol)?;
+            http::header::HeaderValue::from_bytes(value.as_bytes())
+                .map_err(|_| Failure::Protocol)?;
         }
         if code >= 200 {
             return Ok(code);
@@ -97,10 +101,11 @@ pub(crate) async fn https(
         if !scoped() {
             return Err(Failure::Denied);
         }
-        let mut config = verified_tls::application_probe(roots.clone()).map_err(|_| Failure::Tls)?;
+        let mut config =
+            verified_tls::application_probe(roots.clone()).map_err(|_| Failure::Tls)?;
         verified_tls::configure_client(&mut config, b"http/1.1");
-        let server_name = rustls::pki_types::ServerName::try_from(name.to_owned())
-            .map_err(|_| Failure::Tls)?;
+        let server_name =
+            rustls::pki_types::ServerName::try_from(name.to_owned()).map_err(|_| Failure::Tls)?;
         let (socket, _admission) = tcp::connect(peer).await.map_err(|error| {
             if error.kind() == std::io::ErrorKind::PermissionDenied {
                 Failure::Denied
@@ -108,7 +113,11 @@ pub(crate) async fn https(
                 Failure::Network
             }
         })?;
-        if !scoped() || !socket.local_addr().is_ok_and(|local| scope.matches_local(local)) {
+        if !scoped()
+            || !socket
+                .local_addr()
+                .is_ok_and(|local| scope.matches_local(local))
+        {
             return Err(Failure::Denied);
         }
         connected.store(true, Ordering::Release);
@@ -118,8 +127,15 @@ pub(crate) async fn https(
         let (local, mut relay) = tokio::io::duplex(64 * 1024);
         let app = async {
             let mut stream = tokio_rustls::TlsConnector::from(Arc::new(config))
-                .connect(server_name, local).await.map_err(|_| Failure::Tls)?;
-            if stream.get_ref().1.alpn_protocol().is_some_and(|p| p != b"http/1.1") {
+                .connect(server_name, local)
+                .await
+                .map_err(|_| Failure::Tls)?;
+            if stream
+                .get_ref()
+                .1
+                .alpn_protocol()
+                .is_some_and(|p| p != b"http/1.1")
+            {
                 return Err(Failure::Tls);
             }
             if !scoped() {
@@ -127,7 +143,10 @@ pub(crate) async fn https(
             }
             verified.store(true, Ordering::Release);
             let request = format!("HEAD / HTTP/1.1\r\nHost: {name}\r\nConnection: close\r\n\r\n");
-            stream.write_all(request.as_bytes()).await.map_err(|_| Failure::Network)?;
+            stream
+                .write_all(request.as_bytes())
+                .await
+                .map_err(|_| Failure::Network)?;
             let code = head_status(&mut stream).await?;
             if !scoped() {
                 return Err(Failure::Denied);
@@ -137,7 +156,8 @@ pub(crate) async fn https(
         let forwarding = async {
             if let Some(strategy) = strategy {
                 let mut first = Vec::new();
-                if !tcp::read_hello(&mut relay, &mut first).await
+                if !tcp::read_hello(&mut relay, &mut first)
+                    .await
                     .map_err(|_| Failure::Protocol)?
                 {
                     return Err(Failure::Unavailable);
@@ -148,11 +168,15 @@ pub(crate) async fn https(
                 if !scoped() {
                     return Err(Failure::Denied);
                 }
-                socket.write_all(&changed).await.map_err(|_| Failure::Network)?;
+                socket
+                    .write_all(&changed)
+                    .await
+                    .map_err(|_| Failure::Network)?;
                 transformed.store(true, Ordering::Release);
             }
             tokio::io::copy_bidirectional(&mut relay, &mut socket)
-                .await.map_err(|_| Failure::Network)?;
+                .await
+                .map_err(|_| Failure::Network)?;
             Ok(())
         };
         tokio::pin!(app, forwarding);
@@ -188,7 +212,9 @@ mod tests {
     #[tokio::test]
     async fn final_headers_are_required_and_codes_remain_distinct() {
         for code in [200, 302, 403, 429, 451, 503] {
-            let bytes = format!("HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 {code} Test\r\nX-Test: value\r\n\r\n");
+            let bytes = format!(
+                "HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 {code} Test\r\nX-Test: value\r\n\r\n"
+            );
             assert_eq!(head_status(&mut bytes.as_bytes()).await, Ok(code));
         }
         for bytes in [
@@ -210,9 +236,11 @@ mod tests {
         let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut server = rustls::ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions().unwrap()
+            .with_safe_default_protocol_versions()
+            .unwrap()
             .with_no_client_auth()
-            .with_single_cert(vec![cert.cert.der().clone()], key.into()).unwrap();
+            .with_single_cert(vec![cert.cert.der().clone()], key.into())
+            .unwrap();
         server.alpn_protocols = vec![b"http/1.1".to_vec()];
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -225,15 +253,30 @@ mod tests {
                 let mut bytes = Vec::new();
                 loop {
                     bytes.push(stream.read_u8().await.unwrap());
-                    if bytes.ends_with(b"\r\n\r\n") { break; }
+                    if bytes.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
                     assert!(bytes.len() < 1024);
                 }
-                assert_eq!(bytes, b"HEAD / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n");
-                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+                assert_eq!(
+                    bytes,
+                    b"HEAD / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+                );
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
                 let _ = stream.shutdown().await;
             };
-            let probe = https("example.com", peer, scope, strategy, &roots, &|| true,
-                Instant::now() + Duration::from_secs(3));
+            let probe = https(
+                "example.com",
+                peer,
+                scope,
+                strategy,
+                &roots,
+                &|| true,
+                Instant::now() + Duration::from_secs(3),
+            );
             let (result, _) = tokio::join!(probe, server);
             assert_eq!(result.result, Ok(200), "{result:?}");
             assert!(result.connected && result.verified_tls);

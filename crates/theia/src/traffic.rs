@@ -20,9 +20,13 @@ tokio::task_local! { pub(crate) static PROFILE_DIAGNOSTIC: (); }
 tokio::task_local! { pub(crate) static STANDALONE_METER: std::sync::Arc<Counters>; }
 
 fn diagnostic() -> bool {
-    if PROFILE_DIAGNOSTIC.try_with(|_| ()).is_ok() { return true; }
+    if PROFILE_DIAGNOSTIC.try_with(|_| ()).is_ok() {
+        return true;
+    }
     #[cfg(any(windows, test))]
-    if STANDALONE_METER.try_with(|_| ()).is_ok() { return true; }
+    if STANDALONE_METER.try_with(|_| ()).is_ok() {
+        return true;
+    }
     false
 }
 static DIAGNOSTIC_COUNTERS: Counters = Counters::new();
@@ -92,10 +96,14 @@ impl Relay<'_> {
         }
     }
     pub(crate) fn upload(&self, bytes: usize) {
-        self.counters().upload.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.counters()
+            .upload
+            .fetch_add(bytes as u64, Ordering::Relaxed);
     }
     pub(crate) fn download(&self, bytes: usize) {
-        self.counters().download.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.counters()
+            .download
+            .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 }
 impl Drop for Relay<'_> {
@@ -110,21 +118,43 @@ async fn standalone_meter_is_per_session_and_diagnostics_do_not_enter_it() {
     use std::sync::Arc;
     let first = Arc::new(Counters::new());
     let second = Arc::new(Counters::new());
-    STANDALONE_METER.scope(first.clone(), async {
-        let relay = enter_direct();
-        relay.upload(4);
-        relay.download(8);
-        PROFILE_DIAGNOSTIC.scope((), async {
-            let diagnostic = enter_direct();
-            diagnostic.upload(100);
-        }).await;
-    }).await;
-    STANDALONE_METER.scope(second.clone(), async {
-        let relay = enter_udp(Role::Client, false, true);
-        relay.upload(2);
-    }).await;
-    assert_eq!(first.snapshot(), Snapshot { opened: 1, active: 0, upload: 4, download: 8 });
-    assert_eq!(second.snapshot(), Snapshot { opened: 1, active: 0, upload: 2, download: 0 });
+    STANDALONE_METER
+        .scope(first.clone(), async {
+            let relay = enter_direct();
+            relay.upload(4);
+            relay.download(8);
+            PROFILE_DIAGNOSTIC
+                .scope((), async {
+                    let diagnostic = enter_direct();
+                    diagnostic.upload(100);
+                })
+                .await;
+        })
+        .await;
+    STANDALONE_METER
+        .scope(second.clone(), async {
+            let relay = enter_udp(Role::Client, false, true);
+            relay.upload(2);
+        })
+        .await;
+    assert_eq!(
+        first.snapshot(),
+        Snapshot {
+            opened: 1,
+            active: 0,
+            upload: 4,
+            download: 8
+        }
+    );
+    assert_eq!(
+        second.snapshot(),
+        Snapshot {
+            opened: 1,
+            active: 0,
+            upload: 2,
+            download: 0
+        }
+    );
 }
 
 static SERVER_H2: Counters = Counters::new();
@@ -490,7 +520,10 @@ impl Monitor {
     pub(crate) fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         tui_widgets::canvas(frame, area);
         let idle = self.current.iter().all(|s| s.active == 0)
-            && self.history.iter().all(|sample| sample.iter().all(|&v| v == 0));
+            && self
+                .history
+                .iter()
+                .all(|sample| sample.iter().all(|&v| v == 0));
         if idle || area.width < 46 || area.height < 17 || (area.width < 86 && area.height < 27) {
             let area = if idle && area.width >= 86 {
                 Rect::new(area.x, area.y, area.width, area.height.min(13))
@@ -685,7 +718,10 @@ impl Monitor {
             );
         }
         if !self.history.is_empty()
-            && self.history.iter().all(|sample| sample.iter().all(|&v| v == 0))
+            && self
+                .history
+                .iter()
+                .all(|sample| sample.iter().all(|&v| v == 0))
         {
             result.push_str("\nВ измеренных интервалах нет трафика.");
         }

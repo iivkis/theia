@@ -6,9 +6,9 @@ pub mod catalog;
 pub mod diagnostic;
 pub(crate) mod dns;
 #[cfg(windows)]
-pub(crate) mod session;
-#[cfg(windows)]
 pub mod ipc;
+#[cfg(windows)]
+pub(crate) mod session;
 pub use dns::DnsError;
 
 use crate::{
@@ -90,7 +90,13 @@ fn canonical_host(value: &str) -> bool {
     value.contains('.')
         && routing::domain_name(value).is_ok_and(|name| name == value)
         && ![
-            ".local", ".localhost", ".internal", ".onion", ".test", ".invalid", ".example",
+            ".local",
+            ".localhost",
+            ".internal",
+            ".onion",
+            ".test",
+            ".invalid",
+            ".example",
         ]
         .iter()
         .any(|suffix| value.ends_with(suffix))
@@ -109,13 +115,19 @@ impl Resolver {
             || self.bootstrap.is_empty()
             || self.bootstrap.len() > MAX_RESOLVER_BOOTSTRAP
         {
-            return Err(invalid("anti_dpi.resolver", "invalid HTTPS resolver or bootstrap"));
+            return Err(invalid(
+                "anti_dpi.resolver",
+                "invalid HTTPS resolver or bootstrap",
+            ));
         }
         let mut seen = std::collections::HashSet::new();
         if self.bootstrap.iter().any(|ip| {
             canonical_ip(*ip) != *ip || !allowed_destination(*ip, false) || !seen.insert(*ip)
         }) {
-            return Err(invalid("anti_dpi.resolver.bootstrap", "expected unique public IPs"));
+            return Err(invalid(
+                "anti_dpi.resolver.bootstrap",
+                "expected unique public IPs",
+            ));
         }
         Ok(())
     }
@@ -152,13 +164,23 @@ impl Document {
         if (consent.direct_dpi && !consent.direct_egress)
             || (consent.direct_dpi_stun && !consent.direct_dpi)
         {
-            return Err(invalid("anti_dpi.consent", "local egress and Anti-DPI consent required"));
+            return Err(invalid(
+                "anti_dpi.consent",
+                "local egress and Anti-DPI consent required",
+            ));
         }
         if let Some(resolver) = &settings.resolver {
             resolver.validate()?;
         }
-        if settings.rules.iter().any(|rule| rule.action == Action::Allowed) {
-            return Err(invalid("anti_dpi.rules", "server routing is not allowed in standalone"));
+        if settings
+            .rules
+            .iter()
+            .any(|rule| rule.action == Action::Allowed)
+        {
+            return Err(invalid(
+                "anti_dpi.rules",
+                "server routing is not allowed in standalone",
+            ));
         }
         let requires_data = Policy::requires_geodata(&settings.rules)
             .map_err(|_| invalid("anti_dpi.rules", "invalid routing selectors or limits"))?;
@@ -171,7 +193,12 @@ impl Document {
                     && data.manifest.geosite_sha256 != [0; 32]
                     && data.manifest.geoip_sha256 != [0; 32] => {}
             None if !requires_data => {}
-            _ => return Err(invalid("anti_dpi.geodata", "verified DAT selection required")),
+            _ => {
+                return Err(invalid(
+                    "anti_dpi.geodata",
+                    "verified DAT selection required",
+                ))
+            }
         }
         Ok(())
     }
@@ -216,7 +243,10 @@ impl Document {
         if self.anti_dpi.id != next.anti_dpi.id
             || (self != next && next.anti_dpi.revision <= self.anti_dpi.revision)
         {
-            return Err(invalid("anti_dpi.revision", "replacement requires same ID and newer revision"));
+            return Err(invalid(
+                "anti_dpi.revision",
+                "replacement requires same ID and newer revision",
+            ));
         }
         Ok(())
     }
@@ -230,7 +260,9 @@ impl Document {
                 .map_err(|_| invalid("document", "configuration is not UTF-8"))
                 .and_then(Self::parse)
                 .map_err(SaveError::BeforeReplace)?;
-            previous.accepts_replacement(self).map_err(SaveError::BeforeReplace)?;
+            previous
+                .accepts_replacement(self)
+                .map_err(SaveError::BeforeReplace)?;
             if previous == *self {
                 return config::guarded_trust_assert(path, bytes).map_err(SaveError::BeforeReplace);
             }
@@ -306,7 +338,8 @@ impl PreparedPolicy {
         if !allowed_destination(ip, false) {
             return Decision::Drop;
         }
-        match self.policy
+        match self
+            .policy
             .classify(Evidence::Unknown, Evidence::Known(ip))
             .map_or(Decision::Drop, local_decision)
         {
@@ -367,7 +400,10 @@ mod tests {
     #[test]
     fn strict_role_and_consent_and_round_trip() {
         let document = example();
-        assert_eq!(Document::parse(&document.to_toml().unwrap()).unwrap(), document);
+        assert_eq!(
+            Document::parse(&document.to_toml().unwrap()).unwrap(),
+            document
+        );
         assert!(Document::parse(include_str!("../../../examples/client.toml")).is_err());
         let source = include_str!("../../../examples/anti-dpi.toml");
         assert!(Document::parse(&source.replace("system_proxy", "tun")).is_err());
@@ -381,7 +417,9 @@ mod tests {
         assert!(invalid_document.validate().is_ok());
         invalid_document.anti_dpi.proxy.http_listen = "0.0.0.0:8080".into();
         assert!(invalid_document.validate().is_err());
-        assert!(Document::parse(&format!("{source}\n[client]\nsecret='not-a-real-secret'")).is_err());
+        assert!(
+            Document::parse(&format!("{source}\n[client]\nsecret='not-a-real-secret'")).is_err()
+        );
     }
 
     #[test]
@@ -398,7 +436,10 @@ mod tests {
         let mut document = example();
         let ip: IpAddr = "1.1.1.1".parse().unwrap();
         let empty = document.prepare().unwrap();
-        assert_eq!(empty.classify_resolved("example.com", &[ip]), Decision::Pass);
+        assert_eq!(
+            empty.classify_resolved("example.com", &[ip]),
+            Decision::Pass
+        );
         assert_eq!(empty.classify_literal(ip), Decision::Pass);
         document.anti_dpi.rules = vec![
             rule(Action::DirectDpi, &["full:example.com"], &[]),
@@ -406,10 +447,19 @@ mod tests {
         ];
         let policy = document.prepare().unwrap();
         assert_eq!(policy.classify_literal(ip), Decision::Drop);
-        assert_eq!(policy.classify_resolved("example.com", &[ip]), Decision::Modify);
-        assert_eq!(policy.classify_resolved("other.example.com", &[ip]), Decision::Pass);
+        assert_eq!(
+            policy.classify_resolved("example.com", &[ip]),
+            Decision::Modify
+        );
+        assert_eq!(
+            policy.classify_resolved("other.example.com", &[ip]),
+            Decision::Pass
+        );
         document.anti_dpi.rules[0].ips.push("1.1.1.1/32".into());
-        assert_eq!(document.prepare().unwrap().classify_literal(ip), Decision::Modify);
+        assert_eq!(
+            document.prepare().unwrap().classify_literal(ip),
+            Decision::Modify
+        );
     }
 
     #[test]
@@ -423,12 +473,27 @@ mod tests {
         let first = "1.1.1.1".parse().unwrap();
         let second = "8.8.8.8".parse().unwrap();
         let private = "::ffff:127.0.0.1".parse().unwrap();
-        assert_eq!(policy.classify_resolved("example.com", &[first, second]), Decision::Drop);
-        assert_eq!(policy.classify_resolved("example.com", &[first, private]), Decision::Drop);
+        assert_eq!(
+            policy.classify_resolved("example.com", &[first, second]),
+            Decision::Drop
+        );
+        assert_eq!(
+            policy.classify_resolved("example.com", &[first, private]),
+            Decision::Drop
+        );
         assert_eq!(policy.classify_resolved("example.com", &[]), Decision::Drop);
-        assert_eq!(policy.classify_resolved("example.com", &[first; 65]), Decision::Drop);
-        assert_eq!(policy.classify_resolved("blocked.example.com", &[second]), Decision::Drop);
-        assert_eq!(policy.classify_resolved("example.com", &[first]), Decision::Modify);
+        assert_eq!(
+            policy.classify_resolved("example.com", &[first; 65]),
+            Decision::Drop
+        );
+        assert_eq!(
+            policy.classify_resolved("blocked.example.com", &[second]),
+            Decision::Drop
+        );
+        assert_eq!(
+            policy.classify_resolved("example.com", &[first]),
+            Decision::Modify
+        );
         assert_eq!(policy.classify_literal(private), Decision::Drop);
     }
 
@@ -454,18 +519,21 @@ mod tests {
     fn revisions_and_guarded_save_preserve_role_and_reject_stale_bytes() {
         let document = example();
         let mut next = document.clone();
-        next.anti_dpi.rules.push(rule(Action::DirectDpi, &["example.com"], &[]));
+        next.anti_dpi
+            .rules
+            .push(rule(Action::DirectDpi, &["example.com"], &[]));
         assert!(document.accepts_replacement(&next).is_err());
         next.anti_dpi.revision += 1;
         assert!(document.accepts_replacement(&next).is_ok());
-        assert_ne!(document.prepare().unwrap().digest(), next.prepare().unwrap().digest());
+        assert_ne!(
+            document.prepare().unwrap().digest(),
+            next.prepare().unwrap().digest()
+        );
         let mut other = next.clone();
         other.anti_dpi.id = "different".into();
         assert!(document.accepts_replacement(&other).is_err());
 
-        let directory = std::env::temp_dir().join(format!(
-            "theia-f20-save-{}", std::process::id()
-        ));
+        let directory = std::env::temp_dir().join(format!("theia-f20-save-{}", std::process::id()));
         std::fs::create_dir(&directory).unwrap();
         let path = directory.join("anti-dpi.toml");
         document.save(&path, None).unwrap();

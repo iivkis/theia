@@ -50,7 +50,14 @@ fn popular_domains_are_seeded_without_a_manual_list_or_live_probe() {
                 && candidate.source == CandidateSource::PopularDomain
         }));
     }
-    for blocked in ["discord.com", "telegram.org", "www.instagram.com", "youtube.com", "twitter.com", "www.facebook.com"] {
+    for blocked in [
+        "discord.com",
+        "telegram.org",
+        "www.instagram.com",
+        "youtube.com",
+        "twitter.com",
+        "www.facebook.com",
+    ] {
         assert!(!POPULAR_HTTPS_DOMAINS.contains(&blocked));
     }
     assert!(plan.warnings.contains(&Warning::NoPublicServerAddress));

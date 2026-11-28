@@ -196,7 +196,10 @@ impl WindowsServer {
         Self::bind_name(pipe_name(id)?, inbounds)
     }
 
-    pub(crate) fn bind_standalone(path: std::path::PathBuf, control: Arc<crate::anti_dpi::session::Control>) -> Result<Self, ManagementError> {
+    pub(crate) fn bind_standalone(
+        path: std::path::PathBuf,
+        control: Arc<crate::anti_dpi::session::Control>,
+    ) -> Result<Self, ManagementError> {
         let name = standalone_name()?;
         let mut server = Self::bind_name(name, 1)?;
         server.standalone = Some(Arc::new(crate::anti_dpi::ipc::Endpoint::new(path, control)));
@@ -306,7 +309,10 @@ impl WindowsServer {
 }
 
 fn standalone_name() -> Result<String, ManagementError> {
-    Ok(format!(r"\\.\pipe\theia-anti-dpi-v1-{}", current_user_sid()?))
+    Ok(format!(
+        r"\\.\pipe\theia-anti-dpi-v1-{}",
+        current_user_sid()?
+    ))
 }
 
 /// Reuse the same SID-derived local-only pipe and busy timeout, but keep
@@ -323,7 +329,9 @@ pub(crate) async fn query_standalone(request: &str) -> Result<String, Management
                 Err(_) => return Err(ManagementError::SocketUnavailable),
             }
         }
-    }).await.map_err(|_| ManagementError::TimedOut)?
+    })
+    .await
+    .map_err(|_| ManagementError::TimedOut)?
 }
 
 pub(crate) async fn query_standalone_report(request: &str) -> Result<String, ManagementError> {
@@ -332,13 +340,21 @@ pub(crate) async fn query_standalone_report(request: &str) -> Result<String, Man
         loop {
             match ClientOptions::new().open(&name) {
                 Ok(stream) => return Ok(stream),
-                Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => sleep(Duration::from_millis(15)).await,
+                Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
+                    sleep(Duration::from_millis(15)).await
+                }
                 Err(_) => return Err(ManagementError::SocketUnavailable),
             }
         }
-    }).await.map_err(|_| ManagementError::TimedOut)??;
-    timeout(Duration::from_secs(610), crate::anti_dpi::ipc::exchange_report(stream, request))
-        .await.map_err(|_| ManagementError::TimedOut)?
+    })
+    .await
+    .map_err(|_| ManagementError::TimedOut)??;
+    timeout(
+        Duration::from_secs(610),
+        crate::anti_dpi::ipc::exchange_report(stream, request),
+    )
+    .await
+    .map_err(|_| ManagementError::TimedOut)?
 }
 
 pub async fn query_pipe(id: &str, command: StatusCommand) -> Result<StatusReply, ManagementError> {
