@@ -313,7 +313,7 @@ fn visual_review_gallery() {
         } else {
             &[("overview", "Обзор"), ("profiles", "Профили"),
               ("import", "Импорт ключа"), ("proxy", "Подключение"),
-              ("traffic", "Статистика"), ("settings", "Настройки"), ("routing", "Маршрутизация")]
+              ("traffic", "Статистика"), ("settings", "Настройки"), ("routing", "Маршрутизация"), ("diagnostics", "Диагностика")]
         };
         assert_eq!(labels.len(), pages(role).len());
         let mut action_keys = std::collections::HashSet::new();
@@ -327,10 +327,23 @@ fn visual_review_gallery() {
             ui.workspace_focus = ui.workspace_content_focus(role);
             let screen = rendered_interaction(120, 40, &model, &ui);
             if page == 4 {
-                assert!(screen.contains("H2") && screen.contains("H3") && ui.workspace_monitor.is_some());
+                assert!(ui.workspace_monitor.is_some() && ui.traffic_monitor.is_none());
+                assert!(!ui.owned_running(role));
+                if role == Role::Server {
+                    assert!(screen.contains("Нет подтверждённого источника данных"));
+                    assert!(screen.contains("метрики внешнего сервера недоступны"));
+                    assert!(!screen.contains("H2 · TCP") && !screen.contains("H3 · QUIC"));
+                } else {
+                    assert!(screen.contains("H2") && screen.contains("H3"));
+                }
             }
             if page == 5 {
                 assert!(screen.contains(path.to_str().unwrap()));
+            }
+            if role == Role::Client && page == 7 {
+                assert!(screen.contains("Диагностика профиля"));
+                assert!(screen.contains("Системный прокси не изменяется"));
+                assert!(ui.profile_diagnostics.is_none());
             }
             review_capture(&format!("{prefix}-page-{label}"), &model, &ui);
         }
