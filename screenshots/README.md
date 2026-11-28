@@ -1,10 +1,38 @@
 # Theia TUI visual review
 
-Source: 24868f20de975beeb626122e1d2478d1b7c0fbed
+Source: 1757349f4bee1fc03eb4437ce61cd26d1591b4b4
 
 Linux · 120×40 · actual production renderer cells. State fixtures and unavailable actions are not runtime success.
 
 Review layout, hierarchy, readability, labels, empty/error states and navigation. Report missing screens; never infer unobserved states.
+
+## anti-dpi-catalog
+
+![anti-dpi-catalog](anti-dpi-catalog.png)
+
+## anti-dpi-diagnostic-consent
+
+![anti-dpi-diagnostic-consent](anti-dpi-diagnostic-consent.png)
+
+## anti-dpi-first-run
+
+![anti-dpi-first-run](anti-dpi-first-run.png)
+
+## anti-dpi-geodata
+
+![anti-dpi-geodata](anti-dpi-geodata.png)
+
+## anti-dpi-overview
+
+![anti-dpi-overview](anti-dpi-overview.png)
+
+## anti-dpi-routing-editor
+
+![anti-dpi-routing-editor](anti-dpi-routing-editor.png)
+
+## anti-dpi-routing
+
+![anti-dpi-routing](anti-dpi-routing.png)
 
 ## client-action-active-profile
 
@@ -453,6 +481,10 @@ Review layout, hierarchy, readability, labels, empty/error states and navigation
 ## server-welcome
 
 ![server-welcome](server-welcome.png)
+
+## state-anti-dpi-diagnostic-report
+
+![state-anti-dpi-diagnostic-report](state-anti-dpi-diagnostic-report.png)
 
 ## state-disable-confirm
 

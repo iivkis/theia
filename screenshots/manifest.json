@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "source_sha": "24868f20de975beeb626122e1d2478d1b7c0fbed",
+  "source_sha": "1757349f4bee1fc03eb4437ce61cd26d1591b4b4",
   "platform": "linux",
   "columns": 120,
   "rows": 40,
@@ -9,6 +9,48 @@
   "renderer": "Ratatui TestBackend + DejaVu Sans Mono",
   "scope": "Offline fixture scenarios; not a real terminal emulator or live runtime acceptance.",
   "screens": [
+    {
+      "scenario": "anti-dpi-catalog",
+      "file": "anti-dpi-catalog.png",
+      "sha256": "3f0dd6381440ca5f57494a5a142016ee83f409540bd3892f1200d2acc43b7f80",
+      "state_fixture": false
+    },
+    {
+      "scenario": "anti-dpi-diagnostic-consent",
+      "file": "anti-dpi-diagnostic-consent.png",
+      "sha256": "7d44c31343cc0a68bd42b560eaa39a69cd2c0929daa7fb05ee21ae1fd2784fa8",
+      "state_fixture": false
+    },
+    {
+      "scenario": "anti-dpi-first-run",
+      "file": "anti-dpi-first-run.png",
+      "sha256": "efca0fa73c18c6b0326d54cfc07d098622231f0201a0bcc3541796f9ec5199e0",
+      "state_fixture": false
+    },
+    {
+      "scenario": "anti-dpi-geodata",
+      "file": "anti-dpi-geodata.png",
+      "sha256": "7cbe7240078a29b571d5bfa29d60f9fea8118e9ffc9e3809b5d4872a59121148",
+      "state_fixture": false
+    },
+    {
+      "scenario": "anti-dpi-overview",
+      "file": "anti-dpi-overview.png",
+      "sha256": "3f28658a68ce8fd875766a2bd2b994681aabbf336cf3b0ec09d42e39426771fa",
+      "state_fixture": false
+    },
+    {
+      "scenario": "anti-dpi-routing-editor",
+      "file": "anti-dpi-routing-editor.png",
+      "sha256": "c912d7a9c1e667a16231ef1e4152f5b6910a58c57210914196c5e3195b6eb950",
+      "state_fixture": false
+    },
+    {
+      "scenario": "anti-dpi-routing",
+      "file": "anti-dpi-routing.png",
+      "sha256": "5c5a7455528931af01cb8aa0192dd1b08aa00672db50b478fea106631a5cf2e8",
+      "state_fixture": false
+    },
     {
       "scenario": "client-action-active-profile",
       "file": "client-action-active-profile.png",
@@ -36,7 +78,7 @@
     {
       "scenario": "client-action-new-profile",
       "file": "client-action-new-profile.png",
-      "sha256": "47e0b91ef803b501c2bf82e44c1da429ae18c7309436ebc51d3ec76144074253",
+      "sha256": "3ba383bff887f73759264aa79981b5f973eea850e4a7ada9dbe3ac7280dcd407",
       "state_fixture": false
     },
     {
@@ -306,13 +348,13 @@
     {
       "scenario": "home-role-selection-client",
       "file": "home-role-selection-client.png",
-      "sha256": "70755edf4507c3731c245f9df4759121ed4948fe4254737357f3b994cb809bee",
+      "sha256": "8d9adc8ac15b7d71b292a5380537d015143aa6660733f5f42e8dcd61e9620ce5",
       "state_fixture": false
     },
     {
       "scenario": "home-role-selection",
       "file": "home-role-selection.png",
-      "sha256": "2c0f4c0d3146202e18393097f0670b71d603cc3407c08cb6b1c9cc03b98abe27",
+      "sha256": "f163d82b845a490e146c3fcba79936c294f7d611b3b14436c10399d7214c6a87",
       "state_fixture": false
     },
     {
@@ -558,7 +600,7 @@
     {
       "scenario": "server-reality-status-technical",
       "file": "server-reality-status-technical.png",
-      "sha256": "78faf9d5f0dbaa1e1af8b3aa596ed72c69cb1cdff3345c89ce365b178637011a",
+      "sha256": "1c5a619c0b5a5f047ff0ea2395cc17adcfee7def1bd318a4e10a654d87aefe64",
       "state_fixture": false
     },
     {
@@ -680,6 +722,12 @@
       "file": "server-welcome.png",
       "sha256": "007b4869363991b211c170b4db63bfaa27ae26353f90dd75910b7beffa557e42",
       "state_fixture": false
+    },
+    {
+      "scenario": "state-anti-dpi-diagnostic-report",
+      "file": "state-anti-dpi-diagnostic-report.png",
+      "sha256": "b28ff78598e39d93c368bb46c1e1cc4f46521cf43d78c2cc0882315be07082ea",
+      "state_fixture": true
     },
     {
       "scenario": "state-disable-confirm",
@@ -978,7 +1026,7 @@
     {
       "scenario": "state-reality-step6-save-inspection",
       "file": "state-reality-step6-save-inspection.png",
-      "sha256": "2677de48f3240233eed1e1fab4aadbe9296a2205745370612a502ccd5f32f1f4",
+      "sha256": "00d0f25b797000e38f627dbdd044577b02e0e71873ac952c786f762e4ee810ec",
       "state_fixture": true
     },
     {
