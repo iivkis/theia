@@ -168,6 +168,10 @@ pub fn strategy_columns() -> Vec<&'static str> {
     columns().into_iter().map(Column::id).collect()
 }
 
+pub(crate) fn strategy_unavailable(id: &str) -> Option<Reason> {
+    columns().into_iter().find(|column| column.id() == id).and_then(Column::unavailable)
+}
+
 #[derive(Debug)]
 struct Saved {
     path: PathBuf,
@@ -305,6 +309,45 @@ impl Plan {
             "At most {} DNS/HTTPS attempts; 4 concurrent, 6 s per cell, 600 s per job.\nLocal public IP and selected names are disclosed to the resolver/targets. No VPS, no redirect following or OS proxy changes.\nConfirm exact plan with SHA256={}",
             self.hosts.len() * (dns::MAX_DNS_REQUESTS + runnable), hex(self.digest),
         );
+        result
+    }
+
+    /// Localized, typed presentation of the exact reviewed plan. The CLI
+    /// keeps its stable technical representation separately.
+    pub(crate) fn ui_preview(&self, owned: bool) -> String {
+        let mut result = String::new();
+        let runnable = columns().iter().filter(|column| column.unavailable().is_none()).count();
+        let _ = writeln!(result, "ПОДТВЕРЖДЕНИЕ ДИАГНОСТИКИ\nДо подтверждения сетевых запросов нет.\n\nЦелей: {} · Ячеек: {} · Ревизия: {}",
+            self.hosts.len(), self.planned_cells(), self.policy.revision());
+        let _ = writeln!(result, "Не более {} DNS/HTTPS операций, {} параллельно; 6 с на ячейку, 10 мин на задание.",
+            self.hosts.len() * (dns::MAX_DNS_REQUESTS + runnable), if owned { 2 } else { 4 });
+        if let Some(resolver) = &self.document.anti_dpi.resolver {
+            let _ = writeln!(result, "DNS: HTTPS https://{}/dns-query · bootstrap {}", resolver.hostname,
+                resolver.bootstrap.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "));
+        }
+        let _ = writeln!(result, "\nВНИМАНИЕ: DNS-провайдер и проверяемые ресурсы получат ваш публичный IP.\nПроверка не меняет прокси, правила и разрешения рабочего трафика.\nНе следует перенаправлениям. Доступность не доказывает обход DPI.\n\nСтратегии:");
+        for column in columns() {
+            let name = match column.id() {
+                "direct" => "TCP HTTPS — напрямую (контроль)",
+                "tcp_header" => "TCP HTTPS — Header",
+                "tcp_middle" => "TCP HTTPS — Middle",
+                "tcp_balanced" => "TCP HTTPS — Balanced",
+                "quic_v1_initial_split" => "QUIC v1",
+                "quic_v2_initial_split" => "QUIC v2",
+                "stun_fingerprint" => "STUN",
+                other => other,
+            };
+            let state = match column.unavailable() {
+                None => "запланировано",
+                Some(Reason::AwaitingAcceptance) => "не поддерживается (приёмка не завершена)",
+                Some(Reason::MissingEndpointMetadata) => "не проверено (нет данных endpoint)",
+                Some(_) => "не будет запущено",
+            };
+            let _ = writeln!(result, "  {name}: {state}");
+        }
+        let _ = writeln!(result, "\nТочные цели (HEAD /, HTTPS 443):");
+        for host in &self.hosts { let _ = writeln!(result, "  {host}"); }
+        let _ = writeln!(result, "\nКаталог: {VERSION}\nSHA256 плана: {}", hex(self.digest));
         result
     }
 

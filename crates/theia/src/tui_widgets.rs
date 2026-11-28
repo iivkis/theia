@@ -28,6 +28,38 @@ pub(crate) fn canvas(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
+/// Shared role chrome; this deliberately has no dependency on role state or
+/// commands. Server, SmartTheia and standalone all supply verified text.
+pub(crate) fn shell_header(frame: &mut Frame<'_>, area: Rect, brand: &str, status: &str, state: &str) {
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(format!(" {brand} "), Style::default().fg(BG).bg(ACCENT).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("  {status}"), Style::default().fg(TEXT)),
+            ]),
+            Line::styled(state, Style::default().fg(MUTED)),
+        ]).style(Style::default().bg(SURFACE)),
+        area,
+    );
+}
+
+pub(crate) fn section_navigation(frame: &mut Frame<'_>, area: Rect, labels: &[&str], page: usize, focused: bool) {
+    use ratatui::widgets::{List, ListItem};
+    let items = labels.iter().enumerate().map(|(i, label)| {
+        let current = i == page;
+        let marker = if current && focused { "›" } else if current { "•" } else { " " };
+        let style = if current && focused {
+            Style::default().fg(ACCENT).bg(FOCUS).add_modifier(Modifier::BOLD)
+        } else if current {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(TEXT)
+        };
+        ListItem::new(format!("{marker} {label}")).style(style)
+    }).collect::<Vec<_>>();
+    frame.render_widget(List::new(items).block(section(" Разделы ", focused)), area);
+}
+
 /// A flat section with an inset header, preserving the traditional one-cell
 /// inner geometry used by lists and tables. No visible rectangular outline.
 pub(crate) fn section(title: &str, active: bool) -> Block<'_> {

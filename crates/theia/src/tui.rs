@@ -7134,23 +7134,7 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             applied.unwrap_or_else(|| "Работа с этими настройками не подтверждена".into())
         )
     };
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(
-                    format!(" {brand} "),
-                    Style::default()
-                        .fg(BG)
-                        .bg(ACCENT)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!("  {status}"), Style::default().fg(TEXT)),
-            ]),
-            Line::styled(state, Style::default().fg(MUTED)),
-        ])
-        .style(Style::default().bg(SURFACE)),
-        parts[0],
-    );
+    tui_widgets::shell_header(frame, parts[0], brand, status, &state);
     match model.screen {
         Screen::Home => {
             let cards = home_layout(parts[1]);
@@ -9181,32 +9165,7 @@ fn draw_workspace(
     };
     let page = ui.map_or(0, |u| u.workspace_page);
     let nav_focused = ui.is_some_and(|u| u.workspace_focus == WorkspaceFocus::Navigation);
-    let categories = pages(role).iter().enumerate().map(|(i, label)| {
-        let current = i == page;
-        let marker = if current && nav_focused {
-            "›"
-        } else if current {
-            "•"
-        } else {
-            " "
-        };
-        let style = if current && nav_focused {
-            Style::default()
-                .fg(ACCENT)
-                .bg(FOCUS)
-                .add_modifier(Modifier::BOLD)
-        } else if current {
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(TEXT)
-        };
-        ListItem::new(format!("{marker} {label}")).style(style)
-    });
-    frame.render_widget(
-        List::new(categories.collect::<Vec<_>>())
-            .block(tui_widgets::section(" Разделы ", nav_focused)),
-        nav,
-    );
+    tui_widgets::section_navigation(frame, nav, pages(role), page, nav_focused);
     if let Some(editor) = editor {
         if page_has_records(role, page) {
             draw_workspace_records(

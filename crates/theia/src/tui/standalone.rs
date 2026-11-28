@@ -2,11 +2,12 @@
 //! terminal, catalogue, exact plan consent and backend as the CLI.
 use super::{io, event, Event, KeyCode, KeyEventKind, KeyModifiers, Terminal, CrosstermBackend,
     Frame, Layout, Constraint, Paragraph, Row, Table, Wrap, Style, Line, KeyEvent, RoutingPanel,
-    TEXT, MUTED, ACCENT, SURFACE, FOCUS, WARNING, tui_widgets, TuiError, TerminalGuard, IsTerminal};
+    Rect, Modifier, ActionItem, Actions, Field, Form, TEXT, MUTED, ACCENT, SURFACE, FOCUS, WARNING, ERROR,
+    tui_widgets, TuiError, TerminalGuard, IsTerminal, workspace_columns};
 use crate::anti_dpi::{
     authority::Candidate,
-    catalog::{Catalog, Overlay, MAX_JOB_DOMAINS},
-    diagnostic::{strategy_columns, CellResult, CellStatus, Plan},
+    catalog::{Catalog, Overlay, MAX_JOB_DOMAINS, VERSION},
+    diagnostic::{strategy_columns, strategy_unavailable, CellResult, CellStatus, Plan, Report, Reason, Stage},
     Document,
 };
 use std::{
@@ -14,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 fn column_label(id: &str) -> &str {
@@ -22,7 +23,7 @@ fn column_label(id: &str) -> &str {
         "direct" => "Direct",
         "tcp_header" => "Header",
         "tcp_middle" => "Middle",
-        "tcp_balanced" => "Balance",
+        "tcp_balanced" => "Balanced",
         "quic_v1_initial_split" => "QUIC1",
         "quic_v2_initial_split" => "QUIC2",
         "stun_fingerprint" => "STUN",
@@ -50,11 +51,199 @@ fn status(cell: Option<&CellResult>) -> &'static str {
     }
 }
 
+
+const SECTIONS: &[&str] = &["Обзор", "Подключение", "Маршрутизация", "Диагностика", "Статистика", "Настройки"];
+const OVERVIEW: usize = 0;
+const CONNECTION: usize = 1;
+const ROUTING: usize = 2;
+const DIAGNOSTICS: usize = 3;
+const STATISTICS: usize = 4;
+const SETTINGS: usize = 5;
+
+fn yes(value: bool) -> &'static str { if value { "Разрешено" } else { "Запрещено" } }
+
+fn stage(value: Stage) -> &'static str {
+    match value { Stage::Passed => "Пройдено", Stage::Failed => "Ошибка", Stage::NotRun => "Не выполнялось" }
+}
+fn reason(value: Reason) -> &'static str {
+    match value {
+        Reason::None => "Нет ошибки",
+        Reason::AwaitingAcceptance => "Стратегия не прошла независимую приёмку",
+        Reason::MissingEndpointMetadata => "Нет подтверждённых данных о совместимом endpoint",
+        Reason::Budget => "Исчерпан бюджет задания",
+        Reason::Cancelled => "Отменено пользователем",
+        Reason::ContextChanged => "Изменился контекст политики или сети",
+        Reason::Dns(_) => "Ошибка защищённого DNS",
+        Reason::Timeout => "Истёк срок ожидания",
+        Reason::Network => "Сетевая ошибка",
+        Reason::Tls => "Ошибка TLS или проверки безопасности",
+        Reason::Protocol => "Некорректный ответ протокола",
+        Reason::NoTransformation => "Фактическая модификация не подтверждена",
+        Reason::ProtectiveDenial => "Защитный отказ политики",
+    }
+}
+fn status_long(value: CellStatus) -> &'static str {
+    match value {
+        CellStatus::Available => "Доступно (проверенный endpoint)",
+        CellStatus::Redirect => "Перенаправление (цель не проверялась)",
+        CellStatus::HttpError => "Ограничено / HTTP-ошибка",
+        CellStatus::Unavailable => "Недоступно",
+        CellStatus::DnsError => "Ошибка DNS",
+        CellStatus::SecurityError => "Ошибка TLS / безопасности",
+        CellStatus::PolicyDenied => "Запрещено политикой",
+        CellStatus::Unsupported => "Не поддерживается",
+        CellStatus::NotApplicable => "Неприменимо",
+        CellStatus::NotChecked => "Не проверено",
+        CellStatus::Cancelled => "Отменено",
+    }
+}
+fn cell_color(cell: Option<&CellResult>) -> ratatui::style::Color {
+    match cell {
+        Some(c) if c.stale => MUTED,
+        Some(c) => match c.status {
+            CellStatus::Available => ACCENT,
+            CellStatus::Redirect | CellStatus::HttpError => WARNING,
+            CellStatus::Unavailable | CellStatus::DnsError | CellStatus::SecurityError | CellStatus::PolicyDenied => ERROR,
+            _ => MUTED,
+        },
+        None => MUTED,
+    }
+}
+
+/// All edits stay in this local draft until a separate reviewed Save.
+/// Existing routing rules are never implicitly populated from the catalogue.
+struct Draft {
+    original: Document,
+    expected: Option<Vec<u8>>,
+    values: [String; 5],
+    flags: [bool; 4],
+    selected: usize,
+    error: String,
+}
+impl Draft {
+    fn new(original: Document, expected: Option<Vec<u8>>) -> Self {
+        let local = &original.anti_dpi;
+        let values = [
+            local.resolver.as_ref().map_or_else(String::new, |r| r.hostname.clone()),
+            local.resolver.as_ref().map_or_else(String::new, |r| r.bootstrap.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")),
+            local.proxy.http_listen.clone(), local.proxy.socks5_listen.clone(), String::new(),
+        ];
+        let flags = [local.consent.direct_egress, local.consent.direct_dpi, local.consent.direct_dpi_stun, false];
+        Self { original, expected, values, flags, selected: 0, error: String::new() }
+    }
+
+    fn first_run(&self) -> bool { self.expected.is_none() }
+    fn count(&self) -> usize { if self.first_run() { 9 } else { 7 } }
+    fn input_index(&self) -> Option<usize> {
+        match self.selected { 0..=3 => Some(self.selected), 8 if self.first_run() && self.flags[3] => Some(4), _ => None }
+    }
+    fn paste(&mut self, value: &str) {
+        if let Some(i) = self.input_index() {
+            if !value.chars().any(char::is_control) && self.values[i].len() + value.len() <= 16_384 {
+                self.values[i].push_str(value);
+            }
+        }
+    }
+    fn form(&self) -> Form {
+        let mut fields = vec![
+            Field { id: 0, label: "Имя защищённого DNS (DoH)", value: self.values[0].clone(), hint: "Введите выбранное вами имя HTTPS DNS. Без системного DNS и fallback." },
+            Field { id: 1, label: "Доверенные bootstrap IP", value: self.values[1].clone(), hint: "Публичные IP выбранного DNS-провайдера через запятую. Не угадываются автоматически." },
+            Field { id: 2, label: "HTTP / CONNECT listener", value: self.values[2].clone(), hint: "Только loopback. Изменение требует отключения активной сессии." },
+            Field { id: 3, label: "SOCKS5 listener", value: self.values[3].clone(), hint: "Только loopback. UDP ASSOCIATE не означает перехват всего UDP системы." },
+            Field { id: 4, label: "Прямой выход в сеть (Пробел)", value: yes(self.flags[0]).into(), hint: "Ваш IP виден DNS-провайдеру и получателям. По умолчанию запрещено." },
+            Field { id: 5, label: "Anti-DPI (Пробел)", value: yes(self.flags[1]).into(), hint: "Только принятые стратегии. При отказе нет перехода на прямой маршрут." },
+            Field { id: 6, label: "STUN (отдельное разрешение)", value: yes(self.flags[2]).into(), hint: "Только совместимый credential-free Binding; приёмка обязательна." },
+        ];
+        if self.first_run() {
+            fields.push(Field { id: 7, label: "Начальная политика (Пробел)", value: if self.flags[3] { "Anti-DPI для явно заданных доменов" } else { "Ручная (пока без правил)" }.into(), hint: "Каталог не становится политикой автоматически. Выберите способ явно." });
+            fields.push(Field { id: 8, label: "Домены для начального правила", value: if self.flags[3] { self.values[4].clone() } else { "Не используется в ручном режиме".into() }, hint: "Введите имена через запятую или F3 — взять явно отмеченные домены каталога. Только точные имена." });
+        }
+        Form { fields, selected: self.selected,
+            lead: "Черновик · ↑↓ поля · Пробел разрешения/режим · F5 проверить · Esc отменить".into(),
+            error: self.error.clone() }
+    }
+
+    fn next_document(&self) -> Result<Document, String> {
+        let mut next = self.original.clone();
+        let local = &mut next.anti_dpi;
+        local.proxy.http_listen = self.values[2].trim().to_owned();
+        local.proxy.socks5_listen = self.values[3].trim().to_owned();
+        local.consent = crate::anti_dpi::Consent { direct_egress: self.flags[0], direct_dpi: self.flags[1], direct_dpi_stun: self.flags[2] };
+        let hostname = self.values[0].trim();
+        let bootstrap = self.values[1].split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty())
+            .map(|s| s.parse::<std::net::IpAddr>().map_err(|_| "Некорректный bootstrap IP".to_owned()))
+            .collect::<Result<Vec<_>, _>>()?;
+        local.resolver = if hostname.is_empty() && bootstrap.is_empty() { None } else {
+            Some(crate::anti_dpi::Resolver { hostname: hostname.to_owned(), bootstrap })
+        };
+        if self.first_run() && self.flags[3] {
+            let domains = self.values[4].split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty())
+                .map(|s| crate::routing::domain_name(s).map_err(|_| "Некорректное имя домена".to_owned()))
+                .collect::<Result<BTreeSet<_>, _>>()?;
+            if domains.is_empty() || domains.len() > MAX_JOB_DOMAINS {
+                return Err("Для рекомендуемой политики укажите от 1 до 64 доменов.".into());
+            }
+            // Validate via the same catalogue validator, including public-name restrictions.
+            let overlay = Overlay { custom: domains.iter().cloned().collect(), ..Overlay::default() };
+            Catalog::build(&overlay).map_err(|e| e.to_string())?;
+            local.rules = vec![crate::routing::Rule { name: "Выбранные домены".into(),
+                action: crate::routing::Action::DirectDpi,
+                domains: domains.into_iter().map(|name| format!("full:{name}")).collect(), ips: Vec::new(), applications: Vec::new() }];
+        }
+        if self.expected.is_some() && next != self.original {
+            next.anti_dpi.revision = self.original.anti_dpi.revision.checked_add(1).ok_or("Исчерпан номер ревизии")?;
+        }
+        next.prepare().map_err(|e| e.to_string())?;
+        Ok(next)
+    }
+}
+
+fn policy_text(doc: &Document) -> String {
+    use std::fmt::Write as _;
+    let local = &doc.anti_dpi;
+    let mut text = format!("Ревизия: {} · Правил: {}\nСистемный прокси · HTTP {} · SOCKS5 {}\n",
+        local.revision, local.rules.len(), local.proxy.http_listen, local.proxy.socks5_listen);
+    let _ = writeln!(text, "Защищённый DNS: {}", local.resolver.as_ref().map_or_else(|| "не настроен".into(),
+        |r| format!("https://{}/dns-query · {}", r.hostname, r.bootstrap.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "))));
+    let _ = writeln!(text, "Прямой выход: {} · Anti-DPI: {} · STUN: {}", yes(local.consent.direct_egress), yes(local.consent.direct_dpi), yes(local.consent.direct_dpi_stun));
+    let _ = writeln!(text, "\nПорядок правил (первое совпадение; условия ИЛИ):");
+    for (i, rule) in local.rules.iter().enumerate() {
+        let _ = writeln!(text, "{}. {} · {} · домены: {} · IP: {}", i + 1, rule.name,
+            match rule.action { crate::routing::Action::Direct => "Напрямую", crate::routing::Action::DirectDpi => "Anti-DPI", crate::routing::Action::Blocked => "Блокировать", _ => "Недопустимый маршрут" },
+            rule.domains.join(", "), rule.ips.join(", "));
+    }
+    let _ = writeln!(text, "По умолчанию: напрямую только если ни одно правило не совпало.\nНеопределённость или отказ Anti-DPI: блокировать, не переключать на прямой маршрут.");
+    if local.rules.is_empty() || !local.consent.direct_dpi { let _ = writeln!(text, "ВНИМАНИЕ: Anti-DPI не активен."); }
+    let _ = writeln!(text, "Прямое подключение раскрывает публичный IP. TUN/WinDivert недоступны.");
+    text
+}
+
+struct ReportContext {
+    config: Vec<u8>,
+    overlay: Option<Vec<u8>>,
+    epoch: Option<u64>,
+    checked: Instant,
+    stale: bool,
+}
+impl ReportContext {
+    fn read(path: &Path, overlay: Option<Vec<u8>>) -> Option<Self> {
+        Some(Self { config: crate::config::editor_bytes(path).ok()?, overlay,
+            epoch: crate::network_scope::generation(), checked: Instant::now(), stale: false })
+    }
+    fn refresh(&mut self, path: &Path, overlay_path: &Path) {
+        if self.stale || self.checked.elapsed() < Duration::from_secs(1) { return; }
+        self.checked = Instant::now();
+        let overlay_current = match &self.overlay {
+            Some(bytes) => crate::config::editor_bytes(overlay_path).is_ok_and(|value| &value == bytes),
+            None => std::fs::symlink_metadata(overlay_path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound),
+        };
+        self.stale = !overlay_current || crate::network_scope::generation() != self.epoch
+            || !crate::config::editor_bytes(path).is_ok_and(|value| value == self.config);
+    }
+}
+
 #[cfg(windows)]
 use crate::anti_dpi::session::{Control, DiagnosticUpdate as Update, Phase};
-
-#[cfg(not(windows))]
-use crate::anti_dpi::diagnostic::Report;
 
 #[cfg(not(windows))]
 enum Update {
@@ -109,8 +298,13 @@ impl Drop for Worker {
 enum Review {
     Diagnostic(Plan),
     Policy(Candidate, bool),
+    Save(Box<Draft>, Document),
+    DiscardRouting,
+    Export(String, PathBuf),
     #[cfg(windows)]
-    Connect(Candidate),
+    Connect(Candidate, crate::windows_system_proxy::ApplyReview),
+    #[cfg(windows)]
+    Recover(crate::windows_system_proxy::RecoveryReview),
     #[cfg(windows)]
     Disconnect(bool),
 }
@@ -123,7 +317,7 @@ struct OwnedSession {
 
 #[cfg(windows)]
 impl OwnedSession {
-    fn start(candidate: Candidate) -> Result<Self, String> {
+    fn start(candidate: Candidate, review: crate::windows_system_proxy::ApplyReview) -> Result<Self, String> {
         let digest = candidate.digest();
         let (control, commands) = Control::channel().map_err(|error| error.to_string())?;
         let owner = control.clone();
@@ -131,7 +325,7 @@ impl OwnedSession {
             let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2)
                 .thread_stack_size(8 * 1024 * 1024).enable_all().build()
                 .map_err(|_| "Не удалось создать runtime".to_owned())?;
-            runtime.block_on(crate::local_proxy::run_standalone_controlled(candidate, digest, owner, commands))
+            runtime.block_on(crate::local_proxy::run_standalone_controlled(candidate, digest, owner, commands, review))
                 .map_err(|error| error.to_string())
         }).map_err(|_| "Не удалось запустить локальный runtime".to_owned())?;
         Ok(Self { control, thread: Some(thread) })
@@ -170,7 +364,22 @@ struct Panel {
     exit_after_stop: bool,
     leave_requested: bool,
     notice: String,
-    overview: bool,
+    page: usize,
+    navigation: bool,
+    action: usize,
+    draft: Option<Draft>,
+    catalogue_draft: Option<Draft>,
+    confirm_selected: bool,
+    help: bool,
+    details: bool,
+    group: usize,
+    column: usize,
+    report_context: Option<ReportContext>,
+    applied_revision: Option<u64>,
+    #[cfg(windows)]
+    os_observation: Option<crate::windows_system_proxy::ObservedProxy>,
+    #[cfg(windows)]
+    os_checked: Option<Instant>,
 }
 
 impl Panel {
@@ -189,6 +398,10 @@ impl Panel {
             Err(_) => return Err(TuiError::Configuration("cannot inspect diagnostic overlay")),
         };
         let catalog = Catalog::build(&overlay).map_err(|_| TuiError::Configuration("invalid diagnostic catalogue"))?;
+        let draft = if std::fs::symlink_metadata(&path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
+            Some(Draft::new(Document::parse(include_str!("../../../../examples/anti-dpi.toml"))
+                .map_err(|_| TuiError::Configuration("invalid embedded standalone example"))?, None))
+        } else { None };
         Ok(Self { path, overlay_path, overlay, overlay_bytes, catalog, selected: BTreeSet::new(),
             results: BTreeMap::new(), row: 0, offset: 0, filter: String::new(), editing: None,
             review: None, review_scroll: 0, worker: None, routing: None,
@@ -199,7 +412,13 @@ impl Panel {
             #[cfg(windows)]
             exit_after_stop: false,
             leave_requested: false,
-            notice: "Запросы выполняются только после подтверждения плана.".into(), overview: true })
+            notice: "Сетевые запросы только после подтверждения.".into(), page: OVERVIEW, navigation: false, action: 0,
+            draft, catalogue_draft: None, confirm_selected: false, help: false, details: false, group: 0, column: 0, report_context: None, applied_revision: None,
+            #[cfg(windows)]
+            os_observation: None,
+            #[cfg(windows)]
+            os_checked: None,
+        })
     }
 
     fn visible(&self) -> Vec<&crate::anti_dpi::catalog::Entry> {
@@ -215,7 +434,7 @@ impl Panel {
                     self.catalog = new.catalog;
                     self.selected.retain(|host| self.catalog.entries().iter()
                         .any(|entry| &entry.hostname == host && !entry.excluded));
-                    self.results.clear();
+                    self.mark_stale();
                     self.row = 0;
                     self.offset = 0;
                     self.notice = "Список сохранён; правила маршрутизации не изменены.".into();
@@ -226,14 +445,25 @@ impl Panel {
         }
     }
 
+    fn mark_stale(&mut self) {
+        if let Some(context) = &mut self.report_context { context.stale = true; }
+        for cell in self.results.values_mut() { cell.stale = true; }
+    }
+
     fn poll(&mut self) {
+        if let Some(context) = &mut self.report_context { context.refresh(&self.path, &self.overlay_path); }
         if let Some((panel, _, _)) = &mut self.routing { panel.poll(); }
         #[cfg(windows)]
         {
+            if self.os_checked.is_none_or(|last| last.elapsed() >= Duration::from_secs(1)) {
+                self.os_checked = Some(Instant::now());
+                self.os_observation = crate::windows_system_proxy::observed_proxy().ok();
+            }
             if let Some(reply) = &self.apply_reply {
                 match reply.try_recv() {
                     Ok(result) => {
                         self.apply_reply = None;
+                        if result.is_ok() { self.mark_stale(); }
                         self.notice = result.map_or_else(|e| e, |_| "Политика применена без перезапуска; прежние потоки отозваны.".into());
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
@@ -281,6 +511,9 @@ impl Panel {
                 Err(error) => self.notice = error,
             }
         }
+        if self.report_context.as_ref().is_some_and(|c| c.stale) {
+            for cell in self.results.values_mut() { cell.stale = true; }
+        }
     }
 
     fn open_routing(&mut self) {
@@ -303,7 +536,15 @@ impl Panel {
             self.routing = Some((panel, document, bytes));
             return;
         }
-        if !panel.save_requested { return; }
+        if !panel.save_requested {
+            if panel.settings != panel.original {
+                self.routing = Some((panel, document, bytes));
+                self.review = Some(Review::DiscardRouting);
+                self.review_scroll = 0;
+                self.confirm_selected = false;
+            } else { self.navigation = true; }
+            return;
+        }
         panel.save_requested = false;
         let mut next = document.clone();
         let result = (|| {
@@ -320,8 +561,10 @@ impl Panel {
         })();
         match result {
             Ok(()) => {
-                self.notice = "Сохранён новый черновик. Для публикации выберите Apply.".into();
-                self.results.clear();
+                self.notice = "Правила сохранены. Для публикации отдельно примените политику.".into();
+                self.applied_revision = None;
+                self.mark_stale();
+                self.open_routing();
             }
             Err(error) => {
                 panel.message = error;
@@ -330,18 +573,113 @@ impl Panel {
         }
     }
 
+    fn open_settings(&mut self) {
+        let result = (|| {
+            let bytes = crate::config::editor_bytes(&self.path).map_err(|e| e.to_string())?;
+            let document = Document::parse(std::str::from_utf8(&bytes).map_err(|_| "Некорректный UTF-8".to_owned())?).map_err(|e| e.to_string())?;
+            Ok::<_, String>(Draft::new(document, Some(bytes)))
+        })();
+        match result {
+            Ok(draft) => self.draft = Some(draft),
+            Err(error) => self.notice = format!("Файл не изменён: {error}. Откройте исправный файл или создайте новый по другому пути."),
+        }
+    }
+
     fn create_config(&mut self) {
-        let result = Document::parse(include_str!("../../../../examples/anti-dpi.toml"))
-            .map_err(|e| e.to_string()).and_then(|document| document.save(&self.path, None)
-                .map_err(|e| format!("{e:?}")));
-        self.notice = match result {
-            Ok(()) => "Создана безопасная конфигурация без согласий. Задайте resolver и правила в TOML, затем явно Apply.".into(),
-            Err(error) => format!("Не удалось создать: {error}"),
-        };
+        if !std::fs::symlink_metadata(&self.path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
+            self.notice = "Файл уже существует; создание не перезаписывает его.".into();
+            return;
+        }
+        match Document::parse(include_str!("../../../../examples/anti-dpi.toml")) {
+            Ok(doc) => self.draft = Some(Draft::new(doc, None)),
+            Err(error) => self.notice = error.to_string(),
+        }
+    }
+
+    fn draft_key(&mut self, code: KeyCode) {
+        let Some(mut draft) = self.draft.take() else { return };
+        match code {
+            KeyCode::Esc => { self.notice = "Черновик отменён; файл не изменён.".into(); return; }
+            KeyCode::Up | KeyCode::BackTab => draft.selected = draft.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Tab => draft.selected = (draft.selected + 1).min(draft.count() - 1),
+            KeyCode::F(3) if draft.first_run() && draft.flags[3] && draft.selected == 8 => {
+                self.catalogue_draft = Some(draft);
+                self.open_page(DIAGNOSTICS);
+                self.notice = "Выберите домены для начального правила; F3 вернуться к мастеру. Проверки не запускаются.".into();
+                return;
+            }
+            KeyCode::F(5) => match draft.next_document() {
+                Ok(next) => {
+                    self.review = Some(Review::Save(Box::new(draft), next));
+                    self.review_scroll = 0;
+                    self.confirm_selected = false;
+                    return;
+                }
+                Err(error) => draft.error = error,
+            },
+            KeyCode::Char(' ') | KeyCode::Enter if (4..=7).contains(&draft.selected) => {
+                let index = draft.selected - 4;
+                draft.flags[index] = !draft.flags[index];
+                draft.error.clear();
+            }
+            KeyCode::Backspace => if let Some(i) = draft.input_index() { draft.values[i].pop(); draft.error.clear(); },
+            KeyCode::Delete => if let Some(i) = draft.input_index() { draft.values[i].clear(); draft.error.clear(); },
+            KeyCode::Char(ch) if !ch.is_control() => draft.paste(&ch.to_string()),
+            _ => {}
+        }
+        self.draft = Some(draft);
+    }
+
+    fn open_page(&mut self, page: usize) {
+        self.page = page.min(SECTIONS.len() - 1);
+        self.navigation = false;
+        self.action = 0;
+        if self.page == ROUTING && self.routing.is_none() { self.open_routing(); }
+    }
+
+    fn actions(&self) -> Vec<ActionItem> {
+        let item = |key, label| ActionItem { key, label };
+        match self.page {
+            OVERVIEW => {
+                if Document::read(&self.path).is_ok() { vec![item('p', "Открыть подключение"), item('t', "Настроить локальную политику"), item('d', "Открыть диагностику")] }
+                else if std::fs::symlink_metadata(&self.path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
+                    vec![item('n', "Настроить Anti-DPI"), item('d', "Открыть каталог")]
+                } else { vec![item('t', "Проверить конфигурацию"), item('d', "Открыть каталог")] }
+            }
+            CONNECTION => {
+                let mut actions = vec![item('p', "Подключить / отключить (подтверждение)"), item('a', "Применить сохранённую политику"), item('e', "Первично зарегистрировать локальную политику"), item('t', "Настройки подключения")];
+                if cfg!(windows) { actions.push(item('v', "Проверить и восстановить системный прокси")); }
+                actions
+            },
+            ROUTING => vec![item('r', "Открыть редактор маршрутизации"), item('a', "Применить сохранённую политику")],
+            STATISTICS => vec![item('p', "Открыть подключение"), item('d', "Открыть диагностику")],
+            SETTINGS => vec![item('t', "Изменить DNS, listeners и разрешения"), item('a', "Применить сохранённую политику"), item('e', "Первично зарегистрировать локальную политику")],
+            _ => Vec::new(),
+        }
+    }
+
+    fn owner_active(&self) -> bool {
+        #[cfg(windows)]
+        { self.session.is_some() }
+        #[cfg(not(windows))]
+        { false }
+    }
+
+    fn begin_export(&mut self) {
+        if self.results.is_empty() || self.worker.is_some() {
+            self.notice = "Сначала завершите диагностическое задание.".into();
+            return;
+        }
+        let report = Report { catalog_version: VERSION, catalog_digest: Catalog::builtin_digest(),
+            plan_digest: [0; 32], cells: self.results.values().cloned().collect() };
+        self.review = Some(Review::Export(report.anonymous_summary(), self.path.with_file_name("anti-dpi-diagnostic-report.txt")));
+        self.review_scroll = 0;
+        self.confirm_selected = false;
     }
 
     fn begin_review(&mut self, enroll: Option<bool>) {
         self.review_scroll = 0;
+        self.confirm_selected = false;
         match enroll {
             Some(enroll) => match Candidate::read(&self.path) {
                 Ok(candidate) => self.review = Some(Review::Policy(candidate, enroll)),
@@ -359,12 +697,16 @@ impl Panel {
     }
 
     fn key(&mut self, code: KeyCode) -> Result<bool, TuiError> {
-        if self.routing.is_some() {
-            self.routing_key(KeyEvent::new(code, KeyModifiers::NONE));
-            return Ok(false);
-        }
         #[cfg(windows)]
         if self.apply_reply.is_some() { return Ok(false); }
+        if self.help {
+            if matches!(code, KeyCode::Esc | KeyCode::F(1)) { self.help = false; }
+            return Ok(false);
+        }
+        if self.draft.is_some() {
+            self.draft_key(code);
+            return Ok(false);
+        }
         if let Some((custom, mut text)) = self.editing.take() {
             match code {
                 KeyCode::Esc => {}
@@ -389,13 +731,44 @@ impl Panel {
         }
         if self.review.is_some() {
             match code {
-                KeyCode::Esc => { self.review = None; }
+                KeyCode::Esc => { if let Some(Review::Save(draft, _)) = self.review.take() { self.draft = Some(*draft); } }
+                KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => self.confirm_selected = !self.confirm_selected,
+                KeyCode::Enter if !self.confirm_selected => { if let Some(Review::Save(draft, _)) = self.review.take() { self.draft = Some(*draft); } }
                 KeyCode::Up => self.review_scroll = self.review_scroll.saturating_sub(1),
                 KeyCode::Down => self.review_scroll = self.review_scroll.saturating_add(1),
                 KeyCode::PageUp => self.review_scroll = self.review_scroll.saturating_sub(10),
                 KeyCode::PageDown => self.review_scroll = self.review_scroll.saturating_add(10),
-                KeyCode::Char('y') => if let Some(review) = self.review.take() {
+                KeyCode::Enter | KeyCode::Char('y') if self.confirm_selected || code == KeyCode::Char('y') => if let Some(review) = self.review.take() {
                     match review {
+                        Review::Save(draft, next) => {
+                            match next.save(&self.path, draft.expected.as_deref()) {
+                                Ok(()) => {
+                                    self.notice = "Файл сохранён. Политика ещё не применена; подключения не запускались.".into();
+                                    self.applied_revision = None;
+                                    self.mark_stale();
+                                    self.open_page(SETTINGS);
+                                }
+                                Err(error) => {
+                                    let mut draft = *draft;
+                                    draft.error = format!("Сохранение не подтверждено: {error:?}");
+                                    self.draft = Some(draft);
+                                }
+                            }
+                        }
+                        Review::DiscardRouting => {
+                            self.routing = None;
+                            self.navigation = true;
+                            self.notice = "Черновик маршрутизации отменён.".into();
+                        }
+                        Review::Export(summary, path) => {
+                            use std::io::Write as _;
+                            let result = std::fs::OpenOptions::new().create_new(true).write(true).open(&path)
+                                .and_then(|mut file| { file.write_all(summary.as_bytes())?; file.sync_all() });
+                            self.notice = match result {
+                                Ok(()) => format!("Обезличенный отчёт сохранён: {}", path.display()),
+                                Err(error) => format!("Экспорт не подтверждён: {error}. Существующий файл не перезаписывается."),
+                            };
+                        }
                         Review::Policy(candidate, enroll) => {
                             #[cfg(windows)]
                             if let Some(session) = &self.session {
@@ -409,13 +782,16 @@ impl Panel {
                                 }
                                 return Ok(false);
                             }
+                            let revision = candidate.document().anti_dpi.revision;
                             let digest = candidate.digest();
                             let result = if enroll { candidate.enroll(digest) } else { candidate.apply(digest) };
+                            if result.is_ok() { self.applied_revision = Some(revision); self.mark_stale(); }
                             self.notice = result.map_or_else(|e| e.to_string(),
                                 |_| "Локальная политика применена; сеть и системный прокси не изменены.".into());
                         }
                         Review::Diagnostic(plan) => {
                             self.results.clear();
+                            self.report_context = ReportContext::read(&self.path, self.overlay_bytes.clone());
                             #[cfg(windows)]
                             if let Some(session) = &self.session {
                                 match Worker::start_owned(plan, &session.control) {
@@ -428,10 +804,18 @@ impl Panel {
                             self.notice = "Диагностика выполняется. Esc отменяет задание.".into();
                         }
                         #[cfg(windows)]
-                        Review::Connect(candidate) => match OwnedSession::start(candidate) {
+                        Review::Connect(candidate, review) => match OwnedSession::start(candidate, review) {
                             Ok(session) => { self.session = Some(session); self.notice = "Подготовка listeners и WinINet…".into(); }
                             Err(error) => self.notice = error,
                         },
+                        #[cfg(windows)]
+                        Review::Recover(review) => {
+                            self.notice = match crate::windows_system_proxy::recover_reviewed(review) {
+                                Ok(_) => "Условное восстановление завершено; чужие изменения не перезаписывались.".into(),
+                                Err(error) => format!("Восстановление не выполнено: {error:?}. Не изменяйте чужие настройки."),
+                            };
+                            self.os_checked = None;
+                        }
                         #[cfg(windows)]
                         Review::Disconnect(exit) => {
                             if let Some(session) = &self.session {
@@ -446,46 +830,130 @@ impl Panel {
             }
             return Ok(false);
         }
+        if self.routing.is_some() {
+            self.routing_key(KeyEvent::new(code, KeyModifiers::NONE));
+            return Ok(false);
+        }
+        if self.catalogue_draft.is_some() {
+            if matches!(code, KeyCode::F(3) | KeyCode::Esc | KeyCode::Enter) {
+                let mut draft = self.catalogue_draft.take().unwrap();
+                if code != KeyCode::Esc {
+                    draft.values[4] = self.selected.iter().cloned().collect::<Vec<_>>().join(", ");
+                    draft.error.clear();
+                }
+                self.page = OVERVIEW;
+                self.draft = Some(draft);
+                return Ok(false);
+            }
+            if !matches!(code, KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown |
+                KeyCode::Char(' ') | KeyCode::Char('s') | KeyCode::Char('c') | KeyCode::Char('/') | KeyCode::Char('i')) {
+                return Ok(false);
+            }
+        }
+        if code == KeyCode::F(1) { self.help = true; return Ok(false); }
+        if self.details {
+            if matches!(code, KeyCode::Esc | KeyCode::F(7)) { self.details = false; }
+            return Ok(false);
+        }
         if let Some(worker) = &self.worker {
             if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
                 worker.cancel();
                 self.notice = "Отмена; сохраняются завершённые проверки.".into();
+                return Ok(false);
+            }
+            if !matches!(code, KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Char('[') | KeyCode::Char(']') | KeyCode::F(7)) {
+                return Ok(false);
+            }
+        }
+        if self.navigation {
+            match code {
+                KeyCode::Up | KeyCode::BackTab => self.page = self.page.saturating_sub(1),
+                KeyCode::Down | KeyCode::Tab => self.page = (self.page + 1).min(SECTIONS.len() - 1),
+                KeyCode::Enter | KeyCode::Right => self.open_page(self.page),
+                KeyCode::Esc | KeyCode::F(2) => self.navigation = false,
+                _ => {}
             }
             return Ok(false);
         }
+        if code == KeyCode::F(2) || (code == KeyCode::Left && self.page != DIAGNOSTICS) {
+            self.navigation = true;
+            return Ok(false);
+        }
+        let code = if self.page != DIAGNOSTICS {
+            let actions = self.actions();
+            match tui_widgets::action_key(&actions, &mut self.action, code) { Some(code) => code, None => return Ok(false) }
+        } else { code };
         match code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 #[cfg(windows)]
                 if self.session.is_some() {
                     self.review = Some(Review::Disconnect(true));
                     self.review_scroll = 0;
+                    self.confirm_selected = false;
                     return Ok(false);
                 }
                 return Ok(true);
             },
-            KeyCode::Tab | KeyCode::BackTab => self.overview = !self.overview,
-            KeyCode::Char('n') if self.overview => self.create_config(),
-            KeyCode::Char('e') if self.overview => self.begin_review(Some(true)),
-            KeyCode::Char('a') if self.overview => self.begin_review(Some(false)),
-            KeyCode::Char('r') if self.overview => self.open_routing(),
-            KeyCode::Char('p') if self.overview => {
+            KeyCode::Tab | KeyCode::BackTab if self.page == DIAGNOSTICS => self.navigation = true,
+            KeyCode::Char('n') if self.page != DIAGNOSTICS => self.create_config(),
+            KeyCode::Char('t') if self.page != DIAGNOSTICS => { self.page = SETTINGS; self.open_settings(); }
+            KeyCode::Char('d') if self.page != DIAGNOSTICS => self.open_page(DIAGNOSTICS),
+            KeyCode::Char('e') if self.page != DIAGNOSTICS => self.begin_review(Some(true)),
+            KeyCode::Char('a') if self.page != DIAGNOSTICS => self.begin_review(Some(false)),
+            KeyCode::Char('r') if self.page != DIAGNOSTICS => self.open_page(ROUTING),
+            KeyCode::Char('p') if self.page != DIAGNOSTICS => {
+                if self.page != CONNECTION { self.open_page(CONNECTION); return Ok(false); }
+                self.confirm_selected = false;
                 #[cfg(windows)]
                 {
                     self.review_scroll = 0;
                     if self.session.is_some() { self.review = Some(Review::Disconnect(false)); }
                     else { match Candidate::read(&self.path) {
-                        Ok(candidate) => self.review = Some(Review::Connect(candidate)),
+                        Ok(candidate) => {
+                            let bind = candidate.document().anti_dpi.proxy.http_listen.parse::<std::net::SocketAddr>();
+                            match bind.ok().and_then(|bind| crate::windows_system_proxy::review_apply(bind).ok()) {
+                                Some(review) => self.review = Some(Review::Connect(candidate, review)),
+                                None => self.notice = "Не удалось получить безопасный снимок WinINet: возможен другой владелец, журнал восстановления или неподходящий listener. Не перезаписываем настройки.".into(),
+                            }
+                        }
                         Err(error) => self.notice = error.to_string(),
                     } }
                 }
                 #[cfg(not(windows))]
                 { self.notice = "System Proxy MVP доступен только на Windows.".into(); }
             },
-            KeyCode::Char('/') if !self.overview => self.editing = Some((false, self.filter.clone())),
-            KeyCode::Char('i') if !self.overview => self.editing = Some((true, String::new())),
-            KeyCode::Up if !self.overview => self.row = self.row.saturating_sub(1),
-            KeyCode::Down if !self.overview => self.row = (self.row + 1).min(self.visible().len().saturating_sub(1)),
-            KeyCode::Char(' ') if !self.overview => {
+            KeyCode::Char('v') if self.page == CONNECTION => {
+                #[cfg(windows)]
+                if self.session.is_none() {
+                    match crate::windows_system_proxy::review_recovery() {
+                        Ok(review) => { self.review = Some(Review::Recover(review)); self.review_scroll = 0; self.confirm_selected = false; }
+                        Err(error) => self.notice = format!("Восстановление недоступно: {error:?}. Чужой процесс не останавливаем."),
+                    }
+                } else { self.notice = "Сначала штатно отключите собственную сессию.".into(); }
+            },
+            KeyCode::Char('/') if self.page == DIAGNOSTICS => self.editing = Some((false, self.filter.clone())),
+            KeyCode::Char('i') if self.page == DIAGNOSTICS => self.editing = Some((true, String::new())),
+            KeyCode::Up if self.page == DIAGNOSTICS => self.row = self.row.saturating_sub(1),
+            KeyCode::Down if self.page == DIAGNOSTICS => self.row = (self.row + 1).min(self.visible().len().saturating_sub(1)),
+            KeyCode::PageUp if self.page == DIAGNOSTICS => self.row = self.row.saturating_sub(12),
+            KeyCode::PageDown if self.page == DIAGNOSTICS => self.row = (self.row + 12).min(self.visible().len().saturating_sub(1)),
+            KeyCode::Left if self.page == DIAGNOSTICS => self.column = self.column.saturating_sub(1),
+            KeyCode::Right if self.page == DIAGNOSTICS => self.column = (self.column + 1).min(if self.group == 0 { 3 } else { 1 }),
+            KeyCode::Char('[') if self.page == DIAGNOSTICS => { self.group = self.group.saturating_sub(1); self.column = 0; }
+            KeyCode::Char(']') if self.page == DIAGNOSTICS => { self.group = (self.group + 1).min(3); self.column = 0; }
+            KeyCode::F(7) if self.page == DIAGNOSTICS => self.details = true,
+            KeyCode::Char('z') if self.page == DIAGNOSTICS => self.begin_export(),
+            KeyCode::Char('b') if self.page == DIAGNOSTICS => {
+                let failed = self.results.values().filter(|c| !c.stale && matches!(c.status, CellStatus::Unavailable | CellStatus::HttpError | CellStatus::DnsError))
+                    .map(|c| c.domain.clone()).collect::<BTreeSet<_>>();
+                self.selected = failed.into_iter().filter(|h| self.catalog.entries().iter().any(|e| &e.hostname == h && !e.excluded)).take(MAX_JOB_DOMAINS).collect();
+                if self.selected.is_empty() { self.notice = "Нет разрешённых неуспешных проверок для повтора.".into(); }
+                else { self.begin_review(None); }
+            }
+            KeyCode::Char('R') if self.page == DIAGNOSTICS => {
+                self.set_overlay(Overlay { excluded: Vec::new(), ..self.overlay.clone() });
+            }
+            KeyCode::Char(' ') if self.page == DIAGNOSTICS => {
                 let chosen = self.visible().get(self.row).filter(|e| !e.excluded).map(|e| e.hostname.clone());
                 if let Some(host) = chosen {
                     if !self.selected.remove(&host) {
@@ -494,15 +962,15 @@ impl Panel {
                     }
                 }
             }
-            KeyCode::Char('s') if !self.overview => {
+            KeyCode::Char('s') if self.page == DIAGNOSTICS => {
                 let hosts = self.visible().iter().filter(|e| !e.excluded).map(|e| e.hostname.clone()).collect::<Vec<_>>();
                 for host in hosts {
                     if self.selected.len() >= MAX_JOB_DOMAINS { break; }
                     self.selected.insert(host);
                 }
             }
-            KeyCode::Char('c') if !self.overview => self.selected.clear(),
-            KeyCode::Char('x') if !self.overview => {
+            KeyCode::Char('c') if self.page == DIAGNOSTICS => self.selected.clear(),
+            KeyCode::Char('x') if self.page == DIAGNOSTICS => {
                 let chosen = self.visible().get(self.row).map(|e| (e.hostname.clone(), e.excluded));
                 if let Some((host, excluded)) = chosen {
                     let mut next = self.overlay.clone();
@@ -511,93 +979,292 @@ impl Panel {
                     self.set_overlay(next);
                 }
             }
-            KeyCode::Enter if !self.overview => self.begin_review(None),
+            KeyCode::Enter if self.page == DIAGNOSTICS => self.begin_review(None),
             _ => {}
         }
         Ok(false)
     }
 
+    fn owner_text(&self) -> &'static str {
+        #[cfg(windows)]
+        {
+            if let Some(session) = &self.session {
+                return match session.control.status().phase {
+                    Phase::Starting => "Подготовка подключения",
+                    Phase::Connected => "Собственная сессия · readback подтверждён",
+                    Phase::Stopping => "Отключение / восстановление",
+                    Phase::Stopped => "Отключено",
+                    Phase::Failed => "Ошибка подключения",
+                };
+            }
+            use crate::windows_system_proxy::{ObservedProxy, ProxyStatus};
+            match self.os_observation {
+                Some(ObservedProxy::Direct) => "Собственная сессия отсутствует",
+                Some(ObservedProxy::External) => "Внешний прокси / PAC / автоопределение",
+                Some(ObservedProxy::Journal(ProxyStatus::PendingOwned)) => "Журнал прокси · владелец не подтверждён",
+                Some(ObservedProxy::Journal(ProxyStatus::PendingConflict)) => "Требуется восстановление · чужое изменение",
+                Some(ObservedProxy::Journal(ProxyStatus::PendingAlreadyRestored)) => "Журнал требует проверки",
+                Some(ObservedProxy::Journal(ProxyStatus::NoJournal)) | None => "Состояние Windows не подтверждено",
+            }
+        }
+        #[cfg(not(windows))]
+        { "Системный прокси MVP доступен только на Windows" }
+    }
+
+    fn file_state(&self, document: Option<&Document>) -> String {
+        if self.draft.is_some() || self.catalogue_draft.is_some() || self.routing.as_ref().is_some_and(|(p, _, _)| p.settings != p.original || p.fields.is_some()) {
+            return "Файл: черновик не сохранён · рабочая политика не заменена".into();
+        }
+        let Some(document) = document else {
+            return "Файл: отсутствует или не прошёл проверку".into();
+        };
+        #[cfg(windows)]
+        if let Some(session) = &self.session {
+            let state = session.control.status();
+            return format!("Файл: ревизия {} · Активная: {} · Приём трафика: {}",
+                document.anti_dpi.revision, state.revision, if state.admitting { "разрешён" } else { "закрыт" });
+        }
+        format!("Файл: ревизия {} · {}", document.anti_dpi.revision,
+            self.applied_revision.map_or_else(|| "Применение не подтверждено этой панелью".into(),
+                |rev| format!("Последнее подтверждение применения: rev {rev}")))
+    }
+
+    fn draw_page(&self, frame: &mut Frame<'_>, area: Rect, document: Option<&Document>) {
+        use std::fmt::Write as _;
+        let mut text = String::new();
+        let local = document.map(|doc| &doc.anti_dpi);
+        match self.page {
+            OVERVIEW => {
+                let _ = writeln!(text, "Anti-DPI не активен: стратегии ожидают независимой приёмки.\n{}", self.owner_text());
+                if let Some(local) = local {
+                    let _ = writeln!(text, "\nРежим: системный прокси\nПравил: {} · По умолчанию: напрямую при всех NoMatch\nЗащищённый DNS: {}\nПрямой выход: {}\n\nСледующий шаг\n{}",
+                        local.rules.len(), if local.resolver.is_some() { "настроен (сеть не проверена)" } else { "не настроен" },
+                        yes(local.consent.direct_egress), if local.resolver.is_none() || !local.consent.direct_egress {
+                            "Настройте DNS и явно выберите разрешения." } else { "Проверьте правила, примените политику и откройте подключение или диагностику." });
+                } else {
+                    let _ = writeln!(text, "\nНастройте локальную конфигурацию. Без VPS, регистрации на сервере и импортируемых ключей.\nСоздание файла не запускает сеть или системный прокси.");
+                }
+            }
+            CONNECTION => {
+                let _ = writeln!(text, "Режим: системный прокси (MVP)\nTUN / WinDivert: недоступны, post-MVP\n\nСостояние: {}", self.owner_text());
+                if let Some(local) = local {
+                    let _ = writeln!(text, "HTTP: {} · SOCKS5: {}\nПрямой выход: {} · Anti-DPI: {}",
+                        local.proxy.http_listen, local.proxy.socks5_listen, yes(local.consent.direct_egress), yes(local.consent.direct_dpi));
+                }
+                #[cfg(windows)]
+                if let Some(session) = &self.session {
+                    let status = session.control.status();
+                    let _ = writeln!(text, "Активная ревизия: {} · Приём: {}", status.revision, if status.admitting { "разрешён" } else { "закрыт" });
+                } else {
+                    let _ = writeln!(text, "Listeners внешнего процесса не подтверждены.\nПри чужом владельце отключите его штатно. Не захватываем чужой прокси.");
+                }
+                let _ = writeln!(text, "\nТолько HTTP/CONNECT и SOCKS5; не перехватывает произвольный UDP ОС.\nConnect и восстановление требуют отдельного подтверждения.");
+            }
+            STATISTICS => {
+                let _ = writeln!(text, "Источник: счётчики собственной сессии, не диагностические пробы.");
+                #[cfg(windows)]
+                if let Some(session) = &self.session {
+                    let status = session.control.status();
+                    let _ = writeln!(text, "\n{}\nАктивных соединений: {}\nПринято соединений: {}\nОшибок: {}\nБайт к цели: {}\nБайт от цели: {}\n\nРазбивка по стратегиям не подтверждена.",
+                        self.owner_text(), status.active, status.accepted, status.errors, status.uploaded, status.downloaded);
+                } else { let _ = writeln!(text, "\nНет источника данных. Это не нулевые значения трафика."); }
+                #[cfg(not(windows))]
+                let _ = writeln!(text, "\nНет источника данных. Это не нулевые значения трафика.");
+                let _ = writeln!(text, "\nЯчеек диагностического отчёта: {} (отдельно)", self.results.len());
+            }
+            SETTINGS => {
+                if let Some(doc) = document { text = policy_text(doc); }
+                else { text = "Сохранённая конфигурация не прочитана. Ошибочный файл не перезаписывается автоматически.".into(); }
+            }
+            ROUTING => { text = "Откройте общий редактор правил. Сохранение и применение разделены.".into(); }
+            _ => {}
+        }
+        let items = self.actions();
+        let [content, controls] = tui_widgets::action_layout_rows(area, items.len(), 10).unwrap_or([area, Rect::new(area.x, area.bottom(), area.width, 0)]);
+        super::panel(frame, content, SECTIONS[self.page], &text, !self.navigation);
+        Actions { items: &items, selected: self.action }.render_with_focus(frame, controls, !self.navigation);
+    }
+
+    fn columns(&self) -> Vec<Option<&'static str>> {
+        let ids = strategy_columns();
+        match self.group {
+            0 => ids.into_iter().take(4).map(Some).collect(),
+            1 => vec![None, Some("quic_v1_initial_split")],
+            2 => vec![None, Some("quic_v2_initial_split")],
+            _ => vec![None, Some("stun_fingerprint")],
+        }
+    }
+
+    fn draw_diagnostics(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        use ratatui::widgets::Cell;
+        let groups = ["TCP / HTTPS", "QUIC v1", "QUIC v2", "STUN"];
+        let counts = self.results.values().fold([0usize; 5], |mut acc, c| {
+            let i = if c.stale { 4 } else { match c.status {
+                CellStatus::Available => 0,
+                CellStatus::Unsupported | CellStatus::NotApplicable | CellStatus::NotChecked => 2,
+                CellStatus::Cancelled => 3,
+                _ => 1,
+            }};
+            acc[i] += 1;
+            acc
+        });
+        let progress = self.worker.as_ref().map_or_else(
+            || if self.results.is_empty() { "Ожидает запуска".into() } else { "Результаты последнего задания".into() },
+            |w| format!("Выполняется: {}/{} ячеек", self.results.len(), w.total));
+        let header = format!(
+            "Каталог: {} · выбрано {}/64 · {} · поиск: {}\nИсторические данные OONI 2024, не текущие блокировки. Правила не меняются.\n{} · [ ] протоколы · ← → ячейка · F7 детали",
+            self.catalog.entries().len(), self.selected.len(), progress, if self.filter.is_empty() { "нет" } else { &self.filter }, groups[self.group]);
+        let header_h = if area.width < 90 { 5 } else { 4 };
+        let details_h = if area.height >= 20 { 5 } else { 2 };
+        let body = Layout::vertical([Constraint::Length(header_h), Constraint::Min(2), Constraint::Length(details_h)]).split(area);
+        frame.render_widget(Paragraph::new(header).style(Style::default().fg(MUTED)).wrap(Wrap { trim: true }), body[0]);
+        let height = usize::from(body[1].height.saturating_sub(1)).max(1);
+        let visible_len = self.visible().len();
+        self.row = self.row.min(visible_len.saturating_sub(1));
+        if self.row < self.offset { self.offset = self.row; }
+        if self.row >= self.offset + height { self.offset = self.row + 1 - height; }
+        self.offset = self.offset.min(visible_len.saturating_sub(1));
+        let cols = self.columns();
+        // Keep the domain and focused strategy visible on small terminals;
+        // expose every other strategy using the same left/right navigation.
+        let max_cols = usize::from(body[1].width.saturating_sub(19) / 11).max(1);
+        let count = max_cols.min(cols.len());
+        self.column = self.column.min(cols.len().saturating_sub(1));
+        let start = self.column.saturating_sub(count.saturating_sub(1)).min(cols.len().saturating_sub(count));
+        let window = &cols[start..start + count];
+        let rows = self.visible().iter().enumerate().skip(self.offset).take(height).map(|(index, entry)| {
+            let name = format!("{}{}", if entry.excluded { "× " } else if self.selected.contains(&entry.hostname) { "✓ " } else { "  " }, entry.hostname);
+            let mut values = vec![Cell::from(name)];
+            for (i, &id) in window.iter().enumerate() {
+                let result = id.and_then(|id| self.results.get(&(entry.hostname.clone(), id)));
+                let label = if id.is_none() { "нет базы".into() }
+                    else if let Some(c) = result.filter(|c| !c.stale) {
+                        if let Some(code) = c.http_status { code.to_string() } else { status(Some(c)).into() }
+                    } else if result.is_none() && id.is_some_and(|id| strategy_unavailable(id) == Some(Reason::AwaitingAcceptance)) { "н/п".into() }
+                    else { status(result).into() };
+                let focus = index == self.row && start + i == self.column;
+                let style = Style::default().fg(cell_color(result)).bg(if focus { super::INPUT } else if index == self.row { FOCUS } else { SURFACE });
+                values.push(Cell::from(label).style(if focus { style.add_modifier(Modifier::BOLD) } else { style }));
+            }
+            Row::new(values).style(Style::default().fg(TEXT).bg(if index == self.row { FOCUS } else { SURFACE }))
+        }).collect::<Vec<_>>();
+        let widths = std::iter::once(Constraint::Min(16)).chain(window.iter().map(|_| Constraint::Length(10))).collect::<Vec<_>>();
+        let headers = std::iter::once("Домен").chain(window.iter().map(|id| id.map_or("Direct*", column_label))).collect::<Vec<_>>();
+        frame.render_widget(Table::new(rows, widths).header(Row::new(headers).style(Style::default().fg(ACCENT))), body[1]);
+        let selected = self.visible().get(self.row).map(|entry| {
+            let source = entry.provenance.as_ref().map_or_else(|| "Свой домен; нет исторического доказательства".into(),
+                |p| format!("OONI · {} · сетей {}", p.last_confirmed_day, p.confirmed_networks));
+            format!("{} · {source}", entry.hostname)
+        }).unwrap_or_else(|| "Нет совпадений".into());
+        let legend = if self.group == 0 { "200/2xx доступно · 3xx redirect · 4xx/5xx HTTP-ошибка · н/п не поддерживается · н/пр неприменимо · — не проверено" }
+            else { "Direct* для этого UDP-протокола пока не реализован. Никакого сравнения с TCP. н/п не поддерживается · — не проверено" };
+        let summary = format!("Доступно {} · Ошибки/ограничения {} · Не проверено/не поддерживается {} · Отмена {} · Устарело {}\n{selected}\n{legend}",
+            counts[0], counts[1], counts[2], counts[3], counts[4]);
+        frame.render_widget(Paragraph::new(summary).style(Style::default().fg(MUTED)).wrap(Wrap { trim: true }), body[2]);
+    }
+
+    fn detail_text(&self) -> String {
+        let visible = self.visible();
+        let Some(entry) = visible.get(self.row) else { return "Нет выбранной строки".into(); };
+        let cols = self.columns();
+        let id = cols.get(self.column).copied().flatten();
+        let name = id.map_or("Direct (UDP)", column_label);
+        let provenance = entry.provenance.as_ref().map_or_else(|| "Свой домен; без доказательства ограничения".into(),
+            |p| format!("Источник: {}\nПоследнее подтверждение: {} · Сетей: {}\nМасштаб ограничения не установлен", p.source, p.last_confirmed_day, p.confirmed_networks));
+        let mut text = format!("{} · {name}\n{provenance}\n\n", entry.hostname);
+        if let Some(c) = id.and_then(|id| self.results.get(&(entry.hostname.clone(), id))) {
+            text.push_str(&format!("Статус: {}\nАктуальность: {}\nПричина: {}\nПротокол: {:?}\nСеть: {} · TLS: {} · Приложение: {}\nHTTP: {} · Длительность: {} мс · Попыток: {}\nМодификация: {}\nEndpoint: {} · Source: {}\nРешение политики: {:?}",
+                status_long(c.status), if c.stale { "Устарело" } else { "На момент проверки" }, reason(c.reason), c.protocol,
+                stage(c.network), stage(c.tls), stage(c.application), c.http_status.map_or_else(|| "—".into(), |code| code.to_string()),
+                c.duration_ms, c.attempts, c.actual_modification.map_or("Не подтверждена", |m| if m { "Да" } else { "Нет" }),
+                c.endpoint.map_or_else(|| "—".into(), |e| e.to_string()), c.source.map_or_else(|| "—".into(), |ip| ip.to_string()), c.policy_action));
+        } else {
+            text.push_str(if id.is_none() { "Отдельный Direct-контроль UDP ещё не реализован. Сравнение недоступно." }
+                else if id.is_some_and(|id| strategy_unavailable(id) == Some(Reason::AwaitingAcceptance)) { "Стратегия не поддерживается: независимая приёмка не завершена. Проверка не выполнялась." }
+                else { "Нет результата для этой стратегии. Не проверено." });
+        }
+        text
+    }
+
     fn draw(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
         tui_widgets::canvas(frame, area);
-        if let Some((panel, _, _)) = &self.routing {
-            panel.render(frame, area, true);
+        if area.width < 40 || area.height < 14 {
+            frame.render_widget(Paragraph::new("Увеличьте терминал (минимум 40×14).").wrap(Wrap { trim: true }), area);
             return;
         }
-        let parts = Layout::vertical([Constraint::Length(3), Constraint::Min(1), Constraint::Length(3)]).split(area);
-        let head = if self.overview { "THEIA ANTI-DPI · Обзор / конфигурация" }
-            else { "THEIA ANTI-DPI · Диагностика" };
-        frame.render_widget(Paragraph::new(vec![Line::styled(head, Style::default().fg(ACCENT)),
-            Line::styled(self.path.display().to_string(), Style::default().fg(MUTED))]), parts[0]);
-        if let Some(review) = &self.review {
-            let text = match review {
-                Review::Diagnostic(plan) => plan.preview(),
-                Review::Policy(candidate, enroll) => format!("{}\nОперация: {}", candidate.preview(),
-                    if *enroll { "первичная регистрация" } else { "Apply" }),
-                #[cfg(windows)]
-                Review::Connect(candidate) => candidate.connect_preview(),
-                #[cfg(windows)]
-                Review::Disconnect(exit) => format!("Отключить принадлежащую панели сессию?\nБудет закрыт приём трафика и выполнено условное восстановление Windows proxy.\n{}", if *exit { "Затем выйти из панели." } else { "Панель останется открытой." }),
-            };
-            frame.render_widget(Paragraph::new(text).style(Style::default().fg(TEXT)).wrap(Wrap { trim: false })
-                .scroll((self.review_scroll, 0)), parts[1]);
-            frame.render_widget(Paragraph::new("Esc отменить (по умолчанию) · ↑ ↓ / PgUp PgDn просмотр · y подтвердить")
-                .style(Style::default().fg(WARNING)).wrap(Wrap { trim: true }), parts[2]);
+        let document = Document::read(&self.path).ok();
+        let parts = Layout::vertical([Constraint::Length(2), Constraint::Min(6), Constraint::Length(3)]).split(area);
+        tui_widgets::shell_header(frame, parts[0], "THEIA  •  Anti-DPI", self.owner_text(), &self.file_state(document.as_ref()));
+        let body = if let Some([nav, _, details]) = workspace_columns(parts[1]) {
+            tui_widgets::section_navigation(frame, nav, SECTIONS, self.page, self.navigation);
+            details
+        } else if self.navigation && self.review.is_none() && self.draft.is_none() {
+            tui_widgets::section_navigation(frame, parts[1], SECTIONS, self.page, true);
+            frame.render_widget(Paragraph::new(tui_widgets::key_line("↑ ↓ разделы · Enter открыть · Esc назад")).style(Style::default().bg(SURFACE)), parts[2]);
             return;
-        }
-        if self.overview {
-            let mut text = match Document::read(&self.path) {
-                Ok(doc) => format!("Сохранённая ревизия: {}\nПравил: {}\nDirect consent: {}\nDoH: {}\n\n{}\n\nРежим: системный прокси (MVP). Modify пока запрещён.",
-                    doc.anti_dpi.revision, doc.anti_dpi.rules.len(), doc.anti_dpi.consent.direct_egress,
-                    if doc.anti_dpi.resolver.is_some() { "настроен" } else { "не настроен" },
-                    doc.anti_dpi.rules.iter().map(|rule| format!("{} · {:?}", rule.name, rule.action)).collect::<Vec<_>>().join("\n")),
-                Err(_) => "Конфигурация отсутствует или недействительна. n — создать новый файл без перезаписи; существующий ошибочный файл исправьте отдельно.".into(),
+        } else { parts[1] };
+
+        let footer: String;
+        if self.help {
+            super::panel(frame, body, "Справка Anti-DPI",
+                "F2 — разделы; ↑↓ выбор; Enter открыть; Esc назад.\nНастройки и правила сохраняются отдельно от применения.\nДиагностика: Пробел отметить, s все, c очистить, / поиск, i свой домен, x исключить/вернуть, R восстановить встроенные.\n[ ] протоколы, ←→ ячейка, F7 подробности, b повтор, z экспорт.\nСеть только после явного согласия. Отказ Anti-DPI не превращается в прямой маршрут.", true);
+            footer = "Esc закрыть · F1 справка".into();
+        } else if let Some(review) = &self.review {
+            let (title, text, label) = match review {
+                Review::Diagnostic(plan) => ("Диагностика", plan.ui_preview(self.owner_active()), "Запустить проверку"),
+                Review::Policy(candidate, enroll) => ("Применение локальной политики", format!("{}\n\n{}\nСеть и настройки ОС не меняются этой операцией.\nСтарые разрешения потоков отзываются при публикации.",
+                    if *enroll { "Первичная регистрация локальной ревизии (не регистрация на сервере)." } else { "Применить сохранённую ревизию." },
+                    policy_text(candidate.document())), "Применить"),
+                Review::Save(draft, next) => ("Сохранение конфигурации", format!("{}\n{}\n\n{}", if draft.first_run() { "Создать новый файл без перезаписи." } else { "Сохранить новую ревизию (не Apply)." },
+                    "Подтверждение сохраняет конфигурацию и указанные разрешения. Подключение не запускается.", policy_text(next)), "Сохранить"),
+                Review::DiscardRouting => ("Отменить черновик?", "Несохранённые изменения маршрутизации будут потеряны. Рабочая политика не меняется.".into(), "Отменить изменения"),
+                Review::Export(_, path) => ("Обезличенный экспорт", format!("Сохранить агрегированный отчёт в:\n{}\n\nБез доменов, IP, секретов и идентификаторов. Существующий файл не перезаписывается.", path.display()), "Экспортировать"),
+                #[cfg(windows)]
+                Review::Connect(candidate, review) => ("Подключение", format!("{}\n{}\n\nПрокси WinINet будет изменён только при совпадении проверенного снимка.\nПри отказе Modify трафик блокируется. Публичный IP виден получателям.\n{}", review.description(), "Системный прокси, не TUN и не полный перехват UDP.", policy_text(candidate.document())), "Подключить"),
+                #[cfg(windows)]
+                Review::Recover(_) => ("Восстановление системного прокси", "Восстановить только точный проверенный журнал и снимок Windows. Чужой владелец или изменённые настройки не будут перезаписаны.".into(), "Восстановить"),
+                #[cfg(windows)]
+                Review::Disconnect(exit) => ("Отключение", format!("Остановить принадлежащую панели сессию, отозвать потоки и выполнить условное восстановление настроек Windows.\n{}", if *exit { "Затем выйти из панели." } else { "Остаться в панели." }), "Отключить"),
             };
-            #[cfg(windows)]
-            if let Some(session) = &self.session {
-                let status = session.control.status();
-                let phase = match status.phase {
-                    Phase::Starting => "подготовка", Phase::Connected => "подключено (readback)",
-                    Phase::Stopping => "отключение", Phase::Stopped => "отключено", Phase::Failed => "ошибка",
-                };
-                text.push_str(&format!("\n\nПринадлежащая панели сессия: {phase}\nПрименённая ревизия: {} · Admission: {}\nЛокальные соединения: {} активных / {} принятых · ошибки: {}\nPayload: записано к цели {} байт · принято от цели {} байт\nДиагностика не входит в эти счётчики.",
-                    status.revision, if status.admitting { "разрешён" } else { "закрыт" }, status.active, status.accepted, status.errors, status.uploaded, status.downloaded));
+            let rects = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(body);
+            frame.render_widget(Paragraph::new(title).style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)), rects[0]);
+            // Estimate a conservative upper bound for wrapped lines, so a
+            // long selector or DNS/target list never hides the end of consent.
+            let width = usize::from(rects[1].width.max(1));
+            let wrapped = text.lines().map(|line| line.chars().count().div_ceil(width).max(1) + 1).sum::<usize>();
+            let scroll = self.review_scroll.min(wrapped.saturating_sub(1).min(u16::MAX as usize) as u16);
+            frame.render_widget(Paragraph::new(text).style(Style::default().fg(TEXT)).wrap(Wrap { trim: false }).scroll((scroll, 0)), rects[1]);
+            tui_widgets::confirmation_bar(frame, parts[2], "↑↓ / PgUp PgDn просмотр · ←→ выбор · Enter · Esc отменить", false, label, self.confirm_selected);
+            return;
+        } else if let Some(draft) = &self.draft {
+            draft.form().render(frame, body, if draft.first_run() { "Первоначальная настройка Anti-DPI" } else { "Настройки локальной конфигурации" });
+            footer = "↑ ↓ поля · Пробел выбор · Del очистить · F3 домены · F5 проверить · Esc отменить".into();
+        } else if let Some((panel, _, _)) = &self.routing {
+            panel.render(frame, body, true);
+            footer = "↑ ↓ выбор · Tab действия · Enter открыть · s сохранить · Esc назад · F6 GeoData".into();
+        } else if self.details {
+            super::panel(frame, body, "Подробности проверки", &self.detail_text(), true);
+            footer = "Esc назад · F7 закрыть".into();
+        } else if self.page == DIAGNOSTICS {
+            self.draw_diagnostics(frame, body);
+            footer = if let Some((custom, text)) = &self.editing {
+                format!("{}: {text} · Enter принять · Esc отменить", if *custom { "Свой домен" } else { "Поиск" })
+            } else if self.catalogue_draft.is_some() {
+                "↑ ↓ строки · Пробел выбор · s все · c очистить · / поиск · i добавить · F3 принять домены · Esc назад".into()
+            } else if self.worker.is_some() {
+                "Esc отменить · ↑ ↓ строки · ← → ячейки · [ ] протокол · F7 детали".into()
             } else {
-                text.push_str("\n\nСобственная сессия отсутствует; состояние внешнего процесса не подтверждено.");
-            }
-            #[cfg(not(windows))]
-            text.push_str("\n\nSystem Proxy MVP недоступен на этой платформе.");
-            frame.render_widget(Paragraph::new(text).style(Style::default().fg(TEXT)).wrap(Wrap { trim: true }), parts[1]);
+                "F2 разделы · Пробел выбор · s все · c очистить · / поиск · i добавить · x исключить · R вернуть · Enter проверка · b повтор · z экспорт".into()
+            };
         } else {
-            let body = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(parts[1]);
-            let progress = self.worker.as_ref().map_or_else(String::new, |w| format!(" · Готово {}/{}", self.results.len(), w.total));
-            frame.render_widget(Paragraph::new(format!("Каталог {} · выбрано {} · поиск: {}{}", self.catalog.builtin_count(),
-                self.selected.len(), self.filter, progress)).style(Style::default().fg(MUTED)), body[0]);
-            let height = usize::from(body[1].height.saturating_sub(1)).max(1);
-            if self.row < self.offset { self.offset = self.row; }
-            if self.row >= self.offset + height { self.offset = self.row + 1 - height; }
-            let ids = strategy_columns();
-            let rows = self.visible().iter().enumerate().skip(self.offset).take(height).map(|(index, entry)| {
-                let name = format!("{}{}", if entry.excluded { "× " } else if self.selected.contains(&entry.hostname) { "✓ " } else { "  " }, entry.hostname);
-                let mut values = vec![name];
-                for &id in &ids { values.push(status(self.results.get(&(entry.hostname.clone(), id))).into()); }
-                Row::new(values).style(Style::default().fg(TEXT).bg(if index == self.row { FOCUS } else { SURFACE }))
-            }).collect::<Vec<_>>();
-            let widths = std::iter::once(Constraint::Min(15)).chain(ids.iter().map(|_| Constraint::Length(7))).collect::<Vec<_>>();
-            let headers = std::iter::once("Домен").chain(ids.iter().map(|id| column_label(id))).collect::<Vec<_>>();
-            frame.render_widget(Table::new(rows, widths)
-                .header(Row::new(headers).style(Style::default().fg(ACCENT))), body[1]);
+            self.draw_page(frame, body, document.as_ref());
+            footer = if self.navigation { "↑ ↓ разделы · Enter открыть · Esc назад".into() }
+                else { "↑ ↓ действия · Enter открыть · F2 разделы · F1 помощь · Esc назад".into() };
         }
-        let footer = if let Some((custom, text)) = &self.editing {
-            format!("{}: {text} · Enter сохранить · Esc отменить", if *custom { "Свой домен" } else { "Поиск" })
-        } else if self.worker.is_some() {
-            "Esc отменить задание".into()
-        } else if self.overview {
-            "Tab диагностика · r маршрутизация · p подключить/отключить · n создать · e регистрация · a Apply · Esc назад".into()
-        } else {
-            "↑↓ выбор · пробел отметить · s все · c очистить · / поиск · i добавить · x исключить/вернуть · Enter проверка · Tab обзор".into()
-        };
-        frame.render_widget(Paragraph::new(format!("{}\n{footer}", self.notice)).style(Style::default().fg(MUTED)).wrap(Wrap { trim: true }), parts[2]);
+        let footer_rects = Layout::vertical([Constraint::Length(1), Constraint::Length(2)]).split(parts[2]);
+        frame.render_widget(Paragraph::new(tui_widgets::fit_value(&self.notice, footer_rects[0].width, false)).style(Style::default().fg(WARNING).bg(SURFACE)), footer_rects[0]);
+        frame.render_widget(Paragraph::new(tui_widgets::key_line(&footer)).style(Style::default().bg(SURFACE)).wrap(Wrap { trim: true }), footer_rects[1]);
     }
 }
 
@@ -611,12 +1278,13 @@ pub(super) fn run_in(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, path
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     let code = if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') { KeyCode::Esc } else { key.code };
-                    if panel.routing.is_some() {
+                    if panel.routing.is_some() && panel.review.is_none() && !panel.help {
                         panel.routing_key(if code == KeyCode::Esc { KeyEvent::new(code, KeyModifiers::NONE) } else { key });
                     } else if panel.key(code)? { return Ok(()); }
                 }
                 Event::Paste(value) => {
-                    if let Some((routing, _, _)) = &mut panel.routing { routing.paste(&value); }
+                    if let Some(draft) = &mut panel.draft { draft.paste(&value); }
+                    else if panel.review.is_none() && panel.routing.is_some() { if let Some((routing, _, _)) = &mut panel.routing { routing.paste(&value); } }
                     else if let Some((_, text)) = &mut panel.editing {
                         if !value.chars().any(char::is_control) && text.len() + value.len() <= 253 { text.push_str(&value); }
                     }
@@ -643,7 +1311,7 @@ mod tests {
     /// optional; the ordinary test does not require the review environment.
     #[test]
     fn f20_panel_gallery_capture() {
-        use crate::anti_dpi::diagnostic::{Protocol, Reason, Stage};
+        use crate::anti_dpi::diagnostic::Protocol;
         use std::io::Write;
         let root = std::env::temp_dir().join(format!("theia-f20-review-{}", std::process::id()));
         std::fs::create_dir(&root).unwrap();
@@ -672,10 +1340,30 @@ mod tests {
         };
         let mut panel = Panel::new(path.clone()).unwrap();
         capture("anti-dpi-first-run", &mut panel);
+        if let Some(draft) = panel.draft.as_mut() {
+            draft.values[0] = "dns.example.com".into();
+            draft.values[1] = "1.1.1.1".into();
+            draft.flags[3] = true;
+            draft.values[4] = "example.org".into();
+        }
+        panel.key(KeyCode::F(5)).unwrap();
+        assert!(panel.review.is_some());
+        capture("anti-dpi-first-run-preview", &mut panel);
+        panel.key(KeyCode::Esc).unwrap();
+        panel.key(KeyCode::Esc).unwrap();
         std::fs::write(&path, format!("{}\n[anti_dpi.resolver]\nhostname='dns.example.com'\nbootstrap=['1.1.1.1']\n",
             include_str!("../../../../examples/anti-dpi.toml"))).unwrap();
         capture("anti-dpi-overview", &mut panel);
-        panel.open_routing();
+        panel.open_page(CONNECTION);
+        capture("anti-dpi-connection", &mut panel);
+        panel.open_page(STATISTICS);
+        capture("anti-dpi-statistics", &mut panel);
+        panel.open_page(SETTINGS);
+        capture("anti-dpi-settings", &mut panel);
+        panel.open_settings();
+        capture("anti-dpi-settings-editor", &mut panel);
+        panel.key(KeyCode::Esc).unwrap();
+        panel.open_page(ROUTING);
         assert!(panel.routing.is_some());
         capture("anti-dpi-routing", &mut panel);
         panel.routing_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
@@ -684,10 +1372,10 @@ mod tests {
         panel.routing_key(KeyEvent::new(KeyCode::Char('B'), KeyModifiers::NONE));
         capture("anti-dpi-geodata", &mut panel);
         panel.routing = None;
-        panel.overview = false;
+        panel.open_page(DIAGNOSTICS);
         panel.key(KeyCode::Char('s')).unwrap();
         capture("anti-dpi-catalog", &mut panel);
-        panel.selected = ["meduza.io".to_owned()].into_iter().collect();
+        panel.selected = panel.catalog.entries().iter().take(6).map(|entry| entry.hostname.clone()).collect();
         panel.begin_review(None);
         assert!(panel.review.is_some());
         capture("anti-dpi-diagnostic-consent", &mut panel);
@@ -723,6 +1411,25 @@ mod tests {
         }
         panel.notice = "СИНТЕТИЧЕСКИЙ ОФЛАЙН-ПРИМЕР · сеть не проверялась".into();
         capture("state-anti-dpi-diagnostic-report", &mut panel);
+        let (_send, updates) = mpsc::channel();
+        panel.worker = Some(Worker { cancel: Arc::new(AtomicBool::new(false)), updates, thread: None, total: 60 });
+        panel.notice = "СИНТЕТИЧЕСКИЙ ОФЛАЙН-ПРИМЕР · проверка выполняется".into();
+        capture("state-anti-dpi-diagnostic-progress", &mut panel);
+        panel.key(KeyCode::Esc).unwrap();
+        assert!(panel.worker.as_ref().unwrap().cancel.load(Ordering::Acquire));
+        panel.worker.take();
+        panel.notice = "СИНТЕТИЧЕСКИЙ ОФЛАЙН-ПРИМЕР · задание отменено, частичные результаты".into();
+        capture("state-anti-dpi-diagnostic-cancelled", &mut panel);
+        panel.notice = "СИНТЕТИЧЕСКИЙ ОФЛАЙН-ПРИМЕР · сеть не проверялась".into();
+        panel.details = true;
+        capture("state-anti-dpi-diagnostic-cell", &mut panel);
+        panel.details = false;
+        panel.group = 1;
+        capture("state-anti-dpi-diagnostic-quic", &mut panel);
+        panel.group = 0;
+        panel.begin_export();
+        capture("state-anti-dpi-export-confirm", &mut panel);
+        panel.key(KeyCode::Esc).unwrap();
         assert!(panel.worker.is_none());
         assert!(!panel.results.is_empty());
     }
@@ -731,8 +1438,10 @@ mod tests {
     fn offline_panel_selects_catalog_without_network_or_configuration() {
         let path = std::env::temp_dir().join(format!("theia-f20-panel-{}", std::process::id())).join("anti-dpi.toml");
         let mut panel = Panel::new(path.clone()).unwrap();
-        assert!(panel.overview);
-        panel.key(KeyCode::Tab).unwrap();
+        assert_eq!(panel.page, OVERVIEW);
+        assert!(panel.draft.is_some());
+        panel.key(KeyCode::Esc).unwrap();
+        panel.open_page(DIAGNOSTICS);
         panel.key(KeyCode::Char('s')).unwrap();
         assert_eq!(panel.selected.len(), 60);
         assert!(panel.results.is_empty());
@@ -742,5 +1451,41 @@ mod tests {
         terminal.draw(|frame| panel.draw(frame)).unwrap();
         panel.key(KeyCode::Char('c')).unwrap();
         assert!(panel.selected.is_empty());
+    }
+
+    #[test]
+    fn wizard_never_saves_without_review_and_preview_is_localized() {
+        let root = std::env::temp_dir().join(format!("theia-f20-wizard-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("anti-dpi.toml");
+        let mut panel = Panel::new(path.clone()).unwrap();
+        let draft = panel.draft.as_mut().unwrap();
+        assert_eq!(draft.flags, [false; 4]);
+        draft.values[0] = "dns.example.com".into();
+        draft.values[1] = "1.1.1.1".into();
+        draft.flags[3] = true;
+        draft.values[4] = "example.org".into();
+        panel.key(KeyCode::F(5)).unwrap();
+        assert!(matches!(panel.review, Some(Review::Save(_, _))));
+        assert!(!path.exists());
+        panel.key(KeyCode::Enter).unwrap();
+        assert!(panel.draft.is_some());
+        assert!(!path.exists());
+        panel.key(KeyCode::F(5)).unwrap();
+        panel.key(KeyCode::Right).unwrap();
+        panel.key(KeyCode::Enter).unwrap();
+        let saved = Document::read(&path).unwrap();
+        assert_eq!(saved.anti_dpi.rules.len(), 1);
+        assert_eq!(saved.anti_dpi.rules[0].domains, ["full:example.org"]);
+        assert!(!saved.anti_dpi.consent.direct_egress);
+        assert!(panel.applied_revision.is_none());
+        assert!(!panel.owner_active());
+        panel.open_page(DIAGNOSTICS);
+        for (width, height) in [(80, 24), (120, 40), (160, 50)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| panel.draw(frame)).unwrap();
+            assert!(terminal.backend().buffer().content().iter().any(|cell| cell.symbol() != " "));
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

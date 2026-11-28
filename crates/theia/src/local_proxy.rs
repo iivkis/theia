@@ -27,8 +27,9 @@ pub(crate) async fn run_standalone_controlled(
     expected: [u8; 32],
     control: Arc<crate::anti_dpi::session::Control>,
     commands: tokio::sync::mpsc::Receiver<crate::anti_dpi::session::Command>,
+    review: crate::windows_system_proxy::ApplyReview,
 ) -> Result<(), ClientError> {
-    Box::pin(standalone::run_controlled(candidate, expected, control, commands)).await
+    Box::pin(standalone::run_controlled(candidate, expected, control, commands, Some(review))).await
 }
 
 #[cfg(all(any(feature = "native-ingress-lab", test), target_os = "linux"))]

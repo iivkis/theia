@@ -527,14 +527,15 @@ async fn serve(runtime: Arc<Runtime>, http: &TcpListener, socks: &TcpListener) -
 /// release of the shared owner. No fake SmartTheia profile or carrier.
 pub(crate) async fn run(candidate: Candidate, expected: [u8; 32]) -> Result<(), ClientError> {
     let (control, commands) = Control::channel().map_err(|_| ClientError::Configuration)?;
-    run_controlled(candidate, expected, control, commands).await
+    run_controlled(candidate, expected, control, commands, None).await
 }
 
 pub(crate) async fn run_controlled(
     candidate: Candidate, expected: [u8; 32], control: Arc<Control>,
     commands: mpsc::Receiver<Command>,
+    review: Option<crate::windows_system_proxy::ApplyReview>,
 ) -> Result<(), ClientError> {
-    let outcome = run_inner(candidate, expected, control.clone(), commands).await;
+    let outcome = run_inner(candidate, expected, control.clone(), commands, review).await;
     control.set_phase(if outcome.is_ok() { Phase::Stopped } else { Phase::Failed });
     outcome
 }
@@ -558,6 +559,7 @@ async fn diagnostic(runtime: Arc<Runtime>, job: Job) {
 async fn run_inner(
     candidate: Candidate, expected: [u8; 32], control: Arc<Control>,
     mut commands: mpsc::Receiver<Command>,
+    review: Option<crate::windows_system_proxy::ApplyReview>,
 ) -> Result<(), ClientError> {
     if candidate.digest() != expected {
         return Err(ClientError::Configuration);
@@ -581,7 +583,7 @@ async fn run_inner(
     let bind = http.local_addr().map_err(|_| ClientError::Io)?;
     let ipc = crate::windows_control::WindowsServer::bind_standalone(control_path, control.clone())
         .map_err(|_| ClientError::Configuration)?;
-    let mut owner = reservation.apply(bind, None).map_err(|_| ClientError::SystemProxy)?;
+    let mut owner = reservation.apply(bind, review).map_err(|_| ClientError::SystemProxy)?;
     if owner.verify().is_err() {
         return Err(ClientError::SystemProxy);
     }
