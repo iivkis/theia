@@ -93,6 +93,7 @@ async fn production_listener(allow_private: bool, alpn: &[u8]) -> (String, Strin
         disabled: false,
     };
     let policy = ServerPolicy {
+        routing: None,
         allow_private_ips: allow_private,
         max_connections_per_user: 8,
         max_connections_total: 8,

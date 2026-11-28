@@ -60,6 +60,66 @@ class TimingTests(unittest.TestCase):
         with self.assertRaises(timing.EvidenceError):
             timing.summarize(*snapshot(event="push", merged=True))
 
+    def test_sharded_merged_matrix_requires_all_six_added_jobs(self):
+        run, jobs = snapshot(merged=True)
+        for name in sorted(timing.SHARDED_MERGED_JOBS - timing.MERGED_JOBS):
+            entry = deepcopy(jobs["jobs"][0])
+            entry["name"] = name
+            jobs["jobs"].append(entry)
+        jobs["total_count"] = len(jobs["jobs"])
+        result = timing.summarize(run, jobs)
+        self.assertEqual(len(result["jobs"]), 22)
+        self.assertEqual(set(result["jobs"]), timing.SHARDED_MERGED_JOBS)
+        for name in timing.SHARDED_MERGED_JOBS - timing.MERGED_JOBS:
+            broken = deepcopy(jobs)
+            broken["jobs"] = [job for job in broken["jobs"] if job["name"] != name]
+            broken["total_count"] -= 1
+            with self.assertRaises(timing.EvidenceError):
+                timing.summarize(run, broken)
+        with self.assertRaises(timing.EvidenceError):
+            timing.compare(timing.summarize(*snapshot(2, merged=True)), result)
+
+    def test_mvp_matrix_requires_all_platform_and_coverage_shards(self):
+        run, jobs = snapshot(merged=True)
+        template = deepcopy(jobs["jobs"][0])
+        jobs["jobs"] = [{**deepcopy(template), "name": name}
+                        for name in sorted(timing.MVP_MERGED_JOBS)]
+        jobs["total_count"] = len(jobs["jobs"])
+        result = timing.summarize(run, jobs)
+        self.assertEqual(set(result["jobs"]), timing.MVP_MERGED_JOBS)
+        self.assertEqual(len(result["jobs"]), 22)
+        broken = deepcopy(jobs)
+        broken["jobs"] = broken["jobs"][1:]
+        broken["total_count"] -= 1
+        with self.assertRaises(timing.EvidenceError):
+            timing.summarize(run, broken)
+
+    def test_target_group_mvp_matrix_requires_independent_native_checks(self):
+        run, jobs = snapshot(merged=True)
+        template = deepcopy(jobs["jobs"][0])
+        jobs["jobs"] = [{**deepcopy(template), "name": name}
+                        for name in sorted(timing.TARGET_GROUP_MVP_JOBS)]
+        jobs["total_count"] = len(jobs["jobs"])
+        self.assertEqual(len(timing.summarize(run, jobs)["jobs"]), 25)
+        for missing in timing.TARGET_GROUP_MVP_JOBS - timing.MVP_MERGED_JOBS:
+            broken = deepcopy(jobs)
+            broken["jobs"] = [job for job in broken["jobs"] if job["name"] != missing]
+            broken["total_count"] -= 1
+            with self.assertRaises(timing.EvidenceError):
+                timing.summarize(run, broken)
+
+    def test_compact_matrix_still_requires_windows_clippy(self):
+        run, jobs = snapshot(merged=True)
+        template = deepcopy(jobs["jobs"][0])
+        jobs["jobs"] = [{**deepcopy(template), "name": name}
+                        for name in sorted(timing.COMPACT_MVP_JOBS)]
+        jobs["total_count"] = len(jobs["jobs"])
+        self.assertEqual(len(timing.summarize(run, jobs)["jobs"]), 23)
+        # Replacing a required job with an arbitrary name is not allowed.
+        jobs["jobs"][0]["name"] = "not-a-required-check"
+        with self.assertRaises(timing.EvidenceError):
+            timing.summarize(run, jobs)
+
     def test_real_sanitized_api_snapshots_match_observed_durations(self):
         path = SOURCE.parents[1] / "tests" / "ci" / "fixtures" / "timing-snapshots.json"
         snapshots = json.loads(path.read_text(encoding="utf-8"))

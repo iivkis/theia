@@ -127,6 +127,8 @@ class TCPFixture(socketserver.ThreadingTCPServer):
         self.counter = counter
         self.stopping = threading.Event()
         self.slots = threading.BoundedSemaphore(MAX_PEERS)
+        self.accept_lock = threading.Lock()
+        self.accepted = 0
         self.thread = threading.Thread(target=self.serve_forever, kwargs={"poll_interval": 0.05})
         self.thread.start()
 
@@ -134,7 +136,13 @@ class TCPFixture(socketserver.ThreadingTCPServer):
     def port(self):
         return self.server_address[1]
 
+    def accepted_count(self):
+        with self.accept_lock:
+            return self.accepted
+
     def process_request(self, request, address):
+        with self.accept_lock:
+            self.accepted += 1
         if not self.slots.acquire(blocking=False):
             if self.counter:
                 self.counter.fail()
@@ -257,7 +265,7 @@ class UDPWitness:
         require(not self.thread.is_alive(), "UDP witness did not stop")
 
 
-def config_files(directory, cert, key, h2, h3, front, http, socks, transport, token):
+def config_files(directory, cert, key, h2, h3, front, http, socks, transport, token, revision):
     q = lambda value: json.dumps(str(value), ensure_ascii=False)
     common = '\n[management]\nipc = "auto"\nlog_level = "error"\n[ui]\nlanguage = "en"\n'
     server = f'''schema_version = 1
@@ -286,6 +294,7 @@ connect_timeout_ms = 2000
     client = f'''schema_version = 1
 [client]
 active_profile = "bench"
+ingress_mode = "system_proxy"
 [[client.profiles]]
 id = "bench"
 path_prefix = "/v1/bench"
@@ -301,8 +310,11 @@ quic_negative_cache_ttl_s = 900
 [client.proxy]
 http_listen = "{LOOP}:{http}"
 socks5_listen = "{LOOP}:{socks}"
-system_proxy = "off"
 '''
+    # Both immutable comparison references predate the system_proxy ingress schema.
+    # Keep the same listeners and transport; only serialize the equivalent legacy fields.
+    if revision in {"abbb89834a406b4c53be0f1ac0b3ab1a65e66f8d", "917417b09f209334939c38551112081c480eb958"}:
+        client = client.replace('ingress_mode = "system_proxy"\n', '').replace('[client.proxy]\n', '[client.proxy]\nsystem_proxy = "off"\n')
     for name, content in (("server", server), ("client", client)):
         (directory / (name + ".toml")).write_text(content + common, encoding="utf-8")
 
@@ -365,7 +377,7 @@ def sample_rss(processes):
     return sum(p.memory_info().rss for p in processes)
 
 
-def trial(binary, cert, key, transport, workload, condition):
+def trial(binary, cert, key, transport, workload, condition, revision):
     import psutil
 
     streams, count, size = WORKLOADS[workload]
@@ -389,19 +401,33 @@ def trial(binary, cert, key, transport, workload, condition):
             if name.startswith("THEIA_"):
                 del env[name]
         env["THEIA_BENCH_TOKEN"] = base64.urlsafe_b64encode(token).decode().rstrip("=")
+        if platform.system() == "Windows":
+            # The immutable reference uses Tokio's default std-thread stack.
+            # Match the candidate's worker reserve for both variants.
+            env["RUST_MIN_STACK"] = str(8 * 1024 * 1024)
         scratch = tempfile.TemporaryDirectory(prefix="theia-perf-")
         if scratch:
             directory = Path(scratch.name)
-            config_files(directory, cert, key, ports.h2, ports.h3, witness.port, http, socks, transport, token)
+            config_files(directory, cert, key, ports.h2, ports.h3, witness.port, http, socks, transport, token, revision)
             for role, port, release in (("server", ports.h2, ports.release_server),
                                         ("client", http, ports.release_client)):
                 release()
+                # Keep diagnostics for failed startup of the controlled
+                # fixture, not user traffic. Files avoid pipe backpressure.
+                diagnostics = reservations.enter_context(tempfile.TemporaryFile())
                 child = subprocess.Popen([str(binary), role, "run", "--config",
                                           str(directory / (role + ".toml"))],
                                          env=env, stdin=subprocess.DEVNULL,
-                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                         stdout=diagnostics, stderr=diagnostics)
                 children.append(child)
-                wait_port(port, children)
+                try:
+                    wait_port(port, children)
+                except RuntimeError as error:
+                    diagnostics.seek(0, os.SEEK_END)
+                    diagnostics.seek(max(0, diagnostics.tell() - 2048))
+                    detail = diagnostics.read(2048).decode("utf-8", errors="replace")
+                    detail = detail.replace(env["THEIA_BENCH_TOKEN"], "[redacted]")
+                    raise RuntimeError(f"{role} startup failed (exit={child.poll()}): {detail}") from error
             ps = [psutil.Process(p.pid) for p in children]
             initial_cpu = cpu_seconds(ps)
             peak = [sample_rss(ps)]
@@ -415,7 +441,10 @@ def trial(binary, cert, key, transport, workload, condition):
             sampler = threading.Thread(target=sample)
             sampler.start()
             before = counter.snapshot()
-            require(before["carrier_bytes"] == 0, "unexpected traffic before trial")
+            # Authenticated routing synchronization is legitimate startup traffic.
+            # Charge it to total wire overhead, but forbid target connections
+            # before the workload and separately prove its encrypted byte delta.
+            require(origin.accepted_count() == 0, "unexpected target dial before trial")
             start = time.perf_counter()
             barrier = threading.Barrier(streams)
             with concurrent.futures.ThreadPoolExecutor(max_workers=streams) as executor:
@@ -431,12 +460,14 @@ def trial(binary, cert, key, transport, workload, condition):
             require(not sampler.is_alive() and not sample_errors, "resource sampling failed")
             require(all(p.poll() is None for p in children), "fixture process exited during trial")
             application = 2 * streams * count * size
-            require(after["carrier_bytes"] >= application, "missing encrypted carrier evidence")
+            require(after["carrier_bytes"] - before["carrier_bytes"] >= application,
+                    "missing encrypted carrier evidence during workload")
+            require(origin.accepted_count() == streams, "unexpected number of target connections")
             require(cpu >= 0 and peak[0] > 0, "invalid process resource evidence")
             if condition == "udp-loss":
-                require(after["dropped_datagrams"] > 0, "loss condition not exercised")
+                require(after["dropped_datagrams"] > before["dropped_datagrams"], "loss condition not exercised during workload")
             if condition == "relay-delay":
-                require(after["delayed_units"] > 0, "delay condition not exercised")
+                require(after["delayed_units"] > before["delayed_units"], "delay condition not exercised during workload")
             result = dict(application_bytes=application, duration_s=duration,
                           cpu_s=cpu, sampled_peak_rss_bytes=peak[0],
                           latency_ms=[v for r in results for v in r["latency_ms"]],
@@ -482,7 +513,8 @@ def run(args):
                     for variant in order:
                         try:
                             result = trial(binary[variant], args.cert.resolve(strict=True),
-                                           args.key.resolve(strict=True), transport, workload, condition)
+                                           args.key.resolve(strict=True), transport, workload, condition,
+                                           getattr(args, variant + '_revision'))
                         except Exception as error:
                             raise RuntimeError(
                                 f"trial failed: {transport}/{condition}/{workload}/{repetition}/{variant}"

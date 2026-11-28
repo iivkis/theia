@@ -63,13 +63,19 @@ class Terminal:
     def _read(self):
         try:
             if self.win:
-                while self.win.isalive():
+                # Process exit does not mean the ConPTY output pipe is drained.
+                # Read the final restoration sequences and CLI result until EOF.
+                while True:
                     chunk = self.win.read()
                     if chunk:
                         with self.lock:
                             text = chunk if isinstance(chunk, str) else self.decoder.decode(chunk)
                             self.raw += text
                             self.stream.feed(text)
+                    elif not self.win.isalive():
+                        break
+                    else:
+                        time.sleep(0.01)
             else:
                 import select
 
@@ -132,6 +138,10 @@ class Terminal:
                     time.sleep(0.05)
                 if self.alive():
                     raise AssertionError("TUI did not exit after q")
+                # The reader can still have buffered bytes after process exit.
+                self.reader.join(timeout=7.0)
+                assert not self.reader.is_alive(), "PTY output did not drain after exit"
+                assert not self.error, "PTY output read failed after exit"
                 # The guard must leave alt-screen, restore cursor and return.
                 with self.lock:
                     output = self.raw
@@ -177,7 +187,7 @@ def drive(binary, config, scenario, expected):
             tty.wait("Для сервера")
             since = tty.snapshot()
             tty.send("v")
-            tty.wait("revision=" + str(expected), since=since)
+            tty.wait("Версия прав доступа: " + str(expected), since=since)
             revision(binary, expected)
             tty.send("y")  # no saved digest: must never apply
             revision(binary, expected)
@@ -366,12 +376,14 @@ def drive_client_proxy(binary, config, http_port, socks_port, echo_port):
         confirm(tty, "Системный прокси включён")
         proxy_status(binary, "PendingOwned")
         test_tunnels(http_port, socks_port, echo_port)
-        review(tty, "r", "Восстановить только собственные")
-        confirm(tty, "Восстановление WinINet: Restored")
-        proxy_status(binary, "NoJournal")
+        # Navigation must not tear down the owned runtime.
+        tty.send("\x1b")
+        tty.wait("Режим подключения")
+        proxy_status(binary, "PendingOwned")
         test_tunnels(http_port, socks_port, echo_port)
-        apply(tty)
-        review(tty, "x", "Остановить локальный клиент?")
+        tty.send("p")
+        tty.wait("Системный прокси включён")
+        review(tty, "x", "Отключиться?")
         confirm(tty, "Локальный клиент остановлен")
         proxy_status(binary, "NoJournal")
         for port in (http_port, socks_port):
@@ -427,6 +439,11 @@ def drive_client_proxy(binary, config, http_port, socks_port, echo_port):
 
 def drive_dual_product(binary, server, client, cert, admission, fingerprint,
                        http_port, socks_port, echo_port):
+    # Rust starts this process only after real server IPC readiness. The
+    # monotonic barrier therefore cannot expire before startup + 121s.
+    scenario_started = time.monotonic()
+    replay_deadline = scenario_started + 121.0
+    assert Path(cert).is_file()  # The server fixture must have its certificate.
     # Full compiled-binary paths, not an injected TUI/IPC response. The
     # reference inventory is a local, pre-provisioned fixture; no internet.
     server = Path(server)
@@ -524,13 +541,11 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         tty.wait("Режим подключения")
         original = client.read_bytes()
         tty.send("i")
-        tty.wait("Импорт подключения")
+        tty.wait("Вставьте ключ (скрыто)")
         tty.send(str(own_link) + "\r")
         tty.wait("Проверка ключа · собственный TLS")
-        tty.send("c")
-        tty.wait("Проверка сертификата")
-        tty.send("file:" + cert + "\r")
-        tty.wait("CA указан")
+        # Issued Own-TLS keys carry their verified certificate anchor.
+        tty.wait("Закреплён в ключе, соединение ещё НЕ проверено")
         assert client.read_bytes() == original
         tty.send("y")
         tty.wait("Профиль сохранён")
@@ -563,9 +578,18 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         headless.terminate()
         headless.wait(timeout=3)
 
+        # All preceding operations use Own-TLS or local server management.
+        # Do not enroll or connect REALITY before the real replay window ends.
+        replay_wait_started = time.monotonic()
+        while (remaining := replay_deadline - time.monotonic()) > 0:
+            time.sleep(remaining)
+        assert time.monotonic() >= replay_deadline
+        replay_wait = time.monotonic() - replay_wait_started
+        revision(binary, 2)
+
         def enroll():
             tty.send("i")
-            tty.wait("Импорт подключения")
+            tty.wait("Вставьте ключ (скрыто)")
             tty.send(str(reality_link) + "\r")
             tty.wait("ПРЕДПРОСМОТР: самодостаточный ключ REALITY")
             tty.send("y")
@@ -579,7 +603,7 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
         assert client.read_bytes() == saved
         assert len(set(base.glob(".theia-enroll-*")) - before) == 1
         tty.send("\x1b")
-        tty.wait("Режим подключения")
+        tty.wait("Вставьте ключ (скрыто)")
         assert set(base.glob(".theia-enroll-*")) == before
         assert client.read_bytes() == saved
 
@@ -626,14 +650,14 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
     try:
         tty.wait("Параметры · Enter")
         tty.send("v")
-        tty.wait("revision=2")
+        tty.wait("Версия прав доступа: 2")
         tty.send("b")
         tty.wait("Откат авторизации, revision=2")
         tty.send("n")
         tty.wait("Параметры · Enter")
         revision(binary, 2)
         tty.send("v")
-        tty.wait("revision=2")
+        tty.wait("Версия прав доступа: 2")
         tty.send("b")
         tty.wait("Откат авторизации, revision=2")
         tty.send("y")
@@ -644,6 +668,10 @@ def drive_dual_product(binary, server, client, cert, admission, fingerprint,
     finally:
         if tty.alive():
             tty.close(expect_success=False)
+
+    # Preserve the previous active driver budget; only real barrier waiting
+    # is excluded. The Rust harness independently enforces the total budget.
+    assert time.monotonic() - scenario_started - replay_wait <= 50.0
 
 
 def main():

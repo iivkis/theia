@@ -14,7 +14,7 @@ use std::{
 };
 use theia::{
     client_import,
-    config::{self, ClientDocument, Config, SystemProxy, Transport},
+    config::{self, ClientDocument, Config, IngressMode, Transport},
     invite::Invitation,
     tui_editor::Editor,
     Role,
@@ -188,9 +188,7 @@ async fn client_scenario(
             )
             .unwrap();
     } else {
-        editor
-            .import_invitation(&invitation, Some(&ca_ref), None)
-            .unwrap();
+        editor.import_invitation(&invitation, None, None).unwrap();
     }
     assert!(
         editor
@@ -209,16 +207,25 @@ async fn client_scenario(
         assert_eq!(imported.auth_token, "env:THEIA_F14_XHOST_WRONG_TOKEN");
     } else {
         assert!(imported.auth_token.starts_with("file:"));
+        assert_eq!(imported.tls_ca, invitation.trust_reference());
     }
-    assert_eq!(client_doc.client.proxy.system_proxy, SystemProxy::Off);
+    assert_eq!(client_doc.client.ingress_mode, IngressMode::SystemProxy);
+    assert_ne!(client_doc.client.profiles[0].direct_dpi, Some(true));
     assert!(!fs::read_to_string(&config_path)
         .unwrap()
         .contains(&URL_SAFE_NO_PAD.encode(token)));
 
     client_doc.client.active_profile = invitation.id.clone();
     if invalid_ca {
+        use sha2::{Digest, Sha256};
         let wrong_ca = std::env::var("THEIA_F14_XHOST_WRONG_CA").unwrap();
-        client_doc.client.profiles[1].tls_ca = Some(format!("file:{wrong_ca}"));
+        let pem = fs::read(wrong_ca).unwrap();
+        let cert = rustls_pemfile::certs(&mut std::io::BufReader::new(pem.as_slice()))
+            .next()
+            .unwrap()
+            .unwrap();
+        client_doc.client.profiles[1].tls_ca =
+            Some(format!("anchor-sha256:{:x}", Sha256::digest(cert.as_ref())));
     }
     let successful = !invalid_token && !invalid_ca;
     run_client(&config_path, client_doc, origin, successful).await;
@@ -354,10 +361,66 @@ async fn run_client(
             .spawn()
             .unwrap(),
     );
+    if !successful {
+        // Mandatory authenticated routing preflight now rejects wrong CA or
+        // bearer before either listener is exposed.
+        timeout(Duration::from_secs(15), async {
+            loop {
+                assert!(TcpStream::connect(http).await.is_err());
+                assert!(TcpStream::connect(socks).await.is_err());
+                if let Some(status) = process.0.try_wait().unwrap() {
+                    assert!(!status.success());
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("invalid client must fail closed before binding");
+        return;
+    }
     await_client(http, &mut process).await;
     await_client(socks, &mut process).await;
     http_connect(http, origin, successful).await;
     socks5_connect(socks, origin, successful).await;
+    // The identical domain rule selects the native Windows listener rather
+    // than the Linux VM origin. The distinctive reply proves the local dial.
+    let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = target.local_addr().unwrap().port();
+    let listener = tokio::spawn(async move {
+        let (mut stream, _) = target.accept().await.unwrap();
+        stream.write_all(b"native-client-origin").await.unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    let mut direct = TcpStream::connect(http).await.unwrap();
+    direct
+        .write_all(
+            format!("CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response_head(&mut direct).await,
+        b"HTTP/1.1 200 Connection Established\r\n\r\n"
+    );
+    let mut result = Vec::new();
+    direct.read_to_end(&mut result).await.unwrap();
+    assert_eq!(result, b"native-client-origin");
+    listener.await.unwrap();
+    let mut blocked = TcpStream::connect(http).await.unwrap();
+    blocked
+        .write_all(
+            format!(
+                "CONNECT blocked.invalid:{port} HTTP/1.1\r\nHost: blocked.invalid:{port}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert!(!response_head(&mut blocked)
+        .await
+        .starts_with(b"HTTP/1.1 200"));
     assert!(process.0.try_wait().unwrap().is_none());
 }
 
@@ -381,7 +444,19 @@ async fn linux_server_windows_client_f14_h2_h3_open_ok() {
             .unwrap()
             .try_into()
             .unwrap();
-        let config = config::read_file(Path::new(&server_config)).unwrap();
+        let mut config = config::read_file(Path::new(&server_config)).unwrap();
+        let Config::Server(server) = &mut config else {
+            panic!("server fixture");
+        };
+        // The independently transferred public certificate is the actual
+        // server certificate; its private key remains on the Linux node.
+        server
+            .server
+            .inbounds
+            .iter_mut()
+            .find(|inbound| inbound.id == "cross")
+            .unwrap()
+            .tls_cert = format!("file:{}", trusted_ca.display());
         let fixture = CrossOsFixture {
             source: &config,
             endpoint: &endpoint,
@@ -389,17 +464,24 @@ async fn linux_server_windows_client_f14_h2_h3_open_ok() {
             ca: &trusted_ca,
             origin,
         };
-        for transport in [Transport::H2, Transport::H3] {
-            client_scenario(&fixture, transport, false, false).await;
-            client_scenario(&fixture, transport, true, false).await;
-            client_scenario(&fixture, transport, false, true).await;
+        // Each lane owns its own config, credentials, proxy sockets and
+        // process. Keep scenarios within a lane sequential, but overlap
+        // independent H2/H3/Auto lanes against the same bounded server.
+        async fn lane(fixture: &CrossOsFixture<'_>, transport: Transport) {
+            if transport != Transport::Auto {
+                client_scenario(fixture, transport, false, false).await;
+                client_scenario(fixture, transport, true, false).await;
+                client_scenario(fixture, transport, false, true).await;
+            }
             for stream_up in [false, true] {
-                explicit_xhttp_client_scenario(&fixture, transport, stream_up).await;
+                explicit_xhttp_client_scenario(fixture, transport, stream_up).await;
             }
         }
-        for stream_up in [false, true] {
-            explicit_xhttp_client_scenario(&fixture, Transport::Auto, stream_up).await;
-        }
+        tokio::join!(
+            lane(&fixture, Transport::H2),
+            lane(&fixture, Transport::H3),
+            lane(&fixture, Transport::Auto)
+        );
     })
     .await
     .expect("cross-OS Linux/Windows F-14 acceptance deadline");

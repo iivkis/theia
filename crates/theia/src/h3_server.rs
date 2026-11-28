@@ -3,13 +3,17 @@
 use crate::{
     diagnostics::{self, Value},
     protocol::{self, Decoder, Direction, Frame, Role, Session},
-    quic_transport,
     server::{self, GenerationPhase, ServerContext, ServerError},
 };
 use bytes::{Buf, Bytes};
 use h3::{error::Code, quic, server::RequestStream};
 use http::{Request, Response, StatusCode};
-use std::{collections::VecDeque, net::IpAddr, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, Mutex, RwLock},
+    time::Duration,
+};
 use tokio::{io::AsyncWriteExt, net::TcpStream, sync::watch, task::JoinSet, time::timeout};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -17,99 +21,328 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_HANDLERS: usize = crate::transport_policy::MAX_BIDI_STREAMS as usize;
 
-type Stream = RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
+type Stream<S> = RequestStream<S, Bytes>;
 
-struct ConnectionGuard(quinn::Connection);
+// Every native connection enters the same authenticated request handlers.
+trait CarrierStream: quic::BidiStream<Bytes> + quic::RecvStream<Buf = Bytes> + Send + 'static {}
+impl<S: quic::BidiStream<Bytes> + quic::RecvStream<Buf = Bytes> + Send + 'static> CarrierStream
+    for S
+{
+}
 
-impl Drop for ConnectionGuard {
-    fn drop(&mut self) {
-        self.0.close(0u32.into(), b"session closed");
+/// Prepared own-TLS material for the native listener. No keys are re-read
+/// on same-port rotation or rollback.
+#[derive(Clone)]
+pub(crate) struct OwnTlsConfig {
+    native: Arc<rustls::ServerConfig>,
+}
+
+impl OwnTlsConfig {
+    pub(crate) fn from_native(mut native: rustls::ServerConfig) -> Self {
+        native.send_tls13_tickets = 0;
+        Self {
+            native: Arc::new(native),
+        }
+    }
+
+    pub(crate) fn new(
+        certificates: Vec<rustls::pki_types::CertificateDer<'static>>,
+        key: rustls::pki_types::PrivateKeyDer<'static>,
+    ) -> Result<Self, crate::quic_transport::QuicError> {
+        let mut native = crate::transport_policy::Carrier::H3
+            .server_tls(certificates, key)
+            .map_err(|_| crate::quic_transport::QuicError::Configuration)?;
+        native.send_tls13_tickets = 0;
+        Ok(Self {
+            native: Arc::new(native),
+        })
     }
 }
 
-struct EndpointGuard(quinn::Endpoint);
+/// Clones are configuration handles, not additional owners of the live UDP
+/// socket. The socket is moved exactly once into the serving generation.
+#[derive(Clone)]
+pub enum OwnTlsEndpoint {
+    Native {
+        socket: Arc<Mutex<Option<std::net::UdpSocket>>>,
+        config: Arc<RwLock<Arc<rustls::ServerConfig>>>,
+        scope: crate::quic_core::scope::NetworkScope,
+        local: SocketAddr,
+    },
+}
 
-impl Drop for EndpointGuard {
-    fn drop(&mut self) {
-        self.0.close(0u32.into(), b"listener closed");
+impl OwnTlsEndpoint {
+    pub(crate) fn bind(
+        bind: SocketAddr,
+        tls: OwnTlsConfig,
+    ) -> Result<Self, crate::quic_transport::QuicError> {
+        use crate::quic_transport::QuicError;
+        let scope = crate::quic_core::scope::NetworkScope::listener(bind.ip())
+            .ok_or(QuicError::Configuration)?;
+        let socket = crate::routing::carrier_socket::bind_std_udp_listener(bind)
+            .map_err(|_| QuicError::Bind)?;
+        let local = socket.local_addr().map_err(|_| QuicError::Bind)?;
+        Ok(Self::Native {
+            socket: Arc::new(Mutex::new(Some(socket))),
+            config: Arc::new(RwLock::new(tls.native)),
+            scope,
+            local,
+        })
+    }
+
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        let Self::Native { local, .. } = self;
+        Ok(*local)
+    }
+
+    pub(crate) fn set_server_config(&self, tls: OwnTlsConfig) {
+        match self {
+            Self::Native { config, .. } => {
+                // Publication is an infallible pointer replacement. No user
+                // code runs while this lock is held, and existing handshakes
+                // keep the exact immutable configuration they selected.
+                *config.write().unwrap_or_else(|e| e.into_inner()) = tls.native;
+            }
+        }
+    }
+
+    pub(crate) async fn serve(self, context: Arc<ServerContext>) -> Result<(), ServerError> {
+        let (_owner, phase) = watch::channel(GenerationPhase::Active);
+        self.serve_generation(context, phase).await
+    }
+
+    pub(crate) async fn serve_generation(
+        self,
+        context: Arc<ServerContext>,
+        mut phase: watch::Receiver<GenerationPhase>,
+    ) -> Result<(), ServerError> {
+        match self {
+            Self::Native {
+                socket,
+                config,
+                scope,
+                local,
+            } => {
+                if !server::await_generation_activation(&mut phase).await {
+                    return Ok(());
+                }
+                let socket = socket
+                    .lock()
+                    .map_err(|_| ServerError::Io)?
+                    .take()
+                    .ok_or(ServerError::Io)?;
+                let socket =
+                    tokio::net::UdpSocket::from_std(socket).map_err(|_| ServerError::Io)?;
+                if socket.local_addr().map_err(|_| ServerError::Io)? != local {
+                    return Err(ServerError::Io);
+                }
+                serve_native_generation(socket, scope, config, context, phase).await
+            }
+        }
     }
 }
 
-/// Own the listener, handshake tasks, connections and stream handlers.
-/// No detached tasks survive a cancelled listener. Reuse a ServerContext
-/// across transports when wiring the CLI, so their quotas cannot diverge.
-pub async fn serve(
-    endpoint: quinn::Endpoint,
-    context: Arc<ServerContext>,
-) -> Result<(), ServerError> {
-    let (_owner, phase) = watch::channel(GenerationPhase::Active);
-    serve_generation(endpoint, context, phase).await
-}
-
-pub(crate) async fn serve_generation(
-    endpoint: quinn::Endpoint,
+async fn serve_native_generation(
+    socket: tokio::net::UdpSocket,
+    scope: crate::quic_core::scope::NetworkScope,
+    config: Arc<RwLock<Arc<rustls::ServerConfig>>>,
     context: Arc<ServerContext>,
     mut phase: watch::Receiver<GenerationPhase>,
 ) -> Result<(), ServerError> {
-    if !server::await_generation_activation(&mut phase).await {
-        crate::diag!(Info, "server.h3", "generation_aborted_before_activation");
-        return Ok(());
-    }
+    use crate::quic_core::{handshake_udp, listener::Listener, negotiation::VersionPolicy};
+    let mut listener = Listener::with_scope(socket, 128, VersionPolicy::both(), scope)
+        .map_err(|_| ServerError::Io)?;
     crate::diag!(Info, "server.h3", "listener_active");
-    let endpoint = EndpointGuard(endpoint);
     let mut connections = JoinSet::new();
     loop {
+        if *phase.borrow() == GenerationPhase::Drain {
+            break;
+        }
         tokio::select! {
+            biased;
             change = phase.changed() => {
                 if change.is_err() || *phase.borrow() == GenerationPhase::Drain {
                     break;
                 }
             }
             _ = connections.join_next(), if !connections.is_empty() => {}
-            incoming = endpoint.0.accept() => {
-                let Some(incoming) = incoming else {
-                    return Err(ServerError::Io);
-                };
+            incoming = listener.accept() => {
+                let candidate = incoming.map_err(|_| ServerError::Io)?;
                 let connection_id = diagnostics::next_id();
-                crate::diag!(Trace, "server.h3", "quic_incoming",
-                    "connection" = Value::Count(connection_id));
+                crate::diag!(Trace, "server.h3", "quic_incoming", "connection" = Value::Count(connection_id));
                 let Some(slot) = context.connection_slot() else {
-                    crate::diag!(Warn, "server.h3", "connection_quota_rejected",
-                        "connection" = Value::Count(connection_id));
-                    incoming.refuse();
+                    crate::diag!(Warn, "server.h3", "connection_quota_rejected", "connection" = Value::Count(connection_id));
                     continue;
                 };
+                let tls = config.read().unwrap_or_else(|e| e.into_inner()).clone();
                 let context = context.clone();
-                let connection_phase = phase.clone();
+                let phase = phase.clone();
                 connections.spawn(async move {
                     let _slot = slot;
-                    let Ok(connection) = quic_transport::accept(incoming).await else {
-                        crate::diag!(Warn, "server.h3", "quic_tls_handshake_rejected",
-                            "connection" = Value::Count(connection_id));
-                        return;
-                    };
-                    crate::diag!(Debug, "server.h3", "quic_verified",
-                        "connection" = Value::Count(connection_id));
-                    run_connection(connection, context, connection_phase).await;
+                    if let Ok(Ok(session)) = timeout(HANDSHAKE_TIMEOUT, handshake_udp::accept(candidate, tls)).await {
+                        crate::diag!(Debug, "server.h3", "quic_verified", "connection" = Value::Count(connection_id));
+                        let _ = run_native_session(session, context, phase).await;
+                    } else {
+                        crate::diag!(Warn, "server.h3", "quic_tls_handshake_rejected", "connection" = Value::Count(connection_id));
+                    }
                 });
             }
         }
     }
-    // Quinn does not expose a portable accept-only half-close on Endpoint:
-    // while existing streams drain, refuse all NEW datagrams/connection
-    // attempts. EndpointGuard closes everything after the bounded window.
+    listener
+        .stop_accepting()
+        .await
+        .map_err(|_| ServerError::Io)?;
     crate::diag!(Info, "server.h3", "generation_draining");
     let _ = timeout(server::GENERATION_DRAIN, async {
         while !connections.is_empty() {
             tokio::select! {
-                _ = connections.join_next() => {}
-                incoming = endpoint.0.accept() => {
-                    if let Some(incoming) = incoming {
-                        incoming.refuse();
-                    } else {
-                        break;
-                    }
+                _ = connections.join_next() => {},
+                incoming = listener.accept() => {
+                    if incoming.is_err() { break; }
                 }
+            }
+        }
+    })
+    .await;
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+    Ok(())
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+    #[tokio::test]
+    async fn concrete_own_tls_uses_native_and_prebinds_once() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let config = OwnTlsConfig::new(vec![cert.cert.der().clone()], key.into()).unwrap();
+        let endpoint =
+            OwnTlsEndpoint::bind("127.0.0.1:0".parse().unwrap(), config.clone()).unwrap();
+        let OwnTlsEndpoint::Native { local, socket, .. } = &endpoint;
+        let address = *local;
+        assert!(std::net::UdpSocket::bind(address).is_err());
+        endpoint.set_server_config(config);
+        let clone = endpoint.clone();
+        let prepared = socket.lock().unwrap().take().unwrap();
+        assert!(socket.lock().unwrap().is_none());
+        drop(prepared);
+        assert!(std::net::UdpSocket::bind(address).is_ok());
+        drop(clone);
+    }
+}
+
+/// Start the native server on a previously prepared UDP bind.
+pub async fn serve(
+    endpoint: OwnTlsEndpoint,
+    context: Arc<ServerContext>,
+) -> Result<(), ServerError> {
+    endpoint.serve(context).await
+}
+
+/// Experimental loopback entry point; no external listener or configuration
+/// switch. Requires TLS exporter material even for own-TLS; raw fixed-key
+/// sessions cannot enter the shared admission/relay handlers.
+pub async fn run_native_lab(
+    session: crate::quic_core::endpoint::LabSession,
+    context: Arc<ServerContext>,
+) -> Result<(), ServerError> {
+    let peer = session.peer_addr().ip();
+    // REALITY dispatch and pinned-identity admission are not yet integrated.
+    if !peer.is_loopback() || !context.allows_native_lab() {
+        return Err(ServerError::Io);
+    }
+    let _slot = context.connection_slot().ok_or(ServerError::Io)?;
+    let (_owner, phase) = watch::channel(GenerationPhase::Active);
+    run_native_session(session, context, phase).await
+}
+
+/// Explicit pinned-address own-TLS trial, not wired to runtime selection.
+/// The common context enforces connection and request quotas before relay.
+/// On shutdown refuse new connections and drain existing H3 streams.
+pub async fn serve_native_pinned<F>(
+    socket: tokio::net::UdpSocket,
+    scope: crate::quic_core::scope::NetworkScope,
+    tls: Arc<rustls::ServerConfig>,
+    context: Arc<ServerContext>,
+    shutdown: F,
+) -> Result<(), ServerError>
+where
+    F: std::future::Future<Output = ()> + Send,
+{
+    if !scope.is_pinned() {
+        return Err(ServerError::Io);
+    }
+    serve_native_scoped(socket, scope, tls, context, shutdown).await
+}
+
+/// Explicit own-TLS external listener, bound to one concrete IP. Clients
+/// are not restricted to a predeclared IP. This is not yet a runtime
+/// backend selector; callers must opt in and perform independent acceptance.
+pub async fn serve_native_external<F>(
+    socket: tokio::net::UdpSocket,
+    tls: Arc<rustls::ServerConfig>,
+    context: Arc<ServerContext>,
+    shutdown: F,
+) -> Result<(), ServerError>
+where
+    F: std::future::Future<Output = ()> + Send,
+{
+    let local = socket.local_addr().map_err(|_| ServerError::Io)?;
+    let scope = crate::quic_core::scope::NetworkScope::external_server(local.ip())
+        .ok_or(ServerError::Io)?;
+    serve_native_scoped(socket, scope, tls, context, shutdown).await
+}
+
+async fn serve_native_scoped<F>(
+    socket: tokio::net::UdpSocket,
+    scope: crate::quic_core::scope::NetworkScope,
+    tls: Arc<rustls::ServerConfig>,
+    context: Arc<ServerContext>,
+    shutdown: F,
+) -> Result<(), ServerError>
+where
+    F: std::future::Future<Output = ()> + Send,
+{
+    use crate::quic_core::{handshake_udp, listener::Listener, negotiation::VersionPolicy};
+    if !context.allows_native_lab() || tls.send_tls13_tickets != 0 || tls.max_early_data_size != 0 {
+        return Err(ServerError::Io);
+    }
+    let mut listener = Listener::with_scope(socket, 128, VersionPolicy::both(), scope)
+        .map_err(|_| ServerError::Io)?;
+    let (owner, phase) = watch::channel(GenerationPhase::Active);
+    let mut connections = JoinSet::new();
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            _ = connections.join_next(), if !connections.is_empty() => {},
+            incoming = listener.accept() => {
+                let candidate = incoming.map_err(|_| ServerError::Io)?;
+                let Some(slot) = context.connection_slot() else { continue; };
+                let context = context.clone();
+                let tls = tls.clone();
+                let phase = phase.clone();
+                connections.spawn(async move {
+                    let _slot = slot;
+                    if let Ok(session) = handshake_udp::accept(candidate, tls).await {
+                        let _ = run_native_session(session, context, phase).await;
+                    }
+                });
+            }
+        }
+    }
+    listener
+        .stop_accepting()
+        .await
+        .map_err(|_| ServerError::Io)?;
+    let _ = owner.send(GenerationPhase::Drain);
+    let _ = timeout(server::GENERATION_DRAIN, async {
+        while !connections.is_empty() {
+            tokio::select! {
+                _ = connections.join_next() => {},
+                incoming = listener.accept() => { if incoming.is_err() { break; } }
             }
         }
     })
@@ -117,37 +350,51 @@ pub(crate) async fn serve_generation(
     Ok(())
 }
 
-pub(crate) async fn run_connection(
-    connection: quinn::Connection,
+pub(crate) async fn run_native_session(
+    session: crate::quic_core::endpoint::LabSession,
     context: Arc<ServerContext>,
-    mut phase: watch::Receiver<GenerationPhase>,
-) {
-    let guard = ConnectionGuard(connection);
-    let peer = guard.0.remote_address().ip();
+    phase: watch::Receiver<GenerationPhase>,
+) -> Result<(), ServerError> {
+    let peer = session.peer_addr().ip();
+    let (transport, key) = crate::quic_core::h3_adapter::NativeConnection::start(session)
+        .map_err(|_| ServerError::Io)?;
+    let _driver = transport.driver_guard();
+    let mut closed = transport.closed_signal();
+    let mut drained = closed.clone();
     let binding = if context.requires_channel_binding() {
-        let mut key = zeroize::Zeroizing::new([0u8; 32]);
-        if guard
-            .0
-            .export_keying_material(
-                &mut key[..],
-                crate::channel_binding::LABEL,
-                crate::channel_binding::H3,
-            )
-            .is_err()
-        {
-            return;
-        }
         Some(Arc::new(crate::channel_binding::Admission::new(key)))
     } else {
         None
     };
+    run_h3(transport, context, phase, peer, binding, async move {
+        let _ = closed.changed().await;
+    })
+    .await;
+    // Keep the connection quota and listener ownership during the native
+    // driver's closing/draining period, not merely until H3 drops.
+    let _ = timeout(server::GENERATION_DRAIN, drained.changed()).await;
+    Ok(())
+}
+
+async fn run_h3<C, F>(
+    transport: C,
+    context: Arc<ServerContext>,
+    mut phase: watch::Receiver<GenerationPhase>,
+    peer: IpAddr,
+    binding: Option<Arc<crate::channel_binding::Admission>>,
+    closed: F,
+) where
+    C: quic::Connection<Bytes> + 'static,
+    C::BidiStream: CarrierStream,
+    <C::BidiStream as quic::BidiStream<Bytes>>::SendStream: Send + 'static,
+    <C::BidiStream as quic::BidiStream<Bytes>>::RecvStream:
+        quic::RecvStream<Buf = Bytes> + Send + 'static,
+    F: std::future::Future<Output = ()>,
+{
+    tokio::pin!(closed);
     let mut builder = h3::server::builder();
     builder.max_field_section_size(u64::from(crate::transport_policy::MAX_HEADER_LIST_BYTES));
-    let Ok(Ok(mut h3)) = timeout(
-        HANDSHAKE_TIMEOUT,
-        builder.build::<_, Bytes>(h3_quinn::Connection::new(guard.0.clone())),
-    )
-    .await
+    let Ok(Ok(mut h3)) = timeout(HANDSHAKE_TIMEOUT, builder.build::<_, Bytes>(transport)).await
     else {
         crate::diag!(Warn, "server.h3", "h3_handshake_failed_or_timeout");
         return;
@@ -171,7 +418,7 @@ pub(crate) async fn run_connection(
             }
             _ = handlers.join_next(), if !idle => continue,
             request = h3.accept(), if handlers.len() < MAX_HANDLERS => request,
-            _ = guard.0.closed() => break,
+            _ = &mut closed => break,
             _ = tokio::time::sleep(IDLE_TIMEOUT), if idle => break,
         };
         let resolver = match request {
@@ -180,7 +427,7 @@ pub(crate) async fn run_connection(
                 // Do not drop already-admitted streams when the H3 accept
                 // side reports no further requests. Quinn drives DATA/FIN.
                 while handlers.join_next().await.is_some() {}
-                let _ = timeout(CLOSE_TIMEOUT, guard.0.closed()).await;
+                let _ = timeout(CLOSE_TIMEOUT, &mut closed).await;
                 break;
             }
             _ => break,
@@ -205,7 +452,9 @@ pub(crate) async fn run_connection(
                 crate::diag!(Warn, "server.h3", "request_headers_failed_or_timeout");
                 return;
             };
-            if context.is_descriptor_request(&request) {
+            if context.is_routing_request(&request) {
+                handle_routing(request, stream, &context, peer, binding.as_deref()).await;
+            } else if context.is_descriptor_request(&request) {
                 handle_descriptor(request, stream, &context, peer).await;
             } else if context.accepts_split(&request) {
                 handle_split_request(request, stream, &context, peer, &pair, binding.as_deref())
@@ -217,9 +466,9 @@ pub(crate) async fn run_connection(
     }
 }
 
-async fn handle_descriptor(
+async fn handle_descriptor<S: CarrierStream>(
     request: Request<()>,
-    mut stream: Stream,
+    mut stream: Stream<S>,
     context: &ServerContext,
     peer: IpAddr,
 ) {
@@ -271,9 +520,80 @@ async fn handle_descriptor(
     }
 }
 
-async fn handle_request(
+async fn handle_routing<S: CarrierStream>(
     request: Request<()>,
-    mut stream: Stream,
+    mut stream: Stream<S>,
+    context: &ServerContext,
+    peer: IpAddr,
+    binding: Option<&crate::channel_binding::Admission>,
+) {
+    let (_permit, publication) = match context.authorize_routing(&request, peer) {
+        Ok(value) => value,
+        Err(status) => {
+            reject_split(&mut stream, status).await;
+            return;
+        }
+    };
+    if !crate::channel_binding::admit(binding, &[&request]) {
+        reject_split(&mut stream, StatusCode::UNAUTHORIZED).await;
+        return;
+    }
+    let empty = timeout(HANDSHAKE_TIMEOUT, async {
+        stream.recv_data().await.is_ok_and(|data| data.is_none())
+            && stream
+                .recv_trailers()
+                .await
+                .is_ok_and(|trailers| trailers.is_none())
+    })
+    .await
+    .unwrap_or(false);
+    if !empty {
+        reject_split(&mut stream, StatusCode::BAD_REQUEST).await;
+        return;
+    }
+    let signed = match context
+        .routing_response(&publication, request.headers())
+        .await
+    {
+        Ok(bytes) => bytes,
+        Err(status) => {
+            reject_split(&mut stream, status).await;
+            return;
+        }
+    };
+    let Ok(response) = Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "application/octet-stream")
+        .header(http::header::CONTENT_LENGTH, signed.len().to_string())
+        .body(())
+    else {
+        return;
+    };
+    if !matches!(
+        timeout(crate::routing::exchange::TRANSFER_TIMEOUT, async {
+            stream
+                .send_response(context.pad_response(response)?)
+                .await
+                .map_err(|_| ServerError::Io)?;
+            for chunk in signed.chunks(64 * 1024) {
+                stream
+                    .send_data(Bytes::copy_from_slice(chunk))
+                    .await
+                    .map_err(|_| ServerError::Io)?;
+            }
+            stream.finish().await.map_err(|_| ServerError::Io)
+        })
+        .await,
+        Ok(Ok(()))
+    ) {
+        stream.stop_stream(Code::H3_REQUEST_CANCELLED);
+        stream.stop_sending(Code::H3_REQUEST_CANCELLED);
+    }
+}
+
+async fn handle_request<S: CarrierStream>(
+    request: Request<()>,
+    mut stream: Stream<S>,
     context: &ServerContext,
     peer: IpAddr,
     binding: Option<&crate::channel_binding::Admission>,
@@ -326,20 +646,20 @@ async fn handle_request(
     drop(permit);
 }
 
-type SplitPair = crate::split_http::Pair<(Request<()>, Stream)>;
+type SplitPair<S> = crate::split_http::Pair<(Request<()>, Stream<S>)>;
 
-async fn reject_split(stream: &mut Stream, status: StatusCode) {
+async fn reject_split<S: CarrierStream>(stream: &mut Stream<S>, status: StatusCode) {
     let _ = timeout(CLOSE_TIMEOUT, respond(stream, status)).await;
     let _ = timeout(CLOSE_TIMEOUT, stream.finish()).await;
     stream.stop_sending(Code::H3_REQUEST_CANCELLED);
 }
 
-async fn handle_split_request(
+async fn handle_split_request<S: CarrierStream>(
     request: Request<()>,
-    mut stream: Stream,
+    mut stream: Stream<S>,
     context: &ServerContext,
     peer: IpAddr,
-    pair: &SplitPair,
+    pair: &SplitPair<S>,
     binding: Option<&crate::channel_binding::Admission>,
 ) {
     let Some(leg) = context.split_leg(&request) else {
@@ -402,9 +722,9 @@ async fn handle_split_request(
     drop(permit);
 }
 
-async fn relay_request(
-    mut tx: RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
-    mut rx: RequestStream<h3_quinn::RecvStream, Bytes>,
+async fn relay_request<T: quic::SendStream<Bytes>, R: quic::RecvStream>(
+    mut tx: RequestStream<T, Bytes>,
+    mut rx: RequestStream<R, Bytes>,
     context: &ServerContext,
     session_id: u64,
 ) {
@@ -438,7 +758,10 @@ async fn relay_request(
     }
 }
 
-async fn respond_admitted(stream: &mut Stream, context: &ServerContext) -> Result<(), ServerError> {
+async fn respond_admitted<S: CarrierStream>(
+    stream: &mut Stream<S>,
+    context: &ServerContext,
+) -> Result<(), ServerError> {
     let response = Response::builder()
         .status(StatusCode::OK)
         .body(())
@@ -449,7 +772,10 @@ async fn respond_admitted(stream: &mut Stream, context: &ServerContext) -> Resul
         .map_err(|_| ServerError::Io)
 }
 
-async fn respond(stream: &mut Stream, status: StatusCode) -> Result<(), ServerError> {
+async fn respond<S: CarrierStream>(
+    stream: &mut Stream<S>,
+    status: StatusCode,
+) -> Result<(), ServerError> {
     let response = Response::builder()
         .status(status)
         .body(())
@@ -514,9 +840,9 @@ async fn send<S: quic::SendStream<Bytes>>(
         .map_err(|_| ServerError::Io)
 }
 
-async fn handle_frames(
-    tx: &mut RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
-    rx: &mut RequestStream<h3_quinn::RecvStream, Bytes>,
+async fn handle_frames<T: quic::SendStream<Bytes>, R: quic::RecvStream>(
+    tx: &mut RequestStream<T, Bytes>,
+    rx: &mut RequestStream<R, Bytes>,
     context: &ServerContext,
     session_id: u64,
 ) -> Result<(), ServerError> {
@@ -555,10 +881,12 @@ async fn handle_frames(
             }
             break frame;
         };
-        let Frame::OpenTcp { address, port } = open else {
-            return Err(ServerError::Protocol);
-        };
-        Ok::<_, ServerError>((address, port))
+        match open {
+            Frame::OpenTcp { address, port } | Frame::OpenUdp { address, port } => {
+                Ok::<_, ServerError>((address, port))
+            }
+            _ => Err(ServerError::Protocol),
+        }
     })
     .await
     .map_err(|_| ServerError::TimedOut)??;
@@ -571,6 +899,7 @@ async fn handle_frames(
     );
     // Dial only a shared-policy vetted address. Detect early body/EOF/reset
     // while connecting; a client is not allowed to send DATA before OPEN_OK.
+    let udp = state.udp();
     let dial = tokio::select! {
         biased;
         next = async {
@@ -587,7 +916,10 @@ async fn handle_frames(
             next?;
             return Err(ServerError::Protocol);
         }
-        result = context.dial_target(&address, port) => result,
+        result = async {
+            if udp { context.dial_udp_target(&address, port).await.map(crate::udp_relay::Target::Udp) }
+            else { context.dial_target(&address, port).await.map(crate::udp_relay::Target::Tcp) }
+        } => result,
     };
     let tcp = match dial {
         Ok(tcp) => tcp,
@@ -616,13 +948,16 @@ async fn handle_frames(
         "open_ok_sent",
         "session" = Value::Count(session_id)
     );
-    relay(tcp, tx, rx, incoming, state, session_id).await
+    match tcp {
+        crate::udp_relay::Target::Tcp(tcp) => relay(tcp, tx, rx, incoming, state, session_id).await,
+        crate::udp_relay::Target::Udp(udp) => relay_udp(udp, tx, rx, incoming, state).await,
+    }
 }
 
-async fn relay(
+async fn relay<T: quic::SendStream<Bytes>, R: quic::RecvStream>(
     tcp: TcpStream,
-    tx: &mut RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
-    rx: &mut RequestStream<h3_quinn::RecvStream, Bytes>,
+    tx: &mut RequestStream<T, Bytes>,
+    rx: &mut RequestStream<R, Bytes>,
     mut incoming: Incoming,
     mut state: Session,
     session_id: u64,
@@ -744,4 +1079,81 @@ async fn relay(
         .apply(Direction::Send, &Frame::Fin)
         .map_err(|_| ServerError::Protocol)?;
     state.finish().map_err(|_| ServerError::Protocol)
+}
+
+async fn relay_udp<T: quic::SendStream<Bytes>, R: quic::RecvStream>(
+    socket: tokio::net::UdpSocket,
+    tx: &mut RequestStream<T, Bytes>,
+    rx: &mut RequestStream<R, Bytes>,
+    mut decoder: Incoming,
+    state: Session,
+) -> Result<(), ServerError> {
+    let traffic = crate::traffic::enter_udp(crate::Role::Server, true, false);
+    let mut rx_state = state.clone();
+    let mut tx_state = state;
+    let activity = crate::udp_relay::Activity::new();
+    let writing = std::sync::atomic::AtomicBool::new(false);
+    let upload = async {
+        loop {
+            let frame = decoder.next(rx).await?.ok_or(ServerError::Protocol)?;
+            rx_state
+                .apply(Direction::Receive, &frame)
+                .map_err(|_| ServerError::Protocol)?;
+            match frame {
+                Frame::Datagram(data) => {
+                    crate::udp_relay::send_datagram(&socket, &data)
+                        .await
+                        .map_err(|_| ServerError::Io)?;
+                    traffic.upload(data.len());
+                    activity.touch();
+                }
+                Frame::Padding(_) => tokio::task::yield_now().await,
+                Frame::Fin => {
+                    // The protocol FIN can arrive before the HTTP/3 request
+                    // stream FIN. Do not send STOP_SENDING while the peer is
+                    // still committing its graceful transport close.
+                    let tail = timeout(CLOSE_TIMEOUT, decoder.next(rx))
+                        .await
+                        .map_err(|_| ServerError::TimedOut)??;
+                    if tail.is_some() {
+                        return Err(ServerError::Protocol);
+                    }
+                    return Ok::<(), ServerError>(());
+                }
+                _ => return Err(ServerError::Protocol),
+            }
+        }
+    };
+    let download = async {
+        let mut buf = vec![0; crate::protocol::MAX_DATAGRAM + 1];
+        loop {
+            let n = socket.recv(&mut buf).await.map_err(|_| ServerError::Io)?;
+            if n > crate::protocol::MAX_DATAGRAM {
+                continue;
+            }
+            let frame = Frame::Datagram(buf[..n].to_vec());
+            tx_state
+                .apply(Direction::Send, &frame)
+                .map_err(|_| ServerError::Protocol)?;
+            writing.store(true, std::sync::atomic::Ordering::Relaxed);
+            send(tx, &frame).await?;
+            writing.store(false, std::sync::atomic::Ordering::Relaxed);
+            traffic.download(n);
+            activity.touch();
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), ServerError>(())
+    };
+    // UDP FIN terminates the association (no TCP-style half close).
+    let result = tokio::select! { result=upload=>result, result=download=>result, ()=activity.expire()=>Ok(()) };
+    if writing.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(ServerError::TimedOut);
+    }
+    result?;
+    let frame = Frame::Fin;
+    tx_state
+        .apply(Direction::Send, &frame)
+        .map_err(|_| ServerError::Protocol)?;
+    send(tx, &frame).await?;
+    Ok(())
 }

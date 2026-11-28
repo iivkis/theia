@@ -81,7 +81,7 @@ impl FixtureControl {
 pub struct PreparedFixture {
     tcp: TcpListener,
     h2: TlsAcceptor,
-    h3: Option<quinn::Endpoint>,
+    h3: Option<crate::h3_server::OwnTlsEndpoint>,
     context: Arc<ServerContext>,
 }
 
@@ -178,18 +178,21 @@ impl PreparedFixture {
         let h2 = TlsAcceptor::from(Arc::new(tls));
         let h3 = if value.descriptor().h3 {
             Some(
-                quinn::Endpoint::server(
-                    match &admission {
-                        Some((secret, guard)) => crate::identity_tls::checked_quic_server(
-                            identity,
-                            &value,
-                            secret.clone(),
-                            guard.clone(),
-                        ),
-                        None => identity.quic_server("localhost"),
-                    }
-                    .map_err(|_| ServerError::Tls)?,
+                crate::h3_server::OwnTlsEndpoint::bind(
                     local,
+                    crate::h3_server::OwnTlsConfig::from_native(
+                        match &admission {
+                            Some((secret, guard)) => crate::identity_tls::checked_server_tls(
+                                identity,
+                                &value,
+                                Branch::H3,
+                                secret.clone(),
+                                guard.clone(),
+                            ),
+                            None => identity.server_tls("localhost", Branch::H3),
+                        }
+                        .map_err(|_| ServerError::Tls)?,
+                    ),
                 )
                 .map_err(|_| ServerError::Io)?,
             )

@@ -1158,6 +1158,15 @@ impl Wizard {
             ),
             9 => "Дополнительные имена сайтов".into(),
             10 => "Только сети, которые разрешено проверять".into(),
+            11 => {
+                if self.advanced {
+                    "Свернуть".into()
+                } else {
+                    "Открыть".into()
+                }
+            }
+            12 => "Открыть редактор".into(),
+            13 => "Проверить и перейти дальше".into(),
             4 => self.custom_domains(),
             6 => {
                 if self.fields[6] == "auto" {
@@ -1349,11 +1358,14 @@ impl Wizard {
             if self.advanced {
                 fields.push(0);
             }
+            fields.push(11);
+            fields.push(13);
             return fields;
         }
         let mut fields = vec![8, 9];
         if self.custom_enabled {
             fields.push(4);
+            fields.push(12);
         }
         fields.push(10);
         if self.ranges_enabled {
@@ -1362,6 +1374,8 @@ impl Wizard {
         if self.advanced {
             fields.push(6);
         }
+        fields.push(11);
+        fields.push(13);
         fields
     }
     fn toggle_source(&mut self) {
@@ -1486,6 +1500,13 @@ impl Wizard {
                         self.error.clear();
                     }
                     KeyCode::Esc => return true,
+                    KeyCode::Enter if self.focus == 11 => {
+                        self.advanced = !self.advanced;
+                    }
+                    KeyCode::Enter if self.focus == 12 && self.sources && self.custom_enabled => {
+                        self.focus = 4;
+                        self.domain_draft = Some(DomainDraft::new(&self.fields[4]));
+                    }
                     KeyCode::F(2) => {
                         self.advanced = !self.advanced;
                         if !self.visible_fields().contains(&self.focus) {
@@ -1955,6 +1976,9 @@ impl Wizard {
                         5 if self.source.is_none() => "Имя первого пользователя",
                         5 => "Пользователи с доступом",
                         7 => "Разрешённые IP-диапазоны",
+                        11 => "Расширенные настройки",
+                        12 => "Редактировать список сайтов",
+                        13 => "Продолжить",
                         _ => WIZARD_LABELS[id],
                     };
                     out.push_str(&format!("{} {label}: {}\n", if id == self.focus { ">" } else { " " }, self.display_value(id)));
@@ -2084,6 +2108,12 @@ impl ProvisionPanel {
         }
     }
 
+    pub(crate) fn recovery_path(&self) -> Option<&Path> {
+        let wizard = self.wizard.as_ref()?;
+        matches!(wizard.stage, WizardStage::SaveFailed { retry: false, .. })
+            .then_some(wizard.config.as_path())
+    }
+
     pub(crate) fn confirmation_choice(&self) -> Option<(char, &'static str)> {
         if let Some(wizard) = &self.wizard {
             if let Some(panel) = &wizard.registration {
@@ -2099,6 +2129,9 @@ impl ProvisionPanel {
                 }
                 WizardStage::CreateConfirm(_) if !wizard.result_details => Some(('y', "Сохранить")),
                 WizardStage::SaveFailed { retry: true, .. } => Some(('y', "Повторить настройку")),
+                WizardStage::SaveFailed { retry: false, .. } => {
+                    Some(('o', "Открыть настройки заново"))
+                }
                 WizardStage::Success => Some((
                     'y',
                     if wizard.source.is_none() {
@@ -2331,6 +2364,9 @@ impl ProvisionPanel {
             (if wizard.catalogue_enabled() { "[x] Готовый каталог сайтов" } else { "[ ] Готовый каталог сайтов" }, "Пробел или ←/→ — включить или выключить. Сеть только после подтверждения."),
             (if wizard.custom_enabled { "[x] Добавить свои сайты" } else { "[ ] Добавить свои сайты" }, "Пробел или ←/→ — включить или выключить дополнительный источник."),
             (if wizard.ranges_enabled { "[x] Проверить IP-диапазоны" } else { "[ ] Проверить IP-диапазоны" }, "Пробел или ←/→ — включить или выключить. Только с разрешением."),
+            ("› Расширенные настройки", "Enter — раскрыть или свернуть."),
+            ("› Редактировать список сайтов", "Enter — открыть редактор."),
+            ("› Продолжить", "Enter — проверить параметры и перейти дальше."),
         ];
         Some(Form {
             fields: wizard
@@ -2529,6 +2565,176 @@ impl ProvisionPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_resolution_review_and_expired_evidence_require_separate_approval() {
+        let dir = std::env::temp_dir()
+            .join(crate::tui_editor::generated_id("wizard-pinned-review").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("server.toml");
+        let mut panel = ProvisionPanel::first(path.clone()).unwrap();
+        let wizard = panel.wizard.as_mut().unwrap();
+        wizard.fields[2] = "93.184.216.1".into();
+        wizard.suggest_own_ip();
+        wizard.fields[5] = "owner".into();
+        wizard.fields[4] = "reference.example.org=93.184.216.2".into();
+        wizard.custom_enabled = true;
+        wizard.catalogue = false;
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert_eq!(panel.guide().unwrap().0, 1);
+        panel.key(key(KeyCode::Enter));
+        assert_eq!(panel.guide().unwrap().0, 2);
+        panel.key(key(KeyCode::Enter));
+        assert_eq!(panel.guide().unwrap().0, 3);
+        assert!(panel.body().contains("Соединения с сайтами"));
+        panel.key(key(KeyCode::F(2)));
+        assert!(panel.body().contains("reference.example.org"));
+        assert!(panel.confirmation_choice().is_none());
+        panel.key(key(KeyCode::Esc));
+        panel.key(key(KeyCode::Char('y')));
+        assert!(matches!(
+            panel.wizard.as_ref().unwrap().stage,
+            WizardStage::Resolving(..)
+        ));
+        assert!(panel.body().contains("Фаза 1/3"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while matches!(
+            panel.wizard.as_ref().unwrap().stage,
+            WizardStage::Resolving(..)
+        ) {
+            assert!(panel.poll().is_none());
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let WizardStage::ProbeConfirm(value) = &panel.wizard.as_ref().unwrap().stage else {
+            panic!("pinned target must resolve without public DNS");
+        };
+        let input = value.0.clone();
+        let targets = value.1.plan.as_ref().unwrap().targets().to_vec();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].address, "93.184.216.2:443".parse().unwrap());
+        assert_eq!(panel.guide().unwrap().0, 4);
+        assert!(!path.exists() && !input.health.exists());
+        // Inject a completed worker result, not a network success claim.
+        // Old evidence must never authorize creation of credentials or TOML.
+        let (state, report) = rank_checked(
+            &input,
+            targets.clone(),
+            vec![Evidence {
+                h2_status: Some(200),
+                h3_status: None,
+            }],
+            1000,
+            Vec::new(),
+        )
+        .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (cancel, _cancelled) = tokio::sync::oneshot::channel();
+        panel.wizard.as_mut().unwrap().stage = WizardStage::Checking(rx, cancel);
+        assert_eq!(panel.guide().unwrap().0, 4);
+        assert!(panel.poll().is_none());
+        tx.send(Ok((input.clone(), state, report))).unwrap();
+        assert!(panel.poll().is_none());
+        assert_eq!(panel.guide().unwrap().0, 5);
+        assert!(panel
+            .reference_review()
+            .unwrap()
+            .note
+            .contains("не запустит сервер"));
+        panel.key(key(KeyCode::Char('y')));
+        let WizardStage::ProbeConfirm(value) = &panel.wizard.as_ref().unwrap().stage else {
+            panic!("expired evidence must require an exact new probe");
+        };
+        assert!(
+            value.1.plan.as_ref().unwrap().targets() == targets.as_slice(),
+            "expired evidence must retain exact target list"
+        );
+        assert!(!path.exists() && !input.bundle.exists() && !input.health.exists());
+        panel.key(key(KeyCode::Esc));
+        assert!(matches!(
+            panel.wizard.as_ref().unwrap().stage,
+            WizardStage::Input
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn wizard_worker_failure_and_empty_search_do_not_create_material() {
+        let dir = std::env::temp_dir()
+            .join(crate::tui_editor::generated_id("wizard-worker-refusal").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("server.toml");
+        let mut panel = ProvisionPanel::first(path.clone()).unwrap();
+        let wizard = panel.wizard.as_mut().unwrap();
+        wizard.fields[2] = "93.184.216.1".into();
+        wizard.suggest_own_ip();
+        wizard.fields[5] = "owner".into();
+        let input = WizardInput::parse(path.clone(), None, &wizard.effective_fields()).unwrap();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let (tx, rx) = mpsc::channel();
+        let (cancel, mut cancelled) = tokio::sync::oneshot::channel();
+        panel.wizard.as_mut().unwrap().stage = WizardStage::Resolving(rx, cancel);
+        panel.key(key(KeyCode::Esc));
+        assert_eq!(cancelled.try_recv(), Ok(()));
+        assert!(tx
+            .send(Ok((
+                input.clone(),
+                ResolvedSearch {
+                    plan: None,
+                    unresolved: Vec::new()
+                }
+            )))
+            .is_err());
+        let (tx, rx) = mpsc::channel();
+        let (cancel, _cancelled) = tokio::sync::oneshot::channel();
+        panel.wizard.as_mut().unwrap().stage = WizardStage::Resolving(rx, cancel);
+        tx.send(Ok((
+            input.clone(),
+            ResolvedSearch {
+                plan: None,
+                unresolved: Vec::new(),
+            },
+        )))
+        .unwrap();
+        assert!(panel.poll().is_none());
+        assert!(panel.body().contains("TLS не выполнялся"));
+        assert!(panel
+            .reference_review()
+            .unwrap()
+            .note
+            .contains("Ничего не сохранено"));
+        assert!(panel.confirmation_choice().is_none());
+        panel.key(key(KeyCode::F(2)));
+        assert!(panel.reference_review().unwrap().expanded);
+        panel.key(key(KeyCode::Enter));
+        assert!(!panel.reference_review().unwrap().expanded);
+        panel.key(key(KeyCode::Enter));
+        assert_eq!(panel.guide().unwrap().0, 1);
+        let (tx, rx) = mpsc::channel();
+        let (cancel, _cancelled) = tokio::sync::oneshot::channel();
+        panel.wizard.as_mut().unwrap().stage = WizardStage::Checking(rx, cancel);
+        drop(tx);
+        assert!(panel.poll().is_none());
+        assert!(matches!(
+            panel.wizard.as_ref().unwrap().stage,
+            WizardStage::Input
+        ));
+        assert!(!panel.wizard.as_ref().unwrap().error.is_empty());
+        let (tx, rx) = mpsc::channel();
+        panel.wizard.as_mut().unwrap().stage =
+            WizardStage::SavingInitial(rx, input.health.parent().unwrap().to_owned());
+        assert_eq!(panel.guide().unwrap().0, 6);
+        assert!(panel.body().contains("Сохраняем"));
+        tx.send(Err(Error::Approval)).unwrap();
+        assert!(panel.poll().is_none());
+        assert!(panel.body().contains("Повтор недоступен"));
+        assert_eq!(
+            panel.confirmation_choice(),
+            Some(('o', "Открыть настройки заново"))
+        );
+        assert!(!path.exists() && !input.health.exists() && !input.bundle.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn wizard_catalogue_search_is_not_the_three_reference_persistence_limit() {

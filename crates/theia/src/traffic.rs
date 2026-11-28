@@ -15,6 +15,12 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+tokio::task_local! { pub(crate) static PROFILE_DIAGNOSTIC: (); }
+fn diagnostic() -> bool {
+    PROFILE_DIAGNOSTIC.try_with(|_| ()).is_ok()
+}
+static DIAGNOSTIC_COUNTERS: Counters = Counters::new();
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Snapshot {
     pub active: u64,
@@ -40,6 +46,11 @@ impl Counters {
     }
 
     fn enter(&self) -> Relay<'_> {
+        if diagnostic() {
+            DIAGNOSTIC_COUNTERS.opened.fetch_add(1, Ordering::Relaxed);
+            DIAGNOSTIC_COUNTERS.active.fetch_add(1, Ordering::Relaxed);
+            return Relay(&DIAGNOSTIC_COUNTERS);
+        }
         self.opened.fetch_add(1, Ordering::Relaxed);
         self.active.fetch_add(1, Ordering::Relaxed);
         Relay(self)
@@ -74,6 +85,288 @@ static SERVER_H2: Counters = Counters::new();
 static SERVER_H3: Counters = Counters::new();
 static CLIENT_H2: Counters = Counters::new();
 static CLIENT_H3: Counters = Counters::new();
+static CLIENT_DIRECT: Counters = Counters::new();
+static CLIENT_BLOCKED: AtomicU64 = AtomicU64::new(0);
+static DPI_FIRST_RESPONSE: AtomicU64 = AtomicU64::new(0);
+static DPI_FALLBACK_OPEN: AtomicU64 = AtomicU64::new(0);
+static DPI_FIRST_FAILURE: AtomicU64 = AtomicU64::new(0);
+static UDP_DIRECT: Counters = Counters::new();
+static UDP_CLIENT_H2: Counters = Counters::new();
+static UDP_CLIENT_H3: Counters = Counters::new();
+static UDP_SERVER_H2: Counters = Counters::new();
+static UDP_SERVER_H3: Counters = Counters::new();
+static UDP_QUIC: AtomicU64 = AtomicU64::new(0);
+static UDP_STUN: AtomicU64 = AtomicU64::new(0);
+static UDP_STUN_RESPONSE: AtomicU64 = AtomicU64::new(0);
+static UDP_DPI_FALLBACK: AtomicU64 = AtomicU64::new(0);
+static DPI_CACHE_HIT: AtomicU64 = AtomicU64::new(0);
+static DPI_PROBE_OK: AtomicU64 = AtomicU64::new(0);
+static DPI_PROBE_FAILED: AtomicU64 = AtomicU64::new(0);
+static DPI_TLS_ALERT: AtomicU64 = AtomicU64::new(0);
+static DPI_TIMEOUT: AtomicU64 = AtomicU64::new(0);
+static UDP_VERIFIED_LOCAL: AtomicU64 = AtomicU64::new(0);
+static UDP_QUEUE_DROP: AtomicU64 = AtomicU64::new(0);
+static UDP_STUN_FALLBACK: AtomicU64 = AtomicU64::new(0);
+static UDP_STUN_LOCAL: AtomicU64 = AtomicU64::new(0);
+static UDP_STUN_FINGERPRINT: AtomicU64 = AtomicU64::new(0);
+pub(crate) fn udp_stun_fingerprint() {
+    if diagnostic() {
+        return;
+    }
+    UDP_STUN_FINGERPRINT.fetch_add(1, Ordering::Relaxed);
+}
+static UDP_STUN_PROBE_OK: AtomicU64 = AtomicU64::new(0);
+static UDP_STUN_PROBE_FAILED: AtomicU64 = AtomicU64::new(0);
+static UDP_QUIC_V2_FALLBACK: AtomicU64 = AtomicU64::new(0);
+pub(crate) fn udp_stun_local() {
+    if diagnostic() {
+        return;
+    }
+    UDP_STUN_LOCAL.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn udp_stun_probe(good: bool) {
+    if diagnostic() {
+        return;
+    }
+    (if good {
+        &UDP_STUN_PROBE_OK
+    } else {
+        &UDP_STUN_PROBE_FAILED
+    })
+    .fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn udp_quic_v2_fallback() {
+    if diagnostic() {
+        return;
+    }
+    UDP_QUIC_V2_FALLBACK.fetch_add(1, Ordering::Relaxed);
+}
+static DPI_BIDIRECTIONAL: AtomicU64 = AtomicU64::new(0);
+static UDP_PEER_REPLY: AtomicU64 = AtomicU64::new(0);
+static UDP_PEER_FAILURE: AtomicU64 = AtomicU64::new(0);
+static DPI_POLICY_STALE: AtomicU64 = AtomicU64::new(0);
+static DPI_POST_HELLO_FAILURE: AtomicU64 = AtomicU64::new(0);
+pub(crate) fn udp_peer_failure() {
+    if diagnostic() {
+        return;
+    }
+    UDP_PEER_FAILURE.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn dpi_policy_stale() {
+    if diagnostic() {
+        return;
+    }
+    DPI_POLICY_STALE.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn dpi_post_hello_failure() {
+    if diagnostic() {
+        return;
+    }
+    DPI_POST_HELLO_FAILURE.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn dpi_bidirectional() {
+    if diagnostic() {
+        return;
+    }
+    DPI_BIDIRECTIONAL.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn udp_peer_reply() {
+    if diagnostic() {
+        return;
+    }
+    UDP_PEER_REPLY.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn dpi_cache_hit() {
+    if diagnostic() {
+        return;
+    }
+    DPI_CACHE_HIT.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn dpi_probe(good: bool) {
+    if diagnostic() {
+        return;
+    }
+    (if good {
+        &DPI_PROBE_OK
+    } else {
+        &DPI_PROBE_FAILED
+    })
+    .fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn dpi_tls_alert() {
+    if diagnostic() {
+        return;
+    }
+    DPI_TLS_ALERT.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn dpi_timeout() {
+    if diagnostic() {
+        return;
+    }
+    DPI_TIMEOUT.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn udp_verified_local() {
+    if diagnostic() {
+        return;
+    }
+    UDP_VERIFIED_LOCAL.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn udp_queue_drop() {
+    if diagnostic() {
+        return;
+    }
+    UDP_QUEUE_DROP.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn udp_stun_fallback() {
+    if diagnostic() {
+        return;
+    }
+    UDP_STUN_FALLBACK.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn enter_udp(role: Role, h3: bool, direct: bool) -> Relay<'static> {
+    if direct {
+        return UDP_DIRECT.enter();
+    }
+    (match (role, h3) {
+        (Role::Client, false) => &UDP_CLIENT_H2,
+        (Role::Client, true) => &UDP_CLIENT_H3,
+        (Role::Server, false) => &UDP_SERVER_H2,
+        (Role::Server, true) => &UDP_SERVER_H3,
+    })
+    .enter()
+}
+pub(crate) fn udp_quic_flow() {
+    if diagnostic() {
+        return;
+    }
+    UDP_QUIC.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn udp_stun_flow() {
+    if diagnostic() {
+        return;
+    }
+    UDP_STUN.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn udp_stun_response() {
+    if diagnostic() {
+        return;
+    }
+    UDP_STUN_RESPONSE.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn udp_dpi_fallback() {
+    if diagnostic() {
+        return;
+    }
+    UDP_DPI_FALLBACK.fetch_add(1, Ordering::Relaxed);
+}
+#[cfg(test)]
+#[test]
+fn udp_routing_summary_reports_independent_counters() {
+    let report = routing_summary_from([
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
+        18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+    ]);
+    assert!(report.contains("UDP VPS:"));
+    assert!(report.contains("QUIC Initial 7 · STUN 8 · совпавший ответ 9"));
+    assert!(report.contains("QUIC отправлен локально 16 · ответ peer 20 · резерв VPS 10"));
+    assert!(report.contains("STUN через VPS 18 · потери очереди 17 · отказы UDP peer 21"));
+    assert!(report.contains("Отказы после ServerHello 23 · неактуальная политика 22"));
+    assert!(report.contains("STUN Binding локально 24 · проверки 25/26"));
+    assert!(report.contains("QUIC v2/h3 через VPS 27"));
+    assert!(report.contains("STUN добавлен FINGERPRINT 28"));
+}
+
+pub(crate) fn enter_direct() -> Relay<'static> {
+    CLIENT_DIRECT.enter()
+}
+pub(crate) fn blocked() {
+    if diagnostic() {
+        return;
+    }
+    CLIENT_BLOCKED.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn dpi_first_response() {
+    if diagnostic() {
+        return;
+    }
+    DPI_FIRST_RESPONSE.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn dpi_fallback_open() {
+    if diagnostic() {
+        return;
+    }
+    DPI_FALLBACK_OPEN.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn dpi_first_failure() {
+    if diagnostic() {
+        return;
+    }
+    DPI_FIRST_FAILURE.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn routing_totals() -> [u64; 38] {
+    let direct = CLIENT_DIRECT.snapshot();
+    let proxied = snapshot(Role::Client);
+    let udp = UDP_DIRECT.snapshot();
+    let h2 = UDP_CLIENT_H2.snapshot();
+    let h3 = UDP_CLIENT_H3.snapshot();
+    [
+        direct.upload,
+        direct.download,
+        proxied[0].upload.saturating_add(proxied[1].upload),
+        proxied[0].download.saturating_add(proxied[1].download),
+        CLIENT_BLOCKED.load(Ordering::Relaxed),
+        direct.active,
+        proxied[0].active.saturating_add(proxied[1].active),
+        DPI_FIRST_RESPONSE.load(Ordering::Relaxed),
+        DPI_FALLBACK_OPEN.load(Ordering::Relaxed),
+        DPI_FIRST_FAILURE.load(Ordering::Relaxed),
+        udp.upload,
+        udp.download,
+        h2.upload.saturating_add(h3.upload),
+        h2.download.saturating_add(h3.download),
+        udp.active,
+        h2.active.saturating_add(h3.active),
+        UDP_QUIC.load(Ordering::Relaxed),
+        UDP_STUN.load(Ordering::Relaxed),
+        UDP_STUN_RESPONSE.load(Ordering::Relaxed),
+        UDP_DPI_FALLBACK.load(Ordering::Relaxed),
+        DPI_CACHE_HIT.load(Ordering::Relaxed),
+        DPI_PROBE_OK.load(Ordering::Relaxed),
+        DPI_PROBE_FAILED.load(Ordering::Relaxed),
+        DPI_TLS_ALERT.load(Ordering::Relaxed),
+        DPI_TIMEOUT.load(Ordering::Relaxed),
+        UDP_VERIFIED_LOCAL.load(Ordering::Relaxed),
+        UDP_QUEUE_DROP.load(Ordering::Relaxed),
+        UDP_STUN_FALLBACK.load(Ordering::Relaxed),
+        DPI_BIDIRECTIONAL.load(Ordering::Relaxed),
+        UDP_PEER_REPLY.load(Ordering::Relaxed),
+        UDP_PEER_FAILURE.load(Ordering::Relaxed),
+        DPI_POLICY_STALE.load(Ordering::Relaxed),
+        DPI_POST_HELLO_FAILURE.load(Ordering::Relaxed),
+        UDP_STUN_LOCAL.load(Ordering::Relaxed),
+        UDP_STUN_PROBE_OK.load(Ordering::Relaxed),
+        UDP_STUN_PROBE_FAILED.load(Ordering::Relaxed),
+        UDP_QUIC_V2_FALLBACK.load(Ordering::Relaxed),
+        UDP_STUN_FINGERPRINT.load(Ordering::Relaxed),
+    ]
+}
+
+pub(crate) fn routing_summary() -> String {
+    routing_summary_from(routing_totals())
+}
+
+pub(crate) fn routing_summary_from(totals: [u64; 38]) -> String {
+    let [direct_up, direct_down, proxy_up, proxy_down, blocked, direct_active, proxy_active, dpi_first_response, dpi_fallback_open, dpi_first_failure, udp_direct_up, udp_direct_down, udp_proxy_up, udp_proxy_down, udp_direct_active, udp_proxy_active, quic, stun, stun_response, udp_fallback, cache_hits, probes_ok, probes_failed, tls_alerts, timeouts, udp_verified, udp_drops, stun_fallback, bidirectional, udp_peer_reply, udp_peer_failure, policy_stale, post_hello_failure, stun_local, stun_probe_ok, stun_probe_failed, quic_v2_fallback, stun_fingerprint] =
+        totals;
+    format!(
+        "Через VPS: ↑ {} ↓ {} · активно {proxy_active}\nНапрямую: ↑ {} ↓ {} · активно {direct_active}\nЗаблокировано: {blocked}\nAnti-DPI: ServerHello {dpi_first_response} · обмен в обе стороны {bidirectional} · резерв VPS {dpi_fallback_open}\nОшибки первого обмена {dpi_first_failure} · TLS alert {tls_alerts} · тайм-аут {timeouts}\nОтказы после ServerHello {post_hello_failure} · неактуальная политика {policy_stale}\nПроверки TLS/QUIC: успешно {probes_ok} · отказ {probes_failed} · кеш {cache_hits}\nUDP VPS: ↑ {} ↓ {} · активно {udp_proxy_active}\nUDP напрямую: ↑ {} ↓ {} · активно {udp_direct_active}\nUDP: QUIC Initial {quic} · STUN {stun} · совпавший ответ {stun_response}\nUDP: QUIC отправлен локально {udp_verified} · ответ peer {udp_peer_reply} · резерв VPS {udp_fallback}\nSTUN через VPS {stun_fallback} · потери очереди {udp_drops} · отказы UDP peer {udp_peer_failure}\nSTUN Binding локально {stun_local} · проверки {stun_probe_ok}/{stun_probe_failed} (без identity)\nQUIC v2/h3 через VPS {quic_v2_fallback} · STUN добавлен FINGERPRINT {stun_fingerprint}",
+        bytes(proxy_up),
+        bytes(proxy_down),
+        bytes(direct_up),
+        bytes(direct_down),
+        bytes(udp_proxy_up),bytes(udp_proxy_down),bytes(udp_direct_up),bytes(udp_direct_down),
+    )
+}
 
 fn counters(role: Role, h3: bool) -> &'static Counters {
     match (role, h3) {
@@ -150,7 +443,14 @@ impl Monitor {
     /// the same chart scale; the history is bounded to 60 sampled intervals.
     pub(crate) fn render(&self, frame: &mut Frame<'_>, area: Rect) {
         tui_widgets::canvas(frame, area);
-        if area.width < 46 || area.height < 17 || (area.width < 86 && area.height < 27) {
+        let idle = self.current.iter().all(|s| s.active == 0)
+            && self.history.iter().all(|sample| sample.iter().all(|&v| v == 0));
+        if idle || area.width < 46 || area.height < 17 || (area.width < 86 && area.height < 27) {
+            let area = if idle && area.width >= 86 {
+                Rect::new(area.x, area.y, area.width, area.height.min(13))
+            } else {
+                area
+            };
             frame.render_widget(
                 Paragraph::new(self.body())
                     .wrap(Wrap { trim: false })
@@ -166,7 +466,7 @@ impl Monitor {
             area.height.min(if area.width >= 86 { 25 } else { 36 }),
         );
         let layout = Layout::vertical([
-            Constraint::Length(4),
+            Constraint::Length(5),
             Constraint::Min(1),
             Constraint::Length(3),
         ])
@@ -181,7 +481,17 @@ impl Monitor {
             .iter()
             .map(|s| s.opened)
             .fold(0u64, u64::saturating_add);
-        let scope = format!("Активные туннели: {active}   •   Всего открыто: {opened}\nДанные этого процесса без служебного трафика; доставка не подтверждается.");
+        let upload = self
+            .current
+            .iter()
+            .map(|s| s.upload)
+            .fold(0u64, u64::saturating_add);
+        let download = self
+            .current
+            .iter()
+            .map(|s| s.download)
+            .fold(0u64, u64::saturating_add);
+        let scope = format!("Активные туннели: {active}   •   Всего открыто: {opened}\nВсего ↑ {} · ↓ {}\nИсточник: только текущий процесс; доставка не подтверждается.", bytes(upload), bytes(download));
         frame.render_widget(
             Paragraph::new(scope)
                 .wrap(Wrap { trim: true })
@@ -287,6 +597,21 @@ impl Monitor {
 
     pub(crate) fn body(&self) -> String {
         let mut result = String::from("Только трафик текущего процесса Theia; внешние сервисы не измеряются.\nДанные после открытия туннеля, без служебного трафика. Доставка не подтверждается.\n");
+        let upload = self
+            .current
+            .iter()
+            .map(|s| s.upload)
+            .fold(0u64, u64::saturating_add);
+        let download = self
+            .current
+            .iter()
+            .map(|s| s.download)
+            .fold(0u64, u64::saturating_add);
+        result.push_str(&format!(
+            "Всего ↑ {} · ↓ {}\n",
+            bytes(upload),
+            bytes(download)
+        ));
         for (i, s) in self.current.iter().enumerate() {
             let transport = if i == 0 { "H2" } else { "H3" };
             let (up, down) = self.rate[i];
@@ -310,8 +635,13 @@ impl Monitor {
         }
         if self.history.is_empty() {
             result.push_str(
-                "\nСбор первого интервала скорости; нулевой отсчёт не означает отсутствие трафика.",
+                "\nСбор первого измерения скорости; отсутствие отсчёта не означает отсутствие трафика.",
             );
+        }
+        if !self.history.is_empty()
+            && self.history.iter().all(|sample| sample.iter().all(|&v| v == 0))
+        {
+            result.push_str("\nВ измеренных интервалах нет трафика.");
         }
         result.push_str("\nОбновление 1 с • Esc: назад");
         result
@@ -350,6 +680,51 @@ mod tests {
                 download: 23
             }
         );
+    }
+    #[tokio::test]
+    async fn diagnostic_task_does_not_increment_ordinary_relay_counters() {
+        let c = Counters::new();
+        assert!(!diagnostic());
+        PROFILE_DIAGNOSTIC
+            .scope((), async {
+                assert!(diagnostic());
+                let relay = c.enter();
+                assert!(std::ptr::eq(relay.0, &DIAGNOSTIC_COUNTERS));
+                relay.upload(17);
+                relay.download(23);
+                assert_eq!(c.snapshot(), Snapshot::default());
+                udp_stun_fingerprint();
+                udp_stun_local();
+                udp_stun_probe(true);
+                udp_quic_v2_fallback();
+                udp_peer_failure();
+                dpi_policy_stale();
+                dpi_post_hello_failure();
+                dpi_bidirectional();
+                udp_peer_reply();
+                dpi_cache_hit();
+                dpi_probe(false);
+                dpi_tls_alert();
+                dpi_timeout();
+                udp_verified_local();
+                udp_queue_drop();
+                udp_stun_fallback();
+                udp_quic_flow();
+                udp_stun_flow();
+                udp_stun_response();
+                udp_dpi_fallback();
+                blocked();
+                dpi_first_response();
+                dpi_fallback_open();
+                dpi_first_failure();
+            })
+            .await;
+        assert!(!diagnostic());
+        assert_eq!(c.snapshot(), Snapshot::default());
+        let relay = c.enter();
+        assert!(std::ptr::eq(relay.0, &c));
+        drop(relay);
+        assert_eq!(c.snapshot().opened, 1);
     }
     #[test]
     fn history_is_bounded_and_waits_for_first_sample() {

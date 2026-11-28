@@ -96,11 +96,16 @@ pub(crate) struct RecordReview {
     candidate: Config,
     next_selection: usize,
     body: String,
+    confirmation_label: &'static str,
 }
 
 impl RecordReview {
     pub(crate) fn body(&self) -> &str {
         &self.body
+    }
+
+    pub(crate) fn confirmation_label(&self) -> &'static str {
+        self.confirmation_label
     }
 }
 
@@ -140,6 +145,18 @@ impl IssuedInvitation {
             Self::OwnTls(value) => value.token_bytes(),
             Self::Reality { invitation, .. } => invitation.token_bytes(),
         }
+    }
+}
+
+fn invitation_trust(invite: &Invitation, ca: Option<&str>) -> Result<Option<String>, &'static str> {
+    if let Some(anchor) = invite.trust_reference() {
+        if ca.is_some_and(|value| !invite.matches_trust(Some(value))) {
+            return Err("Доверие в ключе не совпадает с указанным сертификатом.");
+        }
+        Ok(Some(anchor))
+    } else {
+        client_import::checked_ca_ref(ca)
+            .map_err(|_| "Explicit TLS CA reference is invalid or unreadable")
     }
 }
 
@@ -193,6 +210,7 @@ pub struct Editor {
     write_uncertain: bool,
     selected_record: usize,
     selected_field: usize,
+    compact_server_fields: bool,
     pub input: String,
     pub editing: bool,
     pub error: Option<String>,
@@ -200,6 +218,43 @@ pub struct Editor {
 }
 
 impl Editor {
+    pub(crate) fn routing_settings(&self) -> Option<&crate::routing::Settings> {
+        match &self.draft {
+            Config::Server(doc) => doc.server.policy.routing.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn stage_routing(
+        &mut self,
+        mut settings: crate::routing::Settings,
+    ) -> Result<(), &'static str> {
+        self.require_clean_records()?;
+        let Config::Server(doc) = &self.original else {
+            return Err("Требуется серверная конфигурация.");
+        };
+        let old = doc.server.policy.routing.as_ref();
+        settings.revision = old
+            .map_or(1, |s| s.revision)
+            .checked_add(1)
+            .ok_or("Исчерпана ревизия правил.")?;
+        settings
+            .validate()
+            .map_err(|_| "Некорректные правила или отсутствуют проверенные базы.")?;
+        let mut candidate = self.original.clone();
+        let Config::Server(doc) = &mut candidate else {
+            unreachable!()
+        };
+        doc.server.policy.routing = Some(settings);
+        candidate
+            .validate()
+            .map_err(|_| "Конфигурация не прошла проверку.")?;
+        self.draft = candidate;
+        self.error = None;
+        self.notice = "Правила подготовлены. Сохраните TOML, затем примените через Управление.";
+        Ok(())
+    }
+
     pub fn load(role: Role, path: &Path) -> Result<Self, &'static str> {
         let source = config::editor_bytes(path).map_err(|_| "cannot read config file")?;
         let utf8 = std::str::from_utf8(&source).map_err(|_| "configuration is not UTF-8")?;
@@ -227,6 +282,7 @@ impl Editor {
             write_uncertain: false,
             selected_record,
             selected_field: 0,
+            compact_server_fields: false,
             input: String::new(),
             editing: false,
             error: None,
@@ -237,7 +293,7 @@ impl Editor {
     /// F-14: commit a completely new client profile from a reviewed invitation.
     /// The source's bearer is never written to TOML; the file is protected by
     /// a fresh owner-only directory and private ACL/mode on both platforms.
-    /// Caller must explicitly review ID/endpoint/SNI/transport and CA trust.
+    /// Caller must explicitly review ID/endpoint/SNI/transport and pinned trust.
     /// First Own-TLS import: create only a real, fully reviewed profile.
     /// A conflicting destination is never replaced; credentials survive an
     /// indeterminate publication but are removed after a pre-commit refusal.
@@ -254,8 +310,9 @@ impl Editor {
         {
             return Err("Выберите новый файл настроек в существующем каталоге.");
         }
-        let ca = client_import::checked_ca_ref(Some(ca_ref))
-            .map_err(|_| "Не удалось проверить доверенный сертификат.")?;
+        let ca = invitation_trust(invite, (!ca_ref.is_empty()).then_some(ca_ref))?
+            .ok_or("Не удалось проверить доверенный сертификат.")?;
+        let ca = Some(ca);
         let mut secret = if let Some(bytes) = invite.token_bytes() {
             let token = Zeroizing::new(bytes);
             Some(
@@ -288,11 +345,11 @@ impl Editor {
             },
             client: config::ClientSettings {
                 active_profile: profile.id.clone(),
+                ingress_mode: config::IngressMode::SystemProxy,
                 profiles: vec![profile],
                 proxy: config::LocalProxy {
                     http_listen: "127.0.0.1:7890".into(),
                     socks5_listen: "127.0.0.1:7891".into(),
-                    system_proxy: config::SystemProxy::Off,
                 },
             },
         });
@@ -352,8 +409,7 @@ impl Editor {
         if document.client.profiles.iter().any(|p| p.id == invite.id) {
             return Err("An existing profile ID cannot be overwritten");
         }
-        let ca = client_import::checked_ca_ref(ca_ref)
-            .map_err(|_| "Explicit TLS CA reference is invalid or unreadable")?;
+        let ca = invitation_trust(invite, ca_ref)?;
         // Only a NEW secret is ever written. A secretless public invitation
         // demands a separately supplied env: reference, never a default.
         let secret = if let Some(bytes) = invite.token_bytes() {
@@ -457,6 +513,7 @@ impl Editor {
             || profile.server_name != invite.server_name
             || profile.path_prefix.as_deref() != Some(invite.path_prefix.as_str())
             || profile.security_mode != invite.security_mode()
+            || !invite.matches_trust(profile.tls_ca.as_deref())
             || (invite.xhttp_mode() != XhttpMode::Auto
                 && profile.effective_xhttp_mode() != invite.xhttp_mode())
             || (invite.transport != Transport::Auto && profile.transport != invite.transport)
@@ -734,6 +791,31 @@ impl Editor {
             self.error = Some("Saved configuration changed; issuance refused".into());
             return None;
         }
+        if let IssuedInvitation::OwnTls(invitation) = &invite {
+            let token = Zeroizing::new(invitation.token_bytes()?);
+            let Config::Server(document) = &self.original else {
+                return None;
+            };
+            let digest = format!("{:x}", Sha256::digest(&token[..]));
+            let current = document
+                .server
+                .users
+                .iter()
+                .find(|user| !user.disabled && user.token_sha256 == digest)
+                .and_then(|user| {
+                    Invitation::issued_from_server(&self.original, &invitation.id, &user.id, &token)
+                        .ok()
+                });
+            let unchanged = current.as_ref().is_some_and(|value| {
+                let left = invitation.encode().ok().map(Zeroizing::new);
+                let right = value.encode().ok().map(Zeroizing::new);
+                matches!((left, right), (Some(a), Some(b)) if a.as_str() == b.as_str())
+            });
+            if !unchanged {
+                self.error = Some("Own-TLS trust changed; issue a new credential.".into());
+                return None;
+            }
+        }
         if let IssuedInvitation::Reality { invitation, user } = &invite {
             // Publication/health may have advanced during TOML save. Never
             // reveal an outdated or no-longer-authorized confidential offer.
@@ -869,6 +951,18 @@ impl Editor {
             .collect()
     }
 
+    pub(crate) fn user_deletable(&self, id: &str) -> bool {
+        let Config::Server(doc) = &self.draft else {
+            return false;
+        };
+        doc.server.users.iter().any(|u| u.id == id)
+            && !doc
+                .server
+                .inbounds
+                .iter()
+                .any(|i| i.allowed_user_ids.iter().any(|u| u == id))
+    }
+
     pub(crate) fn workspace_selected(&self) -> usize {
         self.selected_record
     }
@@ -901,6 +995,26 @@ impl Editor {
                 .get(self.selected_record)
                 .map_or("", |profile| profile.id.as_str()),
         }
+    }
+
+    /// Display endpoint without changing the exact identity used for guarded operations.
+    pub(crate) fn server_connection_label(&self, id: &str) -> Option<String> {
+        let Config::Server(doc) = &self.draft else {
+            return None;
+        };
+        let inbound = doc.server.inbounds.iter().find(|entry| entry.id == id)?;
+        let port = inbound
+            .h2_listen
+            .parse::<std::net::SocketAddr>()
+            .ok()?
+            .port();
+        let host = inbound.server_name.as_str();
+        let endpoint = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        };
+        Some(endpoint)
     }
 
     /// Display address only; profile identity and selection remain keyed by ID.
@@ -1082,6 +1196,8 @@ impl Editor {
                     transport: Transport::Auto,
                     quic_connect_timeout_ms: 1600,
                     quic_negative_cache_ttl_s: 900,
+                    direct_dpi: None,
+                    direct_dpi_stun: None,
                 });
                 next_selection = doc.client.profiles.len() - 1;
                 format!(
@@ -1112,7 +1228,9 @@ impl Editor {
                 }
                 doc.client.profiles.remove(self.selected_record);
                 next_selection = next_selection.min(doc.client.profiles.len() - 1);
-                format!("Удалить профиль {selected}. Файлы CA и credential сохраняются.")
+                format!(
+                    "Удалить профиль {selected}. Файлы сертификата и ключа доступа сохраняются."
+                )
             }
             (Config::Client(doc), RecordAction::ActivateProfile) => {
                 if doc.client.active_profile == selected {
@@ -1120,7 +1238,7 @@ impl Editor {
                 }
                 let previous = std::mem::replace(&mut doc.client.active_profile, selected.clone());
                 format!(
-                    "Активный профиль в TOML: {previous} → {selected}. Runtime не переключается."
+                    "Активный профиль в TOML: {previous} → {selected}. Работающий процесс не переключается."
                 )
             }
             (Config::Server(doc), RecordAction::SetQuota) => {
@@ -1209,8 +1327,19 @@ impl Editor {
             selected,
             candidate,
             next_selection,
+            confirmation_label: match action {
+                RecordAction::NewInbound => "Создать подключение",
+                RecordAction::NewProfile => "Создать профиль",
+                RecordAction::DeleteRecord if self.role() == Role::Server => "Удалить подключение",
+                RecordAction::DeleteRecord => "Удалить профиль",
+                RecordAction::DeleteUser => "Удалить пользователя",
+                RecordAction::ActivateProfile => "Сделать активным",
+                RecordAction::SetGrants => "Сохранить права",
+                RecordAction::SetQuota => "Сохранить лимиты",
+                RecordAction::EditTls | RecordAction::EditTrust => "Заменить настройки доверия",
+            },
             body: format!(
-                "{}\n{detail}\n\nТолько сохранение TOML, без запуска, Apply и удаления файлов.\ny: подтвердить; n/Esc: отменить",
+                "{}\n{detail}\n\nИзменяется только файл настроек. Работающий процесс и остальные файлы не изменяются.\ny: подтвердить; n/Esc: отменить",
                 action.title()
             ),
         })
@@ -1240,26 +1369,48 @@ impl Editor {
             .map(|inbound| inbound.server_name.as_str())
     }
 
-    /// Display the saved permission, never infer the operating-system state.
-    pub(crate) fn system_proxy_allowed(&self) -> bool {
-        matches!(&self.original, Config::Client(doc)
-            if doc.client.proxy.system_proxy == config::SystemProxy::Manual)
+    /// Saved local consent belongs to the selected profile, not the backend.
+    /// A draft or another profile never grants consent to this one.
+    fn saved_selected_profile(&self) -> Option<&config::Profile> {
+        let Config::Client(doc) = &self.original else {
+            return None;
+        };
+        doc.client
+            .profiles
+            .iter()
+            .find(|p| p.id == self.selected_record_id())
     }
 
-    #[cfg(any(windows, test))]
-    pub(crate) fn review_system_proxy_permission(&self) -> Result<RecordReview, &'static str> {
+    pub(crate) fn direct_dpi_allowed(&self) -> bool {
+        self.saved_selected_profile()
+            .is_some_and(|p| p.direct_dpi == Some(true))
+    }
+
+    pub(crate) fn direct_dpi_stun_allowed(&self) -> bool {
+        self.saved_selected_profile()
+            .is_some_and(|p| p.direct_dpi == Some(true) && p.direct_dpi_stun == Some(true))
+    }
+
+    pub(crate) fn review_direct_dpi_permission(&self) -> Result<RecordReview, &'static str> {
         self.require_clean_records()?;
         if self.write_uncertain {
             return Err("Откройте настройки заново.");
         }
+        let enable = !self.direct_dpi_allowed();
         let mut candidate = self.original.clone();
         let Config::Client(doc) = &mut candidate else {
-            return Err("Требуется клиентский профиль.");
+            return Err("Требуется клиентская конфигурация.");
         };
-        if doc.client.active_profile != self.selected_record_id() {
-            return Err("Сначала выберите активный профиль.");
+        let profile = doc
+            .client
+            .profiles
+            .iter_mut()
+            .find(|p| p.id == self.selected_record_id())
+            .ok_or("Профиль не найден.")?;
+        profile.direct_dpi = Some(enable);
+        if !enable {
+            profile.direct_dpi_stun = Some(false);
         }
-        doc.client.proxy.system_proxy = config::SystemProxy::Manual;
         candidate
             .validate()
             .map_err(|_| "Настройки клиента не прошли проверку.")?;
@@ -1268,8 +1419,72 @@ impl Editor {
             selected: self.selected_record_id().to_owned(),
             candidate,
             next_selection: self.selected_record,
-            body: "Разрешить управление системным прокси?\n\nTheia сможет менять HTTP(S)-прокси текущего пользователя Windows только после отдельного подтверждения.\nСейчас сохраняется только разрешение в файле настроек. Прокси Windows и соединение не изменятся.\n\ny: сохранить разрешение · n/Esc: отменить".into(),
+            confirmation_label: if enable {
+                "Разрешить Anti-DPI"
+            } else {
+                "Отключить Anti-DPI"
+            },
+            body: if enable {
+                "Разрешить локальный Anti-DPI для выбранного профиля?\n\nДля правил direct_via_client_anti_dpi возможен локальный TCP/TLS-выход и независимая TLS-проверка назначения: сайт увидит IP вашего устройства. QUIC Modify допускается только после приёмки конкретной стратегии; STUN требует отдельного согласия. Непринятые стратегии используют VPS. DNS запрашивается через Theia. Остальные правила не меняются.\nСохранение не запускает режим; перезапустите клиент.\n\ny: разрешить · n/Esc: отменить".into()
+            } else {
+                "Отключить локальный Anti-DPI?\nПравила direct_via_client_anti_dpi будут использовать VPS после применения нового поколения клиента.\n\ny: отключить · n/Esc: отменить".into()
+            },
         })
+    }
+
+    pub(crate) fn review_direct_dpi_stun_permission(&self) -> Result<RecordReview, &'static str> {
+        self.require_clean_records()?;
+        if self.write_uncertain {
+            return Err("Откройте настройки заново.");
+        }
+        if !self.direct_dpi_allowed() {
+            return Err("Сначала разрешите и сохраните Anti-DPI.");
+        }
+        let enable = !self.direct_dpi_stun_allowed();
+        let mut candidate = self.original.clone();
+        let Config::Client(doc) = &mut candidate else {
+            return Err("Требуется клиентская конфигурация.");
+        };
+        let profile = doc
+            .client
+            .profiles
+            .iter_mut()
+            .find(|p| p.id == self.selected_record_id())
+            .ok_or("Профиль не найден.")?;
+        profile.direct_dpi_stun = Some(enable);
+        candidate
+            .validate()
+            .map_err(|_| "Настройки клиента не прошли проверку.")?;
+        Ok(RecordReview {
+            source: self.saved_sha256(),
+            selected: self.selected_record_id().to_owned(),
+            candidate,
+            next_selection: self.selected_record,
+            confirmation_label: if enable {
+                "Разрешить STUN"
+            } else {
+                "Отозвать согласие STUN"
+            },
+            body: if enable {
+                format!("Сохранить отдельное согласие на STUN Binding для этого профиля?\nПосле приёмки стратегии публичный STUN-сервер может увидеть IP вашего устройства. Только credential-free Binding; ICE/TURN и неподдерживаемые запросы остаются через VPS.\n{}\nСогласие не заменяет приёмку и не запускает сеть.\n\ny: разрешить · n/Esc: отменить", crate::routing::dpi::UdpStrategy::capability_summary())
+            } else {
+                "Отозвать согласие STUN? После применения нового поколения локальный STUN Modify не разрешён.\n\ny: отозвать · n/Esc: отменить".into()
+            },
+        })
+    }
+
+    /// Non-secret values for the settings page. These are saved, not live.
+    pub(crate) fn settings_summary(&self) -> String {
+        match &self.original {
+            Config::Server(doc) => format!(
+                "Лимит на пользователя: {}\nОбщий лимит соединений: {}",
+                doc.server.policy.max_connections_per_user, doc.server.policy.max_connections_total
+            ),
+            Config::Client(doc) => format!(
+                "HTTP: {}\nSOCKS5: {}\nРежим: System Proxy (сохранённый выбор, не состояние ОС)",
+                doc.client.proxy.http_listen, doc.client.proxy.socks5_listen
+            ),
+        }
     }
 
     pub(crate) fn client_proxy_addresses(&self) -> Option<(&str, &str)> {
@@ -1298,7 +1513,12 @@ impl Editor {
                 "REALITY {}/{}: {} [защищённое подключение]",
                 self.selected_record + 1,
                 self.record_count(),
-                self.selected_record_id()
+                if self.role == Role::Server {
+                    self.server_connection_label(self.selected_record_id())
+                        .unwrap_or_else(|| self.selected_record_id().into())
+                } else {
+                    self.selected_record_id().into()
+                }
             );
         }
         match self.role {
@@ -1306,7 +1526,8 @@ impl Editor {
                 "Подключение {}/{}: {}",
                 self.selected_record + 1,
                 self.record_count(),
-                self.selected_record_id(),
+                self.server_connection_label(self.selected_record_id())
+                    .unwrap_or_else(|| self.selected_record_id().into()),
             ),
             Role::Client => format!(
                 "Профиль {}/{}: {}{}",
@@ -1322,9 +1543,42 @@ impl Editor {
         }
     }
 
+    /// Compact workspace fields: hide client transport details, and never
+    /// collapse distinct server listeners. The common port edit is atomic.
+    pub(crate) fn set_compact_server_fields(&mut self, compact: bool) {
+        if !self.editing {
+            self.compact_server_fields = compact;
+            self.selected_field = self
+                .selected_field
+                .min(self.field_count().saturating_sub(1));
+        }
+    }
+
+    pub(crate) fn compact_server_fields(&self) -> bool {
+        self.role == Role::Server && self.compact_server_fields
+    }
+
+    fn common_listener(&self) -> Option<std::net::SocketAddr> {
+        let Config::Server(doc) = &self.draft else {
+            return None;
+        };
+        let inbound = doc.server.inbounds.get(self.selected_record)?;
+        let h2 = inbound.h2_listen.parse::<std::net::SocketAddr>().ok()?;
+        let h3 = inbound.quic_listen.parse::<std::net::SocketAddr>().ok()?;
+        (h2 == h3).then_some(h2)
+    }
+
     pub fn field_count(&self) -> usize {
         match self.role {
+            Role::Server if self.compact_server_fields => {
+                if self.common_listener().is_some() {
+                    2
+                } else {
+                    1
+                }
+            }
             Role::Server => 3,
+            Role::Client if self.compact_server_fields => 1,
             Role::Client => 4,
         }
     }
@@ -1383,6 +1637,7 @@ impl Editor {
 
     pub fn field_name(&self) -> String {
         let suffix = match self.role {
+            Role::Server if self.compact_server_fields && self.selected_field == 1 => "common_port",
             Role::Server => ["server_name", "h2_listen", "quic_listen"][self.selected_field],
             Role::Client => {
                 ["server", "server_name", "transport", "xhttp_mode"][self.selected_field]
@@ -1396,6 +1651,11 @@ impl Editor {
     }
 
     pub fn field_value(&self) -> String {
+        if self.compact_server_fields() && self.selected_field == 1 {
+            return self
+                .common_listener()
+                .map_or_else(String::new, |address| address.port().to_string());
+        }
         match &self.draft {
             Config::Server(doc) => doc
                 .server
@@ -1429,8 +1689,10 @@ impl Editor {
     /// Never include token refs, TLS key refs, grants, or config file paths.
     pub(crate) fn workspace_fields(&self) -> Vec<(&'static str, String, bool)> {
         let labels: &[&str] = match self.role {
+            Role::Server if self.compact_server_fields => &["Адрес сервера", "Порт подключения"],
             Role::Server => &["TLS DNS", "H2 TCP", "H3 UDP"],
-            Role::Client => &["Endpoint", "TLS SNI", "Transport", "XHTTP"],
+            Role::Client if self.compact_server_fields => &["Адрес сервера"],
+            Role::Client => &["Адрес сервера", "Имя сервера (TLS)", "Транспорт", "Режим XHTTP"],
         };
         let values: Vec<String> = match &self.draft {
             Config::Server(doc) => doc
@@ -1438,6 +1700,13 @@ impl Editor {
                 .inbounds
                 .get(self.selected_record)
                 .map(|inbound| {
+                    if self.compact_server_fields {
+                        let mut fields = vec![inbound.server_name.clone()];
+                        if let Some(address) = self.common_listener() {
+                            fields.push(address.port().to_string());
+                        }
+                        return fields;
+                    }
                     vec![
                         inbound.server_name.clone(),
                         inbound.h2_listen.clone(),
@@ -1527,7 +1796,7 @@ impl Editor {
 
     pub fn begin(&mut self) {
         if self.selected_reality() {
-            self.error = Some("Параметры REALITY защищены от обычной правки. Откройте F2 → REALITY: обслуживание для изменения с подтверждением доверия.".into());
+            self.error = Some("Параметры REALITY защищены. Используйте действия выбранного подключения для изменения доверия.".into());
             return;
         }
         if self.write_uncertain {
@@ -1602,6 +1871,8 @@ impl Editor {
         }
         let mut candidate = self.draft.clone();
         let field = self.field_name();
+        let compact = self.compact_server_fields();
+        let common = self.common_listener();
         match &mut candidate {
             Config::Server(doc) => {
                 let Some(inbound) = doc.server.inbounds.get_mut(self.selected_record) else {
@@ -1610,6 +1881,25 @@ impl Editor {
                 };
                 match self.selected_field {
                     0 => inbound.server_name.clone_from(&self.input),
+                    1 if compact => {
+                        let Some(mut address) = common else {
+                            self.error =
+                                Some("Раздельные адреса требуют расширенных настроек.".into());
+                            return false;
+                        };
+                        let Ok(port) = self.input.parse::<u16>() else {
+                            self.error = Some("Введите номер порта от 1 до 65535.".into());
+                            return false;
+                        };
+                        if port == 0 {
+                            self.error = Some("Введите номер порта от 1 до 65535.".into());
+                            return false;
+                        }
+                        address.set_port(port);
+                        let value = address.to_string();
+                        inbound.h2_listen.clone_from(&value);
+                        inbound.quic_listen = value;
+                    }
                     1 => inbound.h2_listen.clone_from(&self.input),
                     _ => inbound.quic_listen.clone_from(&self.input),
                 }
@@ -1759,10 +2049,7 @@ mod tests {
     }
 
     fn server_source() -> String {
-        include_str!("../../../examples/server.toml").replace(
-            "REPLACE_WITH_64_LOWERCASE_HEX",
-            &format!("{:x}", Sha256::digest([0x42; 32])),
-        )
+        crate::invite::fixture_server_source(&[0x42; 32])
     }
 
     fn two_inbounds() -> String {
@@ -2382,10 +2669,7 @@ mod tests {
     }
 
     fn refresh_fixture(token: [u8; 32]) -> Invitation {
-        let source = include_str!("../../../examples/server.toml").replace(
-            "REPLACE_WITH_64_LOWERCASE_HEX",
-            &format!("{:x}", Sha256::digest(token)),
-        );
+        let source = crate::invite::fixture_server_source(&token);
         let server = config::parse(&source).unwrap();
         Invitation::issued_from_server(&server, "public", "device-a", &token).unwrap()
     }
@@ -2417,8 +2701,7 @@ mod tests {
         };
         // Simulate operator-selected existing transport and trust reference.
         doc.client.profiles[1].transport = Transport::H2;
-        let trust = "file:/existing-ca.pem".to_owned();
-        doc.client.profiles[1].tls_ca = Some(trust);
+        assert_eq!(doc.client.profiles[1].tls_ca, initial.trust_reference());
         doc.client.active_profile = "public".into();
         config::atomic_write(&temp.0, &before).unwrap();
         let mut editor = Editor::load(Role::Client, &temp.0).unwrap();
@@ -2466,6 +2749,21 @@ mod tests {
         wrong.endpoint = "other.example.org:443".into();
         assert!(editor.refresh_credential(&wrong).is_err());
         wrong.endpoint = initial.endpoint.clone();
+        // Same endpoint/name/transport but different trust is not rotation.
+        let mut other_server =
+            config::parse(&crate::invite::fixture_server_source(&[0x43; 32])).unwrap();
+        let Config::Server(document) = &mut other_server else {
+            panic!("server");
+        };
+        let other_cert =
+            rcgen::generate_simple_self_signed(vec![initial.server_name.clone()]).unwrap();
+        let cert_file = Temp::write(&other_cert.cert.pem());
+        document.server.inbounds[0].tls_cert = format!("file:{}", cert_file.0.display());
+        let other_invite =
+            Invitation::issued_from_server(&other_server, "public", "device-a", &[0x43; 32])
+                .unwrap();
+        assert_ne!(other_invite.trust_reference(), initial.trust_reference());
+        assert!(editor.refresh_credential(&other_invite).is_err());
         wrong.transport = Transport::H3;
         assert!(editor.refresh_credential(&wrong).is_err());
         assert_eq!(fs::read(&temp.0).unwrap(), before);
@@ -2545,7 +2843,7 @@ mod tests {
         assert_eq!(imported.id, "public");
         assert_eq!(imported.server, "edge.example.org:443");
         assert_eq!(imported.server_name, "edge.example.org");
-        assert!(imported.tls_ca.is_none(), "trust is not granted by URI");
+        assert_eq!(imported.tls_ca, invite.trust_reference());
         assert!(imported.auth_token.starts_with("file:"));
         let secret_path = Path::new(imported.auth_token.strip_prefix("file:").unwrap());
         assert!(secret_path.is_absolute());
@@ -2637,7 +2935,7 @@ mod tests {
     }
 
     #[test]
-    fn import_requires_independent_valid_ca_file_and_never_trusts_uri_ca() {
+    fn import_rejects_unrelated_ca_and_preserves_invitation_anchor() {
         use crate::invite::Invitation;
         let cert = rcgen::generate_simple_self_signed(vec!["edge.example.org".into()]).unwrap();
         let ca = Temp::write(&cert.cert.pem());
@@ -2652,13 +2950,14 @@ mod tests {
             .is_err());
         assert!(editor
             .import_invitation(&invite, Some(&ca_ref), None)
-            .is_ok());
+            .is_err());
+        assert!(editor.import_invitation(&invite, None, None).is_ok());
         let Config::Client(doc) = config::read_file(&temp.0).unwrap() else {
             panic!("client");
         };
         assert_eq!(
             doc.client.profiles[1].tls_ca.as_deref(),
-            Some(ca_ref.as_str())
+            invite.trust_reference().as_deref()
         );
         let secret_file = Path::new(
             doc.client.profiles[1]
@@ -3194,6 +3493,39 @@ mod tests {
         editor.discard();
         assert!(!editor.dirty());
         assert_eq!(fs::read(&temp.0).unwrap(), source);
+    }
+
+    #[test]
+    fn common_server_port_edits_both_listeners_only_after_validation() {
+        let source = server_source();
+        let temp = Temp::write(&source);
+        let mut editor = Editor::load(Role::Server, &temp.0).unwrap();
+        editor.set_compact_server_fields(true);
+        assert_eq!(editor.field_count(), 2);
+        editor.workspace_select_field(1);
+        assert_eq!(editor.field_value(), "443");
+        editor.begin();
+        editor.input = "0".into();
+        assert!(!editor.accept());
+        assert!(!editor.dirty());
+        editor.input = "8443".into();
+        assert!(editor.accept());
+        assert!(editor.dirty());
+        assert_eq!(fs::read_to_string(&temp.0).unwrap(), source);
+        editor.set_compact_server_fields(false);
+        let fields = editor.workspace_fields();
+        assert!(fields[1].1.ends_with(":8443") && fields[2].1.ends_with(":8443"));
+        editor.workspace_select_field(2);
+        editor.begin();
+        editor.input = "0.0.0.0:9443".into();
+        assert!(editor.accept());
+        editor.set_compact_server_fields(true);
+        assert_eq!(editor.field_count(), 1);
+        assert_eq!(editor.workspace_fields().len(), 1);
+        assert_eq!(editor.workspace_field_index(), 0);
+        editor.set_compact_server_fields(false);
+        assert_eq!(editor.workspace_fields()[2].1, "0.0.0.0:9443");
+        assert_eq!(fs::read_to_string(&temp.0).unwrap(), source);
     }
 
     #[test]

@@ -4,7 +4,6 @@ use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer},
     ClientConfig, RootCertStore, ServerConfig,
 };
-use std::sync::Arc;
 
 pub const VERSION: u32 = 1;
 pub const MAX_HEADER_LIST_BYTES: u32 = 8192;
@@ -41,8 +40,7 @@ impl Carrier {
     }
 
     pub(crate) fn configure_client(self, config: &mut ClientConfig) {
-        config.alpn_protocols = vec![self.alpn().to_vec()];
-        config.enable_early_data = false;
+        crate::net::tls::configure_client(config, self.alpn());
     }
 
     pub(crate) fn configure_server(self, config: &mut ServerConfig) {
@@ -53,16 +51,7 @@ impl Carrier {
     /// PKI is always supplied explicitly. Identity-specific admission and
     /// resumption restrictions are applied separately by the identity layer.
     pub(crate) fn client_tls(self, roots: RootCertStore) -> Result<ClientConfig, rustls::Error> {
-        if roots.is_empty() {
-            return Err(rustls::Error::General("empty explicit trust store".into()));
-        }
-        let mut config =
-            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_protocol_versions(&[&rustls::version::TLS13])?
-                .with_root_certificates(roots)
-                .with_no_client_auth();
-        self.configure_client(&mut config);
-        Ok(config)
+        crate::net::tls::roots_tls13(roots, self.alpn())
     }
 
     pub(crate) fn server_tls(
@@ -70,11 +59,9 @@ impl Carrier {
         certificates: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> Result<ServerConfig, rustls::Error> {
-        let mut config =
-            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_protocol_versions(&[&rustls::version::TLS13])?
-                .with_no_client_auth()
-                .with_single_cert(certificates, key)?;
+        let mut config = crate::net::tls::server_tls13_builder()?
+            .with_no_client_auth()
+            .with_single_cert(certificates, key)?;
         self.configure_server(&mut config);
         Ok(config)
     }

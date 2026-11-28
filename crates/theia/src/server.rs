@@ -171,6 +171,7 @@ impl IdentityRoutePolicy {
 }
 
 pub struct SessionPermit {
+    routing: Arc<crate::routing::exchange::Published>,
     _global: Option<OwnedSemaphorePermit>,
     _user: Option<OwnedSemaphorePermit>,
     _live: Option<crate::quota::Lease>,
@@ -195,7 +196,7 @@ impl ServerContext {
         Self::with_limits(
             inbound,
             policy,
-            AuthCell::isolated(inbound, users),
+            AuthCell::isolated(inbound, users, policy, None),
             Arc::new(Semaphore::new(policy.max_connections_total as usize)),
             Arc::new(all_users),
             Arc::new(Semaphore::new(policy.max_connections_total as usize)),
@@ -282,6 +283,14 @@ impl ServerContext {
         }
         let paths = crate::split_http::IdentityRoutes::new(&d.path_prefix)
             .map_err(|_| ServerError::Config)?;
+        let users = self
+            .authorization
+            .load()
+            .map_err(|_| ServerError::Config)?
+            .users
+            .clone();
+        self.authorization = AuthCell::isolated(inbound, &users, &self.policy, Some(&inbound.id));
+        self.routing_publication()?;
         self.padding = d.padding.clone();
         self.identity_routes = Some(RwLock::new(IdentityRoutePolicy {
             paths,
@@ -426,6 +435,83 @@ impl ServerContext {
         }
     }
 
+    /// Routing data is private to authenticated grants, including own-TLS.
+    pub(crate) fn is_routing_request<T>(&self, request: &Request<T>) -> bool {
+        if request.method() != Method::GET {
+            return false;
+        }
+        match &self.identity_routes {
+            Some(routes) => routes
+                .read()
+                .is_ok_and(|r| r.current() && request.uri().path() == r.paths.routing),
+            None => self
+                .own_routes
+                .as_ref()
+                .is_some_and(|r| request.uri().path() == r.routing),
+        }
+    }
+
+    pub(crate) fn authorize_routing<T>(
+        &self,
+        request: &Request<T>,
+        peer: IpAddr,
+    ) -> Result<(SessionPermit, Arc<crate::routing::exchange::Published>), StatusCode> {
+        if !self.is_routing_request(request)
+            || request.uri().query().is_some()
+            || request
+                .headers()
+                .contains_key(crate::split_http::PAIR_HEADER)
+        {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        if !self.peer_budget.admit(peer, Instant::now()) {
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+        if request
+            .headers()
+            .get_all(header::AUTHORIZATION)
+            .iter()
+            .count()
+            != 1
+        {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        let permit = self
+            .authorize(
+                request
+                    .headers()
+                    .get(header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok()),
+            )
+            .map_err(AuthFailure::status)?;
+        let publication = permit.routing.clone();
+        Ok((permit, publication))
+    }
+
+    fn routing_publication(&self) -> Result<Arc<crate::routing::exchange::Published>, ServerError> {
+        self.authorization
+            .load()
+            .map_err(|_| ServerError::Config)?
+            .routing
+            .get(&self.inbound_id)
+            .cloned()
+            .ok_or(ServerError::Config)
+    }
+
+    pub(crate) async fn routing_response(
+        &self,
+        publication: &crate::routing::exchange::Published,
+        headers: &http::HeaderMap,
+    ) -> Result<Arc<[u8]>, StatusCode> {
+        crate::routing::exchange::response_data(
+            publication,
+            headers,
+            self.policy.allow_private_ips,
+            Duration::from_millis(u64::from(self.policy.connect_timeout_ms)),
+        )
+        .await
+    }
+
     pub(crate) fn is_descriptor_request<T>(&self, request: &Request<T>) -> bool {
         self.identity_routes.as_ref().is_some_and(|routes| {
             routes.read().is_ok_and(|routes| {
@@ -506,7 +592,28 @@ impl ServerContext {
         address: &Address,
         port: u16,
     ) -> Result<TcpStream, ErrorCode> {
-        connect_target(address, port, &self.policy).await
+        let routing = self
+            .routing_publication()
+            .map_err(|_| ErrorCode::PolicyDenied)?;
+        connect_target(address, port, &self.policy, routing.snapshot.policy()).await
+    }
+
+    pub(crate) async fn dial_udp_target(
+        &self,
+        address: &Address,
+        port: u16,
+    ) -> Result<tokio::net::UdpSocket, ErrorCode> {
+        let routing = self
+            .routing_publication()
+            .map_err(|_| ErrorCode::PolicyDenied)?;
+        connect_target_with(
+            address,
+            port,
+            &self.policy,
+            routing.snapshot.policy(),
+            crate::udp_relay::connect,
+        )
+        .await
     }
 
     /// Identical admission, route, content type, credential and user quota
@@ -565,6 +672,10 @@ impl ServerContext {
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok());
         self.authorize(auth).map_err(AuthFailure::status)
+    }
+
+    pub(crate) fn allows_native_lab(&self) -> bool {
+        self.security_mode.is_plain() && self.identity_routes.is_none()
     }
 
     pub(crate) fn requires_channel_binding(&self) -> bool {
@@ -679,6 +790,11 @@ impl ServerContext {
         {
             return Err(AuthFailure::Forbidden);
         }
+        let routing = snapshot
+            .routing
+            .get(&self.inbound_id)
+            .cloned()
+            .ok_or(AuthFailure::Forbidden)?;
         // Admission and quota resize serialize through a single short
         // occupancy lock across old/new H2 and QUIC listener generations.
         if let Some(ledger) = &self.live_quota {
@@ -690,6 +806,7 @@ impl ServerContext {
                 })
                 .ok_or(AuthFailure::Busy)?;
             return Ok(SessionPermit {
+                routing,
                 _global: None,
                 _user: None,
                 _live: Some(permit),
@@ -709,6 +826,7 @@ impl ServerContext {
             .try_acquire_owned()
             .map_err(|_| AuthFailure::Busy)?;
         Ok(SessionPermit {
+            routing,
             _global: Some(global),
             _user: Some(per_user),
             _live: None,
@@ -784,7 +902,43 @@ async fn connect_target(
     address: &Address,
     port: u16,
     policy: &ServerPolicy,
+    routing: &crate::routing::Policy,
 ) -> Result<TcpStream, ErrorCode> {
+    connect_target_with(
+        address,
+        port,
+        policy,
+        routing,
+        crate::routing::carrier_socket::connect_plain_tcp,
+    )
+    .await
+}
+
+async fn connect_target_with<T, F, Fut>(
+    address: &Address,
+    port: u16,
+    policy: &ServerPolicy,
+    routing: &crate::routing::Policy,
+    dial: F,
+) -> Result<T, ErrorCode>
+where
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
+    let domain = match address {
+        Address::Dns(name) => Some(name.as_str()),
+        _ => None,
+    };
+    if let Some(name) = domain {
+        if matches!(
+            routing
+                .domain_decision(name)
+                .map_err(|_| ErrorCode::PolicyDenied)?,
+            Some(crate::routing::Action::Direct | crate::routing::Action::Blocked)
+        ) {
+            return Err(ErrorCode::PolicyDenied);
+        }
+    }
     let duration = Duration::from_millis(u64::from(policy.connect_timeout_ms));
     let deadline = tokio::time::Instant::now() + duration;
     timeout(duration, async {
@@ -798,9 +952,23 @@ async fn connect_target(
                 .collect(),
         };
         let permitted = permitted_candidates(candidates, policy.allow_private_ips)?;
+        let mut routed = Vec::new();
+        for candidate in permitted {
+            if routing
+                .matching_action(domain, Some(candidate.ip()))
+                .map_err(|_| ErrorCode::PolicyDenied)?
+                .unwrap_or(crate::routing::Action::Allowed)
+                .permits_server_egress()
+            {
+                routed.push(candidate);
+            }
+        }
+        if routed.is_empty() {
+            return Err(ErrorCode::PolicyDenied);
+        }
         // Pin each ACL-checked SocketAddr. Share the remaining deadline
         // between candidates so an unresponsive IPv6 route cannot starve IPv4.
-        dial_candidates(&permitted, deadline, TcpStream::connect).await
+        dial_candidates(&routed, deadline, dial).await
     })
     .await
     .map_err(|_| ErrorCode::DialTimeout)?
@@ -1092,7 +1260,9 @@ pub(crate) async fn serve_h2_socket<S>(
         let pair = pair.clone();
         let binding = binding.clone();
         handlers.spawn(async move {
-            let result = if context.is_descriptor_request(&request) {
+            let result = if context.is_routing_request(&request) {
+                handle_routing(request, respond, &context, peer.ip(), binding.as_deref()).await
+            } else if context.is_descriptor_request(&request) {
                 handle_descriptor(request, respond, &context, peer.ip()).await
             } else if context.accepts_split(&request) {
                 handle_split_request(
@@ -1186,6 +1356,78 @@ async fn handle_descriptor(
             remaining = &remaining[count..];
             if !remaining.is_empty() {
                 output.reserve_capacity(remaining.len());
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| ServerError::Io)?
+}
+
+async fn handle_routing(
+    mut request: Request<h2::RecvStream>,
+    mut respond: h2::server::SendResponse<Bytes>,
+    context: &ServerContext,
+    peer: IpAddr,
+    binding: Option<&crate::channel_binding::Admission>,
+) -> Result<(), ServerError> {
+    let (_permit, publication) = match context.authorize_routing(&request, peer) {
+        Ok(value) => value,
+        Err(status) => return reject(&mut respond, status).await,
+    };
+    if !crate::channel_binding::admit(binding, &[&request]) {
+        return reject(&mut respond, StatusCode::UNAUTHORIZED).await;
+    }
+    let empty = timeout(HANDSHAKE_TIMEOUT, async {
+        request.body_mut().data().await.is_none()
+            && request
+                .body_mut()
+                .trailers()
+                .await
+                .is_ok_and(|value| value.is_none())
+    })
+    .await
+    .unwrap_or(false);
+    if !empty {
+        return reject(&mut respond, StatusCode::BAD_REQUEST).await;
+    }
+    let signed = match context
+        .routing_response(&publication, request.headers())
+        .await
+    {
+        Ok(bytes) => bytes,
+        Err(status) => return reject(&mut respond, status).await,
+    };
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, signed.len().to_string())
+        .body(())
+        .map_err(|_| ServerError::Http2)?;
+    let mut output = respond
+        .send_response(context.pad_response(response)?, false)
+        .map_err(|_| ServerError::Http2)?;
+    timeout(crate::routing::exchange::TRANSFER_TIMEOUT, async {
+        output.reserve_capacity(signed.len().min(64 * 1024));
+        let mut remaining: &[u8] = &signed;
+        while !remaining.is_empty() {
+            let credit = std::future::poll_fn(|cx| output.poll_capacity(cx))
+                .await
+                .ok_or(ServerError::Io)?
+                .map_err(|_| ServerError::Io)?;
+            if credit == 0 {
+                continue;
+            }
+            let count = credit.min(remaining.len()).min(64 * 1024);
+            output
+                .send_data(
+                    Bytes::copy_from_slice(&remaining[..count]),
+                    count == remaining.len(),
+                )
+                .map_err(|_| ServerError::Io)?;
+            remaining = &remaining[count..];
+            if !remaining.is_empty() {
+                output.reserve_capacity(remaining.len().min(64 * 1024));
             }
         }
         Ok(())
@@ -1469,10 +1711,12 @@ async fn handle_frames(
             }
             break frame;
         };
-        let Frame::OpenTcp { address, port } = open else {
-            return Err(ServerError::Protocol);
-        };
-        Ok::<_, ServerError>((address, port))
+        match open {
+            Frame::OpenTcp { address, port } | Frame::OpenUdp { address, port } => {
+                Ok::<_, ServerError>((address, port))
+            }
+            _ => Err(ServerError::Protocol),
+        }
     })
     .await
     .map_err(|_| ServerError::TimedOut)??;
@@ -1483,6 +1727,7 @@ async fn handle_frames(
         "hello_and_open_validated",
         "session" = Value::Count(session_id)
     );
+    let udp = state.udp();
     let dial = tokio::select! {
         biased;
         next = async {
@@ -1499,7 +1744,10 @@ async fn handle_frames(
             next?;
             return Err(ServerError::Protocol);
         }
-        result = context.dial_target(&address, port) => result,
+        result = async {
+            if udp { context.dial_udp_target(&address, port).await.map(crate::udp_relay::Target::Udp) }
+            else { context.dial_target(&address, port).await.map(crate::udp_relay::Target::Tcp) }
+        } => result,
         _ = std::future::poll_fn(|cx| outgoing.poll_reset(cx)) => {
             return Err(ServerError::Http2);
         }
@@ -1536,7 +1784,14 @@ async fn handle_frames(
         "open_ok_sent",
         "session" = Value::Count(session_id)
     );
-    relay_tcp(tcp, incoming, outgoing, decoder, state, session_id).await
+    match tcp {
+        crate::udp_relay::Target::Tcp(tcp) => {
+            relay_tcp(tcp, incoming, outgoing, decoder, state, session_id).await
+        }
+        crate::udp_relay::Target::Udp(udp) => {
+            relay_udp(udp, incoming, outgoing, decoder, state).await
+        }
+    }
 }
 
 /// Drive the two TCP directions independently. In particular, lack of H2
@@ -1816,7 +2071,7 @@ impl CapturedTls {
             // not simply that two arbitrary private files could be hashed.
             let material = tls_material_from_bytes(inbound, &cert, &key)?;
             let _h2 = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
-            let _h3 = crate::quic_transport::server_config(material.certs, material.key)
+            let _h3 = crate::h3_server::OwnTlsConfig::new(material.certs, material.key)
                 .map_err(|_| ServerError::Tls)?;
             let id = inbound.id.as_bytes();
             for chunk in [id, cert.as_slice(), key.as_slice()] {
@@ -1962,9 +2217,9 @@ enum ReadyListener {
     Plain(
         TcpListener,
         TlsAcceptor,
-        quinn::Endpoint,
+        crate::h3_server::OwnTlsEndpoint,
         Arc<ServerContext>,
-        quinn::ServerConfig,
+        crate::h3_server::OwnTlsConfig,
     ),
     Reality(
         crate::reality_tcp::PreparedTcp,
@@ -2066,6 +2321,7 @@ async fn prepare_selected_listeners_inner(
                 limits.connections.clone(),
                 limits.peer_budget.clone(),
             );
+            // The staged AuthCell may not contain a newly added inbound until CAS.
             context.live_quota = Some(limits.ledger.clone());
             #[cfg(test)]
             let carrier = if let Some(start) = guard_start {
@@ -2085,7 +2341,7 @@ async fn prepare_selected_listeners_inner(
                 crate::tcp_bbr::Error::Unavailable => ServerError::TcpControllerUnavailable,
             })?;
             let tcp = crate::reality_tcp::PreparedTcp::from_live(listener, carrier.clone())?;
-            let udp = tokio::net::UdpSocket::bind(udp_addr)
+            let udp = crate::routing::carrier_socket::bind_plain_udp(udp_addr)
                 .await
                 .map_err(|_| ServerError::Io)?;
             let (quic, silent) = if h3 {
@@ -2125,11 +2381,10 @@ async fn prepare_selected_listeners_inner(
             crate::tcp_bbr::Error::Network => ServerError::Io,
             crate::tcp_bbr::Error::Unavailable => ServerError::TcpControllerUnavailable,
         })?;
-        let h3_config = crate::quic_transport::server_config(material.certs, material.key)
+        let h3_config = crate::h3_server::OwnTlsConfig::new(material.certs, material.key)
             .map_err(|_| ServerError::Tls)?;
-        let endpoint =
-            crate::quic_transport::server_endpoint_with_config(udp_addr, h3_config.clone())
-                .map_err(|_| ServerError::Io)?;
+        let endpoint = crate::h3_server::OwnTlsEndpoint::bind(udp_addr, h3_config.clone())
+            .map_err(|_| ServerError::Io)?;
         let mut context = ServerContext::with_limits(
             inbound,
             &document.server.policy,
@@ -2163,7 +2418,7 @@ async fn prepare_selected_listeners_inner(
 struct HotIdentity {
     id: String,
     h2: Arc<RwLock<TlsAcceptor>>,
-    h3: quinn::Endpoint,
+    h3: crate::h3_server::OwnTlsEndpoint,
 }
 
 /// TLS-only candidate fully staged *before* touching either bound socket.
@@ -2172,7 +2427,7 @@ struct HotIdentity {
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 struct PreparedSamePortTls {
     h2: Vec<TlsAcceptor>,
-    h3: Vec<quinn::ServerConfig>,
+    h3: Vec<crate::h3_server::OwnTlsConfig>,
     identities: Vec<crate::reload_preflight::IdentityHash>,
 }
 
@@ -2192,7 +2447,7 @@ fn prepare_same_port_tls(
         }
         let material = captured.material(inbound, index)?;
         let h2_acceptor = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
-        let h3_config = crate::quic_transport::server_config(material.certs, material.key)
+        let h3_config = crate::h3_server::OwnTlsConfig::new(material.certs, material.key)
             .map_err(|_| ServerError::Tls)?;
         h2.push(h2_acceptor);
         h3.push(h3_config);
@@ -2216,7 +2471,7 @@ struct StructuralRollbackSlot {
 struct RollbackSlot {
     expires: Instant,
     h2: Vec<TlsAcceptor>,
-    h3: Vec<quinn::ServerConfig>,
+    h3: Vec<crate::h3_server::OwnTlsConfig>,
     identities: Vec<crate::reload_preflight::IdentityHash>,
     refs: Vec<(String, String)>,
 }
@@ -2240,7 +2495,7 @@ struct RunningGeneration {
     identities: Vec<HotIdentity>,
     // Exact QUIC configs installed on the endpoints. Saved previous configs
     // support a one-shot TLS undo without reading external PEM files again.
-    active_h3: Vec<quinn::ServerConfig>,
+    active_h3: Vec<crate::h3_server::OwnTlsConfig>,
     reality: Vec<HotReality>,
 }
 
@@ -2282,11 +2537,7 @@ impl RunningGeneration {
                         context.clone(),
                         receiver.clone(),
                     ));
-                    tasks.spawn(crate::h3_server::serve_generation(
-                        udp,
-                        context,
-                        receiver.clone(),
-                    ));
+                    tasks.spawn(udp.serve_generation(context, receiver.clone()));
                 }
                 ReadyListener::Reality(tcp, quic, silent, manager, carrier) => {
                     let root = manager.root_fingerprint();
@@ -2796,7 +3047,7 @@ fn commit_same_port_tls(
                     **guard = acceptor;
                 }
                 for (handle, config) in running.identities.iter().zip(h3) {
-                    handle.h3.set_server_config(Some(config));
+                    handle.h3.set_server_config(config);
                 }
             },
         )
@@ -2893,7 +3144,7 @@ fn commit_tls_rollback(
                 **guard = acceptor;
             }
             for (handle, config) in running.identities.iter().zip(h3) {
-                handle.h3.set_server_config(Some(config));
+                handle.h3.set_server_config(config);
             }
         })
         .map_err(|_| ())?;
@@ -3054,6 +3305,71 @@ async fn run_supervised_file(
         .with_reality(initial.reality)
         .with_reality_ledger(limits.ledger.clone()),
     );
+
+    // Refresh the pinned pair through a durable TOML + live policy CAS.
+    let _geodata_refresh = SupervisorTask(tokio::spawn({
+        let runtime = runtime.clone();
+        let path = config_path.to_owned();
+        async move {
+            let mut next_refresh = tokio::time::Instant::now();
+            let mut last_directory = None;
+            loop {
+                if let Ok(view) = runtime.snapshot() {
+                    if let Some(settings) = view.document.server.policy.routing.clone() {
+                        if let Some(directory) = settings.geodata_directory {
+                            if last_directory.as_ref() != Some(&directory)
+                                || tokio::time::Instant::now() >= next_refresh
+                            {
+                                last_directory = Some(directory.clone());
+                                next_refresh = tokio::time::Instant::now()
+                                    + crate::routing::geodata::REFRESH_INTERVAL;
+                                let result = async {
+                                    let store =
+                                        crate::routing::geodata::Store::new(directory.into())
+                                            .map_err(|_| ())?;
+                                    let pair =
+                                        store.refresh(&settings.rules).await.map_err(|_| ())?;
+                                    let manifest = pair.manifest().clone();
+                                    drop(pair);
+                                    let prepare = runtime.clone();
+                                    let path = path.clone();
+                                    let stage = tokio::task::spawn_blocking(move || {
+                                        prepare.prepare_geodata(&view, &path, manifest)
+                                    })
+                                    .await
+                                    .map_err(|_| ())?
+                                    .map_err(|_| ())?;
+                                    match stage {
+                                        Some(stage) => {
+                                            runtime.activate_geodata(stage).map_err(|_| ())?;
+                                            Ok(true)
+                                        }
+                                        None => Ok(false),
+                                    }
+                                }
+                                .await;
+                                match result {
+                                    Ok(true) => crate::diag!(Info, "server", "geodata_activated"),
+                                    Ok(false) => {}
+                                    Err(()) => {
+                                        // Retry conflicts and temporary failures without replacing pending edits.
+                                        next_refresh =
+                                            tokio::time::Instant::now() + Duration::from_secs(300);
+                                        crate::diag!(
+                                            Warn,
+                                            "server",
+                                            "geodata_refresh_or_apply_failed"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        }
+    }));
 
     // Only the original, protected management listener survives cutover.
     // Never expose a new administrative TCP port or loosen Named Pipe DACL.
@@ -3434,7 +3750,7 @@ async fn run_reality_document_inner(
         Plain(
             TcpListener,
             TlsAcceptor,
-            quinn::Endpoint,
+            crate::h3_server::OwnTlsEndpoint,
             Arc<ServerContext>,
         ),
         Reality(
@@ -3469,6 +3785,7 @@ async fn run_reality_document_inner(
             connections.clone(),
             peers.clone(),
         );
+        context.routing_publication()?;
         context.live_quota = Some(ledger.clone());
         context.apply_own_tls_policy();
         if inbound.security_mode == crate::security_profile::SecurityMode::SmartReality {
@@ -3499,7 +3816,7 @@ async fn run_reality_document_inner(
                 crate::reality_live::Live::new(generation, Arc::new(context), now)?;
             let tcp =
                 crate::reality_tcp::PreparedTcp::from_live(listener, live_generation.clone())?;
-            let udp = tokio::net::UdpSocket::bind(udp_addr)
+            let udp = crate::routing::carrier_socket::bind_plain_udp(udp_addr)
                 .await
                 .map_err(|_| ServerError::Io)?;
             let (quic, silent) = if h3 {
@@ -3539,9 +3856,9 @@ async fn run_reality_document_inner(
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             loaded_identities.push(material.identity.clone());
             let acceptor = tls_acceptor(material.certs.clone(), material.key.clone_key())?;
-            let endpoint =
-                crate::quic_transport::server_endpoint(udp_addr, material.certs, material.key)
-                    .map_err(|_| ServerError::Tls)?;
+            let endpoint = crate::h3_server::OwnTlsConfig::new(material.certs, material.key)
+                .and_then(|tls| crate::h3_server::OwnTlsEndpoint::bind(udp_addr, tls))
+                .map_err(|_| ServerError::Tls)?;
             ready.push(Ready::Plain(
                 listener,
                 acceptor,
@@ -3595,7 +3912,7 @@ async fn run_reality_document_inner(
         match item {
             Ready::Plain(listener, acceptor, endpoint, context) => {
                 tasks.spawn(serve(listener, acceptor, context.clone()));
-                tasks.spawn(crate::h3_server::serve(endpoint, context));
+                tasks.spawn(endpoint.serve(context));
             }
             Ready::Reality(tcp, quic, silent, manager, live_generation) => {
                 tasks.spawn(async move {
@@ -3705,12 +4022,12 @@ async fn run_document_with_config(
             crate::tcp_bbr::Error::Network => ServerError::Io,
             crate::tcp_bbr::Error::Unavailable => ServerError::TcpControllerUnavailable,
         })?;
-        let endpoint =
-            crate::quic_transport::server_endpoint(udp_addr, material.certs, material.key)
-                .map_err(|error| match error {
-                    crate::quic_transport::QuicError::Bind => ServerError::Io,
-                    _ => ServerError::Tls,
-                })?;
+        let endpoint = crate::h3_server::OwnTlsConfig::new(material.certs, material.key)
+            .and_then(|tls| crate::h3_server::OwnTlsEndpoint::bind(udp_addr, tls))
+            .map_err(|error| match error {
+                crate::quic_transport::QuicError::Bind => ServerError::Io,
+                _ => ServerError::Tls,
+            })?;
         let mut context = ServerContext::with_limits(
             inbound,
             &policy,
@@ -3720,6 +4037,7 @@ async fn run_document_with_config(
             connections.clone(),
             peer_budget.clone(),
         );
+        context.routing_publication()?;
         context.apply_own_tls_policy();
         prepared.push((listener, acceptor, endpoint, Arc::new(context)));
     }
@@ -3763,7 +4081,7 @@ async fn run_document_with_config(
     let mut tasks = JoinSet::new();
     for (listener, acceptor, endpoint, context) in prepared {
         tasks.spawn(serve(listener, acceptor, context.clone()));
-        tasks.spawn(crate::h3_server::serve(endpoint, context));
+        tasks.spawn(endpoint.serve(context));
     }
     #[cfg(target_os = "linux")]
     if let Some(management) = management {
@@ -3777,6 +4095,76 @@ async fn run_document_with_config(
         Some(Ok(result)) => result,
         _ => Err(ServerError::Io),
     }
+}
+
+async fn relay_udp(
+    socket: tokio::net::UdpSocket,
+    incoming: &mut h2::RecvStream,
+    outgoing: &mut h2::SendStream<Bytes>,
+    mut decoder: IncomingFrames,
+    state: Session,
+) -> Result<(), ServerError> {
+    let traffic = crate::traffic::enter_udp(crate::Role::Server, false, false);
+    let mut rx_state = state.clone();
+    let mut tx_state = state;
+    let activity = crate::udp_relay::Activity::new();
+    let writing = std::sync::atomic::AtomicBool::new(false);
+    let upload = async {
+        loop {
+            let frame = decoder.next(incoming).await?.ok_or(ServerError::Protocol)?;
+            rx_state
+                .apply(Direction::Receive, &frame)
+                .map_err(|_| ServerError::Protocol)?;
+            match frame {
+                Frame::Datagram(data) => {
+                    crate::udp_relay::send_datagram(&socket, &data)
+                        .await
+                        .map_err(|_| ServerError::Io)?;
+                    traffic.upload(data.len());
+                    activity.touch();
+                }
+                Frame::Padding(_) => tokio::task::yield_now().await,
+                Frame::Fin => return Ok::<(), ServerError>(()),
+                _ => return Err(ServerError::Protocol),
+            }
+        }
+    };
+    let download = async {
+        let mut buf = vec![0; crate::protocol::MAX_DATAGRAM + 1];
+        loop {
+            let n = socket.recv(&mut buf).await.map_err(|_| ServerError::Io)?;
+            if n > crate::protocol::MAX_DATAGRAM {
+                continue;
+            }
+            let frame = Frame::Datagram(buf[..n].to_vec());
+            tx_state
+                .apply(Direction::Send, &frame)
+                .map_err(|_| ServerError::Protocol)?;
+            writing.store(true, std::sync::atomic::Ordering::Relaxed);
+            timeout(FRAME_IDLE_TIMEOUT, send_frame(outgoing, &frame))
+                .await
+                .map_err(|_| ServerError::TimedOut)??;
+            writing.store(false, std::sync::atomic::Ordering::Relaxed);
+            traffic.download(n);
+            activity.touch();
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), ServerError>(())
+    };
+    // UDP FIN terminates the association (no TCP-style half close).
+    let result = tokio::select! { result=upload=>result, result=download=>result, ()=activity.expire()=>Ok(()) };
+    if writing.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(ServerError::TimedOut);
+    }
+    result?;
+    let frame = Frame::Fin;
+    tx_state
+        .apply(Direction::Send, &frame)
+        .map_err(|_| ServerError::Protocol)?;
+    timeout(FRAME_IDLE_TIMEOUT, send_frame(outgoing, &frame))
+        .await
+        .map_err(|_| ServerError::TimedOut)??;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3867,6 +4255,337 @@ mod hardening_tests {
             status,
             StatusReply::RunningRevision { inbounds: 1, .. }
         ));
+        // Drive the actual protected management endpoint while the same
+        // supervisor owns the listeners. Read-only preflights never change
+        // the revision, and mutations require both the saved digest and CAS.
+        let Config::Server(mut candidate) = config::parse(&contents).unwrap() else {
+            panic!("server fixture");
+        };
+        let save = |doc: &ServerDocument| {
+            let bytes = Config::Server(doc.clone()).to_toml().unwrap();
+            fs::write(&path, bytes.as_bytes()).unwrap();
+            <[u8; 32]>::from(Sha256::digest(bytes.as_bytes()))
+        };
+        let query = |command| crate::tui_runtime::query_endpoint(&endpoint, command);
+        let access = |user: &str, digest| {
+            let mut inbound = [0; 64];
+            inbound[..6].copy_from_slice(b"edge-a");
+            let mut name = [0; 64];
+            name[..user.len()].copy_from_slice(user.as_bytes());
+            StatusCommand::AccessStatus {
+                inbound,
+                user: name,
+                saved_sha256: digest,
+            }
+        };
+        assert_eq!(
+            query(access("alice", expected)).await.unwrap(),
+            StatusReply::AccessObserved {
+                revision: 1,
+                state: 3
+            }
+        );
+        assert_eq!(
+            query(access("bob", expected)).await.unwrap(),
+            StatusReply::AccessObserved {
+                revision: 1,
+                state: 1
+            }
+        );
+        assert!(query(access("alice", [0; 32])).await.is_err());
+        assert_eq!(
+            query(StatusCommand::CheckReload).await.unwrap(),
+            StatusReply::Compatible
+        );
+        assert!(query(StatusCommand::CheckTlsRollback).await.is_err());
+        assert!(query(StatusCommand::CheckRestartRollback).await.is_err());
+        assert!(query(StatusCommand::CheckAuthRollback).await.is_err());
+        candidate.server.policy.max_connections_total += 1;
+        let digest = save(&candidate);
+        assert_eq!(
+            query(StatusCommand::CheckQuota).await.unwrap(),
+            StatusReply::QuotaReady
+        );
+        assert!(query(StatusCommand::ApplyQuotaBound {
+            expected_revision: 1,
+            candidate_sha256: [0; 32]
+        })
+        .await
+        .is_err());
+        assert!(query(StatusCommand::ApplyQuotaBound {
+            expected_revision: 2,
+            candidate_sha256: digest
+        })
+        .await
+        .is_err());
+        assert_eq!(
+            query(StatusCommand::ApplyQuotaBound {
+                expected_revision: 1,
+                candidate_sha256: digest
+            })
+            .await
+            .unwrap(),
+            StatusReply::QuotaApplied { revision: 2 }
+        );
+        assert!(query(StatusCommand::ApplyQuotaBound {
+            expected_revision: 1,
+            candidate_sha256: digest
+        })
+        .await
+        .is_err());
+
+        let enabled = candidate.clone();
+        candidate
+            .server
+            .users
+            .iter_mut()
+            .find(|user| user.id == "alice")
+            .unwrap()
+            .disabled = true;
+        let digest = save(&candidate);
+        assert_eq!(
+            query(StatusCommand::CheckReload).await.unwrap(),
+            StatusReply::Compatible
+        );
+        assert_eq!(
+            query(access("alice", digest)).await.unwrap(),
+            StatusReply::AccessObserved {
+                revision: 2,
+                state: 3
+            }
+        );
+        assert!(query(StatusCommand::ApplyReloadBound {
+            expected_revision: 2,
+            candidate_sha256: [0; 32]
+        })
+        .await
+        .is_err());
+        assert_eq!(
+            query(StatusCommand::ApplyReloadBound {
+                expected_revision: 2,
+                candidate_sha256: digest
+            })
+            .await
+            .unwrap(),
+            StatusReply::Applied { revision: 3 }
+        );
+        assert_eq!(
+            query(access("alice", digest)).await.unwrap(),
+            StatusReply::AccessObserved {
+                revision: 3,
+                state: 2
+            }
+        );
+        // Own-TLS-only deployments do not publish a REALITY auth rollback
+        // slot. Restoration is a new explicit, saved and CAS-bound reload.
+        assert!(query(StatusCommand::CheckAuthRollback).await.is_err());
+        assert!(query(StatusCommand::ApplyAuthRollback {
+            expected_revision: 2
+        })
+        .await
+        .is_err());
+        assert!(query(StatusCommand::ApplyAuthRollback {
+            expected_revision: 3
+        })
+        .await
+        .is_err());
+        assert_eq!(
+            query(access("alice", digest)).await.unwrap(),
+            StatusReply::AccessObserved {
+                revision: 3,
+                state: 2
+            }
+        );
+        candidate = enabled;
+        let digest = save(&candidate);
+        assert_eq!(
+            query(StatusCommand::CheckReload).await.unwrap(),
+            StatusReply::Compatible
+        );
+        assert!(query(StatusCommand::ApplyReloadBound {
+            expected_revision: 2,
+            candidate_sha256: digest
+        })
+        .await
+        .is_err());
+        assert_eq!(
+            query(StatusCommand::ApplyReloadBound {
+                expected_revision: 3,
+                candidate_sha256: digest
+            })
+            .await
+            .unwrap(),
+            StatusReply::Applied { revision: 4 }
+        );
+        assert_eq!(
+            query(access("alice", digest)).await.unwrap(),
+            StatusReply::AccessObserved {
+                revision: 4,
+                state: 3
+            }
+        );
+
+        let next_material =
+            rcgen::generate_simple_self_signed(vec!["a.example.org".into()]).unwrap();
+        let next_cert = directory.join("next-cert.pem");
+        let next_key = directory.join("next-key.pem");
+        fs::write(&next_cert, next_material.cert.pem()).unwrap();
+        #[cfg(not(windows))]
+        fs::write(&next_key, next_material.key_pair.serialize_pem()).unwrap();
+        #[cfg(windows)]
+        crate::bounded_input::write_test_private(&next_key, next_material.key_pair.serialize_pem());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&next_key, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let before_rotation = candidate.clone();
+        candidate.server.inbounds[0].tls_cert = format!("file:{}", next_cert.display());
+        candidate.server.inbounds[0].tls_key = format!("file:{}", next_key.display());
+        let digest = save(&candidate);
+        assert_eq!(
+            query(StatusCommand::CheckRestart).await.unwrap(),
+            StatusReply::RestartSamePortTlsReady
+        );
+        assert!(query(StatusCommand::CheckRestartBound {
+            expected_revision: 3,
+            candidate_sha256: digest
+        })
+        .await
+        .is_err());
+        let StatusReply::RestartPreview {
+            same_port: true,
+            material_sha256,
+        } = query(StatusCommand::CheckRestartBound {
+            expected_revision: 4,
+            candidate_sha256: digest,
+        })
+        .await
+        .unwrap()
+        else {
+            panic!("same-port preview");
+        };
+        assert!(query(StatusCommand::ApplyRestartBound {
+            expected_revision: 4,
+            candidate_sha256: digest,
+            tls_sha256: [0; 32]
+        })
+        .await
+        .is_err());
+        assert_eq!(
+            query(StatusCommand::ApplyRestartBound {
+                expected_revision: 4,
+                candidate_sha256: digest,
+                tls_sha256: material_sha256
+            })
+            .await
+            .unwrap(),
+            StatusReply::RestartApplied { revision: 5 }
+        );
+        assert!(matches!(
+            query(StatusCommand::CheckTlsRollback).await.unwrap(),
+            StatusReply::TlsRollbackReady { revision: 5, .. }
+        ));
+        assert!(query(StatusCommand::ApplyTlsRollback {
+            expected_revision: 4
+        })
+        .await
+        .is_err());
+        assert_eq!(
+            query(StatusCommand::ApplyTlsRollback {
+                expected_revision: 5
+            })
+            .await
+            .unwrap(),
+            StatusReply::TlsRollbackApplied { revision: 6 }
+        );
+        assert!(query(StatusCommand::ApplyTlsRollback {
+            expected_revision: 5
+        })
+        .await
+        .is_err());
+
+        // A partial layout adds an independent listener pair and preserves
+        // the old pair. Its one-shot structural rollback retires only that
+        // pair; neither operation mutates the saved candidate.
+        candidate = before_rotation;
+        let mut extra = candidate.server.inbounds[0].clone();
+        extra.id = "edge-c".into();
+        let new_tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let new_udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let extra_tcp = new_tcp.local_addr().unwrap();
+        let extra_udp = new_udp.local_addr().unwrap();
+        extra.h2_listen = extra_tcp.to_string();
+        extra.quic_listen = extra_udp.to_string();
+        candidate.server.inbounds.push(extra);
+        let digest = save(&candidate);
+        assert!(query(StatusCommand::CheckRestartBound {
+            expected_revision: 6,
+            candidate_sha256: digest
+        })
+        .await
+        .is_err());
+        drop((new_tcp, new_udp));
+        let StatusReply::RestartPreview {
+            same_port: false,
+            material_sha256,
+        } = query(StatusCommand::CheckRestartBound {
+            expected_revision: 6,
+            candidate_sha256: digest,
+        })
+        .await
+        .unwrap()
+        else {
+            panic!("partial restart preview");
+        };
+        assert_eq!(
+            query(StatusCommand::ApplyRestartBound {
+                expected_revision: 6,
+                candidate_sha256: digest,
+                tls_sha256: material_sha256
+            })
+            .await
+            .unwrap(),
+            StatusReply::RestartApplied { revision: 7 }
+        );
+        assert_eq!(
+            query(StatusCommand::Status).await.unwrap(),
+            StatusReply::RunningRevision {
+                inbounds: 2,
+                revision: 7
+            }
+        );
+        assert!(std::net::TcpListener::bind(extra_tcp).is_err());
+        assert!(std::net::UdpSocket::bind(extra_udp).is_err());
+        assert!(matches!(
+            query(StatusCommand::CheckRestartRollback).await.unwrap(),
+            StatusReply::RestartRollbackReady { revision: 7, .. }
+        ));
+        assert!(query(StatusCommand::ApplyRestartRollback {
+            expected_revision: 6
+        })
+        .await
+        .is_err());
+        assert_eq!(
+            query(StatusCommand::ApplyRestartRollback {
+                expected_revision: 7
+            })
+            .await
+            .unwrap(),
+            StatusReply::RestartRollbackApplied { revision: 8 }
+        );
+        assert_eq!(
+            query(StatusCommand::Status).await.unwrap(),
+            StatusReply::RunningRevision {
+                inbounds: 1,
+                revision: 8
+            }
+        );
+        assert_eq!(
+            <[u8; 32]>::from(Sha256::digest(fs::read(&path).unwrap())),
+            digest
+        );
+        fs::write(&path, &contents).unwrap();
         stop.send(()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(30), task)
             .await
@@ -4012,7 +4731,7 @@ mod hardening_tests {
             let remote = endpoint.local_addr().unwrap();
             (
                 remote,
-                tokio::spawn(crate::h3_server::serve_generation(endpoint, context, phase)),
+                tokio::spawn(endpoint.serve_generation(context, phase)),
             )
         } else {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4168,6 +4887,7 @@ mod hardening_tests {
                     },
                 ],
                 policy: ServerPolicy {
+                    routing: None,
                     allow_private_ips: false,
                     max_connections_per_user: 1,
                     max_connections_total: 3,

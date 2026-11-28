@@ -295,6 +295,7 @@ async fn real_supervisor_prepares_then_switches_h2_h3_and_drains_old_sessions() 
                     disabled: false,
                 }],
                 policy: ServerPolicy {
+                    routing: None,
                     allow_private_ips: true,
                     max_connections_per_user: 6,
                     max_connections_total: 16,
@@ -580,6 +581,7 @@ async fn same_port_tls_identity_rotation_preserves_h2_h3_and_rejects_invalid_can
                     disabled: false,
                 }],
                 policy: ServerPolicy {
+                    routing: None,
                     allow_private_ips: true,
                     max_connections_per_user: 6,
                     max_connections_total: 16,
@@ -949,6 +951,7 @@ async fn native_live_quota_contraction_and_growth_hold_h2_h3_session_permits() {
                     disabled: false,
                 }],
                 policy: ServerPolicy {
+                    routing: None,
                     allow_private_ips: true,
                     max_connections_per_user: 2,
                     max_connections_total: 2,

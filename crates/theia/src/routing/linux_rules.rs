@@ -1,0 +1,2683 @@
+//! Explicit laboratory-only nftables installation/recovery. The caller must
+//! supply a reference to the host net namespace: this module refuses to
+//! operate in that namespace. No product activation or carrier exemption.
+//! A dedicated inet table queues LOCAL_OUT without bypass. If the owner
+//! dies, the kernel queue closes and the table remains fail closed.
+//! Recovery deletes ONLY our table, using the kernel ruleset generation CAS.
+//! Any unrelated ruleset change after installation requires manual review.
+#[path = "linux_policy_routes.rs"]
+mod policy_routes;
+use super::linux_carrier::LabCarrierSocket;
+use super::nfqueue::{
+    align4, attr, checked_header, kernel_address, message, next_attr, receive, send, Queue,
+};
+pub(crate) use policy_routes::PolicyRoutes;
+use ring::rand::{SecureRandom, SystemRandom};
+use serde::{Deserialize, Serialize};
+use std::{
+    fs::{self, File},
+    io, mem,
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        linux::net::SocketAddrExt,
+        unix::{fs::MetadataExt, net::UnixDatagram},
+    },
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
+
+const NFT: u16 = 10 << 8;
+const REQUEST: u16 = 1;
+const ACK: u16 = 4;
+const CREATE_EXCLUSIVE: u16 = 0x600;
+const APPEND: u16 = 0x800;
+const MAX_CARRIERS: usize = 16;
+const MAX_RULE_OPERATIONS: usize = 96;
+/// Reserved skb routing mark. It is never a carrier socket mark.
+pub const REDIRECT_MARK: u32 = 0x5449;
+pub(crate) const PASS_MARK: u32 = 0x544a;
+pub(super) fn reserved_mark(mark: u32) -> bool {
+    matches!(mark, REDIRECT_MARK | PASS_MARK)
+}
+const MAX_CARRIER_EPOCH: usize = 65_536;
+const NESTED: u16 = 0x8000;
+const FAMILY_INET: u8 = 1;
+const NEW_TABLE: u16 = NFT;
+const GET_TABLE: u16 = NFT | 1;
+const DEL_TABLE: u16 = NFT | 2;
+const NEW_CHAIN: u16 = NFT | 3;
+const NEW_RULE: u16 = NFT | 6;
+const DEL_RULE: u16 = NFT | 8;
+const NEW_GEN: u16 = NFT | 15;
+const GET_GEN: u16 = NFT | 16;
+
+fn refused() -> io::Error {
+    io::Error::from(io::ErrorKind::PermissionDenied)
+}
+fn invalid() -> io::Error {
+    io::Error::from(io::ErrorKind::InvalidData)
+}
+
+fn valid_boot_id(boot: &str) -> bool {
+    boot.len() == 36
+        && boot.bytes().enumerate().all(|(index, b)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                b == b'-'
+            } else {
+                b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
+            }
+        })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Scope {
+    boot: String,
+    dev: u64,
+    ino: u64,
+    /// Present only for explicit PID-1 namespace laboratory activation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    machine: Option<String>,
+}
+pub const HOST_GUARD_JOURNAL: &str = "/var/lib/theia/guard/host.toml";
+fn host_path(path: &Path) -> io::Result<()> {
+    if path != Path::new(HOST_GUARD_JOURNAL) {
+        return Err(refused());
+    }
+    check_parent(path)
+}
+pub(super) fn verify_host_scope(host: &File) -> io::Result<()> {
+    Scope::current_mode(host, true).map(|_| ())
+}
+fn machine_id() -> io::Result<String> {
+    let path = Path::new("/etc/machine-id");
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.is_file() || meta.uid() != 0 || meta.mode() & 0o022 != 0 || meta.len() > 64 {
+        return Err(refused());
+    }
+    let id = fs::read_to_string(path)?.trim().to_owned();
+    if id.len() != 32
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || id.bytes().all(|b| b == b'0')
+    {
+        return Err(refused());
+    }
+    Ok(id)
+}
+impl Scope {
+    fn current(host_namespace: &File) -> io::Result<Self> {
+        Self::current_mode(host_namespace, false)
+    }
+    fn current_mode(host_namespace: &File, host_mode: bool) -> io::Result<Self> {
+        let own = fs::metadata("/proc/thread-self/ns/net")?;
+        let host = host_namespace.metadata()?;
+        let mut stat: libc::statfs = unsafe { mem::zeroed() };
+        if unsafe { libc::fstatfs(host_namespace.as_raw_fd(), &mut stat) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if stat.f_type as u64 != 0x6e736673 {
+            return Err(refused());
+        } // NSFS_MAGIC
+          // NS_GET_NSTYPE rejects a mount/PID namespace presented as a host
+          // network-namespace handle.
+        if unsafe { libc::ioctl(host_namespace.as_raw_fd(), 0xb703 as _) } != libc::CLONE_NEWNET {
+            return Err(refused());
+        }
+        let same = (own.dev(), own.ino()) == (host.dev(), host.ino());
+        let machine = if host_mode {
+            let init = fs::metadata("/proc/1/ns/net")?;
+            if !same
+                || unsafe { libc::geteuid() } != 0
+                || (init.dev(), init.ino()) != (host.dev(), host.ino())
+            {
+                return Err(refused());
+            }
+            Some(machine_id()?)
+        } else {
+            if same {
+                return Err(refused());
+            }
+            None
+        };
+        let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+            .trim()
+            .to_owned();
+        if !valid_boot_id(&boot) {
+            return Err(invalid());
+        }
+        Ok(Self {
+            boot,
+            dev: own.dev(),
+            ino: own.ino(),
+            machine,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RedirectScope {
+    port: u16,
+    loopback: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    policy_queue: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Journal {
+    version: u8,
+    scope: Scope,
+    nonce: [u8; 16],
+    before: u32,
+    installed: u32,
+    // True only for a durable update of an already verified owned table.
+    // Old journals without this field retain the stricter recovery rule.
+    #[serde(default)]
+    previous_present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    redirect: Option<RedirectScope>,
+    #[serde(default)]
+    boot_rearmed: bool,
+    restored: bool,
+}
+impl Journal {
+    fn name(&self) -> String {
+        let suffix: String = self.nonce.iter().map(|n| format!("{n:02x}")).collect();
+        format!("theia_lab_{suffix}")
+    }
+    fn validate(&self, scope: &Scope) -> io::Result<()> {
+        if self.version != 1
+            || &self.scope != scope
+            || self.nonce == [0; 16]
+            || self.before == 0
+            || self.before.checked_add(1) != Some(self.installed)
+            || self
+                .redirect
+                .is_some_and(|scope| scope.port == 0 || scope.loopback == 0)
+            || (scope.machine.is_some() && self.redirect.and_then(|s| s.policy_queue).is_none())
+            || (self.boot_rearmed
+                && (scope.machine.is_none() || self.previous_present || self.restored))
+        {
+            return Err(refused());
+        }
+        Ok(())
+    }
+
+    fn recovery_generation(&self, observed: u32) -> io::Result<u32> {
+        if observed == self.installed || (self.previous_present && observed == self.before) {
+            Ok(observed)
+        } else {
+            Err(refused())
+        }
+    }
+}
+
+fn journal_bytes(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.uid() == unsafe { libc::geteuid() } && meta.nlink() == 1 => {
+            crate::bounded_input::read(path, 4096, true, true).map(|b| Some(b.to_vec()))
+        }
+        Ok(_) => Err(refused()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+fn check_parent(path: &Path) -> io::Result<()> {
+    if !crate::bounded_input::explicit_file_path(path) {
+        return Err(refused());
+    }
+    let parent = path.parent().ok_or_else(refused)?;
+    // A trusted owner-only real directory is required. Reject symlinked
+    // ancestors; the owner is responsible for a stable mount namespace.
+    if fs::canonicalize(parent)? != parent {
+        return Err(refused());
+    }
+    let meta = fs::symlink_metadata(parent)?;
+    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+        return Err(refused());
+    }
+    Ok(())
+}
+fn store(path: &Path, journal: &Journal, expected: Option<&[u8]>) -> io::Result<Vec<u8>> {
+    let encoded = toml::to_string(journal).map_err(|_| invalid())?;
+    crate::config::guarded_trust_write(path, &encoded, expected).map_err(|_| refused())?;
+    let bytes = journal_bytes(path)?.ok_or_else(refused)?;
+    if bytes != encoded.as_bytes() {
+        return Err(refused());
+    }
+    Ok(bytes)
+}
+fn scope_lock() -> io::Result<UnixDatagram> {
+    let address = std::os::unix::net::SocketAddr::from_abstract_name(b"theia-lab-nft-rules-v1")?;
+    UnixDatagram::bind_addr(&address)
+}
+
+struct Netlink(OwnedFd);
+impl Netlink {
+    fn open() -> io::Result<Self> {
+        let raw = unsafe {
+            libc::socket(
+                libc::AF_NETLINK,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                libc::NETLINK_NETFILTER,
+            )
+        };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let local = kernel_address();
+        let rc = unsafe {
+            libc::bind(
+                raw,
+                (&local as *const libc::sockaddr_nl).cast(),
+                mem::size_of_val(&local) as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let wait = libc::timeval {
+            tv_sec: 1,
+            tv_usec: 0,
+        };
+        for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+            let rc = unsafe {
+                libc::setsockopt(
+                    raw,
+                    libc::SOL_SOCKET,
+                    option,
+                    (&wait as *const libc::timeval).cast(),
+                    mem::size_of_val(&wait) as libc::socklen_t,
+                )
+            };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(Self(fd))
+    }
+    fn request(&self, kind: u16, attrs: &[u8]) -> io::Result<Vec<u8>> {
+        send(self.0.as_raw_fd(), &nft_message(kind, REQUEST, 1, attrs))?;
+        let mut b = vec![0u8; 65536];
+        let n = receive(self.0.as_raw_fd(), &mut b)?;
+        b.truncate(n);
+        Ok(b)
+    }
+    fn generation(&self) -> io::Result<u32> {
+        let b = self.request(GET_GEN, &[])?;
+        decode_generation(&b)
+    }
+    fn table(&self, journal: &Journal) -> io::Result<bool> {
+        let mut attrs = Vec::new();
+        name_attr(&mut attrs, 1, &journal.name());
+        let b = self.request(GET_TABLE, &attrs)?;
+        decode_table(&b, journal)
+    }
+    fn batch(&self, generation: u32, operations: &[Vec<u8>]) -> io::Result<()> {
+        if generation == 0 || operations.is_empty() || operations.len() > MAX_RULE_OPERATIONS {
+            return Err(invalid());
+        }
+        let mut attrs = Vec::new();
+        attr(&mut attrs, 1, &generation.to_be_bytes());
+        let mut bytes = message(16, REQUEST, 1, 10, &attrs);
+        for operation in operations {
+            bytes.extend_from_slice(operation);
+        }
+        bytes.extend_from_slice(&message(17, REQUEST, operations.len() as u32 + 2, 10, &[]));
+        send(self.0.as_raw_fd(), &bytes)?;
+        let mut seen = vec![false; operations.len()];
+        let mut received = 0usize;
+        let mut buffer = vec![0u8; 65536];
+        for _ in 0..MAX_RULE_OPERATIONS {
+            let n = receive(self.0.as_raw_fd(), &mut buffer)?;
+            decode_batch_ack(&buffer[..n], &mut seen, &mut received)?;
+            if received == operations.len() {
+                return Ok(());
+            }
+        }
+        Err(invalid())
+    }
+}
+// The same production decoder is used for actual kernel reads and for
+// deterministic malformed-message regression fixtures without NET_ADMIN.
+fn decode_generation(bytes: &[u8]) -> io::Result<u32> {
+    let (kind, seq, body) = checked_header(bytes)?;
+    if kind == 2 {
+        return Err(ack_error(body)?.unwrap_or_else(invalid));
+    }
+    if kind != NEW_GEN || seq != 1 || body.len() < 4 || body[1] != 0 {
+        return Err(invalid());
+    }
+    let mut rest = &body[4..];
+    let mut generation = None;
+    while let Some((kind, value)) = next_attr(&mut rest)? {
+        if kind == 1 {
+            if generation.is_some() || value.len() != 4 {
+                return Err(invalid());
+            }
+            generation = Some(u32::from_be_bytes(value.try_into().map_err(|_| invalid())?));
+        }
+    }
+    generation.filter(|n| *n != 0).ok_or_else(invalid)
+}
+fn decode_table(bytes: &[u8], journal: &Journal) -> io::Result<bool> {
+    let (kind, seq, body) = checked_header(bytes)?;
+    if seq != 1 {
+        return Err(invalid());
+    }
+    if kind == 2 {
+        let error = ack_error(body)?.ok_or_else(invalid)?;
+        return if error.raw_os_error() == Some(libc::ENOENT) {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    if kind != NEW_TABLE || body.len() < 4 || body[0] != FAMILY_INET || body[1] != 0 {
+        return Err(invalid());
+    }
+    let mut rest = &body[4..];
+    let (mut name, mut nonce, mut use_count) = (None, None, None);
+    while let Some((kind, value)) = next_attr(&mut rest)? {
+        match kind {
+            1 if name.is_none() => name = Some(value),
+            6 if nonce.is_none() => nonce = Some(value),
+            3 if use_count.is_none() && value.len() == 4 => {
+                use_count = Some(u32::from_be_bytes(value.try_into().map_err(|_| invalid())?))
+            }
+            1 | 3 | 6 => return Err(invalid()),
+            _ => {}
+        }
+    }
+    let expected = journal.name() + "\0";
+    if name != Some(expected.as_bytes())
+        || nonce != Some(journal.nonce.as_slice())
+        || use_count != Some(if journal.redirect.is_some() { 5 } else { 1 })
+    {
+        return Err(refused());
+    }
+    Ok(true)
+}
+fn decode_batch_ack(bytes: &[u8], seen: &mut [bool], received: &mut usize) -> io::Result<()> {
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let header = rest.get(..16).ok_or_else(invalid)?;
+        let len =
+            u32::from_ne_bytes(header[..4].try_into().map_err(|_| invalid())?) as usize;
+        if len < 16 || align4(len) > rest.len() {
+            return Err(invalid());
+        }
+        let (kind, seq, body) = checked_header(&rest[..align4(len)])?;
+        if kind != 2 {
+            return Err(invalid());
+        }
+        if let Some(error) = ack_error(body)? {
+            return Err(error);
+        }
+        if seq < 2 || seq > seen.len() as u32 + 1 {
+            return Err(invalid());
+        }
+        let slot = &mut seen[(seq - 2) as usize];
+        if *slot {
+            return Err(invalid());
+        }
+        *slot = true;
+        *received += 1;
+        rest = &rest[align4(len)..];
+    }
+    Ok(())
+}
+fn ack_error(body: &[u8]) -> io::Result<Option<io::Error>> {
+    if body.len() < 20 {
+        return Err(invalid());
+    }
+    let code = i32::from_ne_bytes(body[..4].try_into().map_err(|_| invalid())?);
+    match code {
+        0 => Ok(None),
+        i32::MIN => Err(invalid()),
+        n if n < 0 => Ok(Some(io::Error::from_raw_os_error(-n))),
+        _ => Err(invalid()),
+    }
+}
+fn name_attr(out: &mut Vec<u8>, kind: u16, name: &str) {
+    let mut name = name.as_bytes().to_vec();
+    name.push(0);
+    attr(out, kind, &name);
+}
+fn nft_message(kind: u16, flags: u16, sequence: u32, attrs: &[u8]) -> Vec<u8> {
+    let mut msg = message(kind, flags, sequence, 0, attrs);
+    // GETGEN is family-independent, all object operations are inet.
+    if kind != GET_GEN {
+        msg[16] = FAMILY_INET;
+    }
+    msg
+}
+fn install_messages(journal: &Journal, queue: u16, carriers: &[LabCarrierSocket]) -> Vec<Vec<u8>> {
+    let name = journal.name();
+    let mut table = Vec::new();
+    name_attr(&mut table, 1, &name);
+    attr(&mut table, 6, &journal.nonce);
+
+    let mut chain = Vec::new();
+    name_attr(&mut chain, 1, &name);
+    name_attr(&mut chain, 3, "output");
+    name_attr(&mut chain, 7, "filter");
+    let mut hook = Vec::new();
+    attr(&mut hook, 1, &3u32.to_be_bytes()); // LOCAL_OUT
+    attr(&mut hook, 2, &0i32.to_be_bytes());
+    attr(&mut chain, 4 | NESTED, &hook);
+    attr(&mut chain, 5, &0u32.to_be_bytes()); // NF_DROP policy
+
+    let mut rule = Vec::new();
+    name_attr(&mut rule, 1, &name);
+    name_attr(&mut rule, 2, "output");
+    let mut data = Vec::new();
+    attr(&mut data, 1, &queue.to_be_bytes());
+    attr(&mut data, 2, &1u16.to_be_bytes());
+    attr(&mut data, 3, &0u16.to_be_bytes()); // no bypass
+    let mut expression = Vec::new();
+    name_attr(&mut expression, 1, "queue");
+    attr(&mut expression, 2 | NESTED, &data);
+    let mut expressions = Vec::new();
+    attr(&mut expressions, 1 | NESTED, &expression);
+    attr(&mut rule, 4 | NESTED, &expressions);
+    let flags = REQUEST | ACK | CREATE_EXCLUSIVE;
+    let mut messages = vec![
+        nft_message(NEW_TABLE, flags, 2, &table),
+        nft_message(NEW_CHAIN, flags, 3, &chain),
+    ];
+    for carrier in carriers {
+        let expressions = carrier_expressions(carrier.key(), carrier.mark());
+        let mut attrs = Vec::new();
+        name_attr(&mut attrs, 1, &name);
+        name_attr(&mut attrs, 2, "output");
+        attr(&mut attrs, 4 | NESTED, &expressions);
+        messages.push(nft_message(
+            NEW_RULE,
+            flags | APPEND,
+            messages.len() as u32 + 2,
+            &attrs,
+        ));
+    }
+    // Append the queue rule last. No packet may bypass it unless a
+    // preceding kernel socket + exact tuple match admitted it.
+    messages.push(nft_message(
+        NEW_RULE,
+        flags | APPEND,
+        messages.len() as u32 + 2,
+        &rule,
+    ));
+    messages
+}
+
+fn expression(out: &mut Vec<u8>, name: &str, data: &[u8]) {
+    let mut expr = Vec::new();
+    name_attr(&mut expr, 1, name);
+    attr(&mut expr, 2 | NESTED, data);
+    attr(out, 1 | NESTED, &expr);
+}
+fn cmp(out: &mut Vec<u8>, value: &[u8]) {
+    let mut data = Vec::new();
+    attr(&mut data, 1, &1u32.to_be_bytes()); // NFT_REG_1
+    attr(&mut data, 2, &0u32.to_be_bytes()); // NFT_CMP_EQ
+    let mut nested = Vec::new();
+    attr(&mut nested, 1, value);
+    attr(&mut data, 3 | NESTED, &nested);
+    expression(out, "cmp", &data);
+}
+fn meta_cmp(out: &mut Vec<u8>, key: u32, value: &[u8]) {
+    let mut data = Vec::new();
+    attr(&mut data, 1, &1u32.to_be_bytes());
+    attr(&mut data, 2, &key.to_be_bytes());
+    expression(out, "meta", &data);
+    cmp(out, value);
+}
+fn payload_cmp(out: &mut Vec<u8>, base: u32, offset: u32, value: &[u8]) {
+    let mut data = Vec::new();
+    attr(&mut data, 1, &1u32.to_be_bytes());
+    attr(&mut data, 2, &base.to_be_bytes());
+    attr(&mut data, 3, &offset.to_be_bytes());
+    attr(&mut data, 4, &(value.len() as u32).to_be_bytes());
+    expression(out, "payload", &data);
+    cmp(out, value);
+}
+fn socket_matches(key: super::packet::FlowKey, mark: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut socket = Vec::new();
+    attr(&mut socket, 1, &1u32.to_be_bytes()); // NFT_SOCKET_MARK
+    attr(&mut socket, 2, &1u32.to_be_bytes()); // NFT_REG_1
+    expression(&mut out, "socket", &socket);
+    // Socket mark is a native-endian register value, not skb metadata.
+    cmp(&mut out, &mark.to_ne_bytes());
+    tuple_matches(&mut out, key);
+    out
+}
+
+/// L3/L4 checks used after a route change. A tuple alone never authorizes
+/// egress: LOCAL_OUT must first have authenticated the actual socket mark.
+fn tuple_matches(out: &mut Vec<u8>, key: super::packet::FlowKey) {
+    use std::net::IpAddr;
+    match (key.source.ip(), key.destination.ip()) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            meta_cmp(out, 15, &[2]); // NFPROTO_IPV4
+            meta_cmp(
+                out,
+                16,
+                &[if key.transport == super::packet::Transport::Tcp {
+                    6
+                } else {
+                    17
+                }],
+            );
+            payload_cmp(out, 1, 12, &src.octets());
+            payload_cmp(out, 1, 16, &dst.octets());
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            meta_cmp(out, 15, &[10]); // NFPROTO_IPV6
+            meta_cmp(
+                out,
+                16,
+                &[if key.transport == super::packet::Transport::Tcp {
+                    6
+                } else {
+                    17
+                }],
+            );
+            payload_cmp(out, 1, 8, &src.octets());
+            payload_cmp(out, 1, 24, &dst.octets());
+        }
+        _ => unreachable!("validated carrier family"),
+    }
+    let mut ports = [0; 4];
+    ports[..2].copy_from_slice(&key.source.port().to_be_bytes());
+    ports[2..].copy_from_slice(&key.destination.port().to_be_bytes());
+    payload_cmp(out, 2, 0, &ports);
+}
+fn verdict_expression(out: &mut Vec<u8>, code: u32) {
+    let mut verdict = Vec::new();
+    attr(&mut verdict, 1, &code.to_be_bytes());
+    let mut data = Vec::new();
+    attr(&mut data, 2 | NESTED, &verdict);
+    let mut immediate = Vec::new();
+    attr(&mut immediate, 1, &0u32.to_be_bytes()); // NFT_REG_VERDICT
+    attr(&mut immediate, 2 | NESTED, &data);
+    expression(out, "immediate", &immediate);
+}
+fn carrier_expressions(key: super::packet::FlowKey, mark: u32) -> Vec<u8> {
+    let mut out = socket_matches(key, mark);
+    verdict_expression(&mut out, 1);
+    out
+}
+
+fn register_value(out: &mut Vec<u8>, value: &[u8]) {
+    let mut data = Vec::new();
+    attr(&mut data, 1, &1u32.to_be_bytes()); // NFT_REG_1
+    let mut nested = Vec::new();
+    attr(&mut nested, 1, value);
+    attr(&mut data, 2 | NESTED, &nested);
+    expression(out, "immediate", &data);
+}
+fn set_skb_mark(out: &mut Vec<u8>, mark: u32) {
+    register_value(out, &mark.to_ne_bytes());
+    let mut data = Vec::new();
+    attr(&mut data, 2, &3u32.to_be_bytes()); // NFT_META_MARK
+    attr(&mut data, 3, &1u32.to_be_bytes()); // NFTA_META_SREG
+    expression(out, "meta", &data);
+}
+fn redirect_chain(
+    journal: &Journal,
+    name: &str,
+    kind: &str,
+    hook: u32,
+    priority: i32,
+    policy: u32,
+    sequence: u32,
+) -> Vec<u8> {
+    let mut chain = Vec::new();
+    name_attr(&mut chain, 1, &journal.name());
+    name_attr(&mut chain, 3, name);
+    name_attr(&mut chain, 7, kind);
+    let mut hook_data = Vec::new();
+    attr(&mut hook_data, 1, &hook.to_be_bytes());
+    attr(&mut hook_data, 2, &priority.to_be_bytes());
+    attr(&mut chain, 4 | NESTED, &hook_data);
+    attr(&mut chain, 5, &policy.to_be_bytes());
+    nft_message(
+        NEW_CHAIN,
+        REQUEST | ACK | CREATE_EXCLUSIVE,
+        sequence,
+        &chain,
+    )
+}
+fn push_rule(messages: &mut Vec<Vec<u8>>, journal: &Journal, chain: &str, expressions: &[u8]) {
+    let mut attrs = Vec::new();
+    name_attr(&mut attrs, 1, &journal.name());
+    name_attr(&mut attrs, 2, chain);
+    attr(&mut attrs, 4 | NESTED, expressions);
+    messages.push(nft_message(
+        NEW_RULE,
+        REQUEST | ACK | CREATE_EXCLUSIVE | APPEND,
+        messages.len() as u32 + 2,
+        &attrs,
+    ));
+}
+fn redirect_egress_rules(
+    messages: &mut Vec<Vec<u8>>,
+    journal: &Journal,
+    scope: RedirectScope,
+    admissions: &std::collections::BTreeMap<u32, super::packet::FlowKey>,
+) {
+    // All three gates are replaced atomically. The postrouting hook sees
+    // the effective output interface after the LOCAL_OUT route lookup.
+    for (&mark, &key) in admissions {
+        let mut route = socket_matches(key, mark);
+        set_skb_mark(&mut route, mark);
+        verdict_expression(&mut route, 1);
+        push_rule(messages, journal, "route_out", &route);
+        push_rule(messages, journal, "output", &carrier_expressions(key, mark));
+        let mut post = Vec::new();
+        meta_cmp(&mut post, 3, &mark.to_ne_bytes());
+        tuple_matches(&mut post, key);
+        verdict_expression(&mut post, 1);
+        push_rule(messages, journal, "egress", &post);
+    }
+    // Ordinary traffic to a local service remains in the explicitly
+    // excluded local scope. Reset its packet mark, never trust user marks.
+    let mut local = Vec::new();
+    meta_cmp(&mut local, 5, &scope.loopback.to_ne_bytes());
+    set_skb_mark(&mut local, 0);
+    verdict_expression(&mut local, 1);
+    push_rule(messages, journal, "route_out", &local);
+    for protocol in [6u8, 17] {
+        let mut route = Vec::new();
+        meta_cmp(&mut route, 16, &[protocol]);
+        if let Some(queue) = scope.policy_queue {
+            // Clear marks before queuing: only the owned userspace
+            // verdict can stamp an authorized Pass/Redirect packet.
+            set_skb_mark(&mut route, 0);
+            let mut data = Vec::new();
+            attr(&mut data, 1, &queue.to_be_bytes());
+            attr(&mut data, 2, &1u16.to_be_bytes());
+            attr(&mut data, 3, &0u16.to_be_bytes()); // never bypass
+            expression(&mut route, "queue", &data);
+        } else {
+            set_skb_mark(&mut route, REDIRECT_MARK);
+            verdict_expression(&mut route, 1);
+        }
+        push_rule(messages, journal, "route_out", &route);
+    }
+    let mut local = Vec::new();
+    meta_cmp(&mut local, 5, &scope.loopback.to_ne_bytes());
+    verdict_expression(&mut local, 1);
+    push_rule(messages, journal, "output", &local);
+    push_rule(messages, journal, "egress", &local);
+    // LOCAL_OUT may still expose its original state->out after reroute.
+    // The following is not an external permit: postrouting checks the
+    // actual device and admits only loopback or exact carrier traffic.
+    let mut rerouted = Vec::new();
+    meta_cmp(&mut rerouted, 3, &REDIRECT_MARK.to_ne_bytes());
+    verdict_expression(&mut rerouted, 1);
+    push_rule(messages, journal, "output", &rerouted);
+    if scope.policy_queue.is_some() {
+        let mut passed = Vec::new();
+        meta_cmp(&mut passed, 3, &PASS_MARK.to_ne_bytes());
+        verdict_expression(&mut passed, 1);
+        push_rule(messages, journal, "output", &passed);
+        push_rule(messages, journal, "egress", &passed);
+    }
+}
+fn redirect_install(
+    journal: &Journal,
+    scope: RedirectScope,
+    admissions: &std::collections::BTreeMap<u32, super::packet::FlowKey>,
+) -> Vec<Vec<u8>> {
+    let mut table = Vec::new();
+    name_attr(&mut table, 1, &journal.name());
+    attr(&mut table, 6, &journal.nonce);
+    let mut messages = vec![nft_message(
+        NEW_TABLE,
+        REQUEST | ACK | CREATE_EXCLUSIVE,
+        2,
+        &table,
+    )];
+    // Forwarding is outside desktop ingress. Deny it in this isolated
+    // namespace; never allow a failed reroute to forward a packet.
+    for (name, kind, hook, priority, policy) in [
+        ("route_out", "route", 3, -150, 0),
+        ("output", "filter", 3, 0, 0),
+        ("redirect_in", "filter", 0, -150, 1),
+        ("egress", "filter", 4, 0, 0),
+        ("forward", "filter", 2, 0, 0),
+    ] {
+        messages.push(redirect_chain(
+            journal,
+            name,
+            kind,
+            hook,
+            priority,
+            policy,
+            messages.len() as u32 + 2,
+        ));
+    }
+    redirect_egress_rules(&mut messages, journal, scope, admissions);
+    for protocol in [6u8, 17] {
+        let mut expressions = Vec::new();
+        meta_cmp(&mut expressions, 4, &scope.loopback.to_ne_bytes());
+        meta_cmp(&mut expressions, 3, &REDIRECT_MARK.to_ne_bytes());
+        meta_cmp(&mut expressions, 16, &[protocol]);
+        register_value(&mut expressions, &scope.port.to_be_bytes());
+        let mut tproxy = Vec::new();
+        attr(&mut tproxy, 1, &0u32.to_be_bytes()); // NFPROTO_UNSPEC, port only
+        attr(&mut tproxy, 3, &1u32.to_be_bytes()); // NFTA_TPROXY_REG_PORT
+        expression(&mut expressions, "tproxy", &tproxy);
+        verdict_expression(&mut expressions, 1);
+        push_rule(&mut messages, journal, "redirect_in", &expressions);
+    }
+    // No listener or failed tproxy expression: do not deliver normally.
+    let mut deny = Vec::new();
+    meta_cmp(&mut deny, 3, &REDIRECT_MARK.to_ne_bytes());
+    verdict_expression(&mut deny, 0);
+    push_rule(&mut messages, journal, "redirect_in", &deny);
+    messages
+}
+fn redirect_replace(
+    journal: &Journal,
+    scope: RedirectScope,
+    admissions: &std::collections::BTreeMap<u32, super::packet::FlowKey>,
+) -> Vec<Vec<u8>> {
+    let mut messages = Vec::new();
+    for chain in ["route_out", "output", "egress"] {
+        let mut attrs = Vec::new();
+        name_attr(&mut attrs, 1, &journal.name());
+        name_attr(&mut attrs, 2, chain);
+        messages.push(nft_message(
+            DEL_RULE,
+            REQUEST | ACK,
+            messages.len() as u32 + 2,
+            &attrs,
+        ));
+    }
+    redirect_egress_rules(&mut messages, journal, scope, admissions);
+    messages
+}
+
+fn loopback_index() -> io::Result<u32> {
+    let index = unsafe { libc::if_nametoindex(c"lo".as_ptr()) };
+    if index == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(index)
+    }
+}
+
+/// Verify the pre-provisioned policy routing from the actual kernel,
+/// without making a network connection or writing host routing rules.
+/// These are readiness probes, not authority to bypass the egress guard.
+fn marked_route_is_local(destination: std::net::IpAddr, loopback: u32) -> io::Result<bool> {
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            libc::NETLINK_ROUTE,
+        )
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let local = kernel_address();
+    if unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            (&local as *const libc::sockaddr_nl).cast(),
+            mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let timeout = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 250_000,
+    };
+    for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+        if unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                (&timeout as *const libc::timeval).cast(),
+                mem::size_of_val(&timeout) as libc::socklen_t,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    let (family, prefix, address) = match destination {
+        std::net::IpAddr::V4(ip) => (libc::AF_INET as u8, 32, ip.octets().to_vec()),
+        std::net::IpAddr::V6(ip) => (libc::AF_INET6 as u8, 128, ip.octets().to_vec()),
+    };
+    let mut body = vec![family, prefix, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // rtmsg
+    attr(&mut body, 1, &address); // RTA_DST
+    attr(&mut body, 16, &REDIRECT_MARK.to_ne_bytes()); // RTA_MARK
+    let mut request = Vec::new();
+    request.extend_from_slice(&((16 + body.len()) as u32).to_ne_bytes());
+    request.extend_from_slice(&26u16.to_ne_bytes()); // RTM_GETROUTE
+    request.extend_from_slice(&REQUEST.to_ne_bytes());
+    request.extend_from_slice(&1u32.to_ne_bytes());
+    request.extend_from_slice(&0u32.to_ne_bytes());
+    request.extend_from_slice(&body);
+    send(fd.as_raw_fd(), &request)?;
+    let mut bytes = [0u8; 8192];
+    let length = receive(fd.as_raw_fd(), &mut bytes)?;
+    let (kind, sequence, body) = checked_header(&bytes[..length])?;
+    if kind == 2 {
+        return Err(ack_error(body)?.ok_or_else(invalid)?);
+    }
+    if kind != 24 || sequence != 1 || body.len() < 12 || body[0] != family {
+        return Err(invalid());
+    }
+    if body[7] != 2 {
+        return Ok(false);
+    } // RTN_LOCAL
+    let mut rest = &body[12..];
+    let mut output = None;
+    while let Some((kind, value)) = next_attr(&mut rest)? {
+        if kind == 4 {
+            if output.is_some() || value.len() != 4 {
+                return Err(invalid());
+            }
+            output = Some(u32::from_ne_bytes(value.try_into().map_err(|_| invalid())?));
+        }
+    }
+    Ok(output == Some(loopback))
+}
+fn redirect_routes_ready(scope: RedirectScope) -> io::Result<bool> {
+    if loopback_index()? != scope.loopback {
+        return Ok(false);
+    }
+    for address in [
+        "198.51.100.2",
+        "203.0.113.2",
+        "2001:db8:2::2",
+        "2001:db8:3::2",
+    ] {
+        if !marked_route_is_local(address.parse().map_err(|_| invalid())?, scope.loopback)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn parse_journal(bytes: &[u8], scope: &Scope) -> io::Result<Journal> {
+    let journal: Journal = toml::from_str(std::str::from_utf8(bytes).map_err(|_| invalid())?)
+        .map_err(|_| invalid())?;
+    journal.validate(scope)?;
+    Ok(journal)
+}
+
+/// A lab rule lease keeps the namespace ownership lock. Drop never deletes
+/// rules or restores open networking. Explicit reviewed recovery is needed.
+struct SocketCapture {
+    socket: LabCarrierSocket,
+    queue_number: u16,
+    queue_identity: [u8; 16],
+}
+
+/// Proof is available only while the packet is held by the distinct owned
+/// kernel queue and the connected descriptor and rules generation agree.
+/// It establishes socket identity, not which process sent through a shared
+/// socket. Never treat it alone as application/domain routing evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapturedSocket {
+    cookie: u64,
+    key: super::packet::FlowKey,
+    queue_identity: [u8; 16],
+    rules_nonce: [u8; 16],
+    generation: u32,
+}
+impl CapturedSocket {
+    pub fn cookie(&self) -> u64 {
+        self.cookie
+    }
+    pub fn key(&self) -> super::packet::FlowKey {
+        self.key
+    }
+}
+
+pub struct LabRules {
+    journal: Journal,
+    queue_identity: [u8; 16],
+    _carriers: Vec<LabCarrierSocket>,
+    capture: Option<SocketCapture>,
+    journal_path: PathBuf,
+    admissions: std::collections::BTreeMap<u32, super::packet::FlowKey>,
+    dynamic: std::collections::BTreeMap<u32, Arc<LabCarrierSocket>>,
+    used_marks: std::collections::HashSet<u32>,
+    used_cookies: std::collections::HashSet<u64>,
+    queue_number: u16,
+    poisoned: bool,
+    carrier_retired: bool,
+    // Drop socket exemptions before releasing ownership to recovery.
+    _lock: UnixDatagram,
+}
+impl LabRules {
+    pub(crate) fn owns_queue(&self, queue: &Queue) -> io::Result<bool> {
+        queue.number()?;
+        if self.journal.redirect.is_some() || queue.identity() != self.queue_identity {
+            return Ok(false);
+        }
+        self.current()
+    }
+
+    pub(crate) fn owns_capture_queue(&self, queue: &Queue) -> io::Result<bool> {
+        let number = queue.number()?;
+        Ok(self.capture.as_ref().is_some_and(|tag| {
+            tag.queue_number == number && tag.queue_identity == queue.identity()
+        }) && self.current()?)
+    }
+    pub(crate) fn has_capture_queue(&self) -> bool {
+        self.capture.is_some()
+    }
+
+    pub(crate) fn current(&self) -> io::Result<bool> {
+        if self.poisoned {
+            return Ok(false);
+        }
+        let meta = fs::metadata("/proc/thread-self/ns/net")?;
+        if (meta.dev(), meta.ino()) != (self.journal.scope.dev, self.journal.scope.ino) {
+            return Ok(false);
+        }
+        let Some(raw) = journal_bytes(&self.journal_path)? else {
+            return Ok(false);
+        };
+        if parse_journal(&raw, &self.journal.scope)? != self.journal {
+            return Ok(false);
+        }
+        let net = Netlink::open()?;
+        // A missing/replaced journal invalidates the live capture lease,
+        // even if the kernel still has the expected generation and table.
+        Ok(net.generation()? == self.journal.installed
+            && net.table(&self.journal)?
+            && net.generation()? == self.journal.installed
+            && journal_bytes(&self.journal_path)?.as_deref() == Some(raw.as_slice()))
+    }
+
+    pub(crate) fn owns_packet(&self, packet: &super::nfqueue::Packet<'_>) -> io::Result<bool> {
+        if self.journal.redirect.is_some() || packet.queue_identity() != self.queue_identity {
+            return Ok(false);
+        }
+        self.current()
+    }
+
+    /// Corroborate an actual packet received on the dedicated socket
+    /// queue. The kernel rule selected socket mark AND full tuple before
+    /// enqueueing; the private queue identity is not a user header.
+    /// Caller must exclusively own the tagged socket and namespace; no
+    /// untrusted CAP_NET_RAW/CAP_NET_ADMIN or external nft modifications.
+    pub fn captured_socket(
+        &self,
+        packet: &super::nfqueue::Packet<'_>,
+    ) -> io::Result<CapturedSocket> {
+        let capture = self.capture.as_ref().ok_or_else(refused)?;
+        if packet.queue_identity() != capture.queue_identity
+            || !packet.local_output()
+            || !self.current()?
+        {
+            return Err(refused());
+        }
+        let mut key = packet.metadata().ok_or_else(refused)?.flow;
+        key.interface = 0;
+        capture.socket.verify()?;
+        if key != capture.socket.key() || !self.current()? {
+            return Err(refused());
+        }
+        Ok(CapturedSocket {
+            cookie: capture.socket.cookie(),
+            key,
+            queue_identity: capture.queue_identity,
+            rules_nonce: self.journal.nonce,
+            generation: self.journal.installed,
+        })
+    }
+
+    /// The actual private queue, not the tuple alone, establishes the
+    /// provenance. Deny a reserved tuple arriving on the catch-all.
+    pub(crate) fn packet_evidence(
+        &self,
+        packet: &super::nfqueue::Packet<'_>,
+    ) -> io::Result<Option<CapturedSocket>> {
+        if self.journal.redirect.is_some() {
+            return Err(refused());
+        }
+        if packet.queue_identity() == self.queue_identity {
+            if !self.current()? {
+                return Err(refused());
+            }
+            if let (Some(tag), Some(meta)) = (&self.capture, packet.metadata()) {
+                let key = super::packet::FlowKey {
+                    interface: 0,
+                    ..meta.flow
+                };
+                if tag.socket.key() == key {
+                    return Err(refused());
+                }
+            }
+            return Ok(None);
+        }
+        self.captured_socket(packet).map(Some)
+    }
+
+    /// Install a non-bypass queue for a single already connected, owned
+    /// socket. Other packets enter the ordinary catch-all queue. This is
+    /// a laboratory attribution proof, not a carrier exemption. Dynamic
+    /// carrier transactions preserve the tagged rule and queue identity.
+    pub fn install_socket_capture(
+        queue: &Queue,
+        tagged: &Queue,
+        socket: LabCarrierSocket,
+        host_namespace: &File,
+        path: &Path,
+    ) -> io::Result<Self> {
+        let queue_number = tagged.number()?;
+        if queue.number()? == queue_number || tagged.identity() == queue.identity() {
+            return Err(refused());
+        }
+        socket.verify()?;
+        Self::install_inner(
+            Some(queue),
+            host_namespace,
+            path,
+            Vec::new(),
+            Some(SocketCapture {
+                socket,
+                queue_number,
+                queue_identity: tagged.identity(),
+            }),
+            None,
+            false,
+        )
+    }
+
+    /// Blocking operation; run on a dedicated namespace worker, not a Tokio
+    /// executor that can change namespaces between tasks. The provided
+    /// host_namespace handle must genuinely be the trusted host namespace.
+    /// The caller must own an isolated lab and a running NFQUEUE consumer.
+    /// All its output will be queued; this is NOT production activation.
+    pub fn install(queue: &Queue, host_namespace: &File, path: &Path) -> io::Result<Self> {
+        Self::install_with_carriers(queue, host_namespace, path, Vec::new())
+    }
+
+    /// The caller explicitly supplies already authenticated, connected
+    /// carrier sockets. Their exact kernel socket marks and four-tuples
+    /// are matched before the queue. No PID/UID/destination-wide bypass.
+    /// The isolated namespace must not contain untrusted CAP_NET_ADMIN/
+    /// CAP_NET_RAW holders capable of changing socket marks.
+    pub fn install_with_carriers(
+        queue: &Queue,
+        host_namespace: &File,
+        path: &Path,
+        carriers: Vec<LabCarrierSocket>,
+    ) -> io::Result<Self> {
+        Self::install_inner(
+            Some(queue),
+            host_namespace,
+            path,
+            carriers,
+            None,
+            None,
+            false,
+        )
+    }
+
+    /// Managed all-destination TCP/UDP redirect in a dedicated namespace.
+    /// The caller provisions and owns policy routes for REDIRECT_MARK;
+    /// this transaction changes only its journaled inet table.
+    pub fn install_redirect(host_namespace: &File, path: &Path, port: u16) -> io::Result<Self> {
+        let scope = RedirectScope {
+            port,
+            loopback: loopback_index()?,
+            policy_queue: None,
+        };
+        Scope::current(host_namespace)?;
+        if port == 0 || !redirect_routes_ready(scope)? {
+            return Err(refused());
+        }
+        Self::install_inner(
+            None,
+            host_namespace,
+            path,
+            Vec::new(),
+            None,
+            Some(scope),
+            false,
+        )
+    }
+
+    /// One policy queue decides the physical egress or transparent
+    /// termination before the first packet leaves the namespace.
+    pub(crate) fn install_unified(
+        queue: &Queue,
+        host: &File,
+        path: &Path,
+        port: u16,
+        host_mode: bool,
+    ) -> io::Result<Self> {
+        let scope = RedirectScope {
+            port,
+            loopback: loopback_index()?,
+            policy_queue: Some(queue.number()?),
+        };
+        Scope::current_mode(host, host_mode)?;
+        if host_mode {
+            host_path(path)?;
+        }
+        if port == 0 || !redirect_routes_ready(scope)? {
+            return Err(refused());
+        }
+        Self::install_inner(
+            Some(queue),
+            host,
+            path,
+            Vec::new(),
+            None,
+            Some(scope),
+            host_mode,
+        )
+    }
+
+    pub(crate) fn owns_policy_queue(&self, queue: &Queue) -> io::Result<bool> {
+        Ok(
+            self.journal.redirect.and_then(|scope| scope.policy_queue) == Some(queue.number()?)
+                && queue.identity() == self.queue_identity
+                && self.current()?,
+        )
+    }
+
+    pub(crate) fn owns_policy_packet(
+        &self,
+        packet: &super::nfqueue::Packet<'_>,
+    ) -> io::Result<bool> {
+        Ok(self
+            .journal
+            .redirect
+            .and_then(|scope| scope.policy_queue)
+            .is_some()
+            && packet.local_output()
+            && packet.queue_identity() == self.queue_identity
+            && self.current()?)
+    }
+
+    /// Check every retained descriptor against the published admissions,
+    /// not merely the existence of the nftables table. A changed socket
+    /// is terminal for this epoch; shutdown revokes all marks and rules.
+    pub(crate) fn live_admissions(&self) -> io::Result<bool> {
+        if self.carrier_retired
+            || !self.current()?
+            || self.admissions.len() != self._carriers.len() + self.dynamic.len()
+        {
+            return Ok(false);
+        }
+        for socket in self
+            ._carriers
+            .iter()
+            .chain(self.dynamic.values().map(Arc::as_ref))
+        {
+            if socket.verify().is_err()
+                || self.admissions.get(&socket.mark()) != Some(&socket.key())
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn redirect_ready(&self, port: u16) -> io::Result<bool> {
+        let Some(scope) = self.journal.redirect else {
+            return Ok(false);
+        };
+        Ok(scope.port == port && self.live_admissions()? && redirect_routes_ready(scope)?)
+    }
+
+    fn install_inner(
+        queue: Option<&Queue>,
+        host_namespace: &File,
+        path: &Path,
+        carriers: Vec<LabCarrierSocket>,
+        capture: Option<SocketCapture>,
+        redirect: Option<RedirectScope>,
+        host_mode: bool,
+    ) -> io::Result<Self> {
+        let lock = scope_lock()?;
+        let scope = Scope::current_mode(host_namespace, host_mode)?;
+        if host_mode {
+            host_path(path)?;
+        } else {
+            check_parent(path)?;
+        }
+        if carriers.len() > MAX_CARRIERS
+            || (capture.is_some() && (!carriers.is_empty() || redirect.is_some()))
+        {
+            return Err(refused());
+        }
+        let mut marks = std::collections::HashSet::new();
+        let mut cookies = std::collections::HashSet::new();
+        let mut keys = std::collections::HashSet::new();
+        if let Some(tag) = &capture {
+            tag.socket.verify()?;
+            marks.insert(tag.socket.mark());
+            cookies.insert(tag.socket.cookie());
+            keys.insert(tag.socket.key());
+        }
+        for socket in &carriers {
+            socket.verify()?;
+            if !marks.insert(socket.mark())
+                || !cookies.insert(socket.cookie())
+                || !keys.insert(socket.key())
+            {
+                return Err(refused());
+            }
+        }
+        let old = journal_bytes(path)?;
+        let previous = old
+            .as_deref()
+            .map(|bytes| parse_journal(bytes, &scope))
+            .transpose()?;
+        let net = Netlink::open()?;
+        let before = net.generation()?;
+        if let Some(previous) = previous.as_ref().filter(|j| !j.restored) {
+            // A new boot's guard has the exact unified layout and no
+            // carrier entries. Adopt it without removing the DROP chains.
+            if !host_mode
+                || !previous.boot_rearmed
+                || previous.redirect != redirect
+                || !carriers.is_empty()
+                || capture.is_some()
+                || queue.is_none()
+                || previous.installed != before
+                || !net.table(previous)?
+                || net.generation()? != before
+            {
+                return Err(refused());
+            }
+            let mut journal = previous.clone();
+            journal.boot_rearmed = false;
+            store(path, &journal, old.as_deref())?;
+            if net.generation()? != before || !net.table(&journal)? || net.generation()? != before {
+                return Err(refused());
+            }
+            return Ok(Self {
+                _lock: lock,
+                journal,
+                queue_identity: queue.ok_or_else(refused)?.identity(),
+                _carriers: Vec::new(),
+                capture: None,
+                journal_path: path.to_owned(),
+                admissions: Default::default(),
+                dynamic: Default::default(),
+                used_marks: marks,
+                used_cookies: cookies,
+                queue_number: queue.ok_or_else(refused)?.number()?,
+                poisoned: false,
+                carrier_retired: false,
+            });
+        }
+        // Never overwrite the only journal for a table that unexpectedly
+        // exists again, even if an earlier recovery was recorded as complete.
+        if let Some(previous) = &previous {
+            if net.table(previous)? {
+                return Err(refused());
+            }
+        }
+        let installed = before.checked_add(1).ok_or_else(refused)?;
+        let mut nonce = [0; 16];
+        SystemRandom::new()
+            .fill(&mut nonce)
+            .map_err(|_| refused())?;
+        let journal = Journal {
+            version: 1,
+            scope,
+            nonce,
+            before,
+            installed,
+            previous_present: false,
+            redirect,
+            boot_rearmed: false,
+            restored: false,
+        };
+        if net.table(&journal)? || net.generation()? != before {
+            return Err(refused());
+        }
+        let queue_number = queue.map(Queue::number).transpose()?.unwrap_or(0);
+        match redirect {
+            Some(scope) if scope.policy_queue == queue.map(Queue::number).transpose()? => {}
+            None if queue.is_some() => {}
+            _ => return Err(refused()),
+        }
+        let mut operations = match redirect {
+            Some(scope) => redirect_install(
+                &journal,
+                scope,
+                &carriers
+                    .iter()
+                    .map(|socket| (socket.mark(), socket.key()))
+                    .collect(),
+            ),
+            None => install_messages(&journal, queue_number, &carriers),
+        };
+        if let Some(tag) = &capture {
+            let mut last = operations.pop().ok_or_else(invalid)?;
+            operations.push(socket_capture_rule(
+                &journal,
+                tag.socket.key(),
+                tag.socket.mark(),
+                tag.queue_number,
+                operations.len() as u32 + 2,
+            ));
+            last[8..12].copy_from_slice(&(operations.len() as u32 + 2).to_ne_bytes());
+            operations.push(last);
+        }
+        let admissions = carriers
+            .iter()
+            .map(|socket| (socket.mark(), socket.key()))
+            .collect();
+        // Durable intent before changing any OS state, with create-only/CAS
+        // publication. All uncertain failures leave the journal intact.
+        store(path, &journal, old.as_deref())?;
+        net.batch(before, &operations)?;
+        if net.generation()? != installed || !net.table(&journal)? || net.generation()? != installed
+        {
+            return Err(refused());
+        }
+        Ok(Self {
+            _lock: lock,
+            journal,
+            queue_identity: queue.map(Queue::identity).unwrap_or([0; 16]),
+            _carriers: carriers,
+            capture,
+            journal_path: path.to_owned(),
+            admissions,
+            dynamic: Default::default(),
+            used_marks: marks,
+            used_cookies: cookies,
+            queue_number,
+            poisoned: false,
+            carrier_retired: false,
+        })
+    }
+    /// Replace only our output chain's rules in one generation-checked
+    /// transaction. The base chain (DROP policy) is never removed. All
+    /// exact active exemptions precede the same non-bypass queue rule.
+    fn replace_admissions(
+        &mut self,
+        next_admissions: std::collections::BTreeMap<u32, super::packet::FlowKey>,
+    ) -> io::Result<()> {
+        if next_admissions.len() > MAX_CARRIERS || !self.current()? {
+            return Err(refused());
+        }
+        let raw = journal_bytes(&self.journal_path)?.ok_or_else(refused)?;
+        if parse_journal(&raw, &self.journal.scope)? != self.journal {
+            return Err(refused());
+        }
+        let generation = self.journal.installed;
+        let mut next = self.journal.clone();
+        next.before = generation;
+        next.installed = generation.checked_add(1).ok_or_else(refused)?;
+        next.previous_present = true;
+        let mut operations = match next.redirect {
+            Some(scope) => redirect_replace(&next, scope, &next_admissions),
+            None => replace_messages(&next, self.queue_number, &next_admissions),
+        };
+        if let Some(tag) = &self.capture {
+            let mut last = operations.pop().ok_or_else(invalid)?;
+            operations.push(socket_capture_rule(
+                &next,
+                tag.socket.key(),
+                tag.socket.mark(),
+                tag.queue_number,
+                operations.len() as u32 + 2,
+            ));
+            last[8..12].copy_from_slice(&(operations.len() as u32 + 2).to_ne_bytes());
+            operations.push(last);
+        }
+        self.poisoned = true;
+        store(&self.journal_path, &next, Some(&raw))?;
+        let net = Netlink::open()?;
+        net.batch(generation, &operations)?;
+        if net.generation()? != next.installed
+            || !net.table(&next)?
+            || net.generation()? != next.installed
+        {
+            return Err(refused());
+        }
+        self.journal = next;
+        self.admissions = next_admissions;
+        self.poisoned = false;
+        Ok(())
+    }
+    fn admit(&mut self, socket: Arc<LabCarrierSocket>) -> io::Result<()> {
+        if self.carrier_retired
+            || self.poisoned
+            || self.admissions.len() >= MAX_CARRIERS
+            || self.used_marks.len() >= MAX_CARRIER_EPOCH
+            || reserved_mark(socket.mark())
+            || self.used_marks.contains(&socket.mark())
+            || self.used_cookies.contains(&socket.cookie())
+            || self.admissions.values().any(|key| *key == socket.key())
+            || self
+                .capture
+                .as_ref()
+                .is_some_and(|tag| tag.socket.key() == socket.key())
+        {
+            return Err(refused());
+        }
+        socket.verify()?;
+        let mark = socket.mark();
+        // Tombstones precede publication, including uncertain failure.
+        // Never allow an old rule to authorize a recycled random mark.
+        self.used_marks.insert(mark);
+        self.used_cookies.insert(socket.cookie());
+        let mut next = self.admissions.clone();
+        next.insert(mark, socket.key());
+        self.replace_admissions(next)?;
+        self.dynamic.insert(mark, socket);
+        Ok(())
+    }
+
+    /// Retire the entire carrier epoch while leaving the base DROP
+    /// chain and non-bypass NFQUEUE in place. Rule ownership and mark
+    /// reset failures are terminal; never restore or re-admit on error.
+    fn retire_carriers(&mut self) -> io::Result<()> {
+        self.carrier_retired = true;
+        let mut cleared = true;
+        for socket in self
+            ._carriers
+            .iter()
+            .chain(self.dynamic.values().map(Arc::as_ref))
+        {
+            if socket.clear_mark().is_err() {
+                cleared = false;
+            }
+        }
+        let removed = if self.admissions.is_empty() {
+            Ok(())
+        } else {
+            self.replace_admissions(Default::default())
+        };
+        if removed.is_ok() {
+            self.dynamic.clear();
+        }
+        if !cleared || removed.is_err() {
+            self.poisoned = true;
+            return Err(refused());
+        }
+        Ok(())
+    }
+
+    fn revoke(&mut self, mark: u32) -> io::Result<()> {
+        if self.carrier_retired && !self.admissions.contains_key(&mark) {
+            self.dynamic.remove(&mark);
+            return Ok(());
+        }
+        let mut next = self.admissions.clone();
+        if next.remove(&mark).is_none() {
+            return Err(refused());
+        }
+        // Any failed retirement must prevent later admissions. The socket
+        // lease clears its mark before this call, so a stale rule is not a
+        // license to send more traffic through the retired descriptor.
+        let result = self.replace_admissions(next);
+        if result.is_err() {
+            self.poisoned = true;
+        } else {
+            self.dynamic.remove(&mark);
+        }
+        result
+    }
+}
+
+impl Drop for LabRules {
+    fn drop(&mut self) {
+        // No implicit rule restoration. If the owner is dropped on a
+        // failed start or cancellation, disable retained descriptors
+        // before ownership is released. Explicit recovery owns deletion.
+        let _ = self.retire_carriers();
+    }
+}
+
+fn socket_capture_rule(
+    journal: &Journal,
+    key: super::packet::FlowKey,
+    mark: u32,
+    queue: u16,
+    sequence: u32,
+) -> Vec<u8> {
+    let mut expressions = socket_matches(key, mark);
+    let mut data = Vec::new();
+    attr(&mut data, 1, &queue.to_be_bytes());
+    attr(&mut data, 2, &1u16.to_be_bytes());
+    attr(&mut data, 3, &0u16.to_be_bytes()); // no bypass
+    expression(&mut expressions, "queue", &data);
+    let mut attrs = Vec::new();
+    name_attr(&mut attrs, 1, &journal.name());
+    name_attr(&mut attrs, 2, "output");
+    attr(&mut attrs, 4 | NESTED, &expressions);
+    nft_message(
+        NEW_RULE,
+        REQUEST | ACK | CREATE_EXCLUSIVE | APPEND,
+        sequence,
+        &attrs,
+    )
+}
+
+fn replace_messages(
+    journal: &Journal,
+    queue: u16,
+    admissions: &std::collections::BTreeMap<u32, super::packet::FlowKey>,
+) -> Vec<Vec<u8>> {
+    let name = journal.name();
+    let mut flush = Vec::new();
+    name_attr(&mut flush, 1, &name);
+    name_attr(&mut flush, 2, "output");
+    // DELRULE without HANDLE, scoped by TABLE and CHAIN, flushes only
+    // that chain. The transaction recreates every rule before publication.
+    let mut messages = vec![nft_message(DEL_RULE, REQUEST | ACK, 2, &flush)];
+    for (&mark, &key) in admissions {
+        let mut attrs = Vec::new();
+        name_attr(&mut attrs, 1, &name);
+        name_attr(&mut attrs, 2, "output");
+        attr(&mut attrs, 4 | NESTED, &carrier_expressions(key, mark));
+        messages.push(nft_message(
+            NEW_RULE,
+            REQUEST | ACK | CREATE_EXCLUSIVE | APPEND,
+            messages.len() as u32 + 2,
+            &attrs,
+        ));
+    }
+    let mut queue_rule = install_messages(journal, queue, &[])
+        .pop()
+        .expect("queue rule");
+    queue_rule[8..12].copy_from_slice(&(messages.len() as u32 + 2).to_ne_bytes());
+    messages.push(queue_rule);
+    messages
+}
+
+struct DynamicAdmission {
+    socket: Option<Arc<LabCarrierSocket>>,
+    rules: Arc<Mutex<LabRules>>,
+}
+impl Drop for DynamicAdmission {
+    fn drop(&mut self) {
+        if let Some(socket) = self.socket.take() {
+            let mark = socket.mark();
+            // The original socket may still exist in a caller. Reset the
+            // mark before freeing the kernel exemption and its slot.
+            if let Ok(mut rules) = self.rules.lock() {
+                let cleared = socket.clear_mark().is_ok();
+                let revoked = rules.revoke(mark).is_ok();
+                // Even if rule removal succeeds, do not issue new leases
+                // after an uncertain descriptor reset.
+                if !cleared || !revoked {
+                    rules.poisoned = true;
+                    rules.carrier_retired = true;
+                    let _ = rules.retire_carriers();
+                }
+            } else {
+                // A poisoned mutex must not prevent a mark reset.
+                let _ = socket.clear_mark();
+            }
+        }
+    }
+}
+
+/// One scope's registrar, used only by actual H2/H3 socket factories.
+pub(crate) struct LabRegistrar {
+    rules: Arc<Mutex<LabRules>>,
+    host: File,
+}
+impl LabRegistrar {
+    pub(crate) fn new(rules: Arc<Mutex<LabRules>>, host: File) -> Self {
+        Self { rules, host }
+    }
+    fn admit(&self, socket: LabCarrierSocket) -> io::Result<super::carrier_socket::Lease> {
+        let socket = Arc::new(socket);
+        self.rules
+            .lock()
+            .map_err(|_| refused())?
+            .admit(socket.clone())?;
+        // Reset socket mark before releasing the rules ownership lock.
+        Ok(super::carrier_socket::Lease::retain(DynamicAdmission {
+            socket: Some(socket),
+            rules: self.rules.clone(),
+        }))
+    }
+}
+impl super::carrier_socket::Registrar for LabRegistrar {
+    fn tcp(
+        &self,
+        socket: &tokio::net::TcpSocket,
+        peer: std::net::SocketAddr,
+    ) -> io::Result<super::carrier_socket::Lease> {
+        let host_mode = self
+            .rules
+            .lock()
+            .map_err(|_| refused())?
+            .journal
+            .scope
+            .machine
+            .is_some();
+        self.admit(LabCarrierSocket::pending_tcp(
+            socket, peer, &self.host, host_mode,
+        )?)
+    }
+    fn udp(
+        &self,
+        socket: &tokio::net::UdpSocket,
+        peer: std::net::SocketAddr,
+    ) -> io::Result<super::carrier_socket::Lease> {
+        let host_mode = self
+            .rules
+            .lock()
+            .map_err(|_| refused())?
+            .journal
+            .scope
+            .machine
+            .is_some();
+        self.admit(LabCarrierSocket::pending_udp(
+            socket, peer, &self.host, host_mode,
+        )?)
+    }
+    fn udp_reply(
+        &self,
+        socket: &tokio::net::UdpSocket,
+        peer: std::net::SocketAddr,
+    ) -> io::Result<super::carrier_socket::Lease> {
+        {
+            let rules = self.rules.lock().map_err(|_| refused())?;
+            if rules.journal.redirect.is_some() {
+                // In the managed redirect backend, a reverse socket
+                // belongs only to the local path. Never grant a physical
+                // carrier exception to its nonlocal source address.
+                if rules.carrier_retired
+                    || !rules.current()?
+                    || socket.peer_addr()? != peer
+                    || !super::linux_ingress::is_local_ip(peer.ip())?
+                {
+                    return Err(refused());
+                }
+                return Ok(Default::default());
+            }
+        }
+        self.udp(socket, peer)
+    }
+    fn retire(&self) -> io::Result<()> {
+        self.rules.lock().map_err(|_| refused())?.retire_carriers()
+    }
+}
+
+/// Reconcile an old-boot laboratory journal without modifying any kernel
+/// rule. The original boot is gone, so its namespace/generation cannot be
+/// used as deletion authority. Require stable absence of the old table in
+/// the current isolated scope, then CAS a restored journal into this scope.
+/// A recreated or foreign table is refused, never deleted. This is explicit
+/// operator recovery, not an automatic production startup or kill switch.
+pub fn reconcile_after_reboot(host_namespace: &File, path: &Path) -> io::Result<()> {
+    let _lock = scope_lock()?;
+    let scope = Scope::current(host_namespace)?;
+    check_parent(path)?;
+    let raw = journal_bytes(path)?.ok_or_else(refused)?;
+    let mut journal: Journal =
+        toml::from_str(std::str::from_utf8(&raw).map_err(|_| invalid())?).map_err(|_| invalid())?;
+    journal.validate(&journal.scope)?;
+    if journal.scope.machine.is_some()
+        || !valid_boot_id(&journal.scope.boot)
+        || journal.scope.boot == scope.boot
+    {
+        return Err(refused());
+    }
+    let net = Netlink::open()?;
+    let generation = net.generation()?;
+    if net.table(&journal)? || net.generation()? != generation {
+        return Err(refused());
+    }
+    // Never call net.batch on an old-boot journal. Reconciliation is only
+    // evidence of absence; installation remains a separate fresh intent.
+    journal.scope = scope;
+    journal.restored = true; // old-boot absence reconciliation
+    store(path, &journal, Some(&raw))?;
+    if net.generation()? != generation || net.table(&journal)? {
+        return Err(refused());
+    }
+    Ok(())
+}
+
+/// Explicit recovery, after the previous LabRules lease is dropped. A
+/// foreign change anywhere in this namespace makes deletion fail closed.
+/// No forced flush, no whole-ruleset restoration, no table-name guessing.
+pub fn recover(host_namespace: &File, path: &Path) -> io::Result<()> {
+    recover_mode(host_namespace, path, false)
+}
+pub fn recover_host_guard(host_namespace: &File) -> io::Result<()> {
+    recover_mode(host_namespace, Path::new(HOST_GUARD_JOURNAL), true)
+}
+pub(crate) fn recover_mode(host_namespace: &File, path: &Path, host_mode: bool) -> io::Result<()> {
+    let _lock = scope_lock()?;
+    let scope = Scope::current_mode(host_namespace, host_mode)?;
+    if host_mode {
+        host_path(path)?;
+    } else {
+        check_parent(path)?;
+    }
+    let Some(raw) = journal_bytes(path)? else {
+        return policy_routes::recover_if_present(host_namespace, path, host_mode);
+    };
+    let mut journal = parse_journal(&raw, &scope)?;
+    let net = Netlink::open()?;
+    let generation = net.generation()?;
+    let present = net.table(&journal)?;
+    if net.generation()? != generation {
+        return Err(refused());
+    }
+    if journal.restored {
+        // Idempotence is evidence of absence, not permission to delete
+        // an object that appeared after the recorded restoration.
+        if present {
+            return Err(refused());
+        }
+        return policy_routes::recover_if_present(host_namespace, path, host_mode);
+    }
+    let expected = if present {
+        journal.recovery_generation(generation)?;
+        // Routes are restored before the owned firewall guard is removed.
+        policy_routes::recover_if_present(host_namespace, path, host_mode)?;
+        if net.generation()? != generation || !net.table(&journal)? {
+            return Err(refused());
+        }
+        let after = generation.checked_add(1).ok_or_else(refused)?;
+        crate::config::guarded_trust_assert(path, &raw).map_err(|_| refused())?;
+        let mut attrs = Vec::new();
+        name_attr(&mut attrs, 1, &journal.name());
+        net.batch(
+            generation,
+            &[nft_message(DEL_TABLE, REQUEST | ACK, 2, &attrs)],
+        )?;
+        after
+    } else {
+        policy_routes::recover_if_present(host_namespace, path, host_mode)?;
+        generation
+    };
+    // A stable absence observation is required even if a prior recovery
+    // died after deletion but before persisting the restored journal.
+    if net.generation()? != expected || net.table(&journal)? || net.generation()? != expected {
+        return Err(refused());
+    }
+    journal.restored = true;
+    journal.boot_rearmed = false;
+    store(path, &journal, Some(&raw))?;
+    Ok(())
+}
+
+/// Re-arm only a previously explicit host guard after a new boot. The
+/// queue is absent and every nonlocal IP packet is dropped. No carrier,
+/// DNS, rule deletion, user policy fetch or production readiness here.
+/// The unit is separately provisioned by a local administrator.
+pub fn rearm_host_guard(host_namespace: &File) -> io::Result<()> {
+    let path = Path::new(HOST_GUARD_JOURNAL);
+    let _lock = scope_lock()?;
+    let scope = Scope::current_mode(host_namespace, true)?;
+    host_path(path)?;
+    let raw = journal_bytes(path)?.ok_or_else(refused)?;
+    let old: Journal =
+        toml::from_str(std::str::from_utf8(&raw).map_err(|_| invalid())?).map_err(|_| invalid())?;
+    old.validate(&old.scope)?;
+    if old.scope.machine != scope.machine || !valid_boot_id(&old.scope.boot) {
+        return Err(refused());
+    }
+    let net = Netlink::open()?;
+    let generation = net.generation()?;
+    let present = net.table(&old)?;
+    if net.generation()? != generation {
+        return Err(refused());
+    }
+    if old.restored {
+        return if present { Err(refused()) } else { Ok(()) };
+    }
+    let (journal, intent) = if old.scope.boot == scope.boot {
+        if old.scope != scope {
+            return Err(refused());
+        }
+        if present && generation == old.installed {
+            return Ok(());
+        }
+        if present || !old.boot_rearmed || generation != old.before {
+            return Err(refused());
+        }
+        (old, raw) // retry an interrupted create-only boot intent
+    } else {
+        if present {
+            return Err(refused());
+        } // never delete old-boot objects
+        let mut redirect = old.redirect.ok_or_else(refused)?;
+        redirect.loopback = loopback_index()?;
+        let mut nonce = [0u8; 16];
+        SystemRandom::new()
+            .fill(&mut nonce)
+            .map_err(|_| refused())?;
+        let journal = Journal {
+            version: 1,
+            scope,
+            nonce,
+            before: generation,
+            installed: generation.checked_add(1).ok_or_else(refused)?,
+            previous_present: false,
+            redirect: Some(redirect),
+            boot_rearmed: true,
+            restored: false,
+        };
+        if net.table(&journal)? || net.generation()? != generation {
+            return Err(refused());
+        }
+        let intent = store(path, &journal, Some(&raw))?;
+        (journal, intent)
+    };
+    crate::config::guarded_trust_assert(path, &intent).map_err(|_| refused())?;
+    net.batch(
+        journal.before,
+        &redirect_install(
+            &journal,
+            journal.redirect.ok_or_else(refused)?,
+            &Default::default(),
+        ),
+    )?;
+    if net.generation()? != journal.installed
+        || !net.table(&journal)?
+        || net.generation()? != journal.installed
+    {
+        return Err(refused());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn journal() -> Journal {
+        Journal {
+            version: 1,
+            scope: Scope {
+                boot: "test".into(),
+                dev: 1,
+                ino: 2,
+                machine: None,
+            },
+            nonce: [7; 16],
+            before: 12,
+            installed: 13,
+            previous_present: false,
+            redirect: None,
+            boot_rearmed: false,
+            restored: false,
+        }
+    }
+    #[test]
+    fn journal_refuses_unsafe_paths_and_cas_overwrites() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let mut random = [0; 16];
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut random).unwrap();
+        let name: String = random.iter().map(|n| format!("{n:02x}")).collect();
+        let dir = std::env::temp_dir().join(format!("theia-nft-journal-{name}"));
+        fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        let path = dir.join("journal.toml");
+        assert!(check_parent(&path).is_ok());
+        assert!(host_path(&path).is_err());
+        assert!(check_parent(Path::new("relative.toml")).is_err());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(check_parent(&path).is_err());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(journal_bytes(&path).unwrap().is_none());
+        let mut j = journal();
+        let old = store(&path, &j, None).unwrap();
+        assert_eq!(parse_journal(&old, &j.scope).unwrap(), j);
+        j.restored = true;
+        assert!(store(&path, &j, None).is_err());
+        let next = store(&path, &j, Some(&old)).unwrap();
+        assert!(store(&path, &j, Some(&old)).is_err());
+        let hard = dir.join("hard");
+        fs::hard_link(&path, &hard).unwrap();
+        assert!(journal_bytes(&path).is_err());
+        fs::remove_file(hard).unwrap();
+        assert_eq!(journal_bytes(&path).unwrap(), Some(next));
+        let alias = dir.join("alias");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        assert!(journal_bytes(&alias).is_err());
+        assert!(Scope::current(&File::open(&path).unwrap()).is_err());
+        assert!(Scope::current(&File::open("/proc/thread-self/ns/net").unwrap()).is_err());
+        assert!(Scope::current(&File::open("/proc/thread-self/ns/mnt").unwrap()).is_err());
+    }
+
+
+    #[test]
+    fn nft_generation_table_and_batch_receipts_are_strict_and_bound_to_owner() {
+        fn frame(kind: u16, sequence: u32, body: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&((16 + body.len()) as u32).to_ne_bytes());
+            out.extend_from_slice(&kind.to_ne_bytes());
+            out.extend_from_slice(&0u16.to_ne_bytes());
+            out.extend_from_slice(&sequence.to_ne_bytes());
+            out.extend_from_slice(&0u32.to_ne_bytes());
+            out.extend_from_slice(body);
+            out.resize(align4(out.len()), 0);
+            out
+        }
+        let mut attributes = Vec::new();
+        attr(&mut attributes, 1, &13u32.to_be_bytes());
+        let valid = nft_message(NEW_GEN, 0, 1, &attributes);
+        assert_eq!(decode_generation(&valid).unwrap(), 13);
+        assert!(decode_generation(&nft_message(NEW_GEN, 0, 2, &attributes)).is_err());
+        assert!(decode_generation(&nft_message(NEW_TABLE, 0, 1, &attributes)).is_err());
+        assert!(decode_generation(&nft_message(NEW_GEN, 0, 1, &[])).is_err());
+        let mut bad = valid.clone();
+        bad[17] = 1;
+        assert!(decode_generation(&bad).is_err());
+        attr(&mut attributes, 1, &14u32.to_be_bytes());
+        assert!(decode_generation(&nft_message(NEW_GEN, 0, 1, &attributes)).is_err());
+        for value in [vec![0; 4], vec![1; 3], vec![1; 5]] {
+            let mut attrs = Vec::new();
+            attr(&mut attrs, 1, &value);
+            assert!(decode_generation(&nft_message(NEW_GEN, 0, 1, &attrs)).is_err());
+        }
+        let mut ack = [0; 20];
+        ack[..4].copy_from_slice(&(-libc::EPERM).to_ne_bytes());
+        assert_eq!(decode_generation(&frame(2, 1, &ack)).unwrap_err().raw_os_error(), Some(libc::EPERM));
+
+        let mut owner = journal();
+        for redirect in [false, true] {
+            owner.redirect = redirect.then_some(RedirectScope { port: 1080, loopback: 1, policy_queue: None });
+            let expected_count = if redirect { 5u32 } else { 1 };
+            let make = |name: &str, nonce: &[u8], use_count: u32| {
+                let mut attrs = Vec::new();
+                name_attr(&mut attrs, 1, name);
+                attr(&mut attrs, 6, nonce);
+                attr(&mut attrs, 3, &use_count.to_be_bytes());
+                nft_message(NEW_TABLE, 0, 1, &attrs)
+            };
+            assert!(decode_table(&make(&owner.name(), &owner.nonce, expected_count), &owner).unwrap());
+            assert!(decode_table(&make("foreign", &owner.nonce, expected_count), &owner).is_err());
+            assert!(decode_table(&make(&owner.name(), &[9; 16], expected_count), &owner).is_err());
+            assert!(decode_table(&make(&owner.name(), &owner.nonce, expected_count+1), &owner).is_err());
+            let mut duplicate = Vec::new();
+            name_attr(&mut duplicate, 1, &owner.name());
+            name_attr(&mut duplicate, 1, &owner.name());
+            assert!(decode_table(&nft_message(NEW_TABLE, 0, 1, &duplicate), &owner).is_err());
+        }
+        ack[..4].copy_from_slice(&(-libc::ENOENT).to_ne_bytes());
+        assert!(!decode_table(&frame(2, 1, &ack), &owner).unwrap());
+        ack[..4].copy_from_slice(&(-libc::EPERM).to_ne_bytes());
+        assert_eq!(decode_table(&frame(2, 1, &ack), &owner).unwrap_err().raw_os_error(), Some(libc::EPERM));
+
+        let a = frame(2, 2, &[0; 20]);
+        let b = frame(2, 3, &[0; 20]);
+        let mut seen = [false; 2];
+        let mut received = 0;
+        decode_batch_ack(&b, &mut seen, &mut received).unwrap();
+        assert_eq!(seen, [false, true]);
+        assert_eq!(received, 1);
+        decode_batch_ack(&a, &mut seen, &mut received).unwrap();
+        assert_eq!(seen, [true, true]);
+        assert_eq!(received, 2);
+        assert!(decode_batch_ack(&a, &mut seen, &mut received).is_err());
+        for bad in [
+            a[..15].to_vec(), a[..a.len()-1].to_vec(),
+            frame(3, 2, &[0; 20]), frame(2, 1, &[0; 20]),
+            frame(2, 4, &[0; 20]), frame(2, 2, &[0; 19]),
+            frame(2, 2, &ack), [a.as_slice(), a.as_slice()].concat(),
+        ] {
+            assert!(decode_batch_ack(&bad, &mut [false; 2], &mut 0).is_err());
+        }
+    }
+
+    #[test]
+    fn netlink_ack_parser_and_journal_host_invariants_fail_closed() {
+        assert!(ack_error(&[0; 19]).is_err());
+        let mut ack = [0; 20];
+        assert!(ack_error(&ack).unwrap().is_none());
+        ack[..4].copy_from_slice(&(-libc::EPERM).to_ne_bytes());
+        assert_eq!(
+            ack_error(&ack).unwrap().unwrap().raw_os_error(),
+            Some(libc::EPERM)
+        );
+        for code in [1, i32::MIN] {
+            ack[..4].copy_from_slice(&code.to_ne_bytes());
+            assert!(ack_error(&ack).is_err());
+        }
+        let mut j = journal();
+        for variant in 0..5 {
+            let mut invalid = j.clone();
+            match variant {
+                0 => invalid.version = 2,
+                1 => invalid.nonce = [0; 16],
+                2 => invalid.before = 0,
+                3 => invalid.before = u32::MAX,
+                _ => {
+                    invalid.redirect = Some(RedirectScope {
+                        port: 0,
+                        loopback: 1,
+                        policy_queue: None,
+                    })
+                }
+            }
+            assert!(invalid.validate(&j.scope).is_err());
+        }
+        j.scope.machine = Some("a".repeat(32));
+        assert!(j.validate(&j.scope).is_err());
+        j.redirect = Some(RedirectScope {
+            port: 1080,
+            loopback: 1,
+            policy_queue: Some(12),
+        });
+        j.boot_rearmed = true;
+        assert!(j.validate(&j.scope).is_ok());
+        j.previous_present = true;
+        assert!(j.validate(&j.scope).is_err());
+        j.previous_present = false;
+        j.restored = true;
+        assert!(j.validate(&j.scope).is_err());
+    }
+
+    #[test]
+    fn exact_generation_and_scope_required() {
+        let j = journal();
+        assert!(j.validate(&j.scope).is_ok());
+        let mut changed = j.clone();
+        changed.installed += 1;
+        assert!(changed.validate(&j.scope).is_err());
+        let mut changed = j.scope.clone();
+        changed.ino += 1;
+        assert!(j.validate(&changed).is_err());
+        assert_eq!(
+            parse_journal(toml::to_string(&j).unwrap().as_bytes(), &j.scope).unwrap(),
+            j
+        );
+    }
+    #[test]
+    fn recovery_distinguishes_initial_intent_update_intent_and_other_boot() {
+        let mut j = journal();
+        assert!(j.recovery_generation(12).is_err());
+        assert_eq!(j.recovery_generation(13).unwrap(), 13);
+        assert!(j.recovery_generation(14).is_err());
+        j.previous_present = true;
+        assert_eq!(j.recovery_generation(12).unwrap(), 12);
+        assert_eq!(j.recovery_generation(13).unwrap(), 13);
+        assert!(j.recovery_generation(11).is_err());
+        assert!(j.recovery_generation(14).is_err());
+        let mut reboot = j.scope.clone();
+        reboot.boot = "different-boot".into();
+        let data = toml::to_string(&j).unwrap();
+        assert!(parse_journal(data.as_bytes(), &reboot).is_err());
+        assert!(valid_boot_id("00000000-0000-0000-0000-000000000001"));
+        assert!(!valid_boot_id("000000000000-0000-0000-0000-00000000"));
+        assert!(!valid_boot_id("FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF"));
+        // Recovery for an older journal must not guess prior ownership.
+        let legacy = data.replace("previous_present = true\n", "");
+        let old = parse_journal(legacy.as_bytes(), &j.scope).unwrap();
+        assert!(old.recovery_generation(12).is_err());
+    }
+
+    /// The test harness calls this helper in a new process, inheriting its
+    /// parent's already isolated net namespace. The marker is written only
+    /// AFTER the kernel transaction has been confirmed. No Drop runs on kill.
+    #[test]
+    #[ignore = "child of the explicit isolated crash-recovery test only"]
+    fn kernel_crash_owner_child() {
+        let Ok(parent) = std::env::var("THEIA_NFT_CRASH_TEST_PARENT") else {
+            return;
+        };
+        let pid: u32 = parent.parse().expect("parent PID");
+        assert!(pid > 1);
+        let path = std::path::PathBuf::from(
+            std::env::var_os("THEIA_NFT_CRASH_TEST_JOURNAL").expect("journal"),
+        );
+        let host = File::open(format!("/proc/{pid}/ns/net")).unwrap();
+        let queue = Queue::bind(49000, 64).unwrap();
+        let lease = LabRules::install(&queue, &host, &path).unwrap();
+        assert!(lease.owns_queue(&queue).unwrap());
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path.with_extension("ready"))
+            .unwrap();
+        // Keep both leases alive indefinitely. The parent owns a bounded
+        // deadline and kills/reaps the child, including on panic.
+        loop {
+            std::thread::park_timeout(std::time::Duration::from_secs(1));
+            std::hint::black_box((&lease, &queue));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires Linux CAP_SYS_ADMIN, CAP_NET_ADMIN, iproute2 and isolated namespace"]
+    fn kernel_hard_kill_keeps_capture_fail_closed_until_explicit_recovery() {
+        std::thread::spawn(|| {
+            use std::{
+                os::unix::fs::DirBuilderExt,
+                process::{Child, Command, Stdio},
+                time::{Duration, Instant},
+            };
+            struct Reap(Child);
+            impl Drop for Reap {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let host = File::open("/proc/thread-self/ns/net").unwrap();
+            assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) }, 0);
+            let scope = Scope::current(&host).unwrap();
+            assert!(Command::new("ip")
+                .args(["link", "set", "lo", "up"])
+                .status()
+                .unwrap()
+                .success());
+            let mut random = [0; 16];
+            SystemRandom::new().fill(&mut random).unwrap();
+            let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
+            let dir = std::env::temp_dir().join(format!("theia-nft-crash-{suffix}"));
+            fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+            let path = dir.join("journal.toml");
+            let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            receiver
+                .set_read_timeout(Some(Duration::from_millis(300)))
+                .unwrap();
+            let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let target = receiver.local_addr().unwrap();
+            let mut bytes = [0; 32];
+            sender.send_to(b"before", target).unwrap();
+            let (n, _) = receiver.recv_from(&mut bytes).unwrap();
+            assert_eq!(&bytes[..n], b"before");
+            let mut child = Reap(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--ignored",
+                        "--exact",
+                        "routing::linux_rules::tests::kernel_crash_owner_child",
+                        "--nocapture",
+                    ])
+                    .env(
+                        "THEIA_NFT_CRASH_TEST_PARENT",
+                        std::process::id().to_string(),
+                    )
+                    .env("THEIA_NFT_CRASH_TEST_JOURNAL", &path)
+                    .stdin(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !path.with_extension("ready").exists() {
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "capture owner exited before commit"
+                );
+                assert!(Instant::now() < deadline, "capture owner did not commit");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let j = parse_journal(&journal_bytes(&path).unwrap().unwrap(), &scope).unwrap();
+            assert!(Netlink::open().unwrap().table(&j).unwrap());
+            assert!(
+                recover(&host, &path).is_err(),
+                "live owner must prevent restore"
+            );
+            child.0.kill().unwrap();
+            let status = child.0.wait().unwrap();
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(libc::SIGKILL));
+            assert!(
+                Netlink::open().unwrap().table(&j).unwrap(),
+                "owned table disappeared on hard kill"
+            );
+            let _ = sender.send_to(b"must-not-pass", target);
+            let error = receiver.recv_from(&mut bytes).unwrap_err();
+            assert!(matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ));
+            recover(&host, &path).unwrap();
+            assert!(!Netlink::open().unwrap().table(&j).unwrap());
+            sender.send_to(b"restored", target).unwrap();
+            let (n, _) = receiver.recv_from(&mut bytes).unwrap();
+            assert_eq!(&bytes[..n], b"restored");
+            recover(&host, &path).unwrap();
+            fs::remove_dir_all(dir).unwrap();
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires Linux CAP_SYS_ADMIN and CAP_NET_ADMIN; isolated network namespace only"]
+    fn kernel_install_and_recovery_in_new_namespace() {
+        std::thread::spawn(|| {
+            use std::os::unix::fs::DirBuilderExt;
+            let host = File::open("/proc/thread-self/ns/net").unwrap();
+            assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) }, 0);
+            let mut random = [0; 16];
+            SystemRandom::new().fill(&mut random).unwrap();
+            let suffix: String = random.iter().map(|n| format!("{n:02x}")).collect();
+            let dir = std::env::temp_dir().join(format!("theia-nft-lab-{suffix}"));
+            fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+            let path = dir.join("journal.toml");
+            let queue = Queue::bind(49000, 64).unwrap();
+            // The four real transparent sockets must be provisioned before
+            // rule installation, and must not be bindable by another owner.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _entered = rt.enter();
+            let listeners =
+                super::super::linux_ingress::RedirectListeners::bind(&host, 49001).unwrap();
+            assert_eq!(listeners.port(), 49001);
+            assert!(super::super::linux_ingress::RedirectListeners::bind(&host, 49001).is_err());
+            let lease = LabRules::install(&queue, &host, &path).unwrap();
+            let scope = Scope::current(&host).unwrap();
+            let journal = parse_journal(&journal_bytes(&path).unwrap().unwrap(), &scope).unwrap();
+            assert!(Netlink::open().unwrap().table(&journal).unwrap());
+            assert!(recover(&host, &path).is_err()); // live owner
+            let raw = journal_bytes(&path).unwrap().unwrap();
+            let mut altered = journal.clone();
+            altered.restored = true;
+            let altered_bytes = store(&path, &altered, Some(&raw)).unwrap();
+            assert!(!lease.current().unwrap());
+            store(&path, &journal, Some(&altered_bytes)).unwrap();
+            assert!(lease.current().unwrap());
+            drop(lease);
+            recover(&host, &path).unwrap();
+            assert!(!Netlink::open().unwrap().table(&journal).unwrap());
+            recover(&host, &path).unwrap();
+
+            // Simulate an external privileged recreation under the same
+            // identity. A restored journal cannot authorize deletion or
+            // be replaced with a fresh journal while that object exists.
+            let restored = journal_bytes(&path).unwrap().unwrap();
+            let net = Netlink::open().unwrap();
+            net.batch(
+                net.generation().unwrap(),
+                &install_messages(&journal, 49000, &[]),
+            )
+            .unwrap();
+            assert!(net.table(&journal).unwrap());
+            assert!(recover(&host, &path).is_err());
+            assert!(LabRules::install(&queue, &host, &path).is_err());
+            assert_eq!(journal_bytes(&path).unwrap().unwrap(), restored);
+            assert!(net.table(&journal).unwrap());
+
+            // Reboot reconciliation is also forbidden while a same-name
+            // object exists. Emulate an old boot ID without rebooting CI.
+            let mut old_boot = journal.clone();
+            old_boot.scope.boot = "00000000-0000-0000-0000-000000000001".into();
+            let old_bytes = store(&path, &old_boot, Some(&restored)).unwrap();
+            assert!(reconcile_after_reboot(&host, &path).is_err());
+            assert_eq!(journal_bytes(&path).unwrap().unwrap(), old_bytes);
+            assert!(net.table(&journal).unwrap());
+
+            // Test-only cleanup inside the disposable namespace. Neither
+            // product recovery nor installation was allowed to remove it.
+            let mut attrs = Vec::new();
+            name_attr(&mut attrs, 1, &journal.name());
+            net.batch(
+                net.generation().unwrap(),
+                &[nft_message(DEL_TABLE, REQUEST | ACK, 2, &attrs)],
+            )
+            .unwrap();
+            assert!(recover(&host, &path).is_err());
+            let before = net.generation().unwrap();
+            reconcile_after_reboot(&host, &path).unwrap();
+            assert_eq!(net.generation().unwrap(), before);
+            assert!(!net.table(&journal).unwrap());
+            assert!(reconcile_after_reboot(&host, &path).is_err());
+            recover(&host, &path).unwrap();
+            let lease = LabRules::install(&queue, &host, &path).unwrap();
+            drop(lease);
+            recover(&host, &path).unwrap();
+            fs::remove_dir_all(dir).unwrap();
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires Linux CAP_SYS_ADMIN, CAP_NET_ADMIN, iproute2 and isolated namespace"]
+    fn kernel_socket_queue_proves_descriptor_not_just_destination() {
+        std::thread::spawn(|| {
+            use std::{os::unix::fs::DirBuilderExt, process::Command};
+            let host = File::open("/proc/thread-self/ns/net").unwrap();
+            assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) }, 0);
+            assert!(Command::new("ip")
+                .args(["link", "set", "lo", "up"])
+                .status()
+                .unwrap()
+                .success());
+            let mut random = [0; 16];
+            SystemRandom::new().fill(&mut random).unwrap();
+            let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
+            let dir = std::env::temp_dir().join(format!("theia-nft-cookie-{suffix}"));
+            fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+            let path = dir.join("journal.toml");
+            let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let other = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            for socket in [&sender, &other] {
+                socket.connect(receiver.local_addr().unwrap()).unwrap();
+            }
+            let cookie = super::super::linux_attribution::socket_cookie(&sender).unwrap();
+            let socket = LabCarrierSocket::udp(&sender, &host).unwrap();
+            let mut queue = Queue::bind(49000, 64).unwrap();
+            let mut tagged = Queue::bind(49001, 64).unwrap();
+            let mut lease =
+                LabRules::install_socket_capture(&queue, &tagged, socket, &host, &path).unwrap();
+            assert!(lease.owns_capture_queue(&tagged).unwrap());
+            assert!(!lease.owns_capture_queue(&queue).unwrap());
+            sender.send(b"owned").unwrap();
+            {
+                let packet = tagged.receive().unwrap();
+                let proof = lease.captured_socket(&packet).unwrap();
+                assert_eq!(proof.cookie(), cookie);
+                assert_eq!(proof.key().source, sender.local_addr().unwrap());
+                assert_eq!(proof.key().destination, receiver.local_addr().unwrap());
+                assert_eq!(lease.packet_evidence(&packet).unwrap(), Some(proof));
+                lease.replace_admissions(Default::default()).unwrap();
+                assert_ne!(lease.packet_evidence(&packet).unwrap(), Some(proof));
+                packet.finish(super::super::PacketAction::Drop).unwrap();
+            }
+            sender.send(b"still-tagged").unwrap();
+            {
+                let packet = tagged.receive().unwrap();
+                assert_eq!(
+                    lease.packet_evidence(&packet).unwrap().unwrap().cookie(),
+                    cookie
+                );
+                packet.finish(super::super::PacketAction::Drop).unwrap();
+            }
+            lease.capture.as_ref().unwrap().socket.clear_mark().unwrap();
+            sender.send(b"unmarked").unwrap();
+            {
+                let packet = queue.receive().unwrap();
+                assert!(lease.packet_evidence(&packet).is_err());
+                packet.finish(super::super::PacketAction::Drop).unwrap();
+            }
+            other.send(b"other").unwrap();
+            {
+                let packet = queue.receive().unwrap();
+                assert!(lease.captured_socket(&packet).is_err());
+                assert_eq!(lease.packet_evidence(&packet).unwrap(), None);
+                packet.finish(super::super::PacketAction::Drop).unwrap();
+            }
+            drop(lease);
+            recover(&host, &path).unwrap();
+            fs::remove_dir_all(dir).unwrap();
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires Linux CAP_SYS_ADMIN, CAP_NET_ADMIN, iproute2 and isolated namespace"]
+    fn kernel_dynamic_carrier_lease_revokes_exact_socket_and_recycles() {
+        std::thread::spawn(|| {
+            use super::super::carrier_socket::Registrar;
+            use std::{os::unix::fs::DirBuilderExt, process::Command, time::Duration};
+            let host = File::open("/proc/thread-self/ns/net").unwrap();
+            assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) }, 0);
+            assert!(Command::new("ip")
+                .args(["link", "set", "lo", "up"])
+                .status()
+                .unwrap()
+                .success());
+            let mut random = [0; 16];
+            SystemRandom::new().fill(&mut random).unwrap();
+            let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
+            let dir = std::env::temp_dir().join(format!("theia-nft-dynamic-{suffix}"));
+            fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+            let path = dir.join("journal.toml");
+            let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            receiver
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let peer = receiver.local_addr().unwrap();
+            let mut queue = Queue::bind(49000, 64).unwrap();
+            let rules = Arc::new(Mutex::new(LabRules::install(&queue, &host, &path).unwrap()));
+            let registrar = LabRegistrar::new(rules.clone(), host.try_clone().unwrap());
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                for _ in 0..MAX_CARRIERS + 1 {
+                    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                    let lease = registrar.udp(&socket, peer).unwrap();
+                    assert_eq!(rules.lock().unwrap().admissions.len(), 1);
+                    socket.connect(peer).await.unwrap();
+                    assert!(
+                        registrar.udp(&socket, peer).is_err(),
+                        "cannot claim an already marked socket"
+                    );
+                    socket.send(b"admitted").await.unwrap();
+                    let mut received = [0u8; 32];
+                    let (n, source) = receiver.recv_from(&mut received).unwrap();
+                    assert_eq!(&received[..n], b"admitted");
+                    assert_eq!(source, socket.local_addr().unwrap());
+                    drop(lease);
+                    assert!(rules.lock().unwrap().admissions.is_empty());
+                    assert!(rules.lock().unwrap().current().unwrap());
+                    // The same live descriptor cannot receive a new lease
+                    // in the same epoch even after its original rule is gone.
+                    assert!(registrar.udp(&socket, peer).is_err());
+                    socket.send(b"revoked").await.unwrap();
+                    let packet = queue.receive().unwrap();
+                    assert!(rules.lock().unwrap().owns_packet(&packet).unwrap());
+                    assert_eq!(packet.metadata().unwrap().flow.source, source);
+                    assert_eq!(
+                        packet.finish(super::super::PacketAction::Drop).unwrap(),
+                        super::super::PacketAction::Drop
+                    );
+                }
+                // Owner retirement is stronger than dropping one lease:
+                // hold both the original socket and lease alive.
+                let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let held = registrar.udp(&socket, peer).unwrap();
+                socket.connect(peer).await.unwrap();
+                registrar.retire().unwrap();
+                assert!(rules.lock().unwrap().admissions.is_empty());
+                assert!(rules.lock().unwrap().current().unwrap());
+                assert!(registrar.udp(&socket, peer).is_err());
+                socket.send(b"retired").await.unwrap();
+                let packet = queue.receive().unwrap();
+                assert_eq!(
+                    packet.metadata().unwrap().flow.source,
+                    socket.local_addr().unwrap()
+                );
+                packet.finish(super::super::PacketAction::Drop).unwrap();
+                drop(held);
+                assert!(rules.lock().unwrap().current().unwrap());
+            });
+            assert!(
+                recover(&host, &path).is_err(),
+                "live owner excludes recovery"
+            );
+            drop(registrar);
+            drop(rules);
+            recover(&host, &path).unwrap();
+            assert!(
+                parse_journal(
+                    &journal_bytes(&path).unwrap().unwrap(),
+                    &Scope::current(&host).unwrap()
+                )
+                .unwrap()
+                .restored
+            );
+            fs::remove_dir_all(dir).unwrap();
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn redirect_transaction_keeps_all_three_egress_gates_bounded() {
+        let mut j = journal();
+        let scope = RedirectScope {
+            port: 49001,
+            loopback: 1,
+            policy_queue: Some(49000),
+        };
+        j.redirect = Some(scope);
+        let mut admissions = std::collections::BTreeMap::new();
+        for n in 0..MAX_CARRIERS {
+            admissions.insert(
+                100 + n as u32,
+                super::super::packet::FlowKey {
+                    source: std::net::SocketAddr::from(([192, 0, 2, 1], 10000 + n as u16)),
+                    destination: "198.51.100.2:443".parse().unwrap(),
+                    transport: super::super::packet::Transport::Udp,
+                    interface: 0,
+                },
+            );
+        }
+        let installed = redirect_install(&j, scope, &admissions);
+        let updated = redirect_replace(&j, scope, &admissions);
+        assert!(installed.len() <= MAX_RULE_OPERATIONS);
+        assert!(updated.len() <= MAX_RULE_OPERATIONS);
+        for operations in [&installed, &updated] {
+            for (index, msg) in operations.iter().enumerate() {
+                let (_, sequence, _) = checked_header(msg).unwrap();
+                assert_eq!(sequence, index as u32 + 2);
+            }
+        }
+        let empty = redirect_replace(&j, scope, &Default::default());
+        assert_eq!(updated.len() - empty.len(), 3 * MAX_CARRIERS);
+    }
+
+    #[test]
+    fn carrier_rule_uses_socket_mark_and_exact_four_tuple() {
+        let key = super::super::packet::FlowKey {
+            source: "192.0.2.1:1234".parse().unwrap(),
+            destination: "198.51.100.2:443".parse().unwrap(),
+            transport: super::super::packet::Transport::Tcp,
+            interface: 0,
+        };
+        let encoded = carrier_expressions(key, 0x1234abcd);
+        let mut rest = encoded.as_slice();
+        let mut names = Vec::new();
+        while let Some((_, mut expr)) = next_attr(&mut rest).unwrap() {
+            names.push(next_attr(&mut expr).unwrap().unwrap().1);
+        }
+        assert_eq!(
+            names,
+            [
+                b"socket\0".as_slice(),
+                b"cmp\0",
+                b"meta\0",
+                b"cmp\0",
+                b"meta\0",
+                b"cmp\0",
+                b"payload\0",
+                b"cmp\0",
+                b"payload\0",
+                b"cmp\0",
+                b"payload\0",
+                b"cmp\0",
+                b"immediate\0"
+            ]
+        );
+        assert!(encoded.windows(4).any(|w| w == 0x1234abcdu32.to_ne_bytes()));
+        assert!(encoded.windows(4).any(|w| w == [192, 0, 2, 1]));
+        assert!(encoded.windows(4).any(|w| w == [198, 51, 100, 2]));
+        assert!(encoded.windows(4).any(|w| w == [4, 210, 1, 187]));
+    }
+
+    #[test]
+    fn replacement_flushes_only_owned_chain_and_keeps_queue_last() {
+        let journal = journal();
+        let key = super::super::packet::FlowKey {
+            source: "192.0.2.1:1234".parse().unwrap(),
+            destination: "198.51.100.2:443".parse().unwrap(),
+            transport: super::super::packet::Transport::Tcp,
+            interface: 0,
+        };
+        let mut admissions = std::collections::BTreeMap::new();
+        for mark in 1..=MAX_CARRIERS as u32 {
+            admissions.insert(mark, key);
+        }
+        let full = replace_messages(&journal, 42, &admissions);
+        assert_eq!(full.len(), MAX_CARRIERS + 2);
+        let (kind, seq, body) = checked_header(&full[0]).unwrap();
+        assert_eq!((kind, seq), (DEL_RULE, 2));
+        let mut attrs = &body[4..];
+        let name = journal.name() + "\0";
+        assert_eq!(
+            next_attr(&mut attrs).unwrap().unwrap(),
+            (1, name.as_bytes())
+        );
+        assert_eq!(
+            next_attr(&mut attrs).unwrap().unwrap(),
+            (2, b"output\0".as_slice())
+        );
+        assert!(next_attr(&mut attrs).unwrap().is_none());
+        for _ in 0..64 {
+            admissions.remove(&1);
+            let reduced = replace_messages(&journal, 42, &admissions);
+            assert_eq!(reduced.len(), MAX_CARRIERS + 1);
+            admissions.insert(1, key);
+        }
+        let empty = replace_messages(&journal, 42, &Default::default());
+        assert_eq!(empty.len(), 2);
+        let (kind, seq, _) = checked_header(&empty[1]).unwrap();
+        assert_eq!((kind, seq), (NEW_RULE, 3));
+    }
+
+    #[test]
+    fn batch_objects_have_exclusive_creation_and_no_queue_bypass() {
+        let j = journal();
+        let messages = install_messages(&j, 42, &[]);
+        for (i, bytes) in messages.iter().enumerate() {
+            let (kind, seq, body) = checked_header(bytes).unwrap();
+            assert_eq!(kind, [NEW_TABLE, NEW_CHAIN, NEW_RULE][i]);
+            assert_eq!(seq, i as u32 + 2);
+            assert_eq!(body[0], FAMILY_INET);
+            assert_eq!(
+                u16::from_ne_bytes(bytes[6..8].try_into().unwrap()),
+                REQUEST | ACK | CREATE_EXCLUSIVE | if i == 2 { APPEND } else { 0 }
+            );
+        }
+        let (_, _, body) = checked_header(&messages[2]).unwrap();
+        let mut attrs = &body[4..];
+        assert_eq!(next_attr(&mut attrs).unwrap().unwrap().0, 1);
+        assert_eq!(next_attr(&mut attrs).unwrap().unwrap().0, 2);
+        let (_, mut expressions) = next_attr(&mut attrs).unwrap().unwrap();
+        let (_, mut expression) = next_attr(&mut expressions).unwrap().unwrap();
+        assert_eq!(next_attr(&mut expression).unwrap().unwrap().1, b"queue\0");
+        let (_, mut data) = next_attr(&mut expression).unwrap().unwrap();
+        assert_eq!(
+            next_attr(&mut data).unwrap().unwrap().1,
+            &42u16.to_be_bytes()
+        );
+        assert_eq!(
+            next_attr(&mut data).unwrap().unwrap().1,
+            &1u16.to_be_bytes()
+        );
+        assert_eq!(
+            next_attr(&mut data).unwrap().unwrap().1,
+            &0u16.to_be_bytes()
+        );
+    }
+}

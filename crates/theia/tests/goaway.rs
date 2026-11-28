@@ -1,6 +1,9 @@
 //! Independent loopback HTTP peers exercise real graceful GOAWAY frames,
 //! not a mocked pool predicate. The production client must preserve already
 //! admitted streams and obtain a fresh carrier for subsequent OPEN.
+#[path = "support/quinn_reference.rs"]
+mod quinn_reference;
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bytes::{Buf, Bytes};
 use http::{Request, Response};
@@ -281,7 +284,7 @@ async fn h3_peer(
         let requests = requests.clone();
         let mut command = drain.take();
         connections.spawn(async move {
-            let quic = theia::quic_transport::accept(incoming).await.unwrap();
+            let quic = quinn_reference::accept(incoming).await.unwrap();
             let mut connection = h3::server::Connection::new(h3_quinn::Connection::new(quic.clone())).await.unwrap();
             let mut handlers = JoinSet::new();
             let mut pending = HashMap::new();
@@ -323,6 +326,16 @@ async fn h3_peer(
                             }
                         }
                         Ok(None) => break,
+                        // The final client lease may send a graceful
+                        // H3_NO_ERROR before join_next observes a completed
+                        // echo handler. Only accept that exact wire close
+                        // after all expected admissions and GOAWAY; the
+                        // joins below must still prove every echo completed.
+                        Err(_) if accepted == expected && pending.is_empty()
+                            && command.is_none()
+                            && matches!(quic.close_reason(),
+                                Some(quinn::ConnectionError::ApplicationClosed(close))
+                                if close.error_code.into_inner() == 0x100) => break,
                         Err(error) => panic!("H3 fixture connection: {error}"),
                     }
                 }
@@ -459,7 +472,7 @@ async fn h3_scenario(split: bool) {
     let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let mut roots = RootCertStore::empty();
     roots.add(certificate.cert.der().clone()).unwrap();
-    let endpoint = theia::quic_transport::server_endpoint(
+    let endpoint = quinn_reference::server_endpoint(
         "127.0.0.1:0".parse().unwrap(),
         vec![certificate.cert.der().clone()],
         PrivatePkcs8KeyDer::from(certificate.key_pair.serialize_der()).into(),

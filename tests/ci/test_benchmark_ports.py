@@ -40,7 +40,7 @@ class BenchmarkPortsTests(unittest.TestCase):
             path = Path(directory)
             for carrier in ("h2", "h3"):
                 runner.config_files(path, path / "cert.pem", path / "key.pem",
-                                    31001, 31002, 31003, 31004, 31005, carrier, b"test")
+                                    31001, 31002, 31003, 31004, 31005, carrier, b"test", "0" * 40)
                 server = tomllib.loads((path / "server.toml").read_text(encoding="utf-8"))
                 client = tomllib.loads((path / "client.toml").read_text(encoding="utf-8"))
                 inbound = server["server"]["inbounds"][0]
@@ -48,6 +48,22 @@ class BenchmarkPortsTests(unittest.TestCase):
                 self.assertEqual(inbound["quic_listen"], "127.0.0.1:31002")
                 self.assertEqual(client["client"]["profiles"][0]["server"], "127.0.0.1:31003")
                 self.assertEqual(client["client"]["profiles"][0]["transport"], carrier)
+
+    def test_exact_legacy_reference_configurations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            for revision in ("abbb89834a406b4c53be0f1ac0b3ab1a65e66f8d",
+                             "917417b09f209334939c38551112081c480eb958", "0" * 40):
+                runner.config_files(path, path / "cert.pem", path / "key.pem",
+                                    31001, 31002, 31003, 31004, 31005, "h2", b"test", revision)
+                client = tomllib.loads((path / "client.toml").read_text(encoding="utf-8"))["client"]
+                self.assertEqual(client["proxy"]["http_listen"], "127.0.0.1:31004")
+                if revision == "0" * 40:
+                    self.assertEqual(client["ingress_mode"], "system_proxy")
+                    self.assertNotIn("system_proxy", client["proxy"])
+                else:
+                    self.assertNotIn("ingress_mode", client)
+                    self.assertEqual(client["proxy"]["system_proxy"], "off")
 
 
 if __name__ == "__main__":

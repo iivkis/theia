@@ -118,9 +118,9 @@ const CLIENT: &[Group] = &[
     Group {
         title: "Подключение",
         entries: &[
-            always("Состояние / подключить / отключить / Apply", key('V')),
+            always("Состояние / управление локальным прокси / Apply", key('V')),
             always("Монитор трафика этого процесса", Action::Traffic),
-            entry("Режим подключения (прокси / TUN)", key('P')),
+            entry("Системный перехват и режимы совместимости", key('P')),
         ],
     },
     Group {
@@ -158,6 +158,36 @@ const CLIENT: &[Group] = &[
     },
 ];
 
+const STARTUP_SERVER: &[Group] = &[
+    Group {
+        title: "Состояние сервера",
+        entries: &[
+            always(
+                "Запуск / остановка локального сервера",
+                Action::ServerProcess,
+            ),
+            always("Проверить сервер", key('v')),
+            always("Монитор трафика", Action::Traffic),
+            always("Проверить готовность к перезапуску", key('R')),
+        ],
+    },
+    Group {
+        title: "Дополнительно",
+        entries: &[
+            always("Сетевая диагностика", key('p')),
+            always("Комплект по готовому плану", key('w')),
+            always("Открыть конфигурацию", Action::Config),
+        ],
+    },
+];
+const STARTUP_CLIENT: &[Group] = &[Group {
+    title: "Дополнительно",
+    entries: &[
+        always("Монитор трафика", Action::Traffic),
+        always("Открыть сохранённые настройки", Action::Config),
+    ],
+}];
+
 pub(crate) struct Menu {
     role: Role,
     group: usize,
@@ -177,9 +207,11 @@ impl Menu {
     }
 
     fn groups(&self) -> &'static [Group] {
-        match self.role {
-            Role::Server => SERVER,
-            Role::Client => CLIENT,
+        match (self.role, self.configured) {
+            (Role::Server, true) => SERVER,
+            (Role::Client, true) => CLIENT,
+            (Role::Server, false) => STARTUP_SERVER,
+            (Role::Client, false) => STARTUP_CLIENT,
         }
     }
 
@@ -695,7 +727,7 @@ struct FirstInvite {
 enum FirstInviteAction {
     Stay,
     Back,
-    Save(crate::invite::Invitation, String, Option<String>),
+    Save(Box<crate::invite::Invitation>, String, Option<String>),
 }
 
 impl FirstInvite {
@@ -734,6 +766,14 @@ impl FirstInvite {
                     Some("Ключ слишком длинный. Вставьте его целиком или запросите новый.");
             }
         } else {
+            if self.focus == 0
+                && self
+                    .own
+                    .as_ref()
+                    .is_some_and(|invite| invite.trust_reference().is_some())
+            {
+                return;
+            }
             let field = if self.focus == 0 {
                 &mut self.ca
             } else {
@@ -767,12 +807,18 @@ impl FirstInvite {
             let mut fields = vec![Field {
                 id: 0,
                 label: "Доверенный сертификат (CA)",
-                value: if self.ca.is_empty() {
+                value: if invite.trust_reference().is_some() {
+                    "Закреплён в ключе".into()
+                } else if self.ca.is_empty() {
                     String::new()
                 } else {
                     "Файл выбран".into()
                 },
-                hint: "F6 — выбрать PEM-сертификат, полученный отдельно от администратора.",
+                hint: if invite.trust_reference().is_some() {
+                    "Получите ключ по доверенному каналу; отдельный CA не нужен."
+                } else {
+                    "F6 — выбрать PEM-сертификат, полученный отдельно от администратора."
+                },
             }];
             if !invite.has_token() {
                 fields.push(Field {
@@ -848,7 +894,7 @@ impl FirstInvite {
         }
         if self.review {
             if let Some(invite) = &self.own {
-                return format!("Тип: собственный TLS\nПрофиль: {}\nСервер: {}\nИмя TLS: {}\nДоверенный сертификат выбран и проверен локально.\n{credential}\n\nФайл настроек: {path}\nСоздаётся первый активный профиль. Соединение и системный прокси не запускаются.", invite.id, invite.endpoint, invite.server_name, credential = if invite.has_token() { "Личный ключ будет сохранён в защищённом хранилище." } else { "Будет использована указанная ссылка на отдельный ключ." });
+                return format!("Тип: собственный TLS\nПрофиль: {}\nСервер: {}\nИмя TLS: {}\nДоверие подтверждается по ключу или выбранному CA; соединение ещё не проверено.\n{credential}\n\nФайл настроек: {path}\nСоздаётся первый активный профиль. Соединение и системный прокси не запускаются.", invite.id, invite.endpoint, invite.server_name, credential = if invite.has_token() { "Личный ключ будет сохранён в защищённом хранилище." } else { "Будет использована указанная ссылка на отдельный ключ." });
             }
         }
         String::new()
@@ -887,7 +933,7 @@ impl FirstInvite {
                 KeyCode::Char('y') if key.modifiers.is_empty() => {
                     if let Some(invite) = self.own.take() {
                         return FirstInviteAction::Save(
-                            invite,
+                            Box::new(invite),
                             std::mem::take(&mut self.ca),
                             (!self.reference.is_empty())
                                 .then(|| std::mem::take(&mut self.reference)),
@@ -910,7 +956,13 @@ impl FirstInvite {
                     return FirstInviteAction::Back;
                 }
             }
-            KeyCode::F(6) if self.focus == 0 => {
+            KeyCode::F(6)
+                if self.focus == 0
+                    && !self
+                        .own
+                        .as_ref()
+                        .is_some_and(|invite| invite.trust_reference().is_some()) =>
+            {
                 self.browser = Some(FileBrowser::files(if self.own.is_some() {
                     self.ca.strip_prefix("file:").unwrap_or(&self.ca)
                 } else {
@@ -924,10 +976,15 @@ impl FirstInvite {
             }
             KeyCode::Enter => {
                 if let Some(invite) = &self.own {
-                    if !self.ca.is_empty() && !self.ca.starts_with("file:") {
+                    let embedded = invite.trust_reference();
+                    if let Some(anchor) = &embedded {
+                        self.ca = anchor.clone();
+                    } else if !self.ca.is_empty() && !self.ca.starts_with("file:") {
                         self.ca = format!("file:{}", self.ca);
                     }
-                    if crate::client_import::checked_ca_ref(Some(&self.ca)).is_err() {
+                    if embedded.is_none()
+                        && crate::client_import::checked_ca_ref(Some(&self.ca)).is_err()
+                    {
                         self.error = Some("Выберите доверенный PEM-сертификат через F6.");
                     } else if !invite.has_token()
                         && !crate::client_import::valid_explicit_reference(&self.reference)
@@ -993,6 +1050,9 @@ pub(crate) struct ConfigDialog {
     pub(crate) role: Role,
     input: String,
     choice: usize,
+    server_path_mode: Option<usize>,
+    server_path_focus: usize,
+    reopen_only: Option<std::path::PathBuf>,
     error: Option<&'static str>,
     loading: Option<std::sync::mpsc::Receiver<Result<crate::tui_editor::Editor, &'static str>>>,
     setup: Option<FirstSetup>,
@@ -1001,6 +1061,7 @@ pub(crate) struct ConfigDialog {
     first_invite: Option<FirstInvite>,
     imported: bool,
     import_after_load: bool,
+    direct_import: bool,
     creating: bool,
     browser: Option<FileBrowser>,
 }
@@ -1022,6 +1083,9 @@ impl ConfigDialog {
             role,
             input,
             choice: 0,
+            server_path_mode: None,
+            server_path_focus: 0,
+            reopen_only: None,
             error: None,
             loading: None,
             setup: None,
@@ -1030,10 +1094,48 @@ impl ConfigDialog {
             first_invite: None,
             imported: false,
             import_after_load: false,
+            direct_import: false,
             creating: false,
             browser: None,
         }
     }
+    pub(crate) fn reopen(role: Role, path: std::path::PathBuf) -> Self {
+        let mut dialog = Self::new(role, Some(&path));
+        dialog.reopen_only = Some(path);
+        dialog.start_reopen();
+        dialog
+    }
+
+    fn start_reopen(&mut self) {
+        let Some(path) = self.reopen_only.clone() else {
+            return;
+        };
+        let role = self.role;
+        let (tx, rx) = std::sync::mpsc::channel();
+        match std::thread::Builder::new()
+            .name("theia-reopen-config".into())
+            .spawn(move || {
+                let _ = tx.send(crate::tui_editor::Editor::load(role, &path));
+            }) {
+            Ok(_) => {
+                self.loading = Some(rx);
+                self.error = None;
+            }
+            Err(_) => self.error = Some("Не удалось начать чтение файла."),
+        }
+    }
+
+    pub(crate) fn is_server_path_form(&self) -> bool {
+        self.server_path_mode.is_some()
+            && self.browser.is_none()
+            && self.setup.is_none()
+            && self.reality.is_none()
+    }
+
+    pub(crate) fn recovery_path(&self) -> Option<&std::path::Path> {
+        self.reality.as_ref().and_then(|p| p.recovery_path())
+    }
+
     pub(crate) fn imported(&self) -> bool {
         self.imported
     }
@@ -1046,6 +1148,7 @@ impl ConfigDialog {
         if self.role != Role::Client {
             return;
         }
+        self.direct_import = true;
         if std::path::Path::new(&self.input).is_file() {
             self.choice = 0;
             self.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -1074,8 +1177,22 @@ impl ConfigDialog {
     pub(crate) fn prefer_mode(&mut self, choice: usize) {
         self.choice = choice.min(2);
     }
+    pub(crate) fn choose_server_path(&mut self, choice: usize) {
+        if self.role == Role::Server {
+            self.server_path_mode = Some(choice.min(2));
+            self.server_path_focus = 0;
+            self.choice = choice.min(2);
+        }
+    }
+    fn server_path_title(&self) -> &'static str {
+        match self.server_path_mode {
+            Some(1) => "Новый сервер · REALITY",
+            Some(2) => "Новый сервер · свой сертификат",
+            _ => "Открыть настройки сервера",
+        }
+    }
     pub(crate) fn paste(&mut self, text: &str) {
-        if self.browser.is_some() {
+        if self.reopen_only.is_some() || self.browser.is_some() {
             return;
         }
         if let Some(panel) = self.first_invite.as_mut() {
@@ -1133,11 +1250,22 @@ impl ConfigDialog {
         if self.loading.is_some() {
             return false;
         }
+        if self.reopen_only.is_some() {
+            return match key.code {
+                KeyCode::Enter => {
+                    self.start_reopen();
+                    false
+                }
+                KeyCode::Esc => true,
+                _ => false,
+            };
+        }
         if let Some(panel) = self.first_invite.as_mut() {
             match panel.key(key) {
                 FirstInviteAction::Stay => {}
                 FirstInviteAction::Back => {
                     self.first_invite = None;
+                    return self.direct_import;
                 }
                 FirstInviteAction::Save(invite, ca, reference) => {
                     let path = std::path::PathBuf::from(&self.input);
@@ -1232,7 +1360,9 @@ impl ConfigDialog {
                     self.input = path.to_owned();
                     self.error = None;
                     self.browser = None;
-                    if self.choice == 3 {
+                    if self.server_path_mode.is_some() {
+                        self.server_path_focus = 0;
+                    } else if self.choice == 3 {
                         self.choice = 0;
                     }
                 } else {
@@ -1245,22 +1375,43 @@ impl ConfigDialog {
             self.browser = Some(FileBrowser::new(&self.input));
             return false;
         }
-        let code = match key.code {
-            KeyCode::Up | KeyCode::BackTab => {
-                self.choice = (self.choice + 3) % 4;
-                return false;
+        // The welcome screen already chose the mode; this screen only chooses a path.
+        let code = if let Some(mode) = self.server_path_mode {
+            match key.code {
+                KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab => {
+                    self.server_path_focus = 1 - self.server_path_focus;
+                    return false;
+                }
+                KeyCode::Enter if self.server_path_focus == 1 => {
+                    self.browser = Some(FileBrowser::new(&self.input));
+                    return false;
+                }
+                KeyCode::Enter => match mode {
+                    1 => KeyCode::F(4),
+                    2 => KeyCode::F(2),
+                    _ => KeyCode::Enter,
+                },
+                KeyCode::F(2) | KeyCode::F(4) => return false,
+                code => code,
             }
-            KeyCode::Down | KeyCode::Tab => {
-                self.choice = (self.choice + 1) % 4;
-                return false;
+        } else {
+            match key.code {
+                KeyCode::Up | KeyCode::BackTab => {
+                    self.choice = (self.choice + 3) % 4;
+                    return false;
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    self.choice = (self.choice + 1) % 4;
+                    return false;
+                }
+                KeyCode::Enter if self.choice == 1 => KeyCode::F(4),
+                KeyCode::Enter if self.choice == 2 => KeyCode::F(2),
+                KeyCode::Enter if self.choice == 3 => {
+                    self.browser = Some(FileBrowser::new(&self.input));
+                    return false;
+                }
+                code => code,
             }
-            KeyCode::Enter if self.choice == 1 => KeyCode::F(4),
-            KeyCode::Enter if self.choice == 2 => KeyCode::F(2),
-            KeyCode::Enter if self.choice == 3 => {
-                self.browser = Some(FileBrowser::new(&self.input));
-                return false;
-            }
-            code => code,
         };
         match code {
             KeyCode::Esc => return true,
@@ -1346,6 +1497,7 @@ impl ConfigDialog {
             match result {
                 Ok((_, crate::client_import::ProductSource::OwnTls(invite))) => {
                     panel.source = Zeroizing::new(String::new());
+                    panel.ca = invite.trust_reference().unwrap_or_default();
                     panel.own = Some(invite);
                     panel.focus = 0;
                 }
@@ -1397,7 +1549,7 @@ impl ConfigDialog {
     }
     pub(crate) fn form(&self) -> Option<crate::tui_widgets::Form> {
         use crate::tui_widgets::{Field, Form};
-        if self.loading.is_some() {
+        if self.loading.is_some() || self.reopen_only.is_some() {
             return None;
         }
         if let Some(panel) = &self.first_invite {
@@ -1455,6 +1607,34 @@ impl ConfigDialog {
                 error: setup.error.unwrap_or_default().to_owned(),
             });
         }
+        if let Some(mode) = self.server_path_mode {
+            return Some(Form {
+                fields: vec![
+                    Field {
+                        id: 0,
+                        label: "Файл настроек (введите путь)",
+                        value: self.input.clone(),
+                        hint: if mode == 0 {
+                            "Введите путь к существующему TOML. Enter — открыть."
+                        } else {
+                            "Введите путь к новому TOML. Существующий файл не заменяется."
+                        },
+                    },
+                    Field {
+                        id: 1,
+                        label: "Выбрать файл или каталог",
+                        value: "Открыть файловый браузер".into(),
+                        hint: "Выбор пути ничего не записывает. Enter — открыть браузер.",
+                    },
+                ],
+                selected: self.server_path_focus,
+                lead: format!(
+                    "{} · ↑↓ выбрать · Enter продолжить · Ctrl+U очистить",
+                    self.server_path_title()
+                ),
+                error: self.error.unwrap_or_default().to_owned(),
+            });
+        }
         let reality = if self.role == Role::Server {
             "SmartTheia REALITY"
         } else {
@@ -1496,6 +1676,10 @@ impl ConfigDialog {
         } else if let Some(setup) = self.setup.as_mut() {
             if setup.review.is_none() && id < setup.fields.len() {
                 setup.focus = id;
+            }
+        } else if self.server_path_mode.is_some() {
+            if id < 2 {
+                self.server_path_focus = id;
             }
         } else if id < 4 {
             self.choice = id;
@@ -1541,11 +1725,17 @@ impl ConfigDialog {
             "Мастер REALITY"
         } else if self.setup.is_some() {
             "Мастер Own-TLS"
+        } else if self.server_path_mode.is_some() {
+            self.server_path_title()
         } else {
             "Открыть конфигурацию"
         }
     }
     pub(crate) fn body(&self) -> String {
+        if let Some(path) = &self.reopen_only {
+            return format!("Повторное открытие того же файла: {:?}\n{}\nЗапись, удаление файлов и изменение runtime не выполняются.\nEnter: повторить чтение · Esc: закрыть", path,
+                if self.loading.is_some() { "Проверка файла…" } else { self.error.unwrap_or("Файл не подтверждён") });
+        }
         if self.loading.is_some() {
             return if self.creating {
                 "Создаётся новый TOML без замены существующих файлов. Runtime не запускается."
@@ -1610,7 +1800,7 @@ struct FirstSetup {
 enum SetupAction {
     Continue,
     Back,
-    Create(Config),
+    Create(Box<Config>),
 }
 
 impl FirstSetup {
@@ -1700,6 +1890,7 @@ impl FirstSetup {
                             disabled: true,
                         }],
                         policy: config::ServerPolicy {
+                            routing: None,
                             allow_private_ips: false,
                             max_connections_per_user: 64,
                             max_connections_total: 1024,
@@ -1714,6 +1905,7 @@ impl FirstSetup {
                 ui,
                 client: config::ClientSettings {
                     active_profile: f(0),
+                    ingress_mode: config::IngressMode::SystemProxy,
                     profiles: vec![config::Profile {
                         id: f(0),
                         path_prefix: Some(f(5)),
@@ -1727,11 +1919,12 @@ impl FirstSetup {
                         transport: config::Transport::Auto,
                         quic_connect_timeout_ms: 1600,
                         quic_negative_cache_ttl_s: 900,
+                        direct_dpi: None,
+                        direct_dpi_stun: None,
                     }],
                     proxy: config::LocalProxy {
                         http_listen: "127.0.0.1:7890".into(),
                         socks5_listen: "127.0.0.1:7891".into(),
-                        system_proxy: config::SystemProxy::Off,
                     },
                 },
             }),
@@ -1749,7 +1942,7 @@ impl FirstSetup {
                 }
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     if let Some(candidate) = self.review.take() {
-                        return SetupAction::Create(candidate);
+                        return SetupAction::Create(Box::new(candidate));
                     }
                 }
                 _ => {}
@@ -1915,8 +2108,11 @@ mod tests {
         setup.key(press(KeyCode::Char('n')));
         assert!(setup.review.is_none());
         setup.key(press(KeyCode::Enter));
-        let SetupAction::Create(Config::Server(doc)) = setup.key(press(KeyCode::Char('Y'))) else {
+        let SetupAction::Create(config) = setup.key(press(KeyCode::Char('Y'))) else {
             panic!("expected reviewed server config");
+        };
+        let Config::Server(doc) = *config else {
+            panic!("expected server document");
         };
         assert!(doc.server.users[0].disabled);
         assert_eq!(doc.server.users[0].token_sha256.len(), 64);
@@ -1926,6 +2122,25 @@ mod tests {
             doc.server.inbounds[0].quic_listen
         );
         assert!(matches!(setup.key(press(KeyCode::Esc)), SetupAction::Back));
+    }
+
+    #[test]
+    fn direct_import_cancel_closes_shortcut_but_nested_import_returns_to_config() {
+        let root = std::env::temp_dir()
+            .join(crate::tui_editor::generated_id("direct-import-cancel").unwrap());
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("client.toml");
+        let mut direct = ConfigDialog::new(Role::Client, Some(&path));
+        direct.begin_client_import();
+        assert!(direct.first_invite.is_some());
+        assert!(direct.key(press(KeyCode::Esc)));
+        let mut nested = ConfigDialog::new(Role::Client, Some(&path));
+        nested.key(press(KeyCode::F(4)));
+        assert!(nested.first_invite.is_some());
+        assert!(!nested.key(press(KeyCode::Esc)));
+        assert!(nested.first_invite.is_none());
+        assert!(!path.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2111,7 +2326,15 @@ mod tests {
         for role in [Role::Server, Role::Client] {
             for configured in [false, true] {
                 let mut menu = Menu::new(role, configured);
-                assert_eq!(Menu::categories(role).len(), menu.groups().len());
+                if configured {
+                    assert_eq!(Menu::categories(role).len(), menu.groups().len());
+                } else {
+                    assert!(menu
+                        .groups()
+                        .iter()
+                        .flat_map(|group| group.entries)
+                        .all(|entry| !entry.requires_config));
+                }
                 let group_count = menu.groups().len();
                 for group in 0..group_count {
                     menu.click(area, 2, 1 + group as u16);
@@ -2162,16 +2385,12 @@ mod tests {
     fn unconfigured_actions_do_not_mutate_and_selection_is_visible() {
         let mut m = Menu::new(Role::Client, false);
         m.key(KeyCode::Enter);
-        assert_eq!(m.key(KeyCode::Enter), Some(key('V')));
-        m.key(KeyCode::Down);
         assert_eq!(m.key(KeyCode::Enter), Some(Action::Traffic));
-        m.key(KeyCode::End);
-        assert_eq!(m.key(KeyCode::Enter), None);
-        assert!(m.body(10).contains("Сначала откройте"));
-        assert!(m.body(6).contains("Режим подключения (прокси / TUN)"));
-        m.key(KeyCode::Esc);
-        m.key(KeyCode::End);
-        m.key(KeyCode::Enter);
+        assert!(m.body(10).contains("Монитор трафика"));
+        m.key(KeyCode::Down);
         assert_eq!(m.key(KeyCode::Enter), Some(Action::Config));
+        assert!(!m.body(10).contains("Импорт"));
+        m.key(KeyCode::Esc);
+        assert_eq!(m.key(KeyCode::Esc), Some(Action::Close));
     }
 }

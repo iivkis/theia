@@ -40,7 +40,7 @@ pub(crate) const CLIENT_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) const MAX_COMMAND_BYTES: usize = 256;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-pub(crate) const MAX_RESPONSE_BYTES: u64 = 256;
+pub(crate) const MAX_RESPONSE_BYTES: u64 = 1024;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) const MAX_CLIENTS: usize = 8;
 
@@ -79,6 +79,12 @@ impl std::error::Error for ManagementError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusCommand {
     ClientStatus,
+    ClientLifecycle,
+    ClientDisconnect {
+        expected_revision: u64,
+        config_sha256: [u8; 32],
+        instance: [u8; 32],
+    },
     ClientPreview {
         expected_revision: u64,
         candidate_sha256: [u8; 32],
@@ -109,6 +115,12 @@ pub enum StatusCommand {
     CheckRestartBound {
         expected_revision: u64,
         candidate_sha256: [u8; 32],
+    },
+    /// Read-only, exact saved-file bound observation for one inbound/user.
+    AccessStatus {
+        inbound: [u8; 64],
+        user: [u8; 64],
+        saved_sha256: [u8; 32],
     },
     RealityStatus {
         id: [u8; 64],
@@ -145,8 +157,27 @@ pub enum StatusCommand {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyLifecycle {
+    pub revision: u64,
+    pub config_sha256: [u8; 32],
+    pub instance: [u8; 32],
+    /// 0 inactive, 1 preparing, 2 connected, 3 stopping, 4 recovery required.
+    pub phase: u8,
+    /// Both listeners are bound and admission is open.
+    pub listeners_ready: bool,
+    /// 0 not applied, 1 verified applied, 2 unknown / conflict.
+    pub proxy_applied: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatusReply {
+    ClientLifecycle(ProxyLifecycle),
+    /// Acknowledges admission closure, NOT completed CAS restoration.
+    ClientDisconnectAccepted {
+        revision: u64,
+        instance: [u8; 32],
+    },
     ClientRunning {
         revision: u64,
         config_sha256: [u8; 32],
@@ -154,6 +185,12 @@ pub enum StatusReply {
         transport: u8,
         xhttp: u8,
         fallback: bool,
+        routing_revision: u64,
+        routing_state: u8,
+        routing_totals: Box<[u64; 38]>,
+        flow_counts: Option<[u16; 4]>,
+        /// 0 inactive, 1 preparing, 2 isolated lab capture, 3 recovery required.
+        capture_state: u8,
     },
     ClientReady {
         revision: u64,
@@ -168,6 +205,11 @@ pub enum StatusReply {
     RunningRevision {
         inbounds: usize,
         revision: u64,
+    },
+    AccessObserved {
+        revision: u64,
+        /// 0 missing inbound, 1 no grant/user, 2 disabled, 3 authorized for new sessions.
+        state: u8,
     },
     Unsupported,
     /// Candidate passes the deliberately narrow compatibility preflight.
@@ -647,6 +689,25 @@ where
                     "ERR unsupported\n".into()
                 }
             }
+            candidate if parse_access_status(candidate).is_some() => {
+                let (inbound, user, digest) = parse_access_status(candidate).expect("parsed");
+                if let (Some(preflight), Some(live)) = (&preflight, &live) {
+                    let preflight = preflight.clone();
+                    match tokio::task::spawn_blocking(move || preflight.matches_saved_bytes(digest))
+                        .await
+                    {
+                        Ok(true) => match live.access_observation(inbound, user) {
+                            Ok((revision, state)) => {
+                                format!("theia-access-v1 revision={revision} state={state}\n")
+                            }
+                            Err(_) => "ERR unsupported\n".into(),
+                        },
+                        _ => "ERR unsupported\n".into(),
+                    }
+                } else {
+                    "ERR unsupported\n".into()
+                }
+            }
             candidate if parse_reality_status(candidate).is_some() => {
                 let (id, manifest) = parse_reality_status(candidate).expect("parsed");
                 match runtime
@@ -959,6 +1020,27 @@ fn parse_restart_rollback(command: &[u8]) -> Option<u64> {
     )
 }
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+fn parse_access_status(command: &[u8]) -> Option<(&str, &str, [u8; 32])> {
+    let raw = std::str::from_utf8(command.strip_prefix(b"access-status inbound=")?).ok()?;
+    let (inbound, tail) = raw.split_once(" user=")?;
+    let (user, digest) = tail.split_once(" sha256=")?;
+    if !crate::config::valid_id(inbound) || !crate::config::valid_id(user) {
+        return None;
+    }
+    Some((inbound, user, decode_digest(digest)?))
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn access_id(bytes: &[u8; 64]) -> Option<&str> {
+    let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    if bytes[len..].iter().any(|&b| b != 0) {
+        return None;
+    }
+    let id = std::str::from_utf8(&bytes[..len]).ok()?;
+    crate::config::valid_id(id).then_some(id)
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn parse_reality_status(command: &[u8]) -> Option<(&str, [u8; 32])> {
     let raw = std::str::from_utf8(command.strip_prefix(b"reality-status id=")?).ok()?;
     let (id, digest) = raw.split_once(" manifest=")?;
@@ -992,6 +1074,23 @@ fn parse_bound_command(command: &[u8], prefix: &[u8]) -> Option<(u64, [u8; 32])>
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+fn encode_client_hex(value: [u8; 32]) -> String {
+    value.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(any(windows, all(test, target_os = "linux")))]
+fn parse_disconnect(command: &[u8]) -> Option<(u64, [u8; 32], [u8; 32])> {
+    let line = std::str::from_utf8(command.strip_prefix(b"client-disconnect rev=")?).ok()?;
+    let (revision, tail) = line.split_once(" sha256=")?;
+    let (digest, instance) = tail.split_once(" instance=")?;
+    Some((
+        positive_decimal(revision)?,
+        decode_digest(digest)?,
+        decode_digest(instance)?,
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) async fn handle_client<S>(
     mut stream: S,
     client: Arc<crate::local_proxy::ClientRuntime>,
@@ -1012,18 +1111,78 @@ where
         }
         command.push(byte[0]);
     }
+    #[cfg(windows)]
+    let mut disconnect_accepted = false;
     let response = if !newline {
         "ERR unsupported\n".into()
     } else if command == b"client-status" {
-        let (revision, digest, descriptor, transport, xhttp, fallback) = client.status().await;
+        let (
+            revision,
+            digest,
+            descriptor,
+            transport,
+            xhttp,
+            fallback,
+            (routing_revision, routing_state),
+            totals,
+            flow_counts,
+            capture_state,
+        ) = client.status().await;
+        let flows = flow_counts.map_or_else(
+            || "unknown".to_owned(),
+            |counts| counts.map(|n| n.to_string()).join(","),
+        );
+        let totals = totals
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         let hex = digest
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
         format!(
-            "theia-client-v1 r={revision} sha256={hex} d={descriptor} t={transport} x={xhttp} f={}\n",
+            "theia-client-v1 r={revision} sha256={hex} d={descriptor} t={transport} x={xhttp} f={} rr={routing_revision} rs={routing_state} rt={totals} fs={flows} cap={capture_state}\n",
             u8::from(fallback)
         )
+    } else if command == b"client-lifecycle" {
+        #[cfg(windows)]
+        {
+            match client.proxy_lifecycle() {
+                Some(view) => format!(
+                    "theia-client-v1 lifecycle r={} sha256={} instance={} phase={} listeners={} applied={}\n",
+                    view.revision, encode_client_hex(view.config_sha256), encode_client_hex(view.instance),
+                    view.phase, u8::from(view.listeners_ready), view.proxy_applied
+                ),
+                None => "ERR unsupported\n".into(),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            "ERR unsupported\n".into()
+        }
+    } else if command.starts_with(b"client-disconnect ") {
+        #[cfg(windows)]
+        {
+            match parse_disconnect(&command) {
+                Some((revision, digest, instance))
+                    if client
+                        .request_disconnect_bound(revision, digest, instance)
+                        .is_ok() =>
+                {
+                    disconnect_accepted = true;
+                    format!(
+                        "theia-client-v1 disconnect-accepted r={revision} instance={}\n",
+                        encode_client_hex(instance)
+                    )
+                }
+                _ => "theia-client-v1 rejected\n".into(),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            "ERR unsupported\n".into()
+        }
     } else {
         let candidate = parse_bound_command(&command, b"client-preview rev=")
             .map(|(r, d)| (r, d, false))
@@ -1041,11 +1200,19 @@ where
             None => "ERR unsupported\n".into(),
         }
     };
-    stream
-        .write_all(response.as_bytes())
-        .await
-        .map_err(|_| ManagementError::Io)?;
-    stream.shutdown().await.map_err(|_| ManagementError::Io)
+    let written = async {
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .map_err(|_| ManagementError::Io)?;
+        stream.shutdown().await.map_err(|_| ManagementError::Io)
+    }
+    .await;
+    #[cfg(windows)]
+    if disconnect_accepted {
+        client.mark_disconnect_reply_done();
+    }
+    written
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1058,6 +1225,22 @@ where
 {
     let request = match command {
         StatusCommand::ClientStatus => b"client-status\n".to_vec(),
+        StatusCommand::ClientLifecycle => b"client-lifecycle\n".to_vec(),
+        StatusCommand::ClientDisconnect {
+            expected_revision,
+            config_sha256,
+            instance,
+        } => {
+            if expected_revision == 0 {
+                return Err(ManagementError::InvalidReply);
+            }
+            format!(
+                "client-disconnect rev={expected_revision} sha256={} instance={}\n",
+                encode_client_hex(config_sha256),
+                encode_client_hex(instance)
+            )
+            .into_bytes()
+        }
         StatusCommand::ClientPreview {
             expected_revision,
             candidate_sha256,
@@ -1104,6 +1287,16 @@ where
                 return Err(ManagementError::InvalidReply);
             }
             format!("restart-rollback-apply rev={expected_revision}\n").into_bytes()
+        }
+        StatusCommand::AccessStatus {
+            inbound,
+            user,
+            saved_sha256,
+        } => {
+            let inbound = access_id(&inbound).ok_or(ManagementError::InvalidReply)?;
+            let user = access_id(&user).ok_or(ManagementError::InvalidReply)?;
+            let digest: String = saved_sha256.iter().map(|b| format!("{b:02x}")).collect();
+            format!("access-status inbound={inbound} user={user} sha256={digest}\n").into_bytes()
         }
         StatusCommand::RealityStatus { id, len, manifest } => {
             let raw = id
@@ -1202,6 +1395,8 @@ where
     if matches!(
         command,
         StatusCommand::ClientStatus
+            | StatusCommand::ClientLifecycle
+            | StatusCommand::ClientDisconnect { .. }
             | StatusCommand::ClientPreview { .. }
             | StatusCommand::ClientApply { .. }
     ) {
@@ -1217,6 +1412,58 @@ where
             .and_then(|s| s.strip_suffix('\n'))
             .ok_or(ManagementError::InvalidReply)?;
         let parsed = (|| match command {
+            StatusCommand::ClientLifecycle => {
+                let mut fields = line.strip_prefix("lifecycle r=")?.split(' ');
+                let revision = positive_decimal(fields.next()?)?;
+                let config_sha256 = decode_digest(fields.next()?.strip_prefix("sha256=")?)?;
+                let instance = decode_digest(fields.next()?.strip_prefix("instance=")?)?;
+                let phase = match fields.next()?.strip_prefix("phase=")? {
+                    "0" => 0,
+                    "1" => 1,
+                    "2" => 2,
+                    "3" => 3,
+                    "4" => 4,
+                    _ => return None,
+                };
+                let listeners_ready = match fields.next()?.strip_prefix("listeners=")? {
+                    "0" => false,
+                    "1" => true,
+                    _ => return None,
+                };
+                let proxy_applied = match fields.next()?.strip_prefix("applied=")? {
+                    "0" => 0,
+                    "1" => 1,
+                    "2" => 2,
+                    _ => return None,
+                };
+                if fields.next().is_some()
+                    || (phase == 2 && (!listeners_ready || proxy_applied != 1))
+                    || (phase != 2 && listeners_ready)
+                {
+                    return None;
+                }
+                Some(StatusReply::ClientLifecycle(ProxyLifecycle {
+                    revision,
+                    config_sha256,
+                    instance,
+                    phase,
+                    listeners_ready,
+                    proxy_applied,
+                }))
+            }
+            StatusCommand::ClientDisconnect {
+                expected_revision,
+                instance,
+                ..
+            } => {
+                let (revision, nonce) = line
+                    .strip_prefix("disconnect-accepted r=")?
+                    .split_once(" instance=")?;
+                let revision = positive_decimal(revision)?;
+                let nonce = decode_digest(nonce)?;
+                (revision == expected_revision && nonce == instance)
+                    .then_some(StatusReply::ClientDisconnectAccepted { revision, instance })
+            }
             StatusCommand::ClientStatus => {
                 let mut fields = line.split(' ');
                 let revision = positive_decimal(fields.next()?.strip_prefix("r=")?)?;
@@ -1240,7 +1487,57 @@ where
                     "1" => true,
                     _ => return None,
                 };
-                if fields.next().is_some() || ((transport == 0) != (xhttp == 0)) {
+                let unsigned = |raw: &str| {
+                    if raw == "0" {
+                        Some(0)
+                    } else {
+                        positive_decimal(raw)
+                    }
+                };
+                let routing_revision = unsigned(fields.next()?.strip_prefix("rr=")?)?;
+                let routing_state = match fields.next()?.strip_prefix("rs=")? {
+                    "0" => 0,
+                    "1" => 1,
+                    "2" => 2,
+                    "3" => 3,
+                    _ => return None,
+                };
+                if (routing_state == 1 || routing_state == 2) != (routing_revision != 0) {
+                    return None;
+                }
+                let mut counters = fields.next()?.strip_prefix("rt=")?.split(',');
+                let mut routing_totals = [0; 38];
+                for counter in &mut routing_totals {
+                    *counter = unsigned(counters.next()?)?;
+                }
+                let raw_flows = fields.next()?.strip_prefix("fs=")?;
+                let flow_counts = if raw_flows == "unknown" {
+                    None
+                } else {
+                    let mut parts = raw_flows.split(',');
+                    let mut counts = [0u16; 4];
+                    for count in &mut counts {
+                        *count = u16::try_from(unsigned(parts.next()?)?).ok()?;
+                    }
+                    if parts.next().is_some()
+                        || counts.iter().map(|n| usize::from(*n)).sum::<usize>()
+                            > crate::routing::flow::MAX_FLOWS
+                    {
+                        return None;
+                    }
+                    Some(counts)
+                };
+                let capture_state = match fields.next()?.strip_prefix("cap=")? {
+                    "0" => 0,
+                    "1" => 1,
+                    "2" => 2,
+                    "3" => 3,
+                    _ => return None,
+                };
+                if counters.next().is_some()
+                    || fields.next().is_some()
+                    || ((transport == 0) != (xhttp == 0))
+                {
                     return None;
                 }
                 Some(StatusReply::ClientRunning {
@@ -1250,6 +1547,11 @@ where
                     transport,
                     xhttp,
                     fallback,
+                    routing_revision,
+                    routing_state,
+                    routing_totals: Box::new(routing_totals),
+                    flow_counts,
+                    capture_state,
                 })
             }
             StatusCommand::ClientPreview {
@@ -1546,6 +1848,26 @@ where
             Err(ManagementError::InvalidReply)
         };
     }
+    if matches!(command, StatusCommand::AccessStatus { .. }) {
+        if reply == b"ERR unsupported\n" {
+            return Err(ManagementError::Unsupported);
+        }
+        let raw = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
+        let (revision, state) = raw
+            .strip_prefix("theia-access-v1 revision=")
+            .and_then(|line| line.strip_suffix('\n'))
+            .and_then(|line| line.split_once(" state="))
+            .ok_or(ManagementError::InvalidReply)?;
+        let revision = positive_decimal(revision).ok_or(ManagementError::InvalidReply)?;
+        let state = match state {
+            "0" => 0,
+            "1" => 1,
+            "2" => 2,
+            "3" => 3,
+            _ => return Err(ManagementError::InvalidReply),
+        };
+        return Ok(StatusReply::AccessObserved { revision, state });
+    }
     if command == StatusCommand::Status {
         let reply = std::str::from_utf8(&reply).map_err(|_| ManagementError::InvalidReply)?;
         if let Some((count, revision)) = reply
@@ -1622,6 +1944,8 @@ pub async fn query_client_environment(
     if !matches!(
         command,
         StatusCommand::ClientStatus
+            | StatusCommand::ClientLifecycle
+            | StatusCommand::ClientDisconnect { .. }
             | StatusCommand::ClientPreview { .. }
             | StatusCommand::ClientApply { .. }
     ) {
@@ -1656,6 +1980,8 @@ pub async fn query_client_environment(
 pub async fn query_environment(command: StatusCommand) -> Result<StatusReply, ManagementError> {
     let kind = match command {
         StatusCommand::ClientStatus
+        | StatusCommand::ClientLifecycle
+        | StatusCommand::ClientDisconnect { .. }
         | StatusCommand::ClientPreview { .. }
         | StatusCommand::ClientApply { .. } => return Err(ManagementError::Unsupported),
         StatusCommand::Health => "health",
@@ -1666,6 +1992,7 @@ pub async fn query_environment(command: StatusCommand) -> Result<StatusReply, Ma
         StatusCommand::CheckRestartBound { .. } => "restart_preview",
         StatusCommand::CheckRestartRollback => "restart_rollback_check",
         StatusCommand::ApplyRestartRollback { .. } => "restart_rollback_apply",
+        StatusCommand::AccessStatus { .. } => "access_status",
         StatusCommand::RealityStatus { .. } => "reality_status",
         StatusCommand::CheckAuthRollback => "check_auth_rollback",
         StatusCommand::ApplyAuthRollback { .. } => "apply_auth_rollback",
@@ -1871,6 +2198,66 @@ mod strict_wire_matrix_tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_ipc_requires_canonical_instance_and_never_treats_ack_as_restore() {
+        let digest = "ab".repeat(32);
+        let nonce = "cd".repeat(32);
+        let lifecycle = format!("theia-client-v1 lifecycle r=1 sha256={digest} instance={nonce} phase=2 listeners=1 applied=1\n");
+        assert_eq!(
+            peer(
+                StatusCommand::ClientLifecycle,
+                "client-lifecycle\n",
+                lifecycle.as_bytes()
+            )
+            .await,
+            Ok(StatusReply::ClientLifecycle(ProxyLifecycle {
+                revision: 1,
+                config_sha256: [0xab; 32],
+                instance: [0xcd; 32],
+                phase: 2,
+                listeners_ready: true,
+                proxy_applied: 1
+            }))
+        );
+        let command = StatusCommand::ClientDisconnect {
+            expected_revision: 1,
+            config_sha256: [0xab; 32],
+            instance: [0xcd; 32],
+        };
+        let request = format!("client-disconnect rev=1 sha256={digest} instance={nonce}\n");
+        assert_eq!(
+            parse_disconnect(request.trim_end().as_bytes()),
+            Some((1, [0xab; 32], [0xcd; 32]))
+        );
+        assert!(parse_disconnect(
+            format!("client-disconnect rev=01 sha256={digest} instance={nonce}").as_bytes()
+        )
+        .is_none());
+        let reply = format!("theia-client-v1 disconnect-accepted r=1 instance={nonce}\n");
+        assert_eq!(
+            peer(command, &request, reply.as_bytes()).await,
+            Ok(StatusReply::ClientDisconnectAccepted {
+                revision: 1,
+                instance: [0xcd; 32]
+            })
+        );
+        let bad = format!("theia-client-v1 disconnect-accepted r=1 instance={digest}\n");
+        assert_eq!(
+            peer(command, &request, bad.as_bytes()).await,
+            Err(ManagementError::InvalidReply)
+        );
+        let bad = lifecycle.replace("phase=2", "phase=5");
+        assert_eq!(
+            peer(
+                StatusCommand::ClientLifecycle,
+                "client-lifecycle\n",
+                bad.as_bytes()
+            )
+            .await,
+            Err(ManagementError::InvalidReply)
+        );
+    }
+
+    #[tokio::test]
     async fn client_status_requires_canonical_fields_and_exact_revision_cas() {
         let hex = "ab".repeat(32);
         let status = StatusCommand::ClientStatus;
@@ -1882,7 +2269,7 @@ mod strict_wire_matrix_tests {
             (4, 3, 1, false),
         ] {
             let response = format!(
-                "theia-client-v1 r=7 sha256={hex} d={d} t={t} x={x} f={}\n",
+                "theia-client-v1 r=7 sha256={hex} d={d} t={t} x={x} f={} rr=2 rs=1 rt=10,20,30,40,5,1,2,6,7,8,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38 fs=1,2,3,4 cap=2\n",
                 u8::from(f)
             );
             assert_eq!(
@@ -1893,11 +2280,54 @@ mod strict_wire_matrix_tests {
                     descriptor_revision: d,
                     transport: t,
                     xhttp: x,
-                    fallback: f
+                    fallback: f,
+                    routing_revision: 2,
+                    routing_state: 1,
+                    routing_totals: Box::new([
+                        10, 20, 30, 40, 5, 1, 2, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+                        21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38
+                    ]),
+                    flow_counts: Some([1, 2, 3, 4]),
+                    capture_state: 2,
                 })
             );
         }
+        // Maximal counters still fit the fixed response budget.
+        let max_counters = [u64::MAX; 38]
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let max_response = format!(
+            "theia-client-v1 r={} sha256={hex} d={} t=3 x=2 f=0 rr={} rs=1 rt={max_counters} fs=1024,1024,1024,1024 cap=3\n",
+            u64::MAX,
+            u64::MAX,
+            u64::MAX
+        );
+        assert!(max_response.len() as u64 <= MAX_RESPONSE_BYTES);
+        assert!(
+            matches!(peer(status, "client-status\n", max_response.as_bytes()).await,
+            Ok(StatusReply::ClientRunning { routing_totals, .. }) if *routing_totals == [u64::MAX; 38])
+        );
+        let zeros = ["0"; 38].join(",");
+        let noncanonical = format!("{},01", ["0"; 37].join(","));
         for response in [
+            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=2 rs=1 rt={zeros}\n"),
+            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=2 rs=1 rt={zeros} fs=4096,1,0,0 cap=0\n"),
+            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=2 rs=1 rt={zeros} fs=0,0,01,0 cap=0\n"),
+            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=2 rs=1 rt={zeros} fs=0,0,0,0 cap=4\n"),
+            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=2 rs=1 rt={zeros} fs=0,0,0,0\n"),
+            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=0 rs=1 rt={zeros}\n"),
+            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=2 rs=1 rt={noncanonical}\n"),
+            format!(
+                "theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=0 rs=1 rt=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n"
+            ),
+            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=2 rs=1 rt=0,0,0,0,0,0,0,0,0,0\n"),
+            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=2 rs=1 rt=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n"),
+            format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=2 rs=1 rt=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n"),
+            format!(
+                "theia-client-v1 r=7 sha256={hex} d=0 t=0 x=0 f=0 rr=2 rs=1 rt=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,01\n"
+            ),
             format!("theia-client-v1 r=07 sha256={hex} d=0 t=0 x=0 f=0\n"),
             format!("theia-client-v1 r=7 sha256={hex} d=0 t=3 x=0 f=0\n"),
             format!("theia-client-v1 r=7 sha256={hex} d=0 t=0 x=1 f=1\n"),
@@ -2009,6 +2439,49 @@ mod strict_wire_matrix_tests {
         ] {
             assert!(parse_reality_status(invalid.as_bytes()).is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn access_status_is_bounded_read_only_and_strictly_parsed() {
+        let mut inbound = [0; 64];
+        inbound[..4].copy_from_slice(b"edge");
+        let mut user = [0; 64];
+        user[..5].copy_from_slice(b"alice");
+        let command = StatusCommand::AccessStatus {
+            inbound,
+            user,
+            saved_sha256: [0xab; 32],
+        };
+        let request = format!(
+            "access-status inbound=edge user=alice sha256={}\n",
+            "ab".repeat(32)
+        );
+        assert!(request.len() < MAX_COMMAND_BYTES);
+        assert_eq!(
+            parse_access_status(request.trim_end().as_bytes()),
+            Some(("edge", "alice", [0xab; 32]))
+        );
+        assert_eq!(
+            peer(command, &request, b"theia-access-v1 revision=7 state=3\n").await,
+            Ok(StatusReply::AccessObserved {
+                revision: 7,
+                state: 3
+            })
+        );
+        for invalid in [
+            b"theia-access-v1 revision=0 state=3\n".as_slice(),
+            b"theia-access-v1 revision=7 state=4\n",
+            b"theia-access-v1 revision=7 state=3 extra\n",
+        ] {
+            assert_eq!(
+                peer(command, &request, invalid).await,
+                Err(ManagementError::InvalidReply)
+            );
+        }
+        assert_eq!(
+            peer(command, &request, b"ERR unsupported\n").await,
+            Err(ManagementError::Unsupported)
+        );
     }
 
     #[tokio::test]

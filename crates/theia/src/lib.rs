@@ -31,11 +31,19 @@ pub mod invite;
 pub mod live_auth;
 pub mod local_proxy;
 pub mod management;
+mod net;
 mod network_scope;
+mod own_tls;
 mod padding;
 pub mod protocol;
 mod qr_import;
+pub mod quic_core;
 pub mod quic_transport;
+#[cfg(test)]
+extern crate self as theia;
+#[cfg(test)]
+#[path = "../tests/support/quinn_reference.rs"]
+pub(crate) mod quinn_reference;
 pub(crate) mod quota;
 pub mod reality_admission;
 pub mod reality_bootstrap;
@@ -57,6 +65,7 @@ mod relay_batch;
 mod relay_liveness;
 pub mod reload_preflight;
 pub mod restart_guard;
+pub mod routing;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) mod runtime_generation;
 pub mod security_profile;
@@ -76,6 +85,7 @@ pub(crate) mod tui_domain;
 pub mod tui_editor;
 mod tui_menu;
 pub(crate) mod tui_probe;
+mod tui_profile_diagnostics;
 mod tui_reality_enroll;
 mod tui_reality_provision;
 mod tui_reality_register;
@@ -88,10 +98,13 @@ mod tui_staged_material;
 #[cfg(windows)]
 pub(crate) mod tui_system_proxy;
 mod tui_widgets;
+mod udp_metadata;
+mod udp_relay;
 #[cfg(target_os = "windows")]
 pub mod windows_control;
 #[cfg(target_os = "windows")]
 pub mod windows_system_proxy;
+mod xhttp;
 
 use std::fmt;
 use std::path::Path;
@@ -162,6 +175,79 @@ pub enum Command {
         config: String,
     },
     ClientStatus,
+    ClientLifecycle,
+    ClientDisconnect {
+        expected_revision: u64,
+        config_sha256: [u8; 32],
+        instance: [u8; 32],
+    },
+    ClientLinuxRedirectLab {
+        config: String,
+        journal: String,
+        port: u16,
+    },
+    ClientLinuxRecoverLab {
+        journal: String,
+    },
+    ClientLinuxHostLab {
+        config: String,
+        port: u16,
+    },
+    ClientLinuxHostRearm,
+    ClientLinuxHostRecover,
+    /// Explicit backend compatibility check, never activates capture.
+    /// Internal bounded handle-lifetime fixture, no network operations.
+    WinDivertGuardHolder,
+    ClientWinDivertScopeDropLab {
+        directory: String,
+        dll_sha256: [u8; 32],
+        sys_sha256: [u8; 32],
+        interface: u32,
+        seconds: u32,
+    },
+    ClientWinDivertRedirectLab {
+        config: String,
+        directory: String,
+        dll_sha256: [u8; 32],
+        sys_sha256: [u8; 32],
+        targets: Vec<std::net::SocketAddr>,
+        seconds: u32,
+    },
+    ClientWinDivertInterfaceRedirectLab {
+        config: String,
+        directory: String,
+        dll_sha256: [u8; 32],
+        sys_sha256: [u8; 32],
+        capture: u32,
+        carrier: u32,
+        seconds: u32,
+    },
+    ClientWinDivertTcpRelayLab {
+        config: String,
+        directory: String,
+        dll_sha256: [u8; 32],
+        sys_sha256: [u8; 32],
+        target: std::net::SocketAddr,
+    },
+    ClientWinDivertUdpRelayLab {
+        config: String,
+        directory: String,
+        dll_sha256: [u8; 32],
+        sys_sha256: [u8; 32],
+        target: std::net::SocketAddr,
+        flows: usize,
+    },
+    ClientWinDivertLoopback {
+        directory: String,
+        dll_sha256: [u8; 32],
+        sys_sha256: [u8; 32],
+    },
+    ClientWinDivertCheck {
+        directory: String,
+        dll_sha256: [u8; 32],
+        sys_sha256: [u8; 32],
+        install_lab: bool,
+    },
     ClientApply {
         expected_revision: u64,
         candidate_sha256: [u8; 32],
@@ -370,6 +456,160 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
             })
         }
         ["client", "status"] => Ok(Command::ClientStatus),
+        ["client", "lifecycle"] => Ok(Command::ClientLifecycle),
+        ["client", "disconnect", "--expected-revision", revision, "--sha256", digest, "--instance", instance, "--confirm"] => {
+            Ok(Command::ClientDisconnect {
+                expected_revision: expected_revision(revision)?,
+                config_sha256: parse_restart_digest(digest).ok_or(CliError::InvalidArguments)?,
+                instance: parse_restart_digest(instance).ok_or(CliError::InvalidArguments)?,
+            })
+        }
+        ["client", "linux", "--redirect-lab", "--config", config, "--journal", journal, "--port", port, "--confirm-isolated"] => {
+            Ok(Command::ClientLinuxRedirectLab {
+                config: config_path(config)?,
+                journal: config_path(journal)?,
+                port: port
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|n| *n >= 1024)
+                    .ok_or(CliError::InvalidArguments)?,
+            })
+        }
+        ["client", "linux", "--host-redirect-lab", "--config", config, "--port", port, "--confirm-disposable-local-console"] => {
+            Ok(Command::ClientLinuxHostLab {
+                config: config_path(config)?,
+                port: port
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|n| *n >= 1024)
+                    .ok_or(CliError::InvalidArguments)?,
+            })
+        }
+        ["client", "linux", "--host-guard-rearm", "--confirm-disposable-host"] => {
+            Ok(Command::ClientLinuxHostRearm)
+        }
+        ["client", "linux", "--host-guard-recover", "--confirm-disposable-local-console"] => {
+            Ok(Command::ClientLinuxHostRecover)
+        }
+        ["client", "linux", "--recover-lab", "--journal", journal, "--confirm-isolated-recovery"] => {
+            Ok(Command::ClientLinuxRecoverLab {
+                journal: config_path(journal)?,
+            })
+        }
+        ["client", "windivert", "--guard-holder-lab"] => Ok(Command::WinDivertGuardHolder),
+        ["client", "windivert", "--scope-drop-lab", "--directory", directory, "--dll-sha256", dll, "--sys-sha256", sys, "--interface-index", interface, "--seconds", seconds, "--confirm-block"] => {
+            Ok(Command::ClientWinDivertScopeDropLab {
+                directory: config_path(directory)?,
+                dll_sha256: parse_restart_digest(dll).ok_or(CliError::InvalidArguments)?,
+                sys_sha256: parse_restart_digest(sys).ok_or(CliError::InvalidArguments)?,
+                interface: interface
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|n| *n != 0)
+                    .ok_or(CliError::InvalidArguments)?,
+                seconds: seconds
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|n| (1..=30).contains(n))
+                    .ok_or(CliError::InvalidArguments)?,
+            })
+        }
+        ["client", "windivert", "--interface-redirect-lab", "--config", config, "--directory", directory, "--dll-sha256", dll, "--sys-sha256", sys, "--capture-interface", capture, "--carrier-interface", carrier, "--seconds", seconds, "--confirm-isolated-two-interface"] =>
+        {
+            let capture = capture
+                .parse::<u32>()
+                .ok()
+                .filter(|n| *n != 0)
+                .ok_or(CliError::InvalidArguments)?;
+            let carrier = carrier
+                .parse::<u32>()
+                .ok()
+                .filter(|n| *n != 0 && *n != capture)
+                .ok_or(CliError::InvalidArguments)?;
+            Ok(Command::ClientWinDivertInterfaceRedirectLab {
+                config: config_path(config)?,
+                directory: config_path(directory)?,
+                dll_sha256: parse_restart_digest(dll).ok_or(CliError::InvalidArguments)?,
+                sys_sha256: parse_restart_digest(sys).ok_or(CliError::InvalidArguments)?,
+                capture,
+                carrier,
+                seconds: seconds
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|n| (5..=120).contains(n))
+                    .ok_or(CliError::InvalidArguments)?,
+            })
+        }
+        ["client", "windivert", "--redirect-lab", "--config", config, "--directory", directory, "--dll-sha256", dll, "--sys-sha256", sys, "--targets", targets, "--seconds", seconds, "--confirm-isolated"] =>
+        {
+            if targets.len() > 512 {
+                return Err(CliError::InvalidArguments);
+            }
+            let targets = targets
+                .split(',')
+                .map(str::parse::<std::net::SocketAddr>)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| CliError::InvalidArguments)?;
+            if !routing::packet::validate_redirect_lab_targets(&targets) {
+                return Err(CliError::InvalidArguments);
+            }
+            Ok(Command::ClientWinDivertRedirectLab {
+                config: config_path(config)?,
+                directory: config_path(directory)?,
+                dll_sha256: parse_restart_digest(dll).ok_or(CliError::InvalidArguments)?,
+                sys_sha256: parse_restart_digest(sys).ok_or(CliError::InvalidArguments)?,
+                targets,
+                seconds: seconds
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|n| (5..=120).contains(n))
+                    .ok_or(CliError::InvalidArguments)?,
+            })
+        }
+        ["client", "windivert", "--tcp-relay-lab", "--config", config, "--directory", directory, "--dll-sha256", dll, "--sys-sha256", sys, "--target", target, "--confirm"] => {
+            Ok(Command::ClientWinDivertTcpRelayLab {
+                config: config_path(config)?,
+                directory: config_path(directory)?,
+                dll_sha256: parse_restart_digest(dll).ok_or(CliError::InvalidArguments)?,
+                sys_sha256: parse_restart_digest(sys).ok_or(CliError::InvalidArguments)?,
+                target: target.parse().map_err(|_| CliError::InvalidArguments)?,
+            })
+        }
+        ["client", "windivert", "--udp-relay-lab", "--config", config, "--directory", directory, "--dll-sha256", dll, "--sys-sha256", sys, "--target", target, "--confirm"]
+        | ["client", "windivert", "--udp-relay-lab", "--config", config, "--directory", directory, "--dll-sha256", dll, "--sys-sha256", sys, "--target", target, "--flows", _, "--confirm"] => {
+            Ok(Command::ClientWinDivertUdpRelayLab {
+                config: config_path(config)?,
+                directory: config_path(directory)?,
+                dll_sha256: parse_restart_digest(dll).ok_or(CliError::InvalidArguments)?,
+                sys_sha256: parse_restart_digest(sys).ok_or(CliError::InvalidArguments)?,
+                target: target.parse().map_err(|_| CliError::InvalidArguments)?,
+                flows: if args.len() == 16 {
+                    args[14]
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|n| (1..=8).contains(n))
+                        .ok_or(CliError::InvalidArguments)?
+                } else {
+                    1
+                },
+            })
+        }
+        ["client", "windivert", "--loopback-lab", "--directory", directory, "--dll-sha256", dll, "--sys-sha256", sys, "--confirm"] => {
+            Ok(Command::ClientWinDivertLoopback {
+                directory: config_path(directory)?,
+                dll_sha256: parse_restart_digest(dll).ok_or(CliError::InvalidArguments)?,
+                sys_sha256: parse_restart_digest(sys).ok_or(CliError::InvalidArguments)?,
+            })
+        }
+        ["client", "windivert", "--check", "--directory", directory, "--dll-sha256", dll, "--sys-sha256", sys]
+        | ["client", "windivert", "--check", "--directory", directory, "--dll-sha256", dll, "--sys-sha256", sys, "--install-lab", "--confirm"] => {
+            Ok(Command::ClientWinDivertCheck {
+                directory: config_path(directory)?,
+                dll_sha256: parse_restart_digest(dll).ok_or(CliError::InvalidArguments)?,
+                sys_sha256: parse_restart_digest(sys).ok_or(CliError::InvalidArguments)?,
+                install_lab: args.len() == 11,
+            })
+        }
         ["client", "reload", "--check", "--expected-revision", revision, "--sha256", digest] => {
             Ok(Command::ClientApply {
                 expected_revision: expected_revision(revision)?,
@@ -417,7 +657,7 @@ Usage:\n\
   theia reference --help              # consented reference health checks\n\
   theia reality --help                # guarded identity and enrollment\n\
 \n--help, --version, config validate, server run and client run (H2/H3/auto) are implemented.\n\
-Client requires tls_ca PEM bundle. Windows system proxy requires explicit --system-proxy --confirm, a manual config flag and live bound listeners; normal client run and TUI never alter OS proxy.";
+Client requires tls_ca PEM bundle. Windows system proxy requires explicitly confirmed Connect (CLI --system-proxy --confirm or TUI) and live bound listeners; normal client run and TUI import never alter OS proxy.";
 
 /// Synchronous introspection/config validation. Server startup is async in the binary.
 pub fn help(topic: Option<&str>) -> Result<&'static str, CliError> {
@@ -430,7 +670,7 @@ pub fn help(topic: Option<&str>) -> Result<&'static str, CliError> {
             Ok("Usage: theia server run --config <path> | theia server status | theia server reload --check | theia server restart --check | theia server tls fingerprint --config <path> | theia server tls rollback --check | theia server tls rollback --apply --expected-revision N --confirm | theia server restart --apply --expected-revision N --sha256 HEX --tls-sha256 PEMHEX --confirm | theia server quota --check | theia server quota --apply --expected-revision N --sha256 HEX --confirm | theia server reload --apply --expected-revision N --sha256 HEX --confirm | theia server auth rollback --check | theia server auth rollback --apply --expected-revision N --confirm\nQuota CAS resizes only two session/connection caps, retaining all held permits and denying new admissions while over the decreased cap. All other config, TLS identity bytes, grants, user roster and listener addresses must remain unchanged. Requires private Linux/Windows IPC and exact saved SHA256 TOML; lost ACK is indeterminate, query status. Restart-only fresh-port/TLS cutover uses a separate confirmed dual-digest command; the old TOML-only restart syntax is rejected.")
         }
         Some("client") => {
-            Ok("Usage: theia client run --config <path> [--system-proxy --confirm]\ntheia client status\ntheia client reload --check --expected-revision N --sha256 HEX\ntheia client reload --apply --expected-revision N --sha256 HEX --confirm\ntheia client proxy --status\ntheia client proxy --recover --confirm\nWindows only: explicitly opt in to user WinINet HTTP(S) proxy after binding local HTTP/SOCKS5 listeners. system_proxy=manual in TOML required. Snapshot+durable journal, conditional restore on Ctrl+C/normal stop, explicit CAS recovery after crash. Never overwrites foreign proxy changes. CLI flags and TUI import alone never apply OS changes.")
+            Ok("Usage: theia client run --config <path> [--system-proxy --confirm]\ntheia client status\ntheia client lifecycle\ntheia client disconnect --expected-revision N --sha256 HEX --instance HEX --confirm\ntheia client reload --check --expected-revision N --sha256 HEX\ntheia client reload --apply --expected-revision N --sha256 HEX --confirm\ntheia client windivert --check --directory DIR --dll-sha256 HEX --sys-sha256 HEX [--install-lab --confirm]\ntheia client windivert --loopback-lab --directory DIR --dll-sha256 HEX --sys-sha256 HEX --confirm\ntheia client windivert --scope-drop-lab --directory DIR --dll-sha256 HEX --sys-sha256 HEX --interface-index N --seconds 1..30 --confirm-block (isolated local console only; drops all outbound IP on interface)\ntheia client windivert --redirect-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --targets IP:PORT[,IP:PORT] --seconds 5..120 --confirm-isolated\ntheia client windivert --tcp-relay-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --target IP:PORT --confirm\ntheia client windivert --udp-relay-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --target IP:PORT [--flows 1..8] --confirm\ntheia client windivert --interface-redirect-lab --config PATH --directory DIR --dll-sha256 HEX --sys-sha256 HEX --capture-interface N --carrier-interface N --seconds 5..120 --confirm-isolated-two-interface\ntheia client linux --host-redirect-lab --config PATH --port N --confirm-disposable-local-console\ntheia client linux --host-guard-rearm --confirm-disposable-host\ntheia client linux --host-guard-recover --confirm-disposable-local-console\ntheia client proxy --status\ntheia client proxy --recover --confirm\nWindows only: explicitly opt in to user WinINet HTTP(S) proxy after binding local HTTP/SOCKS5 listeners. Saved ingress_mode=system_proxy alone never starts a connection. Snapshot+durable journal, conditional restore on Ctrl+C/normal stop, explicit CAS recovery after crash. Never overwrites foreign proxy changes. CLI flags and TUI import alone never apply OS changes.")
         }
         Some("trust") => Ok(descriptor_cli::HELP),
         Some("reference") => Ok(reference_cli::HELP),
@@ -462,6 +702,268 @@ mod tests {
                 .map(|word| (*word).to_owned())
                 .collect::<Vec<_>>(),
         )
+    }
+
+    #[test]
+    fn windivert_scope_drop_requires_exact_interface_duration_and_block_consent() {
+        let dll = "ab".repeat(32);
+        let sys = "cd".repeat(32);
+        let mut args = [
+            "client",
+            "windivert",
+            "--scope-drop-lab",
+            "--directory",
+            "C:/Theia/WinDivert",
+            "--dll-sha256",
+            &dll,
+            "--sys-sha256",
+            &sys,
+            "--interface-index",
+            "7",
+            "--seconds",
+            "10",
+            "--confirm-block",
+        ];
+        assert!(matches!(
+            command(&args),
+            Ok(Command::ClientWinDivertScopeDropLab {
+                interface: 7,
+                seconds: 10,
+                ..
+            })
+        ));
+        assert!(command(&args[..13]).is_err());
+        args[13] = "--confirm";
+        assert!(command(&args).is_err());
+        args[13] = "--confirm-block";
+        args[10] = "0";
+        assert!(command(&args).is_err());
+        args[10] = "7";
+        args[12] = "31";
+        assert!(command(&args).is_err());
+        args[12] = "0";
+        assert!(command(&args).is_err());
+    }
+    #[test]
+    fn linux_redirect_lab_requires_explicit_isolated_consent() {
+        let mut args = [
+            "client",
+            "linux",
+            "--redirect-lab",
+            "--config",
+            "client.toml",
+            "--journal",
+            "/private/guard.toml",
+            "--port",
+            "49001",
+            "--confirm-isolated",
+        ];
+        assert!(matches!(
+            command(&args),
+            Ok(Command::ClientLinuxRedirectLab { port: 49001, .. })
+        ));
+        assert!(command(&args[..9]).is_err());
+        args[8] = "0";
+        assert!(command(&args).is_err());
+        args[8] = "53";
+        assert!(command(&args).is_err());
+        assert!(matches!(
+            command(&[
+                "client",
+                "linux",
+                "--recover-lab",
+                "--journal",
+                "/private/guard.toml",
+                "--confirm-isolated-recovery"
+            ]),
+            Ok(Command::ClientLinuxRecoverLab { .. })
+        ));
+        assert!(command(&[
+            "client",
+            "linux",
+            "--recover-lab",
+            "--journal",
+            "/private/guard.toml"
+        ])
+        .is_err());
+    }
+    #[test]
+    fn interface_redirect_requires_distinct_explicit_devices() {
+        let dll = "ab".repeat(32);
+        let sys = "cd".repeat(32);
+        let mut args = [
+            "client",
+            "windivert",
+            "--interface-redirect-lab",
+            "--config",
+            "client.toml",
+            "--directory",
+            "C:/Theia/WinDivert",
+            "--dll-sha256",
+            &dll,
+            "--sys-sha256",
+            &sys,
+            "--capture-interface",
+            "3",
+            "--carrier-interface",
+            "4",
+            "--seconds",
+            "30",
+            "--confirm-isolated-two-interface",
+        ];
+        assert!(matches!(
+            command(&args),
+            Ok(Command::ClientWinDivertInterfaceRedirectLab {
+                capture: 3,
+                carrier: 4,
+                ..
+            })
+        ));
+        assert!(command(&args[..17]).is_err());
+        args[14] = "3";
+        assert!(command(&args).is_err());
+        args[14] = "0";
+        assert!(command(&args).is_err());
+    }
+    #[test]
+    fn windivert_redirect_lab_requires_literal_reviewed_targets_and_duration() {
+        let dll = "ab".repeat(32);
+        let sys = "cd".repeat(32);
+        let mut args = [
+            "client",
+            "windivert",
+            "--redirect-lab",
+            "--config",
+            "client.toml",
+            "--directory",
+            "C:/Theia/WinDivert",
+            "--dll-sha256",
+            &dll,
+            "--sys-sha256",
+            &sys,
+            "--targets",
+            "192.0.2.1:443,[2001:db8::1]:8443",
+            "--seconds",
+            "30",
+            "--confirm-isolated",
+        ];
+        assert!(
+            matches!(command(&args),Ok(Command::ClientWinDivertRedirectLab{targets,seconds:30,..}) if targets.len()==2)
+        );
+        assert!(command(&args[..15]).is_err());
+        args[12] = "example.org:443";
+        assert!(command(&args).is_err());
+        args[12] = "192.0.2.1:443,192.0.2.1:443";
+        assert!(command(&args).is_err());
+        args[12] = "192.0.2.1:443";
+        args[14] = "121";
+        assert!(command(&args).is_err());
+    }
+    #[test]
+    fn windivert_relay_lab_requires_confirm_and_literal_target() {
+        let dll = "ab".repeat(32);
+        let sys = "cd".repeat(32);
+        let args = [
+            "client",
+            "windivert",
+            "--udp-relay-lab",
+            "--config",
+            "client.toml",
+            "--directory",
+            "C:/Theia/WinDivert",
+            "--dll-sha256",
+            &dll,
+            "--sys-sha256",
+            &sys,
+            "--target",
+            "192.0.2.1:443",
+            "--confirm",
+        ];
+        assert!(
+            matches!(command(&args),Ok(Command::ClientWinDivertUdpRelayLab {target,..}) if target=="192.0.2.1:443".parse().unwrap())
+        );
+        assert!(command(&args[..13]).is_err());
+        let mut tcp = args;
+        tcp[2] = "--tcp-relay-lab";
+        assert!(
+            matches!(command(&tcp),Ok(Command::ClientWinDivertTcpRelayLab {target,..}) if target=="192.0.2.1:443".parse().unwrap())
+        );
+        assert!(command(&tcp[..13]).is_err());
+        tcp[12] = "example.org:443";
+        assert!(command(&tcp).is_err());
+        let mut multi = args[..13].to_vec();
+        multi.extend(["--flows", "8", "--confirm"]);
+        assert!(matches!(
+            command(&multi),
+            Ok(Command::ClientWinDivertUdpRelayLab { flows: 8, .. })
+        ));
+        multi[14] = "9";
+        assert!(command(&multi).is_err());
+        multi[14] = "0";
+        assert!(command(&multi).is_err());
+        let mut bad = args;
+        bad[12] = "example.org:443";
+        assert!(command(&bad).is_err());
+        let local = [
+            "client",
+            "windivert",
+            "--loopback-lab",
+            "--directory",
+            "C:/Theia/WinDivert",
+            "--dll-sha256",
+            &dll,
+            "--sys-sha256",
+            &sys,
+            "--confirm",
+        ];
+        assert!(matches!(
+            command(&local),
+            Ok(Command::ClientWinDivertLoopback { .. })
+        ));
+        assert!(command(&local[..9]).is_err());
+    }
+
+    #[test]
+    fn windivert_check_requires_explicit_pins_and_install_confirmation() {
+        let dll = "ab".repeat(32);
+        let sys = "cd".repeat(32);
+        let args = [
+            "client",
+            "windivert",
+            "--check",
+            "--directory",
+            "C:/Theia/WinDivert",
+            "--dll-sha256",
+            &dll,
+            "--sys-sha256",
+            &sys,
+        ];
+        assert_eq!(
+            command(&args),
+            Ok(Command::ClientWinDivertCheck {
+                directory: "C:/Theia/WinDivert".into(),
+                dll_sha256: [0xab; 32],
+                sys_sha256: [0xcd; 32],
+                install_lab: false,
+            })
+        );
+        let mut install = args.to_vec();
+        install.push("--install-lab");
+        assert!(command(&install).is_err());
+        install.push("--confirm");
+        assert!(matches!(
+            command(&install),
+            Ok(Command::ClientWinDivertCheck {
+                install_lab: true,
+                ..
+            })
+        ));
+        install.push("--confirm");
+        assert!(command(&install).is_err());
+        assert!(command(&args[..8]).is_err());
+        let mut invalid = args;
+        invalid[6] = "invalid";
+        assert!(command(&invalid).is_err());
     }
 
     #[test]
@@ -765,6 +1267,36 @@ mod tests {
         assert_eq!(
             command(&["tui", "--role", "server", "--role", "client"]),
             Err(CliError::InvalidArguments)
+        );
+    }
+
+    #[test]
+    fn client_disconnect_requires_explicit_instance_revision_and_confirmation() {
+        let digest = "ab".repeat(32);
+        let nonce = "cd".repeat(32);
+        let args = [
+            "client",
+            "disconnect",
+            "--expected-revision",
+            "1",
+            "--sha256",
+            &digest,
+            "--instance",
+            &nonce,
+            "--confirm",
+        ];
+        assert_eq!(
+            command(&args),
+            Ok(Command::ClientDisconnect {
+                expected_revision: 1,
+                config_sha256: [0xab; 32],
+                instance: [0xcd; 32]
+            })
+        );
+        assert!(command(&args[..8]).is_err());
+        assert_eq!(
+            command(&["client", "lifecycle"]),
+            Ok(Command::ClientLifecycle)
         );
     }
 

@@ -1,9 +1,9 @@
 //! Explicit H3 client core with bounded per-profile connection reuse.
 use crate::{
-    client::{bearer_header, error_kind, ClientError},
+    client::{bearer_header, ClientError},
     diagnostics::{self, Value},
     protocol::{self, Address, Decoder, Direction, Frame, Role, Session},
-    quic_transport::{ObservedEndpoint, QuicError},
+    quic_core::{dial, h3_adapter, handshake_udp, negotiation::VersionPolicy, wire::Version},
 };
 use bytes::{Buf, Bytes};
 use h3::{client::RequestStream, quic};
@@ -11,23 +11,26 @@ use http::{header, HeaderValue, Request, StatusCode, Uri};
 use rustls::{pki_types::ServerName, RootCertStore};
 use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncWrite},
     task::JoinHandle,
     time::timeout,
 };
 
-const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
-const IO_TIMEOUT: Duration = Duration::from_secs(30);
-type Tx = RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
-type Rx = RequestStream<h3_quinn::RecvStream, Bytes>;
+use crate::xhttp::session::{
+    self, CarrierKind, FrameReader, FrameWriter, OpenAdapter, IO_TIMEOUT, OPEN_TIMEOUT,
+};
+type Tx = RequestStream<h3_adapter::SendSide, Bytes>;
+type Rx = RequestStream<h3_adapter::RecvSide, Bytes>;
 
 pub struct H3Client {
     remote: SocketAddr,
     name: String,
     uri: Uri,
     authorization: HeaderValue,
-    roots: RootCertStore,
-    identity_quic: Option<quinn::ClientConfig>,
+    own_trust: crate::own_tls::Trust,
+    identity_quic: Option<Arc<rustls::ClientConfig>>,
+    native_lab: Option<crate::quic_core::wire::Version>,
+    native_pins: Option<(SocketAddr, crate::quic_core::scope::NetworkScope)>,
     identity_routes: Option<crate::split_http::IdentityRoutes>,
     padding: crate::descriptor::Padding,
     own_routes: Option<crate::split_http::IdentityRoutes>,
@@ -48,7 +51,16 @@ impl H3Client {
         token: &str,
         roots: RootCertStore,
     ) -> Result<Self, ClientError> {
-        if remote.port() == 0 || remote.ip().is_unspecified() || roots.is_empty() {
+        Self::new_with_trust(remote, name, token, crate::own_tls::Trust::Roots(roots))
+    }
+
+    pub(crate) fn new_with_trust(
+        remote: SocketAddr,
+        name: &str,
+        token: &str,
+        trust: crate::own_tls::Trust,
+    ) -> Result<Self, ClientError> {
+        if remote.port() == 0 || remote.ip().is_unspecified() || !trust.usable() {
             return Err(ClientError::Configuration);
         }
         if !matches!(ServerName::try_from(name), Ok(ServerName::DnsName(_))) {
@@ -65,8 +77,10 @@ impl H3Client {
             name: name.to_owned(),
             uri,
             authorization: bearer_header(token)?,
-            roots,
+            own_trust: trust,
             identity_quic: None,
+            native_lab: None,
+            native_pins: None,
             identity_routes: None,
             padding: crate::descriptor::Padding::default(),
             own_routes: Some(crate::split_http::IdentityRoutes::new(
@@ -93,8 +107,12 @@ impl H3Client {
         {
             return Err(ClientError::Configuration);
         }
-        let quic = crate::identity_tls::quic_client(&d.scope, value.signer())
-            .map_err(|_| ClientError::Tls)?;
+        let quic = crate::identity_tls::client_tls(
+            &d.scope,
+            value.signer(),
+            crate::identity_tls::Branch::H3,
+        )
+        .map_err(|_| ClientError::Tls)?;
         Self::identity_carrier(remote, "localhost", token, value, quic)
     }
 
@@ -116,8 +134,12 @@ impl H3Client {
             .get(usize::from(d.active_reference))
             .ok_or(ClientError::Configuration)?
             .server_name;
-        let quic = crate::identity_tls::admitted_quic_client(value, secret)
-            .map_err(|_| ClientError::Tls)?;
+        let quic = crate::identity_tls::admitted_client_tls(
+            value,
+            crate::identity_tls::Branch::H3,
+            secret,
+        )
+        .map_err(|_| ClientError::Tls)?;
         Self::identity_carrier(remote, name, token, value, quic)
     }
 
@@ -136,8 +158,12 @@ impl H3Client {
             .get(usize::from(d.active_reference))
             .ok_or(ClientError::Configuration)?
             .server_name;
-        let quic = crate::identity_tls::admitted_quic_client(value, secret)
-            .map_err(|_| ClientError::Tls)?;
+        let quic = crate::identity_tls::admitted_client_tls(
+            value,
+            crate::identity_tls::Branch::H3,
+            secret,
+        )
+        .map_err(|_| ClientError::Tls)?;
         Self::identity_carrier(remote, name, token, value, quic)
     }
 
@@ -146,7 +172,7 @@ impl H3Client {
         name: &str,
         token: &str,
         value: &crate::descriptor::Verified,
-        quic: quinn::ClientConfig,
+        quic: rustls::ClientConfig,
     ) -> Result<Self, ClientError> {
         let d = value.descriptor();
         let routes = crate::split_http::IdentityRoutes::new(&d.path_prefix)?;
@@ -161,8 +187,10 @@ impl H3Client {
             name: name.to_owned(),
             uri,
             authorization: bearer_header(token)?,
-            roots: RootCertStore::empty(),
-            identity_quic: Some(quic),
+            own_trust: crate::own_tls::Trust::Roots(RootCertStore::empty()),
+            identity_quic: Some(Arc::new(quic)),
+            native_lab: None,
+            native_pins: None,
             identity_routes: Some(routes),
             padding: d.padding.clone(),
             own_routes: None,
@@ -244,6 +272,165 @@ impl H3Client {
                 return Err(ClientError::Protocol);
             }
             crate::identity_data::finish_descriptor(bytes, expected)
+        })
+        .await
+        .map_err(|_| ClientError::Timeout)?
+    }
+
+    /// Authenticated binary policy snapshot for this exact inbound path.
+    pub(crate) async fn fetch_routing(
+        &self,
+        known: Option<[u8; 32]>,
+    ) -> Result<Vec<u8>, ClientError> {
+        self.routing_resource(None, known, false).await
+    }
+
+    pub(crate) async fn diagnostic_domains(
+        &self,
+        digest: [u8; 32],
+    ) -> Result<Vec<String>, ClientError> {
+        let bytes = self.routing_resource(None, Some(digest), true).await?;
+        crate::routing::exchange::decode_diagnostic_domains(&bytes, digest)
+    }
+
+    pub(crate) async fn resolve_routing(
+        &self,
+        name: &str,
+        digest: [u8; 32],
+    ) -> Result<Vec<std::net::IpAddr>, ClientError> {
+        let bytes = self
+            .routing_resource(Some((name, digest, false)), None, false)
+            .await?;
+        crate::routing::exchange::decode_ips(&bytes)
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        all(target_os = "windows", target_arch = "x86_64")
+    ))]
+    pub(crate) async fn resolve_native_dns(
+        &self,
+        name: &str,
+        digest: [u8; 32],
+    ) -> Result<Vec<std::net::IpAddr>, ClientError> {
+        let bytes = self
+            .routing_resource(Some((name, digest, true)), None, false)
+            .await?;
+        crate::routing::exchange::decode_ips(&bytes)
+    }
+
+    pub(crate) fn own_routing_scope(&self) -> Option<&str> {
+        self.own_routes
+            .as_ref()?
+            .routing
+            .strip_prefix("/v1/")?
+            .strip_suffix("/routing")
+    }
+
+    async fn routing_resource(
+        &self,
+        domain: Option<(&str, [u8; 32], bool)>,
+        known: Option<[u8; 32]>,
+        diagnostic: bool,
+    ) -> Result<Vec<u8>, ClientError> {
+        let routes = self
+            .identity_routes
+            .as_ref()
+            .or(self.own_routes.as_ref())
+            .ok_or(ClientError::Configuration)?;
+        timeout(crate::routing::exchange::TRANSFER_TIMEOUT, async {
+            let route = crate::network_scope::observe(self.remote);
+            let reusable = self.reuse_connections && self.certificate_pin.is_none();
+            let mut lease = self
+                .pool
+                .acquire(
+                    route,
+                    reusable,
+                    |connection| !connection.driver.0.is_finished(),
+                    self.connect_verified(diagnostics::next_id()),
+                )
+                .await?;
+            if route.is_some() && crate::network_scope::observe(self.remote) != route {
+                lease.retire();
+                return Err(ClientError::Io);
+            }
+            if !lease.accepting_new_streams() {
+                return Err(ClientError::Http3);
+            }
+            let connection = lease.connection();
+            let mut sender = connection
+                .sender
+                .lock()
+                .map_err(|_| ClientError::Http3)?
+                .clone();
+            let mut parts = self.uri.clone().into_parts();
+            parts.path_and_query = Some(
+                routes
+                    .routing
+                    .parse()
+                    .map_err(|_| ClientError::Configuration)?,
+            );
+            let uri = Uri::from_parts(parts).map_err(|_| ClientError::Configuration)?;
+            let mut request = Request::get(uri)
+                .header(header::AUTHORIZATION, self.authorization.clone())
+                .body(())
+                .map_err(|_| ClientError::Configuration)?;
+            if let Some((name, digest, native)) = domain {
+                crate::routing::exchange::request_domain(&mut request, name, digest)?;
+                if native {
+                    request.headers_mut().insert(
+                        crate::routing::exchange::NATIVE_DNS_HEADER,
+                        http::HeaderValue::from_static("1"),
+                    );
+                }
+            } else if let Some(digest) = known {
+                crate::routing::exchange::request_digest(&mut request, digest)?;
+            }
+            if diagnostic {
+                request.headers_mut().insert(
+                    crate::routing::exchange::DIAGNOSTIC_HEADER,
+                    http::HeaderValue::from_static("1"),
+                );
+            }
+            let request = crate::channel_binding::attach(
+                connection.binding.as_ref(),
+                self.padding.request(request)?,
+            )?;
+            let mut stream = sender
+                .send_request(request)
+                .await
+                .map_err(|_| ClientError::Http3)?;
+            stream.finish().await.map_err(|_| ClientError::Http3)?;
+            let response = stream
+                .recv_response()
+                .await
+                .map_err(|_| ClientError::Http3)?;
+            crate::split_http::check_status(response.status())?;
+            let expected = crate::routing::exchange::validate_headers(response.headers())?;
+            if (diagnostic && expected > crate::routing::exchange::DIAGNOSTIC_LIMIT)
+                || (domain.is_some() && expected > crate::routing::exchange::DNS_LIMIT)
+            {
+                return Err(ClientError::Protocol);
+            }
+            let mut bytes = Vec::new();
+            while let Some(mut chunk) = stream.recv_data().await.map_err(|_| ClientError::Http3)? {
+                if chunk.remaining() > expected.saturating_sub(bytes.len()) {
+                    return Err(ClientError::Protocol);
+                }
+                let chunk = chunk.copy_to_bytes(chunk.remaining());
+                crate::routing::exchange::append(&mut bytes, &chunk, expected)?;
+            }
+            if stream
+                .recv_trailers()
+                .await
+                .map_err(|_| ClientError::Http3)?
+                .is_some()
+            {
+                return Err(ClientError::Protocol);
+            }
+            let bytes = crate::routing::exchange::finish(bytes, expected)?;
+            lease.admitted();
+            Ok(bytes)
         })
         .await
         .map_err(|_| ClientError::Timeout)?
@@ -343,144 +530,167 @@ impl H3Client {
     }
 
     pub async fn open(&self, address: Address, port: u16) -> Result<H3Tunnel, ClientError> {
-        let operation = diagnostics::next_id();
-        crate::diag!(
-            Debug,
-            "client.h3",
-            "open_begin",
-            "op" = Value::Count(operation)
-        );
-        let open = Frame::OpenTcp { address, port };
-        protocol::encode(&open).map_err(|_| ClientError::Configuration)?;
-        let result = timeout(OPEN_TIMEOUT, self.open_selected(open, operation))
-            .await
-            .map_err(|_| ClientError::Timeout)
-            .and_then(|result| result);
-        match &result {
-            Ok(_) => crate::diag!(
-                Debug,
-                "client.h3",
-                "open_confirmed",
-                "op" = Value::Count(operation)
-            ),
-            Err(error) => crate::diag!(
-                Warn,
-                "client.h3",
-                "open_failed",
-                "op" = Value::Count(operation),
-                "reason" = Value::Label(error_kind(error))
-            ),
-        }
-        result
+        self.open_frame(Frame::OpenTcp { address, port }).await
+    }
+
+    pub(crate) async fn open_udp(
+        &self,
+        address: Address,
+        port: u16,
+    ) -> Result<H3Tunnel, ClientError> {
+        self.open_frame(Frame::OpenUdp { address, port }).await
+    }
+
+    async fn open_frame(&self, open: Frame) -> Result<H3Tunnel, ClientError> {
+        session::open(self, open).await
     }
 
     /// A full authenticated transport handshake, shared by tunnel opens and
     /// idle-cache rechecks. No HTTP request or bearer is sent here.
-    async fn verified_connection(
-        &self,
-    ) -> Result<(ObservedEndpoint, quinn::Connection), ClientError> {
-        let bind = if self.remote.is_ipv4() {
-            SocketAddr::from(([0, 0, 0, 0], 0))
-        } else {
-            SocketAddr::from(([0u16; 8], 0))
-        };
-        let endpoint = match &self.identity_quic {
-            Some(config) => ObservedEndpoint::with_config(bind, config.clone()),
-            None => ObservedEndpoint::new(bind, self.roots.clone()),
+    /// Explicit non-production carrier. Never used by config, Auto or REALITY.
+    /// Certificate pinning cannot be bypassed by selecting this fixture.
+    pub fn with_native_lab(
+        mut self,
+        version: crate::quic_core::wire::Version,
+    ) -> Result<Self, ClientError> {
+        if !self.remote.ip().is_loopback()
+            || self.identity_quic.is_some()
+            || self.certificate_pin.is_some()
+        {
+            return Err(ClientError::Configuration);
         }
-        .map_err(quic_error)?;
-        // No credential/request data until verified full handshake and BBR.
-        let connection = endpoint
-            .connect(self.remote, &self.name, self.connect_timeout)
-            .await
-            .map_err(quic_error)?;
-        if let Some(pin) = self.certificate_pin {
-            let chain = connection
-                .peer_identity()
-                .ok_or(ClientError::Tls)?
-                .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
-                .map_err(|_| ClientError::Tls)?;
-            pin.verify(chain.first().ok_or(ClientError::Tls)?.as_ref())?;
-        }
-        Ok((endpoint, connection))
+        self.pool = crate::connection_pool::Pool::default();
+        self.native_lab = Some(version);
+        self.native_pins = None;
+        Ok(self)
     }
 
-    /// Check only the configured peer, PKI, ALPN, optional pin and BBR.
-    /// Dropping the endpoint closes this probe; it never opens a tunnel.
+    /// Explicit non-production pinned own-TLS carrier. Uses the identical
+    /// H3/XHTTP pool and request FSM, without bypassing certificate validation.
+    pub fn with_native_pinned(
+        mut self,
+        version: crate::quic_core::wire::Version,
+        local: SocketAddr,
+        scope: crate::quic_core::scope::NetworkScope,
+    ) -> Result<Self, ClientError> {
+        if !scope.is_pinned()
+            || !scope.allows_local(local.ip())
+            || !scope.allows_peer(self.remote.ip())
+            || local.is_ipv4() != self.remote.is_ipv4()
+            || self.identity_quic.is_some()
+            || self.certificate_pin.is_some()
+        {
+            return Err(ClientError::Configuration);
+        }
+        self.pool = crate::connection_pool::Pool::default();
+        self.native_lab = Some(version);
+        self.native_pins = Some((local, scope));
+        Ok(self)
+    }
+
+    // Box the handshake future to keep native QUIC state off the executable's
+    // small Windows main stack. All paths verify the actual TLS handshake,
+    // ALPN, transport parameters and optional DER pin before opening H3.
+    fn native_connection(
+        &self,
+    ) -> impl std::future::Future<Output = Result<crate::quic_core::endpoint::LabSession, ClientError>>
+           + Send
+           + '_ {
+        Box::pin(async move {
+            let tls = match &self.identity_quic {
+                Some(config) => config.clone(),
+                None => Arc::new(
+                    self.own_trust
+                        .tls(crate::transport_policy::Carrier::H3)
+                        .map_err(|_| ClientError::Tls)?,
+                ),
+            };
+            let name =
+                ServerName::try_from(self.name.clone()).map_err(|_| ClientError::Configuration)?;
+            let session = if let Some(version) = self.native_lab {
+                // Keep explicit test scopes; never broaden a caller's pinned
+                // addresses or bypass an identity/pin using the lab selectors.
+                if self.identity_quic.is_some() || self.certificate_pin.is_some() {
+                    return Err(ClientError::Configuration);
+                }
+                timeout(self.connect_timeout, async {
+                    let (_, mut session) = match self.native_pins {
+                        Some((local, scope)) => {
+                            handshake_udp::connect_versions_scoped(
+                                local,
+                                self.remote,
+                                VersionPolicy::exact(version),
+                                tls,
+                                name,
+                                scope,
+                            )
+                            .await
+                        }
+                        None => {
+                            handshake_udp::connect_versions(
+                                SocketAddr::new(self.remote.ip(), 0),
+                                self.remote,
+                                VersionPolicy::exact(version),
+                                tls,
+                                name,
+                            )
+                            .await
+                        }
+                    }
+                    .map_err(|_| ClientError::Tls)?;
+                    dial::confirm(&mut session).await.map_err(dial_error)?;
+                    Ok::<_, ClientError>(session)
+                })
+                .await
+                .map_err(|_| ClientError::Timeout)??
+            } else {
+                // Keep v1 for the still-compatible REALITY server. A version
+                // restart for plain TLS must authenticate version_information.
+                let policy = if self.identity_quic.is_some() {
+                    VersionPolicy::exact(Version::V1)
+                } else {
+                    VersionPolicy::both()
+                };
+                dial::connect(self.remote, name, tls, None, policy, self.connect_timeout)
+                    .await
+                    .map_err(dial_error)?
+                    .1
+            };
+            if let Some(pin) = self.certificate_pin {
+                pin.verify(session.peer_leaf().ok_or(ClientError::Tls)?)?;
+            }
+            Ok(session)
+        })
+    }
+
+    /// Check only the configured peer, PKI/identity, ALPN and optional pin.
+    /// No HTTP stream, credential or application byte is sent by this probe.
     pub(crate) async fn probe(&self) -> Result<(), ClientError> {
-        self.verified_connection().await.map(|_| ())
+        let session = self.native_connection().await?;
+        dial::close_probe(session).await.map_err(dial_error)
     }
 
-    async fn open_selected(&self, open: Frame, operation: u64) -> Result<H3Tunnel, ClientError> {
-        use crate::split_http::HelloOutcome;
-        let mut stage = HelloOutcome::Pending;
-        let Some(mode) = &self.auto_mode else {
-            return self
-                .open_mode(&open, operation, self.stream_up, &mut stage)
-                .await;
-        };
-        let ticket = mode.select()?;
-        let stream_up = ticket.stream_up;
-        let result = self
-            .open_mode(&open, operation, stream_up, &mut stage)
-            .await;
-        if !mode.after_attempt(ticket, stream_up, stage)? {
-            return result;
+    pub(crate) async fn warm_carrier(&self) -> Result<(), ClientError> {
+        if !self.reuse_connections || self.certificate_pin.is_some() {
+            return Ok(());
         }
-        // The first attempt is fully dropped and never sent OPEN_TCP.
-        crate::diag!(Debug, "client.h3", "xhttp_pre_open_stream_up_retry");
-        let mut stage = HelloOutcome::Pending;
-        let result = self.open_mode(&open, operation, true, &mut stage).await;
-        mode.after_attempt(ticket, true, stage)?;
-        // The original H3 attempt already completed HTTP admission.
-        // UDP silence in the second attempt must not authorize H2 fallback.
-        match result {
-            Err(ClientError::QuicUnreachable | ClientError::QuicEndpointNetworkRefused) => {
-                Err(ClientError::Timeout)
-            }
-            other => other,
-        }
-    }
-
-    /// At most one fresh connection after an explicit graceful GOAWAY
-    /// before any HELLO/OPEN. Never replay a body or change XHTTP mode.
-    async fn open_mode(
-        &self,
-        open: &Frame,
-        operation: u64,
-        stream_up: bool,
-        stage: &mut crate::split_http::HelloOutcome,
-    ) -> Result<H3Tunnel, ClientError> {
-        use crate::split_http::HelloOutcome;
-        let result = self.open_inner(open, operation, stream_up, stage).await;
-        if *stage != HelloOutcome::Draining {
-            return result;
-        }
-        *stage = HelloOutcome::Pending;
-        let result = self.open_inner(open, operation, stream_up, stage).await;
-        match result {
-            Err(ClientError::QuicUnreachable | ClientError::QuicEndpointNetworkRefused) => {
-                Err(ClientError::Timeout)
-            }
-            other => other,
-        }
+        let route = crate::network_scope::observe(self.remote);
+        self.pool
+            .warm(
+                route,
+                |connection| !connection.driver.0.is_finished(),
+                self.connect_verified(crate::diagnostics::next_id()),
+                || route.is_some() && crate::network_scope::observe(self.remote) == route,
+            )
+            .await
     }
 
     async fn connect_verified(&self, operation: u64) -> Result<H3Connection, ClientError> {
-        let (endpoint, connection) = self.verified_connection().await?;
-        let binding = if self.certificate_pin.is_some() {
-            let mut key = zeroize::Zeroizing::new([0u8; 32]);
-            connection
-                .export_keying_material(
-                    &mut key[..],
-                    crate::channel_binding::LABEL,
-                    crate::channel_binding::H3,
-                )
-                .map_err(|_| ClientError::Tls)?;
-            Some(key)
-        } else {
-            None
-        };
+        let session = self.native_connection().await?;
+        let (transport, key) =
+            h3_adapter::NativeConnection::start(session).map_err(|_| ClientError::Tls)?;
+        let binding = self.certificate_pin.map(|_| key);
+        let close_opener = quic::Connection::opener(&transport);
         crate::diag!(
             Trace,
             "client.h3",
@@ -490,7 +700,7 @@ impl H3Client {
         let mut builder = h3::client::builder();
         builder.max_field_section_size(u64::from(crate::transport_policy::MAX_HEADER_LIST_BYTES));
         let (mut driver, sender) = builder
-            .build::<_, _, Bytes>(h3_quinn::Connection::new(connection))
+            .build::<_, _, Bytes>(transport)
             .await
             .map_err(|_| ClientError::Http3)?;
         // h3 closes the connection when the final SendRequest is dropped.
@@ -504,7 +714,7 @@ impl H3Client {
             sender: std::sync::Mutex::new(sender),
             driver,
             binding,
-            _endpoint: endpoint,
+            close_opener,
         })
     }
 
@@ -731,23 +941,62 @@ impl H3Client {
     }
 }
 
-fn quic_error(error: QuicError) -> ClientError {
-    match error {
-        QuicError::Configuration => ClientError::Configuration,
-        QuicError::Bind => ClientError::Io,
-        QuicError::Timeout => ClientError::Timeout,
-        QuicError::Unreachable => ClientError::QuicUnreachable,
-        QuicError::EndpointNetworkRefused => ClientError::QuicEndpointNetworkRefused,
-        QuicError::Handshake | QuicError::Alpn => ClientError::Tls,
-        QuicError::CongestionController => ClientError::Http3,
+fn dial_error(error: dial::Error) -> ClientError {
+    use crate::net::error::{EndpointUnavailable, FailureClass};
+    match error.class() {
+        FailureClass::Configuration => ClientError::Configuration,
+        FailureClass::LocalSetup => ClientError::Io,
+        FailureClass::AmbiguousTimeout => ClientError::Timeout,
+        FailureClass::EndpointUnavailable(EndpointUnavailable::NoResponse) => {
+            ClientError::QuicUnreachable
+        }
+        FailureClass::EndpointUnavailable(EndpointUnavailable::Refused) => {
+            ClientError::QuicEndpointNetworkRefused
+        }
+        _ => ClientError::Tls,
+    }
+}
+
+impl OpenAdapter for H3Client {
+    type Tunnel = H3Tunnel;
+    const KIND: CarrierKind = CarrierKind::H3;
+    fn explicit_stream_up(&self) -> bool {
+        self.stream_up
+    }
+    fn automatic_mode(&self) -> Option<&crate::split_http::AutoMode> {
+        self.auto_mode.as_ref()
+    }
+    async fn open_attempt<'a>(
+        &'a self,
+        open: &'a Frame,
+        operation: u64,
+        stream_up: bool,
+        stage: &'a mut crate::split_http::HelloOutcome,
+    ) -> Result<H3Tunnel, ClientError> {
+        self.open_inner(open, operation, stream_up, stage).await
     }
 }
 
 struct H3Connection {
-    sender: std::sync::Mutex<h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>>,
+    sender: std::sync::Mutex<h3::client::SendRequest<h3_adapter::Opener, Bytes>>,
     driver: Driver,
     binding: Option<crate::channel_binding::Key>,
-    _endpoint: ObservedEndpoint,
+    close_opener: h3_adapter::Opener,
+}
+
+impl Drop for H3Connection {
+    fn drop(&mut self) {
+        // The driver owns the HTTP/3 critical streams. Commit the connection
+        // close before aborting it or dropping SendRequest: otherwise their
+        // stream destructors can queue RESET_STREAM / STOP_SENDING while the
+        // native UDP worker is still open, racing the graceful close.
+        // close() preserves any earlier terminal transport error.
+        quic::OpenStreams::<Bytes>::close(
+            &mut self.close_opener,
+            h3::error::Code::H3_NO_ERROR,
+            b"",
+        );
+    }
 }
 
 struct Driver(JoinHandle<()>);
@@ -771,16 +1020,43 @@ pub struct H3Tunnel {
 }
 
 impl H3Tunnel {
+    pub(crate) async fn relay_udp(
+        mut self,
+        first: Option<Vec<u8>>,
+        upload: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        download: tokio::sync::mpsc::Sender<Vec<u8>>,
+        flow: Option<&crate::routing::flow::FlowLease>,
+    ) -> Result<(), ClientError> {
+        let mut reader = H3FrameReader {
+            decoder: &mut self.decoder,
+            stream: &mut self.rx,
+        };
+        session::relay_udp(
+            CarrierKind::H3,
+            &self.state,
+            &mut self.tx,
+            &mut reader,
+            first,
+            upload,
+            download,
+            flow,
+        )
+        .await
+    }
+
     pub(crate) fn opened_stream_up(&self) -> bool {
         self.stream_up
     }
     #[cfg(test)]
-    pub(crate) fn rebind_for_test(&self, socket: std::net::UdpSocket) -> Result<(), ClientError> {
+    pub(crate) async fn rebind_for_test(
+        &self,
+        socket: std::net::UdpSocket,
+    ) -> Result<(), ClientError> {
         self._lease
             .connection()
-            ._endpoint
-            .endpoint
-            .rebind(socket)
+            .close_opener
+            .rebind_for_test(socket)
+            .await
             .map_err(|_| ClientError::Io)
     }
 
@@ -790,157 +1066,60 @@ impl H3Tunnel {
         self._lease.shares_connection(&other._lease)
     }
 
-    pub async fn relay<S>(mut self, local: S) -> Result<(), ClientError>
+    pub async fn relay<S>(self, local: S) -> Result<(), ClientError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        let traffic = crate::traffic::enter(crate::Role::Client, true);
-        let operation = self.operation;
-        crate::diag!(
-            Debug,
-            "client.h3",
-            "relay_begin",
-            "op" = Value::Count(operation)
-        );
-        let (mut read, mut write) = tokio::io::split(local);
-        let tx = &mut self.tx;
-        let rx = &mut self.rx;
-        let decoder = &mut self.decoder;
-        let mut upload_state = self.state.clone();
-        let mut download_state = self.state.clone();
-        let activity = crate::relay_liveness::Activity::new();
-        let (upload_done, upload_finished) = tokio::sync::oneshot::channel();
-        let upload = async {
-            let mut buffer = [0; crate::relay_batch::MAX_BATCH];
-            let mut batch = crate::relay_batch::ReadyBatch::default();
-            loop {
-                let n = batch
-                    .read(&mut read, &mut buffer)
-                    .await
-                    .map_err(|_| ClientError::Io)?;
-                let frame = if n == 0 {
-                    Frame::Fin
-                } else {
-                    Frame::Data(buffer[..n].to_vec())
-                };
-                crate::diag!(
-                    Trace,
-                    "client.h3",
-                    "upload_frame",
-                    "op" = Value::Count(operation),
-                    "bytes" = Value::Count(n as u64),
-                    "fin" = Value::Flag(n == 0)
-                );
-                upload_state
-                    .apply(Direction::Send, &frame)
-                    .map_err(|_| ClientError::Protocol)?;
-                send(tx, &frame).await?;
-                if n == 0 {
-                    timeout(IO_TIMEOUT, tx.finish())
-                        .await
-                        .map_err(|_| ClientError::Timeout)?
-                        .map_err(|_| ClientError::Http3)?;
-                    activity.half_closed();
-                    let _ = upload_done.send(());
-                    return Ok::<(), ClientError>(());
-                }
-                self._lease.record_data(n);
-                traffic.upload(n);
-                activity.data(n);
-            }
+        self.relay_guarded(local, None).await
+    }
+
+    pub(crate) async fn relay_guarded<S>(
+        mut self,
+        local: S,
+        flow: Option<&crate::routing::flow::FlowLease>,
+    ) -> Result<(), ClientError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let mut reader = H3FrameReader {
+            decoder: &mut self.decoder,
+            stream: &mut self.rx,
         };
-        let download = async {
-            loop {
-                let frame = decoder.next(rx).await?.ok_or(ClientError::Protocol)?;
-                download_state
-                    .apply(Direction::Receive, &frame)
-                    .map_err(|_| ClientError::Protocol)?;
-                match frame {
-                    Frame::Padding(_) => tokio::task::yield_now().await,
-                    Frame::Data(data) => {
-                        crate::diag!(
-                            Trace,
-                            "client.h3",
-                            "download_frame",
-                            "op" = Value::Count(operation),
-                            "bytes" = Value::Count(data.len() as u64)
-                        );
-                        timeout(IO_TIMEOUT, write.write_all(&data))
-                            .await
-                            .map_err(|_| ClientError::Timeout)?
-                            .map_err(|_| ClientError::Io)?;
-                        self._lease.record_data(data.len());
-                        traffic.download(data.len());
-                        activity.data(data.len());
-                    }
-                    Frame::Fin => {
-                        crate::diag!(
-                            Debug,
-                            "client.h3",
-                            "download_fin",
-                            "op" = Value::Count(operation)
-                        );
-                        timeout(IO_TIMEOUT, write.shutdown())
-                            .await
-                            .map_err(|_| ClientError::Timeout)?
-                            .map_err(|_| ClientError::Io)?;
-                        activity.half_closed();
-                        break;
-                    }
-                    Frame::Abort(code) => return Err(ClientError::Open(code)),
-                    _ => return Err(ClientError::Protocol),
-                }
-            }
-            if crate::relay_liveness::receive_tail(
-                async {
-                    loop {
-                        let frame = decoder.next(rx).await?;
-                        if let Some(padding @ Frame::Padding(_)) = &frame {
-                            if activity.both_finished() {
-                                return Err(ClientError::Protocol);
-                            }
-                            download_state
-                                .apply(Direction::Receive, padding)
-                                .map_err(|_| ClientError::Protocol)?;
-                            tokio::task::yield_now().await;
-                            continue;
-                        }
-                        return Ok(frame);
-                    }
-                },
-                upload_finished,
-                ClientError::Timeout,
-            )
-            .await?
-            .is_some()
-            {
-                return Err(ClientError::Protocol);
-            }
-            Ok::<(), ClientError>(())
-        };
-        if let Err(error) = activity.run(upload, download, ClientError::Timeout).await {
-            crate::diag!(
-                Warn,
-                "client.h3",
-                "relay_failed",
-                "op" = Value::Count(operation),
-                "reason" = Value::Label(error_kind(&error))
-            );
-            return Err(error);
-        }
-        crate::diag!(
-            Debug,
-            "client.h3",
-            "relay_completed",
-            "op" = Value::Count(operation)
-        );
-        self.state
-            .apply(Direction::Send, &Frame::Fin)
-            .map_err(|_| ClientError::Protocol)?;
-        self.state
-            .apply(Direction::Receive, &Frame::Fin)
-            .map_err(|_| ClientError::Protocol)?;
-        self.state.finish().map_err(|_| ClientError::Protocol)
+        let lease = &self._lease;
+        session::relay_tcp(
+            CarrierKind::H3,
+            self.operation,
+            &mut self.state,
+            &mut self.tx,
+            &mut reader,
+            local,
+            flow,
+            |bytes| lease.record_data(bytes),
+        )
+        .await
+    }
+}
+
+impl FrameWriter for Tx {
+    async fn send<'a>(&'a mut self, frame: &'a Frame) -> Result<(), ClientError> {
+        send(self, frame).await
+    }
+    async fn finish(&mut self) -> Result<(), ClientError> {
+        send(self, &Frame::Fin).await?;
+        timeout(IO_TIMEOUT, RequestStream::finish(self))
+            .await
+            .map_err(|_| ClientError::Timeout)?
+            .map_err(|_| ClientError::Http3)
+    }
+}
+
+struct H3FrameReader<'a> {
+    decoder: &'a mut Incoming,
+    stream: &'a mut Rx,
+}
+impl FrameReader for H3FrameReader<'_> {
+    async fn next(&mut self) -> Result<Option<Frame>, ClientError> {
+        self.decoder.next(self.stream).await
     }
 }
 
@@ -1007,7 +1186,7 @@ mod probe_tests {
         let incoming = server.accept().await.unwrap();
         // A credential-free probe may close immediately after the verified
         // client handshake, before the server confirms its final flight.
-        if let Ok(connection) = incoming.await {
+        if let Ok(Ok(connection)) = timeout(Duration::from_secs(3), incoming).await {
             assert!(!matches!(
                 timeout(Duration::from_millis(250), connection.accept_bi()).await,
                 Ok(Ok(_))
@@ -1025,7 +1204,7 @@ mod probe_tests {
         let other = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let der = cert.cert.der().clone();
         let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-        let server = crate::quic_transport::server_endpoint(
+        let server = crate::quinn_reference::server_endpoint(
             "127.0.0.1:0".parse().unwrap(),
             vec![der.clone()],
             key.into(),

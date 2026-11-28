@@ -17,6 +17,8 @@ use tokio::{
 };
 use tokio_rustls::TlsAcceptor;
 
+#[path = "support/quinn_reference.rs"]
+mod quinn_reference;
 #[path = "support/shared_port.rs"]
 mod shared_port;
 
@@ -27,7 +29,7 @@ const TOKEN: [u8; 32] = [0x42; 32];
 async fn shared_quic_listener(
     der: rustls::pki_types::CertificateDer<'static>,
     key: rustls::pki_types::PrivateKeyDer<'static>,
-) -> (TcpListener, quinn::Endpoint) {
+) -> (TcpListener, theia::h3_server::OwnTlsEndpoint) {
     let mut rejected = Vec::new();
     let mut last_error = None;
     for _ in 0..64 {
@@ -117,6 +119,7 @@ fn listener_with_pem_bound_mode(
         disabled: false,
     };
     let policy = ServerPolicy {
+        routing: None,
         allow_private_ips: private,
         max_connections_per_user: 8,
         max_connections_total: 8,
@@ -415,12 +418,13 @@ async fn wait_for_proxy(address: std::net::SocketAddr, child: &mut ChildProcess)
     .expect("client listener startup deadline");
 }
 
-async fn launch_client_with_profile(
+async fn launch_client_with_profile_expected(
     endpoint: String,
     pem: String,
     label: &str,
     transport: theia::config::Transport,
     security_mode: theia::security_profile::SecurityMode,
+    expect_ready: bool,
 ) -> (
     TestDirectory,
     ChildProcess,
@@ -490,6 +494,32 @@ async fn launch_client_with_profile(
     drop(http_reservation);
     drop(socks_reservation);
     let mut child = ChildProcess(command.spawn().unwrap());
+    if !expect_ready {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                assert!(
+                    TcpStream::connect(http).await.is_err(),
+                    "denied client exposed HTTP listener"
+                );
+                assert!(
+                    TcpStream::connect(socks).await.is_err(),
+                    "denied client exposed SOCKS listener"
+                );
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    assert_eq!(
+                        status.code(),
+                        Some(2),
+                        "expected controlled startup refusal"
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("failed authenticated preflight must exit without binding");
+        return (dir, child, http, socks);
+    }
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
         use theia::management::{StatusCommand, StatusReply};
@@ -525,6 +555,21 @@ async fn launch_client_with_profile(
     wait_for_proxy(http, &mut child).await;
     wait_for_proxy(socks, &mut child).await;
     (dir, child, http, socks)
+}
+
+async fn launch_client_with_profile(
+    endpoint: String,
+    pem: String,
+    label: &str,
+    transport: theia::config::Transport,
+    security_mode: theia::security_profile::SecurityMode,
+) -> (
+    TestDirectory,
+    ChildProcess,
+    std::net::SocketAddr,
+    std::net::SocketAddr,
+) {
+    launch_client_with_profile_expected(endpoint, pem, label, transport, security_mode, true).await
 }
 
 async fn launch_client(
@@ -584,6 +629,7 @@ async fn imported_server_invitation_reaches_real_connect_and_socks5_without_env_
         };
         let endpoint_port = endpoint.rsplit(':').next().unwrap().parse::<u16>().unwrap();
         source.server.inbounds[0].server_name = "localhost".into();
+        source.server.inbounds[0].tls_cert = ca_ref.clone();
         source.server.inbounds[0].h2_listen = format!("127.0.0.1:{endpoint_port}");
         source.server.inbounds[0].quic_listen = format!("127.0.0.1:{endpoint_port}");
         source.server.inbounds[0].allowed_user_ids = vec!["client".into()];
@@ -597,9 +643,7 @@ async fn imported_server_invitation_reaches_real_connect_and_socks5_without_env_
         let confidential = invitation.encode().unwrap();
         let decoded = theia::client_import::read_source(&confidential).unwrap();
         let mut editor = Editor::load(Role::Client, &config_path).unwrap();
-        editor
-            .import_invitation(&decoded, Some(&ca_ref), None)
-            .unwrap();
+        editor.import_invitation(&decoded, None, None).unwrap();
         let Config::Client(mut client) = config::read_file(&config_path).unwrap() else {
             panic!("client");
         };
@@ -611,7 +655,7 @@ async fn imported_server_invitation_reaches_real_connect_and_socks5_without_env_
             .unwrap()
             .contains(&token()));
         assert_eq!(imported.server, endpoint);
-        assert_eq!(imported.tls_ca.as_deref(), Some(ca_ref.as_str()));
+        assert_eq!(imported.tls_ca, invitation.trust_reference());
 
         // The user separately selects the imported profile and starts the
         // client. Neither step was part of the import operation itself.
@@ -814,6 +858,7 @@ async fn client_binary_chromium_socks5_over_h3() {
         disabled: false,
     };
     let policy = ServerPolicy {
+        routing: None,
         allow_private_ips: true,
         max_connections_per_user: 8,
         max_connections_total: 8,
@@ -1184,6 +1229,7 @@ async fn auto_falls_back_only_after_udp_silence_and_uses_negative_cache() {
                 tcp.shutdown().await.unwrap();
             }
         });
+        let started = std::time::Instant::now();
         let (_dir, _child, http, _socks) = launch_client(
             endpoint,
             pem,
@@ -1193,14 +1239,13 @@ async fn auto_falls_back_only_after_udp_silence_and_uses_negative_cache() {
         .await;
         // The example uses a 1600 ms handshake deadline. A single silent
         // attempt must not authorize fallback; both deadlines must elapse.
-        let started = std::time::Instant::now();
-        assert!(auto_connect(http, port).await.starts_with("HTTP/1.1 200 "));
         assert!(
             started.elapsed() >= Duration::from_millis(3200),
             "H2 fallback requires two silent QUIC handshake attempts"
         );
         let first = probes.load(std::sync::atomic::Ordering::SeqCst);
         assert!(first > 0, "auto must actually attempt QUIC before H2");
+        assert!(auto_connect(http, port).await.starts_with("HTTP/1.1 200 "));
         assert!(auto_connect(http, port).await.starts_with("HTTP/1.1 200 "));
         assert_eq!(
             probes.load(std::sync::atomic::Ordering::SeqCst),
@@ -1223,22 +1268,33 @@ async fn auto_wrong_h3_certificate_never_retries_working_h2() {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let der = cert.cert.der().clone();
         let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-        let (tcp, udp) = shared_quic_listener(der, key.into()).await;
+        // Keep this wrong-PKI peer independent of the native client.
+        let (tcp, udp) = shared_port::reserve_shared_port();
+        tcp.set_nonblocking(true).unwrap();
+        udp.set_nonblocking(true).unwrap();
+        let tcp = TcpListener::from_std(tcp).unwrap();
+        let udp = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(quinn_reference::server_config(vec![der], key.into()).unwrap()),
+            udp,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .unwrap();
         let (endpoint, _roots, pem, server) = listener_with_pem_bound(true, tcp);
         let quic = tokio::spawn(async move {
             let incoming = udp.accept().await.unwrap();
-            assert!(theia::quic_transport::accept(incoming).await.is_err());
+            assert!(quinn_reference::accept(incoming).await.is_err());
         });
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = target.local_addr().unwrap().port();
-        let (_dir, _child, http, _socks) = launch_client(
+        let (_dir, _child, _http, _socks) = launch_client_with_profile_expected(
             endpoint,
             pem,
             "auto-untrusted",
             theia::config::Transport::Auto,
+            theia::security_profile::SecurityMode::Plain,
+            false,
         )
         .await;
-        assert!(auto_connect(http, port).await.starts_with("HTTP/1.1 502 "));
         quic.await.unwrap();
         assert!(timeout(Duration::from_millis(250), target.accept())
             .await
@@ -1289,6 +1345,7 @@ async fn auto_denied_h3_bearer_never_retries_working_h2() {
             disabled: false,
         };
         let policy = ServerPolicy {
+            routing: None,
             allow_private_ips: true,
             max_connections_per_user: 8,
             max_connections_total: 8,
@@ -1308,15 +1365,15 @@ async fn auto_denied_h3_bearer_never_retries_working_h2() {
         ));
         let h3 = tokio::spawn(theia::h3_server::serve(udp, h3_context));
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = target.local_addr().unwrap().port();
-        let (_dir, _child, http, _socks) = launch_client(
+        let (_dir, _child, _http, _socks) = launch_client_with_profile_expected(
             remote.to_string(),
             cert.cert.pem(),
             "auto-denied",
             theia::config::Transport::Auto,
+            theia::security_profile::SecurityMode::Plain,
+            false,
         )
         .await;
-        assert!(auto_connect(http, port).await.starts_with("HTTP/1.1 403 "));
         assert!(timeout(Duration::from_millis(250), target.accept())
             .await
             .is_err());

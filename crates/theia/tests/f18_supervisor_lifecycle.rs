@@ -106,15 +106,37 @@ impl Endpoint {
     }
 }
 
-fn available_address() -> SocketAddr {
-    (0..16)
-        .find_map(|_| {
-            let tcp = TcpListener::bind("127.0.0.1:0").ok()?;
-            let address = tcp.local_addr().ok()?;
-            let _udp = UdpSocket::bind(address).ok()?;
-            Some(address)
-        })
-        .expect("shared TCP/UDP fixture port")
+fn reserve_address() -> (SocketAddr, TcpListener, UdpSocket) {
+    // The Windows TCP and UDP ephemeral/excluded ranges can differ. Try
+    // both allocation directions, then a bounded set of explicit loopback
+    // ports outside the default dynamic range. Keep both reservations alive.
+    for attempt in 0..128 {
+        if attempt % 2 == 0 {
+            if let Ok(tcp) = TcpListener::bind("127.0.0.1:0") {
+                let address = tcp.local_addr().unwrap();
+                if let Ok(udp) = UdpSocket::bind(address) {
+                    return (address, tcp, udp);
+                }
+            }
+        } else if let Ok(udp) = UdpSocket::bind("127.0.0.1:0") {
+            let address = udp.local_addr().unwrap();
+            if let Ok(tcp) = TcpListener::bind(address) {
+                return (address, tcp, udp);
+            }
+        }
+        let port = 20_000
+            + ((std::process::id()
+                .wrapping_mul(137)
+                .wrapping_add(attempt * 131))
+                % 20_000) as u16;
+        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        if let Ok(tcp) = TcpListener::bind(address) {
+            if let Ok(udp) = UdpSocket::bind(address) {
+                return (address, tcp, udp);
+            }
+        }
+    }
+    panic!("shared TCP/UDP fixture port")
 }
 
 fn save(path: &Path, doc: &ServerDocument) -> [u8; 32] {
@@ -148,7 +170,7 @@ async fn independent_replacement_apply_is_irreversible_across_native_supervisor_
         Scratch(std::env::temp_dir().join(format!("theia-f18-{}-{sequence}", std::process::id())));
     fs::create_dir(&directory.0).unwrap();
     timeout(Duration::from_secs(55), async {
-        let address = available_address();
+        let (address, reserved_tcp, reserved_udp) = reserve_address();
         let now = reference_health::unix_now().unwrap();
         let state = State::new(
             Plan {
@@ -203,6 +225,7 @@ async fn independent_replacement_apply_is_irreversible_across_native_supervisor_
             .unwrap()
             .manifest_sha256;
         let control = Endpoint::new(&directory.0, sequence);
+        drop((reserved_tcp, reserved_udp));
         let mut process = control.launch(&config);
         control.ready(&mut process).await;
         assert!(TcpListener::bind(address).is_err());

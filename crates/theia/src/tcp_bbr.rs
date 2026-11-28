@@ -121,17 +121,14 @@ mod platform {
 pub(crate) use platform::{select, verify};
 
 fn new_socket(address: SocketAddr) -> Result<TcpSocket, Error> {
-    let socket = if address.is_ipv4() {
-        TcpSocket::new_v4()?
-    } else {
-        TcpSocket::new_v6()?
-    };
+    let socket = crate::routing::carrier_socket::new_tcp(address)?;
     select(&socket)?;
     Ok(socket)
 }
 
 /// Select before connect and observe after connect; return the actual
 /// controller when the platform exposes readback.
+#[allow(dead_code)]
 pub(crate) async fn connect(endpoint: &str) -> Result<(TcpStream, Controller), Error> {
     for address in tokio::net::lookup_host(endpoint).await? {
         let socket = new_socket(address)?;
@@ -143,12 +140,42 @@ pub(crate) async fn connect(endpoint: &str) -> Result<(TcpStream, Controller), E
     Err(Error::Network)
 }
 
+/// Product H2 socket factory. The optional scope admits exactly the
+/// concrete socket and target before the first SYN. Its lease is retained
+/// by the H2 driver task until that connection is destroyed.
+pub(crate) async fn connect_carrier(
+    endpoint: &str,
+) -> Result<(TcpStream, Controller, crate::routing::carrier_socket::Lease), Error> {
+    use crate::routing::carrier_socket;
+    if carrier_socket::active() && endpoint.parse::<SocketAddr>().is_err() {
+        // The native capture scope cannot silently send local DNS.
+        return Err(Error::Unavailable);
+    }
+    for address in tokio::net::lookup_host(endpoint).await? {
+        let socket = new_socket(address)?;
+        let lease = carrier_socket::admit_tcp_dial(&socket, address).map_err(|error| {
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                Error::Unavailable
+            } else {
+                Error::Network
+            }
+        })?;
+        if let Ok(stream) = socket.connect(address).await {
+            if stream.peer_addr().ok() != Some(address) {
+                return Err(Error::Unavailable);
+            }
+            let controller = verify(&stream)?;
+            return Ok((stream, controller, lease));
+        }
+    }
+    Err(Error::Network)
+}
+
 pub(crate) fn bind(address: SocketAddr) -> Result<TcpListener, Error> {
     let socket = new_socket(address)?;
     #[cfg(target_os = "linux")]
     socket.set_reuseaddr(true)?;
-    socket.bind(address)?;
-    let listener = socket.listen(1024)?;
+    let listener = crate::routing::carrier_socket::listen_tcp(socket, address, 1024)?;
     verify(&listener)?;
     Ok(listener)
 }

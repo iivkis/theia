@@ -94,7 +94,11 @@ class SpecContractTests(unittest.TestCase):
             self.assertTrue(profile["auth_token"].startswith(("env:", "file:")))
             self.assertEqual(profile["security_mode"], "own-tls")
         proxy = client["proxy"]
-        self.assertEqual(proxy["system_proxy"], "off")
+        self.assertEqual(client["ingress_mode"], "system_proxy")
+        self.assertNotIn("system_proxy", proxy)
+        self.assertNotIn("direct_dpi", proxy)
+        self.assertNotIn("direct_dpi_stun", proxy)
+        self.assertTrue(all(not p.get("direct_dpi", False) and not p.get("direct_dpi_stun", False) for p in profiles))
         for name in ("http_listen", "socks5_listen"):
             self.assertRegex(proxy[name], r"^(127\.0\.0\.1|\[::1\]):[0-9]+$")
 
@@ -104,10 +108,14 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("pub mod camouflage_probe;", read("crates/theia/src/lib.rs"))
         for token in ("pub fn route_selected_local_ip", "pub async fn probe_tls_h2",
                       "ProbeApproval", "IsolatedLoopbackFixture", "PublicHttpsIp",
-                      "TlsConnector", "RootCertStore", "Semaphore::const_new(4)",
+                      "TlsConnector", "RootCertStore", "REFERENCE_PROBES",
                       "MAX_HANDSHAKE_DEADLINE", "Observation::Unknown"):
             with self.subTest(token=token):
                 self.assertIn(token, code)
+        scheduler = read("crates/theia/src/net/probe.rs")
+        self.assertIn("REFERENCE_PROBES: ProbeBudget = ProbeBudget::new(4)", scheduler)
+        self.assertIn("Semaphore::const_new(limit)", scheduler)
+        self.assertIn("REFERENCE_PROBES", read("crates/theia/src/camouflage_h3_probe.rs"))
         for token in ("wrong_ca", "wrong_sni", "timeout", "NoTrustAnchors",
                       "NotApproved", "fingerprint", "TLS1.3"):
             with self.subTest(token=token):
@@ -136,8 +144,12 @@ class SpecContractTests(unittest.TestCase):
         self.assertTrue(all(p["security_mode"] == "own-tls" for p in client["profiles"]))
         self.assertIn('profile.security_mode.is_plain()', read("crates/theia/src/config.rs"))
 
-    def test_windows_manual_proxy_is_not_auto_enabled(self):
-        self.assertNotIn('system_proxy = "on"', read("examples/client.toml"))
+    def test_saved_ingress_mode_is_not_auto_enabled(self):
+        client = toml("examples/client.toml")["client"]
+        self.assertEqual(client["ingress_mode"], "system_proxy")
+        self.assertNotIn("system_proxy", client["proxy"])
+        self.assertIn("ingress_defaults_and_legacy_proxy_keys_are_rejected", read("crates/theia/src/config.rs"))
+        self.assertIn("wininet_system_proxy_requires_independent_confirmation", read("crates/theia/src/lib.rs"))
 
     def test_m01_api_spike_isolated_and_locked(self):
         from pathlib import Path
@@ -171,8 +183,10 @@ class SpecContractTests(unittest.TestCase):
             self.assertIn(required, live_tests)
         workflow = read(".github/workflows/ci.yml")
         self.assertNotIn("actions/setup-go", workflow)
-        self.assertIn("--test independent_h2_loopback -- --ignored", workflow)
-        self.assertIn("run_f13_observations.py f13-observations", workflow)
+        extended = read(".github/workflows/extended-validation.yml")
+        self.assertIn("--test independent_h2_loopback -- --ignored", extended)
+        self.assertIn("run_f13_observations.py f13-observations", extended)
+        self.assertNotIn("run_f13_observations.py f13-observations", workflow)
         runner = read("tests/benchmark/run_f13_observations.py")
         self.assertIn("actual_chromium_h2_settings_and_pseudo_order_reference", runner)
         self.assertIn("actual_chromium_h3_initial_reference", runner)
@@ -247,7 +261,7 @@ class SpecContractTests(unittest.TestCase):
         implementation = read("crates/theia/src/config.rs")
         for required in ("deny_unknown_fields", "allowed_user_ids", "overlaps(",
                          "Ipv6Addr::UNSPECIFIED", "atomic_write", "file.sync_all()",
-                         "secret", "SystemProxy", "MAX_BYTES"):
+                         "secret", "IngressMode", "MAX_BYTES"):
             self.assertIn(required, implementation)
 
     def test_m13_pure_smarttheia_protocol_has_golden_tests(self):
@@ -275,10 +289,13 @@ class SpecContractTests(unittest.TestCase):
         binary = read("crates/theia/src/main.rs")
         for term in ("pub async fn serve(", "pub async fn run_file(",
                      "fn allowed_destination(", "URL_SAFE_NO_PAD", "Sha256::digest",
-                     "ct_eq(", "lookup_host(", "TcpStream::connect",
+                     "ct_eq(", "lookup_host(", "carrier_socket::connect_plain_tcp",
                      "Frame::OpenOk", "TlsAcceptor", "Carrier::H2.h2_server()",
                      "Carrier::H2.accepts_tls("):
             self.assertIn(term, implementation)
+        factory = read("crates/theia/src/routing/carrier_socket.rs")
+        self.assertIn("socket.connect(peer).await?", factory)
+        self.assertIn("admit_tcp_dial(&socket, peer)?", factory)
         policy = read("crates/theia/src/transport_policy.rs")
         for term in ("MAX_BIDI_STREAMS: u32 = 32", "MAX_HEADER_LIST_BYTES: u32 = 8192",
                      "builder.max_concurrent_streams(MAX_BIDI_STREAMS)",
@@ -297,16 +314,17 @@ class SpecContractTests(unittest.TestCase):
         workflow = read(".github/workflows/ci.yml")
         self.assertIn("Swatinem/rust-cache@v2", workflow)
         self.assertIn("scripts/check-spec.sh", workflow)
-        self.assertIn("cargo test --workspace --all-targets --locked", workflow)
-        self.assertLess(workflow.index("cargo test --workspace --all-targets --locked"),
+        self.assertIn("cargo nextest run --workspace --lib --bins --locked --no-fail-fast", workflow)
+        self.assertIn("cargo nextest run --workspace --test '*' --locked --no-fail-fast", workflow)
+        self.assertLess(workflow.index("cargo nextest run --workspace --lib --bins --locked --no-fail-fast"),
                         workflow.index("cargo clippy"))
         self.assertIn("Cargo.lock", workflow)
 
     def test_ci_only_acceptance_contract(self):
         workflow = read(".github/workflows/ci.yml")
         gate = workflow.split("\n  ci-gate:\n", 1)[1]
-        for job in ("specification", "m0-1-api-spike", "m0-1-windows-spike",
-                    "rust-tests", "windows-smoke"):
+        for job in ("specification", "rust-tests", "windows-smoke",
+                    "native-checks", "f14-build", "f14-cross-host", "coverage-native", "coverage-gate"):
             self.assertIn(job, gate.split("if:", 1)[0])
         self.assertIn("always()", gate)
         self.assertIn('get("result") != "success"', gate)
@@ -331,7 +349,7 @@ class SpecContractTests(unittest.TestCase):
                      "connection.graceful_shutdown()", "connection.shutdown(0).await",
                      "shares_transport_with", "h2_scenario(true)", "h3_scenario(true)"):
             self.assertIn(term, code)
-        self.assertIn("cargo test --workspace --all-targets --locked", read(".github/workflows/ci.yml"))
+        self.assertIn("cargo nextest run --workspace --lib --bins --locked --no-fail-fast", read(".github/workflows/ci.yml"))
 
     def test_m22_local_proxy_gate_and_cli_wiring(self):
         implementation = read("crates/theia/src/local_proxy.rs")
@@ -347,9 +365,10 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("CARGO_BIN_EXE_theia", tests)
         self.assertIn("client_binary_chromium_socks5", tests)
         workflow = read(".github/workflows/ci.yml")
-        self.assertIn("browser-e2e", workflow.split("\n  ci-gate:\n", 1)[1])
-        self.assertIn("client_binary_chromium_socks5 -- --ignored --exact", workflow)
-        self.assertIn("client_binary_chromium_socks5_over_h3 -- --ignored --exact", workflow)
+        self.assertIn("coverage-native", workflow.split("\n  ci-gate:\n", 1)[1])
+        self.assertIn("name = 'client_binary_chromium_socks5'; shard = 4", workflow)
+        self.assertIn("name = 'client_binary_chromium_socks5_over_h3'; shard = 4", workflow)
+        self.assertIn("$name --ignored --exact", workflow)
         self.assertIn("production_h3_client_refuses_incompatible_alpn_before_application_data",
                       read("crates/theia/tests/h3_server.rs"))
         self.assertIn("browser bypassed the Theia SOCKS5 path", read("tests/e2e/chromium_socks.py"))
@@ -402,10 +421,20 @@ class SpecContractTests(unittest.TestCase):
 
     def test_m31_h3_client_gate(self):
         client = read("crates/theia/src/h3_client.rs")
-        self.assertIn("ObservedEndpoint::new", client)
+        # Production H3 now uses the native QUIC dialer; retain the
+        # transport observation and fail-closed handshake contract.
+        self.assertIn("dial::connect(self.remote", client)
+        self.assertIn("self.native_connection().await?", client)
+        self.assertIn("dial::close_probe(session)", client)
+        dialer = read("crates/theia/src/quic_core/dial.rs")
+        self.assertIn("observation.failure(true)", dialer)
+        self.assertIn("fallback_requires_observed_send_or_exact_send_error_and_no_response", dialer)
+        self.assertNotIn("quinn::", client.split("#[cfg(test)]\nmod probe_tests", 1)[0])
         self.assertIn("bearer_header(token)?", client)
         self.assertIn("Frame::OpenOk if state.tunnel_open()", client)
-        self.assertIn(".run(upload, download, ClientError::Timeout)", client)
+        self.assertIn("session::relay_tcp(", client)
+        self.assertIn(".run(upload, download, ClientError::Timeout)",
+                      read("crates/theia/src/xhttp/session.rs"))
         self.assertIn("tokio::try_join!(upload, download)", read("crates/theia/src/relay_liveness.rs"))
         tests = read("crates/theia/tests/h3_server.rs")
         self.assertIn("production_h3_client_and_server_relay_exact_bytes", tests)
@@ -415,6 +444,9 @@ class SpecContractTests(unittest.TestCase):
         for adapter in ("client", "h3_client", "server", "h3_server"):
             source = read(f"crates/theia/src/{adapter}.rs")
             with self.subTest(adapter=adapter):
+                if adapter in ("client", "h3_client"):
+                    self.assertIn("session::relay_tcp(", source)
+                    source = read("crates/theia/src/xhttp/session.rs")
                 self.assertIn("relay_liveness::Activity::new()", source)
                 self.assertIn("activity.data(", source)
                 self.assertIn("activity.half_closed()", source)
@@ -427,7 +459,7 @@ class SpecContractTests(unittest.TestCase):
             self.assertIn(f"Case::{case}", tests)
         for adapter in ("server", "h3_server"):
             source = read(f"crates/theia/src/{adapter}.rs")
-            relay = source.split("async fn relay_request(", 1)[1].split("\nasync fn ", 1)[0]
+            relay = source.split("async fn relay_request", 1)[1].split("\nasync fn ", 1)[0]
             self.assertNotIn("SESSION_TIMEOUT", relay)
             self.assertNotIn("Duration::from_secs(300)", relay)
         self.assertIn("h2_request_trailers_after_fin_reset_the_stream",
@@ -438,44 +470,53 @@ class SpecContractTests(unittest.TestCase):
         self.assertIn("enum Carrier", proxy)
         self.assertIn("(None, Some(h3)) => Ok(Self::H3(h3))", proxy)
         self.assertRegex(proxy, r"Self::H3\(client\)\s*=>\s*client\s*\.open\(address,\s*port\)")
-        self.assertIn("Err(ClientError::QuicUnreachable)", proxy)
+        self.assertIn("Err(ClientError::QuicUnreachable)",
+                      read("crates/theia/src/local_proxy/auto.rs"))
         server = read("crates/theia/src/server.rs")
-        self.assertIn("crate::h3_server::serve(endpoint, context)", server)
+        self.assertIn("tasks.spawn(endpoint.serve(context))", server)
         self.assertIn("tasks.spawn(serve(listener, acceptor, context.clone()))", server)
         self.assertIn("h3_server_and_client_binaries_curl_both_local_proxies",
                       read("crates/theia/tests/client_h2.rs"))
 
     def test_m32_auto_selector_is_fail_closed(self):
         proxy = read("crates/theia/src/local_proxy.rs")
-        quic = read("crates/theia/src/quic_transport.rs")
-        self.assertIn("Err(ClientError::QuicUnreachable)", proxy)
-        self.assertIn("self.observation.sent.load", quic)
-        self.assertIn("self.observation.received.load", quic)
-        self.assertIn("handshake_timeout_error", quic)
-        self.assertIn("only_destination_send_network_errors_are_definitive", quic)
-        self.assertIn("QuicEndpointNetworkRefused", proxy)
-        self.assertIn("AUTO_QUIC_ATTEMPTS", proxy)
-        self.assertIn("negative_cache_expires_and_zero_ttl_disables_it", proxy)
-        self.assertIn("recheck_deadline_is_not_extended_and_only_one_generation_can_claim_it", proxy)
-        self.assertIn("idle_profile_rechecks_quic_without_opening_an_application_tunnel", proxy)
-        self.assertIn("result = &mut maintenance => return result", proxy)
-        self.assertIn("self.attempt_h3(generation, || self.h3.probe()).await", proxy)
-        self.assertIn("self.verified_connection().await.map(|_| ())", read("crates/theia/src/h3_client.rs"))
-        self.assertIn("route_change_rejects_stale_results_and_unknown_route_disables_cache", proxy)
-        self.assertIn("crate::network_scope::observe(self.h3.remote())", proxy)
+        auto = read("crates/theia/src/local_proxy/auto.rs")
+        regression = read("crates/theia/src/local_proxy/selector_tests.rs")
+        errors = read("crates/theia/src/net/error.rs")
+        quic = read("crates/theia/src/quic_core/dial.rs")
+        self.assertIn("Err(ClientError::QuicUnreachable)", auto)
+        self.assertIn("self.sent.load", quic)
+        self.assertIn("self.received.load", quic)
+        self.assertIn("observation.failure(true)", quic)
+        self.assertIn("fallback_requires_observed_send_or_exact_send_error_and_no_response", quic)
+        self.assertIn("malformed_response_disables_silence_classification", quic)
+        self.assertIn("ClientError::QuicEndpointNetworkRefused => Some(EndpointUnavailable::Refused)", errors)
+        self.assertIn("endpoint_unavailable(error)", auto)
+        self.assertIn("AUTO_QUIC_ATTEMPTS", auto)
+        self.assertIn("negative_cache_expires_and_zero_ttl_disables_it", regression)
+        self.assertIn("recheck_deadline_is_not_extended_and_only_one_generation_can_claim_it", regression)
+        self.assertIn("idle_profile_rechecks_quic_without_opening_an_application_tunnel", regression)
+        self.assertRegex(proxy, r"result = &mut maintenance => \{\s*tasks.shutdown\(\).await;\s*return result;")
+        self.assertIn("self.attempt_h3(generation, || self.h3.probe()).await", auto)
+        self.assertIn("dial::close_probe(session)", read("crates/theia/src/h3_client.rs"))
+        self.assertIn("route_change_rejects_stale_results_and_unknown_route_disables_cache", regression)
+        self.assertIn("crate::network_scope::observe(self.h3.remote())", auto)
         tests = read("crates/theia/tests/client_h2.rs")
         for name in ("auto_falls_back_only_after_udp_silence_and_uses_negative_cache",
                      "auto_wrong_h3_certificate_never_retries_working_h2",
                      "auto_denied_h3_bearer_never_retries_working_h2"):
             self.assertIn(name, tests)
 
-    def test_m33_quic_congestion_comparison_is_mandatory(self):
-        workflow = read(".github/workflows/ci.yml")
-        gate = workflow.split("\n  ci-gate:\n", 1)[1]
-        # Native BBR evidence is mandatory inside the existing Linux/Windows
-        # M0.1 jobs, not via another pair of identical Cargo builds.
+    def test_m33_quic_congestion_comparison_is_extended_acceptance(self):
+        fast = read(".github/workflows/ci.yml")
+        workflow = read(".github/workflows/extended-validation.yml")
+        gate = workflow.split("\n  extended-gate:\n", 1)[1]
+        # Native BBR comparison stays in explicit extended acceptance, not
+        # ordinary per-merge MVP CI. Production QUIC regressions remain.
         self.assertIn("m0-1-api-spike", gate)
         self.assertIn("m0-1-windows-spike", gate)
+        self.assertNotIn("m0-1-api-spike", fast)
+        self.assertNotIn("m0-1-windows-spike", fast)
         self.assertNotIn("\n  m3-3-bbr-comparison:\n", workflow)
         bbr = ("comparison_records_all_controller_scenarios_ci_only "
                "-- --ignored --exact --nocapture")
@@ -510,7 +551,19 @@ class SpecContractTests(unittest.TestCase):
         server = read("crates/theia/src/server.rs")
         self.assertIn("crate::tcp_bbr::bind", server)
         self.assertIn("crate::tcp_bbr::select(&socket)", server)
-        self.assertIn("BbrConfig::default()", read("crates/theia/src/quic_transport.rs"))
+        self.assertIn("Congestion::Bbr => Scheduler::with_bbr", read("crates/theia/src/quic_core/handshake_udp.rs"))
+        self.assertIn("BbrConfig::default()", read("crates/theia/tests/support/quinn_reference.rs"))
+
+    def test_native_quic_has_no_normal_quinn_dependency(self):
+        manifest = toml("crates/theia/Cargo.toml")
+        for dependency in ("quinn", "quinn-proto", "h3-quinn"):
+            self.assertNotIn(dependency, manifest["dependencies"])
+        self.assertIn("cargo tree --locked -p theia -e normal,build", read(".github/workflows/ci.yml"))
+        self.assertIn("Candidate::admitted", read("crates/theia/src/reality_quic.rs"))
+        self.assertIn("receive_to", read("crates/theia/src/quic_core/listener.rs"))
+        self.assertIn("send_from", read("crates/theia/src/quic_core/listener.rs"))
+        self.assertNotIn("quinn::", read("crates/theia/src/h3_server.rs"))
+        self.assertNotIn("quinn::", read("crates/theia/src/reality_live.rs"))
 
     def test_offline_signed_descriptor_has_fail_closed_acceptance_contract(self):
         source = read("crates/theia/src/descriptor.rs")

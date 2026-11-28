@@ -386,6 +386,14 @@ impl RuntimePanel {
             return false;
         }
         match (self.phase, key.code) {
+            (
+                Phase::Viewing { .. } | Phase::Applied { .. } | Phase::CutoverApplied { .. },
+                KeyCode::Char('R'),
+            ) if self.saved_sha256.is_some() => {
+                self.phase = Phase::RestartChecking;
+                self.start(StatusCommand::CheckRestart);
+                false
+            }
             (Phase::RestartChecking, KeyCode::Esc) => true,
             (Phase::RestartChecking, _) => false,
             (
@@ -634,6 +642,10 @@ impl RuntimePanel {
             }
             items.extend([
                 ActionItem {
+                    key: 'R',
+                    label: "Проверить возможность перезапуска",
+                },
+                ActionItem {
                     key: 's',
                     label: "Применить структуру сервера",
                 },
@@ -736,9 +748,9 @@ impl RuntimePanel {
             Phase::RollbackUnavailable=>"Одноразовый откат недоступен или истёк. Ничего не изменено.\nr: статус | Esc: закрыть".into(),
             Phase::Checking => "Запрос IPC status...\nТолько чтение; ничего не применяется.\nEsc: закрыть".into(),
             Phase::Viewing { inbounds, revision } => format!(
-                "Сервер работает. Inbounds: {inbounds}. Авторизация: revision={revision}.\n\n{}\nr: обновить статус | Esc: закрыть",
+                "Сервер работает. Подключений: {inbounds}. Версия прав доступа: {revision}.\n\n{}\nr: обновить статус | Esc: закрыть",
                 if self.saved_sha256.is_some() {
-                    "a: проверить и подтвердить Apply сохранённого TOML\nПрименяются пользователи, token digest, disabled и grants; занятость удалённых ID сохраняется до завершения их туннелей.\nb: проверить одноразовый откат авторизации REALITY (300 с).\nc: проверить quota-only Apply.\ns: проверить структурный Apply.\nz: проверить структурный откат.\nt: проверить TLS rollback."
+                    "Выберите, какие сохранённые изменения применить. Права доступа, лимиты и структура проверяются отдельно. Действующие соединения при изменении прав сохраняются. Откат возможен только после проверки сервером."
                 } else {
                     "Применение недоступно без явного --role server --config FILE."
                 }
@@ -753,7 +765,7 @@ impl RuntimePanel {
             ),
             Phase::Rejected => "Сервер отклонил кандидат или ревизию. Авторизация не применена.\nПроверьте, что TOML не менялся с момента сохранения, сервер использует тот же файл, а TLS PEM/политика неизменны.\nr: запросить фактический статус | Esc: закрыть".into(),
             Phase::Indeterminate => "Ответ IPC потерян или повреждён. Применение МОГЛО произойти.\nПовторять Apply наугад нельзя. Сначала проверьте текущую revision по r: статус, затем перепроверьте TOML.\nEsc: закрыть".into(),
-            Phase::Unavailable => "Связь с сервером не подтверждена. Запустите сервер в TUI и дождитесь готовности. Для внешнего сервиса нужен настроенный локальный IPC (Linux: THEIA_CONTROL_DIR; Windows: THEIA_CONTROL_PIPE).\nНичего не применено.\nr: повторить проверку | Esc: закрыть".into(),
+            Phase::Unavailable => "Связь с сервером не подтверждена. Это не означает, что он остановлен.\nДля внешней службы нужен защищённый локальный канал управления.\nНичего не применено. Выберите обновление состояния или вернитесь к управлению.".into(),
         }
     }
 }

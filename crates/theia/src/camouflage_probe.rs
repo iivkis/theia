@@ -6,32 +6,25 @@
 //! Caller approval is required for every socket and never inferred from
 //! ASN, provider prefix or the candidate's popularity.
 use crate::camouflage_discovery::{plausible_public_address, Observation, TlsEvidence};
+use crate::net::probe::REFERENCE_PROBES;
 use rustls::{pki_types::ServerName, RootCertStore};
 use std::{
     io,
-    net::{IpAddr, SocketAddr, UdpSocket},
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{net::TcpStream, sync::Semaphore, time::timeout};
+use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 
 const MAX_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(5);
-static ACTIVE_PROBES: Semaphore = Semaphore::const_new(4);
 
 /// Observe the locally selected source address for an existing OS route.
 /// UDP connect() selects a route but sends no packet. This tells us neither
 /// the public NAT egress nor the assigned subnet prefix/ownership; do not
 /// synthesize a /24 or treat this address as permission to scan neighbors.
 pub fn route_selected_local_ip(destination: SocketAddr) -> io::Result<IpAddr> {
-    let bind = if destination.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
-    let socket = UdpSocket::bind(bind)?;
-    socket.connect(destination)?;
-    Ok(socket.local_addr()?.ip())
+    Ok(crate::routing::carrier_socket::selected_source(destination)?.ip())
 }
 
 /// No active scanning by default. Public probes are permitted for exactly
@@ -132,30 +125,17 @@ pub async fn probe_tls_h2(
     }
     // F-18 requires a real TLS 1.3 X25519 witness. A successful
     // handshake using a different group is not that evidence.
-    let mut provider = rustls::crypto::ring::default_provider();
-    provider
-        .kx_groups
-        .retain(|group| group.name() == rustls::NamedGroup::X25519);
-    if provider.kx_groups.is_empty() {
-        return Err(ProbeError::TlsRejected);
-    }
-    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|_| ProbeError::TlsRejected)?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    tls.alpn_protocols = vec![b"h2".to_vec()];
-    tls.enable_early_data = false;
+    let tls = crate::net::tls::reference_h2(roots).map_err(|_| ProbeError::TlsRejected)?;
     let connector = TlsConnector::from(Arc::new(tls));
     let deadline = request.deadline.min(MAX_HANDSHAKE_DEADLINE);
     let start = Instant::now();
 
     timeout(deadline, async move {
-        let _permit = ACTIVE_PROBES
+        let _permit = REFERENCE_PROBES
             .acquire()
             .await
             .map_err(|_| ProbeError::ConnectFailed)?;
-        let tcp = TcpStream::connect(request.address)
+        let tcp = crate::routing::carrier_socket::connect_plain_tcp(request.address)
             .await
             .map_err(|_| ProbeError::ConnectFailed)?;
         let tls = connector

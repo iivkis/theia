@@ -796,6 +796,93 @@ mod tests {
     }
 
     #[test]
+    fn failed_dns_and_probe_workers_never_grant_new_consent() {
+        let mut p = panel();
+        for (error, text) in [
+            (DnsError::NotApproved, "не получено разрешение"),
+            (DnsError::NotCatalogued, "имя отсутствует в каталоге"),
+            (DnsError::InvalidDomain, "некорректное ручное DNS-имя"),
+            (DnsError::TimedOut, "таймаут DNS"),
+            (DnsError::StaleObservation, "устаревший DNS-ответ"),
+            (DnsError::LookupFailed, "DNS-запрос не выполнен"),
+            (DnsError::NoPublicAddresses, "нет публичных адресов"),
+            (DnsError::UnsafeAddress, "все ответы отклонены"),
+            (DnsError::TooManyAnswers, "слишком много DNS адресов"),
+        ] {
+            let (tx, result) = mpsc::channel();
+            let (cancel, _) = oneshot::channel();
+            p.addresses = vec!["93.184.216.10".parse().unwrap()];
+            p.selected = p.addresses.clone();
+            p.dns_received = Some(Instant::now());
+            p.state = DomainState::DnsRunning {
+                result,
+                cancel: Some(cancel),
+            };
+            assert!(p.body().contains("Никакого TCP/H2"));
+            tx.send(Err(error)).unwrap();
+            p.poll();
+            assert!(p.body().contains(text));
+            assert!(p.body().contains("TLS не запускался"));
+            assert!(p.addresses.is_empty() && p.selected.is_empty());
+            p.confirm_probes_and_start();
+            assert!(!p.is_running());
+            assert!(!p.back_or_close());
+            assert!(matches!(p.state, DomainState::Catalog));
+        }
+        for (error, text) in [
+            (DomainUiError::NoTrustAnchors, "нет системных доверенных CA"),
+            (DomainUiError::WorkerUnavailable, "недоступен worker"),
+            (DomainUiError::StaleDnsPin, "DNS-пины устарели"),
+            (DomainUiError::Batch(DualBatchError::Empty), "пустой список"),
+            (
+                DomainUiError::Batch(DualBatchError::TooManyTargets),
+                "слишком много IP",
+            ),
+            (
+                DomainUiError::Batch(DualBatchError::DuplicateTarget),
+                "дублирующаяся цель",
+            ),
+            (
+                DomainUiError::Batch(DualBatchError::TaskFailed),
+                "ошибка задачи",
+            ),
+            (
+                DomainUiError::Batch(DualBatchError::BatchTimedOut),
+                "таймаут 20с",
+            ),
+        ] {
+            let (tx, result) = mpsc::channel();
+            let (cancel, _) = oneshot::channel();
+            p.state = DomainState::ProbeRunning {
+                result,
+                cancel: Some(cancel),
+            };
+            assert!(p.body().contains("без DNS"));
+            p.poll(); // Empty channel cannot advance a state.
+            assert!(p.is_running());
+            tx.send(Err(error)).unwrap();
+            p.poll();
+            assert!(p.body().contains(text));
+            assert!(p.body().contains("REALITY: НЕ готов"));
+            assert!(p.report_actions().is_empty());
+            p.open_review();
+            assert!(!p.review.is_open());
+            assert!(!p.back_or_close());
+        }
+        let (tx, result) = mpsc::channel();
+        let (cancel, mut cancelled) = oneshot::channel();
+        p.state = DomainState::ProbeRunning {
+            result,
+            cancel: Some(cancel),
+        };
+        assert!(p.back_or_close());
+        assert_eq!(cancelled.try_recv(), Ok(()));
+        drop(tx);
+        p.poll();
+        assert!(p.body().contains("недоступен worker"));
+    }
+
+    #[test]
     fn catalog_browsing_is_offline_and_starts_with_zero_checked_ips() {
         let mut panel = panel();
         assert_eq!(panel.domain(), Some("google.com"));

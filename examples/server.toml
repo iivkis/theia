@@ -30,6 +30,17 @@ max_connections_per_user = 64
 max_connections_total = 1024
 connect_timeout_ms = 10000
 
+# Optional routing example (requires explicit Save/Apply and revision updates).
+# direct_dpi prefers an explicitly enabled native client TCP DPI backend;
+# unsupported/failed local attempts use authenticated VPS fallback.
+# [server.policy.routing]
+# revision = 2
+# [[server.policy.routing.rules]]
+# name = "DPI fallback example"
+# action = "direct_via_client_anti_dpi"
+# domains = ["example.org"]
+# ips = []
+
 [management]
 ipc = "auto"
 log_level = "info"

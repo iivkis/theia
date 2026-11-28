@@ -194,7 +194,7 @@ impl StatusPanel {
                             .ok()
                         });
                     let live=match response{
-                        Some(StatusReply::ClientRunning{revision,config_sha256,descriptor_revision,transport,xhttp,fallback}) if config_sha256 == digest && selected_active =>
+                        Some(StatusReply::ClientRunning{revision,config_sha256,descriptor_revision,transport,xhttp,fallback,..}) if config_sha256 == digest && selected_active =>
                             format!("Фоновый клиент: работает с этими настройками (версия {revision}).\nВерсия описания сервера: {descriptor_revision}\nПоследнее подтверждённое соединение: {}; XHTTP: {}\nВременный переход с H3: {}",
                                 match transport{2=>"H2",3=>"H3",_=>"пока нет"}, crate::local_proxy::xhttp_observation(xhttp), if fallback {"да, H3 временно недоступен"} else {"нет"}),
                         Some(StatusReply::ClientRunning{revision,..})=>format!("Фоновый клиент: работает (версия {revision}), но использование выбранного профиля не подтверждено."),
@@ -380,7 +380,7 @@ impl StatusPanel {
                 rt.block_on(async{
                     if let Some(expected_revision)=apply{
                         return Ok(match management::query_client_environment(StatusCommand::ClientApply{expected_revision,candidate_sha256:digest}).await{
-                            Ok(StatusReply::ClientApplied{revision})=>Update::Report(format!("Настройки фонового клиента применены (версия {revision}). Прежние туннели сохранены.")),
+                            Ok(StatusReply::ClientApplied{revision})=>Update::Report(format!("Настройки фонового клиента применены (версия {revision}). Прежнее поколение маршрутизации отозвано.")),
                             Err(management::ManagementError::CandidateRejected)=>Update::Report("Фоновый клиент отклонил настройки. Изменения не подтверждены.".into()),
                             _=>Update::Report("Применение настроек фонового клиента не подтверждено. Обновите состояние перед повтором.".into()),
                         });
@@ -871,6 +871,17 @@ impl StatusPanel {
             }
         }
     }
+    pub(crate) fn routing_observation(&self, digest: [u8; 32]) -> Option<String> {
+        if self.digest != digest || !self.client_active {
+            return None;
+        }
+        let run = self.client_run.as_ref()?;
+        run.stop.as_ref()?;
+        let report = run.report.lock().ok()?;
+        let start = report.find("Правила маршрутизации:")?;
+        Some(report[start..].to_owned())
+    }
+
     pub(crate) fn body(&self) -> String {
         if self.show_details {
             if let Some(details) = &self.details {
@@ -986,6 +997,88 @@ mod tests {
             action_focus: 0,
         }
     }
+    #[test]
+    fn status_worker_failures_refuse_actions_and_preserve_saved_revision() {
+        let mut p = panel(true);
+        for (error, text) in [
+            (Error::Format, "Неверный формат"),
+            (Error::Scope, "Неверный формат"),
+            (Error::Approval, "подтверждение доверия не совпадают"),
+            (Error::Identity, "Не удалось подтвердить доверие"),
+            (Error::Descriptor, "Не удалось подтвердить доверие"),
+            (Error::Health, "устарели или недоступны"),
+            (Error::Grant, "Ключ доступа недействителен"),
+            (Error::Credential, "Ключ доступа недействителен"),
+            (Error::Storage, "Не удалось прочитать настройки"),
+            (Error::Clock, "Проверьте дату и время"),
+        ] {
+            let (tx, rx) = mpsc::channel();
+            p.pending = Some(rx);
+            assert!(p.actions().is_empty());
+            assert!(p.confirmation_choice().is_none());
+            assert!(p.body().contains("Изменения не применяются"));
+            tx.send(Err(error)).unwrap();
+            p.poll();
+            assert!(p.body().contains(text));
+            assert_eq!(p.digest, [1; 32]);
+            assert!(p.refreshed_editor.is_none());
+            assert!(p.client_run.is_none());
+        }
+        let (tx, rx) = mpsc::channel();
+        p.pending = Some(rx);
+        tx.send(Ok(Update::Observation {
+            brief: "verified brief".into(),
+            details: Some("verified details".into()),
+        }))
+        .unwrap();
+        p.poll();
+        assert!(p.summary().contains("verified brief"));
+        assert!(!p.summary().contains("verified details"));
+        p.key(key(KeyCode::Char('d')));
+        assert!(p.body().contains("verified details"));
+        p.key(key(KeyCode::Esc));
+        let (tx, rx) = mpsc::channel();
+        p.pending = Some(rx);
+        p.committing = true;
+        tx.send(Err(Error::Indeterminate)).unwrap();
+        p.poll();
+        assert!(p.reopen_required);
+        assert!(p.body().contains("Запись могла состояться"));
+        assert!(p.actions().is_empty());
+        assert!(p.confirmation_choice().is_none());
+        assert!(!p.key(key(KeyCode::Char('y'))));
+        assert!(p.key(key(KeyCode::Esc)));
+        assert_eq!(p.digest, [1; 32]);
+    }
+
+    #[test]
+    fn routing_observation_requires_same_active_generation_and_live_runtime() {
+        let mut p = panel(true);
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let (_tx, done) = mpsc::channel();
+        let report = std::sync::Arc::new(std::sync::Mutex::new("other details".into()));
+        p.client_run = Some(ClientRun {
+            stop: Some(stop),
+            done,
+            report: report.clone(),
+        });
+        assert!(p.routing_observation([1; 32]).is_none());
+        *report.lock().unwrap() = "private header\nПравила маршрутизации:\nDirect 1".into();
+        assert_eq!(
+            p.routing_observation([1; 32]).as_deref(),
+            Some("Правила маршрутизации:\nDirect 1")
+        );
+        assert!(p.routing_observation([2; 32]).is_none());
+        p.client_active = false;
+        assert!(p.routing_observation([1; 32]).is_none());
+        p.client_active = true;
+        p.key(key(KeyCode::Char('x')));
+        assert_eq!(p.confirmation_choice(), Some(('y', "Остановить")));
+        p.key(key(KeyCode::Char('y')));
+        assert_eq!(stopped.try_recv(), Ok(()));
+        assert!(p.routing_observation([1; 32]).is_none());
+    }
+
     #[test]
     fn technical_status_is_opt_in_and_never_starts_a_worker() {
         let mut p = panel(true);

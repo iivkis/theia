@@ -929,9 +929,11 @@ mod tests {
         assert_eq!(doc.client.profiles.len(), 1);
         assert_eq!(doc.client.active_profile, doc.client.profiles[0].id);
         assert_eq!(
-            doc.client.proxy.system_proxy,
-            crate::config::SystemProxy::Off
+            doc.client.ingress_mode,
+            crate::config::IngressMode::SystemProxy
         );
+        assert_ne!(doc.client.profiles[0].direct_dpi, Some(true));
+        assert_ne!(doc.client.profiles[0].direct_dpi_stun, Some(true));
         assert!(!String::from_utf8_lossy(&bytes).contains(uri.as_str()));
         assert!(
             crate::tui_staged_material::StagedMaterial::create_for_new_config(

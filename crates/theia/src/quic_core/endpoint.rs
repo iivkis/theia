@@ -1,0 +1,1365 @@
+//! Isolated development UDP session for exercising application-space
+//! packet protection, STREAM, ACK and retransmission. Raw key fixtures stay
+//! loopback-only; TLS sessions support explicitly pinned network trials.
+//! This is not a generally selectable production QUIC endpoint.
+use super::listener::SessionIo;
+use super::{
+    ack_tx::History,
+    flow::ReceiveFlow,
+    frames::{self, Frame},
+    packet::{self, Reader, Writer},
+    scheduler::Scheduler,
+    send_flow::SendFlow,
+    spaces::Space,
+};
+use super::{
+    handshake_udp::{HandshakeTail, TailEvent},
+    key_update,
+    lifecycle::{Idle, Shutdown, ShutdownPhase},
+    path::{ConnectionId, Paths, PeerIds},
+};
+use rustls::quic::{Keys, Secrets};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    io,
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
+use tokio::net::UdpSocket;
+
+const CID_LEN: usize = 8;
+const MTU: usize = 1200;
+const MAX_STREAMS: u64 = 8;
+const FLOW_LIMIT: u64 = 64 * 1024;
+
+#[derive(Debug)]
+pub enum Error {
+    Io(io::Error),
+    Scope,
+    Protocol,
+    Closed,
+    Packet(packet::Error),
+    Send(super::send_flow::Error),
+    Receive(super::flow::Error),
+    Schedule(super::scheduler::Error),
+}
+
+enum Protection {
+    Fixed {
+        reader: Reader,
+        writer: Writer,
+    },
+    Rotating {
+        reader: Box<key_update::Receiver>,
+        writer: key_update::Sender,
+    },
+}
+
+pub(crate) struct Established {
+    pub keys: Keys,
+    pub secrets: Secrets,
+    pub idle_timeout: Duration,
+    pub binding: zeroize::Zeroizing<[u8; 32]>,
+    pub peer_leaf: Option<rustls::pki_types::CertificateDer<'static>>,
+    pub peer_limits: super::parameters::Limits,
+    pub peer_reset_token: Option<[u8; 16]>,
+    pub peer_disable_migration: bool,
+    pub tail: Option<HandshakeTail>,
+    pub scheduler: Scheduler,
+    pub early_application: Vec<Vec<u8>>,
+    pub post_handshake: Option<Box<super::handshake::Driver>>,
+}
+
+pub struct LabSession {
+    socket: SessionIo,
+    paths: Paths,
+    local_ids: BTreeMap<u64, [u8; CID_LEN]>,
+    next_local_sequence: u64,
+    peer_cid_limit: usize,
+    peer_disable_migration: bool,
+    auto_cids: bool,
+    cid_retry_at: Option<Instant>,
+    peer_ids: PeerIds,
+    protection: Option<Protection>,
+    handshake_tail: Option<HandshakeTail>,
+    early_application: VecDeque<Vec<u8>>,
+    post_handshake: Option<Box<super::handshake::Driver>>,
+    acknowledgments: History,
+    send: SendFlow,
+    receive: ReceiveFlow,
+    scheduler: Scheduler,
+    closed: bool,
+    shutdown: Shutdown,
+    server: bool,
+    confirmed: bool,
+    idle: Idle,
+    binding: Option<zeroize::Zeroizing<[u8; 32]>>,
+    peer_leaf: Option<rustls::pki_types::CertificateDer<'static>>,
+    peer_application_close: Option<u64>,
+}
+
+impl LabSession {
+    /// RTT learned by the native authenticated QUIC recovery path.
+    pub(crate) fn measured_rtt(&self) -> Option<Duration> {
+        self.scheduler.measured_rtt()
+    }
+
+    /// Accept only explicitly provided application keys from a completed TLS
+    /// session in a controlled fixture. This function does not verify TLS
+    /// completion or identity, so it must not be used for product admission.
+    pub async fn connect(
+        socket: UdpSocket,
+        peer: SocketAddr,
+        server: bool,
+        local_cid: [u8; CID_LEN],
+        remote_cid: [u8; CID_LEN],
+        keys: Keys,
+    ) -> Result<Self, Error> {
+        Self::connect_inner(
+            socket.into(),
+            peer,
+            server,
+            local_cid,
+            &remote_cid,
+            Protection::Fixed {
+                reader: Reader::new(keys.remote),
+                writer: Writer::new(keys.local),
+            },
+            false,
+        )
+    }
+
+    /// Only the UDP handshake driver can construct this session. Server
+    /// TLS completion confirms its handshake; the client waits for the
+    /// authenticated HANDSHAKE_DONE frame.
+    pub(crate) async fn after_handshake(
+        socket: SessionIo,
+        peer: SocketAddr,
+        server: bool,
+        local_cid: [u8; CID_LEN],
+        remote_cid: &[u8],
+        established: Established,
+    ) -> Result<Self, Error> {
+        let Established {
+            keys,
+            secrets,
+            idle_timeout,
+            binding,
+            peer_leaf,
+            peer_limits,
+            peer_reset_token,
+            peer_disable_migration,
+            tail,
+            scheduler,
+            early_application,
+            post_handshake,
+        } = established;
+        let mut session = Self::connect_inner(
+            socket,
+            peer,
+            server,
+            local_cid,
+            remote_cid,
+            Protection::Rotating {
+                reader: Box::new(key_update::Receiver::new(keys.remote, secrets.clone())),
+                writer: key_update::Sender::new(keys.local, secrets),
+            },
+            server,
+        )?;
+        // Preserve the actual path controller and RTT learned during TLS.
+        // Fixed-key fixtures still use the isolated CUBIC scheduler.
+        session.peer_ids =
+            PeerIds::with_initial(remote_cid, peer_reset_token, 2).map_err(|_| Error::Protocol)?;
+        session.peer_cid_limit = peer_limits.active_cid_limit.min(8) as usize;
+        session.peer_disable_migration = peer_disable_migration;
+        use crate::transport_policy as policy;
+        let bidi = u64::from(policy::MAX_BIDI_STREAMS);
+        let uni = u64::from(policy::MAX_QUIC_UNI_STREAMS);
+        let window = u64::from(policy::QUIC_STREAM_RECEIVE_BYTES);
+        session.send = SendFlow::from_peer(server, peer_limits, bidi).map_err(Error::Send)?;
+        session.receive = ReceiveFlow::new(
+            server,
+            bidi,
+            uni,
+            window,
+            window as usize,
+            u64::from(policy::QUIC_CONNECTION_RECEIVE_BYTES),
+        )
+        .map_err(Error::Receive)?;
+        session
+            .receive
+            .enable_local_bidi(bidi)
+            .map_err(Error::Receive)?;
+        session.receive.enable_autotune().map_err(Error::Receive)?;
+        session.scheduler = scheduler;
+        let options = session.socket.options();
+        if options.df {
+            session
+                .scheduler
+                .enable_mtu(peer_limits.max_udp_payload, Instant::now());
+        }
+        session.scheduler.enable_ecn(options.ecn);
+        session.scheduler.application_ack_timing(
+            peer_limits.ack_delay_exponent,
+            peer_limits.max_ack_delay_ms,
+            server,
+        );
+        session.idle = Idle::new(Instant::now(), idle_timeout);
+        session.binding = Some(binding);
+        session.peer_leaf = peer_leaf;
+        session.handshake_tail = tail;
+        session.early_application = early_application.into();
+        session.post_handshake = post_handshake;
+        if server {
+            session
+                .scheduler
+                .enqueue(vec![0x1e])
+                .map_err(Error::Schedule)?;
+        }
+        Ok(session)
+    }
+
+    fn connect_inner(
+        socket: SessionIo,
+        peer: SocketAddr,
+        server: bool,
+        local_cid: [u8; CID_LEN],
+        remote_cid: &[u8],
+        protection: Protection,
+        confirmed: bool,
+    ) -> Result<Self, Error> {
+        let local = socket.local_addr().map_err(Error::Io)?;
+        if !socket.scope().permits(local, peer)
+            || local_cid.as_slice() == remote_cid
+            || local_cid == [0; CID_LEN]
+            || remote_cid.is_empty()
+            || remote_cid.len() > 20
+            || remote_cid.iter().all(|b| *b == 0)
+        {
+            return Err(Error::Scope);
+        }
+        // Preserve the exact pinned peer established during the handshake.
+        match (socket.native_pinned(), socket.peer_addr()) {
+            (true, Ok(connected)) if connected == peer => {}
+            (false, Err(error)) if error.kind() == io::ErrorKind::NotConnected => {}
+            _ => return Err(Error::Scope),
+        }
+        let mut send =
+            SendFlow::new(server, MAX_STREAMS, FLOW_LIMIT, FLOW_LIMIT).map_err(Error::Send)?;
+        send.enable_bidi(MAX_STREAMS, MAX_STREAMS)
+            .map_err(Error::Send)?;
+        let mut receive = ReceiveFlow::new(
+            server,
+            MAX_STREAMS,
+            MAX_STREAMS,
+            FLOW_LIMIT,
+            FLOW_LIMIT as usize,
+            FLOW_LIMIT,
+        )
+        .map_err(Error::Receive)?;
+        receive
+            .enable_local_bidi(MAX_STREAMS)
+            .map_err(Error::Receive)?;
+        Ok(Self {
+            socket,
+            paths: Paths::new_validated(peer),
+            local_ids: BTreeMap::from([(0, local_cid)]),
+            next_local_sequence: 1,
+            peer_cid_limit: 2,
+            peer_disable_migration: false,
+            auto_cids: false,
+            cid_retry_at: None,
+            peer_ids: PeerIds::with_initial(remote_cid, None, 2).map_err(|_| Error::Protocol)?,
+            protection: Some(protection),
+            handshake_tail: None,
+            early_application: VecDeque::new(),
+            post_handshake: None,
+            acknowledgments: History::default(),
+            send,
+            receive,
+            scheduler: Scheduler::default(),
+            closed: false,
+            shutdown: Shutdown::default(),
+            server,
+            confirmed,
+            idle: Idle::new(Instant::now(), Duration::from_secs(30)),
+            binding: None,
+            peer_leaf: None,
+            peer_application_close: None,
+        })
+    }
+
+    pub(crate) fn peer_leaf(&self) -> Option<&[u8]> {
+        self.peer_leaf.as_ref().map(AsRef::as_ref)
+    }
+
+    pub fn handshake_confirmed(&self) -> bool {
+        self.confirmed
+    }
+
+    /// Only TLS-established laboratory sessions have exporter material.
+    /// Taking it is not an admission decision; the HTTP layer must verify it.
+    pub(crate) fn take_channel_binding(&mut self) -> Option<zeroize::Zeroizing<[u8; 32]>> {
+        if self.active() {
+            self.binding.take()
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn peer_application_close(&self) -> Option<u64> {
+        self.peer_application_close
+    }
+
+    pub(crate) fn peer_streams(&self) -> Vec<u64> {
+        self.receive.peer_streams()
+    }
+
+    pub(crate) fn send_reset_code(&self, id: u64) -> Option<u64> {
+        self.send.reset_code(id)
+    }
+
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.paths.active()
+    }
+
+    pub(crate) fn enable_auto_cids(&mut self) {
+        self.auto_cids = true;
+    }
+
+    fn needs_cid(&self) -> bool {
+        self.auto_cids
+            && self.confirmed
+            && self.active()
+            && self.local_ids.len() < self.peer_cid_limit.min(2)
+            && self.next_local_sequence <= super::wire::MAX_VARINT
+    }
+
+    async fn replenish_cids(&mut self, now: Instant) -> Result<(), Error> {
+        if !self.needs_cid()
+            || !self.scheduler.can_queue()
+            || self.cid_retry_at.is_some_and(|at| now < at)
+        {
+            return Ok(());
+        }
+        match self.advertise_connection_id().await {
+            Ok(_) => self.cid_retry_at = None,
+            Err(Error::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                self.cid_retry_at = now.checked_add(Duration::from_secs(1));
+            }
+            Err(e) => return Err(e),
+        }
+        Ok(())
+    }
+
+    /// Advertise one fresh, registered local CID over authenticated 1-RTT.
+    /// Registration precedes transmission; never advertise an unroutable alias.
+    /// This is still a laboratory operation, not production admission.
+    pub async fn advertise_connection_id(&mut self) -> Result<u64, Error> {
+        if !self.confirmed
+            || !self.active()
+            || self.local_ids.len() >= self.peer_cid_limit
+            || !self.scheduler.can_queue()
+            || self.next_local_sequence > super::wire::MAX_VARINT
+        {
+            return Err(Error::Scope);
+        }
+        let (cid, token) = self.socket.issue_cid().await.map_err(Error::Io)?;
+        if cid == [0; CID_LEN] || self.local_ids.values().any(|old| *old == cid) {
+            return Err(Error::Protocol);
+        }
+        let sequence = self.next_local_sequence;
+        let mut frame = vec![0x18];
+        let mut scratch = [0; 8];
+        frame.extend_from_slice(
+            super::wire::encode_varint(sequence, &mut scratch).ok_or(Error::Protocol)?,
+        );
+        frame.extend_from_slice(&[0, CID_LEN as u8]);
+        frame.extend_from_slice(&cid);
+        frame.extend_from_slice(&token);
+        self.scheduler.enqueue(frame).map_err(Error::Schedule)?;
+        self.local_ids.insert(sequence, cid);
+        self.next_local_sequence += 1;
+        Ok(sequence)
+    }
+
+    fn queue_retire_cid(&mut self, sequence: u64) -> Result<(), Error> {
+        let mut frame = vec![0x19];
+        let mut scratch = [0; 8];
+        frame.extend_from_slice(
+            super::wire::encode_varint(sequence, &mut scratch).ok_or(Error::Protocol)?,
+        );
+        self.scheduler.enqueue(frame).map_err(Error::Schedule)
+    }
+
+    /// Controlled rebinding: a different authorized IP requires a fresh peer
+    /// CID and recovery reset. The original socket scope cannot be expanded.
+    /// Existing streams and cryptographic packet numbers remain intact.
+    pub async fn rebind(&mut self, socket: UdpSocket, now: Instant) -> Result<(), Error> {
+        // The native carrier lease belongs to the old kernel socket.
+        // Never replace it with an unregistered SessionIo::direct.
+        // A fresh admitted connection is required until transactional
+        // native socket migration is implemented.
+        if self.server
+            || self.peer_disable_migration
+            || !self.confirmed
+            || !self.active()
+            || self.socket.native_pinned()
+        {
+            return Err(Error::Scope);
+        }
+        let previous = self.socket.local_addr().map_err(Error::Io)?;
+        let next = socket.local_addr().map_err(Error::Io)?;
+        let cross_ip = next.ip() != previous.ip();
+        let rotate = self.peer_ids.has_spare();
+        let scope = self.socket.scope();
+        if !scope.permits(next, self.paths.active())
+            || (cross_ip && !rotate)
+            || (rotate && !self.scheduler.can_queue())
+            || next == previous
+            || next == self.paths.active()
+            || socket.peer_addr().is_ok()
+            || !self.scheduler.can_send_path()
+        {
+            return Err(Error::Scope);
+        }
+        if rotate {
+            let retired = self.peer_ids.rotate().ok_or(Error::Protocol)?;
+            self.queue_retire_cid(retired)?;
+        }
+        if cross_ip {
+            self.scheduler.restart_path(now);
+        } else {
+            self.scheduler.reset_mtu(now);
+        }
+        self.socket = SessionIo::direct(socket, scope);
+        if !self.socket.options().df {
+            self.scheduler.disable_mtu();
+        }
+        let peer = self.paths.active();
+        if let Err(e) = self.send_path(peer, &[1], now).await {
+            self.abort();
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    async fn send_path(
+        &mut self,
+        peer: SocketAddr,
+        frame: &[u8],
+        now: Instant,
+    ) -> Result<(), Error> {
+        self.send_path_sized(peer, frame, MTU, now).await
+    }
+
+    async fn send_path_sized(
+        &mut self,
+        peer: SocketAddr,
+        frame: &[u8],
+        size: usize,
+        now: Instant,
+    ) -> Result<(), Error> {
+        if !self.scheduler.can_send_path() {
+            return Err(Error::Protocol);
+        }
+        let mut payload = frame.to_vec();
+        // Fixed four-byte PN and the 16-byte AEAD tag used by this fixture.
+        let cid_len = self.peer_ids.current().ok_or(Error::Protocol)?.len();
+        let capacity = size
+            .checked_sub(1 + cid_len + 4 + 16)
+            .ok_or(Error::Protocol)?;
+        if capacity < frame.len() {
+            return Err(Error::Protocol);
+        }
+        payload.resize(capacity, 0);
+        let (number, packet) = self.seal(&payload)?;
+        match self.socket.send_to(&packet, peer).await {
+            Ok(n) if n == packet.len() => {
+                self.scheduler
+                    .record_path(number, n, now)
+                    .map_err(Error::Schedule)?;
+                if peer == self.paths.active() {
+                    self.idle.sent(now);
+                }
+                Ok(())
+            }
+            // A failed candidate must not kill the old validated route.
+            // These synchronous failures did not transmit this packet;
+            // its PN remains burned and its amplification reservation stays charged.
+            Err(e)
+                if peer != self.paths.active()
+                    && (matches!(
+                        e.kind(),
+                        io::ErrorKind::NetworkUnreachable
+                            | io::ErrorKind::HostUnreachable
+                            | io::ErrorKind::AddrNotAvailable
+                    ) || super::mtu::message_too_large(&e)) =>
+            {
+                self.scheduler
+                    .burn_unsent(number, now)
+                    .map_err(Error::Schedule)
+            }
+            Ok(_) => Err(Error::Protocol),
+            Err(e) => Err(Error::Io(e)),
+        }
+    }
+
+    pub fn update_keys(&mut self) -> Result<(), Error> {
+        if !self.active() {
+            return Err(Error::Closed);
+        }
+        match self.protection.as_mut().ok_or(Error::Closed)? {
+            Protection::Rotating { writer, .. } => {
+                writer.update(self.confirmed).map_err(Error::Packet)
+            }
+            Protection::Fixed { .. } => Err(Error::Protocol),
+        }
+    }
+
+    pub fn open_uni(&mut self) -> Result<u64, Error> {
+        if !self.active() {
+            return Err(Error::Closed);
+        }
+        self.send.open().map_err(Error::Send)
+    }
+
+    pub fn open_bidi(&mut self) -> Result<u64, Error> {
+        if !self.active() {
+            return Err(Error::Closed);
+        }
+        if !self.receive.can_open_local_bidi() {
+            return Err(Error::Send(super::send_flow::Error::Limit));
+        }
+        let id = self.send.open_bidi().map_err(Error::Send)?;
+        if let Err(e) = self.receive.register_local_bidi(id) {
+            self.abort();
+            return Err(Error::Receive(e));
+        }
+        Ok(id)
+    }
+
+    pub fn queue(&mut self, id: u64, bytes: &[u8], fin: bool) -> Result<(), Error> {
+        if !self.active() {
+            return Err(Error::Closed);
+        }
+        if !self.scheduler.can_queue() {
+            return Err(Error::Schedule(super::scheduler::Error::Limit));
+        }
+        let frame = self.send.encode(id, bytes, fin).map_err(Error::Send)?;
+        self.scheduler.enqueue(frame).map_err(Error::Schedule)
+    }
+
+    pub fn reset_stream(&mut self, id: u64, code: u64) -> Result<(), Error> {
+        if !self.active() {
+            return Err(Error::Closed);
+        }
+        if self.send.is_closed(id) {
+            return Ok(());
+        }
+        if !self.scheduler.can_queue() {
+            return Err(Error::Schedule(super::scheduler::Error::Limit));
+        }
+        if let Some(frame) = self.send.reset(id, code).map_err(Error::Send)? {
+            self.scheduler.cancel_stream(id);
+            if let Err(e) = self.scheduler.enqueue(frame) {
+                self.abort();
+                return Err(Error::Schedule(e));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn stop_sending(&mut self, id: u64, code: u64) -> Result<(), Error> {
+        if !self.active() {
+            return Err(Error::Closed);
+        }
+        self.receive.check_stop(id).map_err(Error::Receive)?;
+        let mut frame = vec![5];
+        for value in [id, code] {
+            let mut scratch = [0; 8];
+            frame.extend_from_slice(
+                super::wire::encode_varint(value, &mut scratch).ok_or(Error::Protocol)?,
+            );
+        }
+        self.scheduler.enqueue(frame).map_err(Error::Schedule)?;
+        self.receive.abandon(id).map_err(Error::Receive)
+    }
+
+    pub(crate) fn send_capacity(&self, id: u64) -> usize {
+        self.send.available(id)
+    }
+
+    pub(crate) fn lifetime_exhausted(&self, bidi: bool) -> bool {
+        self.send.lifetime_exhausted(bidi)
+    }
+
+    /// A peer stream earns a new stream ID only after both relevant halves
+    /// terminate and reliable STREAM/RESET frames are acknowledged.
+    pub(crate) fn retire_stream(&mut self, id: u64, tx: bool, rx: bool) -> Result<bool, Error> {
+        if tx && (!self.send.terminal(id) || self.scheduler.stream_pending(id)) {
+            return Ok(false);
+        }
+        if !rx {
+            if tx {
+                self.send.retire(id);
+            }
+            return Ok(true);
+        }
+        if !self.scheduler.can_queue_n(2) {
+            return Ok(false);
+        }
+        let Some((grant, data)) = self.receive.retire(id) else {
+            return Ok(false);
+        };
+        if let Some(limit) = grant {
+            let bidi = id & 2 == 0;
+            if bidi {
+                self.send.grant_peer_bidi(limit);
+            }
+            self.queue_credit(if bidi { 0x12 } else { 0x13 }, limit)?;
+        }
+        if let Some(limit) = data {
+            self.queue_credit(0x10, limit)?;
+        }
+        if tx {
+            self.send.retire(id);
+        }
+        Ok(true)
+    }
+
+    fn queue_credit(&mut self, ty: u8, limit: u64) -> Result<(), Error> {
+        let mut frame = vec![ty];
+        let mut scratch = [0; 8];
+        frame.extend_from_slice(
+            super::wire::encode_varint(limit, &mut scratch).ok_or(Error::Protocol)?,
+        );
+        self.scheduler.enqueue(frame).map_err(Error::Schedule)
+    }
+
+    pub fn pending(&self) -> usize {
+        if self.active() {
+            self.scheduler.pending()
+        } else {
+            0
+        }
+    }
+
+    pub fn read(&mut self, id: u64, bytes: &mut [u8]) -> Result<usize, Error> {
+        if !self.active() {
+            return Err(Error::Closed);
+        }
+        self.receive.read(id, bytes).map_err(Error::Receive)
+    }
+
+    /// Explicit window replenishment for streaming fixtures. Reserving queue
+    /// capacity first prevents granting credit without its reliable update.
+    pub fn read_replenish(&mut self, id: u64, bytes: &mut [u8]) -> Result<usize, Error> {
+        if !self.active() {
+            return Err(Error::Closed);
+        }
+        if !self.scheduler.can_queue_n(2) {
+            return Err(Error::Schedule(super::scheduler::Error::Limit));
+        }
+        let (n, connection, stream) = self
+            .receive
+            .read_replenish_at(
+                id,
+                bytes,
+                Instant::now(),
+                self.scheduler.measured_rtt().unwrap_or_default(),
+            )
+            .map_err(Error::Receive)?;
+        if n != 0 {
+            for (ty, numbers) in [(0x10, vec![connection]), (0x11, vec![id, stream])] {
+                let mut frame = vec![ty];
+                for value in numbers {
+                    let mut scratch = [0; 8];
+                    frame.extend_from_slice(
+                        super::wire::encode_varint(value, &mut scratch).ok_or(Error::Protocol)?,
+                    );
+                }
+                if let Err(e) = self.scheduler.enqueue(frame) {
+                    self.abort();
+                    return Err(Error::Schedule(e));
+                }
+            }
+        }
+        Ok(n)
+    }
+
+    pub fn finished(&self, id: u64) -> bool {
+        self.active() && self.receive.finished(id)
+    }
+
+    fn register_implicit(&mut self, id: u64) -> Result<(), Error> {
+        self.receive.register_implicit(id).map_err(Error::Receive)?;
+        if id & 2 == 0 && id & 1 != u64::from(self.server) {
+            for prior in self
+                .receive
+                .peer_streams()
+                .into_iter()
+                .filter(|id| id & 2 == 0)
+            {
+                self.send.register_peer_bidi(prior).map_err(Error::Send)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn active(&self) -> bool {
+        !self.closed && self.shutdown.is_open()
+    }
+
+    fn abort(&mut self) {
+        self.closed = true;
+        self.shutdown.abort();
+        self.protection = None;
+        self.handshake_tail = None;
+        self.early_application.clear();
+        self.post_handshake = None;
+        self.binding = None;
+    }
+
+    /// No new streams, data or key changes after local closing begins.
+    pub fn close(&mut self, code: u64, now: Instant) -> Result<(), Error> {
+        if !self.active() {
+            return Err(Error::Closed);
+        }
+        self.shutdown
+            .local(now, self.scheduler.base_pto(), code)
+            .map_err(|_| Error::Protocol)
+    }
+
+    pub fn shutdown_phase(&self) -> ShutdownPhase {
+        self.shutdown.phase()
+    }
+
+    fn tick(&mut self, now: Instant) {
+        self.paths.expire(now);
+        if self.active()
+            && self
+                .idle
+                .deadline(self.scheduler.base_pto())
+                .is_some_and(|at| now >= at)
+        {
+            self.abort();
+            return;
+        }
+        if self.shutdown.expire(now) {
+            self.abort();
+        } else if let Some(Protection::Rotating { reader, .. }) = &mut self.protection {
+            reader.expire(now);
+        }
+    }
+
+    pub fn deadline(&self) -> Option<Instant> {
+        let old_keys = match &self.protection {
+            Some(Protection::Rotating { reader, .. }) => reader.retirement_deadline(),
+            _ => None,
+        };
+        let recovery = if self.active() {
+            self.scheduler.deadline()
+        } else {
+            None
+        };
+        let idle = if self.active() {
+            self.idle.deadline(self.scheduler.base_pto())
+        } else {
+            None
+        };
+        let path_retry = if self.active() && self.scheduler.can_send_path() {
+            self.paths
+                .challenge_deadline(MTU as u64, self.scheduler.base_pto())
+        } else {
+            None
+        };
+        [
+            self.shutdown.deadline(),
+            self.cid_retry_at
+                .filter(|_| self.needs_cid() && self.scheduler.can_queue()),
+            self.handshake_tail
+                .as_ref()
+                .map(HandshakeTail::deadline)
+                .filter(|_| self.active()),
+            old_keys,
+            recovery,
+            self.paths.deadline(),
+            idle,
+            path_retry,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    /// Send at most one datagram per call, ACKs first. The caller owns the
+    /// drive loop and timer. Any uncertain send outcome is terminal.
+    pub async fn flush(&mut self, now: Instant) -> Result<bool, Error> {
+        if self.closed {
+            return Err(Error::Closed);
+        }
+        self.tick(now);
+        if self.closed || self.shutdown.phase() == ShutdownPhase::Draining {
+            return Ok(false);
+        }
+        let result = if self.shutdown.phase() == ShutdownPhase::Closing {
+            self.flush_close(now).await
+        } else {
+            self.flush_inner(now).await
+        };
+        if result.is_err() {
+            self.abort();
+        }
+        result
+    }
+
+    async fn flush_close(&mut self, now: Instant) -> Result<bool, Error> {
+        let Some(code) = self.shutdown.take_close(now, self.scheduler.base_pto()) else {
+            return Ok(false);
+        };
+        let mut payload = vec![0x1d];
+        let mut scratch = [0; 8];
+        payload.extend_from_slice(
+            super::wire::encode_varint(code, &mut scratch).ok_or(Error::Protocol)?,
+        );
+        payload.push(0); // empty reason
+                         // CONNECTION_CLOSE is not ACK-eliciting. Once closing, no normal
+                         // recovery or application frames are driven, but PN never resets.
+        let (_, packet) = self.seal(&payload)?;
+        if self
+            .socket
+            .send_to(&packet, self.paths.active())
+            .await
+            .map_err(Error::Io)?
+            != packet.len()
+        {
+            return Err(Error::Protocol);
+        }
+        Ok(true)
+    }
+
+    fn seal(&mut self, payload: &[u8]) -> Result<(u64, Vec<u8>), Error> {
+        let mut header = vec![0x43];
+        let remote_cid = self.peer_ids.current().ok_or(Error::Protocol)?;
+        header.extend_from_slice(remote_cid);
+        header.extend_from_slice(&[0; 4]);
+        match self.protection.as_mut().ok_or(Error::Closed)? {
+            Protection::Fixed { writer, .. } => writer.seal(&header, payload),
+            Protection::Rotating { writer, .. } => writer.seal(remote_cid, payload),
+        }
+        .map_err(Error::Packet)
+    }
+
+    async fn flush_inner(&mut self, now: Instant) -> Result<bool, Error> {
+        if let Some(tail) = self.handshake_tail.as_mut() {
+            if let Some(eliciting) = tail
+                .flush(&self.socket, self.paths.active(), now)
+                .await
+                .map_err(|_| Error::Protocol)?
+            {
+                if eliciting {
+                    self.idle.sent(now);
+                }
+                return Ok(true);
+            }
+        }
+        self.scheduler.on_timer(now).map_err(Error::Schedule)?;
+        self.replenish_cids(now).await?;
+        if self.scheduler.can_send_path() {
+            let pto = self.scheduler.base_pto();
+            if let Some((peer, challenge)) = self.paths.due_challenge(MTU as u64, now, pto) {
+                if self.paths.reserve_challenge(peer, MTU as u64, now, pto) {
+                    let mut frame = vec![0x1a];
+                    frame.extend_from_slice(&challenge);
+                    self.send_path(peer, &frame, now).await?;
+                    return Ok(true);
+                }
+            }
+        }
+        let ack = self.acknowledgments.encode();
+        let cid_len = self.peer_ids.current().ok_or(Error::Protocol)?.len();
+        let overhead = 1 + cid_len + 4 + 16;
+        // Discover only after confirmation and when ACK/path work is clear.
+        if ack.is_none() {
+            if let Some(size) = self.scheduler.mtu_probe(now) {
+                let mut payload = vec![1];
+                payload.resize(size - overhead, 0);
+                let (number, packet) = self.seal(&payload)?;
+                match self.socket.send_to(&packet, self.paths.active()).await {
+                    Ok(n) if n == packet.len() => {
+                        self.scheduler
+                            .record_mtu_probe(number, n, now)
+                            .map_err(Error::Schedule)?;
+                        self.idle.sent(now);
+                    }
+                    Err(e) if super::mtu::message_too_large(&e) => {
+                        self.scheduler
+                            .reject_mtu(number, packet.len(), now)
+                            .map_err(Error::Schedule)?;
+                    }
+                    Ok(_) => return Err(Error::Protocol),
+                    Err(e) => return Err(Error::Io(e)),
+                }
+                return Ok(true);
+            }
+        }
+        let (payload, ids, probe) = if let Some(ack) = ack {
+            (ack, Vec::new(), false)
+        } else if let Some((ids, frame, probe)) = self
+            .scheduler
+            .candidate_batch(now, self.scheduler.current_mtu() - overhead)
+            .map_err(Error::Schedule)?
+        {
+            (frame, ids, probe)
+        } else {
+            return Ok(false);
+        };
+        let (number, packet) = self.seal(&payload)?;
+        let ect = self.confirmed && !ids.is_empty() && !probe && self.scheduler.should_mark_ecn();
+        match self
+            .socket
+            .send_marked(&packet, self.paths.active(), ect)
+            .await
+        {
+            Ok((n, mark)) if n == packet.len() => {
+                self.scheduler
+                    .record_batch(number, n, &ids, probe, now)
+                    .map_err(Error::Schedule)?;
+                if ect {
+                    self.scheduler.record_ecn(number, mark, now);
+                }
+            }
+            Err(e) if packet.len() > MTU && super::mtu::message_too_large(&e) => {
+                self.scheduler
+                    .reject_mtu(number, packet.len(), now)
+                    .map_err(Error::Schedule)?;
+                return Ok(true);
+            }
+            Ok(_) => return Err(Error::Protocol),
+            Err(e) => return Err(Error::Io(e)),
+        }
+        if ids.is_empty() {
+            self.acknowledgments.sent();
+        } else {
+            self.idle.sent(now);
+        }
+        Ok(true)
+    }
+
+    /// Read at most one datagram. Malformed unauthenticated packets are
+    /// dropped; authenticated protocol errors terminate this lab session.
+    pub async fn recv(&mut self, wait: Duration) -> Result<bool, Error> {
+        self.recv_with_wake(wait, None).await
+    }
+
+    /// Wake only while waiting for UDP, never cancel an authenticated packet
+    /// handler after it has consumed a datagram or reserved a packet number.
+    pub(crate) async fn recv_with_wake(
+        &mut self,
+        wait: Duration,
+        wake: Option<&tokio::sync::Notify>,
+    ) -> Result<bool, Error> {
+        if self.closed {
+            return Err(Error::Closed);
+        }
+        let now = Instant::now();
+        self.tick(now);
+        if self.closed {
+            return Ok(false);
+        }
+        let idle = if self.active() {
+            self.idle.deadline(self.scheduler.base_pto())
+        } else {
+            None
+        };
+        let wait = [self.shutdown.deadline(), idle]
+            .into_iter()
+            .flatten()
+            .fold(wait, |wait, at| wait.min(at.saturating_duration_since(now)));
+        let result = self.recv_inner(wait, wake).await;
+        if result.is_err() {
+            self.abort();
+        } else {
+            self.tick(Instant::now());
+        }
+        result
+    }
+
+    fn receive_stateless_reset(
+        &mut self,
+        packet: &[u8],
+        source: SocketAddr,
+        now: Instant,
+    ) -> Result<bool, Error> {
+        if source != self.paths.active()
+            || packet.len() > super::mtu::MAX_UDP_PAYLOAD
+            || !self.peer_ids.matches_reset(packet)
+        {
+            return Ok(false);
+        }
+        self.enter_draining(now)?;
+        Ok(true)
+    }
+
+    fn enter_draining(&mut self, now: Instant) -> Result<(), Error> {
+        self.shutdown
+            .peer(now, self.scheduler.base_pto())
+            .map_err(|_| Error::Protocol)?;
+        self.protection = None;
+        self.handshake_tail = None;
+        self.early_application.clear();
+        self.post_handshake = None;
+        self.binding = None;
+        Ok(())
+    }
+
+    async fn recv_inner(
+        &mut self,
+        wait: Duration,
+        wake: Option<&tokio::sync::Notify>,
+    ) -> Result<bool, Error> {
+        let mut buf = [0; super::mtu::MAX_UDP_PAYLOAD + 1];
+        let (n, source, mark) = if let Some(packet) = self.early_application.pop_front() {
+            if packet.len() > super::mtu::MAX_UDP_PAYLOAD {
+                return Err(Error::Protocol);
+            }
+            buf[..packet.len()].copy_from_slice(&packet);
+            (packet.len(), self.paths.active(), super::ecn::Mark::NotEct)
+        } else {
+            let incoming = tokio::time::timeout(wait, self.socket.recv_from(&mut buf));
+            let received = if let Some(wake) = wake {
+                tokio::select! { biased; packet = incoming => packet, _ = wake.notified() => return Ok(false) }
+            } else {
+                incoming.await
+            };
+            match received {
+                Ok(Err(e)) if super::mtu::message_too_large(&e) => return Ok(false),
+                Ok(result) => result.map_err(Error::Io)?,
+                Err(_) => return Ok(false),
+            }
+        };
+        if self.shutdown.phase() == ShutdownPhase::Draining {
+            return Ok(false);
+        }
+        if n > super::mtu::MAX_UDP_PAYLOAD {
+            return Ok(false);
+        }
+        let new_path = source != self.paths.active();
+        if new_path
+            && (!self.server
+                || !self.confirmed
+                || !self.active()
+                || !self
+                    .socket
+                    .scope()
+                    .permits(self.socket.local_addr().map_err(Error::Io)?, source))
+        {
+            return Ok(false);
+        }
+        let mut packet = &buf[..n];
+        // A coalesced datagram can carry the last Handshake ACK and the
+        // first HANDSHAKE_DONE/STREAM. Apply each protected space separately.
+        if packet.first().is_some_and(|first| first & 0x80 != 0) {
+            if new_path || n > super::mtu::MAX_UDP_PAYLOAD {
+                return Ok(false);
+            }
+            let Ok(parts) = super::datagram::split(packet) else {
+                return Ok(false);
+            };
+            let mut application = None;
+            for part in parts {
+                match part.kind {
+                    super::datagram::PacketKind::Handshake => {
+                        if let Some(tail) = self.handshake_tail.as_mut() {
+                            let now = Instant::now();
+                            match tail.receive(part.bytes, now).map_err(|_| Error::Protocol)? {
+                                TailEvent::Ignored => {}
+                                TailEvent::Authenticated => self.idle.received(now),
+                                TailEvent::Close => {
+                                    self.enter_draining(now)?;
+                                    return Ok(true);
+                                }
+                            }
+                        }
+                    }
+                    super::datagram::PacketKind::Application => application = Some(part.bytes),
+                    _ => {}
+                }
+            }
+            let Some(application) = application else {
+                return Ok(false);
+            };
+            packet = application;
+        }
+        let n = packet.len();
+        let destination = if (1 + CID_LEN + 4 + 16..=super::mtu::MAX_UDP_PAYLOAD).contains(&n)
+            && packet[0] & 0xc0 == 0x40
+        {
+            self.local_ids
+                .iter()
+                .find_map(|(&seq, cid)| (packet[1..1 + CID_LEN] == *cid).then_some((seq, *cid)))
+        } else {
+            None
+        };
+        let Some((destination_sequence, destination_cid)) = destination else {
+            return self.receive_stateless_reset(packet, source, Instant::now());
+        };
+        let now = Instant::now();
+        let old_key_deadline = now
+            .checked_add(self.scheduler.base_pto().saturating_mul(3))
+            .ok_or(Error::Protocol)?;
+        let result = match self.protection.as_mut().ok_or(Error::Closed)? {
+            Protection::Fixed { reader, .. } => reader.open(packet, 1 + CID_LEN),
+            Protection::Rotating { reader, writer } => {
+                match reader.open(
+                    &destination_cid,
+                    packet,
+                    now,
+                    old_key_deadline,
+                    self.confirmed,
+                ) {
+                    Ok(packet) => {
+                        writer.respond(reader.generation()).map_err(Error::Packet)?;
+                        Ok(packet)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        };
+        let opened = match result {
+            Ok(p) => p,
+            Err(packet::Error::Reserved | packet::Error::Limit) => return Err(Error::Protocol),
+            Err(packet::Error::Crypto | packet::Error::Header) => {
+                return self.receive_stateless_reset(packet, source, now)
+            }
+            Err(_) => return Ok(false),
+        };
+        if matches!(&self.protection, Some(Protection::Fixed { .. }))
+            && opened.header[0] & 0x04 != 0
+        {
+            return Err(Error::Protocol);
+        }
+        let parsed =
+            frames::decode(&opened.payload, Space::Application).map_err(|_| Error::Protocol)?;
+        if new_path {
+            // Only authenticated 1-RTT packets can establish a candidate.
+            // Never apply stream data, ACKs or close from an unvalidated path.
+            let old_ip = self.paths.active().ip();
+            let pto = self.scheduler.base_pto();
+            let Ok(challenge) =
+                self.paths
+                    .begin_with_timeout(source, n as u64, now, pto.saturating_mul(3))
+            else {
+                return Ok(false);
+            };
+            if !parsed.iter().any(|f| {
+                matches!(f, Frame::PathResponse(value)
+                    if self.paths.response(source, *value, now))
+            }) {
+                // A peer may validate its own new path simultaneously. Answer
+                // only the first challenge, within this candidate's budget.
+                // No stream data, ACK or close is applied before validation.
+                if self.scheduler.can_send_path() {
+                    if let Some(Frame::PathChallenge(value)) =
+                        parsed.iter().find(|f| matches!(f, Frame::PathChallenge(_)))
+                    {
+                        let cid_len = self.peer_ids.current().ok_or(Error::Protocol)?.len();
+                        let minimum = 1 + cid_len + 4 + 16 + 9;
+                        let size = if self.paths.reserve_candidate_send(source, MTU as u64, now) {
+                            Some(MTU)
+                        } else if self
+                            .paths
+                            .reserve_candidate_send(source, minimum as u64, now)
+                        {
+                            Some(minimum)
+                        } else {
+                            None
+                        };
+                        if let Some(size) = size {
+                            let mut frame = vec![0x1b];
+                            frame.extend_from_slice(value);
+                            self.send_path_sized(source, &frame, size, now).await?;
+                        }
+                    }
+                }
+                if self.scheduler.can_send_path()
+                    && self.paths.reserve_challenge(
+                        source,
+                        MTU as u64,
+                        now,
+                        self.scheduler.base_pto(),
+                    )
+                {
+                    let mut frame = vec![0x1a];
+                    frame.extend_from_slice(&challenge);
+                    self.send_path(source, &frame, now).await?;
+                }
+                return Ok(false);
+            }
+            // A validated cross-IP path starts a fresh congestion/RTT model;
+            // same-IP NAT rebinding may preserve the old estimates.
+            if old_ip != source.ip() {
+                self.scheduler.restart_path(now);
+            } else {
+                self.scheduler.reset_mtu(now);
+            }
+        }
+        self.idle.received(now);
+        if let Some(Frame::Close {
+            application, code, ..
+        }) = parsed
+            .iter()
+            .find(|frame| matches!(frame, Frame::Close { .. }))
+        {
+            if *application {
+                self.peer_application_close = Some(*code);
+            }
+            // Draining is silent. Drop keys now; retain the connection
+            // object/route until the shutdown deadline.
+            self.enter_draining(now)?;
+            return Ok(true);
+        }
+        if self.shutdown.phase() == ShutdownPhase::Closing {
+            self.shutdown.authenticated_packet(now);
+            return Ok(true);
+        }
+        let eliciting = parsed
+            .iter()
+            .any(|f| !matches!(f, Frame::Ack(_) | Frame::Padding | Frame::Close { .. }));
+        let now = Instant::now();
+        for frame in parsed {
+            match frame {
+                Frame::Padding | Frame::Ping | Frame::PathResponse(_) => {}
+                Frame::PathChallenge(value) if self.confirmed => {
+                    if self.scheduler.can_send_path() {
+                        let mut response = vec![0x1b];
+                        response.extend_from_slice(&value);
+                        self.send_path(source, &response, now).await?;
+                    }
+                }
+                Frame::NewConnectionId {
+                    sequence,
+                    retire_prior_to,
+                    cid,
+                    reset_token,
+                } => {
+                    let retired = self
+                        .peer_ids
+                        .insert(
+                            ConnectionId {
+                                sequence,
+                                cid: cid.to_vec(),
+                                reset_token,
+                            },
+                            retire_prior_to,
+                        )
+                        .map_err(|_| Error::Protocol)?;
+                    if !self.scheduler.can_queue_n(retired.len()) {
+                        return Err(Error::Protocol);
+                    }
+                    for sequence in retired {
+                        self.queue_retire_cid(sequence)?;
+                    }
+                }
+                Frame::RetireConnectionId(sequence) => {
+                    if sequence >= self.next_local_sequence || sequence == destination_sequence {
+                        return Err(Error::Protocol);
+                    }
+                    if let Some(cid) = self.local_ids.get(&sequence).copied() {
+                        if self.local_ids.len() <= 1 {
+                            return Err(Error::Protocol);
+                        }
+                        self.socket.retire_cid(cid).await.map_err(Error::Io)?;
+                        self.local_ids.remove(&sequence);
+                    }
+                }
+                Frame::Ack(ack) => {
+                    self.scheduler
+                        .acknowledge(&ack, now)
+                        .map_err(Error::Schedule)?;
+                    if let Some(Protection::Rotating { writer, .. }) = &mut self.protection {
+                        if let Some(range) = ack.ranges.first() {
+                            writer.acknowledged(range.last);
+                        }
+                    }
+                }
+                Frame::HandshakeDone
+                    if !self.server
+                        && matches!(&self.protection, Some(Protection::Rotating { .. })) =>
+                {
+                    self.confirmed = true;
+                    self.scheduler.confirm_handshake();
+                    self.handshake_tail = None;
+                }
+                Frame::Stream {
+                    id,
+                    offset,
+                    data,
+                    fin,
+                } => {
+                    self.receive
+                        .insert(id, offset, data, fin)
+                        .map_err(Error::Receive)?;
+                    self.register_implicit(id)?;
+                }
+                Frame::ResetStream {
+                    id,
+                    code,
+                    final_size,
+                } => {
+                    self.receive
+                        .reset(id, final_size, code)
+                        .map_err(Error::Receive)?;
+                    self.register_implicit(id)?;
+                }
+                Frame::Crypto { offset, data } if !self.server => {
+                    // Independent TLS 1.3 peers may send NewSessionTicket
+                    // in 1-RTT, even though we never resume. Feed only the
+                    // authenticated, bounded CRYPTO stream to rustls.
+                    // Fixed-key fixtures and server-side peers cannot use
+                    // this path; unexpected TLS output is a protocol error.
+                    let driver = self.post_handshake.as_mut().ok_or(Error::Protocol)?;
+                    driver
+                        .receive(super::handshake::Level::Application, offset, data)
+                        .map_err(|_| Error::Protocol)?;
+                    if driver.poll_output().map_err(|_| Error::Protocol)?.is_some() {
+                        return Err(Error::Protocol);
+                    }
+                }
+                Frame::NewToken(_) if !self.server => {
+                    // No address-token cache or 0-RTT in this backend. Never
+                    // accept a peer's token as identity or admission evidence.
+                }
+                Frame::DataBlocked(_) | Frame::StreamsBlocked { .. } => {}
+                Frame::StreamDataBlocked { id, .. } => {
+                    self.receive.check_stop(id).map_err(Error::Receive)?;
+                    self.register_implicit(id)?;
+                }
+                Frame::StopSending { id, code } => {
+                    if id & 2 == 0 && id & 1 != u64::from(self.server) {
+                        self.register_implicit(id)?;
+                    }
+                    self.reset_stream(id, code)?;
+                }
+                Frame::MaxData(n) => self.send.max_data(n).map_err(Error::Send)?,
+                Frame::MaxStreamData { id, limit } => {
+                    if id & 2 == 0 && id & 1 != u64::from(self.server) {
+                        self.register_implicit(id)?;
+                    }
+                    self.send.max_stream_data(id, limit).map_err(Error::Send)?
+                }
+                Frame::MaxStreams { bidi: false, limit } => {
+                    self.send.max_streams(limit).map_err(Error::Send)?
+                }
+                Frame::MaxStreams { bidi: true, limit } => {
+                    self.send.max_bidi(limit).map_err(Error::Send)?
+                }
+                _ => return Err(Error::Protocol),
+            }
+        }
+        self.acknowledgments
+            .record_marked(opened.number, eliciting, mark);
+        Ok(true)
+    }
+}

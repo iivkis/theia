@@ -381,6 +381,10 @@ impl Form {
             if picker && g.stride >= 2 {
                 let style = label_style.bg(if selected { FOCUS } else { SURFACE });
                 let grant = matches!(field.label, "[x] Доступ выбран" | "[ ] Нет доступа");
+                let user = matches!(
+                    field.label,
+                    "Отключённый пользователь" | "Пользователь с доступом"
+                );
                 let primary = if grant {
                     format!(
                         "{marker}{} {}",
@@ -389,6 +393,12 @@ impl Form {
                         } else {
                             "[ ]"
                         },
+                        field.value
+                    )
+                } else if user {
+                    format!(
+                        "{marker}{}  {}",
+                        if selected { "●" } else { "○" },
                         field.value
                     )
                 } else {
@@ -408,6 +418,8 @@ impl Form {
                                 } else {
                                     "Не выбран"
                                 }
+                            } else if user {
+                                field.label
                             } else {
                                 value
                             },
@@ -710,21 +722,35 @@ impl ReferenceReview {
 fn append_wrapped(lines: &mut Vec<Line<'static>>, text: &str, width: u16, style: Style) {
     let width = usize::from(width.max(1));
     for paragraph in text.split('\n') {
-        let mut row = String::new();
-        let mut used = 0;
-        for c in paragraph.chars() {
-            let c = if c.is_control() { '�' } else { c };
-            let mut buf = [0; 4];
-            let encoded: &str = c.encode_utf8(&mut buf);
-            let cells = Span::raw(encoded).width();
-            if !row.is_empty() && used + cells > width {
-                lines.push(Line::styled(std::mem::take(&mut row), style));
-                used = 0;
+        let clean: String = paragraph
+            .chars()
+            .map(|c| if c.is_control() { '�' } else { c })
+            .collect();
+        let mut rest = clean.as_str();
+        while !rest.is_empty() {
+            let mut used = 0;
+            let mut end = 0;
+            let mut boundary = 0;
+            for (i, c) in rest.char_indices() {
+                let cells = Span::raw(c.to_string()).width();
+                if end > 0 && used + cells > width {
+                    break;
+                }
+                used += cells;
+                end = i + c.len_utf8();
+                if c.is_whitespace() {
+                    boundary = end;
+                }
             }
-            row.push(c);
-            used += cells;
+            if end < rest.len() && boundary > 0 {
+                end = boundary;
+            }
+            lines.push(Line::styled(rest[..end].to_owned(), style));
+            rest = &rest[end..];
         }
-        lines.push(Line::styled(row, style));
+        if clean.is_empty() {
+            lines.push(Line::styled(String::new(), style));
+        }
     }
 }
 

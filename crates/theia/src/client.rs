@@ -1,83 +1,26 @@
 //! Authenticated H2 client transport used by the local proxy listeners.
 //! Trust anchors are supplied by the caller; this API never disables PKI.
 use crate::diagnostics::{self, Value};
-use crate::protocol::{self, Address, Decoder, Direction, ErrorCode, Frame, Role, Session};
+use crate::protocol::{self, Address, Decoder, Direction, Frame, Role, Session};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bytes::Bytes;
 use http::{header, HeaderValue, Request, StatusCode};
 use rustls::{pki_types::ServerName, RootCertStore};
-use std::{collections::VecDeque, fmt, sync::Arc, time::Duration};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncWrite},
     task::JoinHandle,
     time::timeout,
 };
 use tokio_rustls::TlsConnector;
 
-const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
-const IO_TIMEOUT: Duration = Duration::from_secs(30);
+use crate::xhttp::session::{
+    self, CarrierKind, FrameReader, FrameWriter, OpenAdapter, IO_TIMEOUT, OPEN_TIMEOUT,
+};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClientError {
-    Configuration,
-    Io,
-    TcpControllerUnavailable,
-    Tls,
-    Http2,
-    Http3,
-    QuicUnreachable,
-    QuicEndpointNetworkRefused,
-    Unauthorized,
-    SystemProxy,
-    Rejected(u16),
-    Protocol,
-    Open(ErrorCode),
-    Timeout,
-}
-
-impl fmt::Display for ClientError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Never display credential, request headers, endpoint or target values.
-        match self {
-            Self::Configuration => f.write_str("invalid client configuration"),
-            Self::Io => f.write_str("client TCP operation failed"),
-            Self::TcpControllerUnavailable => f.write_str("TCP BBR/CUBIC controller unavailable"),
-            Self::Tls => f.write_str("TLS identity or ALPN verification failed"),
-            Self::Http2 => f.write_str("HTTP/2 transport failed"),
-            Self::Http3 => f.write_str("HTTP/3 transport failed"),
-            Self::QuicUnreachable => f.write_str("quic_unreachable"),
-            Self::QuicEndpointNetworkRefused => f.write_str("quic_endpoint_network_refused"),
-            Self::Unauthorized => f.write_str("server rejected authentication"),
-            Self::SystemProxy => f.write_str("Windows user proxy CAS/recovery failed; inspect client proxy --status and recover explicitly"),
-            Self::Rejected(status) => write!(f, "server rejected request (HTTP {status})"),
-            Self::Protocol => f.write_str("SmartTheia protocol violation"),
-            Self::Open(code) => write!(f, "target connection rejected ({code:?})"),
-            Self::Timeout => f.write_str("client operation timed out"),
-        }
-    }
-}
-
-impl std::error::Error for ClientError {}
-
-/// Sanitized, stable error categories: never format a remote-controlled value.
-pub(crate) fn error_kind(error: &ClientError) -> &'static str {
-    match error {
-        ClientError::Configuration => "configuration",
-        ClientError::Io => "io",
-        ClientError::TcpControllerUnavailable => "tcp_controller_unavailable",
-        ClientError::Tls => "tls",
-        ClientError::Http2 => "h2",
-        ClientError::Http3 => "h3",
-        ClientError::QuicUnreachable => "quic_unreachable",
-        ClientError::QuicEndpointNetworkRefused => "quic_endpoint_network_refused",
-        ClientError::Unauthorized => "unauthorized",
-        ClientError::SystemProxy => "system_proxy",
-        ClientError::Rejected(_) => "http_rejected",
-        ClientError::Protocol => "protocol",
-        ClientError::Open(_) => "open_rejected",
-        ClientError::Timeout => "timeout",
-    }
-}
+// Preserve the public client error API; the implementation is transport-neutral.
+pub(crate) use crate::net::error::error_kind;
+pub use crate::net::error::ClientError;
 
 pub(crate) fn bearer_header(token: &str) -> Result<HeaderValue, ClientError> {
     if token.len() != 43 || token.contains('=') {
@@ -138,11 +81,20 @@ impl H2Client {
         token: &str,
         roots: RootCertStore,
     ) -> Result<Self, ClientError> {
-        if roots.is_empty() {
+        Self::new_with_trust(endpoint, name, token, &crate::own_tls::Trust::Roots(roots))
+    }
+
+    pub(crate) fn new_with_trust(
+        endpoint: &str,
+        name: &str,
+        token: &str,
+        trust: &crate::own_tls::Trust,
+    ) -> Result<Self, ClientError> {
+        if !trust.usable() {
             return Err(ClientError::Configuration);
         }
-        let tls = crate::transport_policy::Carrier::H2
-            .client_tls(roots)
+        let tls = trust
+            .tls(crate::transport_policy::Carrier::H2)
             .map_err(|_| ClientError::Tls)?;
         Self::with_connector(
             endpoint,
@@ -321,6 +273,181 @@ impl H2Client {
                 return Err(ClientError::Protocol);
             }
             crate::identity_data::finish_descriptor(bytes, expected)
+        })
+        .await
+        .map_err(|_| ClientError::Timeout)?
+    }
+
+    /// Authenticated binary policy snapshot for this exact inbound path.
+    pub(crate) async fn fetch_routing(
+        &self,
+        known: Option<[u8; 32]>,
+    ) -> Result<Vec<u8>, ClientError> {
+        self.routing_resource(None, known, false).await
+    }
+
+    pub(crate) async fn diagnostic_domains(
+        &self,
+        digest: [u8; 32],
+    ) -> Result<Vec<String>, ClientError> {
+        let bytes = self.routing_resource(None, Some(digest), true).await?;
+        crate::routing::exchange::decode_diagnostic_domains(&bytes, digest)
+    }
+
+    pub(crate) async fn resolve_routing(
+        &self,
+        name: &str,
+        digest: [u8; 32],
+    ) -> Result<Vec<std::net::IpAddr>, ClientError> {
+        let bytes = self
+            .routing_resource(Some((name, digest, false)), None, false)
+            .await?;
+        crate::routing::exchange::decode_ips(&bytes)
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        all(target_os = "windows", target_arch = "x86_64")
+    ))]
+    pub(crate) async fn resolve_native_dns(
+        &self,
+        name: &str,
+        digest: [u8; 32],
+    ) -> Result<Vec<std::net::IpAddr>, ClientError> {
+        let bytes = self
+            .routing_resource(Some((name, digest, true)), None, false)
+            .await?;
+        crate::routing::exchange::decode_ips(&bytes)
+    }
+
+    pub(crate) fn diagnostic_remote(&self) -> Result<std::net::SocketAddr, ClientError> {
+        self.endpoint
+            .parse()
+            .map_err(|_| ClientError::Configuration)
+    }
+
+    pub(crate) fn own_routing_scope(&self) -> Option<&str> {
+        self.own_routes
+            .as_ref()?
+            .routing
+            .strip_prefix("/v1/")?
+            .strip_suffix("/routing")
+    }
+
+    async fn routing_resource(
+        &self,
+        domain: Option<(&str, [u8; 32], bool)>,
+        known: Option<[u8; 32]>,
+        diagnostic: bool,
+    ) -> Result<Vec<u8>, ClientError> {
+        let routes = self
+            .identity_routes
+            .as_ref()
+            .or(self.own_routes.as_ref())
+            .ok_or(ClientError::Configuration)?;
+        timeout(crate::routing::exchange::TRANSFER_TIMEOUT, async {
+            let route = self
+                .endpoint
+                .parse()
+                .ok()
+                .and_then(crate::network_scope::observe);
+            let reusable = self.reuse_connections
+                && self.certificate_pin.is_none()
+                && matches!(&self.connector, H2Tls::Rustls(_));
+            let mut lease = self
+                .pool
+                .acquire(
+                    route,
+                    reusable,
+                    |connection| !connection.driver.0.is_finished(),
+                    self.connect_verified(diagnostics::next_id()),
+                )
+                .await?;
+            if route.is_some()
+                && self
+                    .endpoint
+                    .parse()
+                    .ok()
+                    .and_then(crate::network_scope::observe)
+                    != route
+            {
+                lease.retire();
+                return Err(ClientError::Io);
+            }
+            if !lease.accepting_new_streams() {
+                return Err(ClientError::Http2);
+            }
+            let connection = lease.connection();
+            let sender = connection
+                .sender
+                .lock()
+                .map_err(|_| ClientError::Http2)?
+                .clone();
+            let mut sender = sender.ready().await.map_err(|_| ClientError::Http2)?;
+            let mut parts = self.uri.clone().into_parts();
+            parts.path_and_query = Some(
+                routes
+                    .routing
+                    .parse()
+                    .map_err(|_| ClientError::Configuration)?,
+            );
+            let uri = http::Uri::from_parts(parts).map_err(|_| ClientError::Configuration)?;
+            let mut request = Request::get(uri)
+                .header(header::AUTHORIZATION, self.authorization.clone())
+                .body(())
+                .map_err(|_| ClientError::Configuration)?;
+            if let Some((name, digest, native)) = domain {
+                crate::routing::exchange::request_domain(&mut request, name, digest)?;
+                if native {
+                    request.headers_mut().insert(
+                        crate::routing::exchange::NATIVE_DNS_HEADER,
+                        http::HeaderValue::from_static("1"),
+                    );
+                }
+            } else if let Some(digest) = known {
+                crate::routing::exchange::request_digest(&mut request, digest)?;
+            }
+            if diagnostic {
+                request.headers_mut().insert(
+                    crate::routing::exchange::DIAGNOSTIC_HEADER,
+                    http::HeaderValue::from_static("1"),
+                );
+            }
+            let request = crate::channel_binding::attach(
+                connection.binding.as_ref(),
+                self.padding.request(request)?,
+            )?;
+            let (response, _) = sender
+                .send_request(request, true)
+                .map_err(|_| ClientError::Http2)?;
+            let response = response.await.map_err(|_| ClientError::Http2)?;
+            crate::split_http::check_status(response.status())?;
+            let expected = crate::routing::exchange::validate_headers(response.headers())?;
+            if (diagnostic && expected > crate::routing::exchange::DIAGNOSTIC_LIMIT)
+                || (domain.is_some() && expected > crate::routing::exchange::DNS_LIMIT)
+            {
+                return Err(ClientError::Protocol);
+            }
+            let mut body = response.into_body();
+            let mut bytes = Vec::new();
+            while let Some(chunk) = body.data().await {
+                let chunk = chunk.map_err(|_| ClientError::Http2)?;
+                crate::routing::exchange::append(&mut bytes, &chunk, expected)?;
+                body.flow_control()
+                    .release_capacity(chunk.len())
+                    .map_err(|_| ClientError::Http2)?;
+            }
+            if body
+                .trailers()
+                .await
+                .map_err(|_| ClientError::Http2)?
+                .is_some()
+            {
+                return Err(ClientError::Protocol);
+            }
+            let bytes = crate::routing::exchange::finish(bytes, expected)?;
+            lease.admitted();
+            Ok(bytes)
         })
         .await
         .map_err(|_| ClientError::Timeout)?
@@ -516,86 +643,59 @@ impl H2Client {
     /// encoded verbatim as OPEN_TCP and are never resolved by this client.
     /// A successful return is possible only after a valid OPEN_OK.
     pub async fn open(&self, address: Address, port: u16) -> Result<Tunnel, ClientError> {
-        let operation = diagnostics::next_id();
-        crate::diag!(
-            Debug,
-            "client.h2",
-            "open_begin",
-            "op" = Value::Count(operation)
-        );
-        let open = Frame::OpenTcp { address, port };
-        protocol::encode(&open).map_err(|_| ClientError::Configuration)?;
-        let result = timeout(OPEN_TIMEOUT, self.open_selected(open, operation))
-            .await
-            .map_err(|_| ClientError::Timeout)
-            .and_then(|result| result);
-        match &result {
-            Ok(_) => crate::diag!(
-                Debug,
-                "client.h2",
-                "open_confirmed",
-                "op" = Value::Count(operation)
-            ),
-            Err(error) => crate::diag!(
-                Warn,
-                "client.h2",
-                "open_failed",
-                "op" = Value::Count(operation),
-                "reason" = Value::Label(error_kind(error))
-            ),
-        }
-        result
+        self.open_frame(Frame::OpenTcp { address, port }).await
     }
 
-    async fn open_selected(&self, open: Frame, operation: u64) -> Result<Tunnel, ClientError> {
-        use crate::split_http::HelloOutcome;
-        let mut stage = HelloOutcome::Pending;
-        let Some(mode) = &self.auto_mode else {
-            return self
-                .open_mode(&open, operation, self.stream_up, &mut stage)
-                .await;
-        };
-        let ticket = mode.select()?;
-        let stream_up = ticket.stream_up;
-        let result = self
-            .open_mode(&open, operation, stream_up, &mut stage)
-            .await;
-        if !mode.after_attempt(ticket, stream_up, stage)? {
-            return result;
-        }
-        // The first attempt is fully dropped and never sent OPEN_TCP.
-        crate::diag!(Debug, "client.h2", "xhttp_pre_open_stream_up_retry");
-        let mut stage = HelloOutcome::Pending;
-        let result = self.open_mode(&open, operation, true, &mut stage).await;
-        mode.after_attempt(ticket, true, stage)?;
-        result
-    }
-
-    /// At most one fresh connection after an explicit graceful GOAWAY
-    /// before any HELLO/OPEN. Never replay a body or change XHTTP mode.
-    async fn open_mode(
+    pub(crate) async fn open_udp(
         &self,
-        open: &Frame,
-        operation: u64,
-        stream_up: bool,
-        stage: &mut crate::split_http::HelloOutcome,
+        address: Address,
+        port: u16,
     ) -> Result<Tunnel, ClientError> {
-        use crate::split_http::HelloOutcome;
-        let result = self.open_inner(open, operation, stream_up, stage).await;
-        if *stage != HelloOutcome::Draining {
-            return result;
+        self.open_frame(Frame::OpenUdp { address, port }).await
+    }
+
+    async fn open_frame(&self, open: Frame) -> Result<Tunnel, ClientError> {
+        session::open(self, open).await
+    }
+
+    pub(crate) async fn warm_carrier(&self) -> Result<(), ClientError> {
+        let reusable = self.reuse_connections
+            && self.certificate_pin.is_none()
+            && matches!(&self.connector, H2Tls::Rustls(_));
+        if !reusable {
+            return Ok(());
         }
-        *stage = HelloOutcome::Pending;
-        self.open_inner(open, operation, stream_up, stage).await
+        let route = self
+            .endpoint
+            .parse()
+            .ok()
+            .and_then(crate::network_scope::observe);
+        self.pool
+            .warm(
+                route,
+                |connection| !connection.driver.0.is_finished(),
+                self.connect_verified(diagnostics::next_id()),
+                || {
+                    route.is_some()
+                        && self
+                            .endpoint
+                            .parse()
+                            .ok()
+                            .and_then(crate::network_scope::observe)
+                            == route
+                },
+            )
+            .await
     }
 
     async fn connect_verified(&self, operation: u64) -> Result<H2Connection, ClientError> {
-        let (socket, controller) = crate::tcp_bbr::connect(self.endpoint.as_str())
-            .await
-            .map_err(|error| match error {
-                crate::tcp_bbr::Error::Network => ClientError::Io,
-                crate::tcp_bbr::Error::Unavailable => ClientError::TcpControllerUnavailable,
-            })?;
+        let (socket, controller, carrier_lease) =
+            crate::tcp_bbr::connect_carrier(self.endpoint.as_str())
+                .await
+                .map_err(|error| match error {
+                    crate::tcp_bbr::Error::Network => ClientError::Io,
+                    crate::tcp_bbr::Error::Unavailable => ClientError::TcpControllerUnavailable,
+                })?;
         crate::diag!(
             Trace,
             "client.h2",
@@ -639,7 +739,7 @@ impl H2Client {
                 } else {
                     None
                 };
-                let (sender, driver) = start_h2(tls, self.wire_shape).await?;
+                let (sender, driver) = start_h2(tls, self.wire_shape, carrier_lease).await?;
                 (sender, driver, binding)
             }
             #[cfg(feature = "experimental-btls-h2")]
@@ -648,7 +748,7 @@ impl H2Client {
                 trusted_ca_pem,
             } => {
                 let tls = crate::h2_btls::connect(socket, server_name, trusted_ca_pem).await?;
-                let (sender, driver) = start_h2(tls, self.wire_shape).await?;
+                let (sender, driver) = start_h2(tls, self.wire_shape, carrier_lease).await?;
                 (sender, driver, None)
             }
         };
@@ -908,6 +1008,7 @@ impl H2Client {
 async fn start_h2<S>(
     tls: S,
     wire_shape: H2WireShape,
+    carrier_lease: crate::routing::carrier_socket::Lease,
 ) -> Result<(h2::client::SendRequest<Bytes>, Driver), ClientError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -927,9 +1028,30 @@ where
         .await
         .map_err(|_| ClientError::Http2)?;
     let driver = Driver(tokio::spawn(async move {
+        let _carrier = carrier_lease;
         let _ = connection.await;
     }));
     Ok((sender, driver))
+}
+
+impl OpenAdapter for H2Client {
+    type Tunnel = Tunnel;
+    const KIND: CarrierKind = CarrierKind::H2;
+    fn explicit_stream_up(&self) -> bool {
+        self.stream_up
+    }
+    fn automatic_mode(&self) -> Option<&crate::split_http::AutoMode> {
+        self.auto_mode.as_ref()
+    }
+    async fn open_attempt<'a>(
+        &'a self,
+        open: &'a Frame,
+        operation: u64,
+        stream_up: bool,
+        stage: &'a mut crate::split_http::HelloOutcome,
+    ) -> Result<Tunnel, ClientError> {
+        self.open_inner(open, operation, stream_up, stage).await
+    }
 }
 
 struct H2Connection {
@@ -959,6 +1081,30 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
+    pub(crate) async fn relay_udp(
+        mut self,
+        first: Option<Vec<u8>>,
+        upload: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        download: tokio::sync::mpsc::Sender<Vec<u8>>,
+        flow: Option<&crate::routing::flow::FlowLease>,
+    ) -> Result<(), ClientError> {
+        let mut reader = H2FrameReader {
+            decoder: &mut self.decoder,
+            stream: &mut self.incoming,
+        };
+        session::relay_udp(
+            CarrierKind::H2,
+            &self.state,
+            &mut self.outgoing,
+            &mut reader,
+            first,
+            upload,
+            download,
+            flow,
+        )
+        .await
+    }
+
     pub(crate) fn opened_stream_up(&self) -> bool {
         self.stream_up
     }
@@ -970,155 +1116,37 @@ impl Tunnel {
 
     /// Relay a local duplex byte stream after OPEN_OK. Each direction has
     /// independent flow control, one bounded frame buffer and FIN state.
-    pub async fn relay<S>(mut self, local: S) -> Result<(), ClientError>
+    pub async fn relay<S>(self, local: S) -> Result<(), ClientError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        let traffic = crate::traffic::enter(crate::Role::Client, false);
-        let operation = self.operation;
-        crate::diag!(
-            Debug,
-            "client.h2",
-            "relay_begin",
-            "op" = Value::Count(operation)
-        );
-        let (mut read, mut write) = tokio::io::split(local);
-        let incoming = &mut self.incoming;
-        let outgoing = &mut self.outgoing;
-        let decoder = &mut self.decoder;
-        let mut upload_state = self.state.clone();
-        let mut download_state = self.state.clone();
-        let activity = crate::relay_liveness::Activity::new();
-        let (upload_done, upload_finished) = tokio::sync::oneshot::channel();
-        let upload = async {
-            let mut buffer = [0; crate::relay_batch::MAX_BATCH];
-            let mut batch = crate::relay_batch::ReadyBatch::default();
-            loop {
-                let size = batch
-                    .read(&mut read, &mut buffer)
-                    .await
-                    .map_err(|_| ClientError::Io)?;
-                let frame = if size == 0 {
-                    Frame::Fin
-                } else {
-                    Frame::Data(buffer[..size].to_vec())
-                };
-                crate::diag!(
-                    Trace,
-                    "client.h2",
-                    "upload_frame",
-                    "op" = Value::Count(operation),
-                    "bytes" = Value::Count(size as u64),
-                    "fin" = Value::Flag(size == 0)
-                );
-                upload_state
-                    .apply(Direction::Send, &frame)
-                    .map_err(|_| ClientError::Protocol)?;
-                timeout(IO_TIMEOUT, send_frame(outgoing, &frame, size == 0))
-                    .await
-                    .map_err(|_| ClientError::Timeout)??;
-                if size == 0 {
-                    activity.half_closed();
-                    let _ = upload_done.send(());
-                    return Ok::<(), ClientError>(());
-                }
-                self._lease.record_data(size);
-                traffic.upload(size);
-                activity.data(size);
-            }
+        self.relay_guarded(local, None).await
+    }
+
+    pub(crate) async fn relay_guarded<S>(
+        mut self,
+        local: S,
+        flow: Option<&crate::routing::flow::FlowLease>,
+    ) -> Result<(), ClientError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let mut reader = H2FrameReader {
+            decoder: &mut self.decoder,
+            stream: &mut self.incoming,
         };
-        let download = async {
-            loop {
-                let frame = decoder.next(incoming).await?.ok_or(ClientError::Protocol)?;
-                download_state
-                    .apply(Direction::Receive, &frame)
-                    .map_err(|_| ClientError::Protocol)?;
-                match frame {
-                    Frame::Padding(_) => tokio::task::yield_now().await,
-                    Frame::Data(data) => {
-                        crate::diag!(
-                            Trace,
-                            "client.h2",
-                            "download_frame",
-                            "op" = Value::Count(operation),
-                            "bytes" = Value::Count(data.len() as u64)
-                        );
-                        timeout(IO_TIMEOUT, write.write_all(&data))
-                            .await
-                            .map_err(|_| ClientError::Timeout)?
-                            .map_err(|_| ClientError::Io)?;
-                        self._lease.record_data(data.len());
-                        traffic.download(data.len());
-                        activity.data(data.len());
-                    }
-                    Frame::Fin => {
-                        crate::diag!(
-                            Debug,
-                            "client.h2",
-                            "download_fin",
-                            "op" = Value::Count(operation)
-                        );
-                        timeout(IO_TIMEOUT, write.shutdown())
-                            .await
-                            .map_err(|_| ClientError::Timeout)?
-                            .map_err(|_| ClientError::Io)?;
-                        activity.half_closed();
-                        break;
-                    }
-                    Frame::Abort(code) => return Err(ClientError::Open(code)),
-                    _ => return Err(ClientError::Protocol),
-                }
-            }
-            if crate::relay_liveness::receive_tail(
-                async {
-                    loop {
-                        let frame = decoder.next(incoming).await?;
-                        if let Some(padding @ Frame::Padding(_)) = &frame {
-                            if activity.both_finished() {
-                                return Err(ClientError::Protocol);
-                            }
-                            download_state
-                                .apply(Direction::Receive, padding)
-                                .map_err(|_| ClientError::Protocol)?;
-                            tokio::task::yield_now().await;
-                            continue;
-                        }
-                        return Ok(frame);
-                    }
-                },
-                upload_finished,
-                ClientError::Timeout,
-            )
-            .await?
-            .is_some()
-            {
-                return Err(ClientError::Protocol);
-            }
-            Ok::<(), ClientError>(())
-        };
-        if let Err(error) = activity.run(upload, download, ClientError::Timeout).await {
-            crate::diag!(
-                Warn,
-                "client.h2",
-                "relay_failed",
-                "op" = Value::Count(operation),
-                "reason" = Value::Label(error_kind(&error))
-            );
-            return Err(error);
-        }
-        crate::diag!(
-            Debug,
-            "client.h2",
-            "relay_completed",
-            "op" = Value::Count(operation)
-        );
-        self.state
-            .apply(Direction::Send, &Frame::Fin)
-            .map_err(|_| ClientError::Protocol)?;
-        self.state
-            .apply(Direction::Receive, &Frame::Fin)
-            .map_err(|_| ClientError::Protocol)?;
-        self.state.finish().map_err(|_| ClientError::Protocol)
+        let lease = &self._lease;
+        session::relay_tcp(
+            CarrierKind::H2,
+            self.operation,
+            &mut self.state,
+            &mut self.outgoing,
+            &mut reader,
+            local,
+            flow,
+            |bytes| lease.record_data(bytes),
+        )
+        .await
     }
 }
 
@@ -1147,6 +1175,32 @@ async fn send_frame(
             .map_err(|_| ClientError::Http2)?;
     }
     Ok(())
+}
+
+impl FrameWriter for h2::SendStream<Bytes> {
+    async fn send<'a>(&'a mut self, frame: &'a Frame) -> Result<(), ClientError> {
+        timeout(IO_TIMEOUT, send_frame(self, frame, false))
+            .await
+            .map_err(|_| ClientError::Timeout)?
+    }
+    async fn finish(&mut self) -> Result<(), ClientError> {
+        timeout(IO_TIMEOUT, send_frame(self, &Frame::Fin, true))
+            .await
+            .map_err(|_| ClientError::Timeout)?
+    }
+    fn abort(&mut self) {
+        self.send_reset(h2::Reason::CANCEL);
+    }
+}
+
+struct H2FrameReader<'a> {
+    decoder: &'a mut IncomingFrames,
+    stream: &'a mut h2::RecvStream,
+}
+impl FrameReader for H2FrameReader<'_> {
+    async fn next(&mut self) -> Result<Option<Frame>, ClientError> {
+        self.decoder.next(self.stream).await
+    }
 }
 
 #[derive(Default)]

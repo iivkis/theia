@@ -223,11 +223,18 @@ impl Model {
 
 /// Creation and rotation both reveal a newly generated bearer only after
 /// the guarded save succeeds. Existing user rotation never re-enables a user.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IssueKind {
     NewUser,
     Rotation,
     Reenable,
+    FirstKey,
+}
+
+impl IssueKind {
+    fn recovering(self) -> bool {
+        matches!(self, Self::Reenable | Self::FirstKey)
+    }
 }
 
 /// Confidential bearer issuance is isolated from ordinary editor commands.
@@ -329,7 +336,7 @@ impl RecordFlow {
             let users = editor.workspace_users();
             let fields = users.iter().enumerate().map(|(id, (name, disabled, _))| Field {
                 id,
-                label: if selected.contains(name) { "[x] Доступ разрешён" } else { "[ ] Нет доступа" },
+                label: if selected.contains(name) { "[x] Доступ выбран" } else { "[ ] Нет доступа" },
                 value: if *disabled { format!("{name} (отключён)") } else { name.clone() },
                 hint: "Пробел меняет право на это подключение. Статус отключённой учётной записи не изменится.",
             }).collect();
@@ -428,127 +435,129 @@ fn pages(role: Role) -> &'static [&'static str] {
         Role::Server => &[
             "Обзор",
             "Подключения",
-            "Пользователи",
-            "Приглашения",
+            "Пользователи и ключи",
+            "Управление",
             "Статистика",
             "Настройки",
             "Диагностика",
+            "Маршрутизация",
         ],
         Role::Client => &[
             "Обзор",
             "Профили",
-            "Импорт",
+            "Импорт ключа",
             "Подключение",
             "Статистика",
             "Настройки",
+            "Маршрутизация",
             "Диагностика",
         ],
     }
 }
 
+/// Record selection is only useful on pages scoped to an inbound or profile.
+fn page_has_records(role: Role, page: usize) -> bool {
+    page == 1
+        || (role == Role::Server && page == 2)
+        || (role == Role::Client && matches!(page, 3 | 7))
+}
+
+fn page_has_users(role: Role, page: usize) -> bool {
+    role == Role::Server && page == 2
+}
+
+/// Each operation has one visible owner. The overview only navigates there.
+#[cfg(test)]
 fn page_actions(role: Role, page: usize, editor: Option<&Editor>) -> Vec<ActionItem> {
+    page_actions_for(role, page, editor, 0, false)
+}
+
+fn page_actions_for(
+    role: Role,
+    page: usize,
+    editor: Option<&Editor>,
+    user: usize,
+    advanced: bool,
+) -> Vec<ActionItem> {
     let entries: &[(char, &str)] = match (role, page) {
-        (Role::Server, 0) => &[
-            ('N', "Создать подключение"),
-            ('u', "Добавить пользователя"),
-            ('b', "Восстановить доступ"),
-            ('G', "Выбрать пользователей"),
-            ('s', "Запуск / остановка"),
-            ('S', "Сохранить файл"),
-            ('a', "Применить права доступа"),
-            ('v', "Состояние / другие изменения"),
-            ('o', "Открыть другой файл"),
-        ],
+        (_, 0) => &[('>', "Перейти к следующему шагу")],
         (Role::Server, 1) => &[
             ('N', "Создать подключение"),
-            ('G', "Кому разрешён доступ"),
-            ('V', "Состояние (только REALITY)"),
-            ('E', "Сертификат (только Own-TLS)"),
+            ('V', "Состояние REALITY"),
+            ('E', "Свой TLS-сертификат"),
             ('D', "Удалить подключение"),
+            ('z', "Расширенные настройки"),
+            ('l', "Публичная ссылка (без ключа доступа)"),
+            ('K', "Заменить доверие REALITY"),
+            ('M', "Регистрация материалов"),
+            ('w', "Комплект по готовому плану"),
         ],
         (Role::Server, 2) => &[
-            ('u', "Добавить пользователя"),
-            ('G', "Выбрать права доступа"),
-            ('b', "Восстановить доступ"),
+            ('u', "Добавить пользователя и выдать ключ"),
+            ('b', "Восстановить доступ и выдать ключ"),
+            ('t', "Заменить ключ пользователя"),
             ('x', "Отключить пользователя"),
-            ('t', "Заменить приглашение"),
+            ('G', "Изменить права доступа"),
             ('U', "Удалить пользователя"),
+            ('j', "Проверить доступ на сервере"),
         ],
         (Role::Server, 3) => &[
-            ('u', "Новый пользователь и ссылка"),
-            ('b', "Восстановить доступ"),
-            ('t', "Заменить приглашение"),
-            ('l', "Ссылка без секрета"),
+            ('s', "Запуск / остановка"),
+            ('v', "Проверить состояние сервера"),
         ],
-        (_, 4) => &[('4', "Открыть монитор трафика")],
+        (Role::Server, 4) => &[],
+        (Role::Client, 4) => &[('4', "Развернуть монитор")],
         (Role::Server, 5) => &[
-            ('S', "Сохранить файл"),
-            ('a', "Применить права доступа"),
-            ('v', "Состояние / другие изменения"),
+            ('S', "Сохранить изменения"),
+            ('o', "Открыть другой файл"),
             ('Q', "Лимиты подключений"),
-            ('o', "Открыть файл"),
-            ('R', "Проверить перезапуск"),
-            ('K', "Заменить доверие"),
-            ('M', "Регистрация материалов"),
         ],
         (Role::Server, 6) => &[
-            ('p', "Сетевая диагностика"),
-            ('V', "Состояние (только REALITY)"),
+            ('i', "Узнать внешний IP"),
+            ('r', "Посмотреть области поиска"),
+            ('T', "Проверить назначенный IP"),
         ],
-        (Role::Client, 0) => &[
-            ('P', "Режим подключения"),
-            ('L', "Выбрать другой профиль"),
-            ('i', "Импорт ключа Theia"),
-            ('V', "Локальный прокси"),
-            ('N', "Новый профиль"),
-            ('A', "Выбрать активный профиль"),
-            ('S', "Сохранить настройки"),
-            ('o', "Открыть файл настроек"),
-        ],
+        (Role::Server, 7) => &[],
         (Role::Client, 1) => &[
-            ('V', "Подключить / отключить"),
-            ('A', "Выбрать активный профиль"),
-            ('N', "Создать профиль"),
-            ('i', "Импорт приглашения"),
-            ('E', "Сертификат Own-TLS"),
+            ('N', "Добавить профиль вручную (Own-TLS)"),
+            ('E', "Доверенный сертификат и ключ"),
             ('D', "Удалить профиль"),
+            ('z', "Расширенные настройки"),
+            ('K', "Подтвердить доверие REALITY"),
+            ('M', "Регистрация материалов"),
+            ('l', "Публичная ссылка (без ключа доступа)"),
         ],
         (Role::Client, 2) => &[
-            ('i', "Импорт ключа, файла или QR"),
-            ('I', "Расширенный импорт REALITY"),
+            ('i', "Вставить ключ"),
+            ('f', "Выбрать файл ключа"),
+            ('Q', "Импортировать QR из изображения"),
         ],
         (Role::Client, 3) if cfg!(windows) => &[
-            ('p', "Включить / выключить системный прокси"),
-            ('V', "Запустить / остановить локальный прокси"),
+            ('p', "Управлять системным прокси"),
+            ('V', "Запустить / остановить локальный прокси (диагностика)"),
             ('L', "Выбрать другой профиль"),
             ('A', "Выбрать активный профиль"),
-            ('i', "Добавить ключ"),
         ],
         (Role::Client, 3) => &[
             ('V', "Запустить / остановить локальный прокси"),
             ('L', "Выбрать другой профиль"),
             ('A', "Выбрать активный профиль"),
-            ('i', "Добавить ключ"),
         ],
-        (Role::Client, 5) => &[
-            ('o', "Открыть файл"),
-            ('S', "Сохранить файл"),
-            ('V', "Состояние и применение"),
-            ('K', "Подтвердить доверие"),
-            ('M', "Регистрация материалов"),
+        (Role::Client, 7) => &[('T', "Проверить сеть выбранного профиля")],
+        (Role::Client, 6) => &[
+            ('j', "Обновить состояние"),
+            ('d', "Разрешить / отключить Anti-DPI"),
+            ('u', "Разрешить / отозвать согласие STUN"),
         ],
-        (Role::Client, 6) => &[('V', "Диагностика подключения")],
+        (Role::Client, 5) => &[('S', "Сохранить файл"), ('o', "Открыть другой файл")],
         _ => &[],
     };
     let Some(editor) = editor else {
         return entries
             .iter()
-            .map(|(key, label)| ActionItem { key: *key, label })
+            .map(|&(key, label)| ActionItem { key, label })
             .collect();
     };
-    // Presentation-only availability. Direct shortcuts still pass through all
-    // existing validation/confirmation guards. Keep rendering and dispatch
-    // on this same list, including mouse hit testing.
     let reality = editor.selected_reality();
     let active = editor.selected_record_is_active();
     let has_record = editor.record_count() > 0;
@@ -557,50 +566,72 @@ fn page_actions(role: Role, page: usize, editor: Option<&Editor>) -> Vec<ActionI
     } else {
         Vec::new()
     };
-    let can_recover = users
-        .iter()
-        .any(|(_, disabled, granted)| *disabled && *granted);
-    let can_rotate = users
-        .iter()
-        .any(|(_, disabled, granted)| !*disabled && *granted);
-    entries
+    let selected = users.get(user.min(users.len().saturating_sub(1)));
+    let can_recover = selected.is_some_and(|(_, disabled, granted)| *disabled && *granted);
+    let can_rotate = selected.is_some_and(|(_, disabled, granted)| !*disabled && *granted);
+    let mut items: Vec<ActionItem> = entries
         .iter()
         .filter_map(|&(key, label)| {
             let available = match (role, key) {
+                (
+                    Role::Server,
+                    'u' | 'b' | 't' | 'x' | 'U' | 'G' | 'V' | 'K' | 'M' | 'w' | 'l' | 'N' | 'D'
+                    | 'E' | 'Q',
+                ) if editor.write_uncertain() => false,
+                (Role::Client, 'T') => has_record && !editor.dirty() && !editor.write_uncertain(),
+                (Role::Client, 'i' | 'f' | 'Q') => !editor.dirty() && !editor.write_uncertain(),
+                (_, 'l' | 'M' | 'w' | 'K') if !advanced => false,
                 (Role::Server, 'V' | 'K') | (Role::Client, 'K') => has_record && reality,
                 (_, 'E') => has_record && !reality,
                 (Role::Server, 'D') => editor.record_count() > 1,
                 (Role::Client, 'D' | 'A') => has_record && !active,
+                (Role::Client, 'u') => editor.direct_dpi_allowed(),
                 (Role::Client, 'L') => editor.record_count() > 1,
                 (Role::Server, 'b') => can_recover,
                 (Role::Server, 'x' | 't') => can_rotate,
+                (_, 'l' | 'M') => has_record,
+                (Role::Server, 'U') => selected.is_some_and(|(id, _, _)| editor.user_deletable(id)),
+                (Role::Server, 'j') => selected.is_some() && !editor.write_uncertain(),
+                (_, 'S') => editor.dirty() && !editor.write_uncertain(),
                 _ => true,
             };
             let label = match (role, key) {
-                (Role::Server, 'V') => "Состояние REALITY",
-                (Role::Server, 'E') => "Свой TLS-сертификат",
-                (Role::Client, 'E') => "Доверенный сертификат и ключ",
-                (Role::Client, 'V') if !active && page == 1 => "Состояние профиля",
-                (Role::Client, 'p') if !editor.system_proxy_allowed() => {
-                    "Настроить и включить системный прокси"
-                }
-                (Role::Client, 'V') if page == 3 && !active => "Состояние выбранного профиля",
+                (Role::Client, 'd') if editor.direct_dpi_allowed() => "Отключить Anti-DPI",
+                (Role::Client, 'd') => "Разрешить Anti-DPI",
+                (Role::Client, 'u') if editor.direct_dpi_stun_allowed() => "Отозвать согласие STUN",
+                (Role::Client, 'u') => "Разрешить STUN",
+                (Role::Client, 'V') if !active => "Состояние выбранного профиля",
+                (_, 'z') if advanced => "Скрыть расширенные настройки",
                 _ => label,
             };
-            // The overview is a starting point, not a second command catalog.
-            // Keep the next recommended action (both possible runtime states)
-            // and the everyday entry points; the dedicated sections retain the
-            // rest of the operations.
-            let overview = page != 0
-                || matches!(
-                    (role, key),
-                    (Role::Server, 's' | 'N' | 'u') | (Role::Client, 'P' | 'i' | 'L')
-                )
-                || key == recommended_step(editor, false).0
-                || key == recommended_step(editor, true).0;
-            (available && overview).then_some(ActionItem { key, label })
+            available.then_some(ActionItem { key, label })
         })
-        .collect()
+        .collect();
+    if role == Role::Server
+        && !matches!(page, 0 | 4 | 5)
+        && editor.dirty()
+        && !editor.write_uncertain()
+    {
+        items.push(ActionItem {
+            key: 'S',
+            label: "Сохранить изменения",
+        });
+    }
+    items
+}
+
+/// The dashboard is a navigator, not a second command dispatcher.
+fn recommendation_page(role: Role, key: char) -> (usize, char) {
+    match (role, key) {
+        (_, 'o' | 'S') => (5, key),
+        (Role::Server, 'N') => (1, key),
+        (Role::Server, 'u' | 'b' | 'G') => (2, key),
+        (Role::Server, _) => (3, key),
+        (Role::Client, 'i') => (2, key),
+        (Role::Client, 'A' | 'p') => (3, key),
+        (Role::Client, 'P') if cfg!(windows) => (3, 'p'),
+        (Role::Client, _) => (3, 'V'),
+    }
 }
 
 /// A recommendation is navigation only. It never writes, applies, or starts a process.
@@ -665,7 +696,10 @@ fn recommended_step(editor: &Editor, owned_running: bool) -> (char, &'static str
             "Получите приглашение у администратора и импортируйте его.",
         )
     } else if owned_running {
-        ('V', "Локальный процесс запущен или запускается. Откройте его состояние для проверки туннеля.")
+        (
+            if cfg!(windows) { 'p' } else { 'V' },
+            "Откройте состояние клиента: готовность прокси и прохождение запросов требуют отдельной проверки.",
+        )
     } else if !editor.selected_record_is_active() {
         (
             'A',
@@ -675,7 +709,7 @@ fn recommended_step(editor: &Editor, owned_running: bool) -> (char, &'static str
         (
             'P',
             if cfg!(windows) {
-                "Выберите системный или локальный прокси. Запуск требует подтверждения."
+                "Подключитесь через системный прокси. Запуск требует подтверждения."
             } else {
                 "Откройте подключение и запустите локальный прокси. Затем настройте нужные приложения."
             },
@@ -685,7 +719,12 @@ fn recommended_step(editor: &Editor, owned_running: bool) -> (char, &'static str
 
 fn save_failure_actions(editor: Option<&Editor>) -> Vec<ActionItem> {
     let mut items = Vec::new();
-    if !editor.is_some_and(Editor::write_uncertain) {
+    if editor.is_some_and(Editor::write_uncertain) {
+        items.push(ActionItem {
+            key: 'o',
+            label: "Открыть настройки заново",
+        });
+    } else {
         items.push(ActionItem {
             key: 'r',
             label: "Повторить сохранение",
@@ -744,12 +783,1035 @@ fn invitation_actions(flow: &IssueFlow) -> Vec<ActionItem> {
     }
 }
 
+// Independent keyboard-first draft. No mutation of the saved file until
+// the existing guarded save/Apply workflows are explicitly invoked.
+struct RoutingPanel {
+    settings: crate::routing::Settings,
+    original: crate::routing::Settings,
+    search: Option<String>,
+    diagnostic_input: Option<String>,
+    geodata_mode: bool,
+    selected: usize,
+    fields: Option<(Option<usize>, [String; 5], usize)>,
+    action_focus: Option<usize>,
+    message: String,
+    directory: PathBuf,
+    download: Option<mpsc::Receiver<Result<(String, crate::routing::geodata::Manifest), String>>>,
+}
+
+impl RoutingPanel {
+    fn new(editor: &Editor) -> Self {
+        let settings = editor
+            .routing_settings()
+            .cloned()
+            .unwrap_or(crate::routing::Settings {
+                revision: 2,
+                geodata_directory: None,
+                diagnostic_domains: crate::routing::snapshot::default_diagnostic_domains(),
+                rules: Vec::new(),
+                datasets: None,
+            });
+        let directory = settings
+            .geodata_directory
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                editor
+                    .saved_path()
+                    .parent()
+                    .unwrap_or(Path::new("."))
+                    .join("geodata")
+            });
+        Self {
+            original: settings.clone(),
+            settings,
+            search: None,
+            diagnostic_input: None,
+            geodata_mode: false,
+            selected: 0,
+            fields: None,
+            action_focus: None,
+            message: String::new(),
+            directory,
+            download: None,
+        }
+    }
+    fn action_name(action: crate::routing::Action) -> &'static str {
+        action.name()
+    }
+    fn action_label(value: &str) -> &str {
+        match crate::routing::Action::from_name(value) {
+            Some(crate::routing::Action::Direct) => "Напрямую",
+            Some(crate::routing::Action::DirectDpi) => "Anti-DPI / резерв VPS",
+            Some(crate::routing::Action::Blocked) => "Блокировать",
+            Some(crate::routing::Action::Allowed) => "Через сервер",
+            None => value,
+        }
+    }
+    fn edit(&mut self, index: Option<usize>) {
+        let values = index
+            .and_then(|i| self.settings.rules.get(i))
+            .map(|r| {
+                [
+                    r.name.clone(),
+                    Self::action_name(r.action).into(),
+                    r.domains.join(", "),
+                    r.ips.join(", "),
+                    r.applications.join(", "),
+                ]
+            })
+            .unwrap_or_else(|| {
+                [
+                    String::new(),
+                    crate::routing::Action::Allowed.name().into(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                ]
+            });
+        self.fields = Some((index, values, 0));
+        self.message.clear();
+    }
+    fn paste(&mut self, input: &str) {
+        if let Some(value) = &mut self.diagnostic_input {
+            if value.len().saturating_add(input.len()) <= 4096
+                && input.bytes().all(|b| {
+                    b.is_ascii_alphanumeric()
+                        || matches!(b, b'.' | b'-' | b',' | b' ' | b'\n' | b'\r' | b'\t')
+                })
+            {
+                value.push_str(input);
+            }
+            return;
+        }
+        if let Some((_, fields, focus)) = &mut self.fields {
+            let input = input.trim_end_matches(['\r', '\n']);
+            if !input.chars().any(char::is_control)
+                && fields[*focus].len().saturating_add(input.len()) <= 8192
+            {
+                fields[*focus].push_str(input);
+            }
+        }
+    }
+    fn poll(&mut self) {
+        let Some(rx) = &self.download else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok((directory, manifest))) => {
+                self.settings.geodata_directory = Some(directory);
+                self.settings.datasets = Some(manifest);
+                self.download = None;
+                self.message = "Компактные базы проверены. Проверьте правила, затем выберите «Принять черновик правил».".into();
+            }
+            Ok(Err(error)) => {
+                self.download = None;
+                self.message = error;
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.download = None;
+                self.message = "Обновление не подтверждено.".into();
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+    fn refresh(&mut self, download: bool) {
+        let directory = self.directory.clone();
+        let rules = self.settings.rules.clone();
+        let (tx, rx) = mpsc::channel();
+        self.download = Some(rx);
+        self.message = "Загрузка XTLS и проверка SHA-256. Действующие правила не изменены.".into();
+        let _worker = std::thread::spawn(move || {
+            let work = || -> Result<(String, crate::routing::geodata::Manifest), String> {
+                if !directory.exists() {
+                    let builder = std::fs::DirBuilder::new();
+                    #[cfg(unix)]
+                    let builder = {
+                        use std::os::unix::fs::DirBuilderExt;
+                        let mut builder = builder;
+                        builder.mode(0o700);
+                        builder
+                    };
+                    builder
+                        .create(&directory)
+                        .map_err(|_| "Не удалось создать каталог баз.".to_owned())?;
+                }
+                if !std::fs::symlink_metadata(&directory).is_ok_and(|m| m.file_type().is_dir()) {
+                    return Err("Небезопасный каталог баз.".into());
+                }
+                let directory = directory
+                    .canonicalize()
+                    .map_err(|_| "Некорректный каталог баз.".to_owned())?;
+                let store = crate::routing::geodata::Store::new(directory.clone())
+                    .map_err(|e| format!("GeoData: {e:?}"))?;
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| "Не удалось запустить загрузчик.".to_owned())?;
+                let pair = if download {
+                    runtime
+                        .block_on(store.refresh(&rules))
+                        .map_err(|e| format!("GeoData: {e:?}"))?
+                } else {
+                    store
+                        .load(&rules)
+                        .map_err(|e| format!("GeoData: {e:?}"))?
+                        .ok_or("Загруженных баз нет.")?
+                };
+                let path = directory.to_str().ok_or("Путь не UTF-8.")?.to_owned();
+                Ok((path, pair.manifest().clone()))
+            };
+            let _ = tx.send(work());
+        });
+    }
+    fn actions(&self) -> Vec<ActionItem> {
+        if self.fields.is_some()
+            || self.download.is_some()
+            || self.search.is_some()
+            || self.diagnostic_input.is_some()
+        {
+            return Vec::new();
+        }
+        if self.geodata_mode {
+            return vec![
+                ActionItem {
+                    key: 'g',
+                    label: "Загрузить и проверить базы",
+                },
+                ActionItem {
+                    key: 'l',
+                    label: "Выбрать загруженные базы",
+                },
+                ActionItem {
+                    key: 'B',
+                    label: "К таблице правил",
+                },
+            ];
+        }
+        let count = self.settings.rules.len();
+        let mut items = Vec::new();
+        if count < 1024 {
+            items.push(ActionItem {
+                key: 'n',
+                label: "Добавить правило",
+            });
+        }
+        if self.selected < count {
+            items.push(ActionItem {
+                key: 'e',
+                label: "Изменить правило",
+            });
+            if self.selected > 0 {
+                items.push(ActionItem {
+                    key: '[',
+                    label: "Переместить выше",
+                });
+            }
+            if self.selected + 1 < count {
+                items.push(ActionItem {
+                    key: ']',
+                    label: "Переместить ниже",
+                });
+            }
+            items.push(ActionItem {
+                key: 'D',
+                label: "Удалить правило из черновика",
+            });
+        }
+        items.push(ActionItem {
+            key: 'B',
+            label: "Управление базами GeoData",
+        });
+        items.push(ActionItem {
+            key: 'G',
+            label: "Домены диагностики клиентов",
+        });
+        if count > 1 {
+            items.push(ActionItem {
+                key: '/',
+                label: "Найти правило",
+            });
+        }
+        if self.settings != self.original {
+            items.push(ActionItem {
+                key: 's',
+                label: "Сохранить изменения",
+            });
+        }
+        items
+    }
+
+    fn layout(&self, area: Rect) -> Option<[Rect; 2]> {
+        let count = self.actions().len();
+        report_action_layout(area, count, &self.body()).or_else(|| {
+            if count == 0 || area.height < 8 {
+                return None;
+            }
+            let rows = ((count as u16).saturating_add(2)).min(area.height.saturating_sub(5));
+            let report = Rect::new(area.x, area.y, area.width, area.height - rows);
+            Some([report, Rect::new(area.x, report.bottom(), area.width, rows)])
+        })
+    }
+
+    fn form(&self) -> Option<Form> {
+        let (_, values, focus) = self.fields.as_ref()?;
+        let definitions = [
+            ("Имя правила", "Короткое понятное название."),
+            (
+                "Действие (←→)",
+                "Стрелки влево и вправо выбирают действие из списка.",
+            ),
+            (
+                "Домены / GeoSite",
+                "Через запятую: example.org или geosite:google.",
+            ),
+            (
+                "IP / CIDR / GeoIP",
+                "Через запятую: 192.0.2.0/24 или geoip:private.",
+            ),
+        ];
+        Some(Form {
+            fields: definitions
+                .iter()
+                .enumerate()
+                .map(|(id, &(label, hint))| Field {
+                    id,
+                    label,
+                    hint,
+                    value: if id == 1 {
+                        Self::action_label(&values[id]).to_owned()
+                    } else {
+                        values[id].clone()
+                    },
+                })
+                .collect(),
+            selected: *focus,
+            lead: "↑↓ / Tab: поле · ←→: действие · Enter: в черновик · Esc: отменить".into(),
+            error: self.message.clone(),
+        })
+    }
+
+    fn render(&self, frame: &mut Frame<'_>, area: Rect, active: bool) {
+        if let Some(value) = &self.diagnostic_input {
+            panel(frame, area, "Домены диагностики клиентов", &format!("1–16 доменов через запятую.\n{value}▏\nCtrl+U очистить · Enter принять в черновик · Esc отменить\n{}", self.message), true);
+            return;
+        }
+        if let Some(form) = self.form() {
+            form.render(frame, area, "Редактирование правила");
+            return;
+        }
+        let items = self.actions();
+        let body = self.body();
+        if let Some([report, controls]) = self.layout(area) {
+            if self.fields.is_none() && self.download.is_none() && !self.geodata_mode {
+                let info = format!(
+                    "GeoData: {} · {}\nПервое совпадение сверху; остальные — через сервер.",
+                    self.settings
+                        .datasets
+                        .as_ref()
+                        .map_or("не выбраны", |m| m.release.as_str()),
+                    if self.settings == self.original {
+                        "без изменений"
+                    } else {
+                        "черновик изменён"
+                    }
+                );
+                let header = Rect::new(report.x, report.y, report.width, 3.min(report.height));
+                panel(
+                    frame,
+                    header,
+                    "Маршрутизация",
+                    &info,
+                    active && self.action_focus.is_none(),
+                );
+                let (start, capacity) = self.rule_window(report);
+                let table = Rect::new(
+                    report.x,
+                    report.y.saturating_add(3),
+                    report.width,
+                    report.height.saturating_sub(4),
+                );
+                let rows = self
+                    .settings
+                    .rules
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .take(capacity)
+                    .map(|(i, rule)| {
+                        let chosen = i == self.selected;
+                        let mut conditions = rule
+                            .domains
+                            .iter()
+                            .chain(&rule.ips)
+                            .take(2)
+                            .map(|value| {
+                                if let Some(domain) = value.strip_prefix("domain:") {
+                                    format!("{domain} + поддомены")
+                                } else if let Some(domain) = value.strip_prefix("full:") {
+                                    format!("{domain} (точно)")
+                                } else {
+                                    value.clone()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let count = rule.domains.len() + rule.ips.len() + rule.applications.len();
+                        if count > 2 || !rule.applications.is_empty() {
+                            conditions.push_str(&format!(" · всего {count}"));
+                        }
+                        if conditions.is_empty() {
+                            conditions = "Приложения (будущие режимы)".into();
+                        }
+                        Row::new(vec![
+                            format!("{} {}", if chosen { "›" } else { " " }, i + 1),
+                            rule.name.clone(),
+                            conditions,
+                            Self::action_label(Self::action_name(rule.action)).to_owned(),
+                        ])
+                        .style(
+                            Style::default().fg(if chosen { ACCENT } else { TEXT }).bg(
+                                if chosen && active && self.action_focus.is_none() {
+                                    FOCUS
+                                } else {
+                                    SURFACE
+                                },
+                            ),
+                        )
+                    });
+                frame.render_widget(
+                    Table::new(
+                        rows,
+                        [
+                            Constraint::Length(5),
+                            Constraint::Percentage(30),
+                            Constraint::Percentage(38),
+                            Constraint::Min(12),
+                        ],
+                    )
+                    .header(
+                        Row::new(["№", "Правило", "Условия", "Действие"])
+                            .style(Style::default().fg(MUTED)),
+                    ),
+                    table,
+                );
+                if report.height >= 5 {
+                    let footer = if !self.message.is_empty() {
+                        self.message.clone()
+                    } else if self.settings.rules.is_empty() {
+                        "Нет правил · по умолчанию: через сервер".into()
+                    } else {
+                        format!(
+                            "{}–{} / {} · по умолчанию: через сервер · Tab действия",
+                            start + 1,
+                            (start + capacity).min(self.settings.rules.len()),
+                            self.settings.rules.len()
+                        )
+                    };
+                    frame.render_widget(
+                        Paragraph::new(footer).style(Style::default().fg(MUTED)),
+                        Rect::new(report.x, report.bottom().saturating_sub(1), report.width, 1),
+                    );
+                }
+            } else {
+                panel(
+                    frame,
+                    report,
+                    "Маршрутизация",
+                    &body,
+                    active && self.action_focus.is_none(),
+                );
+            }
+            Actions {
+                items: &items,
+                selected: self.action_focus.unwrap_or(0),
+            }
+            .render_with_focus(frame, controls, active && self.action_focus.is_some());
+        } else {
+            panel(frame, area, "Маршрутизация", &body, active);
+        }
+    }
+
+    fn rule_window(&self, report: Rect) -> (usize, usize) {
+        let capacity = usize::from(report.height.saturating_sub(5));
+        let start = self
+            .selected
+            .saturating_sub(capacity.saturating_sub(1))
+            .min(self.settings.rules.len().saturating_sub(capacity));
+        (start, capacity)
+    }
+    fn select_at(&mut self, area: Rect, x: u16, y: u16) {
+        if let Some(form) = self.form() {
+            if let Some(id) = form.hit(area, x, y) {
+                if let Some((_, _, focus)) = self.fields.as_mut() {
+                    *focus = id;
+                }
+            }
+            return;
+        }
+        if self.download.is_some() || self.search.is_some() || self.diagnostic_input.is_some() {
+            return;
+        }
+        if let Some([report, controls]) = self.layout(area) {
+            let items = self.actions();
+            if let Some(i) = (Actions {
+                items: &items,
+                selected: self.action_focus.unwrap_or(0),
+            })
+            .hit(controls, x, y)
+            {
+                self.action_focus = Some(i);
+            } else if x >= report.x
+                && x < report.right()
+                && y >= report.y + 4
+                && y < report.bottom().saturating_sub(1)
+            {
+                if self.geodata_mode {
+                    return;
+                }
+                let (start, capacity) = self.rule_window(report);
+                let offset = usize::from(y - report.y - 4);
+                let i = start + offset;
+                if offset < capacity && i < self.settings.rules.len() {
+                    self.selected = i;
+                    self.action_focus = None;
+                }
+            }
+        }
+    }
+
+    // true keeps the draft open; false returns to the workspace.
+    fn key(&mut self, mut key: KeyEvent, editor: Option<&mut Editor>) -> bool {
+        if self.download.is_some() {
+            return true;
+        }
+        if let Some(mut value) = self.diagnostic_input.take() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.message.clear();
+                }
+                KeyCode::Enter => {
+                    if let Some(domains) = crate::tui_profile_diagnostics::parse_domains(&value) {
+                        self.settings.diagnostic_domains = domains;
+                        self.message = "Домены изменены в черновике. Сохраните изменения.".into();
+                    } else {
+                        self.message = "Некорректный список доменов.".into();
+                        self.diagnostic_input = Some(value);
+                    }
+                }
+                KeyCode::Backspace => {
+                    value.pop();
+                    self.diagnostic_input = Some(value);
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.diagnostic_input = Some(String::new())
+                }
+                KeyCode::Char(c)
+                    if c.is_ascii()
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        && value.len() < 4096
+                        && (c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ',' | ' ')) =>
+                {
+                    value.push(c);
+                    self.diagnostic_input = Some(value);
+                }
+                _ => self.diagnostic_input = Some(value),
+            }
+            return true;
+        }
+        if let Some(mut query) = self.search.take() {
+            match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Enter => {
+                    let needle = query.trim().to_lowercase();
+                    let found = self.settings.rules.iter().position(|rule| {
+                        rule.name.to_lowercase().contains(&needle)
+                            || rule
+                                .domains
+                                .iter()
+                                .chain(&rule.ips)
+                                .any(|value| value.to_lowercase().contains(&needle))
+                    });
+                    if let Some(index) = found {
+                        self.selected = index;
+                        self.action_focus = None;
+                        self.message.clear();
+                    } else {
+                        self.message = "Правило не найдено.".into();
+                    }
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    self.search = Some(query);
+                }
+                KeyCode::Char(c)
+                    if !c.is_control()
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        && query.len() + c.len_utf8() <= 256 =>
+                {
+                    query.push(c);
+                    self.search = Some(query);
+                }
+                _ => self.search = Some(query),
+            }
+            return true;
+        }
+        if let Some((index, fields, focus)) = &mut self.fields {
+            match key.code {
+                KeyCode::Esc => {
+                    self.fields = None;
+                }
+                KeyCode::Up | KeyCode::BackTab => *focus = focus.saturating_sub(1),
+                KeyCode::Down | KeyCode::Tab => *focus = (*focus + 1).min(3),
+                KeyCode::Char('u')
+                    if *focus != 1 && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    fields[*focus].clear()
+                }
+                KeyCode::Left | KeyCode::Right if *focus == 1 => {
+                    let options = crate::routing::Action::ALL.map(crate::routing::Action::name);
+                    let index = options.iter().position(|a| *a == fields[1]).unwrap_or(0);
+                    let next = if key.code == KeyCode::Right {
+                        (index + 1) % options.len()
+                    } else {
+                        (index + options.len() - 1) % options.len()
+                    };
+                    fields[1] = options[next].into();
+                }
+                KeyCode::Backspace if *focus != 1 => {
+                    fields[*focus].pop();
+                }
+                KeyCode::Char(c)
+                    if *focus != 1
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        && !c.is_control()
+                        && fields[*focus].len() + c.len_utf8() <= 8192 =>
+                {
+                    fields[*focus].push(c)
+                }
+                KeyCode::Enter => {
+                    let Some(action) = crate::routing::Action::from_name(fields[1].trim()) else {
+                        self.message = "Выберите действие стрелками влево или вправо.".into();
+                        return true;
+                    };
+                    let split = |s: &str| {
+                        s.split(|c: char| c == ',' || c.is_whitespace())
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
+                    };
+                    let rule = crate::routing::Rule {
+                        name: fields[0].trim().into(),
+                        action,
+                        domains: split(&fields[2])
+                            .into_iter()
+                            .map(|value| {
+                                if value.contains(':') {
+                                    value
+                                } else {
+                                    format!("domain:{value}")
+                                }
+                            })
+                            .collect(),
+                        ips: split(&fields[3]),
+                        // MVP cannot attribute processes. Preserve existing advanced
+                        // conditions byte-for-byte; never silently strip them.
+                        applications: split(&fields[4]),
+                    };
+                    if crate::routing::Policy::validate_rules(std::slice::from_ref(&rule)).is_err()
+                    {
+                        self.message = "Правило не прошло проверку.".into();
+                        return true;
+                    }
+                    if let Some(i) = *index {
+                        self.settings.rules[i] = rule;
+                        self.selected = i;
+                    } else if self.settings.rules.len() < 1024 {
+                        self.settings.rules.push(rule);
+                        self.selected = self.settings.rules.len() - 1;
+                    }
+                    self.fields = None;
+                    self.message.clear();
+                }
+                _ => {}
+            }
+            return true;
+        }
+        let len = self.settings.rules.len();
+        if key.modifiers.is_empty() {
+            if key.code == KeyCode::Tab {
+                self.action_focus = Some(0);
+                return true;
+            }
+            if key.code == KeyCode::BackTab
+                || (key.code == KeyCode::Left && self.action_focus.is_some())
+            {
+                self.action_focus = None;
+                return true;
+            }
+            if key.code == KeyCode::Right {
+                self.action_focus = Some(0);
+                return true;
+            }
+            if let Some(mut focus) = self.action_focus {
+                let items = self.actions();
+                let code = tui_widgets::action_key(&items, &mut focus, key.code);
+                self.action_focus = Some(focus);
+                let Some(code) = code else {
+                    return true;
+                };
+                key.code = match code {
+                    KeyCode::Char('e') => KeyCode::Enter,
+                    KeyCode::Char('D') => KeyCode::Delete,
+                    other => other,
+                };
+            }
+        }
+        if self.geodata_mode {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('B') => {
+                    self.geodata_mode = false;
+                    self.action_focus = Some(0);
+                }
+                KeyCode::Char('g') => self.refresh(true),
+                KeyCode::Char('l') => self.refresh(false),
+                _ => {}
+            }
+            return true;
+        }
+        match key.code {
+            KeyCode::Char('B') => {
+                self.geodata_mode = true;
+                self.action_focus = Some(0);
+            }
+            KeyCode::Char('G') => {
+                self.diagnostic_input = Some(self.settings.diagnostic_domains.join(", "));
+                self.message.clear();
+            }
+            KeyCode::Esc => return false,
+            KeyCode::Up => self.selected = self.selected.saturating_sub(1),
+            KeyCode::Down => self.selected = (self.selected + 1).min(len.saturating_sub(1)),
+            KeyCode::Char('/') if len > 1 => {
+                self.search = Some(String::new());
+                self.message.clear();
+            }
+            KeyCode::PageUp => self.selected = self.selected.saturating_sub(7),
+            KeyCode::PageDown => {
+                self.selected = self.selected.saturating_add(7).min(len.saturating_sub(1))
+            }
+            KeyCode::Home => self.selected = 0,
+            KeyCode::End => self.selected = len.saturating_sub(1),
+            KeyCode::Char('n') if len < 1024 => self.edit(None),
+            KeyCode::Enter if self.selected < len => self.edit(Some(self.selected)),
+            KeyCode::Delete if self.selected < len => {
+                self.settings.rules.remove(self.selected);
+                self.selected = self
+                    .selected
+                    .min(self.settings.rules.len().saturating_sub(1));
+            }
+            KeyCode::Char('[') if self.selected > 0 && self.selected < len => {
+                self.settings.rules.swap(self.selected, self.selected - 1);
+                self.selected -= 1;
+            }
+            KeyCode::Char(']') if self.selected + 1 < len => {
+                self.settings.rules.swap(self.selected, self.selected + 1);
+                self.selected += 1;
+            }
+            KeyCode::Char('g') => self.refresh(true),
+            KeyCode::Char('l') => self.refresh(false),
+            KeyCode::Char('s') if self.settings != self.original => {
+                if let Some(editor) = editor {
+                    match editor.stage_routing(self.settings.clone()) {
+                        Ok(()) => return false,
+                        Err(e) => self.message = e.into(),
+                    }
+                }
+            }
+            _ => {}
+        }
+        if self.fields.is_some() {
+            self.action_focus = None;
+        }
+        true
+    }
+    fn body(&self) -> String {
+        let mut body = String::new();
+        if self.geodata_mode {
+            return format!("Базы GeoData · GeoSite Standard + GeoIP Lite\nВыбранный выпуск: {}\nКаталог: {}\n{}\nИзменения вступят в силу после сохранения и применения.", self.settings.datasets.as_ref().map_or("нет", |m| m.release.as_str()), self.directory.display(), self.message);
+        }
+        if let Some(query) = &self.search {
+            return format!("Найти правило по имени, домену или IP\n\nЗапрос: {query}▏\n\nEnter: выбрать совпадение · Esc: отменить");
+        }
+        if let Some((_, fields, focus)) = &self.fields {
+            for (i, (label, value)) in [
+                "Имя",
+                "Действие",
+                "Домены / GeoSite",
+                "IP / CIDR / GeoIP",
+                "Приложения (будущие режимы)",
+            ]
+            .iter()
+            .zip(fields)
+            .enumerate()
+            {
+                let value = if i == 1 {
+                    Self::action_label(value)
+                } else {
+                    value.as_str()
+                };
+                body.push_str(&format!(
+                    "{} {label}: {value}\n",
+                    if i == *focus { "›" } else { " " }
+                ));
+            }
+            body.push_str("\nДомены: example.org или geosite:google\nIP: 192.0.2.0/24 или geoip:private · через запятую\nПриложение: sha256: + 64 строчных hex-символа; в MVP нет атрибуции\nGeoIP Lite: in-ru, in-cn, in-ir — региональные наборы, не геолокация\n\n↑↓ / Tab: поле · ←→: действие · Ctrl+U: очистить\nEnter: принять правило · Esc: отменить");
+        } else {
+            body.push_str(&format!(
+                "GeoData: {} (GeoSite Standard + GeoIP Lite)\nПравила проверяются сверху вниз. Без совпадения — через сервер.\n",
+                self.settings
+                    .datasets
+                    .as_ref()
+                    .map_or("не выбраны", |m| m.release.as_str())
+            ));
+            let start = self.selected.saturating_sub(3);
+            for (i, rule) in self.settings.rules.iter().enumerate().skip(start).take(7) {
+                body.push_str(&format!(
+                    "{} {}. {} · {}\n",
+                    if i == self.selected { "›" } else { " " },
+                    i + 1,
+                    rule.name,
+                    Self::action_label(Self::action_name(rule.action))
+                ));
+            }
+            if self.settings.rules.is_empty() {
+                body.push_str("Нет правил.\n");
+            }
+            body.push_str("\n↑↓ выбрать правило · Tab / → действия · Enter открыть · Esc отменить");
+        }
+        if !self.message.is_empty() {
+            body.push_str(&format!("\n\n{}", self.message));
+        }
+        body
+    }
+}
+
+struct RoutingObservation {
+    digest: [u8; 32],
+    pending: Option<
+        mpsc::Receiver<Result<crate::management::StatusReply, crate::management::ManagementError>>,
+    >,
+    report: String,
+    observed: Option<std::time::Instant>,
+    next: std::time::Instant,
+}
+impl RoutingObservation {
+    fn new(digest: [u8; 32]) -> Self {
+        Self {
+            digest,
+            pending: None,
+            report: String::new(),
+            observed: None,
+            next: std::time::Instant::now(),
+        }
+    }
+    fn refresh(&mut self) {
+        if self.pending.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.pending = Some(rx);
+        let _worker = std::thread::spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| crate::management::ManagementError::Io)
+                .and_then(|rt| {
+                    rt.block_on(crate::management::query_client_environment(
+                        crate::management::StatusCommand::ClientStatus,
+                    ))
+                });
+            let _ = tx.send(result);
+        });
+    }
+    fn poll(&mut self) {
+        if let Some(rx) = &self.pending {
+            match rx.try_recv() {
+                Ok(Ok(crate::management::StatusReply::ClientRunning {
+                    config_sha256,
+                    routing_revision,
+                    routing_state,
+                    routing_totals,
+                    flow_counts,
+                    capture_state,
+                    ..
+                })) if config_sha256 == self.digest => {
+                    let status = match routing_state {
+                        1 => format!("Правила актуальны · ревизия {routing_revision}"),
+                        2 => format!("Внимание: правила просрочены · ревизия {routing_revision}\nНовые соединения заблокированы до успешной проверки"),
+                        3 => "Синхронизация выполняется".into(),
+                        _ => "Правила ещё не подтверждены".into(),
+                    };
+                    let capture = match capture_state {
+                        0 => "не активирован",
+                        1 => "подготовка",
+                        2 => "изолированный тестовый захват (не production)",
+                        _ => "остановлен или ошибка; требуется проверка восстановления",
+                    };
+                    self.report = format!("Источник: защищённый IPC фонового клиента\n{status}\nСистемный перехват: {capture}\n{}\n{}\nСчётчики всего процесса, не отдельного профиля; полезные TCP/UDP-байты.", crate::routing::flow::summary(flow_counts), crate::traffic::routing_summary_from(*routing_totals));
+                    self.observed = Some(std::time::Instant::now());
+                }
+                Err(TryRecvError::Empty) => return,
+                _ => {
+                    self.report = "Состояние фонового клиента с этим TOML не подтверждено. Проверьте запуск и настройки IPC.".into();
+                    self.observed = None;
+                }
+            }
+            self.pending = None;
+            self.next = std::time::Instant::now() + Duration::from_secs(3);
+        }
+        if std::time::Instant::now() >= self.next {
+            self.refresh();
+        }
+    }
+    fn body(&self) -> String {
+        if self.report.is_empty() {
+            return "Проверяем состояние клиента…".into();
+        }
+        match self.observed {
+            Some(time) => format!(
+                "{}\nСнимок получен {} с назад{}",
+                self.report,
+                time.elapsed().as_secs(),
+                if time.elapsed() > Duration::from_secs(6) {
+                    " (устарел)"
+                } else {
+                    ""
+                }
+            ),
+            None => self.report.clone(),
+        }
+    }
+}
+
+struct AccessObservation {
+    digest: [u8; 32],
+    inbound: String,
+    user: String,
+    requested: std::time::Instant,
+    receiver: Option<
+        mpsc::Receiver<Result<crate::management::StatusReply, crate::management::ManagementError>>,
+    >,
+    observed: Option<(u64, u8)>,
+}
+
+impl AccessObservation {
+    fn start(
+        editor: &Editor,
+        user: String,
+        endpoint: Option<PathBuf>,
+        owned: bool,
+    ) -> Option<Self> {
+        if editor.write_uncertain() {
+            return None;
+        }
+        let inbound = editor.selected_record_id().to_owned();
+        if !crate::config::valid_id(&inbound) || !crate::config::valid_id(&user) {
+            return None;
+        }
+        let digest = editor.saved_sha256();
+        let mut inbound_bytes = [0; 64];
+        inbound_bytes[..inbound.len()].copy_from_slice(inbound.as_bytes());
+        let mut user_bytes = [0; 64];
+        user_bytes[..user.len()].copy_from_slice(user.as_bytes());
+        let command = crate::management::StatusCommand::AccessStatus {
+            inbound: inbound_bytes,
+            user: user_bytes,
+            saved_sha256: digest,
+        };
+        let (tx, rx) = mpsc::channel();
+        let requested = std::time::Instant::now();
+        let _worker = std::thread::spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| crate::management::ManagementError::Io)
+                .and_then(|rt| {
+                    rt.block_on(async {
+                        if owned {
+                            match endpoint {
+                                Some(path) => {
+                                    crate::tui_runtime::query_endpoint(&path, command).await
+                                }
+                                None => Err(crate::management::ManagementError::NotConfigured),
+                            }
+                        } else {
+                            crate::management::query_environment(command).await
+                        }
+                    })
+                });
+            let _ = tx.send(result);
+        });
+        Some(Self {
+            digest,
+            inbound,
+            user,
+            requested,
+            receiver: Some(rx),
+            observed: None,
+        })
+    }
+
+    fn poll(&mut self) {
+        if let Some(rx) = &self.receiver {
+            match rx.try_recv() {
+                Ok(Ok(crate::management::StatusReply::AccessObserved { revision, state })) => {
+                    self.observed = Some((revision, state));
+                    self.receiver = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                _ => {
+                    self.receiver = None;
+                }
+            }
+        }
+    }
+
+    fn label(&self, editor: &Editor, user: &str) -> Option<String> {
+        if editor.write_uncertain()
+            || self.digest != editor.saved_sha256()
+            || self.inbound != editor.selected_record_id()
+            || self.user != user
+            || self.requested.elapsed() > std::time::Duration::from_secs(10)
+        {
+            return None;
+        }
+        if self.receiver.is_some() {
+            return Some("Проверяется…".into());
+        }
+        let (revision, state) = self.observed?;
+        let label = match state {
+            1 => "Нет права",
+            2 => "Отключён",
+            3 => "Разрешён",
+            _ => "Нет подключения",
+        };
+        Some(format!("{label} · rev {revision}"))
+    }
+}
+
 struct Interaction {
+    access_observation: Option<AccessObservation>,
     workspace_page: usize,
     workspace_focus: WorkspaceFocus,
     workspace_action: usize,
     workspace_user: usize,
-    proxy_permission_pending: bool,
+    workspace_advanced: bool,
     value_preview: bool,
     preview_text: Option<String>,
     modal_action: usize,
@@ -762,7 +1824,9 @@ struct Interaction {
     config_dialog: Option<ConfigDialog>,
     server_process: ProcessPanel,
     show_server_process: bool,
+    process_from_workspace: bool,
     traffic_monitor: Option<crate::traffic::Monitor>,
+    workspace_monitor: Option<crate::traffic::Monitor>,
     client_background: Option<StatusPanel>,
     issuance: Option<IssueFlow>,
     issue_kind: IssueKind,
@@ -771,6 +1835,9 @@ struct Interaction {
     import_browser: Option<FileBrowser>,
     qr_scan: Option<QrScan>,
     records: Option<RecordFlow>,
+    routing_panel: Option<RoutingPanel>,
+    routing_observation: Option<RoutingObservation>,
+    profile_diagnostics: Option<crate::tui_profile_diagnostics::Panel>,
     discovery: Option<DiscoveryPanel>,
     candidates: Option<CandidateReview>,
     candidate_batch: Option<CandidateBatchPanel>,
@@ -783,6 +1850,8 @@ struct Interaction {
     runtime: Option<RuntimePanel>,
     #[cfg(windows)]
     system_proxy: Option<crate::tui_system_proxy::Panel>,
+    #[cfg(windows)]
+    proxy_background: Option<crate::tui_system_proxy::Panel>,
     pending: Option<KeyEvent>,
     saving: Option<mpsc::Receiver<(Editor, bool)>>,
     exporting: Option<mpsc::Receiver<ExportResult>>,
@@ -791,13 +1860,17 @@ struct Interaction {
 }
 
 impl Interaction {
-    fn new(editor: Option<Editor>) -> Self {
+    fn new(mut editor: Option<Editor>) -> Self {
+        if let Some(editor) = editor.as_mut() {
+            editor.set_compact_server_fields(true);
+        }
         Self {
+            access_observation: None,
             workspace_page: usize::from(editor.is_some()),
             workspace_focus: WorkspaceFocus::Fields,
             workspace_action: 0,
             workspace_user: 0,
-            proxy_permission_pending: false,
+            workspace_advanced: false,
             value_preview: false,
             preview_text: None,
             modal_action: 0,
@@ -810,7 +1883,9 @@ impl Interaction {
             config_dialog: None,
             server_process: ProcessPanel::new(),
             show_server_process: false,
+            process_from_workspace: false,
             traffic_monitor: None,
+            workspace_monitor: None,
             client_background: None,
             issuance: None,
             issue_kind: IssueKind::NewUser,
@@ -819,6 +1894,9 @@ impl Interaction {
             import_browser: None,
             qr_scan: None,
             records: None,
+            routing_panel: None,
+            routing_observation: None,
+            profile_diagnostics: None,
             discovery: None,
             candidates: None,
             candidate_batch: None,
@@ -831,6 +1909,8 @@ impl Interaction {
             runtime: None,
             #[cfg(windows)]
             system_proxy: None,
+            #[cfg(windows)]
+            proxy_background: None,
             pending: None,
             saving: None,
             exporting: None,
@@ -840,6 +1920,7 @@ impl Interaction {
     }
 
     fn start_save(&mut self) {
+        self.access_observation = None;
         let Some(mut editor) = self.editor.take() else {
             return;
         };
@@ -896,6 +1977,10 @@ impl Interaction {
     }
 
     fn paste_record_field(&mut self, text: &str) {
+        if let Some(panel) = self.routing_panel.as_mut() {
+            panel.paste(text);
+            return;
+        }
         if let Some(dialog) = self.config_dialog.as_mut() {
             dialog.paste(text.trim_end_matches(['\r', '\n']));
             return;
@@ -927,6 +2012,25 @@ impl Interaction {
     }
 
     /// Bracketed-paste source text stays in memory and is never rendered.
+    fn paste_workspace_import(&mut self, model: &Model, text: &str) {
+        // Only the visible client import section may begin a new draft.
+        // A paste on Help/Home or another role must not begin an import.
+        if Self::panel_role(model) == Some(Role::Client)
+            && self.workspace_page == 2
+            && self.workspace_focus == WorkspaceFocus::Actions
+            && self.workspace_visible()
+        {
+            if let Some(editor) = self.editor.as_mut().filter(|e| e.role() == Role::Client) {
+                if editor.dirty() || editor.write_uncertain() {
+                    editor.error = Some("Сохраните или отмените черновик перед импортом.".into());
+                    return;
+                }
+                self.importing = Some(ImportFlow::Input(Zeroizing::new(String::new())));
+            }
+        }
+        self.paste_import_source(text);
+    }
+
     fn paste_import_source(&mut self, text: &str) {
         if self.import_browser.is_some() {
             return;
@@ -1004,23 +2108,6 @@ impl Interaction {
             Ok((editor, saved)) => {
                 self.saving = None;
                 self.editor = Some(editor);
-                if std::mem::take(&mut self.proxy_permission_pending) {
-                    #[cfg(windows)]
-                    if saved {
-                        if let Some(editor) = self.editor.as_mut() {
-                            match crate::tui_system_proxy::Panel::open(
-                                editor.saved_path().to_owned(),
-                                editor.saved_sha256(),
-                            ) {
-                                Ok(panel) => {
-                                    self.system_proxy = Some(panel);
-                                    self.modal_action = 0;
-                                }
-                                Err(message) => editor.error = Some(message.into()),
-                            }
-                        }
-                    }
-                }
                 if matches!(self.issuance, Some(IssueFlow::Saving)) {
                     self.modal_action = 0;
                     self.issuance = Some(if saved {
@@ -1074,6 +2161,13 @@ impl Interaction {
     }
 
     fn owned_running(&self, role: Role) -> bool {
+        #[cfg(windows)]
+        if role == Role::Client
+            && (self.system_proxy.as_ref().is_some_and(|p| p.running())
+                || self.proxy_background.as_ref().is_some_and(|p| p.running()))
+        {
+            return true;
+        }
         if role == Role::Server {
             self.server_process.running()
         } else {
@@ -1087,39 +2181,73 @@ impl Interaction {
         }
     }
 
-    fn recommended_action(&self, role: Role) -> usize {
-        let Some(editor) = self.editor_for(role) else {
+    fn visible_workspace_action(&self, role: Role) -> usize {
+        if self.workspace_page == 0 {
             return 0;
-        };
-        let (key, _) = recommended_step(editor, self.owned_running(role));
-        page_actions(role, 0, Some(editor))
-            .iter()
-            .position(|item| item.key == key)
-            .unwrap_or(0)
+        }
+        let count = page_actions_for(
+            role,
+            self.workspace_page,
+            self.editor_for(role),
+            self.workspace_user,
+            self.workspace_advanced,
+        )
+        .len();
+        self.workspace_action.min(count.saturating_sub(1))
     }
 
-    fn visible_workspace_action(&self, role: Role) -> usize {
-        if self.workspace_page == 0 && self.workspace_focus == WorkspaceFocus::Fields {
-            self.recommended_action(role)
+    fn follow_recommendation(&mut self, role: Role) {
+        let Some(editor) = self.editor_for(role) else {
+            return;
+        };
+        let (key, _) = recommended_step(editor, self.owned_running(role));
+        let (page, key) = recommendation_page(role, key);
+        let user = if role == Role::Server && key == 'b' {
+            editor
+                .workspace_users()
+                .iter()
+                .position(|(_, disabled, granted)| *disabled && *granted)
         } else {
-            self.workspace_action
+            None
+        };
+        let action = page_actions_for(
+            role,
+            page,
+            Some(editor),
+            user.unwrap_or(self.workspace_user),
+            false,
+        )
+        .iter()
+        .position(|item| item.key == key)
+        .unwrap_or(0);
+        self.select_workspace_page(role, page);
+        if let Some(user) = user {
+            self.workspace_user = user;
         }
+        self.workspace_action = action;
+        self.workspace_focus = WorkspaceFocus::Actions;
     }
 
     fn select_workspace_page(&mut self, role: Role, page: usize) {
         self.workspace_page = page.min(pages(role).len() - 1);
-        self.workspace_action = if self.workspace_page == 0 {
-            self.recommended_action(role)
+        self.routing_observation = None;
+        self.workspace_monitor = if self.workspace_page == 4 {
+            Some(crate::traffic::Monitor::new(role))
         } else {
-            0
+            None
         };
+        self.workspace_action = 0;
+        self.workspace_advanced = false;
+        if let Some(editor) = self.editor.as_mut() {
+            editor.set_compact_server_fields(true);
+        }
         self.workspace_focus = WorkspaceFocus::Navigation;
     }
 
     fn workspace_content_focus(&self, role: Role) -> WorkspaceFocus {
         match (role, self.workspace_page) {
             (_, 1) => WorkspaceFocus::Fields,
-            (Role::Server, 2 | 3) => WorkspaceFocus::Users,
+            (Role::Server, 2) => WorkspaceFocus::Users,
             _ => WorkspaceFocus::Actions,
         }
     }
@@ -1139,13 +2267,16 @@ impl Interaction {
         let users = self
             .editor_for(role)
             .map_or(0, |e| e.workspace_users().len());
-        let action_count = page_actions(role, self.workspace_page, self.editor_for(role)).len();
+        let action_count = page_actions_for(
+            role,
+            self.workspace_page,
+            self.editor_for(role),
+            self.workspace_user,
+            self.workspace_advanced,
+        )
+        .len();
         self.workspace_action = self.workspace_action.min(action_count.saturating_sub(1));
-        let from_detail = if count > 0
-            && (self.workspace_page == 1
-                || (role == Role::Server && matches!(self.workspace_page, 2 | 3))
-                || (role == Role::Client && self.workspace_page == 3))
-        {
+        let from_detail = if count > 0 && page_has_records(role, self.workspace_page) {
             WorkspaceFocus::Records
         } else {
             WorkspaceFocus::Navigation
@@ -1153,7 +2284,36 @@ impl Interaction {
         if self.workspace_focus == WorkspaceFocus::Fields && detail != WorkspaceFocus::Fields {
             self.workspace_focus = detail;
             if self.workspace_page == 0 {
-                self.workspace_action = self.recommended_action(role);
+                self.workspace_action = 0;
+            }
+        }
+        if matches!(
+            code,
+            KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End
+        ) {
+            let jump = |current: usize, len: usize| match code {
+                KeyCode::Home => 0,
+                KeyCode::End => len.saturating_sub(1),
+                KeyCode::PageUp => current.saturating_sub(10),
+                _ => current.saturating_add(10).min(len.saturating_sub(1)),
+            };
+            match self.workspace_focus {
+                WorkspaceFocus::Records => {
+                    if count > 0 {
+                        if let Some(editor) = self.editor.as_mut() {
+                            editor.workspace_select(jump(record, count));
+                        }
+                        self.workspace_user = 0;
+                        self.workspace_action = 0;
+                    }
+                    return true;
+                }
+                WorkspaceFocus::Users => {
+                    self.workspace_user = jump(self.workspace_user, users);
+                    self.workspace_action = 0;
+                    return true;
+                }
+                _ => {}
             }
         }
         match (self.workspace_focus, code) {
@@ -1163,12 +2323,10 @@ impl Interaction {
             (WorkspaceFocus::Navigation, KeyCode::Down) => {
                 if self.workspace_page + 1 < pages(role).len() {
                     self.select_workspace_page(role, self.workspace_page + 1);
-                } else if count > 0 {
-                    self.workspace_focus = WorkspaceFocus::Records;
                 }
             }
             (WorkspaceFocus::Navigation, KeyCode::Right) => {
-                self.workspace_focus = if self.workspace_page == 1 && count > 0 {
+                self.workspace_focus = if page_has_records(role, self.workspace_page) && count > 0 {
                     WorkspaceFocus::Records
                 } else {
                     detail
@@ -1188,11 +2346,7 @@ impl Interaction {
                         editor.workspace_select(index);
                     }
                     self.workspace_user = 0;
-                    self.workspace_action = if self.workspace_page == 0 {
-                        self.recommended_action(role)
-                    } else {
-                        0
-                    };
+                    self.workspace_action = 0;
                 }
             }
             (WorkspaceFocus::Records, KeyCode::Left) => {
@@ -1235,6 +2389,7 @@ impl Interaction {
                 } else {
                     (self.workspace_user + 1).min(users.saturating_sub(1))
                 };
+                self.workspace_action = 0;
             }
             (WorkspaceFocus::Actions, KeyCode::Up)
                 if self.workspace_action == 0 && detail != WorkspaceFocus::Actions =>
@@ -1262,6 +2417,45 @@ impl Interaction {
         true
     }
 
+    fn runtime_workspace_items(&self) -> Vec<ActionItem> {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return Vec::new();
+        };
+        let mut items = runtime.actions();
+        if self.workspace_page == 3 && self.editor_for(Role::Server).is_some() && !items.is_empty()
+        {
+            if let Some(action) = self.server_process.actions().first() {
+                items.insert(
+                    0,
+                    ActionItem {
+                        key: 'P',
+                        label: action.label,
+                    },
+                );
+            }
+        }
+        items
+    }
+
+    fn runtime_workspace_body(&self) -> String {
+        self.runtime.as_ref().map_or_else(String::new, |runtime| {
+            if self.workspace_page == 3 && self.editor_for(Role::Server).is_some() {
+                format!(
+                    "Процесс этой панели: {}\nКонфигурация: {}\n{}",
+                    self.server_process.status(),
+                    if self.editor_for(Role::Server).is_some_and(Editor::dirty) {
+                        "не сохранена"
+                    } else {
+                        "сохранена"
+                    },
+                    runtime.body()
+                )
+            } else {
+                runtime.body()
+            }
+        })
+    }
+
     fn editor_for(&self, role: Role) -> Option<&Editor> {
         self.editor.as_ref().filter(|edit| edit.role() == role)
     }
@@ -1274,6 +2468,22 @@ impl Interaction {
         }
     }
     fn open_config(&mut self, role: Role) {
+        self.access_observation = None;
+        if let Some(path) = self
+            .editor_for(role)
+            .filter(|e| e.write_uncertain())
+            .map(|e| e.saved_path().to_owned())
+        {
+            self.last_apply = None;
+            self.config_dialog = Some(ConfigDialog::reopen(role, path));
+            return;
+        }
+        #[cfg(windows)]
+        if self.proxy_background.as_ref().is_some_and(|p| p.running()) {
+            self.system_proxy = self.proxy_background.take();
+            self.modal_action = 0;
+            return;
+        }
         if self
             .editor
             .as_ref()
@@ -1305,13 +2515,35 @@ impl Interaction {
         // An uncertain save cannot be retried. Opening a file explicitly
         // re-reads it using the normal loader; the old editor is kept until
         // a successful load. No materials or original file are removed.
-        self.config_dialog = Some(ConfigDialog::new(
-            role,
-            self.editor_for(role).map(Editor::saved_path),
-        ));
+        let mut dialog = ConfigDialog::new(role, self.editor_for(role).map(Editor::saved_path));
+        if role == Role::Server && self.editor_for(role).is_some() {
+            dialog.choose_server_path(0);
+        }
+        self.config_dialog = Some(dialog);
     }
 
     fn poll_navigation(&mut self, model: &mut Model) {
+        if let Some(observation) = self.access_observation.as_mut() {
+            observation.poll();
+        }
+        if let Some(panel) = self.profile_diagnostics.as_mut() {
+            panel.poll();
+        }
+        if let Some(panel) = self.routing_panel.as_mut() {
+            panel.poll();
+        }
+        if model.screen == Screen::Client && self.workspace_page == 6 {
+            if let Some(editor) = self.editor.as_ref().filter(|e| e.role() == Role::Client) {
+                let digest = editor.saved_sha256();
+                let observation = self
+                    .routing_observation
+                    .get_or_insert_with(|| RoutingObservation::new(digest));
+                if observation.digest != digest {
+                    *observation = RoutingObservation::new(digest);
+                }
+                observation.poll();
+            }
+        }
         if let Some(scan) = self.qr_scan.as_ref() {
             let result = match scan.done.try_recv() {
                 Ok(result) => Some(result),
@@ -1338,12 +2570,20 @@ impl Interaction {
         let previous_process_status = self.server_process.status();
         self.server_process.poll();
         if self.server_process.status() != previous_process_status {
+            self.access_observation = None;
             self.last_apply = None;
         }
         if let Some(monitor) = self.traffic_monitor.as_mut() {
             monitor.poll();
         }
+        if let Some(monitor) = self.workspace_monitor.as_mut() {
+            monitor.poll();
+        }
         if let Some(background) = self.client_background.as_mut() {
+            background.poll();
+        }
+        #[cfg(windows)]
+        if let Some(background) = self.proxy_background.as_mut() {
             background.poll();
         }
         if let Some(dialog) = self.config_dialog.as_mut() {
@@ -1369,13 +2609,7 @@ impl Interaction {
                     0
                 };
                 self.workspace_focus = WorkspaceFocus::Actions;
-                if let Some(role) = Self::panel_role(model) {
-                    self.workspace_action = if self.workspace_page == 0 {
-                        self.recommended_action(role)
-                    } else {
-                        0
-                    };
-                }
+                self.workspace_action = 0;
                 self.last_apply = None;
             }
         }
@@ -1452,11 +2686,22 @@ impl Interaction {
             return p.is_consent_pending().then_some(('y', "Разрешить запрос"));
         }
         if let Some(flow) = &self.records {
-            return matches!(flow, RecordFlow::Confirm(_)).then_some(('y', "Сохранить"));
+            return match flow {
+                RecordFlow::Confirm(review) => Some(('y', review.confirmation_label())),
+                _ => None,
+            };
         }
         if let Some(flow) = &self.issuance {
             return match flow {
-                IssueFlow::Confirm(_) => Some(('y', "Сохранить")),
+                IssueFlow::Confirm(_) => Some((
+                    'y',
+                    match self.issue_kind {
+                        IssueKind::NewUser => "Создать пользователя и ключ",
+                        IssueKind::Rotation => "Заменить ключ",
+                        IssueKind::Reenable => "Восстановить доступ",
+                        IssueKind::FirstKey => "Выдать ключ доступа",
+                    },
+                )),
                 IssueFlow::ConfirmReveal => Some(('y', "Показать ссылку")),
                 IssueFlow::ConfirmExport => Some(('y', "Экспортировать")),
                 IssueFlow::ShareConfirm { .. } => Some(('y', "Подтвердить передачу")),
@@ -1530,6 +2775,17 @@ impl Interaction {
         None
     }
 
+    fn inline_import(&self) -> bool {
+        self.workspace_page == 2
+            && self.editor_for(Role::Client).is_some()
+            && matches!(self.importing, Some(ImportFlow::Input(_)))
+            && self.import_browser.is_none()
+            && self.qr_scan.is_none()
+            && self.config_dialog.is_none()
+            && self.reality_enrollment.is_none()
+            && !self.value_preview
+    }
+
     fn workspace_visible(&self) -> bool {
         let clear = !self.value_preview
             && self.menu.is_none()
@@ -1541,10 +2797,12 @@ impl Interaction {
             && self.importing.is_none()
             && self.qr_scan.is_none()
             && self.records.is_none()
+            && self.routing_panel.is_none()
             && self.discovery.is_none()
             && self.candidates.is_none()
             && self.candidate_batch.is_none()
             && self.domain.is_none()
+            && self.profile_diagnostics.is_none()
             && self.probe.is_none()
             && self.reality_provision.is_none()
             && self.reality_enrollment.is_none()
@@ -1563,6 +2821,29 @@ impl Interaction {
     }
 
     fn mouse(&mut self, model: &mut Model, event: MouseEvent, area: Rect) {
+        if let Some(panel) = self.profile_diagnostics.as_mut() {
+            match event.kind {
+                MouseEventKind::ScrollUp => panel.scroll_up(),
+                MouseEventKind::ScrollDown => panel.scroll_down(),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let body = shell_layout(area)[1];
+                    let content = workspace_columns(body).map_or(body, |columns| columns[2]);
+                    panel.select_at(content, event.column, event.row);
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.routing_panel.is_some() {
+            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let body = shell_layout(area)[1];
+                let content = workspace_columns(body).map_or(body, |columns| columns[2]);
+                if let Some(panel) = self.routing_panel.as_mut() {
+                    panel.select_at(content, event.column, event.row);
+                }
+            }
+            return;
+        }
         if area.width < 32 || area.height < 10 {
             return;
         }
@@ -1673,9 +2954,16 @@ impl Interaction {
             }
             return;
         }
-        if let Some(runtime) = self.runtime.as_ref() {
-            let items = runtime.actions();
-            if let Some([_, controls]) = report_action_layout(body, items.len(), &runtime.body()) {
+        if self.runtime.is_some() {
+            let items = self.runtime_workspace_items();
+            let target = if self.workspace_page == 3 && self.editor_for(Role::Server).is_some() {
+                workspace_columns(body).map_or(body, |c| c[2])
+            } else {
+                body
+            };
+            if let Some([_, controls]) =
+                report_action_layout(target, items.len(), &self.runtime_workspace_body())
+            {
                 if let Some(i) = (Actions {
                     items: &items,
                     selected: self.modal_action,
@@ -1778,11 +3066,19 @@ impl Interaction {
         }
         if let Some(flow) = self.records.as_mut() {
             if let Some(form) = flow.form(self.editor.as_ref()) {
-                if let Some(id) = form.hit(
-                    guided_form_area(body, form.fields.len()),
-                    event.column,
-                    event.row,
-                ) {
+                let target = if self.workspace_page == 5
+                    && matches!(
+                        flow,
+                        RecordFlow::Input {
+                            action: RecordAction::SetQuota,
+                            ..
+                        }
+                    ) {
+                    workspace_columns(body).map_or(body, |c| c[2])
+                } else {
+                    guided_form_area(body, form.fields.len())
+                };
+                if let Some(id) = form.hit(target, event.column, event.row) {
                     flow.select_field(id);
                 }
             }
@@ -1823,7 +3119,7 @@ impl Interaction {
         }
         if let Some(IssueFlow::Input(id)) = self.issuance.as_mut() {
             if self.issue_kind != IssueKind::NewUser {
-                let disabled = self.issue_kind == IssueKind::Reenable;
+                let disabled = self.issue_kind.recovering();
                 if let Some(form) = user_picker(self.editor.as_ref(), id, disabled) {
                     if let Some(index) = form.hit(
                         guided_form_area(body, form.fields.len()),
@@ -1882,6 +3178,25 @@ impl Interaction {
             return;
         }
         let Some(columns) = workspace_columns(body) else {
+            if role == Role::Server
+                && self.workspace_page == 7
+                && self.workspace_focus != WorkspaceFocus::Navigation
+                && self
+                    .editor_for(role)
+                    .is_some_and(|e| !e.dirty() && !e.write_uncertain())
+            {
+                if let Some(editor) = self
+                    .editor
+                    .as_ref()
+                    .filter(|e| !e.dirty() && !e.write_uncertain())
+                {
+                    let mut routing = RoutingPanel::new(editor);
+                    routing.select_at(body, event.column, event.row);
+                    self.routing_panel = Some(routing);
+                    self.workspace_focus = WorkspaceFocus::Fields;
+                }
+                return;
+            }
             if self.workspace_focus == WorkspaceFocus::Records {
                 if inside(body) && event.row > body.y && event.row < body.bottom().saturating_sub(1)
                 {
@@ -1893,11 +3208,7 @@ impl Interaction {
                             self.workspace_user = 0;
                         }
                     }
-                    self.workspace_action = if self.workspace_page == 0 {
-                        self.recommended_action(role)
-                    } else {
-                        0
-                    };
+                    self.workspace_action = 0;
                 }
                 return;
             }
@@ -1910,14 +3221,27 @@ impl Interaction {
                 }
                 return;
             }
-            let items = page_actions(role, self.workspace_page, self.editor_for(role));
-            let controls = page_layout(body, role, self.workspace_page, self.editor_for(role))
-                .map(|p| p[1])
-                .unwrap_or(if self.workspace_focus == WorkspaceFocus::Actions {
-                    body
-                } else {
-                    Rect::default()
-                });
+            let items = page_actions_for(
+                role,
+                self.workspace_page,
+                self.editor_for(role),
+                self.workspace_user,
+                self.workspace_advanced,
+            );
+            let controls = page_layout_for(
+                body,
+                role,
+                self.workspace_page,
+                self.editor_for(role),
+                self.workspace_user,
+                self.workspace_advanced,
+            )
+            .map(|p| p[1])
+            .unwrap_or(if self.workspace_focus == WorkspaceFocus::Actions {
+                body
+            } else {
+                Rect::default()
+            });
             if let Some(i) = (Actions {
                 items: &items,
                 selected: self.visible_workspace_action(role),
@@ -1932,16 +3256,27 @@ impl Interaction {
                 return;
             }
             if let Some(editor) = self.editor.as_mut().filter(|e| e.role() == role) {
-                let content = page_layout(body, role, self.workspace_page, Some(editor))
-                    .map(|p| p[0])
-                    .unwrap_or(body);
+                let content = page_layout_for(
+                    body,
+                    role,
+                    self.workspace_page,
+                    Some(editor),
+                    self.workspace_user,
+                    self.workspace_advanced,
+                )
+                .map(|p| p[0])
+                .unwrap_or(body);
+                if role == Role::Client && self.workspace_page == 2 && inside(content) {
+                    self.workspace_focus = WorkspaceFocus::Actions;
+                    self.workspace_action = 0;
+                    return;
+                }
                 if self.workspace_page == 1 {
                     if let Some(id) = editor_field_hit(content, editor, event.column, event.row) {
                         editor.workspace_select_field(id);
                         self.workspace_focus = WorkspaceFocus::Fields;
                     }
-                } else if role == Role::Server
-                    && matches!(self.workspace_page, 2 | 3)
+                } else if page_has_users(role, self.workspace_page)
                     && inside(content)
                     && event.row >= content.y + 2
                     && event.row < content.bottom().saturating_sub(1)
@@ -1951,6 +3286,7 @@ impl Interaction {
                         + usize::from(event.row - content.y - 2);
                     if i < users.len() {
                         self.workspace_user = i;
+                        self.workspace_action = 0;
                         self.workspace_focus = WorkspaceFocus::Users;
                     }
                 }
@@ -1966,7 +3302,8 @@ impl Interaction {
             return;
         }
         let records = columns[1];
-        if inside(records)
+        if page_has_records(role, self.workspace_page)
+            && inside(records)
             && event.row > records.y
             && event.row < records.bottom().saturating_sub(1)
         {
@@ -1978,23 +3315,50 @@ impl Interaction {
                     self.workspace_user = 0;
                 }
             }
-            self.workspace_action = if self.workspace_page == 0 {
-                self.recommended_action(role)
-            } else {
-                0
-            };
+            self.workspace_action = 0;
             self.workspace_focus = WorkspaceFocus::Records;
+            return;
+        }
+        if role == Role::Server
+            && self.workspace_page == 7
+            && inside(columns[2])
+            && self
+                .editor_for(role)
+                .is_some_and(|e| !e.dirty() && !e.write_uncertain())
+        {
+            if let Some(editor) = self
+                .editor
+                .as_ref()
+                .filter(|e| !e.dirty() && !e.write_uncertain())
+            {
+                let mut routing = RoutingPanel::new(editor);
+                routing.select_at(columns[2], event.column, event.row);
+                self.routing_panel = Some(routing);
+                self.workspace_focus = WorkspaceFocus::Fields;
+            }
             return;
         }
         let visible_action = self.visible_workspace_action(role);
         if let Some(editor) = self.editor.as_mut().filter(|e| e.role() == role) {
-            if let Some([content, controls]) =
-                page_layout(columns[2], role, self.workspace_page, Some(editor)).or_else(|| {
-                    (self.workspace_focus == WorkspaceFocus::Actions)
-                        .then_some([Rect::default(), columns[2]])
-                })
-            {
-                let items = page_actions(role, self.workspace_page, Some(editor));
+            if let Some([content, controls]) = page_layout_for(
+                columns[2],
+                role,
+                self.workspace_page,
+                Some(editor),
+                self.workspace_user,
+                self.workspace_advanced,
+            )
+            .or_else(|| {
+                (self.workspace_focus == WorkspaceFocus::Actions)
+                    .then_some([Rect::default(), columns[2]])
+            }) {
+                let items = page_actions_for(
+                    role,
+                    self.workspace_page,
+                    Some(editor),
+                    self.workspace_user,
+                    self.workspace_advanced,
+                );
                 if let Some(i) = (Actions {
                     items: &items,
                     selected: visible_action,
@@ -2005,8 +3369,12 @@ impl Interaction {
                     self.workspace_focus = WorkspaceFocus::Actions;
                     return;
                 }
-                if role == Role::Server
-                    && matches!(self.workspace_page, 2 | 3)
+                if role == Role::Client && self.workspace_page == 2 && inside(content) {
+                    self.workspace_focus = WorkspaceFocus::Actions;
+                    self.workspace_action = 0;
+                    return;
+                }
+                if page_has_users(role, self.workspace_page)
                     && inside(content)
                     && event.row >= content.y + 2
                 {
@@ -2015,6 +3383,7 @@ impl Interaction {
                     let i = start + usize::from(event.row - content.y - 2);
                     if i < users.len() && event.row < content.bottom().saturating_sub(1) {
                         self.workspace_user = i;
+                        self.workspace_action = 0;
                         self.workspace_focus = WorkspaceFocus::Users;
                     }
                     return;
@@ -2045,14 +3414,27 @@ impl Interaction {
                 if let Some(id) = first_user.filter(|id| eligible_users(editor, true).contains(id))
                 {
                     editor.error = None;
-                    self.issue_kind = IssueKind::Reenable;
-                    self.issuance = Some(IssueFlow::Input(id));
+                    self.issue_kind = IssueKind::FirstKey;
+                    self.issuance = Some(IssueFlow::Confirm(id));
                 }
             }
         }
     }
 
     fn update(&mut self, model: &mut Model, mut key: KeyEvent) -> bool {
+        if let Some(panel) = self.profile_diagnostics.as_mut() {
+            if key.kind != KeyEventKind::Press {
+                return false;
+            }
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                self.profile_diagnostics = None;
+                return true;
+            }
+            if panel.key(key) {
+                self.profile_diagnostics = None;
+            }
+            return false;
+        }
         if key.kind == KeyEventKind::Press
             && (key.modifiers == KeyModifiers::SHIFT
                 || (key.modifiers.is_empty()
@@ -2088,6 +3470,30 @@ impl Interaction {
             || self.sharing.is_some()
             || self.clipboard.is_some()
         {
+            return false;
+        }
+        if let Some(mut panel) = self.routing_panel.take() {
+            if key.code == KeyCode::Char('s')
+                && key.modifiers == KeyModifiers::CONTROL
+                && panel.fields.is_none()
+                && panel.search.is_none()
+                && panel.diagnostic_input.is_none()
+            {
+                key = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
+            }
+            if panel.key(key, self.editor.as_mut()) {
+                self.routing_panel = Some(panel);
+            } else {
+                self.workspace_focus = WorkspaceFocus::Navigation;
+                // The only staging exit is the explicit Save action. Esc cannot
+                // dirty the editor; failed validation keeps the panel open.
+                if panel.settings != panel.original
+                    && self.editor.as_ref().is_some_and(Editor::dirty)
+                    && key.code != KeyCode::Esc
+                {
+                    self.start_save();
+                }
+            }
             return false;
         }
         // Cancel is the safe default. Selection never executes an operation.
@@ -2148,6 +3554,12 @@ impl Interaction {
             return false;
         }
         if let Some(dialog) = self.config_dialog.as_mut() {
+            if key.code == KeyCode::Char('o') && key.modifiers.is_empty() {
+                if let Some(path) = dialog.recovery_path().map(Path::to_path_buf) {
+                    self.config_dialog = Some(ConfigDialog::reopen(Role::Server, path));
+                    return false;
+                }
+            }
             let next = dialog.reality_succeeded()
                 && key.code == KeyCode::Char('y')
                 && key.modifiers.is_empty();
@@ -2161,8 +3573,12 @@ impl Interaction {
             return false;
         }
         if self.show_server_process {
-            if self.server_process.key(key.code, self.editor.as_ref()) {
+            let close = self.server_process.key(key.code, self.editor.as_ref());
+            if close
+                || (self.process_from_workspace && self.server_process.confirmation().is_none())
+            {
                 self.show_server_process = false;
+                self.process_from_workspace = false;
             }
             return false;
         }
@@ -2208,7 +3624,11 @@ impl Interaction {
                 return false;
             };
             if proxy.key(KeyEvent { code, ..key }) {
-                self.system_proxy = None;
+                if proxy.running() {
+                    self.proxy_background = self.system_proxy.take();
+                } else {
+                    self.system_proxy = None;
+                }
                 self.modal_action = 0;
             }
             return false;
@@ -2221,10 +3641,11 @@ impl Interaction {
         {
             self.client_background = self.reality_status.take();
             if key.code == KeyCode::F(10) {
-                self.menu = Some(Menu::new(
-                    Role::Client,
-                    self.editor_for(Role::Client).is_some(),
-                ));
+                if self.editor_for(Role::Client).is_some() {
+                    self.workspace_focus = WorkspaceFocus::Navigation;
+                } else {
+                    self.menu = Some(Menu::new(Role::Client, false));
+                }
             }
             return false;
         }
@@ -2247,6 +3668,13 @@ impl Interaction {
             return false;
         }
         if let Some(panel) = self.reality_provision.as_mut() {
+            if key.code == KeyCode::Char('o') && key.modifiers.is_empty() {
+                if let Some(path) = panel.recovery_path().map(Path::to_path_buf) {
+                    self.reality_provision = None;
+                    self.config_dialog = Some(ConfigDialog::reopen(Role::Server, path));
+                    return false;
+                }
+            }
             let next =
                 panel.succeeded() && key.code == KeyCode::Char('y') && key.modifiers.is_empty();
             let first_user = panel.success_first_user().map(str::to_owned);
@@ -2258,8 +3686,8 @@ impl Interaction {
             }
             return false;
         }
-        if let Some(runtime) = self.runtime.as_mut() {
-            let items = runtime.actions();
+        if self.runtime.is_some() {
+            let items = self.runtime_workspace_items();
             let code = if key.modifiers.is_empty() {
                 tui_widgets::action_key(&items, &mut self.modal_action, key.code)
             } else {
@@ -2268,7 +3696,21 @@ impl Interaction {
             let Some(code) = code else {
                 return false;
             };
-            if runtime.key(KeyEvent { code, ..key }) {
+            if code == KeyCode::Char('P') && items.iter().any(|a| a.key == 'P') {
+                if let Some(action) = self.server_process.actions().first().map(|a| a.key) {
+                    self.runtime = None;
+                    self.modal_action = 0;
+                    self.server_process
+                        .key(KeyCode::Char(action), self.editor.as_ref());
+                    self.show_server_process = self.server_process.confirmation().is_some();
+                    self.process_from_workspace = self.show_server_process;
+                    self.confirm_selected = false;
+                }
+            } else if self
+                .runtime
+                .as_mut()
+                .is_some_and(|runtime| runtime.key(KeyEvent { code, ..key }))
+            {
                 self.runtime = None;
                 self.modal_action = 0;
             }
@@ -2439,6 +3881,15 @@ impl Interaction {
             let exiting = key.code == KeyCode::Char('q')
                 || (key.code == KeyCode::Char('c')
                     && key.modifiers.contains(KeyModifiers::CONTROL));
+            #[cfg(windows)]
+            if self.proxy_background.as_ref().is_some_and(|p| p.running())
+                && (exiting
+                    || (role == Some(Role::Client) && matches!(key.code, KeyCode::Char('p' | 'V'))))
+            {
+                self.system_proxy = self.proxy_background.take();
+                self.modal_action = 0;
+                return false;
+            }
             if exiting && self.server_process.running() {
                 self.show_server_process = true;
                 return false;
@@ -2494,6 +3945,8 @@ impl Interaction {
                             if let Some(dialog) = self.config_dialog.as_mut() {
                                 if role == Role::Client && self.welcome_choice == 1 {
                                     dialog.begin_client_import();
+                                } else if role == Role::Server {
+                                    dialog.choose_server_path(self.welcome_choice);
                                 } else {
                                     dialog.prefer_mode(self.welcome_choice);
                                 }
@@ -2505,6 +3958,45 @@ impl Interaction {
                 }
                 if configured && self.workspace_visible() {
                     self.workspace_page = self.workspace_page.min(pages(role).len() - 1);
+                    if let Some(editor) = self.editor.as_mut() {
+                        editor.set_compact_server_fields(!self.workspace_advanced);
+                    }
+                    if role == Role::Server
+                        && self.workspace_page == 7
+                        && key.modifiers.is_empty()
+                        && matches!(
+                            key.code,
+                            KeyCode::Enter | KeyCode::Right | KeyCode::Tab | KeyCode::Char('J')
+                        )
+                        && self
+                            .editor_for(role)
+                            .is_some_and(|e| !e.dirty() && !e.write_uncertain())
+                    {
+                        if let Some(editor) = self.editor.as_mut() {
+                            if editor.dirty() || editor.write_uncertain() {
+                                editor.error = Some(
+                                    "Сначала сохраните или отмените текущие изменения.".into(),
+                                );
+                            } else {
+                                self.routing_panel = Some(RoutingPanel::new(editor));
+                                self.workspace_focus = WorkspaceFocus::Fields;
+                            }
+                        }
+                        return false;
+                    }
+                    if key.modifiers.is_empty()
+                        && matches!(
+                            key.code,
+                            KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End
+                        )
+                        && matches!(
+                            self.workspace_focus,
+                            WorkspaceFocus::Records | WorkspaceFocus::Users
+                        )
+                        && self.workspace_arrow(role, key.code)
+                    {
+                        return false;
+                    }
                     if key.modifiers.is_empty()
                         && matches!(
                             key.code,
@@ -2525,7 +4017,7 @@ impl Interaction {
                     // A connection is the scope of user rights and invitations. The
                     // same shortcut works in every server workspace, even when
                     // the sidebar is hidden on a compact terminal.
-                    if (role == Role::Server || self.workspace_page == 3)
+                    if page_has_records(role, self.workspace_page)
                         && key.modifiers.is_empty()
                         && matches!(key.code, KeyCode::Char('j' | 'k'))
                     {
@@ -2533,11 +4025,7 @@ impl Interaction {
                             editor.select_record(key.code == KeyCode::Char('j'));
                         }
                         self.workspace_user = 0;
-                        self.workspace_action = if self.workspace_page == 0 {
-                            self.recommended_action(role)
-                        } else {
-                            0
-                        };
+                        self.workspace_action = 0;
                         return false;
                     }
                     if key.code == KeyCode::F(7) && self.workspace_focus == WorkspaceFocus::Records
@@ -2557,11 +4045,27 @@ impl Interaction {
                         self.value_preview = true;
                         return false;
                     }
+                    if role == Role::Client
+                        && self.workspace_page == 2
+                        && matches!(
+                            self.workspace_focus,
+                            WorkspaceFocus::Actions | WorkspaceFocus::Fields
+                        )
+                        && key.code == KeyCode::F(6)
+                    {
+                        // The visible input owns the file shortcut. No parsing,
+                        // network or save is started merely by opening the picker.
+                        self.update(model, KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+                        if self.importing.is_some() {
+                            self.update(model, key);
+                        }
+                        return false;
+                    }
                     if key.code == KeyCode::F(6) {
                         if self.workspace_page == 0
                             && self.workspace_focus == WorkspaceFocus::Fields
                         {
-                            self.workspace_action = self.recommended_action(role);
+                            self.workspace_action = 0;
                         }
                         self.workspace_focus = match self.workspace_focus {
                             WorkspaceFocus::Fields | WorkspaceFocus::Users => {
@@ -2570,7 +4074,7 @@ impl Interaction {
                             WorkspaceFocus::Actions => WorkspaceFocus::Navigation,
                             WorkspaceFocus::Records => self.workspace_content_focus(role),
                             WorkspaceFocus::Navigation => {
-                                if role == Role::Server && matches!(self.workspace_page, 2 | 3) {
+                                if page_has_users(role, self.workspace_page) {
                                     WorkspaceFocus::Users
                                 } else {
                                     WorkspaceFocus::Fields
@@ -2613,8 +4117,7 @@ impl Interaction {
                                 return false;
                             }
                             KeyCode::Enter | KeyCode::Tab => {
-                                self.workspace_focus = if role == Role::Server
-                                    && matches!(self.workspace_page, 2 | 3)
+                                self.workspace_focus = if page_has_users(role, self.workspace_page)
                                 {
                                     WorkspaceFocus::Users
                                 } else if self.workspace_page == 1 {
@@ -2635,8 +4138,7 @@ impl Interaction {
                             _ => {}
                         }
                     }
-                    if role == Role::Server
-                        && matches!(self.workspace_page, 2 | 3)
+                    if page_has_users(role, self.workspace_page)
                         && matches!(
                             self.workspace_focus,
                             WorkspaceFocus::Fields | WorkspaceFocus::Users
@@ -2669,11 +4171,19 @@ impl Interaction {
                         }
                     }
                     if self.workspace_focus == WorkspaceFocus::Actions {
-                        let items = page_actions(role, self.workspace_page, self.editor_for(role));
+                        let items = page_actions_for(
+                            role,
+                            self.workspace_page,
+                            self.editor_for(role),
+                            self.workspace_user,
+                            self.workspace_advanced,
+                        );
+                        self.workspace_action =
+                            self.workspace_action.min(items.len().saturating_sub(1));
                         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
                             self.workspace_focus = if key.code == KeyCode::Tab {
                                 WorkspaceFocus::Navigation
-                            } else if role == Role::Server && matches!(self.workspace_page, 2 | 3) {
+                            } else if page_has_users(role, self.workspace_page) {
                                 WorkspaceFocus::Users
                             } else {
                                 WorkspaceFocus::Fields
@@ -2691,7 +4201,11 @@ impl Interaction {
                             && matches!(key.code,KeyCode::Char(ch) if items.iter().any(|item|item.key==ch)))
                         {
                             if self.workspace_page == 4 && key.code == KeyCode::Enter {
-                                self.traffic_monitor = Some(crate::traffic::Monitor::new(role));
+                                // Server statistics already own the full workspace. Do not
+                                // reopen the removed full-screen monitor with a hidden action.
+                                if role == Role::Client {
+                                    self.traffic_monitor = Some(crate::traffic::Monitor::new(role));
+                                }
                                 return false;
                             }
                             if let Some(KeyCode::Char(ch)) = tui_widgets::action_key(
@@ -2699,12 +4213,124 @@ impl Interaction {
                                 &mut self.workspace_action,
                                 key.code,
                             ) {
-                                let selected = if role == Role::Server
-                                    && matches!(self.workspace_page, 2 | 3)
+                                if role == Role::Server
+                                    && self.workspace_page == 6
+                                    && matches!(ch, 'i' | 'r' | 'T')
                                 {
+                                    self.discovery = Some(DiscoveryPanel::new());
+                                    self.modal_action = 0;
+                                    let discovery_key = if ch == 'T' { 't' } else { ch };
+                                    self.update(
+                                        model,
+                                        KeyEvent::new(
+                                            KeyCode::Char(discovery_key),
+                                            KeyModifiers::NONE,
+                                        ),
+                                    );
+                                    return false;
+                                }
+                                if ch == 'j' && role == Role::Server && self.workspace_page == 2 {
+                                    if !self
+                                        .access_observation
+                                        .as_ref()
+                                        .is_some_and(|o| o.receiver.is_some())
+                                    {
+                                        if let Some(editor) = self.editor_for(role) {
+                                            let users = editor.workspace_users();
+                                            if let Some((id, _, _)) = users.get(
+                                                self.workspace_user
+                                                    .min(users.len().saturating_sub(1)),
+                                            ) {
+                                                self.access_observation = AccessObservation::start(
+                                                    editor,
+                                                    id.clone(),
+                                                    self.server_process.management_endpoint(),
+                                                    self.server_process.running(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    return false;
+                                }
+                                if ch == 'T' && role == Role::Client && self.workspace_page == 7 {
+                                    if let Some(editor) = self.editor.as_mut() {
+                                        match editor.require_clean_records() {
+                                            Ok(())
+                                                if !editor.write_uncertain()
+                                                    && !editor.selected_record_id().is_empty() =>
+                                            {
+                                                self.profile_diagnostics = Some(
+                                                    crate::tui_profile_diagnostics::Panel::new(
+                                                        editor.saved_path().to_path_buf(),
+                                                        editor.saved_sha256(),
+                                                        editor.selected_record_id().to_owned(),
+                                                    ),
+                                                );
+                                                editor.error = None;
+                                            }
+                                            Ok(()) => {
+                                                editor.error = Some(
+                                                    "Сохраните профиль или откройте файл заново."
+                                                        .into(),
+                                                )
+                                            }
+                                            Err(e) => editor.error = Some(e.into()),
+                                        }
+                                    }
+                                    return false;
+                                }
+                                if ch == 'j' && role == Role::Client && self.workspace_page == 6 {
+                                    if let Some(observation) = self.routing_observation.as_mut() {
+                                        observation.refresh();
+                                    }
+                                    return false;
+                                }
+                                if matches!(ch, 'd' | 'u')
+                                    && role == Role::Client
+                                    && self.workspace_page == 6
+                                {
+                                    if let Some(editor) = self.editor.as_mut() {
+                                        let review = if ch == 'd' {
+                                            editor.review_direct_dpi_permission()
+                                        } else {
+                                            editor.review_direct_dpi_stun_permission()
+                                        };
+                                        match review {
+                                            Ok(review) => {
+                                                self.records =
+                                                    Some(RecordFlow::Confirm(Box::new(review)));
+                                                editor.error = None;
+                                            }
+                                            Err(message) => editor.error = Some(message.into()),
+                                        }
+                                    }
+                                    return false;
+                                }
+                                if role == Role::Client
+                                    && self.workspace_page == 2
+                                    && matches!(ch, 'f' | 'Q')
+                                {
+                                    // Both file formats use the same local picker and guarded
+                                    // parser. Selecting a source does not read or trust it.
+                                    self.workspace_focus = WorkspaceFocus::Fields;
+                                    self.update(model, KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+                                    if self.importing.is_some() {
+                                        self.update(model, KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
+                                    }
+                                    return false;
+                                }
+                                if ch == '>' && self.workspace_page == 0 {
+                                    self.follow_recommendation(role);
+                                    return false;
+                                }
+                                let selected = if page_has_users(role, self.workspace_page) {
                                     self.editor_for(role).and_then(|e| {
-                                        e.workspace_users()
-                                            .get(self.workspace_user)
+                                        let users = e.workspace_users();
+                                        users
+                                            .get(
+                                                self.workspace_user
+                                                    .min(users.len().saturating_sub(1)),
+                                            )
                                             .map(|u| u.0.clone())
                                     })
                                 } else if role == Role::Server
@@ -2718,8 +4344,37 @@ impl Interaction {
                                 } else {
                                     None
                                 };
+                                if ch == 'z' && self.workspace_page == 1 {
+                                    self.workspace_advanced = !self.workspace_advanced;
+                                    if let Some(editor) = self.editor.as_mut() {
+                                        editor.set_compact_server_fields(!self.workspace_advanced);
+                                    }
+                                    self.workspace_action = page_actions_for(
+                                        role,
+                                        self.workspace_page,
+                                        self.editor_for(role),
+                                        self.workspace_user,
+                                        self.workspace_advanced,
+                                    )
+                                    .iter()
+                                    .position(|a| a.key == 'z')
+                                    .unwrap_or(0);
+                                    return false;
+                                }
                                 if ch == 'L' && role == Role::Client {
                                     self.workspace_focus = WorkspaceFocus::Records;
+                                    return false;
+                                }
+                                if role == Role::Server && ch == 's' && self.workspace_page == 3 {
+                                    let action =
+                                        self.server_process.actions().first().map(|item| item.key);
+                                    if let Some(action) = action {
+                                        self.server_process
+                                            .key(KeyCode::Char(action), self.editor.as_ref());
+                                        self.show_server_process =
+                                            self.server_process.confirmation().is_some();
+                                        self.process_from_workspace = self.show_server_process;
+                                    }
                                     return false;
                                 }
                                 self.workspace_focus = WorkspaceFocus::Fields;
@@ -2737,31 +4392,42 @@ impl Interaction {
                                 };
                                 let result = self.update(model, command);
                                 if let Some(id) = selected {
-                                    if ch == 'x' {
-                                        if let Some(DisableFlow::Input(value)) =
-                                            self.revocation.as_mut()
-                                        {
-                                            *value = id.clone();
-                                        }
+                                    if ch == 'x'
+                                        && matches!(self.revocation, Some(DisableFlow::Input(_)))
+                                    {
+                                        self.revocation = Some(DisableFlow::Confirm(id.clone()));
+                                        self.confirm_selected = false;
                                     }
-                                    if ch == 'U' {
-                                        if let Some(RecordFlow::Input {
-                                            action: RecordAction::DeleteUser,
-                                            fields,
-                                            ..
-                                        }) = self.records.as_mut()
-                                        {
-                                            if let Some(value) = fields.first_mut() {
-                                                *value = id.clone();
+                                    if ch == 'U'
+                                        && matches!(
+                                            self.records,
+                                            Some(RecordFlow::Input {
+                                                action: RecordAction::DeleteUser,
+                                                ..
+                                            })
+                                        )
+                                    {
+                                        if let Some(editor) = self.editor.as_mut() {
+                                            match editor.review_record(
+                                                RecordAction::DeleteUser,
+                                                std::slice::from_ref(&id),
+                                            ) {
+                                                Ok(review) => {
+                                                    self.records =
+                                                        Some(RecordFlow::Confirm(Box::new(review)));
+                                                    self.confirm_selected = false;
+                                                }
+                                                Err(message) => {
+                                                    editor.error = Some(message.into());
+                                                }
                                             }
                                         }
                                     }
-                                    if matches!(ch, 'b' | 't') {
-                                        if let Some(IssueFlow::Input(value)) =
-                                            self.issuance.as_mut()
-                                        {
-                                            *value = id;
-                                        }
+                                    if matches!(ch, 'b' | 't')
+                                        && matches!(self.issuance, Some(IssueFlow::Input(_)))
+                                    {
+                                        self.issuance = Some(IssueFlow::Confirm(id));
+                                        self.confirm_selected = false;
                                     }
                                 }
                                 return result;
@@ -2784,15 +4450,21 @@ impl Interaction {
                         }
                     }
                     if self.workspace_page != 1
-                        && !(role == Role::Server && matches!(self.workspace_page, 2 | 3))
+                        && !page_has_users(role, self.workspace_page)
                         && self.workspace_focus == WorkspaceFocus::Fields
-                        && !page_actions(role, self.workspace_page, self.editor_for(role))
-                            .is_empty()
+                        && !page_actions_for(
+                            role,
+                            self.workspace_page,
+                            self.editor_for(role),
+                            self.workspace_user,
+                            self.workspace_advanced,
+                        )
+                        .is_empty()
                         && key.modifiers.is_empty()
                         && matches!(key.code, KeyCode::Enter | KeyCode::Up | KeyCode::Down)
                     {
                         if self.workspace_page == 0 {
-                            self.workspace_action = self.recommended_action(role);
+                            self.workspace_action = 0;
                         }
                         self.workspace_focus = WorkspaceFocus::Actions;
                         // Open the selected workflow, not its confirmation.
@@ -2804,7 +4476,7 @@ impl Interaction {
                         if self.workspace_page == 0
                             && self.workspace_focus == WorkspaceFocus::Fields
                         {
-                            self.workspace_action = self.recommended_action(role);
+                            self.workspace_action = 0;
                         }
                         self.workspace_focus = if key.code == KeyCode::BackTab {
                             WorkspaceFocus::Navigation
@@ -2824,11 +4496,20 @@ impl Interaction {
                     return false;
                 }
                 if matches!(key.code, KeyCode::F(10) | KeyCode::F(2)) {
-                    self.menu = Some(Menu::new(role, configured));
+                    if configured {
+                        self.workspace_focus = WorkspaceFocus::Navigation;
+                    } else {
+                        self.menu = Some(Menu::new(role, false));
+                    }
                     return false;
                 }
                 if key.code == KeyCode::F(4) {
-                    self.traffic_monitor = Some(crate::traffic::Monitor::new(role));
+                    if role == Role::Server && configured {
+                        self.select_workspace_page(role, 4);
+                        self.workspace_focus = WorkspaceFocus::Fields;
+                    } else {
+                        self.traffic_monitor = Some(crate::traffic::Monitor::new(role));
+                    }
                     return false;
                 }
                 if role == Role::Server && key.code == KeyCode::F(5) {
@@ -2845,11 +4526,7 @@ impl Interaction {
             if model.screen == Screen::Client && matches!(key.code, KeyCode::Char('i' | 'I')) {
                 self.open_config(Role::Client);
                 if let Some(dialog) = self.config_dialog.as_mut() {
-                    if key.code == KeyCode::Char('i') {
-                        dialog.begin_client_import();
-                    } else {
-                        dialog.prefer_reality();
-                    }
+                    dialog.begin_client_import();
                 }
                 return false;
             }
@@ -2927,10 +4604,11 @@ impl Interaction {
                             Err(message) => editor.error = Some(message.into()),
                         }
                     }
-                    KeyCode::Char('2') => match EnrollmentPanel::bound(editor) {
-                        Ok(panel) => self.reality_enrollment = Some(panel),
-                        Err(message) => editor.error = Some(message.into()),
-                    },
+                    KeyCode::Char('2') => {
+                        self.workspace_page = 2;
+                        self.workspace_focus = WorkspaceFocus::Actions;
+                        self.workspace_action = 0;
+                    }
                     KeyCode::Esc => {}
                     _ => self.records = Some(RecordFlow::ChooseMode(role, selected)),
                 },
@@ -2986,14 +4664,11 @@ impl Interaction {
                         match editor.stage_record(*review) {
                             Ok(()) => self.start_save(),
                             Err(message) => {
-                                self.proxy_permission_pending = false;
                                 editor.error = Some(message.into());
                             }
                         }
                     }
-                    KeyCode::Esc | KeyCode::Char('n') => {
-                        self.proxy_permission_pending = false;
-                    }
+                    KeyCode::Esc | KeyCode::Char('n') => {}
                     _ => self.records = Some(RecordFlow::Confirm(review)),
                 },
                 RecordFlow::Input {
@@ -3058,8 +4733,7 @@ impl Interaction {
             match flow {
                 IssueFlow::Input(id)
                     if self.issue_kind != IssueKind::NewUser
-                        && eligible_users(editor, self.issue_kind == IssueKind::Reenable)
-                            .is_empty() =>
+                        && eligible_users(editor, self.issue_kind.recovering()).is_empty() =>
                 {
                     if key.code != KeyCode::Esc {
                         self.issuance = Some(IssueFlow::Input(id));
@@ -3072,7 +4746,7 @@ impl Interaction {
                         id = cycle_user(
                             editor,
                             &id,
-                            self.issue_kind == IssueKind::Reenable,
+                            self.issue_kind.recovering(),
                             matches!(key.code, KeyCode::Down | KeyCode::Tab),
                         );
                         self.issuance = Some(IssueFlow::Input(id));
@@ -3104,12 +4778,15 @@ impl Interaction {
                         let result = match self.issue_kind {
                             IssueKind::NewUser => editor.issue_user(&id),
                             IssueKind::Rotation => editor.rotate_user(&id),
-                            IssueKind::Reenable => editor.reenable_user(&id),
+                            IssueKind::Reenable | IssueKind::FirstKey => editor.reenable_user(&id),
                         };
                         if result.is_ok() {
                             self.issuance = Some(IssueFlow::Saving);
                             self.start_save();
                         } else {
+                            if self.issue_kind == IssueKind::FirstKey {
+                                self.issue_kind = IssueKind::Reenable;
+                            }
                             self.issuance = Some(IssueFlow::Input(id));
                         }
                     }
@@ -3121,6 +4798,9 @@ impl Interaction {
                     KeyCode::Char('r') if !editor.write_uncertain() => {
                         self.issuance = Some(IssueFlow::Saving);
                         self.start_save();
+                    }
+                    KeyCode::Char('o') if editor.write_uncertain() => {
+                        self.open_config(Role::Server)
                     }
                     KeyCode::Char('d') => editor.discard(),
                     _ => self.issuance = Some(IssueFlow::SaveFailed),
@@ -3172,11 +4852,15 @@ impl Interaction {
                     _ => self.issuance = Some(IssueFlow::ConfirmExport),
                 },
                 IssueFlow::Exporting => self.issuance = Some(IssueFlow::Exporting),
-                IssueFlow::Exported(path) => {
-                    if key.code != KeyCode::Esc {
-                        self.issuance = Some(IssueFlow::Exported(path));
+                IssueFlow::Exported(path) => match key.code {
+                    KeyCode::Enter => {
+                        self.workspace_page = 3;
+                        self.workspace_focus = WorkspaceFocus::Actions;
+                        self.workspace_action = 1;
                     }
-                }
+                    KeyCode::Esc => {}
+                    _ => self.issuance = Some(IssueFlow::Exported(path)),
+                },
                 IssueFlow::ExportFailed => {
                     if key.code != KeyCode::Esc {
                         self.issuance = Some(IssueFlow::ExportFailed);
@@ -3232,14 +4916,24 @@ impl Interaction {
                     _ => self.issuance = Some(IssueFlow::ShareConfirm { action, public }),
                 },
                 IssueFlow::Sharing => self.issuance = Some(IssueFlow::Sharing),
-                IssueFlow::ShareDone(message) => {
-                    if key.code != KeyCode::Esc {
-                        self.issuance = Some(IssueFlow::ShareDone(message));
+                IssueFlow::ShareDone(message) => match key.code {
+                    KeyCode::Enter => {
+                        self.workspace_page = 3;
+                        self.workspace_focus = WorkspaceFocus::Actions;
+                        self.workspace_action = 1;
                     }
-                }
+                    KeyCode::Esc => {}
+                    _ => self.issuance = Some(IssueFlow::ShareDone(message)),
+                },
                 IssueFlow::Showing(link) => {
-                    if key.code == KeyCode::Esc {
+                    if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                         editor.clear_issued();
+                        drop(link);
+                        if key.code == KeyCode::Enter {
+                            self.workspace_page = 3;
+                            self.workspace_focus = WorkspaceFocus::Actions;
+                            self.workspace_action = 1;
+                        }
                     } else {
                         self.issuance = Some(IssueFlow::Showing(link));
                     }
@@ -3318,14 +5012,21 @@ impl Interaction {
                         self.revocation = Some(DisableFlow::Saving);
                         self.start_save();
                     }
+                    KeyCode::Char('o') if editor.write_uncertain() => {
+                        self.open_config(Role::Server)
+                    }
                     KeyCode::Char('d') => editor.discard(),
                     _ => self.revocation = Some(DisableFlow::SaveFailed),
                 },
-                DisableFlow::Done => {
-                    if !matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
-                        self.revocation = Some(DisableFlow::Done);
+                DisableFlow::Done => match key.code {
+                    KeyCode::Enter => {
+                        self.workspace_page = 3;
+                        self.workspace_focus = WorkspaceFocus::Actions;
+                        self.workspace_action = 1;
                     }
-                }
+                    KeyCode::Esc => {}
+                    _ => self.revocation = Some(DisableFlow::Done),
+                },
             }
             return false;
         }
@@ -3408,9 +5109,10 @@ impl Interaction {
                             }
                             Ok(client_import::ProductSource::OwnTls(invitation)) => {
                                 editor.error = None;
+                                let ca = invitation.trust_reference();
                                 self.importing = Some(ImportFlow::Preview {
                                     invitation,
-                                    ca: None,
+                                    ca,
                                     public_ref: None,
                                 });
                             }
@@ -3459,7 +5161,7 @@ impl Interaction {
                                 reference: String::new(),
                             });
                         }
-                        KeyCode::Char('c') => {
+                        KeyCode::Char('c') if invitation.trust_reference().is_none() => {
                             self.importing = Some(ImportFlow::Trust {
                                 invitation,
                                 ca: ca.unwrap_or_default(),
@@ -3667,7 +5369,11 @@ impl Interaction {
                         self.workspace_focus = WorkspaceFocus::Actions;
                     }
                     KeyCode::Enter => self.importing = Some(ImportFlow::ActivateConfirm),
-                    KeyCode::Esc => {}
+                    KeyCode::Esc => {
+                        self.workspace_page = 3;
+                        self.workspace_focus = WorkspaceFocus::Actions;
+                        self.workspace_action = 0;
+                    }
                     _ => self.importing = Some(ImportFlow::Done),
                 },
                 ImportFlow::ActivateConfirm => match key.code {
@@ -3819,7 +5525,19 @@ impl Interaction {
                 && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
             {
                 match editor.require_clean_records() {
-                    Ok(()) => self.records = Some(RecordFlow::ChooseMode(editor.role(), 1)),
+                    Ok(()) if editor.role() == Role::Server => {
+                        self.records = Some(RecordFlow::ChooseMode(Role::Server, 1));
+                    }
+                    Ok(()) => match editor.record_fields(RecordAction::NewProfile) {
+                        Ok(fields) => {
+                            self.records = Some(RecordFlow::Input {
+                                action: RecordAction::NewProfile,
+                                fields,
+                                focus: 0,
+                            })
+                        }
+                        Err(message) => editor.error = Some(message.into()),
+                    },
                     Err(message) => editor.error = Some(message.into()),
                 }
                 return false;
@@ -3890,27 +5608,16 @@ impl Interaction {
                 } else {
                     #[cfg(windows)]
                     {
-                        if !editor.system_proxy_allowed() {
-                            match editor.review_system_proxy_permission() {
-                                Ok(review) => {
-                                    self.proxy_permission_pending = true;
-                                    self.records = Some(RecordFlow::Confirm(Box::new(review)));
-                                    editor.error = None;
-                                }
-                                Err(message) => editor.error = Some(message.into()),
+                        match crate::tui_system_proxy::Panel::open(
+                            editor.saved_path().to_owned(),
+                            editor.saved_sha256(),
+                        ) {
+                            Ok(panel) => {
+                                self.system_proxy = Some(panel);
+                                self.modal_action = 0;
+                                editor.error = None;
                             }
-                        } else {
-                            match crate::tui_system_proxy::Panel::open(
-                                editor.saved_path().to_owned(),
-                                editor.saved_sha256(),
-                            ) {
-                                Ok(panel) => {
-                                    self.system_proxy = Some(panel);
-                                    self.modal_action = 0;
-                                    editor.error = None;
-                                }
-                                Err(message) => editor.error = Some(message.into()),
-                            }
+                            Err(message) => editor.error = Some(message.into()),
                         }
                     }
                     #[cfg(not(windows))]
@@ -3925,6 +5632,7 @@ impl Interaction {
             let apply_shortcut =
                 key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r');
             if editor.role() == Role::Server && (key.code == KeyCode::Char('v') || apply_shortcut) {
+                self.access_observation = None;
                 if apply_shortcut && editor.dirty() {
                     editor.error =
                         Some("Сначала Ctrl+S: нельзя применять несохранённый черновик.".into());
@@ -4053,26 +5761,13 @@ impl Interaction {
                 }
                 return false;
             }
-            if editor.role() == Role::Client && key.code == KeyCode::Char('I') {
-                if editor.dirty() {
-                    editor.error =
-                        Some("Сохраните или отмените черновик перед импортом REALITY.".into());
-                } else {
-                    match EnrollmentPanel::bound(editor) {
-                        Ok(panel) => {
-                            editor.error = None;
-                            self.reality_enrollment = Some(panel);
-                        }
-                        Err(message) => editor.error = Some(message.into()),
-                    }
-                }
-                return false;
-            }
-            if editor.role() == Role::Client && key.code == KeyCode::Char('i') {
+            if editor.role() == Role::Client && matches!(key.code, KeyCode::Char('i' | 'I')) {
                 if editor.dirty() {
                     editor.error = Some("Сохраните или отмените черновик перед импортом.".into());
                 } else {
                     editor.error = None;
+                    self.workspace_page = 2;
+                    self.workspace_focus = WorkspaceFocus::Actions;
                     self.importing = Some(ImportFlow::Input(Zeroizing::new(String::new())));
                 }
                 return false;
@@ -4175,43 +5870,68 @@ fn workspace_columns(area: Rect) -> Option<[Rect; 3]> {
         return None;
     }
     let cols = Layout::horizontal([
-        Constraint::Length((area.width / 3).clamp(34, 46)),
+        Constraint::Length(28),
         Constraint::Length(2),
         Constraint::Min(1),
     ])
     .split(area);
-    let left = Layout::vertical([Constraint::Length(9), Constraint::Min(1)]).split(cols[0]);
+    let navigation_height = (pages(Role::Server).len().max(pages(Role::Client).len()) as u16) + 2;
+    let left = Layout::vertical([Constraint::Length(navigation_height), Constraint::Min(1)])
+        .split(cols[0]);
     Some([left[0], left[1], cols[2]])
 }
 
 /// Wrapped rows share the same record-index map for draw and mouse.
 fn record_rows(editor: &Editor, area: Rect) -> Vec<(usize, String)> {
-    let width = usize::from(area.width.saturating_sub(5)).max(1);
+    let width = usize::from(area.width.saturating_sub(4)).max(1);
     let capacity = usize::from(area.height.saturating_sub(2));
     let selected = editor.workspace_selected();
     let mut rows = Vec::new();
     for (index, (id, active, reality)) in editor.workspace_records().into_iter().enumerate() {
         let label = if editor.role() == Role::Client {
             format!(
-                "№{} {}{}",
+                "{}№{} {}",
+                if active { "*" } else { "" },
                 index + 1,
-                editor.client_profile_address(&id).unwrap_or(&id),
-                if active { " *" } else { "" }
+                editor.client_profile_address(&id).unwrap_or(&id)
             )
         } else {
-            format!("{} · {}", id, if reality { "REALITY" } else { "TLS" })
+            format!(
+                "{} · {}",
+                editor.server_connection_label(&id).unwrap_or(id),
+                if reality { "REALITY" } else { "TLS" }
+            )
         };
         let mut line = String::new();
         let mut used = 0;
-        for ch in label.chars() {
+        // A numeric port is one unit, including its colon. Keep it together
+        // even when a long hostname must wrap across several physical rows.
+        let port_start = if editor.role() == Role::Client {
+            label.rsplit_once(':').and_then(|(host, port)| {
+                (!port.is_empty()
+                    && port.bytes().all(|b| b.is_ascii_digit())
+                    && port.len() + 1 <= width)
+                    .then_some(host.len())
+            })
+        } else {
+            None
+        };
+        for (offset, ch) in label.char_indices() {
+            if port_start.is_some_and(|start| offset > start) {
+                continue;
+            }
             let mut encoded = [0; 4];
-            let encoded: &str = ch.encode_utf8(&mut encoded);
-            let cw = Span::raw(encoded).width();
+            let piece: &str = if port_start == Some(offset) {
+                &label[offset..]
+            } else {
+                ch.encode_utf8(&mut encoded)
+            };
+            let cw = Span::raw(piece).width();
             if used + cw > width && !line.is_empty() {
                 rows.push((index, std::mem::take(&mut line)));
                 used = 0;
             }
-            line.push(ch);
+            line.push_str(piece);
             used += cw;
         }
         rows.push((index, line));
@@ -4291,7 +6011,7 @@ impl Viewport {
 
 /// Soft-wrap into explicit visual rows so every part of a long review or
 /// invitation remains accessible. No screen content is retained by Viewport.
-fn visual_rows(body: &str, width: usize) -> (Vec<Line<'_>>, Option<usize>) {
+pub(crate) fn visual_rows(body: &str, width: usize) -> (Vec<Line<'_>>, Option<usize>) {
     let width = width.max(1);
     let mut rows = Vec::new();
     let mut focus = None;
@@ -4795,12 +6515,36 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
     let file = interaction
         .and_then(|ui| Interaction::panel_role(model).and_then(|role| ui.editor_for(role)));
     let saved = match file {
+        _ if interaction.is_some_and(|ui| ui.saving.is_some()) => "Файл: сохранение…",
         Some(e) if e.write_uncertain() => "Файл: запись не подтверждена",
-        Some(e) if e.dirty() => "Файл: не сохранён",
+        Some(_)
+            if interaction.is_some_and(|ui| {
+                ui.routing_panel
+                    .as_ref()
+                    .is_some_and(|p| p.settings != p.original)
+            }) =>
+        {
+            "Файл: есть несохранённые правила"
+        }
+        Some(_)
+            if interaction.is_some_and(|ui| {
+                ui.routing_panel
+                    .as_ref()
+                    .is_some_and(|p| p.fields.is_some() || p.diagnostic_input.is_some())
+            }) =>
+        {
+            "Файл: редактируется маршрутизация"
+        }
+        Some(e) if e.dirty() => "Файл: не сохранён · Ctrl+S сохранить",
         Some(_) => "Файл: сохранён",
         None => "Файл: не открыт",
     };
-    let applied = if model.screen == Screen::Server {
+    let applied = if model.screen == Screen::Server
+        && !interaction.is_some_and(|ui| {
+            ui.routing_panel.as_ref().is_some_and(|p| {
+                p.settings != p.original || p.fields.is_some() || p.diagnostic_input.is_some()
+            })
+        }) {
         interaction
             .and_then(|ui| ui.last_apply)
             .and_then(|(digest, kind, revision)| {
@@ -4849,15 +6593,26 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         }
         Screen::Server | Screen::Client => {
             let role = if model.screen == Screen::Server { Role::Server } else { Role::Client };
-            draw_workspace(frame, parts[1], role, interaction.and_then(|ui| ui.editor_for(role)), interaction.map_or(0, |ui| ui.welcome_choice), interaction);
+            if interaction.is_none_or(|ui| ui.workspace_visible()
+                || ui.editor_for(role).is_some_and(|e| e.editing)
+                || ui.inline_import()) {
+                draw_workspace(frame, parts[1], role, interaction.and_then(|ui| ui.editor_for(role)), interaction.map_or(0, |ui| ui.welcome_choice), interaction);
+            }
         }
         Screen::Help => modal_panel!(
             frame,
             parts[1],
             "Справка",
-            "НАЧАЛО РАБОТЫ\n← →: выбрать роль   Enter: открыть   Esc: назад\nF1: справка   q / Ctrl+C: выйти\n\nНАВИГАЦИЯ\nF2: все действия   F3: открыть файл   F4: трафик\n← →: перейти между областями   ↑ ↓: выбрать строку\nВнизу списка разделов можно перейти к профилям или подключениям.\nВнизу таблицы параметров или пользователей — к действиям.\nEnter: открыть или изменить выбранное поле\nTab, F6 и Alt+←/→ — дополнительные сочетания.\n\nСЕРВЕР\nN: новое подключение   W: мастер REALITY   F5: запуск и остановка\nu: новый пользователь   G: права доступа   x: отключение\nb: восстановление   t: новый токен   l: публичное приглашение\nv: состояние   Ctrl+R: предпросмотр применения прав\n\nКЛИЕНТ\ni: импорт ссылки, файла или QR   V: подключение и состояние\nN: новый профиль   A: выбрать активный профиль\n\nБЕЗОПАСНОСТЬ\nCtrl+S: сохранить файл, не менять работающий процесс.\nИзменение работающего процесса, доверия и сетевые запросы требуют отдельного подтверждения.",
+            "НАЧАЛО РАБОТЫ\n← →: выбрать роль   Enter: открыть   Esc: назад\nF1: справка   q / Ctrl+C: выйти\n\nНАВИГАЦИЯ\nF2: разделы   F3: открыть файл   F4: трафик\n← →: перейти между областями   ↑ ↓: выбрать строку\nСписок профилей или подключений показывается только в связанных разделах.\nВнизу таблицы параметров или пользователей — к действиям.\nEnter: открыть или изменить выбранное поле\nTab, F6 и Alt+←/→ — дополнительные сочетания.\n\nСЕРВЕР\nN: новое подключение   W: мастер REALITY   F5: запуск и остановка\nu: новый пользователь   G: права доступа   x: отключение\nb: восстановление   t: новый токен   l: публичное приглашение\nv: состояние   Ctrl+R: предпросмотр применения прав\n\nКЛИЕНТ\ni: импорт ссылки, файла или QR   V: подключение и состояние\nN: новый профиль   A: выбрать активный профиль\n\nБЕЗОПАСНОСТЬ\nCtrl+S: сохранить файл, не менять работающий процесс.\nИзменение работающего процесса, доверия и сетевые запросы требуют отдельного подтверждения.",
             true,
         ),
+    }
+    if interaction.is_some_and(|ui| {
+        !ui.workspace_visible()
+            && !ui.inline_import()
+            && (!ui.editor.as_ref().is_some_and(|e| e.editing) || ui.value_preview)
+    }) {
+        tui_widgets::canvas(frame, parts[1]);
     }
     if let Some(ui) = interaction.filter(|ui| ui.value_preview) {
         if let Some(text) = &ui.preview_text {
@@ -4899,7 +6654,11 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
                 (dialog.form(), dialog.reference_review()),
             );
         } else if let Some(form) = dialog.form() {
-            form.render_picker(frame, centered_column(parts[1], 108), dialog.title());
+            if dialog.is_server_path_form() {
+                form.render(frame, centered_column(parts[1], 108), dialog.title());
+            } else {
+                form.render_picker(frame, centered_column(parts[1], 108), dialog.title());
+            }
         } else {
             modal_panel!(frame, parts[1], dialog.title(), &dialog.body(), true);
         }
@@ -5061,6 +6820,17 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
         } else {
             modal_panel!(frame, parts[1], "Мастер REALITY", &provision.body(), true);
         }
+    } else if interaction.is_some_and(|ui| {
+        ui.runtime.is_some() && ui.workspace_page == 3 && ui.editor_for(Role::Server).is_some()
+    }) {
+        draw_workspace(
+            frame,
+            parts[1],
+            Role::Server,
+            interaction.and_then(|ui| ui.editor.as_ref()),
+            0,
+            interaction,
+        );
     } else if let Some(runtime) = interaction.and_then(|ui| ui.runtime.as_ref()) {
         tui_widgets::canvas(frame, parts[1]);
         let items = runtime.actions();
@@ -5083,6 +6853,33 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             "Сохранение конфигурации",
             "Проверка изменений и безопасная запись файла выполняются.\nРаботающий процесс не перезапускается.\nДождитесь результата операции.",
             true,
+        );
+    } else if interaction.is_some_and(|ui| ui.routing_panel.is_some()) {
+        draw_workspace(
+            frame,
+            parts[1],
+            Role::Server,
+            interaction.and_then(|ui| ui.editor.as_ref()),
+            0,
+            interaction,
+        );
+    } else if interaction.is_some_and(|ui| {
+        ui.workspace_page == 5
+            && matches!(
+                ui.records,
+                Some(RecordFlow::Input {
+                    action: RecordAction::SetQuota,
+                    ..
+                })
+            )
+    }) {
+        draw_workspace(
+            frame,
+            parts[1],
+            Role::Server,
+            interaction.and_then(|ui| ui.editor.as_ref()),
+            0,
+            interaction,
         );
     } else if let Some(flow) = interaction.and_then(|ui| ui.records.as_ref()) {
         let mut body = flow.body();
@@ -5170,7 +6967,10 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             viewport,
             (Some(browser.form()), None),
         );
-    } else if let Some(flow) = interaction.and_then(|ui| ui.importing.as_ref()) {
+    } else if let Some(flow) = interaction
+        .filter(|ui| !ui.inline_import())
+        .and_then(|ui| ui.importing.as_ref())
+    {
         draw_import(
             frame,
             parts[1],
@@ -5267,6 +7067,15 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             interaction.map_or(0, |u| u.modal_action),
             viewport,
         );
+    } else if interaction.is_some_and(|ui| ui.profile_diagnostics.is_some()) {
+        draw_workspace(
+            frame,
+            parts[1],
+            Role::Client,
+            interaction.and_then(|ui| ui.editor.as_ref()),
+            0,
+            interaction,
+        );
     } else if let Some(probe) = interaction.and_then(|ui| ui.probe.as_ref()) {
         diagnostic_report(
             frame,
@@ -5276,6 +7085,17 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             &probe.report_actions(),
             interaction.map_or(0, |u| u.modal_action),
             viewport,
+        );
+    } else if interaction.is_some_and(|ui| {
+        ui.discovery.is_some() && ui.workspace_page == 6 && ui.editor_for(Role::Server).is_some()
+    }) {
+        draw_workspace(
+            frame,
+            parts[1],
+            Role::Server,
+            interaction.and_then(|ui| ui.editor.as_ref()),
+            0,
+            interaction,
         );
     } else if let Some(discovery) = interaction.and_then(|ui| ui.discovery.as_ref()) {
         diagnostic_report(
@@ -5320,7 +7140,11 @@ fn draw(frame: &mut Frame<'_>, model: &Model, interaction: Option<&Interaction>)
             );
         }
     }
-    let footer = if viewport.is_some_and(|v| v.guided.get()) {
+    let footer = if interaction.is_some_and(Interaction::inline_import) {
+        "Enter проверить · F6 файл / QR · Ctrl+U очистить · Esc отменить"
+    } else if let Some(panel) = interaction.and_then(|ui| ui.profile_diagnostics.as_ref()) {
+        panel.footer()
+    } else if viewport.is_some_and(|v| v.guided.get()) {
         ""
     } else if viewport.is_some_and(|v| v.action_rect.get().is_some()) {
         "↑ ↓ выбор · Enter открыть · Esc назад · Shift+PgUp/PgDn прокрутка"
@@ -5494,7 +7318,8 @@ fn draw_issuance(
     // just the compact report, so no stale rows survive below the actions.
     tui_widgets::canvas(frame, area);
     let rotating = kind == IssueKind::Rotation;
-    let recovering = kind == IssueKind::Reenable;
+    let recovering = kind.recovering();
+    let first = kind == IssueKind::FirstKey;
     if let IssueFlow::Input(id) = flow {
         if !rotating && !recovering {
             let form = Form {
@@ -5526,7 +7351,7 @@ fn draw_issuance(
                 "Заменить личный ключ"
             };
             let message = if recovering {
-                "В этом подключении нет отключённых пользователей с правом доступа.\nЕсли нужен новый ключ для включённого пользователя, выберите «Заменить приглашение»."
+                "В этом подключении нет отключённых пользователей с правом доступа.\nЕсли нужен новый ключ для включённого пользователя, выберите «Заменить ключ пользователя»."
             } else {
                 "В этом подключении нет включённых пользователей с правом доступа.\nДобавьте пользователя или восстановите его доступ."
             };
@@ -5585,7 +7410,9 @@ fn draw_issuance(
             ),
         ),
         IssueFlow::Confirm(id) => (
-            if recovering {
+            if first {
+                "Выдача первого ключа доступа"
+            } else if recovering {
                 "Подтверждение восстановления доступа"
             } else if rotating {
                 "Подтверждение замены личного ключа"
@@ -5594,8 +7421,10 @@ fn draw_issuance(
             },
             format!(
                 "Пользователь: {id}\nПодключение: {}\n\n{}\n\ny: подтвердить и сохранить  n/Esc: отменить",
-                editor.map_or("", |e| e.selected_record_id()),
-                if recovering {
+                editor.and_then(|e| e.server_connection_label(e.selected_record_id())).unwrap_or_else(|| "Не определено".into()),
+                if first {
+                    "Создать личный ключ и включить доступ выбранного пользователя?\nКлюч будет доступен один раз после сохранения.\nДоступ включится для всех разрешённых этому пользователю подключений.\nСервер не запускается и не изменяется этой операцией."
+                } else if recovering {
                     "ВНИМАНИЕ: доступ восстановится для всех ранее разрешённых подключений.\nБудет создан новый ключ; старый восстановить нельзя.\nЧтобы изменить работающий сервер, отдельно примените права."
                 } else if rotating {
                     "ВНИМАНИЕ: новый ключ заменит старый для всех подключений пользователя.\nСтарый ключ перестанет работать для новых сеансов после отдельного применения прав.\nТекущие сеансы продолжатся. Права и состояние пользователя не изменятся."
@@ -5630,13 +7459,15 @@ fn draw_issuance(
         ),
         IssueFlow::Offer => (
             "Одноразовая выдача конфиденциальной ссылки",
-            if recovering {
-                "Восстановление доступа сохранено в файле. Старый ключ восстановить нельзя.\nРаботающий сервер ещё не изменён. После передачи приглашения отдельно примените права доступа.\n\nКОНФИДЕНЦИАЛЬНО: передайте новую ссылку только её владельцу. После закрытия повторного показа не будет.".into()
+            if first {
+                "Первый ключ доступа сохранён. Сервер ещё не изменён.\nПередайте ключ пользователю, затем откройте «Управление» для запуска или применения прав.\n\nКОНФИДЕНЦИАЛЬНО: ключ предназначен только владельцу. После закрытия повторного показа не будет.".into()
+            } else if recovering {
+                "Восстановление доступа сохранено в файле. Старый ключ восстановить нельзя.\nРаботающий сервер ещё не изменён. После передачи приглашения откройте «Управление» и подтвердите применение прав доступа.\n\nКОНФИДЕНЦИАЛЬНО: передайте новую ссылку только её владельцу. После закрытия повторного показа не будет.".into()
             } else if rotating {
                 "Данные нового ключа сохранены. Работающий сервер ещё не изменён.\nСтарый ключ может использоваться для новых сеансов до отдельного применения прав.\n\nКОНФИДЕНЦИАЛЬНО: новая ссылка предназначена только её владельцу. После закрытия повторного показа не будет."
                     .into()
             } else {
-                "Новый пользователь сохранён в файле. Работающий сервер ещё не изменён.\nПосле передачи приглашения отдельно примените права доступа.\n\nКОНФИДЕНЦИАЛЬНО: ссылка содержит личный ключ. Не публикуйте её. После закрытия повторного показа не будет."
+                "Новый пользователь сохранён в файле. Работающий сервер ещё не изменён.\nПосле передачи приглашения откройте «Управление» и подтвердите применение прав доступа.\n\nКОНФИДЕНЦИАЛЬНО: ссылка содержит личный ключ. Не публикуйте её. После закрытия повторного показа не будет."
                     .into()
             },
         ),
@@ -5654,7 +7485,7 @@ fn draw_issuance(
                 if public.is_none() { "КОНФИДЕНЦИАЛЬНО: будет использован одноразовый bearer; не передавайте недоверенному терминалу или получателю." } else { "Публичное приглашение без bearer." })
         ),
         IssueFlow::Sharing => ("Передача приглашения", "Операция выполняется; URI скрыт.".into()),
-        IssueFlow::ShareDone(message) => ("Результат передачи", format!("{message}\nEsc: закрыть. Работающий процесс не изменён.")),
+        IssueFlow::ShareDone(message) => ("Результат передачи", format!("{message}\nEnter: перейти к управлению · Esc: закрыть. Работающий процесс не изменён.")),
         IssueFlow::ConfirmExport => (
             "Подтверждение конфиденциального экспорта",
             "Создать новый защищённый файл рядом с конфигурацией сервера? Ссылка не будет показана. Файл содержит bearer; храните и передавайте его только доверенным способом. Повторная выдача недоступна.\n\ny: сохранить  n/Esc: назад"
@@ -5667,7 +7498,7 @@ fn draw_issuance(
         IssueFlow::Exported(path) => (
             "Конфиденциальный файл создан",
             format!(
-                "Файл содержит bearer. Не публикуйте его.\n\n{path:?}\n\nПуть показан в кавычках. Esc: закрыть. Работающий сервер не обновлён."
+                "Файл содержит bearer. Не публикуйте его.\n\n{path:?}\n\nПуть показан в кавычках. Работающий сервер не обновлён.\nEnter: перейти к управлению · Esc: вернуться."
             ),
         ),
         IssueFlow::ExportFailed => (
@@ -5684,7 +7515,7 @@ fn draw_issuance(
         IssueFlow::Showing(link) => (
             "СЕКРЕТ: ссылка подключения (однократный просмотр)",
             format!(
-                "КОНФИДЕНЦИАЛЬНО. Скопируйте ссылку целиком.\nТерминал/SSH и экран должны быть доверенными.\n\n{link}\n\nEsc: скрыть и стереть из памяти.\nРаботающий процесс не перезапущен.",
+                "КОНФИДЕНЦИАЛЬНО. Скопируйте ссылку целиком.\nТерминал/SSH и экран должны быть доверенными.\n\n{link}\n\nEnter: скрыть и перейти к управлению · Esc: скрыть и закрыть.\nРаботающий процесс не перезапущен.",
                 link = link.as_str()
             ),
         ),
@@ -5779,7 +7610,7 @@ fn draw_revocation(
             "Подтверждение отзыва доступа",
             format!(
                 "Пользователь: {id}\nВыбранное подключение: {}\n\nВНИМАНИЕ: отключение действует для всех подключений пользователя.\nКлюч и права останутся в файле. Новые сеансы будут запрещены после отдельного применения прав.\nТекущие сеансы продолжатся.\n\ny: подтвердить и сохранить  n/Esc: отменить",
-                editor.map_or("", |e| e.selected_record_id())
+                editor.and_then(|e| e.server_connection_label(e.selected_record_id())).unwrap_or_else(|| "Не определено".into())
             ),
         ),
         DisableFlow::Saving => (
@@ -5800,7 +7631,7 @@ fn draw_revocation(
         ),
         DisableFlow::Done => (
             "Отключение сохранено",
-            "Настройки сохранены. Работающий сервер ещё не изменён.\n\nСледующий шаг: закройте это окно и выберите «Применить права доступа». После подтверждения новые подключения пользователя будут запрещены. Уже открытые туннели продолжатся.\n\nEnter/Esc: закрыть.".into(),
+            "Настройки сохранены. Работающий сервер ещё не изменён.\n\nСледующий шаг: перейдите в «Управление», проверьте состояние сервера и выберите «Применить права доступа». Уже открытые туннели продолжатся.\n\nEnter: перейти к управлению · Esc: вернуться к пользователям.".into(),
         ),
     };
     let body = if let DisableFlow::Input(id) = flow {
@@ -5915,12 +7746,13 @@ fn draw_import(
         ImportFlow::Preview { invitation, ca, public_ref } => (
             "Проверка ключа · собственный TLS",
             format!(
-                "Профиль: {}\nАдрес сервера: {}\nИмя сертификата: {}\nТип подключения: {}\nТранспорт: {:?}\nРежим: {:?}\nЛичный ключ: {}\nДоверенный сертификат: {}\nПолучите сертификат отдельно от приглашения.\n\nСохраняется новый профиль без подключения. Существующий профиль не заменяется.\n{}Системный прокси не изменяется.\n\nc: выбрать доверенный сертификат\n{}y: сохранить профиль  n/Esc: отменить\n\n{}",
+                "Профиль: {}\nАдрес сервера: {}\nИмя сертификата: {}\nТип подключения: {}\nТранспорт: {:?}\nРежим: {:?}\nЛичный ключ: {}\nДоверенный сертификат: {}\nПодтвердите доверие к источнику ключа.\n\nСохраняется новый профиль без подключения. Существующий профиль не заменяется.\n{}Системный прокси не изменяется.\n\n{}{}y: сохранить профиль  n/Esc: отменить\n\n{}",
                 invitation.id, invitation.endpoint, invitation.server_name,
                 invitation.security_mode().canonical_name(), invitation.transport, invitation.xhttp_mode(),
                 if invitation.has_token() { "будет сохранён в защищённый отдельный файл" } else { "нет в ссылке; нужна env: ссылка" },
-                if ca.is_some() { "CA указан, ещё НЕ проверено соединение" } else { "НЕТ; профиль не готов к подключению" },
+                if invitation.trust_reference().is_some() { "Закреплён в ключе, соединение ещё НЕ проверено" } else if ca.is_some() { "CA указан, ещё НЕ проверено соединение" } else { "НЕТ; профиль не готов к подключению" },
                 if editor.is_some_and(|e| e.can_refresh_credential(invitation)) { "r: отдельная замена credential существующего профиля; выбранный CA не используется.\n" } else { "" },
+                if invitation.trust_reference().is_some() { "" } else { "c: выбрать доверенный сертификат\n" },
                 if invitation.has_token() { "".into() } else { format!("e: указать env:NAME ({})\n", if public_ref.is_some() { "задано" } else { "обязательно" }) },
                 editor.and_then(|e| e.error.as_deref()).unwrap_or("")
             ),
@@ -6051,8 +7883,20 @@ fn draw_role_card(frame: &mut Frame<'_>, area: Rect, role: Role, selected: bool)
     );
 }
 
+#[cfg(test)]
 fn page_layout(area: Rect, role: Role, page: usize, editor: Option<&Editor>) -> Option<[Rect; 2]> {
-    let count = page_actions(role, page, editor).len();
+    page_layout_for(area, role, page, editor, 0, false)
+}
+
+fn page_layout_for(
+    area: Rect,
+    role: Role,
+    page: usize,
+    editor: Option<&Editor>,
+    user: usize,
+    advanced: bool,
+) -> Option<[Rect; 2]> {
+    let count = page_actions_for(role, page, editor, user, advanced).len();
     let minimum = if page == 1 { 10 } else { 6 };
     if count == 0 || area.height < minimum + 3 {
         return None;
@@ -6062,7 +7906,7 @@ fn page_layout(area: Rect, role: Role, page: usize, editor: Option<&Editor>) -> 
         .min(area.height - minimum)
         .max(3);
     let preferred = if page == 1 {
-        20
+        15
     } else if role == Role::Client && page == 3 {
         editor.map_or(16, |e| {
             let body = client_mode_lines(e, true)
@@ -6081,18 +7925,34 @@ fn page_layout(area: Rect, role: Role, page: usize, editor: Option<&Editor>) -> 
                 .saturating_add(2))
             .min(u16::MAX as usize) as u16
         })
-    } else if role == Role::Server && matches!(page, 2 | 3) {
+    } else if page_has_users(role, page) {
         editor.map_or(6, |e| {
             (e.workspace_users().len() as u16)
                 .saturating_add(3)
-                .clamp(6, 12)
+                .clamp(9, 12)
         })
     } else if page == 0 {
         10
+    } else if role == Role::Client && page == 2 {
+        7
+    } else if role == Role::Client && page == 6 {
+        if area.width >= 76 {
+            10
+        } else {
+            14
+        }
+    } else if page == 5 {
+        8
+    } else if role == Role::Server && page == 3 {
+        7
     } else {
-        6
+        5
     };
-    let content_height = preferred.min(area.height - height);
+    let content_height = if page == 4 && editor.is_some() {
+        area.height - height
+    } else {
+        preferred.min(area.height - height)
+    };
     let content = Rect::new(area.x, area.y, area.width, content_height);
     let controls = Rect::new(area.x, content.bottom(), area.width, height);
     Some([content, controls])
@@ -6115,19 +7975,36 @@ fn client_mode_lines(editor: &Editor, running: bool) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::styled(
             if running {
-                "● Локальный прокси запущен или запускается (не проверка связи с сервером)"
+                "Есть локальный сеанс этой панели; готовность не подтверждена здесь"
             } else {
-                "○ Локальный прокси не запущен"
+                "Нет отслеживаемого локального сеанса этой панели"
             },
             Style::default()
-                .fg(if running { ACCENT } else { MUTED })
+                .fg(MUTED)
                 .add_modifier(Modifier::BOLD),
         ),
         Line::raw(format!("Активный профиль: {active}")),
         Line::raw(if editor.selected_record_is_active() {
-            format!("Защита: {}", if editor.selected_reality() { "REALITY" } else { "Own-TLS" })
+            format!(
+                "Защита: {}",
+                if editor.selected_reality() {
+                    "REALITY"
+                } else {
+                    "Own-TLS"
+                }
+            )
         } else {
-            format!("Выбран: {} · {}", editor.client_profile_label(editor.selected_record_id()).unwrap_or_else(|| "Нет профиля".into()), if editor.selected_reality() { "REALITY" } else { "Own-TLS" })
+            format!(
+                "Выбран: {} · {}",
+                editor
+                    .client_profile_label(editor.selected_record_id())
+                    .unwrap_or_else(|| "Нет профиля".into()),
+                if editor.selected_reality() {
+                    "REALITY"
+                } else {
+                    "Own-TLS"
+                }
+            )
         }),
         Line::raw(""),
         Line::styled(
@@ -6137,22 +8014,11 @@ fn client_mode_lines(editor: &Editor, running: bool) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         ),
         Line::raw(if cfg!(windows) {
-            if editor.system_proxy_allowed() {
-                "Для программ, использующих настройки прокси Windows. Не VPN."
-            } else {
-                "Для программ с системным прокси Windows. Сначала потребуется разрешение."
-            }
+            "Настройки Windows: не проверены на этом экране. Откройте управление для проверки и подключения."
         } else {
-            "На Linux пока недоступен. Настройте прокси в нужных приложениях."
+            "Настройки Linux не поддерживаются в текущем клиенте. Доступен ручной локальный прокси."
         }),
-        Line::styled(
-            "TUN / VPN",
-            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
-        ),
-        Line::styled(
-            "Пока недоступен. Весь трафик устройства через Theia не направляется.",
-            Style::default().fg(MUTED),
-        ),
+        Line::raw("Запросы приложений: не проверены. Прокси не охватывает весь трафик устройства."),
         Line::raw(""),
         Line::styled(
             "Локальный прокси",
@@ -6161,10 +8027,14 @@ fn client_mode_lines(editor: &Editor, running: bool) -> Vec<Line<'static>> {
         Line::raw(format!("HTTP {http}")),
         Line::raw(format!("SOCKS5 {socks}")),
         Line::styled(
-            "Запустите локальный прокси и укажите адрес в нужном приложении. Остальной трафик не защищается этим режимом.",
+            "Ручной режим диагностики. Остальной трафик не защищается.",
             Style::default().fg(MUTED),
         ),
         Line::raw(""),
+        Line::styled(
+            "TUN / WinDivert / NFQUEUE — в будущем",
+            Style::default().fg(MUTED),
+        ),
     ];
     if !editor.selected_record_is_active() {
         lines.insert(
@@ -6196,8 +8066,21 @@ fn draw_page(
     ui: Option<&Interaction>,
     compact: bool,
 ) {
-    let page = ui.map_or(0, |u| u.workspace_page.min(6));
-    let items = page_actions(role, page, Some(editor));
+    let page = ui.map_or(0, |u| u.workspace_page.min(pages(role).len() - 1));
+    let mut items = page_actions_for(
+        role,
+        page,
+        Some(editor),
+        ui.map_or(0, |u| u.workspace_user),
+        ui.is_some_and(|u| u.workspace_advanced),
+    );
+    if role == Role::Server && page == 3 {
+        if let Some(item) = items.iter_mut().find(|item| item.key == 's') {
+            item.label = ui
+                .and_then(|u| u.server_process.actions().first().map(|a| a.label))
+                .unwrap_or("Сервер завершает работу");
+        }
+    }
     let focus = ui.map_or(WorkspaceFocus::Fields, |u| u.workspace_focus);
     let selected = ui.map_or(0, |u| u.visible_workspace_action(role));
     if compact && focus == WorkspaceFocus::Navigation {
@@ -6214,22 +8097,119 @@ fn draw_page(
         );
         return;
     }
-    let [content, controls] =
-        page_layout(area, role, page, Some(editor)).unwrap_or([area, Rect::default()]);
+    if role == Role::Server && page == 3 {
+        if let Some(ui) = ui.filter(|u| u.runtime.is_some()) {
+            let items = ui.runtime_workspace_items();
+            let body = ui.runtime_workspace_body();
+            let title = "Управление";
+            if let Some([report, controls]) = report_action_layout(area, items.len(), &body) {
+                panel_at(frame, report, title, &body, false, Some(&ui.viewport));
+                Actions {
+                    items: &items,
+                    selected: ui.modal_action,
+                }
+                .render(frame, controls);
+            } else {
+                panel_at(frame, area, title, &body, true, Some(&ui.viewport));
+            }
+            return;
+        }
+    }
+    if role == Role::Server && page == 5 {
+        if let Some(
+            flow @ RecordFlow::Input {
+                action: RecordAction::SetQuota,
+                ..
+            },
+        ) = ui.and_then(|u| u.records.as_ref())
+        {
+            if let Some(form) = flow.form(Some(editor)) {
+                form.render(frame, area, "Настройки · лимиты соединений");
+                return;
+            }
+        }
+    }
+    if role == Role::Server && page == 6 {
+        if let Some(discovery) = ui.and_then(|u| u.discovery.as_ref()) {
+            diagnostic_report(
+                frame,
+                area,
+                "Сетевая диагностика",
+                &discovery.body(),
+                &discovery.report_actions(),
+                ui.map_or(0, |u| u.modal_action),
+                ui.map(|u| &u.viewport),
+            );
+            return;
+        }
+    }
+    if role == Role::Client && page == 7 {
+        if let Some(panel) = ui.and_then(|u| u.profile_diagnostics.as_ref()) {
+            panel.render(frame, area);
+            return;
+        }
+        let body = format!("Профиль: {}\nПроверка сервера, H2/H3, TCP Anti-DPI и XHTTP. Системный прокси не изменяется. Выберите профиль и запустите проверку.", editor.selected_record_id());
+        if let Some([report, controls]) = page_layout_for(area, role, page, Some(editor), 0, false)
+        {
+            panel(frame, report, "Диагностика профиля", &body, false);
+            Actions {
+                items: &items,
+                selected,
+            }
+            .render_with_focus(frame, controls, focus == WorkspaceFocus::Actions);
+        } else {
+            panel(frame, area, "Диагностика профиля", &body, true);
+        }
+        return;
+    }
+    if role == Role::Server && page == 7 {
+        if let Some(routing) = ui.and_then(|u| u.routing_panel.as_ref()) {
+            routing.render(frame, area, true);
+        } else {
+            let routing = RoutingPanel::new(editor);
+            if editor.dirty() || editor.write_uncertain() {
+                let text = format!(
+                    "{}\n\nСначала сохраните или отмените текущие изменения.",
+                    routing.body()
+                );
+                if let Some([report, controls]) =
+                    page_layout_for(area, role, page, Some(editor), 0, false)
+                {
+                    panel(frame, report, "Маршрутизация", &text, false);
+                    Actions {
+                        items: &items,
+                        selected,
+                    }
+                    .render_with_focus(
+                        frame,
+                        controls,
+                        focus == WorkspaceFocus::Actions,
+                    );
+                } else {
+                    panel(frame, area, "Маршрутизация", &text, false);
+                }
+            } else {
+                routing.render(frame, area, false);
+            }
+        }
+        return;
+    }
+    let [content, controls] = page_layout_for(
+        area,
+        role,
+        page,
+        Some(editor),
+        ui.map_or(0, |u| u.workspace_user),
+        ui.is_some_and(|u| u.workspace_advanced),
+    )
+    .unwrap_or([area, Rect::default()]);
     if page == 0 {
         let local = if role == Role::Server {
             ui.map_or("Неизвестно", |u| u.server_process.status())
-        } else if ui.is_some_and(|u| {
-            u.client_background
-                .as_ref()
-                .is_some_and(StatusPanel::local_running)
-                || u.reality_status
-                    .as_ref()
-                    .is_some_and(StatusPanel::local_running)
-        }) {
-            "Локальный процесс запущен или запускается"
+        } else if ui.is_some_and(|u| u.owned_running(Role::Client)) {
+            "Есть сеанс этой панели; проверьте состояние подключения"
         } else {
-            "Локальный процесс не запущен"
+            "Нет отслеживаемого сеанса этой панели"
         };
         let title = if role == Role::Server {
             "Обзор сервера"
@@ -6250,10 +8230,20 @@ fn draw_page(
             "Файл сохранён"
         };
         let (next_key, help) = recommended_step(editor, ui.is_some_and(|u| u.owned_running(role)));
-        let next_label = items
+        let (next_page, action_key) = recommendation_page(role, next_key);
+        let next_user = if next_key == 'b' && role == Role::Server {
+            users
+                .iter()
+                .position(|(_, disabled, granted)| *disabled && *granted)
+                .unwrap_or(0)
+        } else {
+            ui.map_or(0, |u| u.workspace_user)
+        };
+        let next_items = page_actions_for(role, next_page, Some(editor), next_user, false);
+        let next_label = next_items
             .iter()
-            .find(|item| item.key == next_key)
-            .map_or("Открыть файл (F3)", |item| item.label);
+            .find(|item| item.key == action_key)
+            .map_or(pages(role)[next_page], |item| item.label);
         if role == Role::Server {
             let allowed = users
                 .iter()
@@ -6263,10 +8253,17 @@ fn draw_page(
                 "Подключений пока нет".to_owned()
             } else {
                 format!(
-                    "{} · {} из {} пользователей имеют доступ",
-                    editor.selected_record_id(),
+                    "{} · {} из {} пользователей имеют доступ по {}",
+                    editor
+                        .server_connection_label(editor.selected_record_id())
+                        .unwrap_or_else(|| editor.selected_record_id().to_owned()),
                     allowed,
-                    users.len()
+                    users.len(),
+                    if editor.dirty() {
+                        "черновику"
+                    } else {
+                        "файлу"
+                    }
                 )
             };
             let color = if editor.write_uncertain() {
@@ -6282,7 +8279,7 @@ fn draw_page(
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ),
                 Line::styled(status, Style::default().fg(color)),
-                Line::raw(format!("Сервер: {local}")),
+                Line::raw(format!("Процесс этой панели: {local}")),
                 Line::styled(
                     format!("Далее: {next_label}"),
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -6297,7 +8294,7 @@ fn draw_page(
             }
             frame.render_widget(
                 Paragraph::new(lines)
-                    .block(tui_widgets::section("Настройка сервера", true))
+                    .block(tui_widgets::section("Обзор сервера", true))
                     .wrap(Wrap { trim: true }),
                 content,
             );
@@ -6307,11 +8304,11 @@ fn draw_page(
                     format!("{records}: {}", editor.record_count()),
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ),
-                Line::raw(if role == Role::Server {
-                    format!("Пользователи в файле: {}", users.len())
-                } else {
-                    editor.selection_summary()
-                }),
+                Line::raw(
+                    editor
+                        .client_profile_label(editor.selected_record_id())
+                        .unwrap_or_else(|| "Нет профиля".into()),
+                ),
                 Line::raw(format!("Конфигурация: {status}")),
                 Line::raw(format!("Процесс: {local}")),
                 Line::raw(""),
@@ -6329,11 +8326,93 @@ fn draw_page(
                 content,
             );
         }
+    } else if role == Role::Client && page == 2 {
+        let input = ui.and_then(|u| u.importing.as_ref()).and_then(|flow| {
+            if let ImportFlow::Input(source) = flow {
+                Some(source.len())
+            } else {
+                None
+            }
+        });
+        let focused = focus == WorkspaceFocus::Actions;
+        let lines = vec![
+            Line::raw("Получите личный ключ Theia у администратора."),
+            Line::raw("Вставьте ссылку, выберите файл ключа или изображение QR."),
+            Line::raw("Тип подключения определится автоматически."),
+            Line::styled(
+                input.filter(|n| *n > 0).map_or_else(
+                    || " Вставьте ключ (скрыто) ".to_owned(),
+                    |n| format!(" Введено {n} байт (скрыто) "),
+                ),
+                Style::default()
+                    .fg(if focused { TEXT } else { MUTED })
+                    .bg(if focused { FOCUS } else { SURFACE }),
+            ),
+            Line::raw("Сохранение и запуск требуют отдельных подтверждений."),
+        ];
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(tui_widgets::section("Импорт ключа", focused))
+                .wrap(Wrap { trim: false }),
+            content,
+        );
+        if input.is_some() {
+            frame.render_widget(
+                Paragraph::new("Enter — проверить · F6 — файл / QR · Esc — отменить")
+                    .wrap(Wrap { trim: true }),
+                controls,
+            );
+            return;
+        }
+    } else if page == 4 {
+        if let Some(monitor) = ui.and_then(|u| u.workspace_monitor.as_ref()) {
+            if role == Role::Server {
+                if !ui.is_some_and(|u| u.server_process.status() == "Запущен") {
+                    panel(frame, area, "Статистика", "Нет подтверждённого источника данных.\nСервер этой панели не готов; метрики внешнего сервера недоступны.\nПерейдите в «Управление», чтобы проверить состояние или запустить сервер.", true);
+                    return;
+                }
+                let status = "Источник: счётчики процесса этой панели (с запуска Theia).";
+                if area.height >= 8 {
+                    frame.render_widget(
+                        Paragraph::new(status)
+                            .style(Style::default().fg(MUTED))
+                            .wrap(Wrap { trim: true }),
+                        Rect::new(area.x, area.y, area.width, 2),
+                    );
+                    monitor.render(
+                        frame,
+                        Rect::new(
+                            area.x,
+                            area.y + 2,
+                            area.width,
+                            area.height.saturating_sub(2),
+                        ),
+                    );
+                } else {
+                    monitor.render(frame, area);
+                }
+                return;
+            }
+            let monitor_area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(3));
+            monitor.render(frame, monitor_area);
+            let expand = Rect::new(
+                area.x,
+                monitor_area.bottom(),
+                area.width,
+                3.min(area.height),
+            );
+            Actions {
+                items: &items,
+                selected,
+            }
+            .render_with_focus(frame, expand, focus == WorkspaceFocus::Actions);
+            return;
+        }
     } else if role == Role::Client && page == 3 {
         draw_client_modes(frame, content, editor, ui);
     } else if page == 1 {
         draw_editor(frame, content, editor, focus == WorkspaceFocus::Fields);
-    } else if role == Role::Server && matches!(page, 2 | 3) {
+    } else if page_has_users(role, page) {
         let users = editor.workspace_users();
         let selected = ui
             .map_or(0, |u| u.workspace_user)
@@ -6358,18 +8437,17 @@ fn draw_page(
                             " "
                         }
                     ),
-                    if *granted {
-                        "Разрешено"
+                    if *disabled {
+                        "Отключён"
+                    } else if *granted {
+                        "Разрешён"
                     } else {
                         "Нет права"
                     }
                     .into(),
-                    if *disabled {
-                        "Отключён"
-                    } else {
-                        "Включён"
-                    }
-                    .into(),
+                    ui.and_then(|u| u.access_observation.as_ref())
+                        .and_then(|o| o.label(editor, id))
+                        .unwrap_or_else(|| "Не подтверждён".into()),
                 ])
                 .style(Style::default().fg(color).bg(if active {
                     FOCUS
@@ -6387,18 +8465,26 @@ fn draw_page(
                 ],
             )
             .header(
-                Row::new(["Пользователь", "Право доступа", "Учётная запись"])
-                    .style(Style::default().fg(MUTED)),
+                Row::new([
+                    "Пользователь",
+                    if editor.write_uncertain() {
+                        "Запись не подтверждена"
+                    } else if editor.dirty() {
+                        "Доступ в черновике"
+                    } else {
+                        "Доступ по файлу"
+                    },
+                    "На сервере (новые сеансы)",
+                ])
+                .style(Style::default().fg(MUTED)),
             )
             .block(tui_widgets::section(
                 &format!(
                     "{}: {}",
-                    if page == 3 {
-                        "Приглашения для"
-                    } else {
-                        "Доступ к"
-                    },
-                    editor.selected_record_id()
+                    "Пользователи и ключи для",
+                    editor
+                        .server_connection_label(editor.selected_record_id())
+                        .unwrap_or_else(|| editor.selected_record_id().to_owned())
                 ),
                 focus == WorkspaceFocus::Users,
             )),
@@ -6417,9 +8503,14 @@ fn draw_page(
         }
         // Render explanatory text only in unused table rows. Mouse selection
         // still uses the same row geometry and cannot select the help text.
-        if page == 3 && users.len() <= 3 && content.height >= 9 {
+        if users.len() <= 3 && content.height >= 9 {
             let y = content.y + 2 + users.len() as u16 + 1;
-            let hint = "Личная ссылка показывается один раз.\nЕсли потеряли её, выберите пользователя и «Заменить приглашение».\nСтарый ключ перестанет работать для новых сеансов после применения прав.";
+            let hint = match users.get(selected) {
+                Some((_, true, true)) => "Пользователь отключён в настройках. Восстановление создаёт новый ключ.\nФактический доступ проверяется и применяется в разделе «Управление».",
+                Some((_, _, false)) => "У пользователя нет права на это подключение. Измените права доступа.\nУдаление возможно только без прав на всех подключениях.",
+                Some(_) => "Проверка доступа показывает снимок новых сеансов (до 10 с).\nЗамена ключа действует после применения прав в «Управлении».",
+                None => "Добавьте пользователя и выдайте ему ключ.",
+            };
             frame.render_widget(
                 Paragraph::new(hint)
                     .style(Style::default().fg(MUTED))
@@ -6434,12 +8525,28 @@ fn draw_page(
         }
     } else {
         let description = match (role,page) {
-            (Role::Client,2) => "Добавьте ключ от администратора.\n\nПроверьте адрес сервера и сохраните профиль.\nПодключение запускается отдельно.",
-            (_,4) => "Скорость, объём и активные соединения.\n\nДанные только локального процесса Theia.",
-            (_,5) => "Сохранение записывает файл.\nПрименение меняет работающий процесс отдельно.",
-            _ => "Проверьте состояние подключения.\nСетевые проверки требуют согласия.",
+            (Role::Server,3) => {
+                let status = ui.map_or("Состояние неизвестно", |u| u.server_process.status());
+                let applied = ui.and_then(|u| u.last_apply)
+                    .filter(|(sha, _, _)| !editor.dirty() && *sha == editor.saved_sha256())
+                    .map_or_else(|| "Работа с сохранёнными настройками не подтверждена".into(), |(_, kind, revision)| format!("Последнее подтверждение: {kind}, rev {revision}"));
+                format!("Процесс этой панели: {status}\n{applied}\nПроверка состояния ничего не изменяет. Применение и откат доступны после ответа сервера.")
+            }
+            (Role::Client,6) => {
+                let observation = if editor.dirty() || editor.write_uncertain() { "Сохранённые настройки изменились. Состояние выбранного файла не подтверждено.".into() }
+                else if let Some(local) = ui.and_then(|u| u.client_background.as_ref()).and_then(|p| p.routing_observation(editor.saved_sha256())) {
+                    format!("Источник: локальный процесс этой панели\n{local}\nСчётчики с запуска процесса, полезные TCP/UDP-байты.")
+                } else {
+                    ui.and_then(|u| u.routing_observation.as_ref()).filter(|o| o.digest == editor.saved_sha256()).map_or_else(|| "Проверяем состояние клиента…".into(), RoutingObservation::body)
+                };
+                format!("Anti-DPI выбранного профиля: {}\nСогласие STUN: {}\nUDP Modify: {}; непринятые стратегии используют VPS.\n{observation}", if editor.direct_dpi_allowed() { "разрешён" } else { "выключен (резерв VPS)" }, if editor.direct_dpi_stun_allowed() { "сохранено" } else { "нет" }, crate::routing::dpi::UdpStrategy::capability_summary())
+            }
+            (Role::Server,7) => editor.routing_settings().map_or_else(|| "Правил нет. По умолчанию весь трафик Theia идёт через сервер.".into(), |s| format!("Ревизия: {} · правил: {}\nGeoData: {}\nСохраните TOML, затем примените через Управление.", s.revision, s.rules.len(), s.datasets.as_ref().map_or("не выбраны", |m| m.release.as_str()))),
+            (_,5) => format!("Файл: {}\n{}\nСохранение не меняет работающий процесс.", editor.saved_path().display(), editor.settings_summary()),
+            (Role::Server,6) => "Сетевые адреса и доступность. Проверки ещё не выполнялись.\nВыберите нужную проверку. Внешние запросы требуют отдельного согласия.".into(),
+            _ => "Проверьте состояние подключения.\nСетевые проверки требуют согласия.".into(),
         };
-        panel(frame, content, pages(role)[page], description, true);
+        panel(frame, content, pages(role)[page], &description, true);
     }
     if controls.height > 0 {
         Actions {
@@ -6450,9 +8557,7 @@ fn draw_page(
             frame,
             controls,
             focus == WorkspaceFocus::Actions
-                || (focus == WorkspaceFocus::Fields
-                    && page != 1
-                    && !(role == Role::Server && matches!(page, 2 | 3))),
+                || (focus == WorkspaceFocus::Fields && page != 1 && !page_has_users(role, page)),
         );
     } else if focus == WorkspaceFocus::Actions && !items.is_empty() {
         Actions {
@@ -6476,7 +8581,10 @@ fn draw_workspace(
     }
     let Some([nav, records, details]) = workspace_columns(area) else {
         if let Some(editor) = editor {
-            if ui.is_some_and(|u| u.workspace_focus == WorkspaceFocus::Records) {
+            if ui.is_some_and(|u| {
+                u.workspace_focus == WorkspaceFocus::Records
+                    && page_has_records(role, u.workspace_page)
+            }) {
                 draw_workspace_records(frame, area, role, editor, true);
             } else {
                 draw_page(frame, area, role, editor, ui, true);
@@ -6515,13 +8623,15 @@ fn draw_workspace(
         nav,
     );
     if let Some(editor) = editor {
-        draw_workspace_records(
-            frame,
-            records,
-            role,
-            editor,
-            ui.is_some_and(|u| u.workspace_focus == WorkspaceFocus::Records),
-        );
+        if page_has_records(role, page) {
+            draw_workspace_records(
+                frame,
+                records,
+                role,
+                editor,
+                ui.is_some_and(|u| u.workspace_focus == WorkspaceFocus::Records),
+            );
+        }
         draw_page(frame, details, role, editor, ui, false);
     } else {
         panel(
@@ -6590,7 +8700,7 @@ fn draw_workspace_records(
 fn welcome_form(role: Role, selected: usize) -> Form {
     let (reality, description, lead) = match role {
         Role::Server => ("Настроить новый сервер (REALITY)", "Рекомендуется: не нужен собственный TLS-сертификат", "Настраиваете сервер впервые? Выберите создание REALITY. Если Theia уже настроена, откройте существующий файл."),
-        Role::Client => ("Импортировать ключ Theia", "Ссылка или файл · тип определяется автоматически", "Настраиваете клиент впервые? Получите приглашение у администратора. Если профили уже сохранены, откройте их файл."),
+        Role::Client => ("Импортировать ключ Theia", "Вставка, файл или QR · тип определяется автоматически", "Настраиваете клиент впервые? Получите приглашение у администратора. Если профили уже сохранены, откройте их файл."),
     };
     Form {
         fields: vec![
@@ -6656,11 +8766,11 @@ fn editor_layout(area: Rect) -> Option<[Rect; 4]> {
             .split(parts[1]);
         return Some([parts[0], middle[0], middle[1], parts[2]]);
     }
-    if area.height >= 20 {
+    if area.height >= 18 {
         let parts = Layout::vertical([
             Constraint::Length(5),
             Constraint::Length(7),
-            Constraint::Length(5),
+            Constraint::Length(3),
             Constraint::Min(3),
         ])
         .split(area);
@@ -6748,25 +8858,23 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor, focused: bool
     } else {
         "Enter — изменить выбранное поле"
     };
-    let actions = if server {
-        "Создайте подключение или запустите сервер"
-    } else {
-        "i Импорт приглашения · N Новый профиль · V Подключение"
-    };
+    let actions = "Другие операции находятся в соответствующих разделах.";
     let next = if editor.record_count() == 0 {
         if server {
-            "Создайте первое подключение (W или N)."
+            "Создайте первое подключение."
         } else {
-            "Импортируйте приглашение (i) или создайте профиль (N)."
+            "Откройте раздел «Импорт ключа» или добавьте профиль вручную."
         }
     } else if editor.write_uncertain() {
         "Откройте конфигурацию заново, прежде чем продолжать."
     } else if editor.dirty() {
         "Сохраните изменения (Ctrl+S). Это не изменяет работающий процесс."
+    } else if editor.compact_server_fields() && editor.field_count() == 1 {
+        "Раздельные адреса прослушивания: откройте расширенные настройки."
     } else if server {
-        "Запустите сервер или выдайте доступ пользователю."
+        "Права доступа и ключи находятся в разделе «Пользователи и ключи»."
     } else {
-        "V — открыть подключение и проверить его состояние."
+        "Для запуска и проверки откройте раздел «Подключение»."
     };
     let title = if editor.editing {
         "Изменение параметра"
@@ -6778,6 +8886,9 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor, focused: bool
     let fields = editor.workspace_fields();
     let friendly = match (server, editor.workspace_field_index()) {
         (true, 0) => "Домен, используемый при проверке TLS.",
+        (true, 1) if editor.compact_server_fields() => {
+            "Общий порт TCP и UDP. Раздельные адреса — в расширенных настройках."
+        }
         (true, 1) => "На каком адресе и порту сервер принимает TCP (HTTP/2).",
         (true, _) => "На каком адресе и порту сервер принимает UDP (HTTP/3).",
         (false, 0) => "Адрес и порт удалённого сервера.",
@@ -6832,7 +8943,9 @@ fn draw_editor(frame: &mut Frame<'_>, area: Rect, editor: &Editor, focused: bool
     }
 
     let (start, rows, header) = editor_table_window(table_area, editor);
-    let labels = if server {
+    let labels = if editor.compact_server_fields() {
+        ["Адрес сервера", "Порт подключения", "", ""]
+    } else if server {
         ["Имя сервера", "Адрес TCP (H2)", "Адрес UDP (H3)", ""]
     } else {
         [
@@ -7106,8 +9219,12 @@ pub fn run(role: Option<Role>, config_path: Option<&Path>) -> Result<(), TuiErro
                     interaction.mouse(&mut model, mouse, Rect::new(0, 0, size.width, size.height));
                 }
                 Event::Paste(text) => {
+                    if let Some(panel) = interaction.profile_diagnostics.as_mut() {
+                        panel.paste(&text);
+                        continue;
+                    }
                     interaction.paste_record_field(&text);
-                    interaction.paste_import_source(&text);
+                    interaction.paste_workspace_import(&model, &text);
                     if let Some(editor) = interaction.editor.as_mut().filter(|e| e.editing) {
                         if !text.chars().any(char::is_control) {
                             for ch in text.chars() {
@@ -7195,18 +9312,64 @@ mod tests {
                     let navigation = rendered_interaction(area.width, area.height, &model, &ui);
                     assert!(navigation.contains(pages(role)[page]));
                     ui.update(&mut model, press(KeyCode::Enter));
+                    if role == Role::Server && page == 7 {
+                        // Routing has its own inline table/actions, not generic workspace actions.
+                        assert_eq!(ui.workspace_focus, WorkspaceFocus::Fields);
+                        let view = rendered_interaction(area.width, area.height, &model, &ui);
+                        assert!(view.contains("Добавить правило"));
+                        assert!(!view.contains("THEIA_AUTH_TOKEN"));
+                        assert!(!view.contains("token_sha256"));
+                        let details = columns.map_or(body, |c| c[2]);
+                        let panel = ui.routing_panel.as_ref().expect("inline routing panel");
+                        assert!(panel.fields.is_none() && panel.download.is_none());
+                        let original_rules = panel.settings.rules.clone();
+                        let [report, controls] =
+                            panel.layout(details).expect("routing action layout");
+                        assert_eq!(controls.y, report.bottom());
+                        assert!(controls.bottom() <= details.bottom());
+                        let items = panel.actions();
+                        let actions = Actions {
+                            items: &items,
+                            selected: 0,
+                        };
+                        let (y, index) = (controls.y..controls.bottom())
+                            .find_map(|y| actions.hit(controls, controls.x + 2, y).map(|i| (y, i)))
+                            .expect("visible routing action");
+                        ui.mouse(&mut model, click_at(controls.x + 2, y), area);
+                        let panel = ui.routing_panel.as_ref().unwrap();
+                        assert_eq!(panel.action_focus, Some(index));
+                        assert!(panel.fields.is_none() && panel.download.is_none());
+                        assert_eq!(panel.settings.rules, original_rules);
+                        ui.update(&mut model, press(KeyCode::Esc));
+                        assert!(ui.routing_panel.is_none());
+                        assert_eq!(ui.workspace_focus, WorkspaceFocus::Navigation);
+                        assert!(ui.workspace_visible());
+                        assert!(!ui.owned_running(role));
+                        assert!(!ui.editor.as_ref().unwrap().dirty());
+                        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+                        continue;
+                    }
                     if page == 1 {
                         assert_eq!(ui.workspace_focus, WorkspaceFocus::Records);
                         ui.update(&mut model, press(KeyCode::Right));
                     }
                     let expected_focus = if page == 1 {
                         WorkspaceFocus::Fields
-                    } else if role == Role::Server && matches!(page, 2 | 3) {
+                    } else if page_has_users(role, page) {
                         WorkspaceFocus::Users
                     } else {
                         WorkspaceFocus::Actions
                     };
-                    assert_eq!(ui.workspace_focus, expected_focus);
+                    assert_eq!(
+                        ui.workspace_focus, expected_focus,
+                        "role={role:?} page={page}"
+                    );
+                    if role == Role::Server && page == 4 {
+                        ui.update(&mut model, press(KeyCode::Enter));
+                        assert!(ui.traffic_monitor.is_none());
+                        assert!(ui.workspace_monitor.is_some());
+                        assert!(ui.workspace_visible());
+                    }
                     let view = rendered_interaction(area.width, area.height, &model, &ui);
                     assert!(!view.contains("THEIA_AUTH_TOKEN"));
                     assert!(!view.contains("token_sha256"));
@@ -7215,6 +9378,14 @@ mod tests {
                     if page == 1 {
                         let content = layout.map_or(details, |p| p[0]);
                         let table = editor_layout(content).unwrap()[1];
+                        let editor = ui.editor.as_ref().unwrap();
+                        let field = if role == Role::Client {
+                            assert_eq!(editor.field_count(), 1);
+                            assert_eq!(editor.workspace_fields().len(), 1);
+                            0
+                        } else {
+                            1
+                        };
                         let y = (table.y..table.bottom())
                             .find(|&y| {
                                 editor_field_hit(
@@ -7222,13 +9393,14 @@ mod tests {
                                     ui.editor.as_ref().unwrap(),
                                     table.x + 2,
                                     y,
-                                ) == Some(1)
+                                ) == Some(field)
                             })
-                            .unwrap();
+                            .expect("visible compact field");
                         ui.mouse(&mut model, click_at(table.x + 2, y), area);
-                        assert_eq!(ui.editor.as_ref().unwrap().workspace_field_index(), 1);
+                        assert_eq!(ui.editor.as_ref().unwrap().workspace_field_index(), field);
+                        assert_eq!(ui.workspace_focus, WorkspaceFocus::Fields);
                         assert!(!ui.editor.as_ref().unwrap().editing);
-                    } else if role == Role::Server && matches!(page, 2 | 3) {
+                    } else if page_has_users(role, page) {
                         let content = layout.unwrap()[0];
                         ui.mouse(&mut model, click_at(content.x + 2, content.y + 2), area);
                         assert_eq!(ui.workspace_focus, WorkspaceFocus::Users);
@@ -7279,12 +9451,49 @@ mod tests {
                 let area = Rect::new(0, 0, 160, 42);
                 let records = workspace_columns(shell_layout(area)[1]).unwrap()[1];
                 ui.select_workspace_page(role, 3);
-                ui.mouse(&mut model, click_at(records.x + 2, records.y + 2), area);
+                // The compact sidebar wraps the active address (including '*').
+                // A physical row is not a profile index. Click every visible row
+                // of the second profile and verify selection without activation.
+                let rows = record_rows(ui.editor.as_ref().unwrap(), records);
+                let active_rows: Vec<_> = rows
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(row, (index, _))| (*index == 0).then_some(row))
+                    .collect();
+                let backup_rows: Vec<_> = rows
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(row, (index, _))| (*index == 1).then_some(row))
+                    .collect();
+                assert!(!active_rows.is_empty(), "active label must remain visible");
+                assert!(!backup_rows.is_empty());
+                for row in active_rows {
+                    ui.mouse(
+                        &mut model,
+                        click_at(records.x + 2, records.y + 1 + row as u16),
+                        area,
+                    );
+                    assert_eq!(ui.editor.as_ref().unwrap().selected_record_id(), "home");
+                }
+                for row in backup_rows {
+                    ui.mouse(
+                        &mut model,
+                        click_at(records.x + 2, records.y + 1 + row as u16),
+                        area,
+                    );
+                    assert_eq!(ui.editor.as_ref().unwrap().selected_record_id(), "backup");
+                    assert!(!ui.editor.as_ref().unwrap().selected_record_is_active());
+                    assert!(!ui.owned_running(role));
+                    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+                }
                 let editor = ui.editor.as_ref().unwrap();
                 assert_eq!(editor.selected_record_id(), "backup");
                 assert!(!editor.selected_record_is_active());
                 assert_eq!(recommended_step(editor, false).0, 'A');
-                assert_eq!(recommended_step(editor, true).0, 'V');
+                assert_eq!(
+                    recommended_step(editor, true).0,
+                    if cfg!(windows) { 'p' } else { 'V' }
+                );
                 let view = rendered_interaction(160, 42, &model, &ui);
                 assert!(view.contains("Активный профиль: №1 · edge.example.org:443"));
                 assert_eq!(ui.workspace_focus, WorkspaceFocus::Records);
@@ -7299,11 +9508,35 @@ mod tests {
             ui.select_workspace_page(role, 4);
             ui.update(&mut model, press(KeyCode::Enter));
             ui.update(&mut model, press(KeyCode::Enter));
-            assert!(ui.traffic_monitor.is_some());
-            assert!(rendered_interaction(60, 18, &model, &ui).contains("Монитор трафика"));
-            ui.poll_navigation(&mut model);
-            ui.update(&mut model, press(KeyCode::Esc));
-            assert!(ui.traffic_monitor.is_none());
+            assert!(ui.workspace_monitor.is_some());
+            if role == Role::Server {
+                assert!(ui.traffic_monitor.is_none());
+                assert!(ui.workspace_visible());
+                assert_eq!(ui.workspace_page, 4);
+                let wide = rendered_interaction(120, 40, &model, &ui);
+                assert!(
+                    wide.contains("Разделы")
+                        && wide.contains("Нет подтверждённого источника данных")
+                );
+                let compact = rendered_interaction(60, 18, &model, &ui);
+                assert!(compact.contains("Нет подтверждённого источника данных"));
+                ui.poll_navigation(&mut model);
+                ui.update(&mut model, press(KeyCode::F(4)));
+                assert_eq!(ui.workspace_page, 4);
+                assert!(ui.workspace_monitor.is_some());
+                assert!(ui.traffic_monitor.is_none());
+                ui.update(&mut model, press(KeyCode::Left));
+                assert_eq!(ui.workspace_focus, WorkspaceFocus::Navigation);
+                ui.update(&mut model, press(KeyCode::Up));
+                assert_eq!(ui.workspace_page, 3);
+                assert!(ui.workspace_monitor.is_none());
+            } else {
+                assert!(ui.traffic_monitor.is_some());
+                assert!(rendered_interaction(60, 18, &model, &ui).contains("Монитор трафика"));
+                ui.poll_navigation(&mut model);
+                ui.update(&mut model, press(KeyCode::Esc));
+                assert!(ui.traffic_monitor.is_none());
+            }
             assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
             assert!(!ui.owned_running(role));
         }
@@ -7409,7 +9642,7 @@ mod tests {
             std::env::temp_dir().join(crate::tui_editor::generated_id("server-controls").unwrap());
         std::fs::create_dir(&root).unwrap();
         let path = root.join("server.toml");
-        let original = server_issuance_fixture().replace("allowed_user_ids = [\"device-a\"]", "allowed_user_ids = [\"device-a\", \"device-b\"]").replace("[server.policy]", &format!("[[server.users]]\nid = \"device-b\"\ntoken_sha256 = \"{}\"\ndisabled = false\n\n[server.policy]", "11".repeat(32)));
+        let original = server_issuance_fixture().replace("allowed_user_ids = [\"device-a\"]", "allowed_user_ids = [\"device-a\", \"device-b\"]").replace("[server.policy]", &format!("[[server.users]]\nid = \"device-b\"\ntoken_sha256 = \"{}\"\ndisabled = false\n\n[[server.users]]\nid = \"device-c\"\ntoken_sha256 = \"{}\"\ndisabled = false\n\n[server.policy]", "11".repeat(32), "22".repeat(32)));
         std::fs::write(&path, &original).unwrap();
         let mut ui = Interaction::new(Some(Editor::load(Role::Server, &path).unwrap()));
         let mut model = Model::new(Some(Role::Server));
@@ -7422,18 +9655,31 @@ mod tests {
             ui.update(&mut model, press(KeyCode::Down));
             assert_eq!(ui.workspace_user, 1);
             ui.update(&mut model, press(KeyCode::Enter));
-            let items = page_actions(Role::Server, 2, ui.editor.as_ref());
+            if command == 'U' {
+                ui.update(&mut model, press(KeyCode::Up));
+                ui.workspace_user = 2;
+                ui.workspace_focus = WorkspaceFocus::Actions;
+            }
+            let items = page_actions_for(
+                Role::Server,
+                2,
+                ui.editor.as_ref(),
+                ui.workspace_user,
+                false,
+            );
             ui.workspace_action = items.iter().position(|item| item.key == command).unwrap();
             ui.update(&mut model, press(KeyCode::Enter));
             match command {
                 'x' => assert!(
-                    matches!(&ui.revocation, Some(DisableFlow::Input(id)) if id == "device-b")
+                    matches!(&ui.revocation, Some(DisableFlow::Confirm(id)) if id == "device-b")
                 ),
                 't' => {
-                    assert!(matches!(&ui.issuance, Some(IssueFlow::Input(id)) if id == "device-b"))
+                    assert!(
+                        matches!(&ui.issuance, Some(IssueFlow::Confirm(id)) if id == "device-b")
+                    )
                 }
                 'U' => assert!(
-                    matches!(&ui.records, Some(RecordFlow::Input { action: RecordAction::DeleteUser, fields, .. }) if fields.first().is_some_and(|id| id == "device-b"))
+                    matches!(&ui.records, Some(RecordFlow::Confirm(review)) if review.confirmation_label() == "Удалить пользователя" && review.body().contains("device-c"))
                 ),
                 _ => unreachable!(),
             }
@@ -7645,7 +9891,7 @@ mod tests {
         let screen = rendered_interaction(120, 40, &model, &ui);
         for label in [
             "Системный прокси",
-            "TUN / VPN",
+            "TUN / WinDivert / NFQUEUE",
             "Локальный прокси",
             "Активный профиль",
             "127.0.0.1",
@@ -7654,27 +9900,25 @@ mod tests {
         ] {
             assert!(screen.contains(label), "missing {label}");
         }
+        assert!(screen.contains("Запросы приложений: не проверены"));
+        assert!(!screen.contains("Системный прокси включён"));
         assert!(!ui.owned_running(Role::Client));
         assert!(ui.reality_status.is_none());
         let keys = page_actions(Role::Client, 3, ui.editor.as_ref());
         assert_eq!(keys.iter().any(|a| a.key == 'p'), cfg!(windows));
         #[cfg(windows)]
-        assert_eq!(keys[0].label, "Настроить и включить системный прокси");
+        assert_eq!(keys[0].label, "Управлять системным прокси");
         ui.update(&mut model, press(KeyCode::Down));
         assert!(!ui.owned_running(Role::Client));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-        // The saved permission is separate from all operating-system effects.
-        let editor = ui.editor.as_mut().unwrap();
-        assert!(!editor.system_proxy_allowed());
-        let review = editor.review_system_proxy_permission().unwrap();
-        assert!(review
-            .body()
-            .contains("Прокси Windows и соединение не изменятся"));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-        editor.stage_record(review).unwrap();
-        assert!(!editor.system_proxy_allowed());
-        assert!(editor.save());
-        assert!(editor.system_proxy_allowed());
+        // Saved ingress selection is not an OS mutation or activation.
+        let crate::config::Config::Client(doc) = crate::config::read_file(&path).unwrap() else {
+            panic!("client")
+        };
+        assert_eq!(
+            doc.client.ingress_mode,
+            crate::config::IngressMode::SystemProxy
+        );
         assert!(!ui.owned_running(Role::Client));
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -7787,6 +10031,42 @@ mod tests {
             label,
             "№2 long-label-for-testing-profile-address.example.org:443"
         );
+        for width in 12..=40 {
+            let rows = record_rows(editor, Rect::new(0, 0, width, 40));
+            let last = rows.iter().rfind(|(index, _)| *index == 1).unwrap();
+            assert!(last.1.ends_with(":443"), "width={width}: {rows:?}");
+            assert!(rows
+                .iter()
+                .all(|(_, row)| Span::raw(row.as_str()).width() <= usize::from(width - 4)));
+        }
+        let rows = record_rows(editor, Rect::new(0, 0, 28, 20));
+        assert!(rows.iter().any(|(index, row)| *index == 0
+            && row == "*№1 edge.example.org:443"));
+        // Both narrow and wide terminal layouts must map continuation rows
+        // to the same profile. Re-select the first profile before each click
+        // so this also checks that mouse selection actually changes focus.
+        for area in [
+            Rect::new(0, 0, 70, 34),
+            Rect::new(0, 0, 120, 40),
+            Rect::new(0, 0, 160, 42),
+        ] {
+            let body = shell_layout(area)[1];
+            let records = workspace_columns(body).map_or(body, |columns| columns[1]);
+            ui.editor.as_mut().unwrap().workspace_select(0);
+            ui.workspace_focus = WorkspaceFocus::Records;
+            let rows = record_rows(ui.editor.as_ref().unwrap(), records);
+            let row = rows.iter().rposition(|(index, _)| *index == 1).unwrap();
+            ui.mouse(
+                &mut model,
+                click_at(records.x + 2, records.y + 1 + row as u16),
+                area,
+            );
+            assert_eq!(ui.editor.as_ref().unwrap().selected_record_id(), "backup");
+            assert_eq!(ui.workspace_focus, WorkspaceFocus::Records);
+            assert!(!ui.editor.as_ref().unwrap().selected_record_is_active());
+            assert!(!ui.owned_running(Role::Client));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
         ui.update(&mut model, press(KeyCode::F(7)));
         assert!(ui
             .preview_text
@@ -7882,7 +10162,8 @@ mod tests {
         std::fs::write(&path, &original).unwrap();
         let mut ui = Interaction::new(Some(Editor::load(Role::Server, &path).unwrap()));
         ui.after_reality_success(Some("device-a".into()));
-        assert!(matches!(&ui.issuance, Some(IssueFlow::Input(id)) if id == "device-a"));
+        assert!(matches!(&ui.issuance, Some(IssueFlow::Confirm(id)) if id == "device-a"));
+        assert_eq!(ui.issue_kind, IssueKind::FirstKey);
         assert_eq!(ui.workspace_page, 2);
         assert!(!ui.editor.as_ref().unwrap().dirty());
         assert!(!ui.server_process.running());
@@ -7907,7 +10188,11 @@ mod tests {
         let screen = rendered_interaction(80, 24, &model, &ui);
         assert!(screen.contains("Запуск / остановка"));
         ui.update(&mut model, press(KeyCode::Enter));
+        assert_eq!(ui.workspace_page, 3);
+        assert!(!ui.show_server_process);
+        ui.update(&mut model, press(KeyCode::Enter));
         assert!(ui.show_server_process);
+        assert_eq!(ui.server_process.confirmation(), Some(true));
         assert!(!ui.server_process.running());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         std::fs::remove_file(path).unwrap();
@@ -8001,8 +10286,15 @@ mod tests {
         let area = Rect::new(0, 0, 120, 40);
         let [_, _, workspace] = workspace_columns(shell_layout(area)[1]).unwrap();
         for role in [Role::Server, Role::Client] {
-            for page in [0, 2, 4, 5, 6] {
-                let [content, controls] = page_layout(workspace, role, page, None).unwrap();
+            for page in [0, 2, 4, 5] {
+                if role == Role::Server && page == 4 {
+                    // Inline server statistics intentionally have no secondary action panel.
+                    assert!(page_actions(role, page, None).is_empty());
+                    assert!(page_layout(workspace, role, page, None).is_none());
+                    continue;
+                }
+                let [content, controls] =
+                    page_layout(workspace, role, page, None).expect("page with visible actions");
                 assert_eq!(controls.x, content.x);
                 assert_eq!(controls.width, content.width);
                 assert_eq!(controls.y, content.bottom());
@@ -8022,20 +10314,630 @@ mod tests {
         let model = Model::new(Some(Role::Server));
         ui.workspace_page = 1;
         let before = rendered_interaction(120, 40, &model, &ui);
-        assert!(before.contains("Что это значит"));
+        assert!(before.contains("Создать подключение"));
         for kind in [IssueKind::NewUser, IssueKind::Rotation, IssueKind::Reenable] {
             ui.issue_kind = kind;
             ui.issuance = Some(IssueFlow::Offer);
             let screen = rendered_interaction(120, 40, &model, &ui);
             assert!(screen.contains("Показать ссылку один раз"));
             assert!(screen.contains("Сохранить приглашение в файл"));
-            assert!(!screen.contains("Что это значит"));
+            assert!(!screen.contains("Создать подключение"));
             assert!(!screen.contains("edge.example.org"));
             assert!(!screen.contains("доступ пользователю."));
             assert!(!screen.contains("theia://"));
         }
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn workspace_import_and_monitor_are_inline_and_read_only() {
+        let path =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("inline-pages").unwrap());
+        let original = include_str!("../../../examples/client.toml");
+        std::fs::write(&path, original).unwrap();
+        let mut model = Model::new(Some(Role::Client));
+        let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
+        ui.select_workspace_page(Role::Client, 2);
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(ui.importing.is_none());
+        let screen = rendered_interaction(120, 40, &model, &ui);
+        assert!(screen.contains("Вставьте ключ (скрыто)"));
+        assert!(screen.contains("Выбрать файл ключа"));
+        assert!(screen.contains("Импортировать QR из изображения"));
+        assert!(screen.contains("Разделы"));
+        ui.paste_workspace_import(&Model::new(None), "theia://v1/test");
+        assert!(ui.importing.is_none());
+        ui.paste_workspace_import(&model, "theia://v1/test");
+        assert!(ui.inline_import());
+        let screen = rendered_interaction(120, 40, &model, &ui);
+        assert!(screen.contains("Введено 15 байт (скрыто)"));
+        assert!(!screen.contains("theia://v1/test"));
+        assert!(screen.contains("Разделы"));
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.importing.is_none());
+        for source in ['f', 'Q'] {
+            ui.workspace_focus = WorkspaceFocus::Actions;
+            ui.update(&mut model, press(KeyCode::Char(source)));
+            assert!(ui.import_browser.is_some());
+            ui.update(&mut model, press(KeyCode::Esc));
+            ui.update(&mut model, press(KeyCode::Esc));
+            assert!(ui.importing.is_none());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+        ui.select_workspace_page(Role::Client, 4);
+        ui.update(&mut model, press(KeyCode::Enter));
+        let screen = rendered_interaction(120, 40, &model, &ui);
+        assert!(screen.contains("Разделы"));
+        assert!(screen.contains("H2") && screen.contains("H3"));
+        assert!(ui.workspace_monitor.is_some());
+        assert!(ui.traffic_monitor.is_none());
+        assert!(!ui.owned_running(Role::Client));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn workspace_selected_user_and_advanced_actions_are_contextual() {
+        let path =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("context-actions").unwrap());
+        let original = server_issuance_fixture()
+            .replace("allowed_user_ids = [\"device-a\"]", "allowed_user_ids = [\"device-a\", \"device-b\"]")
+            .replace("[server.policy]", &format!("[[server.users]]\nid = \"device-b\"\ntoken_sha256 = \"{}\"\ndisabled = true\n\n[[server.users]]\nid = \"device-c\"\ntoken_sha256 = \"{}\"\ndisabled = false\n\n[server.policy]", "11".repeat(32), "22".repeat(32)));
+        std::fs::write(&path, &original).unwrap();
+        let editor = Editor::load(Role::Server, &path).unwrap();
+        let keys = |user| {
+            page_actions_for(Role::Server, 2, Some(&editor), user, false)
+                .into_iter()
+                .map(|a| a.key)
+                .collect::<Vec<_>>()
+        };
+        assert!(keys(0).contains(&'t') && keys(0).contains(&'x'));
+        assert!(!keys(0).contains(&'b') && !keys(0).contains(&'U'));
+        assert!(keys(1).contains(&'b') && !keys(1).contains(&'t') && !keys(1).contains(&'U'));
+        assert!(keys(2).contains(&'U') && !keys(2).contains(&'b') && !keys(2).contains(&'x'));
+        assert!(editor
+            .review_record(RecordAction::DeleteUser, &["device-a".into()])
+            .is_err());
+        let review = editor
+            .review_record(RecordAction::DeleteUser, &["device-c".into()])
+            .unwrap();
+        assert_eq!(review.confirmation_label(), "Удалить пользователя");
+        assert!(!page_actions_for(Role::Server, 1, Some(&editor), 0, false)
+            .iter()
+            .any(|a| a.key == 'M'));
+        assert!(page_actions_for(Role::Server, 1, Some(&editor), 0, true)
+            .iter()
+            .any(|a| a.key == 'M'));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn revocation_failure_replaces_entire_workspace() {
+        let path =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("review-revoke").unwrap());
+        let original = server_issuance_fixture();
+        std::fs::write(&path, &original).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Server, &path).unwrap()));
+        let model = Model::new(Some(Role::Server));
+        ui.revocation = Some(DisableFlow::SaveFailed);
+        let screen = rendered_interaction(120, 40, &model, &ui);
+        assert!(screen.contains("Повторить сохранение"));
+        assert!(screen.contains("Отменить черновик"));
+        assert!(!screen.contains("Что это значит"));
+        assert!(!screen.contains("Адрес UDP"));
+        assert!(!screen.contains("Создать подключение"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn workspace_has_single_owner_for_every_visible_operation() {
+        for role in [Role::Server, Role::Client] {
+            let mut seen = std::collections::HashSet::new();
+            for page in 0..pages(role).len() {
+                for item in page_actions(role, page, None) {
+                    assert!(seen.insert(item.key), "duplicate action {}", item.key);
+                }
+            }
+            assert!(!page_has_records(role, 0));
+            assert!(!page_has_records(role, 4));
+            assert!(!page_has_records(role, 5));
+        }
+        assert!(page_actions(Role::Server, 6, None)
+            .iter()
+            .any(|a| a.key == 'T'));
+        assert!(!page_actions(Role::Server, 6, None)
+            .iter()
+            .any(|a| a.key == 't'));
+        assert_eq!(recommendation_page(Role::Server, 'b'), (2, 'b'));
+        assert_eq!(recommendation_page(Role::Server, 'G'), (2, 'G'));
+        let imports = page_actions(Role::Client, 2, None);
+        assert_eq!(imports.iter().map(|a| a.key).collect::<Vec<_>>(), vec!['i', 'f', 'Q']);
+        assert_eq!(recommendation_page(Role::Client, 'i'), (2, 'i'));
+        assert_eq!(recommendation_page(Role::Client, 'A'), (3, 'A'));
+        assert_eq!(recommendation_page(Role::Server, 'S'), (5, 'S'));
+        assert!(!page_has_users(Role::Server, 3));
+        assert_eq!(pages(Role::Client).len(), 8);
+        assert!(page_has_records(Role::Client, 7));
+        assert_eq!(pages(Role::Client)[7], "Диагностика");
+        assert_eq!(pages(Role::Server).len(), 8);
+    }
+
+    #[test]
+    fn routing_workspace_reports_verified_ipc_and_stages_only_draft() {
+        let client_path =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("routing-client").unwrap());
+        let client_source = include_str!("../../../examples/client.toml");
+        std::fs::write(&client_path, client_source).unwrap();
+        let editor = Editor::load(Role::Client, &client_path).unwrap();
+        let digest = editor.saved_sha256();
+        let mut client = Interaction::new(Some(editor));
+        client.select_workspace_page(Role::Client, 6);
+        client.workspace_focus = WorkspaceFocus::Actions;
+        let mut observation = RoutingObservation::new(digest);
+        let (tx, rx) = mpsc::channel();
+        observation.pending = Some(rx);
+        tx.send(Ok(crate::management::StatusReply::ClientRunning {
+            revision: 1,
+            config_sha256: digest,
+            descriptor_revision: 0,
+            transport: 2,
+            xhttp: 1,
+            fallback: false,
+            routing_revision: 5,
+            routing_state: 1,
+            routing_totals: Box::new([
+                10, 20, 30, 40, 2, 1, 1, 3, 4, 5, 10, 20, 30, 40, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            ]),
+            flow_counts: Some([1, 2, 3, 4]),
+            capture_state: 2,
+        }))
+        .unwrap();
+        observation.poll();
+        client.routing_observation = Some(observation);
+        let screen = rendered_interaction(120, 40, &Model::new(Some(Role::Client)), &client);
+        assert!(screen.contains("ревизия 5"));
+        assert!(screen.contains("изолированный тестовый захват"));
+        assert!(screen.contains("IPC"));
+        assert!(screen.contains("Anti-DPI"));
+        assert!(screen.contains("резерв VPS"));
+        let editor = client.editor.as_mut().unwrap();
+        assert!(!editor.direct_dpi_allowed());
+        assert!(!editor.direct_dpi_stun_allowed());
+        assert!(editor.review_direct_dpi_stun_permission().is_err());
+        let review = editor.review_direct_dpi_permission().unwrap();
+        assert_eq!(review.confirmation_label(), "Разрешить Anti-DPI");
+        editor.stage_record(review).unwrap();
+        assert!(editor.dirty());
+        assert!(!editor.direct_dpi_allowed());
+        assert_eq!(
+            std::fs::read_to_string(&client_path).unwrap(),
+            client_source
+        );
+        std::fs::remove_file(client_path).unwrap();
+
+        let path =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("routing-server").unwrap());
+        let source = server_issuance_fixture();
+        std::fs::write(&path, &source).unwrap();
+        let mut editor = Editor::load(Role::Server, &path).unwrap();
+        let mut panel = RoutingPanel::new(&editor);
+        panel.edit(None);
+        let (_, fields, _) = panel.fields.as_mut().unwrap();
+        *fields = [
+            "local".into(),
+            "direct_via_client".into(),
+            "full:localhost".into(),
+            String::new(),
+            String::new(),
+        ];
+        assert!(panel.key(press(KeyCode::Enter), Some(&mut editor)));
+        assert_eq!(panel.settings.rules.len(), 1);
+        assert_eq!(
+            panel.settings.rules[0].action,
+            crate::routing::Action::Direct
+        );
+        panel.edit(None);
+        let (_, fields, _) = panel.fields.as_mut().unwrap();
+        *fields = [
+            "DPI".into(),
+            "direct_via_client_anti_dpi".into(),
+            "example.org".into(),
+            String::new(),
+            String::new(),
+        ];
+        assert!(panel.key(press(KeyCode::Enter), Some(&mut editor)));
+        assert_eq!(
+            panel.settings.rules[1].action,
+            crate::routing::Action::DirectDpi
+        );
+        assert!(panel.body().contains("Anti-DPI / резерв VPS"));
+        panel.key(press(KeyCode::Char('/')), Some(&mut editor));
+        for ch in "local".chars() {
+            panel.key(press(KeyCode::Char(ch)), Some(&mut editor));
+        }
+        panel.key(press(KeyCode::Enter), Some(&mut editor));
+        assert_eq!(panel.selected, 0);
+        assert!(panel.search.is_none());
+        assert!(!editor.dirty());
+        assert!(!panel.key(press(KeyCode::Char('s')), Some(&mut editor)));
+        assert!(editor.dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn diagnostic_domain_editor_is_bounded_and_stages_only_on_explicit_save() {
+        let path = std::env::temp_dir()
+            .join(crate::tui_editor::generated_id("diagnostic-domains").unwrap());
+        let source = server_issuance_fixture();
+        std::fs::write(&path, &source).unwrap();
+        let mut editor = Editor::load(Role::Server, &path).unwrap();
+        let mut panel = RoutingPanel::new(&editor);
+        let original = panel.settings.diagnostic_domains.clone();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let clear = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert!(panel.actions().iter().any(|a| a.key == 'G'));
+        panel.key(key(KeyCode::Char('G')), Some(&mut editor));
+        assert!(panel.actions().is_empty());
+        assert_eq!(
+            panel.diagnostic_input.as_deref(),
+            Some(original.join(", ").as_str())
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 25)).unwrap();
+        terminal
+            .draw(|frame| panel.render(frame, frame.area(), true))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen = (0..25)
+            .map(|y| {
+                (0..100)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("Домены диагностики клиентов"));
+        panel.key(clear, Some(&mut editor));
+        panel.paste("https://invalid");
+        panel.paste(&"a".repeat(4097));
+        panel.key(key(KeyCode::Char('ж')), Some(&mut editor));
+        assert_eq!(panel.diagnostic_input.as_deref(), Some(""));
+        panel.key(key(KeyCode::Enter), Some(&mut editor));
+        assert!(panel.message.contains("Некорректный"));
+        panel.paste("Discord.COM, x.com\n");
+        panel.key(key(KeyCode::Backspace), Some(&mut editor));
+        panel.key(key(KeyCode::Esc), Some(&mut editor));
+        assert_eq!(panel.settings.diagnostic_domains, original);
+        assert!(!editor.dirty());
+        panel.key(key(KeyCode::Char('G')), Some(&mut editor));
+        panel.key(clear, Some(&mut editor));
+        panel.paste("Discord.COM, x.co");
+        panel.key(key(KeyCode::Char('m')), Some(&mut editor));
+        panel.key(key(KeyCode::Enter), Some(&mut editor));
+        assert!(panel.diagnostic_input.is_none());
+        assert_eq!(
+            panel.settings.diagnostic_domains,
+            vec!["discord.com", "x.com"]
+        );
+        assert!(panel.actions().iter().any(|a| a.key == 's'));
+        assert!(!editor.dirty());
+        assert!(!panel.key(key(KeyCode::Char('s')), Some(&mut editor)));
+        assert!(editor.dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn access_observation_is_bound_to_saved_inbound_user_and_fresh_reply() {
+        let path =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("access-observed").unwrap());
+        std::fs::write(&path, server_issuance_fixture()).unwrap();
+        let editor = Editor::load(Role::Server, &path).unwrap();
+        assert!(AccessObservation::start(&editor, "invalid user".into(), None, true).is_none());
+        let mut observation =
+            AccessObservation::start(&editor, "test-user".into(), None, true).unwrap();
+        // Owned instance without an endpoint can never fall through to a
+        // different process's environment IPC.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while observation.receiver.is_some() && std::time::Instant::now() < deadline {
+            observation.poll();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(observation.receiver.is_none());
+        assert!(observation.label(&editor, "test-user").is_none());
+        for (state, expected) in [
+            (0, "Нет подключения"),
+            (1, "Нет права"),
+            (2, "Отключён"),
+            (3, "Разрешён"),
+        ] {
+            let (tx, rx) = mpsc::channel();
+            observation.receiver = Some(rx);
+            observation.requested = std::time::Instant::now();
+            observation.poll();
+            assert_eq!(
+                observation.label(&editor, "test-user").as_deref(),
+                Some("Проверяется…")
+            );
+            tx.send(Ok(crate::management::StatusReply::AccessObserved {
+                revision: 7,
+                state,
+            }))
+            .unwrap();
+            observation.poll();
+            assert_eq!(
+                observation.label(&editor, "test-user").unwrap(),
+                format!("{expected} · rev 7")
+            );
+            assert!(observation.label(&editor, "other-user").is_none());
+        }
+        observation.requested = std::time::Instant::now() - Duration::from_secs(11);
+        assert!(observation.label(&editor, "test-user").is_none());
+        observation.requested = std::time::Instant::now();
+        observation.digest = [0; 32];
+        assert!(observation.label(&editor, "test-user").is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn inline_routing_actions_never_execute_on_focus() {
+        let dir =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("routing-actions").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("server.toml");
+        let original = server_issuance_fixture();
+        std::fs::write(&path, &original).unwrap();
+        let mut ui = Interaction::new(Some(Editor::load(Role::Server, &path).unwrap()));
+        let mut model = Model::new(Some(Role::Server));
+        ui.select_workspace_page(Role::Server, 7);
+        let screen = rendered_interaction(120, 40, &model, &ui);
+        assert!(screen.contains("Добавить правило") && screen.contains("Разделы"));
+        ui.update(&mut model, press(KeyCode::Enter));
+        ui.update(&mut model, press(KeyCode::Tab));
+        ui.update(&mut model, press(KeyCode::Down));
+        assert!(ui.routing_panel.as_ref().unwrap().download.is_none());
+        ui.update(&mut model, press(KeyCode::Up));
+        ui.update(&mut model, press(KeyCode::Enter));
+        assert!(ui.routing_panel.as_ref().unwrap().fields.is_some());
+        ui.update(&mut model, press(KeyCode::Esc));
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.routing_panel.is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(!ui.editor.as_ref().unwrap().dirty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn routing_rule_editor_preserves_order_cancel_and_offline_dataset_failure() {
+        let dir =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("routing-draft").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("server.toml");
+        let source = server_issuance_fixture();
+        std::fs::write(&path, &source).unwrap();
+        let mut editor = Editor::load(Role::Server, &path).unwrap();
+        let mut panel = RoutingPanel::new(&editor);
+        assert!(panel.body().contains("Нет правил"));
+        for name in ["alpha", "beta", "gamma"] {
+            assert!(panel.key(press(KeyCode::Char('n')), None));
+            panel.paste(name);
+            panel.key(press(KeyCode::Tab), None);
+            let before = panel.fields.as_ref().unwrap().1[1].clone();
+            panel.key(press(KeyCode::Right), None);
+            assert_ne!(panel.fields.as_ref().unwrap().1[1], before);
+            panel.key(press(KeyCode::Left), None);
+            assert_eq!(panel.fields.as_ref().unwrap().1[1], before);
+            panel.key(press(KeyCode::Down), None);
+            panel.paste("domain:example.org");
+            assert!(panel.body().contains("example.org"));
+            panel.key(press(KeyCode::Enter), None);
+            assert!(panel.fields.is_none());
+        }
+        let names = |p: &RoutingPanel| {
+            p.settings
+                .rules
+                .iter()
+                .map(|r| r.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&panel), ["alpha", "beta", "gamma"]);
+        panel.key(press(KeyCode::Char('[')), None);
+        assert_eq!(names(&panel), ["alpha", "gamma", "beta"]);
+        panel.key(press(KeyCode::Char(']')), None);
+        assert_eq!(names(&panel), ["alpha", "beta", "gamma"]);
+        panel.key(press(KeyCode::Up), None);
+        panel.key(press(KeyCode::Enter), None);
+        panel.key(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            None,
+        );
+        panel.key(press(KeyCode::Char('x')), None);
+        panel.key(press(KeyCode::Backspace), None);
+        panel.key(press(KeyCode::Enter), None);
+        assert!(panel.fields.is_some());
+        assert!(panel.body().contains("не прошло проверку"));
+        panel.paste("discarded");
+        panel.key(press(KeyCode::Esc), None);
+        assert_eq!(names(&panel), ["alpha", "beta", "gamma"]);
+        panel.key(press(KeyCode::Enter), None);
+        panel.key(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            None,
+        );
+        panel.paste("beta-edited");
+        panel.key(press(KeyCode::Enter), None);
+        assert_eq!(names(&panel), ["alpha", "beta-edited", "gamma"]);
+        panel.key(press(KeyCode::Delete), None);
+        assert_eq!(names(&panel), ["alpha", "gamma"]);
+        panel.key(press(KeyCode::Down), None);
+        assert_eq!(panel.selected, 1);
+        // Select a local-only dataset in an empty private directory; no network.
+        panel.key(press(KeyCode::Char('l')), None);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while panel.download.is_some() {
+            panel.poll();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!panel.message.is_empty());
+        assert!(panel.settings.datasets.is_none());
+        assert!(!editor.dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        assert!(!panel.key(press(KeyCode::Char('s')), Some(&mut editor)));
+        assert!(editor.dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn routing_table_and_form_pointer_preserve_draft_without_io() {
+        let dir =
+            std::env::temp_dir().join(crate::tui_editor::generated_id("routing-pointer").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("server.toml");
+        let source = server_issuance_fixture();
+        std::fs::write(&path, &source).unwrap();
+        let editor = Editor::load(Role::Server, &path).unwrap();
+        let mut panel = RoutingPanel::new(&editor);
+        let area = Rect::new(0, 0, 120, 40);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| panel.render(frame, area, true))
+            .unwrap();
+        for name in ["alpha", "beta", "gamma"] {
+            panel.edit(None);
+            let (_, values, _) = panel.fields.as_mut().unwrap();
+            values[0] = name.into();
+            values[2] = "domain:example.org, full:localhost".into();
+            values[3] = "192.0.2.0/24".into();
+            let form = panel.form().unwrap();
+            let target = (0..area.height)
+                .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+                .find(|&(x, y)| form.hit(area, x, y) == Some(3))
+                .unwrap();
+            panel.select_at(area, target.0, target.1);
+            assert_eq!(panel.fields.as_ref().unwrap().2, 3);
+            terminal
+                .draw(|frame| panel.render(frame, area, true))
+                .unwrap();
+            panel.key(press(KeyCode::Enter), None);
+            assert!(panel.fields.is_none());
+        }
+        let [report, _] = panel.layout(area).unwrap();
+        panel.select_at(area, report.x + 1, report.y + 4);
+        assert_eq!(panel.selected, 0);
+        panel.select_at(area, report.x + 1, report.y + 5);
+        assert_eq!(panel.selected, 1);
+        assert!(panel.action_focus.is_none());
+        terminal
+            .draw(|frame| panel.render(frame, area, true))
+            .unwrap();
+        terminal
+            .draw(|frame| panel.render(frame, area, false))
+            .unwrap();
+        let names = panel
+            .settings
+            .rules
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["alpha", "beta", "gamma"]);
+        assert!(!editor.dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn routing_observation_never_treats_stale_or_mismatched_runtime_as_active() {
+        let digest = [7; 32];
+        let mut observation = RoutingObservation::new(digest);
+        assert!(observation.body().contains("Проверяем"));
+        for (routing_state, capture_state, expected) in [
+            (0, 0, "не активирован"),
+            (1, 1, "подготовка"),
+            (2, 3, "Новые соединения заблокированы"),
+            (3, 2, "Синхронизация выполняется"),
+        ] {
+            let (tx, rx) = mpsc::channel();
+            observation.pending = Some(rx);
+            tx.send(Ok(crate::management::StatusReply::ClientRunning {
+                revision: 1,
+                config_sha256: digest,
+                descriptor_revision: 0,
+                transport: 2,
+                xhttp: 1,
+                fallback: false,
+                routing_revision: 5,
+                routing_state,
+                routing_totals: Box::new([0; 38]),
+                flow_counts: None,
+                capture_state,
+            }))
+            .unwrap();
+            observation.poll();
+            assert!(observation.body().contains(expected));
+        }
+        observation.observed = Some(std::time::Instant::now() - Duration::from_secs(7));
+        assert!(observation.body().contains("устарел"));
+        let (tx, rx) = mpsc::channel();
+        observation.pending = Some(rx);
+        tx.send(Ok(crate::management::StatusReply::ClientRunning {
+            revision: 1,
+            config_sha256: [8; 32],
+            descriptor_revision: 0,
+            transport: 2,
+            xhttp: 1,
+            fallback: false,
+            routing_revision: 5,
+            routing_state: 1,
+            routing_totals: Box::new([0; 38]),
+            flow_counts: None,
+            capture_state: 2,
+        }))
+        .unwrap();
+        observation.poll();
+        assert!(observation.observed.is_none());
+        assert!(observation.body().contains("не подтверждено"));
+        assert!(!observation.body().contains("изолированный тестовый захват"));
+        let (tx, rx) = mpsc::channel();
+        observation.pending = Some(rx);
+        observation.poll();
+        assert!(observation.pending.is_some());
+        drop(tx);
+        observation.poll();
+        assert!(observation.pending.is_none());
+        assert!(observation.observed.is_none());
+    }
+
+    #[test]
+    fn configured_sections_shortcut_uses_navigation_not_second_menu() {
+        for role in [Role::Server, Role::Client] {
+            let path =
+                std::env::temp_dir().join(crate::tui_editor::generated_id("single-nav").unwrap());
+            let original = if role == Role::Server {
+                server_issuance_fixture()
+            } else {
+                include_str!("../../../examples/client.toml").to_owned()
+            };
+            std::fs::write(&path, &original).unwrap();
+            let mut model = Model::new(Some(role));
+            let mut ui = Interaction::new(Some(Editor::load(role, &path).unwrap()));
+            for key in [KeyCode::F(2), KeyCode::F(10)] {
+                ui.update(&mut model, press(key));
+                assert_eq!(ui.workspace_focus, WorkspaceFocus::Navigation);
+                assert!(ui.menu.is_none());
+                assert!(!ui.owned_running(role));
+                assert!(!ui.editor.as_ref().unwrap().dirty());
+            }
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
@@ -8058,12 +10960,16 @@ mod tests {
         std::fs::write(&path, include_str!("../../../examples/client.toml")).unwrap();
         let editor = Editor::load(Role::Client, &path).unwrap();
         let items = page_actions(Role::Client, 1, Some(&editor));
+        assert!(!page_actions(Role::Client, 5, Some(&editor)).iter().any(|a| a.key == 'S'));
         assert!(!items.iter().any(|a| matches!(a.key, 'A' | 'D')));
-        assert!(items.iter().any(|a| a.key == 'V'));
+        assert!(!items.iter().any(|a| matches!(a.key, 'V' | 'i' | 'A')));
+        assert!(page_actions(Role::Client, 3, Some(&editor))
+            .iter()
+            .any(|a| a.key == 'V'));
         let mut selected = 0;
         assert_eq!(
             tui_widgets::action_key(&items, &mut selected, KeyCode::Enter),
-            Some(KeyCode::Char('V'))
+            Some(KeyCode::Char('N'))
         );
         std::fs::remove_file(path).unwrap();
     }
@@ -8103,6 +11009,19 @@ mod tests {
         ui.workspace_focus = WorkspaceFocus::Fields;
         ui.update(&mut model, press(KeyCode::Enter));
         assert!(matches!(ui.importing, Some(ImportFlow::Input(_))));
+        ui.update(&mut model, press(KeyCode::Esc));
+        ui.update(&mut model, press(KeyCode::Char('I')));
+        assert!(matches!(ui.importing, Some(ImportFlow::Input(_))));
+        assert!(ui.reality_enrollment.is_none());
+        ui.update(&mut model, press(KeyCode::Esc));
+        ui.update(&mut model, press(KeyCode::Char('N')));
+        assert!(matches!(
+            ui.records,
+            Some(RecordFlow::Input {
+                action: RecordAction::NewProfile,
+                ..
+            })
+        ));
         ui.update(&mut model, press(KeyCode::Esc));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         assert!(!ui.editor.as_ref().unwrap().dirty());
@@ -8193,6 +11112,9 @@ mod tests {
         std::fs::write(&path, original).unwrap();
         let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
         let mut model = Model::new(Some(Role::Client));
+        assert_eq!(ui.editor.as_ref().unwrap().field_count(), 1);
+        ui.workspace_advanced = true;
+        ui.editor.as_mut().unwrap().set_compact_server_fields(false);
         ui.editor.as_mut().unwrap().workspace_select_field(2);
         ui.update(&mut model, press(KeyCode::Enter));
         let before = ui.editor.as_ref().unwrap().field_value();
@@ -8260,6 +11182,8 @@ mod tests {
         let original = include_str!("../../../examples/client.toml");
         std::fs::write(&path, original).unwrap();
         ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
+        ui.workspace_advanced = true;
+        ui.editor.as_mut().unwrap().set_compact_server_fields(false);
         let details = workspace_columns(body).unwrap()[2];
         let details = page_layout(details, Role::Client, 1, ui.editor.as_ref())
             .map(|p| p[0])
@@ -8291,18 +11215,38 @@ mod tests {
             });
             let mut ui = Interaction::new(None);
             let mut model = Model::new(Some(role));
+            if role == Role::Server {
+                let welcome = rendered_interaction(120, 40, &model, &ui);
+                assert!(welcome.contains("REALITY") && welcome.contains("Own-TLS"));
+                ui.welcome_choice = 1;
+            }
             ui.update(&mut model, press(KeyCode::Enter));
             let dialog = ui.config_dialog.as_mut().unwrap();
             dialog.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
             dialog.paste(path.to_str().unwrap());
             let snapshot = rendered_interaction(120, 40, &model, &ui);
-            assert!(snapshot.contains(if role == Role::Server {
-                "REALITY"
+            if role == Role::Server {
+                assert!(snapshot.contains("REALITY") && snapshot.contains("Файл настроек"));
+                assert!(
+                    !snapshot.contains("Own-TLS")
+                        && !snapshot.contains("Открыть сохранённые настройки")
+                );
+                assert_eq!(
+                    ui.config_dialog
+                        .as_ref()
+                        .unwrap()
+                        .form()
+                        .unwrap()
+                        .fields
+                        .len(),
+                    2
+                );
+                ui.update(&mut model, press(KeyCode::Down));
+                ui.update(&mut model, press(KeyCode::Up));
             } else {
-                "Импорт ключа Theia"
-            }));
-            assert!(snapshot.contains("Own-TLS"));
-            ui.update(&mut model, press(KeyCode::Down));
+                assert!(snapshot.contains("Импорт ключа Theia") && snapshot.contains("Own-TLS"));
+                ui.update(&mut model, press(KeyCode::Down));
+            }
             ui.update(&mut model, press(KeyCode::Enter));
             let snapshot = rendered_interaction(120, 40, &model, &ui);
             assert!(snapshot.contains("1/"));
@@ -8491,7 +11435,8 @@ mod tests {
         second.id = "backup".into();
         second.server = "backup.example.org:443".into();
         doc.client.profiles.push(second);
-        fs::write(&path, Config::Client(doc).to_toml().unwrap()).unwrap();
+        let original = Config::Client(doc).to_toml().unwrap();
+        fs::write(&path, &original).unwrap();
 
         let mut interaction = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
         let mut model = Model::new(Some(Role::Client));
@@ -8509,6 +11454,32 @@ mod tests {
             .as_ref()
             .unwrap()
             .selected_record_is_active());
+        assert_eq!(interaction.editor.as_ref().unwrap().field_count(), 1);
+        assert_eq!(
+            interaction.editor.as_ref().unwrap().field_name(),
+            "client.profiles[1].server"
+        );
+        // Down leaves the only basic field for the action list. Opening
+        // advanced fields is an explicit, presentation-only action.
+        assert!(!interaction.update(&mut model, press(KeyCode::Down)));
+        assert_eq!(interaction.workspace_focus, WorkspaceFocus::Actions);
+        let items = page_actions(Role::Client, 1, interaction.editor.as_ref());
+        let advanced = items.iter().position(|a| a.key == 'z').unwrap();
+        for _ in 0..advanced {
+            assert!(!interaction.update(&mut model, press(KeyCode::Down)));
+        }
+        assert_eq!(interaction.workspace_action, advanced);
+        assert!(!interaction.update(&mut model, press(KeyCode::Enter)));
+        assert!(interaction.workspace_advanced);
+        assert_eq!(interaction.editor.as_ref().unwrap().field_count(), 4);
+        assert_eq!(interaction.editor.as_ref().unwrap().workspace_fields().len(), 4);
+        assert!(!interaction.owned_running(Role::Client));
+        assert!(!interaction.editor.as_ref().unwrap().dirty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!interaction.update(&mut model, press(KeyCode::Left)));
+        assert_eq!(interaction.workspace_focus, WorkspaceFocus::Records);
+        assert!(!interaction.update(&mut model, press(KeyCode::Right)));
+        assert_eq!(interaction.workspace_focus, WorkspaceFocus::Fields);
         assert!(!interaction.update(&mut model, press(KeyCode::Down)));
         assert_eq!(
             interaction.editor.as_ref().unwrap().field_name(),
@@ -8532,6 +11503,13 @@ mod tests {
         );
         assert_eq!(model.screen, Screen::Client);
         assert!(!interaction.editor.as_ref().unwrap().dirty());
+        assert!(!interaction.owned_running(Role::Client));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        // Reopening the section restores the compact view and clamps focus.
+        interaction.select_workspace_page(Role::Client, 1);
+        assert!(!interaction.workspace_advanced);
+        assert_eq!(interaction.editor.as_ref().unwrap().field_count(), 1);
+        assert_eq!(interaction.editor.as_ref().unwrap().workspace_field_index(), 0);
         fs::remove_file(path).unwrap();
     }
 
@@ -8556,7 +11534,9 @@ mod tests {
         let mut editor = Editor::load(Role::Client, &path).unwrap();
         editor.select_record(true);
         editor.select_field(true);
-        let interaction = Interaction::new(Some(editor));
+        let mut interaction = Interaction::new(Some(editor));
+        interaction.workspace_advanced = true;
+        interaction.editor.as_mut().unwrap().set_compact_server_fields(false);
         let model = Model::new(Some(Role::Client));
         for (width, height) in [(60, 18), (80, 24), (120, 40)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -8581,11 +11561,7 @@ mod tests {
     }
 
     fn server_issuance_fixture() -> String {
-        use sha2::{Digest, Sha256};
-        include_str!("../../../examples/server.toml").replace(
-            "REPLACE_WITH_64_LOWERCASE_HEX",
-            &format!("{:x}", Sha256::digest([0x42; 32])),
-        )
+        crate::invite::fixture_server_source(&[0x42; 32])
     }
 
     fn rendered_interaction(width: u16, height: u16, model: &Model, ui: &Interaction) -> String {
@@ -8807,11 +11783,7 @@ mod tests {
         }
         assert!(!path.exists());
         capture("client-first-key-trust", &model, &ui);
-        ui.update(&mut model, press(KeyCode::Enter)); // CA is mandatory.
-        assert_eq!(ui.config_dialog.as_ref().unwrap().guide().unwrap().0, 3);
-        assert!(!path.exists());
-        ui.paste_record_field(ca.to_str().unwrap());
-        ui.update(&mut model, press(KeyCode::Enter));
+        ui.update(&mut model, press(KeyCode::Enter)); // The trusted key already contains its anchor.
         assert_eq!(ui.config_dialog.as_ref().unwrap().guide().unwrap().0, 4);
         assert!(!path.exists());
         capture("client-first-key-save-review", &model, &ui);
@@ -8837,8 +11809,11 @@ mod tests {
         };
         assert_eq!(doc.client.profiles.len(), 1);
         assert_eq!(doc.client.active_profile, doc.client.profiles[0].id);
-        assert_eq!(doc.client.proxy.system_proxy, config::SystemProxy::Off);
+        assert_eq!(doc.client.ingress_mode, config::IngressMode::SystemProxy);
+        assert_ne!(doc.client.profiles[0].direct_dpi, Some(true));
+        assert_ne!(doc.client.profiles[0].direct_dpi_stun, Some(true));
         assert!(doc.client.profiles[0].auth_token.starts_with("file:"));
+        assert_eq!(doc.client.profiles[0].tls_ca, invite.trust_reference());
         let bytes = std::fs::read(&path).unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains(uri.as_str()));
         assert!(Editor::create_first_invitation(
@@ -9829,6 +12804,147 @@ mod tests {
     }
 
     #[test]
+    fn worker_receipts_are_distinct_from_runtime_activation_and_disconnect() {
+        let root = std::env::temp_dir().join(crate::tui_editor::generated_id("worker-receipts").unwrap());
+        std::fs::create_dir(&root).unwrap();
+        let server = root.join("server.toml");
+        let client = root.join("client.toml");
+        let server_source = server_issuance_fixture();
+        let client_source = include_str!("../../../examples/client.toml");
+        std::fs::write(&server, &server_source).unwrap();
+        std::fs::write(&client, client_source).unwrap();
+        // Inject only the worker's completion receipt, not a forged runtime
+        // reply. These transitions must not start a client or apply grants.
+        for saved in [false, true] {
+            for scenario in 0..5 {
+                let (role, path) = if scenario < 2 { (Role::Server, &server) } else { (Role::Client, &client) };
+                let mut model = Model::new(Some(role));
+                let editor = Editor::load(role, path).unwrap();
+                let mut ui = Interaction::new(None);
+                match scenario {
+                    0 => ui.issuance = Some(IssueFlow::Saving),
+                    1 => ui.revocation = Some(DisableFlow::Saving),
+                    2 => ui.importing = Some(ImportFlow::RefreshSaving),
+                    3 => ui.importing = Some(ImportFlow::Saving),
+                    _ => ui.importing = Some(ImportFlow::Activating),
+                }
+                let (tx, rx) = mpsc::channel();
+                ui.saving = Some(rx);
+                assert!(!ui.poll_save(&mut model).unwrap());
+                assert!(ui.editor.is_none());
+                tx.send((editor, saved)).unwrap_or_else(|_| panic!("worker receiver"));
+                assert!(!ui.poll_save(&mut model).unwrap());
+                assert!(ui.editor.is_some() && ui.saving.is_none());
+                match (scenario, saved) {
+                    (0, true) => assert!(matches!(ui.issuance, Some(IssueFlow::Offer))),
+                    (0, false) => assert!(matches!(ui.issuance, Some(IssueFlow::SaveFailed))),
+                    (1, true) => assert!(matches!(ui.revocation, Some(DisableFlow::Done))),
+                    (1, false) => assert!(matches!(ui.revocation, Some(DisableFlow::SaveFailed))),
+                    (2, true) => assert!(matches!(ui.importing, Some(ImportFlow::RefreshDone))),
+                    (3, true) => assert!(matches!(ui.importing, Some(ImportFlow::Done))),
+                    (2 | 3, false) => assert!(matches!(ui.importing, Some(ImportFlow::Failed))),
+                    (4, true) => {
+                        assert!(ui.importing.is_none());
+                        assert_eq!(ui.workspace_page, 3);
+                        assert_eq!(ui.workspace_focus, WorkspaceFocus::Actions);
+                    }
+                    (4, false) => assert!(matches!(ui.importing, Some(ImportFlow::ActivationFailed))),
+                    _ => unreachable!(),
+                }
+                assert!(!ui.owned_running(role));
+                assert_eq!(std::fs::read_to_string(&server).unwrap(), server_source);
+                assert_eq!(std::fs::read_to_string(&client).unwrap(), client_source);
+            }
+        }
+        let mut model = Model::new(Some(Role::Server));
+        for (result, expected) in [
+            (Some(Ok((root.join("qr.svg"), true))), "QR SVG сохранён"),
+            (Some(Ok((root.join("key.invite"), false))), "Ничего не обрезано"),
+            (Some(Err("fixture write failure")), "повторная выдача требует ротации"),
+            (None, "Результат записи не подтверждён"),
+        ] {
+            let mut ui = Interaction::new(Some(Editor::load(Role::Server, &server).unwrap()));
+            let (tx, rx) = mpsc::channel();
+            ui.sharing = Some(rx);
+            ui.issuance = Some(IssueFlow::Sharing);
+            assert!(!ui.poll_save(&mut model).unwrap());
+            if let Some(result) = result { tx.send(result).unwrap(); }
+            drop(tx);
+            assert!(!ui.poll_save(&mut model).unwrap());
+            assert!(matches!(&ui.issuance, Some(IssueFlow::ShareDone(message)) if message.contains(expected)));
+            assert!(ui.sharing.is_none());
+            assert!(!ui.owned_running(Role::Server));
+        }
+        for succeeded in [false, true] {
+            let mut ui = Interaction::new(None);
+            let (tx, rx) = mpsc::channel();
+            ui.exporting = Some(rx);
+            ui.issuance = Some(IssueFlow::Exporting);
+            assert!(!ui.poll_save(&mut model).unwrap());
+            let editor = Editor::load(Role::Server, &server).unwrap();
+            let result = if succeeded { Ok(root.join("key.invite")) } else { Err("fixture export failure") };
+            tx.send((editor, result)).unwrap_or_else(|_| panic!("worker receiver"));
+            assert!(!ui.poll_save(&mut model).unwrap());
+            assert!(ui.editor.is_some() && ui.exporting.is_none());
+            if succeeded {
+                assert!(matches!(&ui.issuance, Some(IssueFlow::Exported(path)) if path == &root.join("key.invite")));
+            } else {
+                assert!(matches!(ui.issuance, Some(IssueFlow::ExportFailed)));
+                assert_eq!(ui.editor.as_ref().unwrap().error.as_deref(), Some("fixture export failure"));
+            }
+        }
+        let mut ui = Interaction::new(None);
+        let (tx, rx) = mpsc::channel();
+        ui.exporting = Some(rx);
+        drop(tx);
+        assert!(matches!(ui.poll_save(&mut model), Err(TuiError::Io)));
+        ui.exporting = None;
+        let (tx, rx) = mpsc::channel();
+        ui.saving = Some(rx);
+        drop(tx);
+        assert!(matches!(ui.poll_save(&mut model), Err(TuiError::Io)));
+        assert_eq!(std::fs::read_to_string(&server).unwrap(), server_source);
+        assert_eq!(std::fs::read_to_string(&client).unwrap(), client_source);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn workspace_import_paste_is_bounded_hidden_and_contextual() {
+        let root = std::env::temp_dir().join(crate::tui_editor::generated_id("import-paste").unwrap());
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("client.toml");
+        let original = include_str!("../../../examples/client.toml");
+        std::fs::write(&path, original).unwrap();
+        let mut model = Model::new(Some(Role::Client));
+        let mut ui = Interaction::new(Some(Editor::load(Role::Client, &path).unwrap()));
+        ui.select_workspace_page(Role::Client, 1);
+        ui.paste_workspace_import(&model, "not-a-key");
+        assert!(ui.importing.is_none());
+        ui.select_workspace_page(Role::Client, 2);
+        ui.workspace_focus = WorkspaceFocus::Actions;
+        ui.paste_workspace_import(&model, "sensitive-fixture\r\n");
+        assert!(matches!(&ui.importing, Some(ImportFlow::Input(source)) if source.as_str() == "sensitive-fixture"));
+        assert!(!rendered_interaction(120, 40, &model, &ui).contains("sensitive-fixture"));
+        ui.paste_import_source("\tinvalid");
+        assert!(matches!(&ui.importing, Some(ImportFlow::Input(source)) if source.is_empty()));
+        assert!(ui.editor.as_ref().unwrap().error.is_some());
+        ui.paste_import_source(&"x".repeat(crate::invite::MAX_URI + 1));
+        assert!(matches!(&ui.importing, Some(ImportFlow::Input(source)) if source.is_empty()));
+        ui.paste_import_source("another-fixture");
+        assert!(ui.editor.as_ref().unwrap().error.is_none());
+        ui.update(&mut model, press(KeyCode::F(6)));
+        assert!(ui.import_browser.is_some());
+        ui.paste_import_source("not-pasted-through-browser");
+        assert!(matches!(&ui.importing, Some(ImportFlow::Input(source)) if source.as_str() == "another-fixture"));
+        ui.update(&mut model, press(KeyCode::Esc));
+        ui.update(&mut model, press(KeyCode::Esc));
+        assert!(ui.importing.is_none());
+        assert!(!ui.owned_running(Role::Client));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn credential_and_revocation_panels_distinguish_saved_state_from_runtime() {
         fn render(mut render_panel: impl FnMut(&mut Frame<'_>, Rect)) -> String {
             let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
@@ -9895,6 +13011,26 @@ mod tests {
                 "Файл содержит bearer",
             ),
             (IssueFlow::ExportFailed, "Секрет повторно не выдаётся"),
+            (IssueFlow::ConfirmReveal, "повторная выдача невозможна"),
+            (IssueFlow::Sharing, "URI скрыт"),
+            (
+                IssueFlow::ShareDone("Передано".into()),
+                "Работающий процесс не изменён",
+            ),
+            (
+                IssueFlow::ShareConfirm {
+                    action: crate::tui_share::Action::Qr,
+                    public: None,
+                },
+                "КОНФИДЕНЦИАЛЬНО",
+            ),
+            (
+                IssueFlow::ShareConfirm {
+                    action: crate::tui_share::Action::Clipboard,
+                    public: Some("public-fixture".into()),
+                },
+                "Публичное приглашение без bearer",
+            ),
         ] {
             let screen =
                 render(|f, a| draw_issuance(f, a, &flow, None, IssueKind::NewUser, None, 0));
@@ -9949,6 +13085,9 @@ mod tests {
             ),
             (ImportFlow::Saving, "Сохраняем профиль и ключ"),
             (ImportFlow::Done, "Профиль сохранён"),
+            (ImportFlow::ActivateConfirm, "Выбор профиля"),
+            (ImportFlow::Activating, "Соединение не запускается"),
+            (ImportFlow::ActivationFailed, "Выбор профиля не подтверждён"),
             (ImportFlow::Failed, "Импорт НЕ подтверждён"),
         ] {
             let screen = render(|f, a| draw_import(f, a, &flow, None, None));

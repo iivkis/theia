@@ -93,7 +93,13 @@ pub(crate) fn assess_managed_reload(
     Config::Server(candidate.clone())
         .validate()
         .map_err(|_| ReloadCheckError::InvalidConfig)?;
+    crate::routing::Settings::transition(
+        running.server.policy.routing.as_ref(),
+        candidate.server.policy.routing.as_ref(),
+    )
+    .map_err(|_| ReloadCheckError::InvalidConfig)?;
     let mut normalized = candidate.clone();
+    normalized.server.policy.routing = running.server.policy.routing.clone();
     normalized.server.users = running.server.users.clone();
     for (before, after) in running
         .server
@@ -167,6 +173,13 @@ impl ReloadPreflight {
     /// rebasing the candidate snapshot after an authorization-only CAS.
     pub(crate) fn rebased(&self, candidate: ServerDocument) -> Self {
         Self::new(self.config_path.clone(), candidate, self.identities.clone())
+    }
+
+    /// Read only the bounded file; no TLS load, listener probe, or publication.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    pub(crate) fn matches_saved_bytes(&self, expected: [u8; 32]) -> bool {
+        crate::bounded_input::read(&self.config_path, 1024 * 1024, false, false)
+            .is_ok_and(|bytes| <[u8; 32]>::from(Sha256::digest(bytes.as_slice())) == expected)
     }
 
     /// Read the candidate exactly once and verify every restart-only
@@ -310,6 +323,12 @@ impl ReloadPreflight {
         candidate: ServerDocument,
     ) -> Result<ServerDocument, ReloadCheckError> {
         assess_managed_reload(&self.active, &candidate)?;
+        if self.active.server.policy.routing != candidate.server.policy.routing {
+            for inbound in &candidate.server.inbounds {
+                crate::routing::exchange::Published::prepare(inbound, &candidate.server.policy)
+                    .map_err(|_| ReloadCheckError::InvalidConfig)?;
+            }
+        }
         self.verify_candidate_material(candidate)
     }
 
@@ -492,6 +511,7 @@ mod tests {
                     disabled: false,
                 }],
                 policy: ServerPolicy {
+                    routing: None,
                     allow_private_ips: false,
                     max_connections_per_user: 2,
                     max_connections_total: 8,

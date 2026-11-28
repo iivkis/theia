@@ -10,6 +10,17 @@ pub(crate) struct Scope {
 }
 
 impl Scope {
+    pub(crate) fn bind_address(self) -> SocketAddr {
+        let mut source = self.source;
+        source.set_port(0);
+        source
+    }
+
+    pub(crate) fn matches_local(self, mut address: SocketAddr) -> bool {
+        address.set_port(0);
+        address == self.bind_address()
+    }
+
     #[cfg(test)]
     pub(crate) fn fixture(source: SocketAddr, epoch: u64) -> Self {
         Self { source, epoch }
@@ -27,6 +38,11 @@ impl std::str::FromStr for Scope {
 
 /// Bracket source selection with two observations. A transition or an
 /// unavailable observer prevents reuse and negative-cache publication.
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub(crate) fn generation() -> Option<u64> {
+    platform::epoch()
+}
+
 pub(crate) fn observe(remote: SocketAddr) -> Option<Scope> {
     let before = platform::epoch()?;
     let source = crate::local_proxy::route_source(remote)?;

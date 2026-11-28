@@ -1,387 +1,275 @@
 #!/usr/bin/env python3
-"""CI DAG performance guard: parallel tests, intact mandatory gates and independent TLS checks.
-
-No YAML parser or network dependencies. Each assertion is an explicit check
-against the current CI contract; a workflow refactor must update this test
-when changing job names or structure.
-"""
+"""Fail-closed contract for the mandatory MVP and explicitly requested extended DAGs."""
 from pathlib import Path
 import re
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
 workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+extended = (ROOT / ".github/workflows/extended-validation.yml").read_text(encoding="utf-8")
 
 
-def require(value: bool, message: str) -> None:
-    if not value:
+def require(ok, message):
+    if not ok:
         raise SystemExit("CI graph regression: " + message)
 
 
-def job(name: str) -> str:
+def job(name, source=workflow):
     pattern = r"(?ms)^  " + re.escape(name) + r":\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)"
-    matches = re.findall(pattern, workflow)
+    matches = re.findall(pattern, source)
     require(len(matches) == 1, f"expected one job: {name}")
     return matches[0]
 
 
-def needs(name: str) -> set[str]:
-    match = re.search(r"(?m)^    needs:\s*(.+)$", job(name))
-    require(match is not None, f"{name} has no dependency declaration")
-    value = match.group(1).strip()
-    if value.startswith("[") and value.endswith("]"):
-        return {part.strip() for part in value[1:-1].split(",")}
-    return {value}
+def needs(name, source=workflow):
+    match = re.search(r"(?m)^    needs:\s*(.+)$", job(name, source))
+    require(match is not None, f"{name} must declare prerequisites")
+    return set(match.group(1).strip("[]").replace(" ", "").split(","))
 
 
-mandatory = {
-    "specification",
-    "rust-tests",
-    "windows-smoke",
-    "f14-cross-host",
-    "browser-e2e",
-    "m0-1-api-spike",
-    "m0-1-windows-spike",
-    "m3-4-btls-spike",
-    "m3-4e-btls-production-feature",
-    "coverage-native",
-    "coverage-gate",
-}
-
-require(needs("rust-tests") == {"specification"}, "Linux tests must await spec only")
-for name in ("windows-smoke", "browser-e2e"):
-    require(
-        needs(name) == {"specification"},
-        f"{name} must run in parallel with Linux tests after specification",
-    )
-    require(
-        "needs.specification.outputs.rust_ready == 'true'" in job(name),
-        f"{name} must retain the Rust readiness precondition",
-    )
-require(needs("ci-gate") == mandatory, "ci-gate must depend on EVERY required job")
-require(needs("f14-cross-host") == {"specification", "browser-e2e"},
-        "F-14 must use native browser builds without waiting for unrelated long tests")
-cross_host = job("f14-cross-host")
-require("runs-on: windows-2025" in cross_host and "wsl-version: 2" in cross_host,
-        "F-14 must connect native Windows client to real Linux WSL2 VM")
-require("name: f14-linux-server" in cross_host and "name: f14-windows-compiled" in cross_host,
-        "F-14 must consume both native OS binaries, never build on WSL runner")
-require("scripts/f14-cross-os-ci.py" in cross_host
-        and "--windows-client" in cross_host and "--windows-test" in cross_host
-        and "cargo build" not in cross_host,
-        "F-14 must execute prebuilt native Windows harness without duplicate compilation")
-browser = job("browser-e2e")
-require("Build genuine Linux server for Windows cross-OS F-14 E2E\n        if: runner.os == 'Linux'" in browser
-        and "name: f14-linux-server" in browser
-        and "actions/upload-artifact@v4" in browser,
-        "Linux Theia ELF must originate from mandatory native Linux browser build")
-require("Stage Windows E2E binaries from Cargo JSON artifact paths\n        if: runner.os == 'Windows'" in browser
-        and "cargo build --workspace --locked --bin theia --message-format=json" in browser
-        and "name: f14-windows-compiled" in browser,
-        "Windows Theia and test harness must originate from mandatory native Windows browser build")
-require("name: f14-linux-server" not in job("rust-tests")
-        and "name: f14-windows-compiled" not in job("windows-smoke"),
-        "do not rebuild or upload F-14 binaries after unrelated suites")
-require("python3 -m unittest discover -s tests/ci -p 'test_f14_*.py'" in job("specification"),
-        "cheap F-14 WSL guest IP regression must precede expensive Rust builds")
-require("continue-on-error" not in cross_host and "|| true" not in cross_host,
-        "F-14 cross-OS acceptance cannot be made optional")
-
-gate = job("ci-gate")
-require("always() && github.event.pull_request.merged == true" in gate,
-        "ci-gate must execute even on failure, but only for merged PRs")
-require('results.get(name, {}).get("result") != "success"' in gate,
-        "ci-gate must reject failed/skipped/cancelled prerequisites")
-# Keep the gate's internal expected set aligned with actual dependencies.
-match = re.search(r"expected = \{([^}]+)\}", gate)
-require(match is not None, "ci-gate must declare the exact expected set")
-expected_in_gate = set(re.findall(r'"([^"]+)"', match.group(1)))
-require(expected_in_gate == mandatory, "ci-gate expected set drift")
-
-windows = job("windows-smoke")
-require("cargo test --workspace --all-targets --locked" in windows,
-        "native Windows all-target tests must stay mandatory")
-require("Cross-logon Windows pipe kernel-denial E2E (mandatory)" in windows,
-        "never remove or skip the cross-SID kernel security E2E")
-require("windows-cross-sid-ci.ps1" in windows,
-        "the second-SID test must actually run in CI")
-require("pywinpty==3.0.5 pyte==0.8.2" in windows,
-        "the ConPTY/VT test dependencies must be pinned")
-require("THEIA_WINDOWS_PROXY_E2E_ALLOWED" in windows
-        and "native_wininet_cas_recovery_and_foreign_override" in windows
-        and "compiled_client_proxy_conpty_lifecycle -- --ignored --exact" in windows,
-        "F-07 native and compiled ConPTY lifecycle must both run on disposable Windows")
-require('CARGO_PROFILE_DEV_DEBUG: "line-tables-only"' in windows
-        and 'CARGO_PROFILE_TEST_DEBUG: "line-tables-only"' in windows,
-        "Windows test/dev binaries must retain diagnostic line numbers with bounded debug info")
-require("CARGO_PROFILE_RELEASE_DEBUG" not in windows,
-        "release profile must remain unchanged by the test-only optimization")
-
-# Only a closed PR targeting main can trigger this workflow. Closing without
-# merging creates at most an all-skipped run: no runner is allocated.
-trigger = re.search(r"(?ms)^on:\n(.*?)(?=^[a-z])", workflow)
-require(trigger is not None and trigger.group(1).strip() ==
-        "pull_request:\n    branches: [main]\n    types: [closed]",
-        "CI must be triggered only by PR closure targeting main")
-dev_merge = "github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'dev' && github.event.pull_request.head.repo.full_name == github.repository"
-require("if: " + dev_merge in job("specification"),
-        "only same-repository dev merges may allocate native runners")
-require("always() && " + dev_merge in gate,
-        "final gate must share the exact dev merge guard")
-require(workflow.count("ref: ${{ github.event.pull_request.merge_commit_sha }}") == 1
-        and workflow.count("actions/checkout@v4") ==
-        3 + workflow.count("ref: ${{ needs.specification.outputs.tested_sha }}")
-        and "ref: abbb89834a406b4c53be0f1ac0b3ab1a65e66f8d" in job("browser-e2e")
-        and "path: .perf-baseline" in job("browser-e2e"),
-        "only specification checks out merge; all native jobs pin the exact published SHA")
-require(workflow.count('--sha "${{ needs.specification.outputs.tested_sha }}"') == 2,
-        "both coverage producers and gate must use the tested SHA")
-require("test_ci_coverage.py" in job("specification"),
-        "coverage regression tests must run before native fan-out")
-coverage_native = job("coverage-native")
-coverage_gate = job("coverage-gate")
-require(needs("coverage-native") == {"specification"} and
-        needs("coverage-gate") == {"specification", "coverage-native"},
-        "coverage gate must consume both native jobs")
-for term in ("os: [ubuntu-latest, windows-latest]", "llvm-tools-preview",
-             "cargo llvm-cov test --workspace --all-targets --all-features --locked --no-report",
-             "cargo llvm-cov report --json --include-build-script",
-             "--no-report --lib -- windows_system_proxy::tests::native_wininet_cas_recovery_and_foreign_override --ignored --exact",
-             "--no-report --test tui_real_terminal -- compiled_client_proxy_conpty_lifecycle --ignored --exact",
-             "cargo llvm-cov clean --profraw-only", 'workspaces: ". -> target/llvm-cov-target"',
-             "cache-targets: true", "cache-workspace-crates: false",
-             "Instrumented real WinINet CAS and recovery failed or did not execute",
-             "Instrumented real ConPTY lifecycle failed or did not execute",
-             "THEIA_WINDOWS_PROXY_E2E_ALLOWED", "cargo llvm-cov report --lcov --include-build-script",
-             "ci-coverage.py collect", "--llvm-json coverage-segments.json",
-             "coverage-raw-failure-", "if: failure()", "coverage.lcov",
-             "if-no-files-found: error"):
-    require(term in coverage_native, "missing native coverage contract: " + term)
-for term in ("coverage-Linux", "coverage-Windows", "ci-coverage.py gate",
-             "THEIA_COVERAGE_SYNTAX_TESTS"):
-    require(term in coverage_gate, "missing combined coverage contract: " + term)
-require("continue-on-error" not in coverage_native + coverage_gate,
-        "coverage collection and threshold may not be advisory")
-# Real H2/H3 cases share one bounded, non-ignored native test. Both the
-# ordinary and instrumented suites execute it; there is no separate soak job.
-require("  native-liveness:" not in workflow, "obsolete long-running job must not return")
-for name in ("rust-tests", "windows-smoke"):
-    require("cargo test --workspace --all-targets --locked" in job(name),
-            f"{name}: real network matrix must execute in the full native suite")
-require("cargo llvm-cov test --workspace --all-targets --all-features --locked --no-report" in coverage_native,
-        "both instrumented native suites must execute the real network matrix")
-liveness_source = (ROOT / "crates/theia/tests/tunnel_liveness.rs").read_text(encoding="utf-8")
-require("async fn production_h2_h3_asymmetric_traffic_half_close_and_idle()" in liveness_source
-        and "#[ignore" not in liveness_source
-        and "for transport in [Transport::H2, Transport::H3]" in liveness_source
-        and "cases.spawn(async move" in liveness_source
-        and "Case::LongUpload," in liveness_source and "Case::LongDownload," in liveness_source
-        and "(23, Duration::from_secs(2))" in liveness_source
-        and "if long { 40 } else { 30 }" in liveness_source
-        and "Duration::from_secs(55)" in liveness_source,
-        "retain real concurrent H2/H3 byte progress, half-close and idle with a <60s deadline")
-activity_source = (ROOT / "crates/theia/src/relay_liveness.rs").read_text(encoding="utf-8")
-require("async fn sustained_progress_beyond_300_seconds_in_either_direction()" in activity_source
-        and "#[tokio::test(start_paused = true)]" in activity_source
-        and "for _ in 0..32" in activity_source
-        and "Duration::from_secs(320)" in activity_source
-        and "activity.run(progress, inactive" in activity_source
-        and "activity.run(inactive, progress" in activity_source,
-        "retain accelerated long-progress regression in both directions")
-require("workflow_dispatch:" not in workflow and "  push:" not in workflow,
-        "direct pushes, PR updates and manual dispatch must not start CI")
-require("github.event.pull_request.merge_commit_sha" in job("specification")
-        and 'test "$MERGED_SHA" = "$GITHUB_SHA"' in job("specification")
-        and 'test "$(git rev-parse HEAD)" = "$MERGED_SHA"' in job("specification"),
-        "CI must verify the exact merged commit, not a later main tip")
-# Optional release-profile builds remain available in the same merge run.
-for os, payload in (("Linux", job("rust-tests")), ("Windows", windows)):
-    require(re.search(
-        rf"(?m)^      - name: Requested release compilation \({os}\)\n"
-        r"        if: contains\(github.event.pull_request.labels.\*\.name, 'release-build'\)\n"
-        r"        run: cargo build --workspace --release --locked$",
-        payload,
-    ) is not None, f"{os}: optimized release build must stay available on a labelled merge")
-require(workflow.count("run: cargo build --workspace --release --locked") == 2,
-        "only the two labelled release compilations may exist")
-
-require("python3 -m compileall -q scripts tests" in job("specification"),
-        "cheap Python preflight must execute before Rust tests")
-linux = job("rust-tests")
-require("cargo test --workspace --all-targets --locked" in linux,
-        "mandatory Linux all-target tests must run")
-require("cargo clippy --workspace --all-targets --all-features -- -D warnings" in linux,
-        "mandatory Clippy warnings-as-errors must run")
-
-# The 16 actual BBR/CUBIC impairment trials still run on BOTH native
-# operating systems, but reuse the existing M0.1 compiled Rust workspace.
-# Keep the validator and per-OS evidence artifacts as mandatory acceptance.
-bbr_command = (
-    "cargo test --manifest-path spikes/m0_1/Cargo.toml --locked "
-    "--test quic_congestion_comparison "
-    "comparison_records_all_controller_scenarios_ci_only "
-    "-- --ignored --exact --nocapture"
-)
-for name, platform in (("m0-1-api-spike", "ubuntu-latest"),
-                       ("m0-1-windows-spike", "windows-latest")):
-    payload = job(name)
-    require(bbr_command in payload, f"{name}: native BBR/CUBIC evidence must run")
-    require("python tests/benchmark/check_bbr_comparison.py $env:THEIA_BBR_RESULTS_PATH" in payload,
-            f"{name}: all 16 CSV scenarios must be validated")
-    require(f"THEIA_BBR_RESULTS_PATH: ${{{{ github.workspace }}}}/theia-bbr-{platform}.csv" in payload,
-            f"{name}: native BBR evidence CSV path is missing")
-    require("name: m3-3-quic-comparison-${{ runner.os }}" in payload
-            and "if: always()" in payload and "if-no-files-found: error" in payload,
-            f"{name}: do not silently skip the CSV artifact on an error")
-require("  m3-3-bbr-comparison:" not in workflow,
-        "duplicate BBR Rust build runners must stay removed")
-require("pyte==0.8.2" in linux, "the Linux real-PTY test needs its VT parser")
+def jobs(source):
+    return set(re.findall(r"(?m)^  ([a-z][a-z0-9-]*):\n", source.split("\njobs:\n", 1)[1]))
 
 
-# One trusted post-merge Rustfmt-only publication; native jobs stay read-only.
-spec = job("specification")
-require("fetch-depth: 2" in spec, "merged commit checkout must be bounded")
-require("steps.scope.outputs.native_required" in spec
-        and 'echo "native_required=true"' in spec
-        and "test_ci_scope.py" in spec,
-        "every merged commit must take the full native path")
-require("scripts/ci-format-repair.py prepare-merged" in spec
-        and spec.count("scripts/ci-format-repair.py verify-merged") == 2
-        and "test_ci_format_repair.py" in spec,
-        "verified post-merge formatting and its safety regressions must precede fan-out")
-require("tested_sha: ${{ steps.publish-format.outputs.tested_sha }}" in spec
-        and 'echo "tested_sha=$FORMATTED_SHA"' in spec
-        and 'git push --atomic origin "$FORMATTED_SHA:refs/heads/main" "$FORMATTED_SHA:refs/heads/dev"' in spec
-        and 'git push origin "$FORMATTED_SHA:refs/heads/main"' in spec
-        and '[[ "$tip" == "$MERGED_SHA" ]]' in spec
-        and '[[ "$dev" == "$DEV_SHA" ]]' in spec
-        and "git merge-base --is-ancestor" in spec,
-        "format publication must be bound to the merge and only fast-forward unchanged dev")
-require("gh workflow run" not in workflow and "--force" not in spec
-        and "git push" not in "".join(job(name) for name in mandatory - {"specification"}),
-        "never dispatch another CI or force-push; publication only in specification")
-require("ci-formatted-source" not in workflow and "persist-format:" not in workflow,
-        "never test a formatter overlay or mutate a green SHA")
-for name in mandatory - {"specification"}:
-    payload = job(name)
-    require("cargo fmt " not in payload,
-            f"{name}: formatting must run once in specification, not per native job")
-for name in mandatory - {"specification"}:
-    payload = job(name)
-    require("needs.specification.outputs.native_required == 'true'" in payload,
-            f"{name}: full matrix must run only when native scope is proven required")
-    require("needs.specification.outputs.rust_ready == 'true'" in payload,
-            f"{name}: Rust precondition must be explicit and fail closed")
-    if name not in {"f14-cross-host", "coverage-gate"}:
-        require("actions/download-artifact@v4" not in payload,
-                f"{name}: no repeating CI format artifact downloads")
-require("actions/download-artifact@v4" in job("f14-cross-host"),
-        "cross-host still MUST use authenticated native OS binaries")
-gate = job("ci-gate")
-require("NATIVE_REQUIRED: ${{ needs.specification.outputs.native_required }}" in gate,
-        "final gate must use exactly the preflight's scope")
-require('native != "true"' in gate,
-        "unknown or skipped native scope must fail closed")
+def contains(source, *terms):
+    for term in terms:
+        require(term in source, "missing CI contract: " + term)
+
+
+def expected_set(payload):
+    match = re.search(r"expected = \{([^}]+)\}", payload)
+    require(match is not None, "missing gate inventory")
+    return set(re.findall(r'"([^"]+)"', match.group(1)))
+
+
+mandatory = {"specification", "rust-tests", "windows-smoke", "native-checks", "f14-build",
+             "f14-cross-host", "coverage-native", "coverage-gate"}
+deferred = {"m0-1-api-spike", "m0-1-windows-spike", "native-performance",
+            "f19-performance", "m3-4-btls-spike", "m3-4e-btls-production-feature",
+            "browser-e2e", "f15-driver-build", "f15-kernel", "release-profile"}
+require(jobs(workflow) == mandatory | {"ci-gate"}, "ordinary MVP inventory changed")
+require(jobs(extended) == deferred | {"specification", "extended-gate"}, "extended inventory changed")
+require(needs("ci-gate") == expected_set(job("ci-gate")) == mandatory, "MVP gate must require all jobs")
+require(needs("extended-gate", extended) == expected_set(job("extended-gate", extended))
+        == deferred | {"specification"}, "extended gate must require all jobs")
+for name in ("rust-tests", "windows-smoke", "coverage-native", "f14-build"):
+    require(needs(name) == {"specification"}, f"{name} must run in parallel")
+require(needs("native-checks") == {"specification", "f14-build"},
+        "Windows Clippy requires the actual same-run native BoringSSL producer")
+require(needs("f14-cross-host") == {"specification", "f14-build"}, "cross-host must use early native builds")
+require(needs("coverage-gate") == {"specification", "coverage-native"}, "all native reports must arrive")
+for name in deferred:
+    require(needs(name, extended) == {"specification"}, "extended jobs must run independently")
+for source, trigger in ((workflow, "pull_request:\n    branches: [main]\n    types: [closed]"),
+                        (extended, "workflow_dispatch:")):
+    match = re.search(r"(?ms)^on:\n(.*?)(?=^[a-z])", source)
+    require(match is not None and match.group(1).strip() == trigger, "workflow trigger drift")
+dev_merge = ("github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'dev'"
+             " && github.event.pull_request.head.repo.full_name == github.repository")
+spec, gate = job("specification"), job("ci-gate")
+contains(spec, "if: " + dev_merge, "fetch-depth: 2", 'test "$MERGED_SHA" = "$GITHUB_SHA"',
+         'test "$(git rev-parse HEAD)" = "$MERGED_SHA"', "python3 -m compileall -q scripts tests",
+         "python3 -m unittest discover -s tests/ci -p 'test_f14_*.py'", "test_ci_coverage.py",
+         "test_ci_scope.py", "test_ci_timing.py", "test_independent_h2_probe.py",
+         "test_ci_boringssl.py", "test_ci_rust_toolchain.py",
+         "python3 scripts/ci-rust-toolchain.py record",
+         "rust_release: "+ "${{ steps.compiler.outputs.release }}",
+         "rust_commit: "+ "${{ steps.compiler.outputs.commit }}",
+         "python3 scripts/ci-native-targets.py", "test_ci_native_targets.py",
+         "test_ci_format_repair.py", "scripts/check-spec.sh", "scripts/ci-format-repair.py prepare-merged",
+         'echo "native_required=true"', 'echo "tested_sha=$FORMATTED_SHA"',
+         'git push --atomic origin "$FORMATTED_SHA:refs/heads/main" "$FORMATTED_SHA:refs/heads/dev"',
+         'git push origin "$FORMATTED_SHA:refs/heads/main"', '[[ "$tip" == "$MERGED_SHA" ]]',
+         '[[ "$dev" == "$DEV_SHA" ]]', "git merge-base --is-ancestor")
+require(spec.count("scripts/ci-format-repair.py verify-merged") == 2, "format must be verified twice")
+require("rust-cache" not in spec and "actions/cache" not in spec and "--force" not in spec,
+        "privileged publication cannot restore executable caches or force-push")
+contains(gate, "always() && " + dev_merge, 'results.get(name, {}).get("result") != "success"',
+         'native != "true"', "TESTED_SHA:", "MERGED_SHA:", "native CI passed on exact source",
+         "actions: read", 'repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT',
+         'run["created_at"]', 'run["run_started_at"]', "elapsed > 300",
+         'failed.append("wall-clock budget (300s)")')
 require(workflow.count("contents: write") == 1 and "contents: write" in spec
-        and "actions: write" not in workflow and "contents: read" in workflow,
-        "only trusted specification may publish a Rustfmt-only child; no dispatch permission")
-require("TESTED_SHA: ${{ needs.specification.outputs.tested_sha }}" in gate
-        and "native CI passed on exact source" in gate,
-        "final gate must report the exact tested source SHA")
-
-require("actions/setup-go" not in workflow and "THEIA_UTLS" not in workflow
-        and "utls_reference" not in workflow and "gofmt " not in workflow,
-        "retired Go/uTLS toolchain must not return")
+        and "contents: write" not in extended and "actions: write" not in workflow + extended,
+        "only specification may write source")
+require("gh workflow run" not in workflow + extended and "git push" not in extended,
+        "no recursive dispatch or extended publication")
+contains(extended, 'test "$GITHUB_REF" = refs/heads/main',
+         'test "$(git rev-parse HEAD)" = "$GITHUB_SHA"', 'echo "tested_sha=$GITHUB_SHA"',
+         "cache-mode: read")
+require("cache-mode: write" not in extended and "continue-on-error" not in workflow + extended,
+        "no advisory acceptance or extended cache write")
+contains(workflow, "cache-mode: read", "cancel-in-progress: false",
+         "ci-main-merge-${{ github.event.pull_request.merge_commit_sha || github.run_id }}")
+# Only existing Windows cache producers get a cold recovery budget.
+# The separate mandatory wall-clock gate still rejects over-300s attempts.
+contains(job("windows-smoke"), "timeout-minutes: ${{ matrix.shard == 1 && 15 || 5 }}")
+contains(job("coverage-native"),
+         "timeout-minutes: ${{ matrix.os == 'windows-latest' && matrix.shard == 1 && 15 || 5 }}")
+writers = {"rust-tests", "windows-smoke", "coverage-native", "native-checks"}
+for name in mandatory - {"specification"}:
+    payload = job(name)
+    contains(payload, "needs.specification.outputs.native_required",
+             "needs.specification.outputs.rust_ready",
+             "ref: ${{ needs.specification.outputs.tested_sha }}")
+    require("git push" not in payload and "cargo fmt " not in payload, "publish only in specification")
+    require(("    cache-mode: write" in payload) == (name in writers), "cache permission drift")
+    if name in writers:
+        contains(payload, "if: " + dev_merge, "cache-workspace-crates: false", "cache-bin: false")
+        if name != "native-checks":
+            contains(payload, "save-if: ${{ matrix.shard == 1 }}")
+    if name in {"rust-tests", "windows-smoke", "native-checks", "f14-build", "coverage-native"}:
+        contains(payload, "CI_RUST_RELEASE: "+ "${{ needs.specification.outputs.rust_release }}",
+                 "CI_RUST_COMMIT: "+ "${{ needs.specification.outputs.rust_commit }}",
+                 "python scripts/ci-rust-toolchain.py prepare")
+        require("dtolnay/rust-toolchain" not in payload, "native toolchain must verify exact compiler")
+    if name in {"rust-tests", "windows-smoke", "native-checks", "f14-build"}:
+        contains(payload, "shared-key: native-default-deps-v4",
+                 'CARGO_PROFILE_DEV_DEBUG: "line-tables-only"',
+                 'CARGO_PROFILE_TEST_DEBUG: "line-tables-only"')
+require("CARGO_PROFILE_RELEASE_DEBUG" not in workflow, "release settings must not change")
+for name in ("rust-tests", "windows-smoke"):
+    payload = job(name)
+    contains(payload, "shard: [1, 2]", "fail-fast: false", "tool: cargo-nextest@0.9.140",
+             "if: matrix.shard == 1\n        run: cargo nextest run --workspace --lib --bins --locked --no-fail-fast",
+             "if: matrix.shard == 2\n        run: cargo nextest run --workspace --test '*' --locked --no-fail-fast")
+    require("--filter-expr" not in payload and "--retries" not in payload
+            and "--partition" not in payload, "complete disjoint native build groups")
+contains(job("rust-tests"), "if: matrix.shard == 2\n        run: python -m pip install --disable-pip-version-check --no-input pyte==0.8.2")
+contains(job("windows-smoke"), "if: matrix.shard == 2\n        run: python -m pip install --disable-pip-version-check --no-input pywinpty==3.0.5 pyte==0.8.2")
+checks = job("native-checks")
+contains(checks, "check: windows-clippy", "if: matrix.check == 'windows-clippy'",
+         "cargo clippy --workspace --all-targets --features experimental-btls-h2 --locked -- -D warnings",
+         "id: clippy-cache", "shared-key: native-clippy-deps-v2",
+         "name: f14-windows-boringssl", "scripts/ci-boringssl.py verify",
+         'BORING_BSSL_PATH: ${{ runner.temp }}/theia-boringssl',
+         "if: steps.clippy-cache.outputs.cache-hit != 'true'",
+         "shared-key: native-default-deps-v4", "save-if: false")
+require(checks.count("save-if: true") == 1, "only trusted Windows Clippy writes its dependency cache")
+require(checks.index("scripts/ci-boringssl.py verify") < checks.index("BORING_BSSL_PATH:"),
+        "the exact native bundle must be verified before use")
+require("BORING_BSSL_ASSUME_PATCHED" not in workflow, "do not bypass patch provenance")
+require("check: linux-clippy" not in checks and "check: windows-cross-sid" not in checks,
+        "do not allocate duplicate runners for short checks")
+contains(job("rust-tests"), "Linux all-feature Clippy", "if: matrix.shard == 1\n        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings")
+contains(job("windows-smoke"), "Cross-logon Windows pipe kernel-denial E2E (mandatory)\n        if: matrix.shard == 1",
+         "windows-cross-sid-ci.ps1")
+f14, cross = job("f14-build"), job("f14-cross-host")
+contains(f14, "os: [ubuntu-24.04, windows-latest]", "fail-fast: false",
+         "cargo tree --locked -p theia -e normal,build",
+         "Build genuine Linux server for Windows cross-OS F-14 E2E",
+         "Stage Windows E2E binaries from Cargo JSON artifact paths",
+         "name: f14-linux-server", "name: f14-windows-compiled",
+         "name: f14-windows-boringssl", "Tee-Object -FilePath $eventFile",
+         "scripts/ci-boringssl.py stage", "f14-cargo-events.jsonl",
+         "$bins = @($testEvents | Where-Object", "if ($bins.Count -eq 0)",
+         "$_.profile.test -eq $false", "$_.target.kind -contains 'bin'",
+         "save-if: false", "actions/upload-artifact@v4")
+contains(cross, "runs-on: windows-2025", "wsl-version: 2", "distribution: Ubuntu-24.04",
+         "name: f14-linux-server", "name: f14-windows-compiled", "scripts/f14-cross-os-ci.py",
+         "--windows-client", "--windows-test", "Verify guest fixture dependencies; install only when missing",
+         "command -v python3 >/dev/null && command -v openssl >/dev/null",
+         "apt-get update", "apt-get install --yes --no-install-recommends python3 openssl",
+         "sys.version_info >= (3, 10)", "openssl version")
+require("additional-packages:" not in cross, "avoid unconditional WSL apt update")
+require("cargo build" not in cross and "|| true" not in cross, "cross-host must use native artifacts")
+cov, cg = job("coverage-native"), job("coverage-gate")
+contains(cov, "os: [ubuntu-latest, windows-latest]", "shard: [1, 2, 3, 4, 5, 6]",
+         "fail-fast: false", "llvm-tools-preview", "cargo-llvm-cov@0.9.1", "tool: cargo-nextest@0.9.140",
+         "cargo llvm-cov clean --profraw-only", 'workspaces: ". -> target/llvm-cov-target"',
+         "if: runner.os == 'Linux' && (matrix.shard == 2 || matrix.shard == 3)",
+         "if: runner.os == 'Windows' && (matrix.shard == 2 || matrix.shard == 3 || matrix.shard == 4)",
+         "cache-targets: true",
+         "if: matrix.shard == 1\n        run: cargo llvm-cov nextest --workspace --lib --bins --all-features --locked --no-report --no-fail-fast",
+         "if: matrix.shard == 2\n        run: cargo llvm-cov nextest --workspace --test '*' --all-features --locked --no-report --no-fail-fast",
+         "if: matrix.shard == 3",
+         "--no-report --test tui_real_terminal -- compiled_dual_mode_tui_invitation_import_apply_and_rollback --ignored --exact",
+         "THEIA_WINDOWS_PROXY_E2E_ALLOWED",
+         "--no-report --lib -- windows_system_proxy::tests::native_wininet_cas_recovery_and_foreign_override --ignored --exact",
+         "--no-report --test tui_real_terminal -- compiled_client_proxy_conpty_lifecycle --ignored --exact",
+         "Instrumented real WinINet CAS and recovery failed or did not execute",
+         "Instrumented real ConPTY lifecycle failed or did not execute",
+         "Instrument real disposable Windows WinINet lifecycle\n        if: runner.os == 'Windows' && matrix.shard == 1",
+         "Instrument real disposable Windows ConPTY lifecycle\n        if: runner.os == 'Windows' && matrix.shard == 4",
+         "if: matrix.shard >= 4", "$_.shard -eq [int]$env:COVERAGE_SHARD",
+         "No mandatory fixtures assigned to coverage shard", "$name --ignored --exact", "test result: ok",
+         "cargo llvm-cov report --lcov --include-build-script",
+         "cargo llvm-cov report --json --include-build-script",
+         "ci-coverage.py collect", "--llvm-json coverage-segments.json",
+         "--shard ${{ matrix.shard }} --shards 6", "name: coverage-shard-${{ runner.os }}-${{ matrix.shard }}",
+         "coverage-raw-failure-", "if-no-files-found: error")
+fixtures = {"client_binary_chromium_socks5": 4, "client_binary_chromium_socks5_over_h3": 4,
+            "native_clients_require_pki_and_exact_alpn": 5,
+            "independent_aioquic_v1_v2_bidirectional_h3": 5,
+            "routing::packet_modify::tests::independent_aioquic_initial_modify_v1_v2": 5,
+            "independent_aioquic_live_modify_v1_v2": 6,
+            "udp_relay::tests::independent_quic_product_relay_v1_v2": 6,
+            "server::hardening_tests::independent_external_reference_through_registered_reality_dispatchers": 6}
+observed = re.findall(r"name = '([^']+)'; shard = (\d+) \}", cov)
+require(len(observed) == len(fixtures) and {n: int(s) for n, s in observed} == fixtures,
+        "every independent MVP fixture must execute once per platform")
+require("shared-key: native-default-deps-v4" not in cov and "--filter-expr" not in cov
+        and "--partition" not in cov,
+        "instrumentation must be isolated and complete")
+require(cov.count("cargo llvm-cov report --lcov --include-build-script") == 1, "export once per shard")
+for name in ("Instrument real dual-mode TUI", "Instrument real disposable Windows WinINet",
+             "Instrument real disposable Windows ConPTY", "Instrument independent protocol and browser interoperability"):
+    require(cov.index(name) < cov.index("Export LCOV once"), "fixture must precede export")
+contains(cg, "pattern: coverage-shard-*", "merge-multiple: false",
+         "ci-coverage.py gate --reports-dir coverage-shards --shards 6",
+         "THEIA_COVERAGE_SYNTAX_TESTS", "coverage-summary")
+require((cov + cg).count('--sha "${{ needs.specification.outputs.tested_sha }}"') == 2, "exact coverage SHA")
+contains((ROOT / "scripts/ci-coverage.py").read_text(encoding="utf-8"), "MIN_PERCENT = 80",
+         "read_shards", "identity in seen", 'report["inventory"] != expected',
+         "Production sources missing executable evidence", "max(combined[name].get(number, 0), hits)")
+tui = (ROOT / "crates/theia/tests/tui_real_terminal.rs").read_text(encoding="utf-8")
+contains(tui, '#[ignore = "mandatory dedicated native coverage shard: real startup replay guard"]',
+         "async fn compiled_dual_mode_tui_invitation_import_apply_and_rollback()",
+         "Duration::from_secs(171)",
+         'assert!(running.0.try_wait().unwrap().is_none())')
+driver = (ROOT / "scripts/tui-real-terminal-e2e.py").read_text(encoding="utf-8")
+contains(driver, "scenario_started = time.monotonic()", "replay_deadline = scenario_started + 121.0",
+         "while (remaining := replay_deadline - time.monotonic()) > 0:", "time.sleep(remaining)",
+         "assert time.monotonic() >= replay_deadline",
+         "assert time.monotonic() - scenario_started - replay_wait <= 50.0")
+require(driver.index("replay_deadline = scenario_started + 121.0")
+        < driver.index("assert time.monotonic() >= replay_deadline")
+        < driver.index("        def enroll():"),
+        "REALITY cannot enroll before the full real startup window")
+live = (ROOT / "crates/theia/tests/tunnel_liveness.rs").read_text(encoding="utf-8")
+contains(live, "async fn production_h2_h3_asymmetric_traffic_half_close_and_idle()",
+         "for transport in [Transport::H2, Transport::H3]", "cases.spawn(async move", "Case::LongUpload,",
+         "Case::LongDownload,", "(23, Duration::from_secs(2))", "if long { 40 } else { 30 }", "Duration::from_secs(55)")
+require("#[ignore" not in live, "real liveness remains mandatory")
+contains((ROOT / "crates/theia/src/relay_liveness.rs").read_text(encoding="utf-8"),
+         "async fn sustained_progress_beyond_300_seconds_in_either_direction()",
+         "#[tokio::test(start_paused = true)]", "for _ in 0..32", "Duration::from_secs(320)",
+         "activity.run(progress, inactive", "activity.run(inactive, progress, \"idle\")")
+profile = tomllib.loads((ROOT / ".config/nextest.toml").read_text(encoding="utf-8"))["profile"]["default"]
+require(profile["default-filter"] == "all()" and profile["retries"] == 0
+        and profile["fail-fast"] is False and profile["test-threads"] == 4,
+        "bounded scheduling without exclusions or retries")
+require({entry["filter"]: entry["priority"] for entry in profile["overrides"]} == {
+    "test(=production_h2_h3_asymmetric_traffic_half_close_and_idle)": 100,
+    "test(=compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas)": 90,
+}, "start both long integration cases early without changing their deadlines")
+for term in ("run_f13_observations.py f13-observations", "run_native_quic_comparison.py",
+             "native_binary_performance_comparison", "comparison_records_all_controller_scenarios_ci_only",
+             "drivers/windows/windivert/test-package.ps1", "scripts/f15-kernel-tests.py",
+             "cargo build --workspace --release --locked"):
+    require(term not in workflow, "deferred work returned to critical path: " + term)
+    contains(extended, term)
+contains(job("f15-kernel", extended), "sudo -n unshare -n true", "f15-coverage-build.json --coverage",
+         "cargo llvm-cov show-env --sh", "scripts/f15-kernel-tests.py --verify-coverage coverage.json")
+contains(job("f15-driver-build", extended), "make -C drivers/linux",
+         "drivers/windows/windivert/test-package.ps1", "OfficialPackageVerified=$false", "if-no-files-found: error")
 for name in ("m0-1-api-spike", "m0-1-windows-spike"):
-    payload = job(name)
-    require("actions/setup-python@v5" in payload and "python-version: '3.12'" in payload,
-            f"{name}: independent TLS probe interpreter required")
-    require("cargo test --manifest-path spikes/m0_1/Cargo.toml --locked --test independent_h2_loopback -- --ignored --nocapture" in payload,
-            f"{name}: independent strict PKI/H2 test cannot be removed")
-require("test_independent_h2_probe.py" in spec and "test_ci_timing.py" in spec,
-        "cheap probe and timing regressions must run")
-require("client_binary_chromium_socks5_over_h3 -- --ignored --exact" in job("browser-e2e"),
-        "native browser functional navigation over explicit H3 must run")
-require("run_f13_observations.py f13-observations" in browser,
-        "real browser reference runner remains mandatory")
-
-require(
-    "concurrency:" in workflow
-    and "ci-main-merge-${{ github.event.pull_request.merge_commit_sha || github.run_id }}" in workflow
-    and "cancel-in-progress: false" in workflow,
-    "different merged commits must never cancel one another",
-)
-# Cache privileges are separate from repository contents permissions.
-# The privileged formatter and all non-producers remain read-only for caches.
-require(re.search(r"(?m)^cache-mode: read$", workflow) is not None,
-        "cache access defaults to read-only")
-cache_writers = {"m0-1-api-spike", "m0-1-windows-spike", "rust-tests",
-                 "windows-smoke", "m3-4-btls-spike",
-                 "m3-4e-btls-production-feature", "coverage-native"}
-for name in mandatory | {"ci-gate"}:
-    payload = job(name)
-    require(("    cache-mode: write" in payload) == (name in cache_writers),
-            f"{name}: unexpected cache-write privilege")
-    if name in cache_writers:
-        require(needs(name) == {"specification"}
-                and "if: " + dev_merge in payload
-                and "cache-workspace-crates: false" in payload
-                and "cache-bin: false" in payload,
-                f"{name}: cache producer must be trusted and dependency-only")
-require("rust-cache" not in spec and "actions/cache" not in spec,
-        "never restore executable caches in the write-privileged source publisher")
-for name in ("rust-tests", "windows-smoke", "browser-e2e"):
-    payload = job(name)
-    require("shared-key: native-default-deps-v4" in payload
-            and 'CARGO_PROFILE_DEV_DEBUG: "line-tables-only"' in payload
-            and 'CARGO_PROFILE_TEST_DEBUG: "line-tables-only"' in payload
-            and "cache-workspace-crates: false" in payload
-            and "cache-bin: false" in payload,
-            f"{name}: incompatible shared native cache or workspace output caching")
-for name in ("browser-e2e",):
-    require("save-if: false" in job(name), f"{name}: restore-only cache consumer")
-require("shared-key: native-default-deps-v4" not in coverage_native,
-        "instrumented outputs must never share the default native target cache")
-require(coverage_native.count("cargo llvm-cov report --lcov --include-build-script") == 1
-        and coverage_native.index("Instrument real disposable Windows proxy and ConPTY lifecycle")
-        < coverage_native.index("Export LCOV once after all native instrumented tests"),
-        "export LCOV exactly once, after all mandatory instrumented cases")
-require("$bins = @($testEvents | Where-Object" in browser
-        and "if ($bins.Count -eq 0)" in browser
-        and "$_.profile.test -eq $false" in browser
-        and "$_.target.kind -contains 'bin'" in browser,
-        "F-14 must reuse a genuine same-build Windows client, with explicit build fallback")
-require("test_native_performance.py" in spec
-        and "native_binary_performance_evidence_smoke" in browser
-        and "check_native_performance.py native-performance.json" in browser
-        and "--require-smoke" in browser
-        and "native-performance-" in browser,
-        "native paired performance smoke and evidence must remain mandatory")
-require("test_classifier_evidence.py" in spec, "independent score evidence regressions remain mandatory")
-require("test_f19_bundle.py" in spec, "exact-revision independent evidence join regressions remain mandatory")
-require("native_binary_performance_comparison" in browser
-        and "native-comparison.json" in browser
-        and "--require-comparison --policy tests/benchmark/native-diagnostic-policy.json" in browser
-        and "Build exact native baseline before candidate" in browser,
-        "native baseline and candidate comparison remains mandatory")
-f13_runner = (ROOT / "tests/benchmark/run_f13_observations.py").read_text(encoding="utf-8")
-require(all(case in f13_runner for case in (
-            "actual_native_h3_client_initial_reference",
-            "real_default_h2_settings_and_pseudo_headers_are_measured",
-            "actual_chromium_h2_settings_and_pseudo_order_reference",
-            "actual_chromium_h3_initial_reference"))
-        and "run_f13_observations.py f13-observations" in browser
-        and "--samples 3" in browser
-        and "check_f13_observations.py f13-observations --expected-revision" in browser
-        and "test_f13_observations.py" in spec,
-        "repeated exact-revision native and browser observation matrix must remain mandatory")
-require("test_benchmark_ports.py" in spec and "test_benchmark_ports.py" in browser,
-        "native benchmark transport-specific port reservation regressions remain mandatory")
-require("native_clients_require_pki_and_exact_alpn -- --ignored --exact" in browser,
-        "independent native-client TLS trust and ALPN matrix must remain mandatory")
-require("ref: 917417b09f209334939c38551112081c480eb958" in browser
-        and "path: .f19-baseline" in browser
-        and "THEIA_F19_BASELINE_BIN" in browser
-        and "f19-comparison.json" in browser
-        and "--require-comparison --policy tests/benchmark/f19-diagnostic-policy.json" in browser,
-        "isolated exact pre-batch overhead comparison remains mandatory")
-print("CI_GRAPH_PARALLEL_AND_NATIVE_CHECKS_OK")
+    contains(job(name, extended), "comparison_records_all_controller_scenarios_ci_only",
+             "check_bbr_comparison.py", "--test independent_h2_loopback -- --ignored")
+contains(job("native-performance", extended), "abbb89834a406b4c53be0f1ac0b3ab1a65e66f8d",
+         "check_native_performance.py", "--require-comparison", "--require-smoke")
+contains(job("f19-performance", extended), "917417b09f209334939c38551112081c480eb958",
+         "THEIA_F19_BASELINE_BIN", "f19-comparison.json", "--require-comparison")
+contains(job("browser-e2e", extended), "run_f13_observations.py", "--samples 3",
+         "check_f13_observations.py", "run_native_quic_comparison.py")
+print("CI_MVP_SHARDS_EXTENDED_SCOPE_AND_SECURITY_CONTRACT_OK")

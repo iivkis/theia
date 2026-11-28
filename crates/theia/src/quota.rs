@@ -214,6 +214,7 @@ mod tests {
 
     fn policy(per_user: u32, total: u32) -> ServerPolicy {
         ServerPolicy {
+            routing: None,
             allow_private_ips: true,
             max_connections_per_user: per_user,
             max_connections_total: total,

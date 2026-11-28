@@ -2,6 +2,9 @@
 //! loopback fixtures, not evidence for the public REALITY admission relay.
 #![forbid(unsafe_code)]
 
+#[path = "support/quinn_reference.rs"]
+mod quinn_reference;
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use sha2::{Digest, Sha256};
 use std::{
@@ -34,6 +37,7 @@ const DEADLINE: Duration = Duration::from_secs(25);
 
 fn policy(allow_private_ips: bool) -> ServerPolicy {
     ServerPolicy {
+        routing: None,
         allow_private_ips,
         max_connections_per_user: 8,
         max_connections_total: 8,
@@ -137,15 +141,31 @@ impl Drop for Scratch {
 }
 
 async fn bind() -> TcpListener {
-    // TCP/UDP port availability is not identical on all native platforms.
-    for _ in 0..16 {
-        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        if let Ok(udp) = std::net::UdpSocket::bind(tcp.local_addr().unwrap()) {
-            drop(udp);
-            return tcp;
+    // Windows can reserve an entire UDP-only exclusion range (Hyper-V).
+    // Asking TCP for successive ephemeral ports can remain in that range.
+    // Allocate UDP first, and retain rejected candidates until selection so
+    // the kernel cannot hand us the same unavailable port repeatedly.
+    let mut rejected = Vec::new();
+    let mut last = None;
+    for _ in 0..256 {
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0")
+            .expect("allocate an ephemeral UDP fixture port");
+        let address = udp.local_addr().unwrap();
+        match TcpListener::bind(address).await {
+            Ok(tcp) => return tcp,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                last = Some(error);
+                rejected.push(udp);
+            }
+            Err(error) => panic!("unexpected TCP fixture bind error: {error}"),
         }
     }
-    panic!("unable to reserve a loopback fixture port");
+    panic!("unable to reserve a shared TCP/UDP loopback fixture port: {last:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -599,23 +619,41 @@ async fn native_admission_callbacks_complete_full_tls_and_quic_before_applicatio
         server.await.unwrap();
 
         let server = quinn::Endpoint::server(
-            identity_tls::checked_quic_server(&identity, &v, secret.clone(), guard.clone())
+            quinn_reference::server_from_tls(
+                identity_tls::checked_server_tls(
+                    &identity,
+                    &v,
+                    Branch::H3,
+                    secret.clone(),
+                    guard.clone(),
+                )
                 .unwrap(),
+            )
+            .unwrap(),
             remote,
         )
         .unwrap();
         let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         let cases = [
             (
-                identity_tls::quic_client(&scope, identity.public_key()).unwrap(),
+                quinn_reference::client_from_tls(
+                    identity_tls::client_tls(&scope, identity.public_key(), Branch::H3).unwrap(),
+                )
+                .unwrap(),
                 false,
             ),
             (
-                identity_tls::admitted_quic_client(&v, wrong).unwrap(),
+                quinn_reference::client_from_tls(
+                    identity_tls::admitted_client_tls(&v, Branch::H3, wrong).unwrap(),
+                )
+                .unwrap(),
                 false,
             ),
             (
-                identity_tls::admitted_quic_client(&v, secret).unwrap(),
+                quinn_reference::client_from_tls(
+                    identity_tls::admitted_client_tls(&v, Branch::H3, secret).unwrap(),
+                )
+                .unwrap(),
                 true,
             ),
         ];

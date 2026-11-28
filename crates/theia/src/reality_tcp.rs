@@ -23,7 +23,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     sync::{watch, Semaphore},
     task::JoinSet,
     time::{timeout, timeout_at, Instant},
@@ -51,6 +51,12 @@ pub enum Error {
 pub struct Prefixed<T> {
     inner: T,
     prefix: bytes::Bytes,
+}
+
+impl<T> Prefixed<T> {
+    pub(crate) fn new(inner: T, prefix: bytes::Bytes) -> Self {
+        Self { inner, prefix }
+    }
 }
 
 impl<T: AsyncRead + Unpin> AsyncRead for Prefixed<T> {
@@ -275,10 +281,13 @@ impl RelayGate {
             .try_acquire_owned()
             .map_err(|_| Error::Limit)?;
         let address = lease.address().map_err(|_| Error::Reference)?;
-        let upstream = timeout(CONNECT, TcpStream::connect(address))
-            .await
-            .map_err(|_| Error::Deadline)?
-            .map_err(|_| Error::Io)?;
+        let upstream = timeout(
+            CONNECT,
+            crate::routing::carrier_socket::connect_plain_tcp(address),
+        )
+        .await
+        .map_err(|_| Error::Deadline)?
+        .map_err(|_| Error::Io)?;
         if upstream.peer_addr().map_err(|_| Error::Io)? != address
             || lease.address().map_err(|_| Error::Reference)? != address
         {

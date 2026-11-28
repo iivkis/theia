@@ -15,8 +15,6 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-    sync::Semaphore,
     time::timeout,
 };
 use tokio_rustls::TlsConnector;
@@ -39,7 +37,8 @@ pub enum IpifyConsent {
 const MAX_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_RESPONSE_HEADER: usize = 4096;
 const MAX_RESPONSE_BODY: usize = 64;
-static ACTIVE_EGRESS_REQUESTS: Semaphore = Semaphore::const_new(2);
+static ACTIVE_EGRESS_REQUESTS: crate::net::probe::ProbeBudget =
+    crate::net::probe::ProbeBudget::new(2);
 
 /// Caller-granted scope, not automatically derived from a local interface,
 /// provider CIDR, popular domain, or external service response. Only a single
@@ -291,15 +290,8 @@ pub async fn observe_public_egress(
     if !matches!(server_name, ServerName::DnsName(_)) {
         return Err(EgressError::InvalidRequest);
     }
-    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .map_err(|_| EgressError::TlsRejected)?
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-    tls.enable_early_data = false;
+    let tls =
+        crate::net::tls::roots_tls13(roots, b"http/1.1").map_err(|_| EgressError::TlsRejected)?;
     let connector = TlsConnector::from(Arc::new(tls));
     let source = EgressSource {
         server_name: request.server_name.clone(),
@@ -311,7 +303,7 @@ pub async fn observe_public_egress(
             .acquire()
             .await
             .map_err(|_| EgressError::ConnectFailed)?;
-        let tcp = TcpStream::connect(request.address)
+        let tcp = crate::routing::carrier_socket::connect_plain_tcp(request.address)
             .await
             .map_err(|_| EgressError::ConnectFailed)?;
         let mut stream = connector

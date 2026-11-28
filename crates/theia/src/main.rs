@@ -4,8 +4,19 @@ use theia::{
     CliError, Command,
 };
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() {
+fn main() {
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    runtime.enable_all();
+    // Debug and instrumented async carrier call chains need bounded stack
+    // headroom on both platforms. Reserve 8 MiB per worker.
+    runtime.thread_stack_size(8 * 1024 * 1024);
+    runtime
+        .build()
+        .expect("create Theia runtime")
+        .block_on(Box::pin(run()));
+}
+
+async fn run() {
     diagnostics::init();
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic| {
@@ -45,18 +56,18 @@ async fn main() {
         Ok(Command::TuiEdit { role, config }) => tui::run(Some(role), Some(Path::new(&config)))
             .map(|_| "tui closed".to_owned())
             .map_err(|error| CliError::Tui(error.message())),
-        Ok(Command::ServerRun { config }) => server::run_file(Path::new(&config))
+        Ok(Command::ServerRun { config }) => Box::pin(server::run_file(Path::new(&config)))
             .await
             .map(|_| "server stopped".to_owned())
             .map_err(CliError::Server),
-        Ok(Command::ClientRun { config }) => local_proxy::run_file(Path::new(&config))
+        Ok(Command::ClientRun { config }) => Box::pin(local_proxy::run_file(Path::new(&config)))
             .await
             .map(|_| "client stopped".to_owned())
             .map_err(CliError::Client),
         Ok(Command::ClientRunSystemProxy { config }) => {
             #[cfg(windows)]
             {
-                local_proxy::run_file_with_system_proxy(Path::new(&config))
+                Box::pin(local_proxy::run_file_with_system_proxy(Path::new(&config)))
                     .await
                     .map(|_| "client stopped; conditional WinINet proxy restore completed".to_owned())
                     .map_err(CliError::Client)
@@ -67,14 +78,195 @@ async fn main() {
                 Err(CliError::NotImplemented("Windows user proxy"))
             }
         }
+        Ok(Command::ClientLinuxHostLab{config,port})=>{
+            #[cfg(target_os="linux")]
+            {
+                tokio::task::spawn_blocking(move || {
+                    let host=std::fs::File::open("/proc/1/ns/net").map_err(|_|theia::client::ClientError::Configuration)?;
+                    let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build()
+                        .map_err(|_|theia::client::ClientError::Io)?;
+                    runtime.block_on(Box::pin(local_proxy::NativeIngress::run_linux_host_lab(
+                        Path::new(&config),host,port,tokio::signal::ctrl_c())))
+                }).await.map_err(|_|CliError::Client(theia::client::ClientError::Io))
+                    .and_then(|result|result.map_err(CliError::Client))
+                    .map(|_|"Linux disposable host lab stopped; owned rules and routes restored".to_owned())
+            }
+            #[cfg(not(target_os="linux"))]
+            {let _=(config,port);Err(CliError::NotImplemented("Linux disposable host lab"))}
+        }
+        Ok(command @ (Command::ClientLinuxHostRearm|Command::ClientLinuxHostRecover))=>{
+            #[cfg(target_os="linux")]
+            {
+                tokio::task::spawn_blocking(move || {
+                    let host=std::fs::File::open("/proc/1/ns/net")?;
+                    match command {
+                        Command::ClientLinuxHostRearm=>theia::routing::linux_rules::rearm_host_guard(&host),
+                        _=>theia::routing::linux_rules::recover_host_guard(&host),
+                    }
+                }).await.map_err(|_|CliError::Client(theia::client::ClientError::Io))
+                    .and_then(|result|result.map_err(|_|CliError::Client(theia::client::ClientError::Io)))
+                    .map(|_|"Linux host guard transaction complete; no physical enforcement or production readiness asserted".to_owned())
+            }
+            #[cfg(not(target_os="linux"))]
+            {let _=command;Err(CliError::NotImplemented("Linux host guard"))}
+        }
+        Ok(Command::ClientLinuxRedirectLab{config,journal,port})=>{
+            #[cfg(target_os="linux")]
+            {
+                // Inherit the explicitly selected network namespace
+                // from the caller (e.g. ip netns exec). Compare against
+                // PID 1's namespace, not a user-selected arbitrary FD.
+                tokio::task::spawn_blocking(move || {
+                    let host=std::fs::File::open("/proc/1/ns/net").map_err(|_|theia::client::ClientError::Configuration)?;
+                    let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build()
+                        .map_err(|_|theia::client::ClientError::Io)?;
+                    runtime.block_on(Box::pin(local_proxy::NativeIngress::run_linux_redirect_lab(
+                        Path::new(&config),host,Path::new(&journal),port,tokio::signal::ctrl_c())))
+                }).await.map_err(|_|CliError::Client(theia::client::ClientError::Io))
+                    .and_then(|result|result.map_err(CliError::Client))
+                    .map(|_|"Linux isolated redirect stopped; owned nftables table and policy routes restored".to_owned())
+            }
+            #[cfg(not(target_os="linux"))]
+            {let _=(config,journal,port);Err(CliError::NotImplemented("Linux isolated redirect"))}
+        }
+        Ok(Command::ClientLinuxRecoverLab{journal})=>{
+            #[cfg(target_os="linux")]
+            {
+                tokio::task::spawn_blocking(move || {
+                    let host=std::fs::File::open("/proc/1/ns/net")?;
+                    theia::routing::linux_rules::recover(&host,Path::new(&journal))
+                }).await.map_err(|_|CliError::Client(theia::client::ClientError::Io))
+                    .and_then(|result|result.map_err(|_|CliError::Client(theia::client::ClientError::Io)))
+                    .map(|_|"Linux isolated guard recovered; owned policy route objects restored".to_owned())
+            }
+            #[cfg(not(target_os="linux"))]
+            {let _=journal;Err(CliError::NotImplemented("Linux isolated guard recovery"))}
+        }
+        Ok(Command::WinDivertGuardHolder) => {
+            // The parent duplicates exactly one already-open lab handle
+            // into this bounded fixture. No driver or network access here.
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            Ok("WinDivert handle holder exited".to_owned())
+        }
+        Ok(Command::ClientWinDivertScopeDropLab { directory,dll_sha256,sys_sha256,interface,seconds }) => {
+            #[cfg(all(windows,target_arch="x86_64"))]
+            {
+                theia::routing::windivert::scope_drop_acceptance(directory.into(),dll_sha256,sys_sha256,interface,seconds).await
+                    .map(|s|format!("WinDivert scope drop lab finished; observed={} tcp4={} tcp6={} udp4={} udp6={} unsupported_or_malformed={} distinct_tuples={}; all captured packets discarded; no persistent protection or application identity asserted",s.observed(),s.tcp_v4,s.tcp_v6,s.udp_v4,s.udp_v6,s.unsupported_or_malformed,s.distinct_tuples))
+                    .map_err(|_|CliError::Client(theia::client::ClientError::Io))
+            }
+            #[cfg(not(all(windows,target_arch="x86_64")))]
+            {
+                let _=(directory,dll_sha256,sys_sha256,interface,seconds);
+                Err(CliError::NotImplemented("WinDivert x64 Windows backend"))
+            }
+        }
+        Ok(Command::ClientWinDivertInterfaceRedirectLab{config,directory,dll_sha256,sys_sha256,capture,carrier,seconds})=>{
+            #[cfg(all(windows,target_arch="x86_64"))]
+            {
+                local_proxy::NativeIngress::run_windows_interface_redirect_lab(Path::new(&config),directory.into(),dll_sha256,sys_sha256,capture,carrier,seconds).await
+                    .map(|_|"WinDivert isolated interface redirect ended; outside interface never protected; no production readiness asserted".to_owned())
+                    .map_err(CliError::Client)
+            }
+            #[cfg(not(all(windows,target_arch="x86_64")))]
+            {let _=(config,directory,dll_sha256,sys_sha256,capture,carrier,seconds);Err(CliError::NotImplemented("WinDivert x64 interface redirect"))}
+        }
+        Ok(Command::ClientWinDivertRedirectLab { config,directory,dll_sha256,sys_sha256,targets,seconds }) => {
+            #[cfg(all(windows,target_arch="x86_64"))]
+            {
+                local_proxy::NativeIngress::run_windows_redirect_lab(Path::new(&config),directory.into(),dll_sha256,sys_sha256,targets,seconds).await
+                    .map(|_|"WinDivert scoped TCP/UDP redirect laboratory ended; capture inactive; no production readiness or successful application exchange asserted".to_owned())
+                    .map_err(CliError::Client)
+            }
+            #[cfg(not(all(windows,target_arch="x86_64")))]
+            {
+                let _=(config,directory,dll_sha256,sys_sha256,targets,seconds);
+                Err(CliError::NotImplemented("WinDivert x64 Windows backend"))
+            }
+        }
+        Ok(Command::ClientWinDivertTcpRelayLab { config,directory,dll_sha256,sys_sha256,target }) => {
+            #[cfg(all(windows,target_arch="x86_64"))]
+            {
+                local_proxy::NativeIngress::run_windows_tcp_relay_lab(Path::new(&config),directory.into(),dll_sha256,sys_sha256,target).await
+                    .map(|_|"WinDivert authorized TCP echo through the configured authenticated carrier verified; capture inactive".to_owned())
+                    .map_err(CliError::Client)
+            }
+            #[cfg(not(all(windows,target_arch="x86_64")))]
+            {
+                let _=(config,directory,dll_sha256,sys_sha256,target);
+                Err(CliError::NotImplemented("WinDivert x64 Windows backend"))
+            }
+        }
+        Ok(Command::ClientWinDivertUdpRelayLab { config,directory,dll_sha256,sys_sha256,target,flows }) => {
+            #[cfg(all(windows,target_arch="x86_64"))]
+            {
+                local_proxy::NativeIngress::run_windows_udp_relay_lab(Path::new(&config),directory.into(),dll_sha256,sys_sha256,target,flows).await
+                    .map(|_|"WinDivert authorized UDP echo through the configured authenticated carrier verified; capture inactive".to_owned())
+                    .map_err(CliError::Client)
+            }
+            #[cfg(not(all(windows,target_arch="x86_64")))]
+            {
+                let _=(config,directory,dll_sha256,sys_sha256,target,flows);
+                Err(CliError::NotImplemented("WinDivert x64 Windows backend"))
+            }
+        }
+        Ok(Command::ClientWinDivertLoopback { directory, dll_sha256, sys_sha256 }) => {
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            {
+                theia::routing::windivert::loopback_acceptance(directory.into(),dll_sha256,sys_sha256).await
+                    .map(|_| "WinDivert isolated IPv4/IPv6 TCP redirect, UDP receive/send/reverse socket lifecycle and scoped crash guard verified; capture inactive".to_owned())
+                    .map_err(|_| CliError::Client(theia::client::ClientError::Io))
+            }
+            #[cfg(not(all(windows, target_arch = "x86_64")))]
+            {
+                let _ = (directory,dll_sha256,sys_sha256);
+                Err(CliError::NotImplemented("WinDivert x64 Windows backend"))
+            }
+        }
+        Ok(Command::ClientWinDivertCheck { directory, dll_sha256, sys_sha256, install_lab }) => {
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            {
+                theia::routing::windivert::probe(Path::new(&directory), dll_sha256, sys_sha256, install_lab)
+                    .map(|_| "WinDivert 2.2 API available; capture inactive; loaded driver hash not attested".to_owned())
+                    .map_err(|_| CliError::Client(theia::client::ClientError::Io))
+            }
+            #[cfg(not(all(windows, target_arch = "x86_64")))]
+            {
+                let _ = (directory, dll_sha256, sys_sha256, install_lab);
+                Err(CliError::NotImplemented("WinDivert x64 Windows backend"))
+            }
+        }
         Ok(Command::ClientStatus)=>{
             match management::query_client_environment(management::StatusCommand::ClientStatus).await{
-                Ok(management::StatusReply::ClientRunning{revision,config_sha256,descriptor_revision,transport,xhttp,fallback})=>{
+                Ok(management::StatusReply::ClientRunning{revision,config_sha256,descriptor_revision,transport,xhttp,fallback,routing_revision,routing_state,routing_totals,flow_counts,capture_state})=>{
                     let digest=config_sha256.iter().map(|b|format!("{b:02x}")).collect::<String>();
-                    Ok(format!("client running; revision={revision}; config_sha256={digest}; descriptor_revision={descriptor_revision}; last_open_transport={transport}; last_open_xhttp={xhttp}; h3_negative_cache={fallback}"))
+                    let capture = match capture_state { 0=>"inactive", 1=>"preparing", 2=>"isolated_lab", _=>"recovery_required" };
+                    Ok(format!("client running; revision={revision}; config_sha256={digest}; descriptor_revision={descriptor_revision}; last_open_transport={transport}; last_open_xhttp={xhttp}; h3_negative_cache={fallback}; routing_revision={routing_revision}; routing_state={routing_state}; routing_totals={routing_totals:?}; flow_counts={flow_counts:?}; packet_interception={capture}"))
                 }
                 Ok(_)=>Err(CliError::Management(management::ManagementError::InvalidReply)),
                 Err(error)=>Err(CliError::Management(error)),
+            }
+        }
+        Ok(Command::ClientLifecycle) => {
+            match management::query_client_environment(management::StatusCommand::ClientLifecycle).await {
+                Ok(management::StatusReply::ClientLifecycle(view)) => {
+                    let digest = view.config_sha256.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                    let instance = view.instance.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                    let lifecycle = match view.phase { 0=>"inactive", 1=>"preparing", 2=>"connected", 3=>"stopping", _=>"recovery_required" };
+                    let actual = if view.phase == 2 { "system_proxy" } else { "none" };
+                    let applied = match view.proxy_applied { 0=>"no", 1=>"yes", _=>"unknown" };
+                    Ok(format!("configured_mode=system_proxy; actual_mode={actual}; lifecycle={lifecycle}; scope=proxy_requests; guard=not_applicable; listeners_ready={}; proxy_settings_applied={applied}; revision={}; config_sha256={digest}; instance={instance}", view.listeners_ready, view.revision))
+                }
+                Ok(_) => Err(CliError::Management(management::ManagementError::InvalidReply)),
+                Err(error) => Err(CliError::Management(error)),
+            }
+        }
+        Ok(Command::ClientDisconnect { expected_revision, config_sha256, instance }) => {
+            match management::query_client_environment(management::StatusCommand::ClientDisconnect { expected_revision, config_sha256, instance }).await {
+                Ok(management::StatusReply::ClientDisconnectAccepted { revision, .. }) =>
+                    Ok(format!("disconnect accepted; revision={revision}; restoration not yet confirmed; inspect client proxy --status")),
+                Ok(_) => Err(CliError::Management(management::ManagementError::InvalidReply)),
+                Err(error) => Err(CliError::Management(error)),
             }
         }
         Ok(Command::ClientApply{expected_revision,candidate_sha256,apply})=>{
@@ -82,7 +274,7 @@ async fn main() {
                 else{management::StatusCommand::ClientPreview{expected_revision,candidate_sha256}};
             match management::query_client_environment(command).await{
                 Ok(management::StatusReply::ClientReady{revision})=>Ok(format!("client candidate ready; revision={revision}; nothing applied")),
-                Ok(management::StatusReply::ClientApplied{revision})=>Ok(format!("client carrier applied; revision={revision}; existing tunnels retained")),
+                Ok(management::StatusReply::ClientApplied{revision})=>Ok(format!("client carrier applied; revision={revision}; previous routing generation retired")),
                 Ok(_)=>Err(CliError::Management(management::ManagementError::InvalidReply)),
                 Err(error)=>Err(CliError::Management(error)),
             }

@@ -130,6 +130,19 @@ max_connections_per_user = 32
 max_connections_total = 64
 connect_timeout_ms = 2000
 
+[server.policy.routing]
+revision = 2
+
+[[server.policy.routing.rules]]
+name = "local direct"
+action = "direct_via_client"
+domains = ["full:localhost"]
+
+[[server.policy.routing.rules]]
+name = "blocked test name"
+action = "blackhole"
+domains = ["full:blocked.invalid"]
+
 [management]
 ipc = "auto"
 log_level = "error"
@@ -157,7 +170,14 @@ language = "ru"
                 deadline = time.monotonic() + 25
                 while time.monotonic() < deadline:
                     if process.poll() is not None:
-                        raise RuntimeError("Linux Theia server exited before readiness")
+                        # Bound the controlled fixture's diagnostics; never
+                        # include the bearer digest or the config document.
+                        with logs.open("rb") as diagnostic:
+                            diagnostic.seek(0, 2)
+                            diagnostic.seek(max(0, diagnostic.tell() - 2048))
+                            detail = diagnostic.read(2048).decode("utf-8", errors="replace")
+                        detail = detail.replace(digest, "[redacted]")
+                        raise RuntimeError(f"Linux Theia server exited before readiness (exit={process.returncode}): {detail}")
                     try:
                         with socket.create_connection(("127.0.0.1", args.port), timeout=0.25):
                             break

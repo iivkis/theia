@@ -188,6 +188,7 @@ async fn compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas() {
                 disabled: false,
             }],
             policy: ServerPolicy {
+                routing: None,
                 allow_private_ips: true,
                 max_connections_per_user: 5,
                 max_connections_total: 12,
@@ -378,6 +379,7 @@ async fn compiled_tui_real_terminal_needs_y_and_obeys_content_bound_cas() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "mandatory dedicated native coverage shard: real startup replay guard"]
 async fn compiled_dual_mode_tui_invitation_import_apply_and_rollback() {
     use theia::{
         client_import::PrivateBearer,
@@ -406,13 +408,39 @@ async fn compiled_dual_mode_tui_invitation_import_apply_and_rollback() {
         .unwrap()
         .ip();
     let reserve = |ip| {
-        (0..16)
-            .find_map(|_| {
-                let tcp = TcpListener::bind(std::net::SocketAddr::new(ip, 0)).ok()?;
-                let udp = UdpSocket::bind(tcp.local_addr().ok()?).ok()?;
-                Some((tcp, udp))
-            })
-            .unwrap()
+        // TCP and UDP have distinct ephemeral/excluded port ranges on
+        // Windows. Keep unsuccessful reservations alive during the search
+        // so an allocator cannot repeatedly return the same unusable port.
+        let mut tcp_rejected = Vec::new();
+        let mut udp_rejected = Vec::new();
+        let mut errors = Vec::new();
+        let addr = std::net::SocketAddr::new(ip, 0);
+        for _ in 0..128 {
+            match UdpSocket::bind(addr) {
+                Ok(udp) => match TcpListener::bind(udp.local_addr().unwrap()) {
+                    Ok(tcp) => return (tcp, udp),
+                    Err(error) => {
+                        errors.push(error);
+                        udp_rejected.push(udp);
+                    }
+                },
+                Err(error) => errors.push(error),
+            }
+            match TcpListener::bind(addr) {
+                Ok(tcp) => match UdpSocket::bind(tcp.local_addr().unwrap()) {
+                    Ok(udp) => return (tcp, udp),
+                    Err(error) => {
+                        errors.push(error);
+                        tcp_rejected.push(tcp);
+                    }
+                },
+                Err(error) => errors.push(error),
+            }
+        }
+        panic!(
+            "cannot reserve a shared TCP/UDP port on {ip}: {:?}",
+            errors.last()
+        );
     };
     let own = reserve(localhost);
     let smart = reserve(std::net::Ipv4Addr::LOCALHOST.into());
@@ -522,11 +550,10 @@ async fn compiled_dual_mode_tui_invitation_import_apply_and_rollback() {
     })
     .await
     .unwrap();
-    // The actual production process deliberately rejects admission timestamps
-    // through startup + 120s to prevent cross-restart replay without a journal.
-    // Readiness above proves IPC only, not admission. Wait outside the bounded
-    // interactive terminal scenario; do not backdate or bypass the replay guard.
-    sleep(Duration::from_secs(121)).await;
+    // The real server rejects REALITY admission through startup + 120s.
+    // The driver starts its monotonic 121s barrier only AFTER this readiness
+    // check, overlaps independent Own-TLS work, and waits before REALITY
+    // enrollment. No test clock override or backdating of admission.
     assert!(running.0.try_wait().unwrap().is_none());
     assert!(cli_status(binary, env_key, &endpoint, 1));
     let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -547,7 +574,9 @@ async fn compiled_dual_mode_tui_invitation_import_apply_and_rollback() {
         "python3"
     };
     let output = timeout(
-        Duration::from_secs(50),
+        // Same total budget as the previous 121s sleep + 50s driver.
+        // The driver separately enforces a 50s active-work budget.
+        Duration::from_secs(171),
         tokio::task::spawn_blocking(move || {
             Command::new(interpreter)
                 .arg(script)
@@ -584,6 +613,7 @@ async fn compiled_dual_mode_tui_invitation_import_apply_and_rollback() {
     .unwrap()
     .unwrap();
     echo_task.abort();
+    assert!(running.0.try_wait().unwrap().is_none());
     assert!(
         output.status.success(),
         "dual-mode terminal scenario failed: {}",
@@ -654,6 +684,7 @@ async fn compiled_client_proxy_conpty_lifecycle() {
                 disabled: false,
             }],
             policy: ServerPolicy {
+                routing: None,
                 allow_private_ips: true,
                 max_connections_per_user: 5,
                 max_connections_total: 12,
@@ -730,7 +761,6 @@ async fn compiled_client_proxy_conpty_lifecycle() {
     let socks_port = second.local_addr().unwrap().port();
     client.client.proxy.http_listen = format!("127.0.0.1:{http_port}");
     client.client.proxy.socks5_listen = format!("127.0.0.1:{socks_port}");
-    client.client.proxy.system_proxy = theia::config::SystemProxy::Manual;
     fs::write(&client_file, Config::Client(client).to_toml().unwrap()).unwrap();
     drop(first);
     drop(second);
