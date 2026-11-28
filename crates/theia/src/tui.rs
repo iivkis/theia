@@ -863,6 +863,14 @@ impl GeoPicker {
         self.verified && (!self.marked.is_empty() || !self.original.is_empty())
     }
 
+    fn changes(&self) -> (usize, usize) {
+        (self.marked.difference(&self.original).count(), self.original.difference(&self.marked).count())
+    }
+
+    fn removes_all(&self) -> bool {
+        self.verified && self.marked.is_empty() && !self.original.is_empty()
+    }
+
     fn synced_value(&self, value: &str) -> String {
         let mut seen = std::collections::BTreeSet::new();
         let mut next = Vec::new();
@@ -947,6 +955,20 @@ impl GeoPicker {
         items
     }
 
+    fn enter_action(&self) -> Option<usize> {
+        self.action.or_else(|| self.actions().iter().position(|item| item.key == 'a'))
+    }
+
+    fn row_status(&self, code: &str) -> (&'static str, Color) {
+        if !self.verified {
+            ("Не проверено", MUTED)
+        } else if !self.in_catalog(code) {
+            ("Нет в базе", WARNING)
+        } else {
+            ("", if self.marked.contains(code) { ACCENT } else { TEXT })
+        }
+    }
+
     fn info(&self) -> String {
         let state = if self.loading.is_some() {
             "Читаем локальные проверенные базы…"
@@ -970,12 +992,12 @@ impl GeoPicker {
         } else {
             ""
         };
-        let empty = if self.verified && self.marked.is_empty() && !self.original.is_empty() {
-            "После применения все категории этого типа будут удалены из поля."
+        let empty = if self.removes_all() {
+            "Внимание: все категории этого типа будут удалены из поля."
         } else {
             ""
         };
-        [state, semantic, unavailable, empty, full.as_str()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n")
+        [state, empty, unavailable, semantic, full.as_str()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n")
     }
 
     fn layout(&self, area: Rect) -> GeoPickerLayout {
@@ -985,13 +1007,15 @@ impl GeoPicker {
         let info_lines = if info.is_empty() { 0 } else {
             visual_rows(&info, usize::from(inner_width).max(1)).0.len().min(6) as u16
         };
+        let summary_height = if self.verified { 2 } else { 1 };
+        let top_height = 1 + summary_height;
         let desired_rows = self.matches().len().clamp(1, 12) as u16 + 1;
         let desired_controls = self.actions().len() as u16 + 2;
-        let height = area.height.min(26).min(4 + desired_rows + info_lines + desired_controls);
+        let height = area.height.min(26).min(2 + top_height + desired_rows + info_lines + desired_controls);
         let outer = Rect::new(area.x + (area.width - width) / 2, area.y + (area.height - height) / 2, width, height);
         let x = outer.x.saturating_add(2);
         let inner_h = height.saturating_sub(2);
-        let top = inner_h.min(2);
+        let top = inner_h.min(top_height);
         let control_h = desired_controls.min(inner_h.saturating_sub(top).saturating_sub(2));
         let room = inner_h.saturating_sub(top + control_h);
         let info_h = info_lines.min(room.saturating_sub(2));
@@ -1021,7 +1045,7 @@ impl GeoPicker {
             return;
         }
         let items = self.actions();
-        if let Some(index) = (Actions { items: &items, selected: self.action.unwrap_or(0) }).hit(layout.controls, x, y) {
+        if let Some(index) = (Actions { items: &items, selected: self.enter_action().unwrap_or(0) }).hit(layout.controls, x, y) {
             self.action = Some(index);
         } else if x >= layout.search.x && x < layout.search.right() && y == layout.search.y {
             self.action = None;
@@ -1040,36 +1064,78 @@ impl GeoPicker {
         let capacity = usize::from(layout.rows.height.saturating_sub(1));
         let start = self.window(capacity, filtered.len());
         let search = if self.marked_only {
-            format!("Все отмеченные · фильтр сохранён: {}", self.query)
+            if self.query.is_empty() { "Все отмеченные".into() } else { format!("Все отмеченные · поиск: {}", self.query) }
         } else {
             format!("Поиск: {}{}", self.query, if self.action.is_none() { "▏" } else { "" })
         };
         frame.render_widget(Paragraph::new(search).style(Style::default().fg(TEXT).bg(INPUT)), layout.search);
         let end = (start + capacity).min(filtered.len());
-        let summary = format!("{}: {} · В базе: {} · Отмечено: {} · {}–{}", if self.marked_only { "Выбрано" } else { "Найдено" }, filtered.len(), self.codes.len(), self.marked.len(), if end == 0 { 0 } else { start + 1 }, end);
-        frame.render_widget(Paragraph::new(summary).style(Style::default().fg(MUTED)), layout.summary);
+        let summary = if self.verified {
+            let range = if end > 0 && filtered.len() > capacity {
+                format!(" · {}–{}", start + 1, end)
+            } else {
+                String::new()
+            };
+            let (added, removed) = self.changes();
+            let counts = if self.marked_only {
+                format!("Отмечено: {}{range}", self.marked.len())
+            } else {
+                format!("Найдено: {} · Отмечено: {}{range}", filtered.len(), self.marked.len())
+            };
+            vec![
+                Line::styled(counts, Style::default().fg(MUTED)),
+                Line::from(vec![
+                    Span::styled(format!("Добавлено: {added}"), Style::default().fg(if added > 0 { ACCENT } else { MUTED })),
+                    Span::raw(" · "),
+                    Span::styled(format!("Удалено: {removed}"), Style::default().fg(if removed > 0 { WARNING } else { MUTED })),
+                ]),
+            ]
+        } else {
+            vec![Line::styled(format!("Каталог не проверен · В поле: {}", self.original.len()), Style::default().fg(MUTED))]
+        };
+        frame.render_widget(Paragraph::new(summary), layout.summary);
         let table = filtered.iter().enumerate().skip(start).take(capacity).map(|(index, code)| {
             let chosen = self.marked.contains(*code);
-            let suffix = if self.verified && !self.in_catalog(code) { " · нет в базе" } else { "" };
-            Row::new(vec![if chosen { "[x]" } else { "[ ]" }.to_owned(), format!("{}{code}{suffix}", self.prefix())])
-                .style(Style::default().fg(if chosen || index == self.focus { ACCENT } else { TEXT })
-                    .bg(if index == self.focus && self.action.is_none() { FOCUS } else { BG }))
+            let (status, color) = self.row_status(code);
+            Row::new(vec![if chosen { "[x]" } else { "[ ]" }.to_owned(), format!("{}{code}", self.prefix()), status.to_owned()])
+                .style(Style::default().fg(color)
+                    .bg(if self.verified && index == self.focus && self.action.is_none() { FOCUS } else { BG }))
         });
-        frame.render_widget(Table::new(table, [Constraint::Length(5), Constraint::Min(8)])
-            .header(Row::new(["Выбор", "Категория"]).style(Style::default().fg(MUTED))), layout.rows);
+        frame.render_widget(Table::new(table, [Constraint::Length(5), Constraint::Min(8), Constraint::Length(13)])
+            .header(Row::new(["Выбор", "Категория", "Статус"]).style(Style::default().fg(MUTED))), layout.rows);
         if layout.info.height > 0 {
-            frame.render_widget(Paragraph::new(self.info()).wrap(Wrap { trim: true }).style(Style::default().fg(if self.message.is_empty() { MUTED } else { WARNING })), layout.info);
+            let info = self.info();
+            let lines = info.lines().map(|line| {
+                let warning = line == self.message || line.starts_with("Внимание:") || line.starts_with("Отмеченные категории с пометкой");
+                Line::styled(line.to_owned(), Style::default().fg(if warning { WARNING } else { MUTED }))
+            }).collect::<Vec<_>>();
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), layout.info);
         }
         let items = self.actions();
-        Actions { items: &items, selected: self.action.unwrap_or(0) }
-            .render_with_focus(frame, layout.controls, self.action.is_some());
+        let selection = self.enter_action();
+        if let Some(selected) = selection {
+            Actions { items: &items, selected }.render_with_focus(frame, layout.controls, self.action.is_some());
+        } else {
+            // No implicit Enter action in this state: draw a plain list,
+            // without a misleading selection marker on Cancel.
+            let rows = items.iter().map(|item| ratatui::widgets::ListItem::new(format!("   {}", item.label)).style(Style::default().fg(TEXT))).collect::<Vec<_>>();
+            frame.render_widget(ratatui::widgets::List::new(rows).block(tui_widgets::section(" Действия ", false)), layout.controls);
+        }
     }
 
     fn footer(&self) -> &'static str {
-        if !self.verified {
-            "Tab действия · Enter выполнить · Esc отменить"
+        if self.action.is_some() {
+            "↑↓ действие · Enter выполнить выбранное · Tab переключить · Esc отменить"
+        } else if !self.verified {
+            "Tab действия · Esc отменить"
         } else if self.can_apply() {
-            "↑↓ строка · Пробел отметить/снять · Tab действия · Enter выполнить · F4 отмеченные · Esc отменить"
+            if self.matches().is_empty() {
+                "Поиск · Enter применить выбор · Tab действия · Esc отменить"
+            } else {
+                "↑↓ строка · Пробел отметить/снять · Enter применить выбор · Tab действия · Esc отменить"
+            }
+        } else if self.matches().is_empty() {
+            "Измените поиск · Tab действия · Esc отменить"
         } else {
             "↑↓ строка · Пробел отметить · Tab действия · Esc отменить"
         }
@@ -1220,7 +1286,7 @@ impl RoutingPanel {
         let items = picker.actions();
         let action_count = items.len();
         let mut command = None;
-        if key.modifiers.is_empty() {
+        if key.modifiers.is_empty() || (key.code == KeyCode::BackTab && key.modifiers == KeyModifiers::SHIFT) {
             match key.code {
                 KeyCode::Tab => {
                     picker.action = match picker.action {
@@ -1247,13 +1313,7 @@ impl RoutingPanel {
                     return;
                 }
                 KeyCode::Enter => {
-                    command = if let Some(i) = picker.action {
-                        items.get(i).map(|item| item.key)
-                    } else if picker.can_apply() {
-                        Some('a')
-                    } else {
-                        None
-                    };
+                    command = picker.enter_action().and_then(|i| items.get(i)).map(|item| item.key);
                 }
                 KeyCode::F(4) if picker.verified && (!picker.marked.is_empty() || picker.marked_only) => command = Some('m'),
                 _ => {}
@@ -11254,6 +11314,8 @@ mod tests {
         values[2] = "example.org, geosite:google".into();
         panel.key(press(KeyCode::F(6)), None);
         assert!(panel.geo_picker.as_ref().unwrap().message.contains("Нет выбранной"));
+        assert_eq!(panel.geo_picker.as_ref().unwrap().row_status("google"), ("Не проверено", MUTED));
+        assert!(panel.geo_picker.as_ref().unwrap().enter_action().is_none());
         panel.key(press(KeyCode::Esc), None);
         panel.key(press(KeyCode::F(6)), None);
         let picker = panel.geo_picker.as_mut().unwrap();
@@ -11388,11 +11450,17 @@ mod tests {
             assert_eq!(panel.geo_picker.as_ref().unwrap().marked.len(), 2);
             assert!(panel.geo_picker.as_ref().unwrap().marked.contains("old-code"));
             assert!(panel.geo_picker.as_ref().unwrap().info().contains("нет в базе"));
+            assert_eq!(panel.geo_picker.as_ref().unwrap().row_status("old-code"), ("Нет в базе", WARNING));
+            assert_eq!(panel.geo_picker.as_ref().unwrap().changes(), (0, 0));
             panel.paste(old);
             panel.key(press(KeyCode::Char(' ')), None);
             panel.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), None);
             panel.paste(new);
             panel.key(press(KeyCode::Char(' ')), None);
+            let picker = panel.geo_picker.as_ref().unwrap();
+            assert_eq!(picker.changes(), (1, 1));
+            assert_eq!(picker.actions()[picker.enter_action().unwrap()].key, 'a');
+            assert!(picker.footer().contains("Enter применить выбор"));
             panel.key(press(KeyCode::Enter), None);
             assert_eq!(panel.fields.as_ref().unwrap().1[field], updated);
 
@@ -11405,6 +11473,8 @@ mod tests {
             panel.key(press(KeyCode::Char(' ')), None);
             assert!(panel.geo_picker.as_ref().unwrap().marked.is_empty());
             assert!(panel.geo_picker.as_ref().unwrap().can_apply());
+            assert!(panel.geo_picker.as_ref().unwrap().removes_all());
+            assert_eq!(panel.geo_picker.as_ref().unwrap().changes(), (0, 2));
             panel.key(press(KeyCode::Esc), None);
             assert_eq!(panel.fields.as_ref().unwrap().1[field], updated);
 
