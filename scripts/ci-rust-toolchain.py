@@ -54,19 +54,16 @@ def prepare(expected, components):
     compiler(f"release: {release}\ncommit-hash: {commit}\nhost: requested")
     chosen = "stable"
     if not ready(chosen, expected, components):
-        # The hosted image can be stale by one or more patch releases.
-        # Update the existing stable installation once, without fetching a
-        # new rustup installer. A mid-run stable release must not change SHA.
-        args = ["rustup", "toolchain", "install", chosen, "--profile", "minimal",
-                "--no-self-update"]
-        for component in components:
-            args += ["--component", component]
-        subprocess.run(args, check=True)
+        # Install the exact trusted release with only required components.
+        # Updating the image's existing stable channel retains unrelated
+        # rustfmt, Clippy and cross-target components, and can race a release.
+        chosen = release
         if not ready(chosen, expected, components):
-            chosen = release
-            args = [*args[:3], chosen, *args[4:]]
-            if not ready(chosen, expected, components):
-                subprocess.run(args, check=True)
+            args = ["rustup", "toolchain", "install", chosen, "--profile", "minimal",
+                    "--no-self-update"]
+            for component in components:
+                args += ["--component", component]
+            subprocess.run(args, check=True)
     if not ready(chosen, expected, components):
         raise ValueError("exact specification Rust compiler/components unavailable")
     subprocess.run(["rustup", "default", chosen], check=True)
