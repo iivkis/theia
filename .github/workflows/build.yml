@@ -56,14 +56,50 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        id: deps-cache
         with:
           key: release-build-v2-${{ matrix.os }}-${{ matrix.target }}
           cache-workspace-crates: false
           cache-bin: false
+      - name: Verify MVP dependency graph
+        run: |
+          $graph = @(cargo tree --locked -p theia --no-default-features --target $env:RELEASE_TARGET -e normal,build --prefix none)
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve locked MVP dependency graph' }
+          if ($graph -match '^(btls|btls-sys|tokio-btls) v') {
+            throw 'Experimental BoringSSL dependency is present in the MVP distribution'
+          }
+          "MVP feature graph: no default features; no experimental BoringSSL or native ingress labs." >> $env:GITHUB_STEP_SUMMARY
+          "Dependency cache hit: ${{ steps.deps-cache.outputs.cache-hit }}" >> $env:GITHUB_STEP_SUMMARY
       - name: Compile optimized native binary
         run: |
-          cargo build --locked --release --bin theia --target $env:RELEASE_TARGET
-          if ($LASTEXITCODE -ne 0) { throw 'Release compilation failed' }
+          $clock = [System.Diagnostics.Stopwatch]::StartNew()
+          cargo build --locked --release --no-default-features --bin theia --target $env:RELEASE_TARGET --timings
+          $code = $LASTEXITCODE
+          $clock.Stop()
+          "MVP optimized compilation seconds: $([math]::Round($clock.Elapsed.TotalSeconds, 2))" >> $env:GITHUB_STEP_SUMMARY
+          if ($code -ne 0) { throw 'Release compilation failed' }
+      - name: Verify excluded laboratory commands and retained MVP CLI
+        run: |
+          $exe = Join-Path "target/$env:RELEASE_TARGET/release" $env:RELEASE_EXE
+          $help = & $exe client --help
+          if ($LASTEXITCODE -ne 0 -or ($help -join "`n") -notmatch '--system-proxy' -or ($help -join "`n") -match 'client (windivert|linux)') {
+            throw 'MVP client help does not match the feature boundary'
+          }
+          $PSNativeCommandUseErrorActionPreference = $false
+          foreach ($lab in @('linux', 'windivert')) {
+            $result = & $exe client $lab --check 2>&1
+            if ($LASTEXITCODE -ne 3 -or ($result -join "`n") -notmatch 'excluded from MVP build') {
+              throw "Experimental command did not refuse safely: $lab"
+            }
+          }
+      - name: Upload compilation timing report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: timings-${{ matrix.artifact }}
+          path: target/cargo-timings/cargo-timing.html
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Verify Linux ABI and older distribution startup
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         shell: bash
@@ -186,7 +222,7 @@ jobs:
           notes="$(mktemp)"
           trap 'rm -f "$notes"' EXIT
           printf '%s\n' \
-            'Experimental development build. Not a stable release or a release acceptance result.' \
+            'Experimental MVP-only development build. Optional native ingress laboratories and experimental BoringSSL backend are not compiled. Not a stable release or a release acceptance result.' \
             '' \
             "Source commit: $GITHUB_SHA" \
             "Source branch: $GITHUB_REF_NAME" \

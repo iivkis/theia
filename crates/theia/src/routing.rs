@@ -2,37 +2,37 @@
 //! No DNS, transport, file I/O or implicit bypass occurs in this module.
 pub(crate) mod carrier_socket;
 pub(crate) mod client_state;
-#[cfg(target_os = "linux")]
+#[cfg(all(any(feature = "native-ingress-lab", test), target_os = "linux"))]
 pub mod dns_attribution;
 pub(crate) mod dpi;
 pub(crate) mod exchange;
 pub(crate) mod flow;
 pub mod geodata;
-#[cfg(target_os = "linux")]
+#[cfg(all(any(feature = "native-ingress-lab", test), target_os = "linux"))]
 pub mod linux_attribution;
 #[cfg(all(target_os = "linux", feature = "linux-ebpf-lab"))]
 pub mod linux_bpf_loader;
-#[cfg(target_os = "linux")]
+#[cfg(all(any(feature = "native-ingress-lab", test), target_os = "linux"))]
 pub mod linux_carrier;
-#[cfg(target_os = "linux")]
+#[cfg(all(any(feature = "native-ingress-lab", test), target_os = "linux"))]
 pub mod linux_events;
-#[cfg(target_os = "linux")]
+#[cfg(all(any(feature = "native-ingress-lab", test), target_os = "linux"))]
 pub mod linux_ingress;
-#[cfg(target_os = "linux")]
+#[cfg(all(any(feature = "native-ingress-lab", test), target_os = "linux"))]
 pub mod linux_rules;
-#[cfg(any(
-    target_os = "linux",
-    all(target_os = "windows", target_arch = "x86_64")
+#[cfg(all(
+    any(feature = "native-ingress-lab", test),
+    any(target_os = "linux", all(target_os = "windows", target_arch = "x86_64"))
 ))]
 pub(crate) mod native_dns;
-#[cfg(target_os = "linux")]
+#[cfg(all(any(feature = "native-ingress-lab", test), target_os = "linux"))]
 pub mod nfqueue;
 pub mod packet;
 pub mod packet_modify;
 pub(crate) mod policy_lease;
 mod settings;
 pub mod snapshot;
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(all(feature = "native-ingress-lab", target_os = "windows"), test))]
 pub mod windivert;
 pub use settings::Settings;
 

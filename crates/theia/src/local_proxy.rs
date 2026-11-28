@@ -9,13 +9,13 @@ pub(crate) mod profile_diagnostics;
 mod runtime;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) use runtime::ClientRuntime;
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(all(any(feature = "native-ingress-lab", test), any(target_os = "linux", target_os = "windows")))]
 mod native;
 #[cfg(windows)]
 mod system_proxy;
-#[cfg(target_os = "linux")]
+#[cfg(all(any(feature = "native-ingress-lab", test), target_os = "linux"))]
 pub use native::LabStunPermit;
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(all(any(feature = "native-ingress-lab", test), any(target_os = "linux", target_os = "windows")))]
 pub use native::NativeIngress;
 #[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
 use native::NativeOwner;
