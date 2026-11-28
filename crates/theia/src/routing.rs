@@ -449,6 +449,34 @@ fn entry_code(bytes: &[u8]) -> Result<String, RoutingError> {
     code.ok_or(RoutingError::InvalidDat)
 }
 
+/// Enumerate only selector-compatible category names from an already pinned DAT.
+pub(crate) fn category_catalog(data: &[u8]) -> Result<Vec<String>, RoutingError> {
+    if data.len() > MAX_DAT {
+        return Err(RoutingError::Limit);
+    }
+    let mut names = std::collections::BTreeSet::new();
+    let mut wire = Wire(data);
+    while let Some((field, value)) = wire.next()? {
+        if field != 1 {
+            continue;
+        }
+        let Field::Bytes(bytes) = value else {
+            return Err(RoutingError::InvalidDat);
+        };
+        let code = entry_code(bytes)?;
+        if category(&code).is_err() {
+            continue;
+        }
+        if !names.insert(code.to_ascii_lowercase()) {
+            return Err(RoutingError::InvalidDat);
+        }
+        if names.len() > MAX_SELECTORS {
+            return Err(RoutingError::Limit);
+        }
+    }
+    Ok(names.into_iter().collect())
+}
+
 fn dat_domain(bytes: &[u8], regex_count: &mut usize) -> Result<DomainPattern, RoutingError> {
     let mut wire = Wire(bytes);
     let mut kind = None;
@@ -1075,6 +1103,19 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn category_catalog_lists_supported_names_without_expanding_records() {
+        let mut data = site("GOOGLE@CN", 2, "other.example");
+        data.extend(site("GOOGLE", 2, "google.com"));
+        data.extend(site("CATEGORY-ADS", 2, "ads.example"));
+        assert_eq!(category_catalog(&data).unwrap(), ["category-ads", "google"]);
+        data.extend(site("google", 2, "duplicate.example"));
+        assert!(category_catalog(&data).is_err());
+        let mut ips = ip_data("IN-RU", &[192, 0, 2, 0], 24, false);
+        ips.extend(ip_data("PRIVATE", &[10, 0, 0, 0], 8, false));
+        assert_eq!(category_catalog(&ips).unwrap(), ["in-ru", "private"]);
     }
 
     #[test]

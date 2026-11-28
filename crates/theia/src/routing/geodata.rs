@@ -101,6 +101,9 @@ impl Pair {
     pub fn compile(&self, rules: &[Rule]) -> Result<Policy, Error> {
         Ok(Policy::compile(rules, &self.geosite, &self.geoip)?)
     }
+    pub(crate) fn category_names(&self, site: bool) -> Result<Vec<String>, Error> {
+        Ok(super::category_catalog(if site { &self.geosite } else { &self.geoip })?)
+    }
 }
 
 fn hash(bytes: &[u8]) -> [u8; 32] {

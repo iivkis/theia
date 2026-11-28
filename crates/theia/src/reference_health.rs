@@ -445,30 +445,51 @@ fn stable(first: Option<u16>, second: Option<u16>) -> Option<u16> {
     first.filter(|status| Some(*status) == second && accepted_status(*status))
 }
 
-async fn check_target(target: &Target, roots: &RootCertStore, own: &HashSet<IpAddr>) -> Evidence {
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SearchObservation {
+    pub evidence: Evidence,
+    /// Elapsed validated HTTPS H2 HEAD transaction, not ICMP or wire RTT.
+    pub h2_ms: Option<u64>,
+}
+
+async fn check_target_measured(target: &Target, roots: &RootCertStore, own: &HashSet<IpAddr>) -> SearchObservation {
     let mut rounds = [Evidence::default(); 2];
-    for round in &mut rounds {
+    let mut times = [0u64; 2];
+    for (index, round) in rounds.iter_mut().enumerate() {
         // Fresh DNS before each pair, but all TCP/UDP connects use the
         // immutable exact pin, never a re-resolved or redirected address.
         if fresh_dns(target, own).await.is_err() {
-            return Evidence::default();
+            return SearchObservation::default();
         }
         let (h2, h3) = tokio::join!(
-            timeout(ATTEMPT, h2_head(target, roots.clone())),
+            async {
+                let started = std::time::Instant::now();
+                let result = timeout(ATTEMPT, h2_head(target, roots.clone())).await;
+                (result, started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+            },
             timeout(ATTEMPT, h3_head(target, roots.clone()))
         );
-        round.h2_status = h2.ok().flatten();
+        times[index] = h2.1;
+        round.h2_status = h2.0.ok().flatten();
         round.h3_status = h3.ok().flatten();
     }
     // Check once more after the application observations: a DNS change
     // during the last handshake must not be recorded as fresh evidence.
     if fresh_dns(target, own).await.is_err() {
-        return Evidence::default();
+        return SearchObservation::default();
     }
-    Evidence {
+    let evidence = Evidence {
         h2_status: stable(rounds[0].h2_status, rounds[1].h2_status),
         h3_status: stable(rounds[0].h3_status, rounds[1].h3_status),
+    };
+    SearchObservation {
+        evidence,
+        h2_ms: evidence.eligible().then(|| times[0].saturating_add(times[1]) / 2),
     }
+}
+
+async fn check_target(target: &Target, roots: &RootCertStore, own: &HashSet<IpAddr>) -> Evidence {
+    check_target_measured(target, roots, own).await.evidence
 }
 
 /// The caller must have confirmed the exact document before invoking this.
@@ -515,7 +536,7 @@ pub(crate) async fn check_search(
     search: &SearchPlan,
     approved: [u8; 32],
     progress: &std::sync::atomic::AtomicUsize,
-) -> Result<Vec<Evidence>, Error> {
+) -> Result<Vec<SearchObservation>, Error> {
     if search.digest()? != approved {
         return Err(Error::Approval);
     }
@@ -530,7 +551,7 @@ pub(crate) async fn check_search(
     let own = Arc::new(extend_endpoint_addresses(&context, own).await?);
     timeout(SEARCH_DEADLINE, async {
         let _permit = ACTIVE.acquire().await.map_err(|_| Error::Timeout)?;
-        let mut results = vec![Evidence::default(); search.targets().len()];
+        let mut results = vec![SearchObservation::default(); search.targets().len()];
         for (batch, group) in search.targets().chunks(SEARCH_PARALLELISM).enumerate() {
             let mut tasks = tokio::task::JoinSet::new();
             for (offset, target) in group.iter().cloned().enumerate() {
@@ -538,9 +559,9 @@ pub(crate) async fn check_search(
                 let own = Arc::clone(&own);
                 tasks.spawn(async move {
                     let evidence = if own.contains(&normalize(target.address.ip())) {
-                        Evidence::default()
+                        SearchObservation::default()
                     } else {
-                        check_target(&target, &roots, &own).await
+                        check_target_measured(&target, &roots, &own).await
                     };
                     (batch * SEARCH_PARALLELISM + offset, evidence)
                 });
