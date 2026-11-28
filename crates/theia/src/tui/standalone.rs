@@ -136,6 +136,7 @@ struct Draft {
     step: SetupStep,
     choice: usize,
     input_backup: Option<[String; 5]>,
+    adding_sites: bool,
     original: Document,
     expected: Option<Vec<u8>>,
     values: [String; 5],
@@ -152,7 +153,7 @@ impl Draft {
             local.proxy.http_listen.clone(), local.proxy.socks5_listen.clone(), String::new(),
         ];
         let flags = [local.consent.direct_egress, local.consent.direct_dpi, local.consent.direct_dpi_stun, false];
-        Self { step: if expected.is_none() { SetupStep::Mode } else { SetupStep::Settings }, choice: 0, input_backup: None, original, expected, values, flags, selected: 0, error: String::new() }
+        Self { step: if expected.is_none() { SetupStep::Mode } else { SetupStep::Settings }, choice: 0, input_backup: None, adding_sites: false, original, expected, values, flags, selected: 0, error: String::new() }
     }
 
     fn first_run(&self) -> bool { self.expected.is_none() }
@@ -188,9 +189,9 @@ impl Draft {
             SetupStep::Mode => ("Шаг 1 из 5 · Как настроить Anti-DPI?",
                 "Anti-DPI помогает проверять доступность сайтов и применять принятые способы изменения трафика.\nРаботает без VPS и ключей. Сейчас стратегии изменения трафика ожидают приёмки.\n\nВыберите способ настройки. Никаких сетевых запросов или изменений Windows пока не будет.".into(),
                 vec![item('1', "Рекомендуемая · выбрать нужные сайты"), item('2', "Ручная · настроить правила позднее")]),
-            SetupStep::Domains => ("Шаг 2 из 5 · Какие сайты вам нужны?",
+            SetupStep::Domains => (if self.adding_sites { "Добавить сайты для Anti-DPI" } else { "Шаг 2 из 5 · Какие сайты вам нужны?" },
                 format!("Укажите сайты, для которых хотите использовать Anti-DPI. Остальные не получат это правило.\n\nВыбрано: {domains}\n{}\n\nПока это только черновик. Для продолжения нужен хотя бы один сайт.", if self.values[4].is_empty() { "Пока ничего не выбрано" } else { &self.values[4] }),
-                vec![item('1', "Выбрать сайты из каталога"), item('2', "Ввести свои сайты"), item('3', "Далее · подтвердить выбранные сайты")]),
+                vec![item('1', "Выбрать сайты из каталога"), item('2', "Ввести свои сайты"), item('3', if self.adding_sites { "Проверить новое правило" } else { "Далее · подтвердить выбранные сайты" })]),
             SetupStep::Settings => ("Настройки · Что изменить?",
                 format!("DNS: {}\nПрямой выход: {} · Anti-DPI: {} · STUN: {}\n\nВыберите только то, что хотите изменить. Правила сайтов и адреса локальных прокси сохраняются без изменений.", if self.values[0].is_empty() { "не настроен" } else { &self.values[0] }, yes(self.flags[0]), yes(self.flags[1]), yes(self.flags[2])),
                 vec![item('1', "Выбрать защищённый DNS"), item('2', "Изменить разрешения"), item('3', "Расширенные настройки · адреса прокси, STUN")]),
@@ -206,6 +207,9 @@ impl Draft {
             SetupStep::DomainInput | SetupStep::CustomDns | SetupStep::Advanced => ("", String::new(), Vec::new()),
         };
         let mut text = text;
+        if self.adding_sites && self.step == SetupStep::Domains {
+            text.push_str("\nНовое правило добавится после существующих. Более ранние правила имеют приоритет. Разрешения не меняются.");
+        }
         if !self.first_run() {
             match self.step {
                 SetupStep::Dns => text.push_str(&format!("\nТекущий DNS: {}", if self.values[0].is_empty() { "не настроен" } else { &self.values[0] })),
@@ -231,7 +235,7 @@ impl Draft {
 
     fn render_wizard(&self, frame: &mut Frame<'_>, area: Rect) {
         if matches!(self.step, SetupStep::DomainInput | SetupStep::CustomDns) {
-            self.wizard_form().render(frame, area, if self.step == SetupStep::DomainInput { "Шаг 2 из 5 · Свои сайты" } else if self.first_run() { if self.flags[3] { "Шаг 3 из 5 · Другой DNS" } else { "Шаг 2 из 4 · Другой DNS" } } else { "Настройки · Другой DNS" });
+            self.wizard_form().render(frame, area, if self.step == SetupStep::DomainInput { if self.adding_sites { "Добавить свои сайты" } else { "Шаг 2 из 5 · Свои сайты" } } else if self.first_run() { if self.flags[3] { "Шаг 3 из 5 · Другой DNS" } else { "Шаг 2 из 4 · Другой DNS" } } else { "Настройки · Другой DNS" });
             return;
         }
         let (title, mut text, items) = self.wizard_choices();
@@ -272,6 +276,17 @@ impl Draft {
 
     fn next_document(&self) -> Result<Document, String> {
         let mut next = self.original.clone();
+        if self.adding_sites {
+            let domains = self.domain_values()?;
+            let revision = next.anti_dpi.revision.checked_add(1).ok_or("Исчерпан номер ревизии")?;
+            let mut name = format!("Сайты Anti-DPI ({revision})");
+            while next.anti_dpi.rules.iter().any(|rule| rule.name == name) { name.push('_'); }
+            next.anti_dpi.rules.push(crate::routing::Rule { name, action: crate::routing::Action::DirectDpi,
+                domains: domains.into_iter().map(|name| format!("full:{name}")).collect(), ips: Vec::new(), applications: Vec::new() });
+            next.anti_dpi.revision = revision;
+            next.prepare().map_err(|e| e.to_string())?;
+            return Ok(next);
+        }
         let local = &mut next.anti_dpi;
         local.proxy.http_listen = self.values[2].trim().to_owned();
         local.proxy.socks5_listen = self.values[3].trim().to_owned();
@@ -463,6 +478,7 @@ struct Panel {
     results: BTreeMap<(String, &'static str), CellResult>,
     report_only: bool,
     report_hosts: BTreeSet<String>,
+    diagnostic_menu: bool,
     row: usize,
     offset: usize,
     filter: String,
@@ -520,7 +536,7 @@ impl Panel {
                 .map_err(|_| TuiError::Configuration("invalid embedded standalone example"))?, None))
         } else { None };
         Ok(Self { path, overlay_path, overlay, overlay_bytes, catalog, selected: BTreeSet::new(),
-            results: BTreeMap::new(), report_only: false, report_hosts: BTreeSet::new(), row: 0, offset: 0, filter: String::new(), editing: None,
+            results: BTreeMap::new(), report_only: false, report_hosts: BTreeSet::new(), diagnostic_menu: false, row: 0, offset: 0, filter: String::new(), editing: None,
             review: None, review_scroll: 0, worker: None, routing: None,
             #[cfg(windows)]
             session: None,
@@ -660,7 +676,7 @@ impl Panel {
                 self.review = Some(Review::DiscardRouting);
                 self.review_scroll = 0;
                 self.confirm_selected = false;
-            } else { self.navigation = true; }
+            } else { self.navigation = false; self.action = 0; }
             return;
         }
         panel.save_requested = false;
@@ -703,6 +719,14 @@ impl Panel {
         }
     }
 
+    fn add_sites(&mut self) {
+        self.open_settings();
+        if let Some(draft) = &mut self.draft {
+            draft.adding_sites = true;
+            draft.move_to(SetupStep::Domains);
+        }
+    }
+
     fn create_config(&mut self) {
         if !std::fs::symlink_metadata(&self.path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
             self.notice = "Файл уже существует; создание не перезаписывает его.".into();
@@ -734,6 +758,7 @@ impl Panel {
             let previous = match draft.step {
                 Mode => { self.notice = "Настройка отменена; файл не создан.".into(); return; }
                 Settings | Advanced => { self.notice = "Черновик отменён; файл не изменён.".into(); return; }
+                Domains if draft.adding_sites => { self.notice = "Добавление сайтов отменено; правила не изменены.".into(); return; }
                 Domains => Mode,
                 DomainInput => Domains,
                 Dns => if !draft.first_run() { Settings } else if draft.flags[3] { Domains } else { Mode },
@@ -810,6 +835,7 @@ impl Panel {
             (Domains, Some(KeyCode::Char('2'))) => { draft.input_backup = Some(draft.values.clone()); draft.move_to(DomainInput); },
             (Domains, Some(KeyCode::Char('3'))) => {
                 match draft.domain_values() {
+                    Ok(_) if draft.adding_sites => { self.preview_draft(draft); return; }
                     Ok(_) => draft.move_to(Dns),
                     Err(error) => draft.error = error,
                 }
@@ -888,7 +914,7 @@ impl Panel {
         self.page = page.min(SECTIONS.len() - 1);
         self.navigation = false;
         self.action = 0;
-        if self.page == ROUTING && self.routing.is_none() { self.open_routing(); }
+        self.diagnostic_menu = false;
     }
 
     fn actions(&self) -> Vec<ActionItem> {
@@ -898,14 +924,14 @@ impl Panel {
                 if let Ok(doc) = Document::read(&self.path) {
                     let local = &doc.anti_dpi;
                     if local.resolver.is_none() || !local.consent.direct_egress {
-                        vec![item('t', "Завершить настройку DNS и разрешений"), item('d', "Открыть каталог сайтов"), item('p', "Состояние подключения")]
+                        vec![item('t', if local.resolver.is_none() { "Выбрать защищённый DNS" } else { "Разрешить выход в интернет" }), item('d', "Открыть каталог сайтов"), item('w', "Добавить сайты для Anti-DPI"), item('p', "Состояние подключения")]
                     } else if self.newly_saved {
                         vec![item('e', "Применить новую конфигурацию"), item('t', "Изменить настройки"), item('d', "Открыть диагностику")]
                     } else if self.applied_revision != Some(local.revision) {
                         vec![item('a', "Применить сохранённые правила"), item('e', "Первое применение (только новый файл)"), item('t', "Изменить настройки"), item('d', "Открыть диагностику")]
                     } else if cfg!(windows) {
-                        vec![item('p', "Открыть подключение"), item('d', "Открыть диагностику"), item('t', "Изменить настройки")]
-                    } else { vec![item('d', "Открыть диагностику"), item('t', "Изменить настройки"), item('p', "Состояние подключения")] }
+                        vec![item('p', "Открыть подключение"), item('d', "Открыть диагностику"), item('w', "Добавить сайты для Anti-DPI"), item('t', "Изменить настройки")]
+                    } else { vec![item('d', "Открыть диагностику"), item('w', "Добавить сайты для Anti-DPI"), item('t', "Изменить настройки"), item('p', "Состояние подключения")] }
                 }
                 else if std::fs::symlink_metadata(&self.path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
                     vec![item('n', "Настроить Anti-DPI"), item('d', "Открыть каталог")]
@@ -922,10 +948,27 @@ impl Panel {
                 if cfg!(windows) { actions.push(item('v', "Проверить и восстановить системный прокси")); }
                 actions
             },
-            ROUTING => vec![item('r', "Открыть редактор маршрутизации"), item('a', "Применить сохранённую политику")],
+            ROUTING => if Document::read(&self.path).is_ok() {
+                vec![item('w', "Добавить сайты для Anti-DPI"), item('r', "Все правила · расширенный редактор"), item('a', "Применить сохранённые правила")]
+            } else if std::fs::symlink_metadata(&self.path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
+                vec![item('n', "Сначала настроить Anti-DPI")]
+            } else { vec![item('t', "Проверить конфигурацию")] },
             STATISTICS => vec![item('p', "Открыть подключение"), item('d', "Открыть диагностику")],
             SETTINGS => vec![item('t', "Настроить DNS и разрешения"), item('a', "Применить сохранённую политику"), item('e', "Первично зарегистрировать локальную политику")],
             _ => Vec::new(),
+        }
+    }
+
+    fn diagnostic_actions(&self) -> Vec<ActionItem> {
+        let item = |key, label| ActionItem { key, label };
+        if self.report_only {
+            let mut items = vec![item('j', "Объяснить выбранный результат"), item('v', "Вернуться к каталогу сайтов"), item('[', "Предыдущий протокол"), item(']', "Следующий протокол")];
+            if !self.results.is_empty() { items.extend([item('b', "Повторить неуспешные проверки"), item('z', "Сохранить обезличенный отчёт")]); }
+            items
+        } else {
+            let mut items = vec![item('k', "Проверить отмеченные сайты"), item(' ', "Отметить / снять отметку с сайта"), item('/', "Найти сайт"), item('i', "Добавить свой сайт"), item('s', "Отметить все видимые сайты"), item('c', "Очистить выбор"), item('x', "Исключить / вернуть сайт"), item('R', "Вернуть исключённые сайты")];
+            if !self.report_hosts.is_empty() { items.push(item('v', "Открыть последний отчёт")); }
+            items
         }
     }
 
@@ -957,6 +1000,7 @@ impl Panel {
                 Err(error) => self.notice = error.to_string(),
             },
             None => {
+                if self.selected.is_empty() { self.notice = "Сначала отметьте хотя бы один сайт пробелом или через меню действий.".into(); return; }
                 let hosts = self.selected.iter().cloned().collect::<Vec<_>>();
                 let overlay = self.overlay_bytes.as_ref().map(|_| self.overlay_path.as_path());
                 match Plan::prepare(&self.path, overlay, &hosts) {
@@ -1029,7 +1073,8 @@ impl Panel {
                         }
                         Review::DiscardRouting => {
                             self.routing = None;
-                            self.navigation = true;
+                            self.navigation = false;
+                            self.action = 0;
                             self.notice = "Черновик маршрутизации отменён.".into();
                         }
                         Review::Export(summary, path) => {
@@ -1131,7 +1176,7 @@ impl Panel {
                     self.selected = selected; self.filter = filter; self.row = row; self.offset = offset;
                 }
                 self.notice = "Сайты выбираются только для черновика; сеть не запускается.".into();
-                self.page = OVERVIEW;
+                self.page = if draft.adding_sites { ROUTING } else { OVERVIEW };
                 self.draft = Some(draft);
                 return Ok(false);
             }
@@ -1165,6 +1210,27 @@ impl Panel {
             }
             return Ok(false);
         }
+        if self.page == DIAGNOSTICS && self.catalogue_draft.is_none() && self.worker.is_none() {
+            if self.diagnostic_menu {
+                if matches!(code, KeyCode::Esc | KeyCode::F(3) | KeyCode::Tab | KeyCode::BackTab) {
+                    self.diagnostic_menu = false; return Ok(false);
+                }
+                if code == KeyCode::F(2) { self.diagnostic_menu = false; self.navigation = true; return Ok(false); }
+                let items = self.diagnostic_actions();
+                if code == KeyCode::Enter {
+                    if let Some(action) = tui_widgets::action_key(&items, &mut self.action, code) {
+                        self.diagnostic_menu = false;
+                        return self.key(action);
+                    }
+                } else if matches!(code, KeyCode::Up | KeyCode::Down | KeyCode::Home | KeyCode::End) {
+                    let _ = tui_widgets::action_key(&items, &mut self.action, code);
+                }
+                return Ok(false);
+            }
+            if matches!(code, KeyCode::Tab | KeyCode::BackTab | KeyCode::F(3)) {
+                self.diagnostic_menu = true; self.action = 0; return Ok(false);
+            }
+        }
         if code == KeyCode::F(2) || (code == KeyCode::Left && self.page != DIAGNOSTICS) {
             self.navigation = true;
             return Ok(false);
@@ -1186,11 +1252,22 @@ impl Panel {
             },
             KeyCode::Tab | KeyCode::BackTab if self.page == DIAGNOSTICS => self.navigation = true,
             KeyCode::Char('n') if self.page != DIAGNOSTICS => self.create_config(),
-            KeyCode::Char('t') if self.page != DIAGNOSTICS => { self.page = SETTINGS; self.open_settings(); }
+            KeyCode::Char('t') if self.page != DIAGNOSTICS => {
+                let from_overview = self.page == OVERVIEW;
+                self.page = SETTINGS;
+                self.open_settings();
+                if from_overview {
+                    if let Some(draft) = &mut self.draft {
+                        if draft.values[0].is_empty() { draft.move_to(SetupStep::Dns); }
+                        else if !draft.flags[0] { draft.move_to(SetupStep::Direct); }
+                    }
+                }
+            }
             KeyCode::Char('d') if self.page != DIAGNOSTICS => self.open_page(DIAGNOSTICS),
             KeyCode::Char('e') if self.page != DIAGNOSTICS => self.begin_review(Some(true)),
             KeyCode::Char('a') if self.page != DIAGNOSTICS => self.begin_review(Some(false)),
-            KeyCode::Char('r') if self.page != DIAGNOSTICS => self.open_page(ROUTING),
+            KeyCode::Char('r') if self.page == ROUTING => self.open_routing(),
+            KeyCode::Char('w') if self.page == ROUTING || self.page == OVERVIEW => { self.open_page(ROUTING); self.add_sites(); },
             KeyCode::Char('p') if self.page != DIAGNOSTICS => {
                 if self.page != CONNECTION { self.open_page(CONNECTION); return Ok(false); }
                 self.confirm_selected = false;
@@ -1226,7 +1303,7 @@ impl Panel {
                 else { self.report_only = !self.report_only; self.filter.clear(); self.row = 0; self.offset = 0; }
             }
             KeyCode::Char('/') if self.page == DIAGNOSTICS => self.editing = Some((false, self.filter.clone())),
-            KeyCode::Char('i') if self.page == DIAGNOSTICS => self.editing = Some((true, String::new())),
+            KeyCode::Char('i') if self.page == DIAGNOSTICS && !self.report_only => self.editing = Some((true, String::new())),
             KeyCode::Up if self.page == DIAGNOSTICS => self.row = self.row.saturating_sub(1),
             KeyCode::Down if self.page == DIAGNOSTICS => self.row = (self.row + 1).min(self.visible().len().saturating_sub(1)),
             KeyCode::PageUp if self.page == DIAGNOSTICS => self.row = self.row.saturating_sub(12),
@@ -1235,7 +1312,7 @@ impl Panel {
             KeyCode::Right if self.page == DIAGNOSTICS => self.column = (self.column + 1).min(if self.group == 0 { 3 } else { 1 }),
             KeyCode::Char('[') if self.page == DIAGNOSTICS => { self.group = self.group.saturating_sub(1); self.column = 0; }
             KeyCode::Char(']') if self.page == DIAGNOSTICS => { self.group = (self.group + 1).min(3); self.column = 0; }
-            KeyCode::F(7) if self.page == DIAGNOSTICS => self.details = true,
+            KeyCode::F(7) | KeyCode::Char('j') if self.page == DIAGNOSTICS => self.details = true,
             KeyCode::Char('z') if self.page == DIAGNOSTICS => self.begin_export(),
             KeyCode::Char('b') if self.page == DIAGNOSTICS => {
                 let failed = self.results.values().filter(|c| !c.stale && matches!(c.status, CellStatus::Unavailable | CellStatus::HttpError | CellStatus::DnsError))
@@ -1244,10 +1321,10 @@ impl Panel {
                 if self.selected.is_empty() { self.notice = "Нет разрешённых неуспешных проверок для повтора.".into(); }
                 else { self.begin_review(None); }
             }
-            KeyCode::Char('R') if self.page == DIAGNOSTICS => {
+            KeyCode::Char('R') if self.page == DIAGNOSTICS && !self.report_only => {
                 self.set_overlay(Overlay { excluded: Vec::new(), ..self.overlay.clone() });
             }
-            KeyCode::Char(' ') if self.page == DIAGNOSTICS => {
+            KeyCode::Char(' ') if self.page == DIAGNOSTICS && (!self.report_only || self.catalogue_draft.is_some()) => {
                 let chosen = self.visible().get(self.row).filter(|e| !e.excluded).map(|e| e.hostname.clone());
                 if let Some(host) = chosen {
                     if !self.selected.remove(&host) {
@@ -1256,15 +1333,15 @@ impl Panel {
                     }
                 }
             }
-            KeyCode::Char('s') if self.page == DIAGNOSTICS => {
+            KeyCode::Char('s') if self.page == DIAGNOSTICS && (!self.report_only || self.catalogue_draft.is_some()) => {
                 let hosts = self.visible().iter().filter(|e| !e.excluded).map(|e| e.hostname.clone()).collect::<Vec<_>>();
                 for host in hosts {
                     if self.selected.len() >= MAX_JOB_DOMAINS { break; }
                     self.selected.insert(host);
                 }
             }
-            KeyCode::Char('c') if self.page == DIAGNOSTICS => self.selected.clear(),
-            KeyCode::Char('x') if self.page == DIAGNOSTICS => {
+            KeyCode::Char('c') if self.page == DIAGNOSTICS && (!self.report_only || self.catalogue_draft.is_some()) => self.selected.clear(),
+            KeyCode::Char('x') if self.page == DIAGNOSTICS && !self.report_only => {
                 let chosen = self.visible().get(self.row).map(|e| (e.hostname.clone(), e.excluded));
                 if let Some((host, excluded)) = chosen {
                     let mut next = self.overlay.clone();
@@ -1273,7 +1350,8 @@ impl Panel {
                     self.set_overlay(next);
                 }
             }
-            KeyCode::Enter if self.page == DIAGNOSTICS => self.begin_review(None),
+            KeyCode::Enter if self.page == DIAGNOSTICS && self.report_only => self.details = true,
+            KeyCode::Enter | KeyCode::Char('k') if self.page == DIAGNOSTICS && !self.report_only => self.begin_review(None),
             _ => {}
         }
         Ok(false)
@@ -1376,7 +1454,11 @@ impl Panel {
                 if let Some(doc) = document { text = policy_text(doc); }
                 else { text = "Сохранённая конфигурация не прочитана. Ошибочный файл не перезаписывается автоматически.".into(); }
             }
-            ROUTING => { text = "Откройте общий редактор правил. Сохранение и применение разделены.".into(); }
+            ROUTING => {
+                if let Some(local) = local {
+                    let _ = writeln!(text, "Выберите, какие сайты должны использовать Anti-DPI.\n\nСохранено правил: {} · Anti-DPI: {}\nНовое правило добавляется в конец списка; существующие правила сохраняют приоритет.\nДля изменения порядка, удаления правил и групп сайтов откройте расширенный редактор.\n\nСохранение не применяет настройки и не запускает сеть.", local.rules.len(), yes(local.consent.direct_dpi));
+                } else { text = "Сначала создайте или откройте исправную конфигурацию. Правила пока недоступны.".into(); }
+            }
             _ => {}
         }
         let items = self.actions();
@@ -1398,7 +1480,8 @@ impl Panel {
     fn draw_setup_catalogue(&mut self, frame: &mut Frame<'_>, area: Rect) {
         use ratatui::widgets::Cell;
         let body = Layout::vertical([Constraint::Length(4), Constraint::Min(2), Constraint::Length(2)]).split(area);
-        let header = format!("Шаг 2 из 5 · Выберите сайты\nОтмечено в каталоге: {} из 64 · Поиск: {}\nИсторический список OONI. Выбор не запускает проверку и не сохраняет правила.", self.selected.len(), if self.filter.is_empty() { "нет" } else { &self.filter });
+        let title = if self.catalogue_draft.as_ref().is_some_and(|d| d.adding_sites) { "Добавить сайты · Каталог" } else { "Шаг 2 из 5 · Выберите сайты" };
+        let header = format!("{title}\nОтмечено в каталоге: {} из 64 · Поиск: {}\nИсторический список OONI. Выбор не запускает проверку и не сохраняет правила.", self.selected.len(), if self.filter.is_empty() { "нет" } else { &self.filter });
         frame.render_widget(Paragraph::new(header).style(Style::default().fg(TEXT)).wrap(Wrap { trim: true }), body[0]);
         let height = usize::from(body[1].height.saturating_sub(1)).max(1);
         let len = self.visible().len();
@@ -1433,8 +1516,8 @@ impl Panel {
         let progress = self.worker.as_ref().map_or_else(
             || if self.results.is_empty() { "Ожидает запуска".into() } else { "Результаты последнего задания".into() },
             |w| format!("Выполняется: {}/{} ячеек", self.results.len(), w.total));
-        let view = if self.report_only { "Результаты · v: открыть каталог" } else { "Каталог · v: результаты" };
-        let hint = if self.worker.is_some() { "Esc — остановить проверку" } else if self.report_only { "F7 — объяснение выбранного результата; b — повторить неуспешные" } else { "Пробел — отметить сайт; Enter — проверить выбранные" };
+        let view = if self.report_only { "Результаты проверки" } else { "Каталог сайтов" };
+        let hint = if self.worker.is_some() { "Esc — остановить проверку" } else if self.report_only { "Enter — объяснить результат · Tab — меню действий" } else { "Пробел — отметить сайт · Enter — проверить · Tab — меню действий" };
         let header = format!(
             "{view} · {progress}\nСайтов: {} · отмечено для следующей проверки {}/64 · поиск: {}\n{} · [ ] протокол · ← → ячейка\n{hint}",
             self.visible().len(), self.selected.len(), if self.filter.is_empty() { "нет" } else { &self.filter }, groups[self.group]);
@@ -1576,6 +1659,13 @@ impl Panel {
         } else if self.details {
             super::panel(frame, body, "Подробности проверки", &self.detail_text(), true);
             footer = "Esc назад · F7 закрыть".into();
+        } else if self.page == DIAGNOSTICS && self.diagnostic_menu {
+            let items = self.diagnostic_actions();
+            let text = if self.report_only { "Выберите действие с последним отчётом. Повтор проверки потребует нового согласия." } else { "Выберите действие с каталогом. Проверка сайтов начнётся только после отдельного подтверждения." };
+            let [content, controls] = tui_widgets::action_layout_rows(body, items.len(), 3).unwrap_or([body, Rect::new(body.x, body.bottom(), body.width, 0)]);
+            super::panel(frame, content, "Диагностика · Действия", text, true);
+            Actions { items: &items, selected: self.action }.render_with_focus(frame, controls, true);
+            footer = "↑ ↓ выбор · Enter выполнить · Tab / Esc назад · F2 разделы".into();
         } else if self.page == DIAGNOSTICS {
             if self.catalogue_draft.is_some() { self.draw_setup_catalogue(frame, body); } else { self.draw_diagnostics(frame, body); }
             footer = if let Some((custom, text)) = &self.editing {
@@ -1585,8 +1675,8 @@ impl Panel {
             } else if self.worker.is_some() {
                 "Esc отменить · ↑ ↓ строки · ← → ячейки · [ ] протокол · F7 детали".into()
             } else {
-                if self.report_only { "↑ ↓ сайты · ← → ячейки · F7 объяснение · v каталог · b повтор · z экспорт · F2 разделы".into() }
-                else { "↑ ↓ сайты · Пробел отметить · Enter проверить · / поиск · i свой сайт · F1 помощь · F2 разделы · v результаты".into() }
+                if self.report_only { "↑ ↓ сайты · ← → ячейки · Enter объяснить · Tab действия · F2 разделы".into() }
+                else { "↑ ↓ сайты · Пробел отметить · Enter проверить · Tab действия · F2 разделы".into() }
             };
         } else {
             self.draw_page(frame, body, document.as_ref());
@@ -1733,8 +1823,23 @@ mod tests {
         panel.key(KeyCode::Esc).unwrap();
         panel.key(KeyCode::Esc).unwrap();
         panel.open_page(ROUTING);
-        assert!(panel.routing.is_some());
         capture("anti-dpi-routing", &mut panel);
+        panel.key(KeyCode::Enter).unwrap();
+        capture("anti-dpi-routing-sites", &mut panel);
+        panel.key(KeyCode::Down).unwrap();
+        panel.key(KeyCode::Enter).unwrap();
+        panel.draft.as_mut().unwrap().paste("example.org");
+        panel.key(KeyCode::Enter).unwrap();
+        panel.key(KeyCode::Down).unwrap();
+        panel.key(KeyCode::Down).unwrap();
+        panel.key(KeyCode::Enter).unwrap();
+        assert!(matches!(panel.review, Some(Review::Save(_, _))));
+        capture("anti-dpi-routing-sites-preview", &mut panel);
+        panel.key(KeyCode::Esc).unwrap();
+        panel.key(KeyCode::Esc).unwrap();
+        panel.key(KeyCode::Down).unwrap();
+        panel.key(KeyCode::Enter).unwrap();
+        assert!(panel.routing.is_some());
         panel.routing_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         capture("anti-dpi-routing-editor", &mut panel);
         panel.routing_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -1744,6 +1849,10 @@ mod tests {
         panel.open_page(DIAGNOSTICS);
         panel.key(KeyCode::Char('s')).unwrap();
         capture("anti-dpi-catalog", &mut panel);
+        panel.key(KeyCode::Tab).unwrap();
+        assert!(panel.diagnostic_menu);
+        capture("anti-dpi-diagnostic-actions", &mut panel);
+        panel.key(KeyCode::Esc).unwrap();
         panel.selected = panel.catalog.entries().iter().take(6).map(|entry| entry.hostname.clone()).collect();
         panel.begin_review(None);
         assert!(panel.review.is_some());
@@ -1783,6 +1892,9 @@ mod tests {
         panel.row = 0; panel.offset = 0;
         panel.notice = "СИНТЕТИЧЕСКИЙ ОФЛАЙН-ПРИМЕР · сеть не проверялась".into();
         capture("state-anti-dpi-diagnostic-report", &mut panel);
+        panel.key(KeyCode::Tab).unwrap();
+        capture("state-anti-dpi-report-actions", &mut panel);
+        panel.key(KeyCode::Esc).unwrap();
         assert_eq!(panel.visible().len(), 6);
         panel.key(KeyCode::Char('v')).unwrap();
         assert_eq!(panel.visible().len(), 60);
@@ -1828,6 +1940,47 @@ mod tests {
         terminal.draw(|frame| panel.draw(frame)).unwrap();
         panel.key(KeyCode::Char('c')).unwrap();
         assert!(panel.selected.is_empty());
+    }
+
+    #[test]
+    fn guided_sites_append_rule_without_changing_existing_policy_or_permissions() {
+        let mut doc = Document::parse(include_str!("../../../../examples/anti-dpi.toml")).unwrap();
+        doc.anti_dpi.rules.push(crate::routing::Rule { name: "Existing block".into(), action: crate::routing::Action::Blocked,
+            domains: vec!["full:example.org".into()], ips: Vec::new(), applications: Vec::new() });
+        let mut draft = Draft::new(doc.clone(), Some(Vec::new()));
+        draft.adding_sites = true;
+        draft.values[4] = "example.org, example.net".into();
+        let next = draft.next_document().unwrap();
+        assert_eq!(next.anti_dpi.rules.len(), 2);
+        assert_eq!(next.anti_dpi.rules[0], doc.anti_dpi.rules[0]);
+        assert_eq!(next.anti_dpi.rules[1].action, crate::routing::Action::DirectDpi);
+        assert_eq!(next.anti_dpi.rules[1].domains, ["full:example.net", "full:example.org"]);
+        assert_eq!(next.anti_dpi.consent, doc.anti_dpi.consent);
+        assert_eq!(next.anti_dpi.resolver, doc.anti_dpi.resolver);
+        assert_eq!(next.anti_dpi.proxy, doc.anti_dpi.proxy);
+        assert_eq!(next.anti_dpi.revision, doc.anti_dpi.revision + 1);
+    }
+
+    #[test]
+    fn diagnostic_menu_navigation_is_offline_and_report_enter_explains() {
+        let path = std::env::temp_dir().join(format!("theia-f20-menu-{}", std::process::id())).join("anti-dpi.toml");
+        let mut panel = Panel::new(path.clone()).unwrap();
+        panel.key(KeyCode::Esc).unwrap();
+        panel.open_page(DIAGNOSTICS);
+        panel.key(KeyCode::Tab).unwrap();
+        assert!(panel.diagnostic_menu);
+        panel.key(KeyCode::Down).unwrap();
+        assert!(panel.selected.is_empty());
+        panel.key(KeyCode::Enter).unwrap();
+        assert_eq!(panel.selected.len(), 1);
+        assert!(panel.review.is_none());
+        assert!(panel.worker.is_none());
+        panel.report_hosts = panel.selected.clone();
+        panel.report_only = true;
+        panel.key(KeyCode::Enter).unwrap();
+        assert!(panel.details);
+        assert!(panel.review.is_none());
+        assert!(!path.exists());
     }
 
     #[test]
