@@ -10737,8 +10737,11 @@ mod tests {
         let editor = Editor::load(Role::Server, &path).unwrap();
         let mut panel = RoutingPanel::new(&editor);
         let area = Rect::new(0, 0, 120, 40);
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
-        terminal.draw(|frame| panel.render(frame, area, true)).unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| panel.render(frame, area, true))
+            .unwrap();
         for name in ["alpha", "beta", "gamma"] {
             panel.edit(None);
             let (_, values, _) = panel.fields.as_mut().unwrap();
@@ -10752,7 +10755,9 @@ mod tests {
                 .unwrap();
             panel.select_at(area, target.0, target.1);
             assert_eq!(panel.fields.as_ref().unwrap().2, 3);
-            terminal.draw(|frame| panel.render(frame, area, true)).unwrap();
+            terminal
+                .draw(|frame| panel.render(frame, area, true))
+                .unwrap();
             panel.key(press(KeyCode::Enter), None);
             assert!(panel.fields.is_none());
         }
@@ -10762,9 +10767,18 @@ mod tests {
         panel.select_at(area, report.x + 1, report.y + 5);
         assert_eq!(panel.selected, 1);
         assert!(panel.action_focus.is_none());
-        terminal.draw(|frame| panel.render(frame, area, true)).unwrap();
-        terminal.draw(|frame| panel.render(frame, area, false)).unwrap();
-        let names = panel.settings.rules.iter().map(|r| r.name.as_str()).collect::<Vec<_>>();
+        terminal
+            .draw(|frame| panel.render(frame, area, true))
+            .unwrap();
+        terminal
+            .draw(|frame| panel.render(frame, area, false))
+            .unwrap();
+        let names = panel
+            .settings
+            .rules
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>();
         assert_eq!(names, ["alpha", "beta", "gamma"]);
         assert!(!editor.dirty());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);

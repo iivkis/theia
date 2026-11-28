@@ -1657,7 +1657,8 @@ mod tests {
             head_fixture(
                 b"HTTP/1.1 403 Forbidden\r\nX-Test: complete\r\n\r\n".to_vec(),
                 "diagnostic.example"
-            ).await,
+            )
+            .await,
             Ok(403)
         );
     }
