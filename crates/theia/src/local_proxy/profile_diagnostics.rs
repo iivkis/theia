@@ -520,7 +520,7 @@ async fn session(
             let result = Box::pin(https(
                 &carrier,
                 cache,
-                &domain,
+                (&domain, 443),
                 expected,
                 true,
                 action,
@@ -586,7 +586,7 @@ async fn session(
                     match Box::pin(udp_https(
                         &carrier,
                         cache,
-                        &domain,
+                        (&domain, 443),
                         expected,
                         true,
                         action,
@@ -617,7 +617,7 @@ async fn session(
                     match Box::pin(https(
                         transport,
                         cache,
-                        &domain,
+                        (&domain, 443),
                         expected,
                         false,
                         action,
@@ -647,7 +647,7 @@ async fn session(
                     match Box::pin(udp_https(
                         transport,
                         cache,
-                        &domain,
+                        (&domain, 443),
                         expected,
                         false,
                         action,
@@ -742,16 +742,17 @@ async fn check_carrier(
 async fn https(
     carrier: &Carrier,
     cache: &super::Cache,
-    name: &str,
+    target: (&str, u16),
     digest: [u8; 32],
     allow_dpi: bool,
     action: Action,
     tls: Arc<rustls::ClientConfig>,
 ) -> Result<(u16, ActualRoute, u128), ClientError> {
+    let (name, _) = target;
     let started = Instant::now();
     timeout(Duration::from_secs(12), async {
         let authorization = cache.policy.pin(digest)?;
-        let mut routed = egress::diagnostic_open(carrier, cache, name, digest, allow_dpi).await?;
+        let mut routed = egress::diagnostic_open(carrier, cache, target, digest, allow_dpi).await?;
         let direct = matches!(&routed.tunnel, ProxyTunnel::Direct(_));
         let observed = Arc::new(AtomicU8::new(routed.open_code()));
         let strategy = if let ProxyTunnel::Dpi(route) = &mut routed.tunnel {
@@ -1023,13 +1024,14 @@ async fn proxy_https(
 async fn udp_https(
     carrier: &Carrier,
     cache: &super::Cache,
-    name: &str,
+    target: (&str, u16),
     digest: [u8; 32],
     automatic: bool,
     action: Action,
     tls: Arc<rustls::ClientConfig>,
 ) -> Result<(u16, ActualRoute, u128), ClientError> {
     use crate::quic_core::{dial, h3_adapter, handshake_udp, wire::Version};
+    let (name, port) = target;
     let started = Instant::now();
     timeout(Duration::from_secs(15), async {
         let observed = Arc::new(AtomicU8::new(0));
@@ -1059,7 +1061,7 @@ async fn udp_https(
                 pending.push(buf[..n].to_vec());
             }
             authorization.check()?;
-            let routed = egress::diagnostic_udp(carrier, cache, name, digest, &observed, &candidate, &pending[0]).await?;
+            let routed = egress::diagnostic_udp(carrier, cache, target, digest, &observed, &candidate, &pending[0]).await?;
             routed.record_transport(&observed);
             local_selected.set(matches!(&routed.tunnel, crate::udp_relay::Tunnel::VerifiedLocal(..)));
             if !local_selected.get() && !matches!(observed.load(Ordering::Relaxed) >> 2, 2 | 3) { return Err(ClientError::Protocol); }
@@ -1106,7 +1108,7 @@ async fn udp_https(
             builder.max_field_section_size(u64::from(crate::transport_policy::MAX_HEADER_LIST_BYTES));
             let (mut driver, mut sender) = builder.build::<_, _, bytes::Bytes>(transport).await.map_err(|_| ClientError::Http3)?;
             let request = async {
-                let request = http::Request::head(format!("https://{name}/")).body(()).map_err(|_| ClientError::Configuration)?;
+                let request = http::Request::head(format!("https://{name}:{port}/")).body(()).map_err(|_| ClientError::Configuration)?;
                 let mut stream = sender.send_request(request).await.map_err(|_| ClientError::Http3)?;
                 stream.finish().await.map_err(|_| ClientError::Http3)?;
                 for _ in 0..5 {
@@ -1155,6 +1157,103 @@ fn status(line: &[u8]) -> Result<u16, ClientError> {
         return Err(ClientError::Protocol);
     }
     Ok(code)
+}
+
+
+#[cfg(test)]
+pub(super) async fn transport_fixture(client: &ProxyClient, cert: &rcgen::CertifiedKey, action: Action, label: &'static str) {
+    // All target I/O remains on loopback. The production call sites always
+    // use port 443; the internal target tuple lets fixtures reserve ephemeral
+    // ports without changing the user-visible diagnostics contract.
+    let ProxyClient::Direct(carrier_client) = client else { panic!("own TLS fixture"); };
+    let carrier = &carrier_client.carrier;
+    let cache = client.routing_cache();
+    cache.dpi.set_enabled(false);
+    let digest = client.routing_policy().await.unwrap().digest();
+    let name = "localhost";
+    let (observed_action, ips, pin) = egress::diagnostic_target(carrier, cache, name, digest).await.unwrap();
+    assert_eq!(observed_action, action);
+    assert!(ips.is_empty());
+    assert!(pin.check().is_ok());
+    assert!(egress::diagnostic_target(carrier, cache, name, [0; 32]).await.is_err());
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert.cert.der().clone()).unwrap();
+    let tls = Arc::new(crate::net::tls::application_probe(roots.clone()).unwrap());
+    let server_tls = Arc::new(crate::net::tls::server_tls13_builder().unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.cert.der().clone()], rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into()).unwrap());
+    for automatic in [true, false] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        if action == Action::Direct && !automatic {
+            assert!(matches!(Box::pin(https(carrier, cache, (name, port), digest, automatic, action, tls.clone())).await,
+                Err(ClientError::Open(crate::protocol::ErrorCode::PolicyDenied))));
+            assert!(timeout(Duration::from_millis(20), listener.accept()).await.is_err());
+            continue;
+        }
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_tls.clone());
+        let origin = async {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = acceptor.accept(socket).await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                assert!(request.len() < 1024);
+                request.push(socket.read_u8().await.unwrap());
+            }
+            assert_eq!(request, b"HEAD / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            socket.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await.unwrap();
+            let _ = socket.shutdown().await;
+        };
+        let (result, ()) = timeout(Duration::from_secs(8), async {
+            tokio::join!(Box::pin(https(carrier, cache, (name, port), digest, automatic, action, tls.clone())), origin)
+        }).await.expect("bounded TCP diagnostic fixture");
+        let (code, route, _) = result.unwrap();
+        assert_eq!(code, 204);
+        match route {
+            ActualRoute::Direct => assert_eq!(action, Action::Direct),
+            ActualRoute::Xhttp { carrier, fallback, .. } => {
+                assert_ne!(action, Action::Direct);
+                assert_eq!(carrier, label);
+                assert_eq!(matches!(fallback, Some(FallbackCause::Disabled)), automatic && action == Action::DirectDpi);
+            }
+            _ => panic!("unexpected diagnostic route"),
+        }
+    }
+    if action == Action::Direct { return; }
+    let quic_tls = Arc::new(crate::net::tls::roots_tls13(roots, b"h3").unwrap());
+    for automatic in [true, false] {
+        // Use the resolver's first permitted localhost candidate for UDP;
+        // unlike TCP, a connected UDP socket cannot detect an absent peer.
+        let bind = tokio::net::lookup_host(("localhost", 0)).await.unwrap()
+            .find(|addr| addr.ip().is_loopback()).unwrap();
+        let endpoint = crate::quinn_reference::server_endpoint(bind, vec![cert.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into()).unwrap();
+        let port = endpoint.local_addr().unwrap().port();
+        let (done, mut completed) = oneshot::channel::<()>();
+        let origin = async {
+            let conn = crate::quinn_reference::accept(endpoint.accept().await.unwrap()).await.unwrap();
+            let mut driver = h3::server::builder().build::<_, bytes::Bytes>(h3_quinn::Connection::new(conn)).await.unwrap();
+            let (request, mut stream) = driver.accept().await.unwrap().unwrap().resolve_request().await.unwrap();
+            assert_eq!(request.method(), http::Method::HEAD);
+            assert_eq!(request.uri().path(), "/");
+            assert!(stream.recv_data().await.unwrap().is_none());
+            stream.send_response(http::Response::builder().status(204).body(()).unwrap()).await.unwrap();
+            stream.finish().await.unwrap();
+            tokio::select! {
+                _ = &mut completed => {},
+                _ = driver.accept() => {},
+            }
+        };
+        let probe = async {
+            let result = Box::pin(udp_https(carrier, cache, (name, port), digest, automatic, action, quic_tls.clone())).await;
+            let _ = done.send(());
+            result
+        };
+        let (result, ()) = timeout(Duration::from_secs(12), async { tokio::join!(probe, origin) }).await.expect("bounded independent HTTP/3 diagnostic fixture");
+        let (code, route, _) = result.unwrap();
+        assert_eq!(code, 204);
+        assert!(matches!(route, ActualRoute::Xhttp { carrier, fallback, .. } if carrier == label && matches!(fallback, Some(FallbackCause::Disabled)) == (automatic && action == Action::DirectDpi)));
+    }
 }
 
 #[cfg(test)]

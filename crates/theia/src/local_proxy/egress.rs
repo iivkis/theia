@@ -488,15 +488,15 @@ pub(super) async fn diagnostic_target(
 pub(super) async fn diagnostic_open(
     carrier: &Carrier,
     cache: &Cache,
-    name: &str,
+    target: (&str, u16),
     digest: [u8; 32],
     allow_dpi: bool,
 ) -> Result<RoutedTcp, ClientError> {
     let (egress, flow) = route_egress(
         carrier,
         cache,
-        Address::Dns(name.to_owned()),
-        443,
+        Address::Dns(target.0.to_owned()),
+        target.1,
         EgressRequest::Tcp { allow_dpi },
         Some(digest),
     )
@@ -512,7 +512,7 @@ pub(super) async fn diagnostic_open(
 pub(super) async fn diagnostic_udp(
     carrier: &Carrier,
     cache: &Cache,
-    name: &str,
+    target: (&str, u16),
     digest: [u8; 32],
     observed: &Arc<std::sync::atomic::AtomicU8>,
     candidate: &crate::routing::dpi::udp::Candidate,
@@ -521,8 +521,8 @@ pub(super) async fn diagnostic_udp(
     let (egress, flow) = route_egress(
         carrier,
         cache,
-        Address::Dns(name.to_owned()),
-        443,
+        Address::Dns(target.0.to_owned()),
+        target.1,
         EgressRequest::Udp {
             candidate,
             first,
