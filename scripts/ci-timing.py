@@ -57,6 +57,11 @@ TARGET_GROUP_MVP_JOBS = MVP_MERGED_JOBS | frozenset({
 # prerequisite inventory still includes the Windows production-feature lint.
 COMPACT_MVP_JOBS = MVP_MERGED_JOBS | frozenset({"Native prerequisite (windows-clippy)"})
 
+# Keep the historical 80% inventory for old snapshots; the current contract
+# has the same 23 jobs but a 50% production coverage threshold.
+CURRENT_MVP_JOBS = (COMPACT_MVP_JOBS - {"Production line coverage >= 80%"}
+                    | {"Production line coverage >= 50%"})
+
 
 class EvidenceError(ValueError):
     """Incomplete or incomparable timing evidence."""
@@ -107,7 +112,9 @@ def summarize(run: dict, response: dict) -> dict:
     if merged and isinstance(jobs, list):
         names = {job.get("name") for job in jobs if isinstance(job, dict)
                  and isinstance(job.get("name"), str)}
-        if names == COMPACT_MVP_JOBS:
+        if names == CURRENT_MVP_JOBS:
+            expected_jobs = CURRENT_MVP_JOBS
+        elif names == COMPACT_MVP_JOBS:
             expected_jobs = COMPACT_MVP_JOBS
         elif names == TARGET_GROUP_MVP_JOBS:
             expected_jobs = TARGET_GROUP_MVP_JOBS

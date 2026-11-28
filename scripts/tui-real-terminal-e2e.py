@@ -31,6 +31,7 @@ class Terminal:
         self.stream = pyte.Stream(self.screen)
         self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self.lock = threading.Lock()
+        self.changed = threading.Condition(self.lock)
         self.error = None
         self.posix_master = None
         self.win = None
@@ -72,6 +73,7 @@ class Terminal:
                             text = chunk if isinstance(chunk, str) else self.decoder.decode(chunk)
                             self.raw += text
                             self.stream.feed(text)
+                            self.changed.notify_all()
                     elif not self.win.isalive():
                         break
                     else:
@@ -95,10 +97,15 @@ class Terminal:
                         text = self.decoder.decode(chunk)
                         self.raw += text
                         self.stream.feed(text)
+                        self.changed.notify_all()
         except EOFError:
             pass
         except Exception as exc:
-            self.error = str(exc)
+            with self.changed:
+                self.error = str(exc)
+        finally:
+            with self.changed:
+                self.changed.notify_all()
 
     def snapshot(self):
         with self.lock:
@@ -110,14 +117,19 @@ class Terminal:
 
     def wait(self, text, since=0, seconds=TIMEOUT):
         deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline:
-            if text in self.visible():
-                return
-            if self.error:
-                raise AssertionError("PTY read failed: " + self.error)
-            if not self.alive():
-                raise AssertionError("TUI exited before modal " + repr(text))
-            time.sleep(0.05)
+        # Wake on real terminal output rather than adding a polling delay
+        # to each screen transition. The bounded fallback also detects exits
+        # without output; the original deadline and visible-screen assertion
+        # remain unchanged.
+        with self.changed:
+            while (remaining := deadline - time.monotonic()) > 0:
+                if text in "\n".join(self.screen.display):
+                    return
+                if self.error:
+                    raise AssertionError("PTY read failed: " + self.error)
+                if not self.alive():
+                    raise AssertionError("TUI exited before modal " + repr(text))
+                self.changed.wait(timeout=min(remaining, 0.2))
         # Never dump the whole terminal: other TUI screens may contain secrets.
         raise AssertionError("Missing visible TUI text in real terminal: " + repr(text))
 

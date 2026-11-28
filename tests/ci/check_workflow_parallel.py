@@ -86,7 +86,9 @@ require("rust-cache" not in spec and "actions/cache" not in spec and "--force" n
         "privileged publication cannot restore executable caches or force-push")
 contains(gate, "always() && " + dev_merge, 'results.get(name, {}).get("result") != "success"',
          'native != "true"', "TESTED_SHA:", "MERGED_SHA:", "native CI passed on exact source",
-         "actions: read", 'repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT',
+         "actions: read", 'https://api.github.com/repos/{repo}/actions/runs/{run_id}/attempts/{attempt}',
+         'urlopen(request, timeout=10)', 'run.get("id") != int(os.environ["GITHUB_RUN_ID"])',
+         'run.get("run_attempt") != int(os.environ["GITHUB_RUN_ATTEMPT"])',
          'run["created_at"]', 'run["run_started_at"]', "elapsed > 300",
          'failed.append("wall-clock budget (300s)")')
 require(workflow.count("contents: write") == 1 and "contents: write" in spec
