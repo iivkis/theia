@@ -264,10 +264,38 @@ pub(super) fn udp_strategy(
     first: &[u8],
     stun_enabled: bool,
 ) -> Option<crate::routing::dpi::UdpStrategy> {
+    udp_strategy_impl(address, port, candidate, first, stun_enabled, false)
+}
+
+pub(super) fn udp_strategy_standalone(
+    address: &Address,
+    port: u16,
+    candidate: &crate::routing::dpi::udp::Candidate,
+    first: &[u8],
+    stun_enabled: bool,
+) -> Option<crate::routing::dpi::UdpStrategy> {
+    udp_strategy_impl(address, port, candidate, first, stun_enabled, true)
+}
+
+fn udp_strategy_impl(
+    address: &Address,
+    port: u16,
+    candidate: &crate::routing::dpi::udp::Candidate,
+    first: &[u8],
+    stun_enabled: bool,
+    standalone: bool,
+) -> Option<crate::routing::dpi::UdpStrategy> {
     use crate::quic_core::wire::Version;
     use crate::routing::dpi::{
         udp::{BindingStrategy, Candidate},
         UdpStrategy,
+    };
+    let transformable = |sni: &str| {
+        if standalone {
+            crate::routing::packet_modify::quic_initial_transform(first, sni).is_some()
+        } else {
+            crate::routing::packet_modify::quic_initial_datagrams(first, sni).is_some()
+        }
     };
     // The classified name must match the explicit target, and the actual
     // first datagram must be transformable. A probe alone is not consent.
@@ -275,7 +303,7 @@ pub(super) fn udp_strategy(
         (Address::Dns(name), Candidate::QuicH3(sni))
             if port == 443
                 && crate::routing::domain_name(name).as_deref() == Ok(sni.as_str())
-                && crate::routing::packet_modify::quic_initial_datagrams(first, sni).is_some()
+                && transformable(sni)
                 && crate::reality_quic_wire::long(first)
                     .is_some_and(|h| h.version == Version::V1.wire()) =>
         {
@@ -284,7 +312,7 @@ pub(super) fn udp_strategy(
         (Address::Dns(name), Candidate::QuicV2H3(sni))
             if port == 443
                 && crate::routing::domain_name(name).as_deref() == Ok(sni.as_str())
-                && crate::routing::packet_modify::quic_initial_datagrams(first, sni).is_some()
+                && transformable(sni)
                 && crate::reality_quic_wire::long(first)
                     .is_some_and(|h| h.version == Version::V2.wire()) =>
         {

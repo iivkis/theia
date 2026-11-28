@@ -44,6 +44,11 @@ pub(crate) use strategy::Strategy;
 use strategy::{Key, Lease, Verdict};
 use tokio::{io::AsyncWriteExt, net::TcpStream, time::timeout};
 
+// Owner-directed experimental standalone development build. Availability
+// is not independent F-20 acceptance. Stable/product acceptance still
+// requires separate recorded evidence and disabling experimental enablement.
+pub(crate) const STANDALONE_EXPERIMENTAL: bool = true;
+
 const ATTEMPT: Duration = Duration::from_secs(2);
 const PROBE_WAVE: usize = 2;
 const OPEN_BUDGET: Duration = Duration::from_secs(6);
@@ -123,6 +128,11 @@ impl UdpStrategy {
         // transformed QUIC probe (ordinary reachability is insufficient).
         const ACCEPTED: &[UdpStrategy] = &[];
         !matches!(self, Self::StunBinding(udp::BindingStrategy::Plain)) && ACCEPTED.contains(&self)
+    }
+
+    pub(crate) fn available_for_standalone(self) -> bool {
+        !matches!(self, Self::StunBinding(udp::BindingStrategy::Plain))
+            && (self.accepted_for_standalone() || STANDALONE_EXPERIMENTAL)
     }
 
     pub(crate) fn accepted_for_proxy(self) -> bool {
@@ -580,7 +590,7 @@ impl Engine {
         pin: &PolicyLease,
         strategy: UdpStrategy,
     ) -> Result<Option<VerifiedUdp>, ClientError> {
-        if !self.standalone || !strategy.accepted_for_standalone() {
+        if !self.standalone || !strategy.available_for_standalone() {
             return Ok(None);
         }
         self.open_udp_pinned(name, port, ips, pin, strategy).await
@@ -595,7 +605,7 @@ impl Engine {
         strategy: UdpStrategy,
     ) -> Result<Option<VerifiedUdp>, ClientError> {
         pin.check_owner(&self.policy)?;
-        if self.standalone && !strategy.accepted_for_standalone() {
+        if self.standalone && !strategy.available_for_standalone() {
             return Ok(None);
         }
         let policy = pin.digest();
@@ -671,18 +681,41 @@ impl Engine {
                                 if !probe::fits(deadline, budget, ATTEMPT) {
                                     return Ok(None);
                                 }
-                                let revoked = async {
-                                    loop {
-                                        if !live() {
-                                            return Err(stale_policy());
+                                if self.standalone {
+                                    let observed = diagnostic::quic_https(
+                                        name,
+                                        address,
+                                        key.network,
+                                        version,
+                                        true,
+                                        config,
+                                        &live,
+                                        (tokio::time::Instant::now() + budget).min(deadline),
+                                    ).await;
+                                    match observed.result {
+                                        Ok(Some(200..=299)) if observed.transformed && observed.verified_tls => {
+                                            Some(udp::ProbeTiming { rtt: None })
                                         }
-                                        tokio::time::sleep(Duration::from_millis(50)).await;
+                                        Err(diagnostic::Failure::Denied) => return Err(stale_policy()),
+                                        Err(diagnostic::Failure::Tls | diagnostic::Failure::Protocol) => {
+                                            return Err(ClientError::Tls)
+                                        }
+                                        _ => None,
                                     }
-                                };
-                                tokio::select! {
-                                    biased;
-                                    result = revoked => result?,
-                                    result = udp::probe_quic_checked(name, address, Some(key.network), config, version, budget) => result?,
+                                } else {
+                                    let revoked = async {
+                                        loop {
+                                            if !live() {
+                                                return Err(stale_policy());
+                                            }
+                                            tokio::time::sleep(Duration::from_millis(50)).await;
+                                        }
+                                    };
+                                    tokio::select! {
+                                        biased;
+                                        result = revoked => result?,
+                                        result = udp::probe_quic_checked(name, address, Some(key.network), config, version, budget) => result?,
+                                    }
                                 }
                             }
                             UdpStrategy::StunBinding(binding) => {
@@ -922,7 +955,7 @@ impl Engine {
             || (self.standalone
                 && !Strategy::ALL
                     .into_iter()
-                    .any(Strategy::accepted_for_standalone))
+                    .any(Strategy::available_for_standalone))
         {
             return Ok(None);
         }
@@ -979,7 +1012,7 @@ impl Engine {
                             .ranked(&key)
                             .into_iter()
                             .filter(|strategy| {
-                                !self.standalone || strategy.accepted_for_standalone()
+                                !self.standalone || strategy.available_for_standalone()
                             })
                             .collect::<Vec<_>>();
                         if let Some((
