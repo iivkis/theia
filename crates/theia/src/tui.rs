@@ -527,9 +527,13 @@ fn page_actions_for(
             ('M', "Регистрация материалов"),
             ('l', "Публичная ссылка (без ключа доступа)"),
         ],
-        (Role::Client, 2) => &[('i', "Ввести ключ")],
+        (Role::Client, 2) => &[
+            ('i', "Вставить ключ"),
+            ('f', "Выбрать файл ключа"),
+            ('Q', "Импортировать QR из изображения"),
+        ],
         (Role::Client, 3) if cfg!(windows) => &[
-            ('p', "Подключиться / отключиться"),
+            ('p', "Управлять системным прокси"),
             ('V', "Запустить / остановить локальный прокси (диагностика)"),
             ('L', "Выбрать другой профиль"),
             ('A', "Выбрать активный профиль"),
@@ -575,6 +579,7 @@ fn page_actions_for(
                     | 'E' | 'Q',
                 ) if editor.write_uncertain() => false,
                 (Role::Client, 'T') => has_record && !editor.dirty() && !editor.write_uncertain(),
+                (Role::Client, 'i' | 'f' | 'Q') => !editor.dirty() && !editor.write_uncertain(),
                 (_, 'l' | 'M' | 'w' | 'K') if !advanced => false,
                 (Role::Server, 'V' | 'K') | (Role::Client, 'K') => has_record && reality,
                 (_, 'E') => has_record && !reality,
@@ -587,7 +592,7 @@ fn page_actions_for(
                 (_, 'l' | 'M') => has_record,
                 (Role::Server, 'U') => selected.is_some_and(|(id, _, _)| editor.user_deletable(id)),
                 (Role::Server, 'j') => selected.is_some() && !editor.write_uncertain(),
-                (Role::Server, 'S') => editor.dirty() && !editor.write_uncertain(),
+                (_, 'S') => editor.dirty() && !editor.write_uncertain(),
                 _ => true,
             };
             let label = match (role, key) {
@@ -693,7 +698,7 @@ fn recommended_step(editor: &Editor, owned_running: bool) -> (char, &'static str
     } else if owned_running {
         (
             if cfg!(windows) { 'p' } else { 'V' },
-            "Клиент запущен или запускается. Откройте его состояние для проверки туннеля.",
+            "Откройте состояние клиента: готовность прокси и прохождение запросов требуют отдельной проверки.",
         )
     } else if !editor.selected_record_is_active() {
         (
@@ -4293,6 +4298,19 @@ impl Interaction {
                                             }
                                             Err(message) => editor.error = Some(message.into()),
                                         }
+                                    }
+                                    return false;
+                                }
+                                if role == Role::Client
+                                    && self.workspace_page == 2
+                                    && matches!(ch, 'f' | 'Q')
+                                {
+                                    // Both file formats use the same local picker and guarded
+                                    // parser. Selecting a source does not read or trust it.
+                                    self.workspace_focus = WorkspaceFocus::Fields;
+                                    self.update(model, KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+                                    if self.importing.is_some() {
+                                        self.update(model, KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
                                     }
                                     return false;
                                 }
@@ -7931,12 +7949,12 @@ fn client_mode_lines(editor: &Editor, running: bool) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::styled(
             if running {
-                "● Локальный прокси запущен или запускается (не проверка связи с сервером)"
+                "Есть локальный сеанс этой панели; готовность не подтверждена здесь"
             } else {
-                "○ Локальный прокси не запущен"
+                "Нет отслеживаемого локального сеанса этой панели"
             },
             Style::default()
-                .fg(if running { ACCENT } else { MUTED })
+                .fg(MUTED)
                 .add_modifier(Modifier::BOLD),
         ),
         Line::raw(format!("Активный профиль: {active}")),
@@ -7970,16 +7988,18 @@ fn client_mode_lines(editor: &Editor, running: bool) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         ),
         Line::raw(if cfg!(windows) {
-            "Основной режим MVP. Для приложений, использующих прокси Windows. Подключение требует подтверждения."
+            "Настройки Windows: не проверены на этом экране. Откройте управление для проверки и подключения."
         } else {
-            "Основной режим MVP; Linux backend пока недоступен. Возможен локальный диагностический прокси."
+            "Настройки Linux не поддерживаются в текущем клиенте. Доступен ручной локальный прокси."
         }),
+        Line::raw("Запросы приложений: не проверены. Прокси не охватывает весь трафик устройства."),
         Line::raw(""),
         Line::styled(
             "Локальный прокси",
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         ),
-        Line::raw(format!("HTTP {http} · SOCKS5 {socks}")),
+        Line::raw(format!("HTTP {http}")),
+        Line::raw(format!("SOCKS5 {socks}")),
         Line::styled(
             "Ручной режим диагностики. Остальной трафик не защищается.",
             Style::default().fg(MUTED),
@@ -8160,17 +8180,10 @@ fn draw_page(
     if page == 0 {
         let local = if role == Role::Server {
             ui.map_or("Неизвестно", |u| u.server_process.status())
-        } else if ui.is_some_and(|u| {
-            u.client_background
-                .as_ref()
-                .is_some_and(StatusPanel::local_running)
-                || u.reality_status
-                    .as_ref()
-                    .is_some_and(StatusPanel::local_running)
-        }) {
-            "Локальный процесс запущен или запускается"
+        } else if ui.is_some_and(|u| u.owned_running(Role::Client)) {
+            "Есть сеанс этой панели; проверьте состояние подключения"
         } else {
-            "Локальный процесс не запущен"
+            "Нет отслеживаемого сеанса этой панели"
         };
         let title = if role == Role::Server {
             "Обзор сервера"
@@ -8297,7 +8310,8 @@ fn draw_page(
         });
         let focused = focus == WorkspaceFocus::Actions;
         let lines = vec![
-            Line::raw("Вставьте личный ключ Theia или выберите файл / QR (F6)."),
+            Line::raw("Получите личный ключ Theia у администратора."),
+            Line::raw("Вставьте ссылку, выберите файл ключа или изображение QR."),
             Line::raw("Тип подключения определится автоматически."),
             Line::styled(
                 input.filter(|n| *n > 0).map_or_else(
@@ -8660,7 +8674,7 @@ fn draw_workspace_records(
 fn welcome_form(role: Role, selected: usize) -> Form {
     let (reality, description, lead) = match role {
         Role::Server => ("Настроить новый сервер (REALITY)", "Рекомендуется: не нужен собственный TLS-сертификат", "Настраиваете сервер впервые? Выберите создание REALITY. Если Theia уже настроена, откройте существующий файл."),
-        Role::Client => ("Импортировать ключ Theia", "Ссылка или файл · тип определяется автоматически", "Настраиваете клиент впервые? Получите приглашение у администратора. Если профили уже сохранены, откройте их файл."),
+        Role::Client => ("Импортировать ключ Theia", "Вставка, файл или QR · тип определяется автоматически", "Настраиваете клиент впервые? Получите приглашение у администратора. Если профили уже сохранены, откройте их файл."),
     };
     Form {
         fields: vec![
@@ -9851,12 +9865,14 @@ mod tests {
         ] {
             assert!(screen.contains(label), "missing {label}");
         }
+        assert!(screen.contains("Запросы приложений: не проверены"));
+        assert!(!screen.contains("Системный прокси включён"));
         assert!(!ui.owned_running(Role::Client));
         assert!(ui.reality_status.is_none());
         let keys = page_actions(Role::Client, 3, ui.editor.as_ref());
         assert_eq!(keys.iter().any(|a| a.key == 'p'), cfg!(windows));
         #[cfg(windows)]
-        assert_eq!(keys[0].label, "Подключиться / отключиться");
+        assert_eq!(keys[0].label, "Управлять системным прокси");
         ui.update(&mut model, press(KeyCode::Down));
         assert!(!ui.owned_running(Role::Client));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
@@ -10281,6 +10297,8 @@ mod tests {
         assert!(ui.importing.is_none());
         let screen = rendered_interaction(120, 40, &model, &ui);
         assert!(screen.contains("Вставьте ключ (скрыто)"));
+        assert!(screen.contains("Выбрать файл ключа"));
+        assert!(screen.contains("Импортировать QR из изображения"));
         assert!(screen.contains("Разделы"));
         ui.paste_workspace_import(&Model::new(None), "theia://v1/test");
         assert!(ui.importing.is_none());
@@ -10292,10 +10310,15 @@ mod tests {
         assert!(screen.contains("Разделы"));
         ui.update(&mut model, press(KeyCode::Esc));
         assert!(ui.importing.is_none());
-        ui.update(&mut model, press(KeyCode::F(6)));
-        assert!(ui.import_browser.is_some());
-        ui.update(&mut model, press(KeyCode::Esc));
-        ui.update(&mut model, press(KeyCode::Esc));
+        for source in ['f', 'Q'] {
+            ui.workspace_focus = WorkspaceFocus::Actions;
+            ui.update(&mut model, press(KeyCode::Char(source)));
+            assert!(ui.import_browser.is_some());
+            ui.update(&mut model, press(KeyCode::Esc));
+            ui.update(&mut model, press(KeyCode::Esc));
+            assert!(ui.importing.is_none());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
         ui.select_workspace_page(Role::Client, 4);
         ui.update(&mut model, press(KeyCode::Enter));
         let screen = rendered_interaction(120, 40, &model, &ui);
@@ -10385,8 +10408,7 @@ mod tests {
         assert_eq!(recommendation_page(Role::Server, 'b'), (2, 'b'));
         assert_eq!(recommendation_page(Role::Server, 'G'), (2, 'G'));
         let imports = page_actions(Role::Client, 2, None);
-        assert_eq!(imports.len(), 1);
-        assert_eq!(imports[0].key, 'i');
+        assert_eq!(imports.iter().map(|a| a.key).collect::<Vec<_>>(), vec!['i', 'f', 'Q']);
         assert_eq!(recommendation_page(Role::Client, 'i'), (2, 'i'));
         assert_eq!(recommendation_page(Role::Client, 'A'), (3, 'A'));
         assert_eq!(recommendation_page(Role::Server, 'S'), (5, 'S'));
@@ -10892,6 +10914,7 @@ mod tests {
         std::fs::write(&path, include_str!("../../../examples/client.toml")).unwrap();
         let editor = Editor::load(Role::Client, &path).unwrap();
         let items = page_actions(Role::Client, 1, Some(&editor));
+        assert!(!page_actions(Role::Client, 5, Some(&editor)).iter().any(|a| a.key == 'S'));
         assert!(!items.iter().any(|a| matches!(a.key, 'A' | 'D')));
         assert!(!items.iter().any(|a| matches!(a.key, 'V' | 'i' | 'A')));
         assert!(page_actions(Role::Client, 3, Some(&editor))
