@@ -28,7 +28,7 @@ use std::{
 
 fn column_label(id: &str) -> &str {
     match id {
-        "direct" => "Прямой",
+        "direct" | "quic_v1_direct" | "quic_v2_direct" | "stun_direct" => "Прямой",
         "tcp_header" => "Header",
         "tcp_middle" => "Middle",
         "tcp_balanced" => "Balanced",
@@ -93,7 +93,8 @@ fn reason(value: Reason) -> &'static str {
     match value {
         Reason::None => "Нет ошибки",
         Reason::AwaitingAcceptance => "Способ пока не доступен в этой версии",
-        Reason::MissingEndpointMetadata => "Нет подтверждённых данных о совместимом endpoint",
+        Reason::MissingEndpointMetadata => "Нет сведений о поддержке протокола этим сервером",
+        Reason::ConsentRequired => "Нужно отдельное разрешение STUN в настройках",
         Reason::Budget => "Исчерпан бюджет задания",
         Reason::Cancelled => "Отменено пользователем",
         Reason::ContextChanged => "Изменился контекст политики или сети",
@@ -127,7 +128,7 @@ fn cell_explanation(cell: &CellResult) -> &'static str {
     }
     match cell.status {
         CellStatus::Available => {
-            if cell.strategy_id == "direct" {
+            if cell.strategy_id == "direct" || cell.strategy_id.ends_with("_direct") {
                 "Цель ответила напрямую. Для этой проверки Anti-DPI не требовался."
             } else {
                 "Цель ответила при проверке стратегии. Это не гарантия обхода DPI."
@@ -315,7 +316,7 @@ impl Draft {
             .count();
         let (title, text, mut items) = match self.step {
             SetupStep::Mode => ("Шаг 1 из 5 · Как настроить Anti-DPI?",
-                "Anti-DPI помогает проверять доступность сайтов и применять принятые способы изменения трафика.\nРаботает без VPS и ключей. Недоступные способы не используются.\n\nВыберите способ настройки. Никаких сетевых запросов или изменений Windows пока не будет.".into(),
+                "Anti-DPI помогает проверять доступность сайтов и применять доступные способы изменения трафика.\nРаботает без VPS и ключей. Недоступные способы не используются.\n\nВыберите способ настройки. Никаких сетевых запросов или изменений Windows пока не будет.".into(),
                 vec![item('1', "Рекомендуемая · выбрать нужные сайты"), item('2', "Ручная · настроить правила позднее")]),
             SetupStep::Domains => (if self.edit_rule.is_some() { "Изменить список сайтов" } else if self.adding_sites { "Добавить сайты для Anti-DPI" } else { "Шаг 2 из 5 · Какие сайты вам нужны?" },
                 format!("Укажите сайты, для которых хотите использовать Anti-DPI. Остальные не получат это правило.\n\nВыбрано: {domains}\n{}\n\nПока это только черновик. Для продолжения нужен хотя бы один сайт.", if self.values[4].is_empty() { "Пока ничего не выбрано" } else { &self.values[4] }),
@@ -330,8 +331,8 @@ impl Draft {
                 "Чтобы проверить сайты или подключаться к ним напрямую, требуется ваше разрешение.\nDNS-провайдер и сайты могут видеть ваш публичный IP. Anti-DPI не является VPN.\nЕсли не разрешить прямой выход, рабочий трафик не будет отправляться.\nЭто не запускает подключение. Разрешение можно изменить в настройках.".into(),
                 vec![item('1', "Пока не разрешать"), item('2', "Разрешить прямое подключение")]),
             SetupStep::Modify => (if self.first_run() { if self.flags[3] { "Шаг 5 из 5 · Разрешить Anti-DPI?" } else { "Шаг 4 из 4 · Разрешить Anti-DPI?" } } else { "Разрешения 2 из 2 · Anti-DPI" },
-                "Разрешить изменение трафика только для сайтов, указанных в правилах.\nРазрешение включает только доступные в этой версии способы.\nПри невозможности применить Anti-DPI соединение блокируется, а не отправляется напрямую.\nSTUN не включается этим шагом. Его отдельное разрешение доступно в расширенных настройках.".into(),
-                vec![item('1', "Пока не разрешать · Anti-DPI не активен"), item('2', "Разрешить принятые стратегии Anti-DPI")]),
+                "Разрешить изменение трафика только для сайтов, указанных в правилах.\nЭкспериментальная сборка: способы доступны, независимая приёмка не подтверждена.\nПри невозможности применить Anti-DPI соединение блокируется, а не отправляется напрямую.\nSTUN не включается этим шагом. Его отдельное разрешение доступно в расширенных настройках.".into(),
+                vec![item('1', "Пока не разрешать · Anti-DPI не активен"), item('2', "Разрешить Anti-DPI (экспериментальные способы)")]),
             SetupStep::DomainInput | SetupStep::CustomDns | SetupStep::Advanced | SetupStep::RulePick => ("", String::new(), Vec::new()),
         };
         let mut text = text;
@@ -492,7 +493,7 @@ impl Draft {
             Field { id: 3, label: "Локальный SOCKS5-прокси", value: self.values[3].clone(), hint: "Только loopback. UDP ASSOCIATE не означает перехват всего UDP системы." },
             Field { id: 4, label: "Прямой выход в сеть (Пробел)", value: yes(self.flags[0]).into(), hint: "Ваш IP виден DNS-провайдеру и получателям. По умолчанию запрещено." },
             Field { id: 5, label: "Anti-DPI (Пробел)", value: yes(self.flags[1]).into(), hint: "Только принятые стратегии. При отказе нет перехода на прямой маршрут." },
-            Field { id: 6, label: "STUN (отдельное разрешение)", value: yes(self.flags[2]).into(), hint: "Только совместимый credential-free Binding; приёмка обязательна." },
+            Field { id: 6, label: "STUN (отдельное разрешение)", value: yes(self.flags[2]).into(), hint: "Только совместимый credential-free Binding; отдельное согласие." },
         ];
         Form {
             fields,
@@ -691,10 +692,13 @@ fn policy_text(doc: &Document) -> String {
         let _ = writeln!(text, "ВНИМАНИЕ: Anti-DPI не активен.");
     } else if strategy_columns()
         .into_iter()
-        .filter(|id| *id != "direct")
+        .filter(|id| *id != "direct" && !id.ends_with("_direct"))
         .all(|id| strategy_unavailable(id) == Some(Reason::AwaitingAcceptance))
     {
         let _ = writeln!(text, "ВНИМАНИЕ: ни одна стратегия Anti-DPI ещё не принята; соответствующие соединения будут блокироваться.");
+    }
+    if crate::routing::dpi::STANDALONE_EXPERIMENTAL {
+        let _ = writeln!(text, "Экспериментальные способы Anti-DPI. Независимая приёмка не подтверждена.");
     }
     if local.resolver.is_none() || !local.consent.direct_egress {
         let _ = writeln!(
@@ -1787,7 +1791,7 @@ impl Panel {
             return;
         }
         if cell.policy_action == Some(crate::anti_dpi::Decision::Modify) {
-            self.notice = "Для сайта уже действует правило Anti-DPI; рабочий движок сам выбирает принятый способ.".into();
+            self.notice = "Для сайта уже действует правило Anti-DPI; рабочий движок сам выбирает доступный способ.".into();
             return;
         }
         let expected = context.config.clone();
@@ -1823,6 +1827,24 @@ impl Panel {
         self.preview_draft(draft);
     }
 
+    fn toggle_udp_endpoint(&mut self, key: char) {
+        let Some(host) = self.visible().get(self.row).filter(|entry| !entry.excluded)
+            .map(|entry| entry.hostname.clone()) else { return; };
+        let mut next = self.overlay.clone();
+        let list = match key {
+            'h' => &mut next.quic_v1,
+            'H' => &mut next.quic_v2,
+            'S' => &mut next.stun,
+            _ => return,
+        };
+        if list.contains(&host) {
+            list.retain(|entry| entry != &host);
+        } else {
+            list.push(host);
+        }
+        self.set_overlay(next);
+    }
+
     fn diagnostic_actions(&self) -> Vec<ActionItem> {
         let item = |key, label| ActionItem { key, label };
         if self.report_only {
@@ -1852,6 +1874,9 @@ impl Panel {
                 item('c', "Очистить выбор"),
                 item('x', "Исключить / вернуть сайт"),
                 item('R', "Вернуть исключённые сайты"),
+                item('h', "Указать / снять свой QUIC v1 (UDP 443)"),
+                item('H', "Указать / снять свой QUIC v2 (UDP 443)"),
+                item('S', "Указать / снять STUN для сервера (UDP 3478)"),
             ];
             if !self.report_hosts.is_empty() {
                 items.push(item('v', "Открыть последний отчёт"));
@@ -2436,6 +2461,9 @@ impl Panel {
                     self.begin_review(None);
                 }
             }
+            KeyCode::Char(key @ ('h' | 'H' | 'S')) if self.page == DIAGNOSTICS && !self.report_only && self.catalogue_draft.is_none() => {
+                self.toggle_udp_endpoint(key);
+            }
             KeyCode::Char('R') if self.page == DIAGNOSTICS && !self.report_only => {
                 self.set_overlay(Overlay {
                     excluded: Vec::new(),
@@ -2589,11 +2617,12 @@ impl Panel {
     fn readiness_text(&self, document: &Document) -> String {
         let local = &document.anti_dpi;
         let applied = self.applied_revision == Some(local.revision);
-        format!("Готовность к подключению\n[OK] Настройки прочитаны\n[{}] DNS: {}\n[{}] Выход в интернет: {}\n[{}] Применение правил: {}\n[{}] Системный прокси: {}\nAnti-DPI: стратегии ожидают независимой приёмки.",
+        format!("Готовность к подключению\n[OK] Настройки прочитаны\n[{}] DNS: {}\n[{}] Выход в интернет: {}\n[{}] Применение правил: {}\n[{}] Системный прокси: {}\nAnti-DPI: {}.",
             if local.resolver.is_some() { "OK" } else { "!" }, local.resolver.as_ref().map_or("выберите поставщика", |r| r.hostname.as_str()),
             if local.consent.direct_egress { "OK" } else { "!" }, yes(local.consent.direct_egress),
             if applied { "OK" } else { "!" }, if applied { "подтверждено этой панелью" } else { "нужно подтвердить" },
-            if cfg!(windows) { "?" } else { "—" }, self.owner_text())
+            if cfg!(windows) { "?" } else { "—" }, self.owner_text(),
+            if crate::routing::dpi::STANDALONE_EXPERIMENTAL { "экспериментальные стратегии доступны после согласия" } else { "только принятые стратегии" })
     }
 
     fn draw_page(&self, frame: &mut Frame<'_>, area: Rect, document: Option<&Document>) {
@@ -2604,7 +2633,8 @@ impl Panel {
             OVERVIEW => {
                 let _ = writeln!(
                     text,
-                    "Anti-DPI не активен: стратегии ожидают независимой приёмки.\n{}",
+                    "{}\n{}",
+                    if crate::routing::dpi::STANDALONE_EXPERIMENTAL { "Anti-DPI: экспериментальные стратегии TCP/QUIC/STUN доступны." } else { "Anti-DPI: используются только принятые стратегии." },
                     self.owner_text()
                 );
                 if let Some(local) = local {
@@ -2712,9 +2742,9 @@ impl Panel {
         let ids = strategy_columns();
         match self.group {
             0 => ids.into_iter().take(4).map(Some).collect(),
-            1 => vec![None, Some("quic_v1_initial_split")],
-            2 => vec![None, Some("quic_v2_initial_split")],
-            _ => vec![None, Some("stun_fingerprint")],
+            1 => vec![Some("quic_v1_direct"), Some("quic_v1_initial_split")],
+            2 => vec![Some("quic_v2_direct"), Some("quic_v2_initial_split")],
+            _ => vec![Some("stun_direct"), Some("stun_fingerprint")],
         }
     }
 
@@ -3074,15 +3104,15 @@ impl Panel {
         let legend = if self.group == 0 {
             "2xx — ответ получен · 3xx — перенаправление · 4xx/5xx — HTTP-ошибка\nн/п — не поддерживается · н/пр — неприменимо · — не проверено"
         } else {
-            "Прямой* — контроль UDP не реализован. Сравнение с TCP недопустимо.\nн/п — не поддерживается · — не проверено"
+            "Прямой — контроль выбранного UDP-протокола. Сравнение с TCP недопустимо.\nн/п — не поддерживается · — не проверено"
         };
         let recommendation = if self.group != 0 {
-            "Для сравнения нужен отдельный контроль того же UDP-протокола.".into()
+            "Сравнивайте прямой контроль и Anti-DPI одного протокола.".into()
         } else if let Some(cell) = self.selected_recommendation() {
             format!("Подошёл способ {} ({} мс). u — подготовить правило; выбор способа в работе автоматический.", column_label(cell.strategy_id), cell.duration_ms)
         } else if self.worker.is_some() {
             "Дождитесь завершения проверки.".into()
-        } else if strategy_columns().iter().filter(|id| **id != "direct").all(|id| strategy_unavailable(id).is_some()) {
+        } else if strategy_columns().iter().filter(|id| **id != "direct" && !id.ends_with("_direct")).all(|id| strategy_unavailable(id).is_some()) {
             "Anti-DPI пока недоступен: проверка только прямого подключения.".into()
         } else {
             "Нет подтверждённого улучшения относительно прямого подключения.".into()
@@ -3131,9 +3161,9 @@ impl Panel {
                 c.duration_ms, c.attempts, c.actual_modification.map_or("Не подтверждена", |m| if m { "Да" } else { "Нет" }),
                 c.endpoint.map_or_else(|| "—".into(), |e| e.to_string()), c.source.map_or_else(|| "—".into(), |ip| ip.to_string()), c.policy_action));
         } else {
-            text.push_str(if id.is_none() { "Отдельный Direct-контроль UDP ещё не реализован. Сравнение недоступно." }
+            text.push_str(if id.is_none() { "Нет данных о совместимом UDP-сервере для выбранного протокола." }
                 else if id.is_some_and(|id| strategy_unavailable(id) == Some(Reason::AwaitingAcceptance)) { "Этот способ пока недоступен в данной версии. Проверка не выполнялась." }
-                else { "Нет результата для этой стратегии. Не проверено." });
+                else { "Нет результата. Для UDP проверьте сведения о поддержке протокола в каталоге." });
         }
         text.push_str(&format!(
             "\n\nИстория каталога (не результат текущей проверки):\n{provenance}"
@@ -3622,9 +3652,9 @@ mod tests {
             panel.results.insert((host.clone(), "direct"), direct);
             for strategy_id in strategy_columns().into_iter().filter(|id| *id != "direct") {
                 let protocol = match strategy_id {
-                    "quic_v1_initial_split" => Protocol::QuicV1,
-                    "quic_v2_initial_split" => Protocol::QuicV2,
-                    "stun_fingerprint" => Protocol::Stun,
+                    "quic_v1_direct" | "quic_v1_initial_split" => Protocol::QuicV1,
+                    "quic_v2_direct" | "quic_v2_initial_split" => Protocol::QuicV2,
+                    "stun_direct" | "stun_fingerprint" => Protocol::Stun,
                     _ => Protocol::TcpHttps,
                 };
                 panel.results.insert(
@@ -3633,11 +3663,11 @@ mod tests {
                         domain: host.clone(),
                         protocol,
                         strategy_id,
-                        status: CellStatus::Unsupported,
+                        status: if protocol == Protocol::TcpHttps { CellStatus::Cancelled } else { CellStatus::NotChecked },
                         network: Stage::NotRun,
                         tls: Stage::NotRun,
                         application: Stage::NotRun,
-                        reason: Reason::AwaitingAcceptance,
+                        reason: if protocol == Protocol::TcpHttps { Reason::Cancelled } else { Reason::MissingEndpointMetadata },
                         actual_modification: None,
                         http_status: None,
                         duration_ms: 0,
