@@ -785,11 +785,114 @@ fn invitation_actions(flow: &IssueFlow) -> Vec<ActionItem> {
 
 // Independent keyboard-first draft. No mutation of the saved file until
 // the existing guarded save/Apply workflows are explicitly invoked.
+struct GeoPicker {
+    field: usize,
+    query: String,
+    codes: Vec<String>,
+    marked: std::collections::BTreeSet<String>,
+    focus: usize,
+    loading: Option<mpsc::Receiver<Result<Vec<String>, String>>>,
+    message: String,
+}
+impl GeoPicker {
+    fn prefix(&self) -> &'static str {
+        if self.field == 2 { "geosite:" } else { "geoip:" }
+    }
+    fn matches(&self) -> Vec<&str> {
+        let query = self.query.to_ascii_lowercase();
+        let needle = query.strip_prefix(self.prefix()).unwrap_or(&query);
+        self.codes.iter().map(String::as_str).filter(|code| code.contains(needle)).collect()
+    }
+    fn poll(&mut self) {
+        let Some(rx) = &self.loading else { return; };
+        match rx.try_recv() {
+            Ok(Ok(codes)) => {
+                self.codes = codes;
+                self.loading = None;
+            }
+            Ok(Err(message)) => {
+                self.message = message;
+                self.loading = None;
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.message = "Не удалось прочитать проверенную пару GeoData.".into();
+                self.loading = None;
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+    fn query(&mut self, text: &str) {
+        if text.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.:".contains(&b))
+            && self.query.len().saturating_add(text.len()) <= 128
+        {
+            self.query.push_str(text);
+            self.focus = 0;
+        }
+    }
+    fn layout(area: Rect) -> (Rect, Rect) {
+        let width = area.width.min(72);
+        let height = area.height.min(23);
+        let outer = Rect::new(area.x + (area.width - width) / 2, area.y + (area.height - height) / 2, width, height);
+        let rows = Rect::new(outer.x.saturating_add(2), outer.y.saturating_add(4), outer.width.saturating_sub(4), outer.height.saturating_sub(8));
+        (outer, rows)
+    }
+    fn window(&self, capacity: usize, total: usize) -> usize {
+        self.focus.saturating_sub(capacity.saturating_sub(1)).min(total.saturating_sub(capacity))
+    }
+    fn select_at(&mut self, area: Rect, x: u16, y: u16) {
+        let (_, rows) = Self::layout(area);
+        if x >= rows.x && x < rows.right() && y > rows.y && y < rows.bottom() {
+            let count = self.matches().len();
+            let index = self.window(usize::from(rows.height.saturating_sub(1)), count) + usize::from(y - rows.y - 1);
+            if index < count {
+                self.focus = index;
+            }
+        }
+    }
+    fn render(&self, frame: &mut Frame<'_>, area: Rect) {
+        let (outer, rows) = Self::layout(area);
+        frame.render_widget(ratatui::widgets::Clear, outer);
+        frame.render_widget(ratatui::widgets::Block::bordered()
+            .title(if self.field == 2 { " Выбор GeoSite " } else { " Выбор GeoIP " })
+            .style(Style::default().fg(ACCENT).bg(BG)), outer);
+        if outer.height < 9 || outer.width < 18 { return; }
+        let filtered = self.matches();
+        let capacity = usize::from(rows.height.saturating_sub(1));
+        let start = self.window(capacity, filtered.len());
+        frame.render_widget(Paragraph::new(format!("Поиск: {}▏", self.query)).style(Style::default().fg(TEXT).bg(INPUT)),
+            Rect::new(rows.x, outer.y + 1, rows.width, 1));
+        frame.render_widget(Paragraph::new(format!("Найдено: {} из {} · Отмечено: {}", filtered.len(), self.codes.len(), self.marked.len())).style(Style::default().fg(MUTED)),
+            Rect::new(rows.x, outer.y + 2, rows.width, 1));
+        let table = filtered.iter().enumerate().skip(start).take(capacity).map(|(index, code)| {
+            let chosen = self.marked.contains(*code);
+            Row::new(vec![if chosen { "[x]" } else { "[ ]" }.to_owned(), format!("{}{code}", self.prefix())])
+                .style(Style::default().fg(if chosen || index == self.focus { ACCENT } else { TEXT })
+                    .bg(if index == self.focus { FOCUS } else { BG }))
+        });
+        frame.render_widget(Table::new(table, [Constraint::Length(5), Constraint::Min(8)])
+            .header(Row::new(["Выбор", "Категория"]).style(Style::default().fg(MUTED))), rows);
+        let message = if self.loading.is_some() {
+            "Читаем локальные проверенные базы…"
+        } else if !self.message.is_empty() {
+            self.message.as_str()
+        } else if filtered.is_empty() {
+            "Категории не найдены."
+        } else {
+            "Выбранные категории будут добавлены только в текущее поле."
+        };
+        frame.render_widget(Paragraph::new(message).wrap(Wrap { trim: true }).style(Style::default().fg(if self.message.is_empty() { MUTED } else { WARNING })),
+            Rect::new(rows.x, rows.bottom(), rows.width, 2));
+        frame.render_widget(Paragraph::new("↑↓ выбрать · Пробел отметить · Enter добавить · Esc отменить").wrap(Wrap { trim: true }).style(Style::default().fg(ACCENT)),
+            Rect::new(rows.x, outer.bottom().saturating_sub(3), rows.width, 2));
+    }
+}
+
 struct RoutingPanel {
     settings: crate::routing::Settings,
     original: crate::routing::Settings,
     search: Option<String>,
     diagnostic_input: Option<String>,
+    geo_picker: Option<GeoPicker>,
     geodata_mode: bool,
     selected: usize,
     fields: Option<(Option<usize>, [String; 5], usize)>,
@@ -827,6 +930,7 @@ impl RoutingPanel {
             settings,
             search: None,
             diagnostic_input: None,
+            geo_picker: None,
             geodata_mode: false,
             selected: 0,
             fields: None,
@@ -873,6 +977,10 @@ impl RoutingPanel {
         self.message.clear();
     }
     fn paste(&mut self, input: &str) {
+        if let Some(picker) = &mut self.geo_picker {
+            picker.query(input.trim());
+            return;
+        }
         if let Some(value) = &mut self.diagnostic_input {
             if value.len().saturating_add(input.len()) <= 4096
                 && input.bytes().all(|b| {
@@ -893,7 +1001,83 @@ impl RoutingPanel {
             }
         }
     }
+    fn open_geo_picker(&mut self, field: usize) {
+        let mut picker = GeoPicker {
+            field, query: String::new(), codes: Vec::new(), marked: Default::default(),
+            focus: 0, loading: None, message: String::new(),
+        };
+        if let Some(manifest) = self.settings.datasets.clone() {
+            let directory = self.directory.clone();
+            let (tx, rx) = mpsc::channel();
+            picker.loading = Some(rx);
+            let _worker = std::thread::spawn(move || {
+                let result = (|| {
+                    let store = crate::routing::geodata::Store::new(directory)
+                        .map_err(|e| format!("GeoData: {e:?}"))?;
+                    let pair = store.load_pinned(&manifest, &[])
+                        .map_err(|e| format!("GeoData: {e:?}"))?;
+                    pair.category_names(field == 2).map_err(|e| format!("GeoData: {e:?}"))
+                })();
+                let _ = tx.send(result);
+            });
+        } else {
+            picker.message = "Нет выбранной пары GeoData. Закройте окно и выберите базы в разделе маршрутизации.".into();
+        }
+        self.geo_picker = Some(picker);
+    }
+    fn geo_key(&mut self, key: KeyEvent) {
+        let Some(mut picker) = self.geo_picker.take() else { return; };
+        if key.code == KeyCode::Esc { return; }
+        if picker.loading.is_some() {
+            self.geo_picker = Some(picker);
+            return;
+        }
+        match key.code {
+            KeyCode::Enter => {
+                if !picker.marked.is_empty() {
+                    if let Some((_, fields, _)) = &mut self.fields {
+                        let current = &fields[picker.field];
+                        let mut existing = current.split(|c: char| c == ',' || c.is_whitespace())
+                            .filter(|s| !s.is_empty()).map(str::to_ascii_lowercase).collect::<std::collections::HashSet<_>>();
+                        let mut next = current.trim_end().to_owned();
+                        for code in &picker.marked {
+                            let token = format!("{}{code}", picker.prefix());
+                            if existing.insert(token.clone()) {
+                                if !next.is_empty() && !next.ends_with(',') { next.push_str(", "); }
+                                else if !next.is_empty() { next.push(' '); }
+                                next.push_str(&token);
+                            }
+                        }
+                        if next.len() > 8192 {
+                            picker.message = "Превышен размер поля. Снимите часть отметок.".into();
+                            self.geo_picker = Some(picker);
+                            return;
+                        }
+                        fields[picker.field] = next;
+                    }
+                    return;
+                }
+            }
+            KeyCode::Up => picker.focus = picker.focus.saturating_sub(1),
+            KeyCode::Down => picker.focus = (picker.focus + 1).min(picker.matches().len().saturating_sub(1)),
+            KeyCode::PageUp => picker.focus = picker.focus.saturating_sub(10),
+            KeyCode::PageDown => picker.focus = (picker.focus + 10).min(picker.matches().len().saturating_sub(1)),
+            KeyCode::Home => picker.focus = 0,
+            KeyCode::End => picker.focus = picker.matches().len().saturating_sub(1),
+            KeyCode::Char(' ') if key.modifiers.is_empty() => {
+                if let Some(code) = picker.matches().get(picker.focus).map(|s| (*s).to_owned()) {
+                    if !picker.marked.remove(&code) { picker.marked.insert(code); }
+                }
+            }
+            KeyCode::Backspace => { picker.query.pop(); picker.focus = 0; }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => { picker.query.clear(); picker.focus = 0; }
+            KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => picker.query(&c.to_string()),
+            _ => {}
+        }
+        self.geo_picker = Some(picker);
+    }
     fn poll(&mut self) {
+        if let Some(picker) = &mut self.geo_picker { picker.poll(); }
         let Some(rx) = &self.download else {
             return;
         };
@@ -1063,11 +1247,11 @@ impl RoutingPanel {
             ),
             (
                 "Домены / GeoSite",
-                "Через запятую: example.org или geosite:google.",
+                "F6 — найти категории GeoSite. Или введите домены через запятую.",
             ),
             (
                 "IP / CIDR / GeoIP",
-                "Через запятую: 192.0.2.0/24 или geoip:private.",
+                "F6 — найти категории GeoIP. Или введите IP/CIDR через запятую.",
             ),
         ];
         Some(Form {
@@ -1086,7 +1270,7 @@ impl RoutingPanel {
                 })
                 .collect(),
             selected: *focus,
-            lead: "↑↓ / Tab: поле · ←→: действие · Enter: в черновик · Esc: отменить".into(),
+            lead: "↑↓ / Tab: поле · F6: GeoData · ←→: действие · Enter: в черновик · Esc: отменить".into(),
             error: self.message.clone(),
         })
     }
@@ -1098,6 +1282,7 @@ impl RoutingPanel {
         }
         if let Some(form) = self.form() {
             form.render(frame, area, "Редактирование правила");
+            if let Some(picker) = &self.geo_picker { picker.render(frame, area); }
             return;
         }
         let items = self.actions();
@@ -1241,6 +1426,10 @@ impl RoutingPanel {
         (start, capacity)
     }
     fn select_at(&mut self, area: Rect, x: u16, y: u16) {
+        if let Some(picker) = &mut self.geo_picker {
+            picker.select_at(area, x, y);
+            return;
+        }
         if let Some(form) = self.form() {
             if let Some(id) = form.hit(area, x, y) {
                 if let Some((_, _, focus)) = self.fields.as_mut() {
@@ -1282,6 +1471,16 @@ impl RoutingPanel {
 
     // true keeps the draft open; false returns to the workspace.
     fn key(&mut self, mut key: KeyEvent, editor: Option<&mut Editor>) -> bool {
+        if self.geo_picker.is_some() {
+            self.geo_key(key);
+            return true;
+        }
+        if key.code == KeyCode::F(6) {
+            if let Some((_, _, field @ (2 | 3))) = self.fields.as_ref() {
+                self.open_geo_picker(*field);
+                return true;
+            }
+        }
         if self.download.is_some() {
             return true;
         }
@@ -10791,6 +10990,47 @@ mod tests {
         assert!(!panel.key(press(KeyCode::Char('s')), Some(&mut editor)));
         assert!(editor.dirty());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn geo_picker_filters_marks_and_appends_only_to_draft() {
+        let dir = std::env::temp_dir().join(crate::tui_editor::generated_id("geo-picker").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("server.toml");
+        let source = server_issuance_fixture();
+        std::fs::write(&path, &source).unwrap();
+        let editor = Editor::load(Role::Server, &path).unwrap();
+        let mut panel = RoutingPanel::new(&editor);
+        panel.edit(None);
+        let (_, values, focus) = panel.fields.as_mut().unwrap();
+        *focus = 2;
+        values[2] = "example.org, geosite:google".into();
+        panel.key(press(KeyCode::F(6)), None);
+        assert!(panel.geo_picker.as_ref().unwrap().message.contains("Нет выбранной"));
+        panel.key(press(KeyCode::Esc), None);
+        panel.geo_picker = Some(GeoPicker {
+            field: 2, query: String::new(), codes: vec!["category-ads".into(), "google".into(), "youtube".into()],
+            marked: Default::default(), focus: 0, loading: None, message: String::new(),
+        });
+        panel.paste("goo");
+        panel.key(press(KeyCode::Char(' ')), None);
+        panel.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), None);
+        panel.paste("you");
+        panel.key(press(KeyCode::Char(' ')), None);
+        panel.key(press(KeyCode::Enter), None);
+        assert_eq!(panel.fields.as_ref().unwrap().1[2], "example.org, geosite:google, geosite:youtube");
+        assert!(panel.settings.rules.is_empty());
+        panel.fields.as_mut().unwrap().2 = 3;
+        panel.geo_picker = Some(GeoPicker {
+            field: 3, query: String::new(), codes: vec!["in-ru".into(), "private".into()],
+            marked: Default::default(), focus: 0, loading: None, message: String::new(),
+        });
+        panel.key(press(KeyCode::Char(' ')), None);
+        panel.key(press(KeyCode::Esc), None);
+        assert!(panel.fields.as_ref().unwrap().1[3].is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        assert!(!editor.dirty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
